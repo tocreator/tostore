@@ -1,11 +1,11 @@
-import '../statistics/table_statistics.dart';
+import '../statistic/table_statistics.dart';
 import 'query_plan.dart';
 
-/// 查询代价估算器
+/// query cost estimator
 class CostEstimator {
   final TableStatistics _statistics;
 
-  // 代价权重
+  // cost weight
   static const double _indexSeekCost = 1.0;
   static const double _indexScanCost = 2.0;
   static const double _tableScanCost = 10.0;
@@ -14,7 +14,7 @@ class CostEstimator {
 
   CostEstimator(this._statistics);
 
-  /// 估算查询计划代价
+  /// estimate query plan cost
   double estimateCost(QueryPlan plan) {
     double totalCost = 0.0;
     int estimatedRows = _statistics.totalRows;
@@ -52,7 +52,7 @@ class CostEstimator {
     return totalCost;
   }
 
-  /// 估算索引扫描代价
+  /// estimate index scan cost
   CostEstimate _estimateIndexScanCost(
     Map<String, dynamic> conditions,
     int inputRows,
@@ -65,11 +65,12 @@ class CostEstimator {
       if (fieldStats == null) continue;
 
       if (entry.value is Map) {
-        // 范围查询
+        // range query
         cost += _indexScanCost * (outputRows / fieldStats.distinctValues);
-        outputRows = (outputRows * 0.3).ceil(); // 估计范围查询返回30%的行
+        outputRows = (outputRows * 0.3)
+            .ceil(); // estimate range query returns 30% of rows
       } else {
-        // 精确查询
+        // exact query
         cost += _indexSeekCost;
         outputRows = (outputRows / fieldStats.distinctValues).ceil();
       }
@@ -78,7 +79,7 @@ class CostEstimator {
     return CostEstimate(cost, outputRows);
   }
 
-  /// 估算过滤代价
+  /// estimate filter cost
   CostEstimate _estimateFilterCost(
     Map<String, dynamic> conditions,
     int inputRows,
@@ -93,10 +94,11 @@ class CostEstimator {
       cost += _filterCost * inputRows;
 
       if (entry.value is Map) {
-        // 复杂条件
-        outputRows = (outputRows * 0.5).ceil(); // 估过滤掉50%的行
+        // complex condition
+        outputRows =
+            (outputRows * 0.5).ceil(); // estimate filter out 50% of rows
       } else {
-        // 简单相等条件
+        // simple equal condition
         outputRows = (outputRows / fieldStats.distinctValues).ceil();
       }
     }
@@ -104,22 +106,22 @@ class CostEstimator {
     return CostEstimate(cost, outputRows);
   }
 
-  /// 估算排序代价
+  /// estimate sort cost
   double _estimateSortCost(int rows) {
     if (rows <= 1) return 0;
-    // 使用 O(n log n) 复杂度估算排序代价
+    // use O(n log n) complexity to estimate sort cost
     return _sortCost * rows * _log2(rows);
   }
 
-  /// 计算以2为底的对数
+  /// calculate logarithm base 2
   double _log2(int n) {
-    // 使用换底公式: log2(n) = ln(n) / ln(2)
+    // use change of base formula: log2(n) = ln(n) / ln(2)
     return _ln(n) / 0.693147180559945; // ln(2) ≈ 0.693147180559945
   }
 
-  /// 计算自然对数
+  /// calculate natural logarithm
   double _ln(int n) {
-    // 使用泰勒级数计算自然对数
+    // use taylor series to calculate natural logarithm
     double x = (n - 1) / (n + 1);
     double result = 0;
     double term = x;
@@ -134,7 +136,7 @@ class CostEstimator {
     return 2 * result;
   }
 
-  /// 估算基数（返回行数）
+  /// estimate cardinality (return row count)
   int estimateCardinality(
     String tableName,
     Map<String, dynamic>? where,
@@ -150,10 +152,10 @@ class CostEstimator {
       if (fieldStats == null) continue;
 
       if (entry.value is Map) {
-        // 范围条件
+        // range condition
         cardinality = (cardinality * 0.3).ceil();
       } else {
-        // 相等条件
+        // equal condition
         cardinality = (cardinality / fieldStats.distinctValues).ceil();
       }
     }
@@ -162,7 +164,7 @@ class CostEstimator {
   }
 }
 
-/// 代价估算结果
+/// cost estimate result
 class CostEstimate {
   final double cost;
   final int rows;

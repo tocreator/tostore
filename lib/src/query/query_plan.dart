@@ -1,6 +1,6 @@
 import 'cost_estimator.dart';
 
-/// 查询计划
+/// query plan
 class QueryPlan {
   final List<QueryOperation> operations;
 
@@ -11,17 +11,17 @@ class QueryPlan {
     return 'QueryPlan(operations: ${operations.map((op) => op.toString()).join(', ')})';
   }
 
-  /// 估算执行成本
+  /// estimate execution cost
   double estimateCost(CostEstimator estimator) {
     return estimator.estimateCost(this);
   }
 
-  /// 添加操作
+  /// add operation
   void addOperation(QueryOperation operation) {
     operations.add(operation);
   }
 
-  /// 获取预计返回行数
+  /// get estimated number of rows
   int estimatedRows(CostEstimator estimator) {
     return estimator.estimateCardinality(
       operations.first.value as String,
@@ -29,7 +29,7 @@ class QueryPlan {
     );
   }
 
-  /// 提取查询条件
+  /// extract query conditions
   Map<String, dynamic>? _extractWhereConditions() {
     for (var operation in operations) {
       if (operation.type == QueryOperationType.filter) {
@@ -39,7 +39,7 @@ class QueryPlan {
     return null;
   }
 
-  /// 获取查询计划描述
+  /// get query plan description
   String explain() {
     final buffer = StringBuffer();
     for (var i = 0; i < operations.length; i++) {
@@ -48,7 +48,7 @@ class QueryPlan {
     return buffer.toString();
   }
 
-  /// 解释查询操作
+  /// explain query operation
   String _explainOperation(QueryOperation operation) {
     switch (operation.type) {
       case QueryOperationType.tableScan:
@@ -63,7 +63,7 @@ class QueryPlan {
   }
 }
 
-/// 查询操作
+/// query operation
 class QueryOperation {
   final QueryOperationType type;
   final String? indexName;
@@ -88,7 +88,7 @@ class QueryOperation {
   }
 }
 
-/// 查询操作类型
+/// query operation type
 enum QueryOperationType {
   tableScan,
   indexScan,

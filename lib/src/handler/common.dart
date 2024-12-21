@@ -5,16 +5,16 @@ import 'package:path_provider/path_provider.dart';
 
 import 'logger.dart';
 
-/// 内部配置项
+/// internal configuration
 class InternalConfig {
-  /// 是否显示Logger具体标签
+  /// whether to show Logger specific label
   static const bool showLoggerInternalLabel = false;
 
-  /// 对外显示的统一标签
+  /// public label
   static const String publicLabel = 'tostore';
 }
 
-/// 将任何对象类型转为字符串
+/// convert any object type to string
 String toStringWithAll(Object? object) {
   String value = '';
   try {
@@ -26,12 +26,13 @@ String toStringWithAll(Object? object) {
       value = object.toString();
     }
   } catch (e) {
-    Logger.error('无法将对象 ${object.runtimeType} 转换：$e', label: 'toStringWithAll');
+    Logger.error('cannot convert ${object.runtimeType} to string: $e',
+        label: 'toStringWithAll');
   }
   return value;
 }
 
-/// 获取app保存目录，用于数据、配置等永久保存
+/// get app save directory, for data, config, etc.
 Future<String> getPathApp() async {
   var cachePath =
       Directory("${(await getApplicationDocumentsDirectory()).path}/common");

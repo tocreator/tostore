@@ -1,4 +1,4 @@
-/// 基础空间变更事件
+/// switch base path event
 class BasePathChangedEvent {
   final String? oldBaseName;
   final String? newBaseName;

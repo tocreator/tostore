@@ -1,6 +1,6 @@
 import 'dart:async';
 
-/// Future 构建器 Mixin
+/// Future builder mixin
 mixin FutureBuilderMixin<T> implements Future<T> {
   Future<T> get future;
 

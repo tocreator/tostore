@@ -19,10 +19,10 @@ import '../model/table_info.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
-import '../statistics/statistics_collector.dart';
+import '../statistic/statistics_collector.dart';
 import 'transaction_manager.dart';
 
-/// 数据存储引擎
+/// Core storage engine implementation
 class DataStoreImpl {
   static final Map<String, DataStoreImpl> _instances = {};
   Completer<void> _initCompleter = Completer<void>();
@@ -39,13 +39,11 @@ class DataStoreImpl {
   final Future<void> Function(DataStoreImpl db)? _onOpen;
 
   bool _baseInitialized = false;
-
   bool _isSwitchingSpace = false;
 
-  /// 检查是否已初始化
   bool get isInitialized => _isInitialized;
 
-  /// 工厂构造函数,支持多实例
+  /// Create instance with configuration
   factory DataStoreImpl({
     String? dbPath,
     DataStoreConfig? config,
@@ -85,23 +83,19 @@ class DataStoreImpl {
     this._onOpen,
   );
 
-  /// 开始初始化
+  /// Start initialization process
   void _startInitialize(String? dbPath, DataStoreConfig? config) {
     if (_initializing || _isInitialized) {
       return;
     }
 
-    // 创建新的 Completer
     _initCompleter = Completer<void>();
 
-    // 开始初始化流程
     initialize(dbPath: dbPath, config: config).then((_) {
-      // 初始化完成后完成 Completer
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
       }
     }).catchError((e) {
-      // 初始化失败时完成 Completer 的错误
       if (!_initCompleter.isCompleted) {
         _initCompleter.completeError(e);
       }
@@ -109,7 +103,7 @@ class DataStoreImpl {
     });
   }
 
-  /// 获取数据库的版本号
+  /// Get database version
   Future<int> getVersion() async {
     try {
       final versionFile = File('${config.dbPath}/version');
@@ -122,18 +116,16 @@ class DataStoreImpl {
     }
   }
 
-  /// 设置数据库版本号
+  /// Set database version
   Future<void> setVersion(int version) async {
     final versionFile = File('${config.dbPath}/version');
     await versionFile.writeAsString(version.toString());
   }
 
-  /// 确保初始化完成
+  /// Ensure initialization is complete
   Future<void> _ensureInitialized() async {
-    if (!_isInitialized) {
-      if (!_initCompleter.isCompleted) {
-        await _initCompleter.future;
-      }
+    if (!_isInitialized && !_initCompleter.isCompleted) {
+      await _initCompleter.future;
     }
   }
 
@@ -147,7 +139,7 @@ class DataStoreImpl {
   QueryExecutor? _queryExecutor;
   StatisticsCollector? _statisticsCollector;
 
-  // 添加唯一值缓存
+  // Cache for unique values
   final Map<String, Map<String, Set<dynamic>>> _uniqueValuesCache = {};
 
   FileManager? _fileManager;
@@ -158,10 +150,10 @@ class DataStoreImpl {
     return _fileManager!;
   }
 
-  /// 获取当前基础空间名
+  /// Get current base space name
   String get currentBaseSpaceName => _currentSpaceName;
 
-  /// 获取当前配置
+  /// Get current configuration
   DataStoreConfig get config {
     if (_config == null) {
       throw StateError('DataStore not initialized');
@@ -169,7 +161,7 @@ class DataStoreImpl {
     return _config!;
   }
 
-  /// 获取数据库路径
+  /// Get database path
   Future<String> getDatabasePath({String? dbPath}) async {
     if (_config != null && isInitialized) {
       return _config!.dbPath;
@@ -180,29 +172,25 @@ class DataStoreImpl {
     return "$appPath/db";
   }
 
-  /// 获取表路径
+  /// Get table path
   Future<String> getTablePath(String tableName) async {
     final schema = await getTableSchema(tableName);
-
     return config.getTablePath(tableName, schema.isGlobal);
   }
 
-  /// 获取表路径(同步版本)
+  /// Get table path (sync version)
   String getTablePathSync(String tableName, {bool isGlobal = false}) {
-    // 只能从缓存获取
     final schema = _queryExecutor?.queryCacheManager.getSchema(tableName);
     return config.getTablePath(tableName, schema?.isGlobal ?? isGlobal);
   }
 
-  /// 初始化数据存储引擎
+  /// Initialize storage engine
   Future<bool> initialize({String? dbPath, DataStoreConfig? config}) async {
-    // 如果已经在初始化中,等待初始化完成
     if (_initializing && !_initCompleter.isCompleted) {
       await _initCompleter.future;
       return true;
     }
 
-    // 如果已经初始化完成且参数相同,直接返回
     if (_isInitialized && dbPath == _config?.dbPath && config == _config) {
       return true;
     }
@@ -210,7 +198,6 @@ class DataStoreImpl {
     _initializing = true;
 
     try {
-      // 如果已初始化,先关闭现有实例
       if (_config != null) {
         await close();
       }
@@ -227,26 +214,15 @@ class DataStoreImpl {
 
       await Directory(dbPath).create(recursive: true);
 
-      _queryOptimizer = QueryOptimizer(
-        this,
-      );
-      _queryExecutor = QueryExecutor(
-        this,
-        _indexManager!,
-      );
+      _queryOptimizer = QueryOptimizer(this);
+      _queryExecutor = QueryExecutor(this, _indexManager!);
 
-      // 恢复未完成的事务
       await _recoveryIncompleteTransactions();
-
       await _loadDataToCache();
 
-      // 标记基础初始化完成
       _baseInitialized = true;
-
-      // 执行表创建和升级
       await _startSetupAndUpgrade();
 
-      // 标记完全初始化完成
       _isInitialized = true;
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
@@ -258,24 +234,21 @@ class DataStoreImpl {
       if (!_initCompleter.isCompleted) {
         _initCompleter.completeError(e);
       }
-      Logger.error('数据库初始化失败: $e', label: 'DataStore.initialize');
+      Logger.error('Database initialization failed: $e',
+          label: 'DataStore.initialize');
       rethrow;
     } finally {
       _initializing = false;
     }
   }
 
-  /// 开始创建表及升级
+  /// Setup tables and handle upgrades
   Future<void> _startSetupAndUpgrade() async {
     try {
-      // 配置数据库
       await _onConfigure?.call(this);
-
       final oldVersion = await getVersion();
 
-      // 首次创建或切换基础空间时创建表
       if (oldVersion == 0 || _isSwitchingSpace) {
-        // 创建基础空间键值表
         await createTable(
           _kvStoreName,
           const TableSchema(
@@ -291,7 +264,6 @@ class DataStoreImpl {
           ),
         );
 
-        // 创建全局键值表
         await createTable(
           _globalKvStoreName,
           const TableSchema(
@@ -314,23 +286,21 @@ class DataStoreImpl {
           await setVersion(_version);
         }
       } else if (oldVersion < _version) {
-        // 需要升级
         await _onUpgrade?.call(this, oldVersion, _version);
         await setVersion(_version);
       } else if (oldVersion > _version) {
-        // 需要降级
         await _onDowngrade?.call(this, oldVersion, _version);
         await setVersion(_version);
       }
 
-      // 数据库打开完成
       await _onOpen?.call(this);
     } catch (e) {
-      Logger.error('数据库设置或升级失败: $e', label: 'DataStore._startSetupAndUpgrade');
+      Logger.error('Database setup or upgrade failed: $e',
+          label: 'DataStore._startSetupAndUpgrade');
     }
   }
 
-  /// 关闭数据库
+  /// close database
   Future<void> close() async {
     try {
       await _fileManager?.dispose();
@@ -365,14 +335,15 @@ class DataStoreImpl {
 
       _fileManager = null;
 
-      Logger.info('数据库实例已关闭: $_instanceKey', label: 'DataStoreImpl.close');
+      Logger.info('The database instance has been closed: $_instanceKey',
+          label: 'DataStoreImpl.close');
     } catch (e) {
-      Logger.error('数据库关闭失败: $e', label: 'DataStore.close');
+      Logger.error('Database shutdown failed: $e', label: 'DataStore.close');
       rethrow;
     }
   }
 
-  /// 创建表
+  /// create table
   Future<void> createTable(
     String tableName,
     TableSchema schema,
@@ -382,22 +353,22 @@ class DataStoreImpl {
     }
 
     try {
-      // 1. 检查全局路径和基础路径
-      final globalPath = config.getTablePath(tableName, true);
-      final basePath = config.getTablePath(tableName, false);
-      final globalSchemaFile = File('$globalPath.schema');
-      final baseSchemaFile = File('$basePath.schema');
+      // 1. check global path and base path
+      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
+      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
 
       if (await globalSchemaFile.exists()) {
-        Logger.warn('表 $tableName 在全局空间已存在', label: 'DataStore.createTable');
+        Logger.warn('Table $tableName already exists in global space',
+            label: 'DataStore.createTable');
         return;
       }
       if (await baseSchemaFile.exists()) {
-        Logger.warn('表 $tableName 在基础空间已存在', label: 'DataStore.createTable');
+        Logger.warn('Table $tableName already exists in base space',
+            label: 'DataStore.createTable');
         return;
       }
 
-      // 2. 创建目标目录
+      // 2. create target directory
       final isGlobal = schema.isGlobal;
       final targetPath =
           isGlobal ? config.getGlobalPath() : config.getBasePath();
@@ -406,75 +377,75 @@ class DataStoreImpl {
         await targetDir.create(recursive: true);
       }
 
-      // 3. 获取目标表路径
-      final dataFile = File('$targetPath.dat');
-      final schemaFile = File('$targetPath.schema');
+      // 3. get target table path
+      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
+      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
 
       await _concurrencyManager!.acquireWriteLock(tableName);
       try {
-        // 4. 验证表结构
+        // 4. validate table structure
         _validateSchema(schema);
 
-        // 5. 创建新的表文件
+        // 5. create new table file
         await dataFile.create(recursive: true);
         await schemaFile.writeAsString(jsonEncode(schema));
 
-        // 6. 创建主键索引
+        // 6. create primary key index
         await _indexManager?.createPrimaryIndex(tableName, schema.primaryKey);
 
-        // 7. 创建其他索引
+        // 7. create other indexes
         for (var index in schema.indexes) {
           await _indexManager?.createIndex(tableName, index);
         }
 
-        Logger.info('表 $tableName 创建成功');
+        Logger.info('Table $tableName created successfully');
       } finally {
         await _concurrencyManager!.releaseWriteLock(tableName);
       }
 
-      // 8. 缓存新创建的表结构
+      // 8. cache new created table structure
       _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
     } catch (e) {
-      Logger.error('创建表失败: $e', label: 'DataStore.createTable');
+      Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       rethrow;
     }
   }
 
-  /// 插入数据的完整流程
+  /// insert data complete process
   Future<bool> insert(String tableName, Map<String, dynamic> data) async {
-    // 需要完全初始化
+    // need to be fully initialized
     if (!_isInitialized) {
       await _ensureInitialized();
     }
 
-    // 1. 事务和锁
+    // 1. transaction and lock
     final transaction = await _transactionManager!.beginTransaction();
     await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
-      // 2. 数据验证
+      // 2. data validation
       final schema = await getTableSchema(tableName);
       final validData = await _validateAndProcessData(schema, data, tableName);
       if (validData == null) {
         return false;
       }
 
-      // 3. 唯一性检查
+      // 3. unique check
       if (!await _checkUniqueConstraints(tableName, validData)) {
         return false;
       }
 
-      // 4. 更新缓存
+      // 4. update cache
       _queryExecutor?.queryCacheManager.addCachedRecord(tableName, validData);
 
-      // 5. 添加到写入队列(插入操作)
+      // 5. add to write queue (insert operation)
       fileManager.addToWriteQueue(tableName, validData, isUpdate: false);
 
-      // 6. 提交事务
+      // 6. commit transaction
       await _transactionManager!.commit(transaction);
       return true;
     } catch (e) {
-      Logger.error('插入失败: $e', label: 'DataStore.insert');
+      Logger.error('Insert failed: $e', label: 'DataStore.insert');
       await _rollbackTransaction(transaction, tableName, data);
       return false;
     } finally {
@@ -482,17 +453,17 @@ class DataStoreImpl {
     }
   }
 
-  /// 事务回滚
+  /// rollback transaction
   Future<void> _rollbackTransaction(
     Transaction? transaction,
     String tableName,
     Map<String, dynamic> data,
   ) async {
     try {
-      // 1. 回滚事务
+      // 1. rollback transaction
       await _transactionManager!.rollback(transaction);
 
-      // 2. 从缓存中删除
+      // 2. remove from cache
       final schema = await getTableSchema(tableName);
       final primaryKeyField = schema.primaryKey;
       final primaryKeyValue = data[primaryKeyField];
@@ -502,14 +473,14 @@ class DataStoreImpl {
         primaryKeyValue.toString(),
       );
 
-      // 3. 从写入队列中删除
+      // 3. remove from write queue
       final queue = fileManager.writeQueue[tableName];
       if (queue != null) {
         queue.removeWhere(
             (record) => record[primaryKeyField] == primaryKeyValue);
       }
 
-      // 4. 从文件中删除最后一条记录（如果已写入）
+      // 4. remove last record from file (if written)
       final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
       if (await dataFile.exists()) {
         final lines = await dataFile.readAsLines();
@@ -522,24 +493,25 @@ class DataStoreImpl {
               await dataFile.writeAsString('${lines.join('\n')}\n');
             }
           } catch (e) {
-            Logger.error('解析最后一条记录失败: $e',
+            Logger.error('Failed to parse last record: $e',
                 label: 'DataStore._rollbackTransaction');
           }
         }
       }
 
-      // 5. 回滚索引
+      // 5. rollback indexes
       await _indexManager?.deleteFromIndexes(tableName, data);
 
-      Logger.info('事务回滚成功');
+      Logger.info('Transaction rollback successfully');
     } catch (e) {
-      Logger.error('事务回滚失败: $e', label: 'DataStore._rollbackTransaction');
+      Logger.error('Transaction rollback failed: $e',
+          label: 'DataStore._rollbackTransaction');
       _queryExecutor?.queryCacheManager.invalidateCache(tableName);
       rethrow;
     }
   }
 
-  /// 验证和处理数据
+  /// validate and process data
   Future<Map<String, dynamic>?> _validateAndProcessData(
     TableSchema schema,
     Map<String, dynamic> data,
@@ -549,7 +521,7 @@ class DataStoreImpl {
       final result = Map<String, dynamic>.from(data);
       final primaryKey = schema.primaryKey;
 
-      // 1. 处理自增主键
+      // 1. handle auto increment primary key
       if (!result.containsKey(primaryKey) || result[primaryKey] == null) {
         if (schema.autoIncrement) {
           result[primaryKey] = await _getNextId(tableName);
@@ -561,7 +533,7 @@ class DataStoreImpl {
         }
       }
 
-      // 2. 填充默认值和空值
+      // 2. fill default value and null value
       for (var field in schema.fields) {
         if (!result.containsKey(field.name)) {
           if (field.defaultValue != null) {
@@ -575,22 +547,23 @@ class DataStoreImpl {
 
         final value = result[field.name];
 
-        // 检查非空约束
+        // check non-null constraint
         if (!field.nullable && value == null) {
-          Logger.warn('警告: 字段 ${field.name} 不能为空');
+          Logger.warn('Warning: field ${field.name} cannot be null');
           return null;
         }
 
-        // 检查数据类型
+        // check data type
         if (value != null && !_isValidDataType(value, field.type)) {
-          Logger.warn('警告: 字段 ${field.name} 的值类型不正确');
+          Logger.warn(
+              'Warning: value type of field ${field.name} is incorrect');
           return null;
         }
 
-        // 检查最大长度
+        // check max length
         if (value != null && field.maxLength != null) {
           if (value is String && value.length > field.maxLength!) {
-            Logger.warn('警告: 字段 ${field.name} 超出最大长度');
+            Logger.warn('Warning: field ${field.name} exceeds max length');
             return null;
           }
         }
@@ -598,12 +571,13 @@ class DataStoreImpl {
 
       return result;
     } catch (e) {
-      Logger.error('数据验证失败: $e', label: 'DataStore-_validateAndProcessData');
+      Logger.error('Data validation failed: $e',
+          label: 'DataStore-_validateAndProcessData');
       return null;
     }
   }
 
-  /// 获取类型默认值
+  /// get type default value
   dynamic _getTypeDefaultValue(DataType type) {
     switch (type) {
       case DataType.integer:
@@ -621,7 +595,7 @@ class DataStoreImpl {
     }
   }
 
-  /// 检数据类型是否有效
+  /// check data type is valid
   bool _isValidDataType(dynamic value, DataType type) {
     if (value == null) return true;
     switch (type) {
@@ -646,7 +620,7 @@ class DataStoreImpl {
     }
   }
 
-  /// Map方式查询数据
+  /// query data by map
   Future<List<Map<String, dynamic>>> queryByMap(
     String tableName, {
     Map<String, dynamic>? where,
@@ -657,10 +631,10 @@ class DataStoreImpl {
     await _ensureInitialized();
 
     try {
-      // 将 Map 条件转换为 QueryCondition
+      // convert map condition to QueryCondition
       final condition = _convertMapToCondition(where);
 
-      // 构建查询计划
+      // build query plan
       final queryPlan = await _queryOptimizer?.optimize(
         tableName,
         where ?? {},
@@ -671,7 +645,7 @@ class DataStoreImpl {
         throw StateError('Query optimizer not initialized');
       }
 
-      // 使用 QueryExecutor 执行查询
+      // execute query by QueryExecutor
       final results = await _queryExecutor?.execute(
             queryPlan,
             tableName,
@@ -684,12 +658,12 @@ class DataStoreImpl {
 
       return results;
     } catch (e) {
-      Logger.error('查询失败: $e', label: 'DataStore.queryByMap');
+      Logger.error('Query failed: $e', label: 'DataStore.queryByMap');
       rethrow;
     }
   }
 
-  /// 将 Map 条件转换为 QueryCondition
+  /// convert map condition to QueryCondition
   QueryCondition _convertMapToCondition(Map<String, dynamic>? where) {
     if (where == null || where.isEmpty) {
       return QueryCondition();
@@ -697,21 +671,21 @@ class DataStoreImpl {
 
     final condition = QueryCondition();
 
-    // 处理 OR 条件
+    // handle OR condition
     if (where.containsKey('OR')) {
       final orGroups = where['OR'] as List<Map<String, dynamic>>;
       for (var group in orGroups) {
-        // 添加第一组条件
+        // add first group condition
         for (var entry in group.entries) {
           _addCondition(condition, entry.key, entry.value);
         }
-        // 后续组使用 OR
+        // use OR for subsequent groups
         if (group != orGroups.last) {
           condition.or();
         }
       }
     } else {
-      // 处理普通 AND 条件
+      // handle normal AND condition
       for (var entry in where.entries) {
         _addCondition(condition, entry.key, entry.value);
       }
@@ -720,7 +694,7 @@ class DataStoreImpl {
     return condition;
   }
 
-  /// 添加单个条件
+  /// add single condition
   void _addCondition(QueryCondition condition, String field, dynamic value) {
     if (value == null) {
       condition.where(field, 'IS', null);
@@ -735,7 +709,7 @@ class DataStoreImpl {
         case 'IN':
         case 'NOT IN':
           if (compareValue is! List) {
-            Logger.warn('IN/NOT IN 操作符需要 List 类型的值',
+            Logger.warn('IN/NOT IN operator needs List type value',
                 label: 'DataStore._addCondition');
             return;
           }
@@ -746,7 +720,7 @@ class DataStoreImpl {
           if (compareValue is! Map ||
               !compareValue.containsKey('start') ||
               !compareValue.containsKey('end')) {
-            Logger.warn('BETWEEN 操作符需要包含 start 和 end 的 Map',
+            Logger.warn('BETWEEN operator needs Map with start and end',
                 label: 'DataStore._addCondition');
             return;
           }
@@ -757,7 +731,7 @@ class DataStoreImpl {
         case 'LIKE':
         case 'NOT LIKE':
           if (compareValue is! String) {
-            Logger.warn('LIKE/NOT LIKE 操作符需要字符串类型的值',
+            Logger.warn('LIKE/NOT LIKE operator needs String type value',
                 label: 'DataStore._addCondition');
             return;
           }
@@ -770,12 +744,12 @@ class DataStoreImpl {
           break;
 
         default:
-          // 处理其他操作符 (>, <, >=, <=, !=)
+          // handle other operators (>, <, >=, <=, !=)
           condition.where(field, operator, compareValue);
           break;
       }
     } else {
-      // 简单相等条件
+      // simple equal condition
       condition.where(field, '=', value);
     }
   }
@@ -792,34 +766,34 @@ class DataStoreImpl {
   }
 
   Future<List<Transaction>> _loadIncompleteTransactions() async {
-    // 实现从事务日志加载未完成的事务
+    // implement loading incomplete transactions from transaction log
     return [];
   }
 
-  /// 验证表结构
+  /// validate table structure
   void _validateSchema(TableSchema schema) {
-    // 检查主键
+    // check primary key
     if (schema.primaryKey.isEmpty) {
       throw ArgumentError('Primary key cannot be empty');
     }
 
-    // 检查字段定义
+    // check field definition
     if (schema.fields.isEmpty) {
       throw ArgumentError('Table must have at least one field');
     }
 
-    // 检查主键字段是否存在
+    // check primary key field is exist
     if (!schema.fields.any((col) => col.name == schema.primaryKey)) {
       throw ArgumentError('Primary key field not found in fields');
     }
 
-    // 检查字段名是否唯一
+    // check field name is unique
     final fieldNames = schema.fields.map((col) => col.name).toSet();
     if (fieldNames.length != schema.fields.length) {
       throw ArgumentError('Field names must be unique');
     }
 
-    // 检查索引字段是否存在
+    // check index field is exist
     for (var index in schema.indexes) {
       for (var field in index.fields) {
         if (!fieldNames.contains(field)) {
@@ -829,23 +803,23 @@ class DataStoreImpl {
     }
   }
 
-  /// 计算校验和
+  /// calculate checksum
   String _calculateChecksum(Uint8List data) {
     final compressor = DataCompressor();
     return compressor.calculateChecksum(data).toString();
   }
 
-  /// 回滚事务
+  /// rollback transaction
   Future<void> rollback(Transaction transaction) async {
     await _transactionManager!.rollback(transaction);
   }
 
-  /// 应用事务变更
+  /// apply transaction changes
   Future<void> _applyChanges(Transaction transaction) async {
     await _transactionManager!.commit(transaction);
   }
 
-  /// 验证数据完整性
+  /// verify data integrity
   Future<bool> _verifyDataIntegrity(String tableName) async {
     final tablePath = getTablePath(tableName);
     final dataFile = File('$tablePath.dat');
@@ -862,9 +836,9 @@ class DataStoreImpl {
     return storedChecksum.trim() == actualChecksum;
   }
 
-  /// 修复数据
+  /// repair data
   Future<void> _repairData(String tableName) async {
-    // 使用自动修复器修复数据
+    // use auto repair to repair data
     final autoRepair = AutoRepair(
       this,
       _indexManager!,
@@ -873,63 +847,63 @@ class DataStoreImpl {
     await autoRepair.repairTableStructure(tableName);
   }
 
-  /// 备份数据返回备份路径
+  /// backup data and return backup path
   Future<String> backup() async {
     try {
-      // 1. 先刷新所有待写入的数据
+      // 1. flush all pending data
       await fileManager.flushWriteQueue();
 
-      // 2. 创建备份管理器
+      // 2. create backup manager
       final backupManager = BackupManager(this);
 
-      // 3. 创建备份
+      // 3. create backup
       final backupPath = await backupManager.createBackup();
-      Logger.info('备份创建成功: $backupPath');
+      Logger.info('Backup created successfully: $backupPath');
       return backupPath;
     } catch (e) {
-      Logger.error('创建备份失败: $e', label: 'DataStore-backup');
+      Logger.error('Create backup failed: $e', label: 'DataStore-backup');
       rethrow;
     }
   }
 
-  /// 从备份恢复
+  /// restore from backup
   Future<bool> restore(String backupPath) async {
     try {
-      // 1. 创建备份管理器
+      // 1. create backup manager
       final backupManager = BackupManager(this);
 
-      // 2. 加载备份数据
+      // 2. load backup data
       final backupData = await backupManager.loadBackup(backupPath);
 
-      // 3. 获取实际的数据部分
+      // 3. get actual data part
       final data = backupData['data'] as Map<String, dynamic>;
       if (data.isEmpty) {
-        Logger.error('备份数据为空', label: 'DataStore-restore');
+        Logger.error('Backup data is empty', label: 'DataStore-restore');
         return false;
       }
 
-      // 4. 清理现有数据
+      // 4. clean existing data
       final dbDir = Directory(_config!.getBasePath());
       if (await dbDir.exists()) {
         await dbDir.delete(recursive: true);
       }
       await dbDir.create();
 
-      // 5. 恢复每个表的数据
+      // 5. restore each table data
       for (var entry in data.entries) {
         final tableName = entry.key;
         final tableData = entry.value as Map<String, dynamic>;
 
-        // 恢复schema
+        // restore schema
         final schema =
             TableSchema.fromJson(tableData['schema'] as Map<String, dynamic>);
         await createTable(tableName, schema);
 
-        // 恢复数据
+        // restore data
         final records =
             (tableData['data'] as List).cast<Map<String, dynamic>>();
 
-        // 写入数据文件
+        // write data to file
         final dataFile = File(_config!.getDataPath(tableName, schema.isGlobal));
         final sink = dataFile.openWrite(mode: FileMode.append);
         await _indexManager?.resetIndexes(tableName);
@@ -953,20 +927,21 @@ class DataStoreImpl {
         }
       }
 
-      Logger.info('从备份恢复成功');
+      Logger.info('Restore from backup successfully');
       return true;
     } catch (e) {
-      Logger.error('从备份恢复失败: $e', label: 'DataStore-restore');
+      Logger.error('Restore from backup failed: $e',
+          label: 'DataStore-restore');
       return false;
     }
   }
 
-  /// 更新统计信息
+  /// update statistics
   Future<void> updateStatistics(String tableName) async {
     await _statisticsCollector!.collectTableStatistics(tableName);
   }
 
-  /// 获取查询计划
+  /// get query plan
   Future<String> explainQuery(
     String tableName, {
     Map<String, dynamic>? where,
@@ -980,7 +955,7 @@ class DataStoreImpl {
     return queryPlan.explain();
   }
 
-  /// 验证和处理更新数据
+  /// validate and process update data
   Future<Map<String, dynamic>?> _validateAndProcessUpdateData(
     TableSchema schema,
     Map<String, dynamic> data,
@@ -989,42 +964,45 @@ class DataStoreImpl {
     try {
       final result = Map<String, dynamic>.from(data);
 
-      // 移除主键字段(如果存在)
+      // remove primary key field (if exists)
       result.remove(schema.primaryKey);
 
-      // 检查数据类型
+      // check data type
       for (var entry in result.entries) {
         final field = schema.fields.firstWhere(
           (col) => col.name == entry.key,
-          orElse: () => throw StateError('未知字段 ${entry.key}'),
+          orElse: () => throw StateError('Unknown field ${entry.key}'),
         );
 
         if (entry.value != null && !_isValidDataType(entry.value, field.type)) {
-          Logger.warn('警告: 字段 ${entry.key} 的值类型不正确');
+          Logger.warn('Warning: value type of field ${entry.key} is incorrect');
           return null;
         }
       }
 
       return result;
     } catch (e) {
-      Logger.error('更新数据验证失败: $e',
+      Logger.error('Update data validation failed: $e',
           label: 'DataStore-_validateAndProcessUpdateData');
       return null;
     }
   }
 
-  /// 更新记录
+  /// update record
   Future<bool> updateInternal(
     String tableName,
     Map<String, dynamic> data,
-    QueryCondition condition,
-  ) async {
+    QueryCondition condition, {
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+  }) async {
     await _ensureInitialized();
     final transaction = await _transactionManager!.beginTransaction();
     await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
-      // 验证数据
+      // validate data
       final schema = await getTableSchema(tableName);
       final validData =
           await _validateAndProcessUpdateData(schema, data, tableName);
@@ -1032,80 +1010,82 @@ class DataStoreImpl {
         return false;
       }
 
-      // 查找匹配的记录
-      final records = await _executeQuery(tableName, condition);
+      // find matching records
+      final records = await _executeQuery(tableName, condition,
+          orderBy: orderBy, limit: limit, offset: offset);
       if (records.isEmpty) {
         return false;
       }
 
-      // 检查唯一性约束
+      // check unique constraints
       for (var record in records) {
-        // 合并更新数据
+        // merge update data
         final updatedRecord = Map<String, dynamic>.from(record)
           ..addAll(validData);
 
-        // 检查字段的唯一性约束
+        // check unique constraints of fields
         for (var field in schema.fields) {
           if (field.unique && validData.containsKey(field.name)) {
             final value = validData[field.name];
-            // 查找是否有其他记录已经使用了这个值
+            // find if other records are using this value
             final existing = await _executeQuery(
                 tableName,
                 QueryCondition()
                   ..where(field.name, '=', value)
                   ..where(schema.primaryKey, '!=', record[schema.primaryKey]));
             if (existing.isNotEmpty) {
-              Logger.warn('警告: 字段 ${field.name} 的值 $value 已存在');
+              Logger.warn(
+                  'Warning: value $value of field ${field.name} already exists');
               return false;
             }
           }
         }
 
-        // 检查索引的唯一性约束
+        // check unique constraints of indexes
         for (var index in schema.indexes.where((idx) => idx.unique)) {
-          // 如果更新涉及索引字段
+          // if update involves index fields
           if (index.fields.any((col) => validData.containsKey(col))) {
             final indexValues = Map<String, dynamic>.from(record);
             indexValues.addAll(validData);
 
-            // 构建唯一索引的查询条件
+            // build query condition for unique index
             final condition = QueryCondition();
             for (var col in index.fields) {
               condition.where(col, '=', indexValues[col]);
             }
-            condition.where(
-                schema.primaryKey, '!=', record[schema.primaryKey]); // 排除当前记录
+            condition.where(schema.primaryKey, '!=',
+                record[schema.primaryKey]); // exclude current record
 
             final existing = await _executeQuery(tableName, condition);
             if (existing.isNotEmpty) {
               Logger.warn(
-                  '警告: 唯一索引 ${index.actualIndexName} 的值 ${record[schema.primaryKey]} 已存在');
+                  'Warning: value ${record[schema.primaryKey]} of unique index ${index.actualIndexName} already exists');
               return false;
             }
           }
         }
 
-        // 更新缓存和写入队列、索引
+        // update cache and write queue, index
         _queryExecutor?.queryCacheManager.removeCachedRecord(
             tableName, record[schema.primaryKey].toString());
         _queryExecutor?.queryCacheManager
             .addCachedRecord(tableName, updatedRecord);
 
-        // 更新写入队列
+        // update write queue
         fileManager.addToWriteQueue(tableName, updatedRecord, isUpdate: true);
       }
 
-      // 提交事务
+      // commit transaction
       await _transactionManager!.commit(transaction);
 
-      // 使受影响记录的相关查询缓存失效
+      // invalidate related query cache of affected records
       final affectedPrimaryKeys =
           records.map((r) => r[schema.primaryKey]).toSet();
       await _queryExecutor?.invalidateRecords(tableName, affectedPrimaryKeys);
 
       return true;
     } catch (e) {
-      Logger.error('更新失败: $e', label: 'DataStore-update');
+      Logger.error('Update failed: $e', label: 'DataStore-update');
       await _transactionManager!.rollback(transaction);
       rethrow;
     } finally {
@@ -1113,36 +1093,36 @@ class DataStoreImpl {
     }
   }
 
-  /// 清空表
+  /// clear table
   Future<void> clear(String tableName) async {
     final transaction = await _transactionManager!.beginTransaction();
     await _concurrencyManager!.acquireWriteLock(tableName);
     try {
-      // 清空文件
+      // clear file
       final tablePath = getTablePath(tableName);
       final dataFile = File('$tablePath.dat');
       if (await dataFile.exists()) {
         await dataFile.writeAsString('');
       }
 
-      // 清空记录缓存
+      // clear record cache
       _queryExecutor?.queryCacheManager.invalidateCache(tableName);
 
-      // 清空写入队列
+      // clear write queue
       fileManager.writeQueue.remove(tableName);
 
-      // 重置索引
+      // reset index
       await _indexManager?.resetIndexes(tableName);
 
-      // 清理唯一值缓存
+      // clear unique value cache
       _uniqueValuesCache.remove(tableName);
 
-      // 清理统计信息
+      // clear statistics
       _statisticsCollector?.invalidateCache(tableName);
 
       await _transactionManager!.commit(transaction);
     } catch (e) {
-      Logger.info('清空表失败: $e', label: 'DataStore-clear');
+      Logger.info('Clear table failed: $e', label: 'DataStore-clear');
       await _transactionManager!.rollback(transaction);
       rethrow;
     } finally {
@@ -1150,17 +1130,21 @@ class DataStoreImpl {
     }
   }
 
-  /// 删除记录
+  /// delete record
   Future<bool> deleteInternal(
     String tableName,
-    QueryCondition condition,
-  ) async {
+    QueryCondition condition, {
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+  }) async {
     final transaction = await _transactionManager!.beginTransaction();
     await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
-      // 先找出要删除的记录
-      final recordsToDelete = await _executeQuery(tableName, condition);
+      // find records to delete
+      final recordsToDelete = await _executeQuery(tableName, condition,
+          orderBy: orderBy, limit: limit, offset: offset);
 
       if (recordsToDelete.isEmpty) {
         return true;
@@ -1171,11 +1155,11 @@ class DataStoreImpl {
       final queue = fileManager.writeQueue[tableName];
 
       for (var record in recordsToDelete) {
-        // 从记录缓存中移除
+        // remove from record cache
         _queryExecutor?.queryCacheManager
             .removeCachedRecord(tableName, record[primaryKey].toString());
 
-        // 使相关查询缓存失效
+        // invalidate related query cache
         _queryExecutor?.invalidateRecord(tableName, record[primaryKey]);
 
         queue?.removeWhere(
@@ -1184,14 +1168,14 @@ class DataStoreImpl {
         await _indexManager!.deleteFromIndexes(tableName, record);
       }
 
-      // 从文件中删除
+      // delete from file
       final dataFile = File('${getTablePath(tableName)}.dat');
       if (await dataFile.exists()) {
         final lines = await dataFile.readAsLines();
         final remainingLines = lines.where((line) {
           if (line.trim().isEmpty) return true;
           final record = jsonDecode(line) as Map<String, dynamic>;
-          // 使用主键来判断是否需要删除
+          // use primary key to determine if it needs to be deleted
           return !recordsToDelete
               .any((r) => r[schema.primaryKey] == record[schema.primaryKey]);
         }).toList();
@@ -1199,14 +1183,14 @@ class DataStoreImpl {
         await dataFile.writeAsString('${remainingLines.join('\n')}\n');
       }
 
-      // 更新统计信息
+      // update statistics
       await _statisticsCollector?.collectTableStatistics(tableName);
 
       await _transactionManager!.commit(transaction);
     } catch (e) {
-      Logger.info('删除失败: $e', label: 'DataStore-delete');
+      Logger.info('Delete failed: $e', label: 'DataStore-delete');
       await _transactionManager!.rollback(transaction);
-      // 清理缓存，确保数据一致性
+      // clear cache, ensure data consistency
       return false;
     } finally {
       await _concurrencyManager!.releaseWriteLock(tableName);
@@ -1215,24 +1199,24 @@ class DataStoreImpl {
     return true;
   }
 
-  /// 删除表
+  /// drop table
   Future<void> dropTable(String tableName) async {
     try {
       await _concurrencyManager!.acquireWriteLock(tableName);
 
-      // 删除数据文件
+      // delete data file
       final tablePath = getTablePath(tableName);
       final dataFile = File('$tablePath.dat');
       if (await dataFile.exists()) {
         await dataFile.delete();
       }
 
-      // 删除模式文件
+      // delete schema file
       final schemaFile = File('$tablePath.schema');
       if (await schemaFile.exists()) {
         await schemaFile.delete();
 
-        // 删除索引文件
+        // delete index file
         final schema = await getTableSchema(tableName);
         for (var index in schema.indexes) {
           final indexFile = File(
@@ -1243,28 +1227,28 @@ class DataStoreImpl {
         }
       }
 
-      // 清理所有相关缓存
+      // clear all related caches
       _queryExecutor?.queryCacheManager.invalidateCache(tableName);
       _queryExecutor?.invalidateCache(tableName);
       _statisticsCollector?.invalidateCache(tableName);
     } catch (e) {
-      Logger.error('删除表失败: $e', label: 'DataStore-dropTable');
+      Logger.error('Drop table failed: $e', label: 'DataStore-dropTable');
       rethrow;
     } finally {
       await _concurrencyManager!.releaseWriteLock(tableName);
     }
   }
 
-  /// 获取表结构
+  /// get table schema
   Future<TableSchema> getTableSchema(String tableName) async {
-    // 1. 先从缓存获取
+    // 1. get from cache first
     final cachedSchema = _queryExecutor?.queryCacheManager.getSchema(tableName);
     if (cachedSchema != null) {
       return cachedSchema;
     }
 
-    // 2. 从文件加载
-    // 先尝试从全局空间获取数据结构文件是否存在，如果不存在则从基础空间获取
+    // 2. load from file
+    // try to get schema file from global space first, if not exist, then get from base space
     var schemaPath = config.getSchemaPath(tableName, true);
     var schemaFile = File(schemaPath);
     if (!await schemaFile.exists()) {
@@ -1279,26 +1263,27 @@ class DataStoreImpl {
       final schemaJson = await schemaFile.readAsString();
       final schema = TableSchema.fromJson(jsonDecode(schemaJson));
 
-      // 3. 缓存并返回
+      // 3. cache and return
       _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
       return schema;
     } catch (e) {
-      Logger.error('加载表结构失败: $e', label: 'DataStore.getTableSchema');
+      Logger.error('Load table schema failed: $e',
+          label: 'DataStore.getTableSchema');
       rethrow;
     }
   }
 
-  /// 验证数据完整性
+  /// verify data integrity
   Future<bool> verifyIntegrity(String tableName) async {
     return _verifyDataIntegrity(tableName);
   }
 
-  /// 修复数据
+  /// repair data
   Future<void> repair(String tableName) async {
     await _repairData(tableName);
   }
 
-  /// 批量插入数据
+  /// batch insert data
   Future<bool> batchInsert(
       String tableName, List<Map<String, dynamic>> records) async {
     await _ensureInitialized();
@@ -1306,7 +1291,7 @@ class DataStoreImpl {
     try {
       await _concurrencyManager!.acquireWriteLock(tableName);
 
-      // 1. 获取表结构和验证数据
+      // 1. get table schema and validate data
       final schema = await getTableSchema(tableName);
       final validRecords = <Map<String, dynamic>>[];
 
@@ -1322,29 +1307,31 @@ class DataStoreImpl {
         return false;
       }
 
-      // 2. 检查唯一性约束并过滤重复数据
+      // 2. check unique constraints and filter duplicate data
       final uniqueRecords = <Map<String, dynamic>>[];
       for (var record in validRecords) {
         if (await _checkUniqueConstraints(tableName, record)) {
           uniqueRecords.add(record);
         } else {
-          Logger.warn('跳过重复数据: $record', label: 'DataStore-batchInsert');
+          Logger.warn('Skip duplicate data: $record',
+              label: 'DataStore-batchInsert');
         }
       }
 
       if (uniqueRecords.isEmpty) {
-        Logger.warn('所有数据都重复,批量插入取消', label: 'DataStore-batchInsert');
+        Logger.warn('All data are duplicates, batch insert canceled',
+            label: 'DataStore-batchInsert');
         return false;
       }
 
-      // 3. 获取待写入队列中的数据(如果有)
+      // 3. get data in write queue (if any)
       final pendingData = fileManager.writeQueue[tableName] ?? [];
-      fileManager.writeQueue.remove(tableName); // 清空队列
+      fileManager.writeQueue.remove(tableName); // clear queue
 
-      // 4. 合并所有要写入的数据
+      // 4. merge all data to write
       final allData = [...pendingData, ...uniqueRecords];
 
-      // 5. 写入文件、缓存和索引
+      // 5. write to file, cache and index
       final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
       final sink = dataFile.openWrite(mode: FileMode.append);
       try {
@@ -1357,10 +1344,10 @@ class DataStoreImpl {
         await sink.close();
       }
 
-      // 6. 异步更新信息
+      // 6. async update information
       _updateStatisticsAsync(tableName);
 
-      // 7. 异步记录事务日志
+      // 7. async log transaction
       _logTransactionAsync('batchInsert', tableName, {
         'count': allData.length,
         'timestamp': DateTime.now().millisecondsSinceEpoch,
@@ -1368,36 +1355,38 @@ class DataStoreImpl {
 
       return true;
     } catch (e) {
-      Logger.error('批量插入失败: $e', label: 'DataStore-batchInsert');
+      Logger.error('Batch insert failed: $e', label: 'DataStore-batchInsert');
       return false;
     } finally {
       await _concurrencyManager!.releaseWriteLock(tableName);
     }
   }
 
-  /// 异步更新统计信息
+  /// async update statistics
   void _updateStatisticsAsync(String tableName) {
     Future(() async {
       try {
         await _statisticsCollector?.collectTableStatistics(tableName);
       } catch (e) {
-        Logger.error('异步更新统计信息失败: $e', label: 'DataStore-batchInsert');
+        Logger.error('Async update statistics failed: $e',
+            label: 'DataStore-batchInsert');
       }
     });
   }
 
-  /// 异步记录事务日志
+  /// async log transaction
   void _logTransactionAsync(String operation, String tableName, dynamic data) {
     Future(() async {
       try {
         await _transactionManager?.logOperation(operation, tableName, data);
       } catch (e) {
-        Logger.error('异步记录事务日志失败: $e', label: 'DataStore-batchInsert');
+        Logger.error('Async log transaction failed: $e',
+            label: 'DataStore-batchInsert');
       }
     });
   }
 
-  /// 同步锁包装方法
+  /// synchronized lock wrapper method
   Future<T> synchronized<T>(Object lock, Future<T> Function() callback) async {
     try {
       await _concurrencyManager?.acquireWriteLock('global');
@@ -1407,26 +1396,27 @@ class DataStoreImpl {
     }
   }
 
-  /// 加载数据到缓存
+  /// load data to cache
   Future<void> _loadDataToCache() async {
     try {
-      // 1. 加载基础空间数据
+      // 1. load data from base space
       final baseDir = Directory(_config!.getBasePath());
       if (await baseDir.exists()) {
         await _loadPathData(baseDir);
       }
 
-      // 2. 加载全局空间数据
+      // 2. load data from global space
       final globalDir = Directory(_config!.getGlobalPath());
       if (await globalDir.exists()) {
         await _loadPathData(globalDir);
       }
     } catch (e) {
-      Logger.error('加载数据到缓存失败: $e', label: 'DataStore._loadDataToCache');
+      Logger.error('Load data to cache failed: $e',
+          label: 'DataStore._loadDataToCache');
     }
   }
 
-  /// 加载指定路径下的数据
+  /// load data from specified path
   Future<void> _loadPathData(Directory dir) async {
     final files = await dir
         .list()
@@ -1439,41 +1429,41 @@ class DataStoreImpl {
         final tableName = _getFileName(file.path);
         final schema = await getTableSchema(tableName);
 
-        // 获取文件大小
+        // get file size
         final fileSize = await file.length();
 
-        // 只缓存小文件
+        // only cache small files
         if (fileSize <= _config!.maxTableCacheSize) {
-          // 使用公开的常量
+          // use public constant
           final records = await _loadAllRecords(file);
           await _queryExecutor?.queryCacheManager.cacheEntireTable(
             tableName,
             records,
             schema.primaryKey,
           );
-
-          Logger.info('表 $tableName 已完整加载到缓存');
         } else {
           await _loadRecentRecords(file, tableName, schema);
-          Logger.info('表 $tableName 文件 $fileSize 超过大小限制，缓存部分数据',
+          Logger.info(
+              'Table $tableName file $fileSize exceeds size limit, cache partial data',
               label: 'DataStore._loadPathData');
         }
       } catch (e) {
-        Logger.error('加载表数据失败: ${file.path}, 错误: $e',
+        Logger.error('Load table data failed: ${file.path}, error: $e',
             label: 'DataStore._loadPathData');
-        continue; // 继续加载其他表
+        continue; // continue loading other tables
       }
     }
   }
 
-  /// 加载最近的记录
+  /// load recent records
   Future<void> _loadRecentRecords(
     File file,
     String tableName,
     TableSchema schema,
   ) async {
     final lines = await file.readAsLines();
-    final recentLines = lines.reversed.take(1000); // 只加载最近1000条记录
+    final recentLines =
+        lines.reversed.take(1000); // only load recent 1000 records
 
     for (var line in recentLines) {
       if (line.trim().isEmpty) continue;
@@ -1481,10 +1471,11 @@ class DataStoreImpl {
       _queryExecutor?.queryCacheManager.addCachedRecord(tableName, data);
     }
 
-    Logger.info('表 $tableName 部分加载到缓存 (最近1000条记录)');
+    Logger.info(
+        'Table $tableName partially loaded to cache (recent 1000 records)');
   }
 
-  /// 加载所有记录
+  /// load all records
   Future<List<Map<String, dynamic>>> _loadAllRecords(File file) async {
     final results = <Map<String, dynamic>>[];
     final lines = await file.readAsLines();
@@ -1498,34 +1489,34 @@ class DataStoreImpl {
     return results;
   }
 
-  /// 从路径中提取文件名
+  /// extract file name from path
   String _getFileName(String path) {
     final normalizedPath = path.replaceAll('\\', '/');
     final parts = normalizedPath.split('/');
     return parts.last.replaceAll('.dat', '');
   }
 
-  /// 检查唯一性约束
+  /// check unique constraints
   Future<bool> _checkUniqueConstraints(
       String tableName, Map<String, dynamic> data) async {
     final schema = await getTableSchema(tableName);
     final primaryKey = schema.primaryKey;
     final primaryValue = data[primaryKey];
 
-    // 1. 检查字段的唯一性约束
+    // 1. check unique constraints of fields
     for (var field in schema.fields) {
       if (field.unique && field.name != primaryKey) {
-        // 排除主键字段
+        // exclude primary key field
         final value = data[field.name];
         if (value != null) {
-          // 检查唯一字段的值是否已存在
+          // check if value of unique field already exists
           if (!_uniqueValuesCache.containsKey(tableName)) {
             _uniqueValuesCache[tableName] = {};
           }
           if (!_uniqueValuesCache[tableName]!.containsKey(field.name)) {
             _uniqueValuesCache[tableName]![field.name] = <dynamic>{};
 
-            // 初始化缓存
+            // initialize cache
             final dataFile =
                 File(config.getDataPath(tableName, schema.isGlobal));
             if (await dataFile.exists()) {
@@ -1542,26 +1533,27 @@ class DataStoreImpl {
           }
         }
 
-        // 检查值是否已存在
+        // check if value already exists
         if (_uniqueValuesCache[tableName]![field.name]!.contains(value)) {
-          Logger.warn('警告: 字段 ${field.name} 的值 $value 已存在');
+          Logger.warn(
+              'Warning: value $value of field ${field.name} already exists');
           return false;
         }
       }
     }
 
-    // 2. 检查索引的唯一性约束
+    // 2. check unique constraints of indexes
     if (!_uniqueValuesCache.containsKey(tableName)) {
       _uniqueValuesCache[tableName] = {
         primaryKey: <dynamic>{},
       };
 
-      // 初始化唯一索引的集合
+      // initialize unique index collections
       for (var index in schema.indexes.where((idx) => idx.unique)) {
         _uniqueValuesCache[tableName]![index.fields.first] = <dynamic>{};
       }
 
-      // 一次性加载所有数据到缓存
+      // load all data to cache at once
       final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
       if (await dataFile.exists()) {
         final lines = await dataFile.readAsLines();
@@ -1569,7 +1561,7 @@ class DataStoreImpl {
           if (line.trim().isEmpty) continue;
           final record = jsonDecode(line) as Map<String, dynamic>;
 
-          // 收集主键和唯一索引的值
+          // collect primary key and unique index values
           _uniqueValuesCache[tableName]![primaryKey]!.add(record[primaryKey]);
           for (var index in schema.indexes.where((idx) => idx.unique)) {
             final fieldName = index.fields.first;
@@ -1581,55 +1573,59 @@ class DataStoreImpl {
       }
     }
 
-    // 3. 检查主键
+    // 3. check primary key
     if (_uniqueValuesCache[tableName]![primaryKey]!.contains(primaryValue)) {
-      Logger.warn('警告: 主键重复: $primaryValue');
+      Logger.warn('Warning: primary key duplicate: $primaryValue');
       return false;
     }
 
-    // 4. 检查唯一索引
+    // 4. check unique indexes
     for (var index in schema.indexes.where((idx) => idx.unique)) {
       final fieldName = index.fields.first;
       final value = data[fieldName];
       if (value != null &&
           _uniqueValuesCache[tableName]![fieldName]!.contains(value)) {
-        Logger.warn('警告: 唯一索引 ${index.actualIndexName} 的值 $value 已存在');
+        Logger.warn(
+            'Warning: value $value of unique index ${index.actualIndexName} already exists');
         return false;
       }
     }
 
-    // 5. 检查写入队列中的值
+    // 5. check values in write queue
     final pendingData = fileManager.writeQueue[tableName] ?? [];
     for (var record in pendingData) {
-      // 检查主键
+      // check primary key
       if (record[primaryKey] == primaryValue) {
-        Logger.warn('警告: 主键在写入队列中重复: $primaryValue');
+        Logger.warn(
+            'Warning: primary key duplicate in write queue: $primaryValue');
         return false;
       }
 
-      // 检查唯一字段
+      // check unique fields
       for (var field in schema.fields) {
         if (field.unique && field.name != primaryKey) {
           final value = data[field.name];
           if (value != null && record[field.name] == value) {
-            Logger.warn('警告: 字段 ${field.name} 的值在写入队列中重复: $value');
+            Logger.warn(
+                'Warning: value $value of field ${field.name} already exists in write queue');
             return false;
           }
         }
       }
 
-      // 检查唯一索引
+      // check unique indexes
       for (var index in schema.indexes.where((idx) => idx.unique)) {
         final fieldName = index.fields.first;
         final value = data[fieldName];
         if (value != null && record[fieldName] == value) {
-          Logger.warn('警告: 唯一索引在写入队列中重复: $fieldName = $value');
+          Logger.warn(
+              'Warning: unique index duplicate in write queue: $fieldName = $value');
           return false;
         }
       }
     }
 
-    // 6. 如果通过所有检查，更新缓存
+    // 6. if pass all checks, update cache
     _uniqueValuesCache[tableName]![primaryKey]!.add(primaryValue);
     for (var field in schema.fields) {
       if (field.unique && field.name != primaryKey) {
@@ -1650,7 +1646,7 @@ class DataStoreImpl {
     return true;
   }
 
-  /// 按ID查询
+  /// query by id
   Future<Map<String, dynamic>?> queryById(String tableName, dynamic id) async {
     try {
       final schema = await getTableSchema(tableName);
@@ -1663,12 +1659,12 @@ class DataStoreImpl {
       );
       return results.isEmpty ? null : results.first;
     } catch (e) {
-      Logger.error('按ID查询失败: $e', label: 'DataStore.queryById');
+      Logger.error('Query by id failed: $e', label: 'DataStore.queryById');
       rethrow;
     }
   }
 
-  /// 按字段查询
+  /// query by field
   Future<List<Map<String, dynamic>>> queryBy(
     String tableName,
     String field,
@@ -1679,12 +1675,12 @@ class DataStoreImpl {
 
       return await _executeQuery(tableName, condition);
     } catch (e) {
-      Logger.error('字段查询失败: $e', label: 'DataStore.queryBy');
+      Logger.error('Query by field failed: $e', label: 'DataStore.queryBy');
       rethrow;
     }
   }
 
-  /// SQL 方式查询（将 SQL 条件转换为 QueryCondition）
+  /// SQL query (convert SQL conditions to QueryCondition)
   Future<List<Map<String, dynamic>>> queryBySql(
     String tableName, {
     String? where,
@@ -1694,19 +1690,19 @@ class DataStoreImpl {
     int? offset,
   }) async {
     try {
-      // 解析 SQL 条件为 QueryCondition
+      // parse SQL conditions to QueryCondition
       QueryCondition? condition;
       if (where != null) {
         condition = _parseSqlWhereClause(where, whereArgs);
       }
 
-      // 解析排序
+      // parse order by
       List<String>? orderByList;
       if (orderBy != null) {
         orderByList = orderBy.split(',').map((e) => e.trim()).toList();
       }
 
-      // 执行查询
+      // execute query
       return await _executeQuery(
         tableName,
         condition ?? QueryCondition(),
@@ -1715,12 +1711,12 @@ class DataStoreImpl {
         offset: offset,
       );
     } catch (e) {
-      Logger.error('SQL查询失败: $e', label: 'DataStore.queryBySql');
+      Logger.error('SQL query failed: $e', label: 'DataStore.queryBySql');
       rethrow;
     }
   }
 
-  /// 执行查询
+  /// Execute query
   Future<List<Map<String, dynamic>>> _executeQuery(
     String tableName,
     QueryCondition condition, {
@@ -1728,7 +1724,7 @@ class DataStoreImpl {
     int? limit,
     int? offset,
   }) async {
-    // 构建查询计划
+    // build query plan
     final queryPlan = await _queryOptimizer?.optimize(
       tableName,
       condition.build(),
@@ -1739,7 +1735,7 @@ class DataStoreImpl {
       throw StateError('Query optimizer not initialized');
     }
 
-    // 使用 QueryExecutor 执行查询
+    // execute query using QueryExecutor
     return await _queryExecutor?.execute(
           queryPlan,
           tableName,
@@ -1751,20 +1747,20 @@ class DataStoreImpl {
         [];
   }
 
-  /// 解析 SQL where 子句为 QueryCondition
+  /// Parse SQL where clause to QueryCondition
   QueryCondition _parseSqlWhereClause(String where, List<dynamic>? whereArgs) {
     final condition = QueryCondition();
     if (where.isEmpty) return condition;
 
-    // 将 || 替换为 OR，将 && 替换为 AND
+    // Replace operators
     where = where.replaceAll('||', 'OR').replaceAll('&&', 'AND');
 
-    // 按 OR 分割
+    // Split by OR
     final orGroups = where.split(RegExp(r'\s+OR\s+', caseSensitive: false));
     var argIndex = 0;
 
     for (var group in orGroups) {
-      // 解析每个 OR 组中的 AND 条件
+      // Parse AND conditions in each OR group
       final conditions =
           group.trim().split(RegExp(r'\s+AND\s+', caseSensitive: false));
 
@@ -1773,7 +1769,6 @@ class DataStoreImpl {
         argIndex += _countPlaceholders(condStr);
       }
 
-      // 如果不是最后一个组，添加 OR
       if (group != orGroups.last) {
         condition.or();
       }
@@ -1782,14 +1777,13 @@ class DataStoreImpl {
     return condition;
   }
 
-  /// 解析单个条件(by sql)
+  /// Parse single SQL condition
   void _parseSingleCondition(
     QueryCondition condition,
     String condStr,
     List<dynamic>? whereArgs,
     int startArgIndex,
   ) {
-    // 解析操作符
     String? operator;
     for (var op in ['>=', '<=', '!=', '=', '>', '<', 'LIKE', 'IS NOT', 'IS']) {
       if (RegExp('\\s+$op\\s+', caseSensitive: false).hasMatch(condStr)) {
@@ -1800,7 +1794,6 @@ class DataStoreImpl {
 
     if (operator == null) return;
 
-    // 分割字段名和值
     final parts =
         condStr.split(RegExp('\\s+$operator\\s+', caseSensitive: false));
     if (parts.length != 2) return;
@@ -1808,26 +1801,26 @@ class DataStoreImpl {
     final field = parts[0].trim();
     String valueStr = parts[1].trim();
 
-    // 处理值
+    // handle value
     dynamic value;
     if (valueStr == '?' &&
         whereArgs != null &&
         startArgIndex < whereArgs.length) {
-      // 处理参数占位符
+      // handle parameter placeholder
       value = whereArgs[startArgIndex];
     } else if ((valueStr.startsWith("'") && valueStr.endsWith("'")) ||
         (valueStr.startsWith('"') && valueStr.endsWith('"'))) {
-      // 处理字符串值
+      // handle string value
       value = valueStr.substring(1, valueStr.length - 1);
     } else if (valueStr.toLowerCase() == 'null') {
-      // 处理 NULL 值
+      // handle NULL value
       value = null;
     } else {
-      // 尝试解析为数字
+      // try to parse to number
       value = num.tryParse(valueStr) ?? valueStr;
     }
 
-    // 添加条件
+    // add condition
     switch (operator) {
       case '=':
         condition.where(field, '=', value);
@@ -1860,12 +1853,12 @@ class DataStoreImpl {
     }
   }
 
-  /// 计算占位符数量
+  /// Count placeholders
   int _countPlaceholders(String condition) {
     return '?'.allMatches(condition).length;
   }
 
-  /// 切换基础空间
+  /// Switch base space
   Future<bool> switchBaseSpace({String spaceName = 'default'}) async {
     await _ensureInitialized();
 
@@ -1877,101 +1870,96 @@ class DataStoreImpl {
     _currentSpaceName = spaceName;
 
     try {
-      // 更新配置
+      // Update configuration
       if (_config != null) {
         _config = _config!.copyWith(baseName: _currentSpaceName);
       }
 
-      // 清理缓存和队列
+      // Clear caches
       _queryExecutor?.queryCacheManager.onBasePathChanged();
       fileManager.writeQueue.clear();
       _uniqueValuesCache.clear();
 
-      // 设置切换标记
       _isSwitchingSpace = true;
 
-      // 重新初始化数据库
+      // Reinitialize database
       _isInitialized = false;
       _baseInitialized = false;
       await initialize(dbPath: _config?.dbPath, config: _config);
 
-      // 触发基础空间变更事件
+      // Notify space change
       _notifyBasePathChanged(BasePathChangedEvent(oldSpaceName, spaceName));
 
-      Logger.info('基础空间已切换: $oldSpaceName -> $spaceName');
+      Logger.info('Base space switched: $oldSpaceName -> $spaceName');
 
-      // 清理非全局表的索引
+      // Clear non-global indexes
       _indexManager?.onBasePathChanged();
 
       return true;
     } catch (e) {
-      // 回滚
+      // Rollback on failure
       _currentSpaceName = oldSpaceName;
       if (_config != null) {
         _config = _config!.copyWith(baseName: oldSpaceName);
       }
-      Logger.error('切换基础空间失败: $e', label: 'DataStore.switchBaseSpace');
+      Logger.error('Space switch failed: $e',
+          label: 'DataStore.switchBaseSpace');
       return false;
     } finally {
-      // 重置切换标记
       _isSwitchingSpace = false;
     }
   }
 
-  /// 通知基础空间变更
+  /// Notify base path change event
   void _notifyBasePathChanged(BasePathChangedEvent event) {
     _indexManager?.onBasePathChanged();
     _statisticsCollector?.onBasePathChanged(event);
   }
 
-  /// 删除数据库
+  /// Delete database
   Future<void> deleteDatabase({String? dbPath}) async {
     try {
       final dbDirPath = await getDatabasePath(dbPath: dbPath);
-      // 1. 先关闭数据库
       await close();
 
-      // 2. 删除数据库目录
       final dbDir = Directory(dbDirPath);
       if (await dbDir.exists()) {
         await dbDir.delete(recursive: true);
-        Logger.info('数据库已删除: $dbDirPath');
+        Logger.info('Database deleted: $dbDirPath');
       }
 
-      // 3. 清理所有管理器状态
-      _indexManager?.onBasePathChanged(); // 清理索引缓存
-      _queryExecutor?.queryCacheManager.clear(); // 清理查询缓存
-      _maxIds.clear(); // 清理自增ID缓存
+      _indexManager?.onBasePathChanged();
+      _queryExecutor?.queryCacheManager.clear();
+      _maxIds.clear();
       _maxIdsDirty.clear();
-      _uniqueValuesCache.clear(); // 清理唯一值缓存
+      _uniqueValuesCache.clear();
 
-      // 4. 从实例映射中移除
       _instances.remove(_instanceKey);
     } catch (e) {
-      Logger.error('删除数据库失败: $e', label: 'DataStore.deleteDatabase');
+      Logger.error('Delete database failed: $e',
+          label: 'DataStore.deleteDatabase');
       rethrow;
     }
   }
 
-  // 添加自增ID写入队列
+  /// Add auto-increment ID to write queue
   final Map<String, int> _maxIds = {};
-  final Map<String, bool> _maxIdsDirty = {}; // 标记是否需要写入
+  final Map<String, bool> _maxIdsDirty = {}; // mark if need to write
 
-  /// 更新最大ID值(只在内存中更新)
+  /// Update max ID value (only in memory)
   void _updateMaxIdInMemory(String tableName, int id) {
     final currentMaxId = _maxIds[tableName] ?? 0;
     if (id > currentMaxId) {
       _maxIds[tableName] = id;
-      _maxIdsDirty[tableName] = true; // 标记需要写入
+      _maxIdsDirty[tableName] = true; // mark if need to write
     }
   }
 
-  /// 获取下一个自增ID
+  /// Get next auto-increment ID
   Future<int> _getNextId(String tableName) async {
     final schema = await getTableSchema(tableName);
-    // 先从内存获取
     if (!_maxIds.containsKey(tableName)) {
-      // 首次访问,从文件加载
+      // Load from file on first access
       final maxIdFile =
           File(config.getAutoIncrementPath(tableName, schema.isGlobal));
       if (await maxIdFile.exists()) {
@@ -1984,12 +1972,12 @@ class DataStoreImpl {
 
     final nextId = (_maxIds[tableName] ?? 0) + 1;
     _maxIds[tableName] = nextId;
-    _maxIdsDirty[tableName] = true; // 标记需要写入
+    _maxIdsDirty[tableName] = true;
 
     return nextId;
   }
 
-  /// 刷新自增ID到文件
+  /// Flush max IDs to disk
   Future<void> _flushMaxIds() async {
     final dirtyTables = _maxIdsDirty.entries
         .where((entry) => entry.value)
@@ -2006,26 +1994,28 @@ class DataStoreImpl {
           final maxIdFile =
               File(config.getAutoIncrementPath(tableName, schema.isGlobal));
           await maxIdFile.writeAsString(maxId.toString());
-          _maxIdsDirty[tableName] = false; // 清除写入标记
+          _maxIdsDirty[tableName] = false;
         }
       } catch (e) {
-        Logger.error('写入自增ID失败: $e', label: 'DataStore-_flushMaxIds');
+        Logger.error('Write auto-increment ID failed: $e',
+            label: 'DataStore-_flushMaxIds');
       }
     }
   }
 
-  /// 键值对存储表名
-  static const String _kvStoreName = 'kv_store'; // 基础空间下的键值存储
-  static const String _globalKvStoreName = 'global_kv_store'; // 全局键值存储
+  /// Key-value store table name
+  static const String _kvStoreName = 'kv_store'; // base space key-value store
+  static const String _globalKvStoreName =
+      'global_kv_store'; // global key-value store
 
-  /// 设置键值对
+  /// Set key-value pair
   Future<bool> setValue(String key, dynamic value,
       {bool isGlobal = false}) async {
     await _ensureInitialized();
 
     final tableName = isGlobal ? _globalKvStoreName : _kvStoreName;
 
-    // 构造数据
+    // build data
     final data = {
       'key': key,
       'value': jsonEncode(value),
@@ -2039,7 +2029,7 @@ class DataStoreImpl {
       if (existing.isEmpty) {
         return await insert(tableName, data);
       } else {
-        // 创建更新条件
+        // build update condition
         final condition = QueryCondition()..where('key', '=', key);
         return await updateInternal(
           tableName,
@@ -2048,12 +2038,13 @@ class DataStoreImpl {
         );
       }
     } catch (e) {
-      Logger.error('设置键值对失败: $e', label: 'DataStore.setValue');
+      Logger.error('Set key-value pair failed: $e',
+          label: 'DataStore.setValue');
       return false;
     }
   }
 
-  /// 获取键值
+  /// Get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
     await _ensureInitialized();
 
@@ -2065,43 +2056,43 @@ class DataStoreImpl {
     try {
       return jsonDecode(result.first['value']);
     } catch (e) {
-      Logger.error('解析键值失败: $e', label: 'DataStore.getValue');
+      Logger.error('Parse key-value failed: $e', label: 'DataStore.getValue');
       return null;
     }
   }
 
-  /// 删除键值
+  /// Remove key-value pair
   Future<bool> removeValue(String key, {bool isGlobal = false}) async {
     await _ensureInitialized();
 
     final tableName = isGlobal ? _globalKvStoreName : _kvStoreName;
-    // 创建删除条件
+    // build delete condition
     final condition = QueryCondition()..where('key', '=', key);
     await deleteInternal(tableName, condition);
     return true;
   }
 
-  /// 获取查询优化器
+  /// Get query optimizer
   QueryOptimizer? getQueryOptimizer() => _queryOptimizer;
 
-  /// 获取查询执行器
+  /// Get query executor
   QueryExecutor? getQueryExecutor() => _queryExecutor;
 
   ConcurrencyManager? get concurrencyManager => _concurrencyManager;
   IndexManager? get indexManager => _indexManager;
 
-  /// 刷新自增ID到文件
+  /// Flush auto-increment ID to file
   Future<void> flushMaxIds() async {
     await _flushMaxIds();
   }
 
-  /// 获取缓存统计信息
+  /// Get cache stats
   Map<String, int> getCacheStats() {
     return fileManager.writeQueue
         .map((key, value) => MapEntry(key, value.length));
   }
 
-  /// 获取表信息
+  /// Get table info
   Future<TableInfo> getTableInfo(String tableName) async {
     final schema = await getTableSchema(tableName);
     final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
@@ -2126,7 +2117,7 @@ class DataStoreImpl {
     );
   }
 
-  /// 获取表记录数量
+  /// Get table record count
   Future<int> _getRecordCount(String tableName) async {
     final schema = await getTableSchema(tableName);
     final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
@@ -2134,7 +2125,7 @@ class DataStoreImpl {
 
     final allRecords = <String, bool>{};
 
-    // 1. 读取文件中的记录
+    // 1. Read records from file
     final lines = await dataFile.readAsLines();
     for (var line in lines) {
       if (line.trim().isEmpty) continue;
@@ -2143,7 +2134,7 @@ class DataStoreImpl {
       allRecords[primaryKeyValue] = true;
     }
 
-    // 2. 合并待写入队列中的记录
+    // 2. Merge records in pending write queue
     final pendingRecords = fileManager.writeQueue[tableName] ?? [];
     for (var record in pendingRecords) {
       final primaryKeyValue = record[schema.primaryKey].toString();
@@ -2153,7 +2144,7 @@ class DataStoreImpl {
     return allRecords.length;
   }
 
-  /// 判断是否为全局表
+  /// Check if it is a global table
   Future<bool> isGlobalTable(String tableName) async {
     final schema = await getTableSchema(tableName);
     return schema.isGlobal;

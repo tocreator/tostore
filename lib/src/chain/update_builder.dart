@@ -3,7 +3,7 @@ import 'dart:async';
 import 'chain_builder.dart';
 import 'future_builder_mixin.dart';
 
-/// 更新构建器
+/// update builder
 class UpdateBuilder extends ChainBuilder<UpdateBuilder>
     with FutureBuilderMixin<bool> {
   final Map<String, dynamic> _data;
@@ -17,6 +17,9 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
       $tableName,
       _data,
       condition,
+      orderBy: $orderBy,
+      limit: $limit,
+      offset: $offset,
     );
     return _future!;
   }

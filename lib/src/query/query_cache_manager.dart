@@ -1,24 +1,24 @@
 import '../core/data_store_impl.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
-import '../statistics/table_statistics.dart';
+import '../statistic/table_statistics.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
 
-/// 统一的查询缓存管理器
+/// unified query cache manager
 class QueryCacheManager {
   final QueryCache _cache;
   // 记录表与查询的依赖关系,Map<表名, Map<查询ID, 查询信息>>
   final Map<String, Map<String, _QueryInfo>> _tableDependencies = {};
   final DataStoreImpl _dataStore;
 
-  // 添加全表缓存
+  // add full table cache
   final Map<String, TableCache> tableCaches = {};
 
-  // 添加 Schema 缓存
+  // add schema cache
   final Map<String, TableSchema> _schemaCache = {};
 
-  // 添加统计信息缓存
+  // add stats cache
   final Map<String, TableStatistics> _statsCache = {};
 
   QueryCacheManager(this._dataStore)
@@ -26,7 +26,7 @@ class QueryCacheManager {
           maxSize: _dataStore.config.maxQueryCacheSize,
         );
 
-  /// 缓存查询结果
+  /// cache query results
   void cacheQuery(
     QueryCacheKey key,
     List<Map<String, dynamic>> results,
@@ -64,13 +64,13 @@ class QueryCacheManager {
     }
   }
 
-  /// 获取缓存的查询结果
+  /// get cached query results
   List<Map<String, dynamic>>? getQuery(QueryCacheKey key) {
     final results = _cache.get(key.toString());
     return results;
   }
 
-  /// 检查记录是否匹配查询条件
+  /// check if record matches query conditions
   Future<bool> _recordMatchesConditions(
     String tableName,
     dynamic primaryKeyValue,
@@ -93,7 +93,7 @@ class QueryCacheManager {
     }
   }
 
-  /// 获取记录完整数据
+  /// get record full data
   Future<Map<String, dynamic>?> _getRecordByPrimaryKey(
     String tableName,
     String primaryKeyField,
@@ -107,24 +107,24 @@ class QueryCacheManager {
       );
       return results.isEmpty ? null : results.first;
     } catch (e) {
-      Logger.error('获取记录失败: $e',
+      Logger.error('get record by primary key failed: $e',
           label: 'QueryCacheManager._getRecordByPrimaryKey');
       return null;
     }
   }
 
-  /// 使单条记录相关的缓存失效
+  /// invalidate record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
     try {
       final tableQueries = _tableDependencies[tableName];
       if (tableQueries == null) return;
 
-      // 找出需要更新的查询
+      // query cache
       for (var entry in tableQueries.entries) {
         final queryInfo = entry.value;
 
-        // 如果是全表缓存或者匹配查询条件，则使缓存失效
+        // if it is full table cache or matches query conditions, invalidate cache
         if (queryInfo.isFullTableCache ||
             await _recordMatchesConditions(
               tableName,
@@ -137,28 +137,28 @@ class QueryCacheManager {
         }
       }
 
-      // 如果表没有相关查询了，清理依赖关系
+      // if table has no related queries, clean dependency
       if (tableQueries.isEmpty) {
         _tableDependencies.remove(tableName);
       }
     } catch (e) {
-      Logger.error('使记录缓存失效失败: $e',
+      Logger.error('invalidate record cache failed: $e',
           label: 'QueryCacheManager.invalidateRecord');
     }
   }
 
-  /// 使多条记录相关的缓存失效
+  /// invalidate records related cache
   Future<void> invalidateRecords(
     String tableName,
     Set<dynamic> primaryKeyValues,
   ) async {
     try {
-      // 如果 primaryKeyValues 为空，清除该表所有相关的查询缓存
+      // if primaryKeyValues is empty, clear all related queries cache
       if (primaryKeyValues.isEmpty) {
-        // 清除表依赖关系中的缓存
+        // clear table dependency cache
         _tableDependencies.remove(tableName);
 
-        // 清除通用缓存中该表的所有查询
+        // clear all related queries cache in general cache
         final keysToRemove = <String>[];
         _cache.cache.forEach((key, queryCache) {
           if (queryCache.tableName == tableName) {
@@ -172,10 +172,10 @@ class QueryCacheManager {
         return;
       }
 
-      // 1. 处理查询缓存
+      // 1. handle query cache
       final keysToRemove = <String>[];
 
-      // 1.1 处理表依赖关系中的缓存
+      // 1.1 handle table dependency cache
       final tableDeps = _tableDependencies[tableName];
       if (tableDeps != null) {
         for (var entry in tableDeps.entries) {
@@ -190,7 +190,7 @@ class QueryCacheManager {
         }
       }
 
-      // 1.2 处理通用缓存
+      // 1.2 handle general cache
       _cache.cache.forEach((key, queryCache) {
         if (queryCache.tableName == tableName) {
           if (queryCache.results.any((record) {
@@ -202,19 +202,19 @@ class QueryCacheManager {
         }
       });
 
-      // 2. 移除缓存
+      // 2. remove cache
       for (var key in keysToRemove) {
         _cache.invalidate(key);
         tableDeps?.remove(key);
       }
 
-      // 3. 如果表没有相关查询了，清理依赖关系
+      // 3. if table has no related queries, clean dependency
       if (tableDeps?.isEmpty ?? false) {
         _tableDependencies.remove(tableName);
       }
     } catch (e) {
       Logger.error(
-        '使多条记录缓存失效失败: $e\n'
+        'invalidate records cache failed: $e\n'
         'tableName: $tableName\n'
         'primaryKeyValues: $primaryKeyValues',
         label: 'QueryCacheManager.invalidateRecords',
@@ -222,18 +222,18 @@ class QueryCacheManager {
     }
   }
 
-  /// 清除所有缓存
+  /// clear all cache
   void clear() {
     _cache.clear();
     _tableDependencies.clear();
-    Logger.debug('清除所有缓存', label: 'QueryCacheManager.clear');
+    Logger.debug('clear all cache', label: 'QueryCacheManager.clear');
   }
 
-  /// 缓存表的所有记录
+  /// cache all records of a table
   Future<void> cacheEntireTable(String tableName,
       List<Map<String, dynamic>> records, String primaryKeyField,
       {bool isFullTableCache = true}) async {
-    // 检查文件大小是否允许全表缓存
+    // check if file size allows full table cache
     if (!_dataStore.fileManager.allowFullTableCache(
       tableName,
       _dataStore.config.maxTableCacheSize,
@@ -241,15 +241,15 @@ class QueryCacheManager {
       isFullTableCache = false;
     }
 
-    // 检查表缓存数量限制
+    // check table cache count limit
     if (tableCaches.length >= _dataStore.config.maxTableCacheCount) {
-      // 移除最旧的表缓存
+      // remove oldest table cache
       final oldest = tableCaches.entries.reduce(
           (a, b) => a.value.lastUpdated.isBefore(b.value.lastUpdated) ? a : b);
       tableCaches.remove(oldest.key);
     }
 
-    // 获取当前时间作为缓存时间
+    // get current time as cache time
     final now = DateTime.now();
 
     tableCaches[tableName] = TableCache(
@@ -261,13 +261,13 @@ class QueryCacheManager {
     );
   }
 
-  /// 检查表是否已完全缓存
+  /// check if table is fully cached
   bool isTableFullyCached(String tableName) {
     final cache = tableCaches[tableName];
     return cache?.isFullTableCache ?? false;
   }
 
-  /// 从缓存获取表的所有记录
+  /// get all records of a table from cache
   List<Map<String, dynamic>>? getEntireTable(String tableName) {
     final cache = tableCaches[tableName];
     if (cache == null) return null;
@@ -275,7 +275,7 @@ class QueryCacheManager {
     return List<Map<String, dynamic>>.from(cache.records);
   }
 
-  /// 更新缓存中的记录
+  /// update cached record
   void updateCachedRecord(
     String tableName,
     String id,
@@ -293,7 +293,7 @@ class QueryCacheManager {
     }
   }
 
-  /// 添加记录到缓存
+  /// add record to cache
   void addCachedRecord(String tableName, Map<String, dynamic> record) {
     final cache = tableCaches[tableName];
     if (cache == null) return;
@@ -302,7 +302,7 @@ class QueryCacheManager {
     cache.lastUpdated = DateTime.now();
   }
 
-  /// 从缓存删除记录
+  /// remove record from cache
   void removeCachedRecord(String tableName, String id) {
     final cache = tableCaches[tableName];
     if (cache == null) return;
@@ -311,27 +311,27 @@ class QueryCacheManager {
     cache.lastUpdated = DateTime.now();
   }
 
-  /// 缓存表结构
+  /// cache table schema
   void cacheSchema(String tableName, TableSchema schema) {
     _schemaCache[tableName] = schema;
   }
 
-  /// 获取缓存的表结构
+  /// get cached table schema
   TableSchema? getSchema(String tableName) {
     return _schemaCache[tableName];
   }
 
-  /// 缓存统计信息
+  ///   cache table statistics
   void cacheStatistics(String tableName, TableStatistics stats) {
     _statsCache[tableName] = stats;
   }
 
-  /// 获取缓存的统计信息
+  /// get cached statistics
   TableStatistics? getStatistics(String tableName) {
     return _statsCache[tableName];
   }
 
-  /// 获取缓存统计信息
+  /// get cached statistics
   Map<String, int> getCacheStats() {
     return {
       'tableCaches': tableCaches.length,
@@ -341,9 +341,9 @@ class QueryCacheManager {
     };
   }
 
-  /// 处理基础空间变更
+  /// handle base path changed
   void onBasePathChanged() {
-    // 清除所有非全局表的缓存
+    // clear all non-global table caches
     tableCaches.removeWhere((tableName, _) => !tableName.startsWith('global_'));
     _tableDependencies
         .removeWhere((tableName, _) => !tableName.startsWith('global_'));
@@ -351,11 +351,11 @@ class QueryCacheManager {
         .removeWhere((tableName, _) => !tableName.startsWith('global_'));
     _statsCache.removeWhere((tableName, _) => !tableName.startsWith('global_'));
 
-    // 清除查询缓存
+    // clear query cache
     _cache.clear();
   }
 
-  /// 根据主键获取记录
+  /// get record by primary key
   Map<String, dynamic>? getRecordByPrimaryKey(
       String tableName, dynamic primaryKeyValue) {
     final cache = tableCaches[tableName];
@@ -369,7 +369,7 @@ class QueryCacheManager {
     );
   }
 
-  /// 根据字段值查询记录
+  /// query records by field value
   List<Map<String, dynamic>> queryRecordsByField(
     String tableName,
     String fieldName,
@@ -383,13 +383,13 @@ class QueryCacheManager {
         .toList();
   }
 
-  /// 清除表的所有缓存
+  /// invalidate all cache of a table
   Future<void> invalidateCache(String tableName) async {
     try {
-      // 1. 清除表依赖关系中的缓存
+      // 1. clear table dependency cache
       _tableDependencies.remove(tableName);
 
-      // 2. 清除通用缓存中该表的所有查询
+      // 2. clear all related queries cache in general cache
       final keysToRemove = <String>[];
       _cache.cache.forEach((key, queryCache) {
         if (queryCache.tableName == tableName) {
@@ -401,13 +401,13 @@ class QueryCacheManager {
         _cache.invalidate(key);
       }
 
-      // 3. 清除 Schema 缓存
+      // 3. clear schema cache
       _schemaCache.remove(tableName);
 
-      // 4. 清除统计信息缓存
+      // 4. clear stats cache
       _statsCache.remove(tableName);
 
-      // 5. 重置表缓存(保留结构但清空数据)
+      // 5. reset table cache (keep structure but clear data)
       final cache = tableCaches[tableName];
       if (cache != null) {
         cache.records.clear();
@@ -415,41 +415,41 @@ class QueryCacheManager {
       }
     } catch (e) {
       Logger.error(
-        '清除表缓存失败: $e\n'
+        'clear table cache failed: $e\n'
         'tableName: $tableName',
         label: 'QueryCacheManager.invalidateCache',
       );
     }
   }
 
-  // 获取表缓存时间
+  /// get table cache time
   DateTime? getTableCacheTime(String tableName) {
     return tableCaches[tableName]?.cacheTime;
   }
 
-  // 获取表缓存数量
+  /// get table cache count
   int getTableCacheCount(String tableName) {
     return tableCaches[tableName]?.records.length ?? 0;
   }
 
-  /// 获取查询缓存数量
+  /// get query cache count
   int getCacheCountAll() {
     return _cache.size;
   }
 
-  /// 获取表缓存数量
+  /// get table cache count
   int getTableCacheCountAll() {
     return tableCaches.values
         .fold(0, (sum, cache) => sum + (cache.records.length));
   }
 }
 
-/// 查询信息，包含查询条件、主键字段名和结果集
+/// query info, contains query conditions, primary key field name and result set
 class _QueryInfo {
-  final QueryCacheKey queryKey; // 查询条件
-  final String primaryKeyField; // 主键字段名
-  final List<Map<String, dynamic>> results; // 查询结果集
-  final bool isFullTableCache; // 是否是全表缓存
+  final QueryCacheKey queryKey; // query conditions
+  final String primaryKeyField; // primary key field name
+  final List<Map<String, dynamic>> results; // query result set
+  final bool isFullTableCache; // whether it is full table cache
 
   _QueryInfo({
     required this.queryKey,
@@ -459,7 +459,7 @@ class _QueryInfo {
   });
 }
 
-/// 表缓存
+/// table cache
 class TableCache {
   final List<Map<String, dynamic>> records;
   final String primaryKeyField;

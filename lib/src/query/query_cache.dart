@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'query_condition.dart';
 
-/// 查询缓存
+/// query cache
 class QueryCache {
   final int _maxSize;
   final Map<String, CachedQuery> _cache = {};
@@ -13,10 +13,10 @@ class QueryCache {
     Duration maxAge = const Duration(minutes: 10),
   }) : _maxSize = maxSize;
 
-  /// 获取缓存数量
+  /// get cache size
   int get size => _cache.length;
 
-  /// 获取缓存的查询结果
+  /// get cached query results
   List<Map<String, dynamic>>? get(String key) {
     final cached = _cache[key];
     if (cached == null) return null;
@@ -24,11 +24,11 @@ class QueryCache {
     return cached.results;
   }
 
-  /// 缓存查询结果
+  /// cache query results
   void put(String key, List<Map<String, dynamic>> results, String tableName,
       String primaryKeyField) {
     if (_cache.length >= _maxSize) {
-      // 移除最旧的缓存
+      // remove oldest cache
       final oldest = _cache.entries.reduce(
           (a, b) => a.value.timestamp.isBefore(b.value.timestamp) ? a : b);
       _cache.remove(oldest.key);
@@ -42,18 +42,18 @@ class QueryCache {
     );
   }
 
-  /// 使缓存失效
+  /// invalidate cache
   void invalidate(String key) {
     _cache.remove(key);
   }
 
-  /// 清除所有缓存
+  /// clear all cache
   void clear() {
     _cache.clear();
   }
 }
 
-/// 缓存的查询
+/// cached query
 class CachedQuery {
   final List<Map<String, dynamic>> results;
   final DateTime timestamp;
@@ -68,7 +68,7 @@ class CachedQuery {
   });
 }
 
-/// 查询缓存键
+/// query cache key
 class QueryCacheKey {
   final String tableName;
   final QueryCondition condition;

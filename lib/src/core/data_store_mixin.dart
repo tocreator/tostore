@@ -1,17 +1,17 @@
 import 'package:flutter/foundation.dart';
 
-/// 数据存储内部方法 Mixin
+/// data store internal method mixin
 mixin DataStoreMixin {
-  /// 内部更新方法
+  /// internal update method
   @protected
   Future<void> updateInternal(
       String tableName, Map<String, dynamic> data, Map<String, dynamic> where);
 
-  /// 内部删除方法
+  /// internal delete method
   @protected
   Future<void> deleteInternal(String tableName, Map<String, dynamic> where);
 
-  /// 内部查询方法
+  /// internal query method
   @protected
   Future<List<Map<String, dynamic>>> queryByMap(
     String tableName, {
@@ -21,7 +21,7 @@ mixin DataStoreMixin {
     int? offset,
   });
 
-  /// 获取表路径
+  /// get table path
   @protected
   String getTablePath(String tableName);
 }

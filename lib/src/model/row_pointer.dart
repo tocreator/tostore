@@ -1,9 +1,9 @@
-/// 行位置信息
+/// row pointer
 class RowPointer {
-  final int offset; // 文件中的行偏移量
-  final int length; // 记录的长度
-  final int version; // 记录版本号，用于处理更新
-  final String checksum; // 记录校验和，用于验证完整性
+  final int offset; // row offset in file
+  final int length; // record length
+  final int version; // record version, for update processing
+  final String checksum; // record checksum, for integrity verification
 
   const RowPointer({
     required this.offset,
@@ -12,7 +12,7 @@ class RowPointer {
     String? checksum,
   }) : checksum = checksum ?? '';
 
-  /// 从字符串创建
+  /// create from string
   factory RowPointer.fromString(String value) {
     final parts = value.split(':');
     return RowPointer(
@@ -23,16 +23,16 @@ class RowPointer {
     );
   }
 
-  /// 转换为字符串
+  /// convert to string
   @override
   String toString() => '$offset:$length:$version:$checksum';
 
-  /// 计算校验和
+  /// calculate checksum
   static String calculateChecksum(String content) {
     return content.hashCode.toString();
   }
 
-  /// 创建新的行位置信息
+  /// create new row pointer
   static Future<RowPointer> create(
     String content,
     int offset, {
@@ -46,12 +46,12 @@ class RowPointer {
     );
   }
 
-  /// 验证记录完整性
+  /// verify record integrity
   bool verifyContent(String content) {
     return checksum.isEmpty || checksum == calculateChecksum(content);
   }
 
-  /// 创建新版本
+  /// create new version
   RowPointer newVersion() {
     return RowPointer(
       offset: offset,

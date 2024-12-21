@@ -1,4 +1,4 @@
-/// 表统计信息
+/// table statistics
 class TableStatistics {
   final Map<String, FieldStatistics> fieldStats;
   final int totalRows;
@@ -8,7 +8,7 @@ class TableStatistics {
     required this.totalRows,
   });
 
-  /// 从 JSON 创建
+  /// from json
   factory TableStatistics.fromJson(Map<String, dynamic> json) {
     return TableStatistics(
       fieldStats: (json['fieldStats'] as Map<String, dynamic>).map(
@@ -18,7 +18,7 @@ class TableStatistics {
     );
   }
 
-  /// 转换为 JSON
+  /// to json
   Map<String, dynamic> toJson() {
     return {
       'fieldStats': fieldStats.map(
@@ -29,7 +29,7 @@ class TableStatistics {
   }
 }
 
-/// 字段统计信息
+/// field statistics
 class FieldStatistics {
   final int distinctValues;
   final dynamic minValue;
@@ -43,7 +43,7 @@ class FieldStatistics {
     required this.nullPercentage,
   });
 
-  /// 从 JSON 创建
+  /// from json
   factory FieldStatistics.fromJson(Map<String, dynamic> json) {
     return FieldStatistics(
       distinctValues: json['distinctValues'] as int,
@@ -53,7 +53,7 @@ class FieldStatistics {
     );
   }
 
-  /// 转换为 JSON
+  /// to json
   Map<String, dynamic> toJson() {
     return {
       'distinctValues': distinctValues,

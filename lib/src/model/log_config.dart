@@ -1,18 +1,18 @@
 import '../handler/logger.dart';
 
-/// 全局日志配置
+/// global log config
 class LogConfig {
-  /// 是否启用日志
+  /// enable log
   static bool enableLog = true;
 
-  /// 日志回调方法，用于自定义日志处理
-  /// [message] 日志内容
-  /// [type] 日志回调类型(warn/error)
-  /// [label] 日志标签
+  /// log callback method, for custom log processing
+  /// [message] log content
+  /// [type] log callback type (warn/error)
+  /// [label] log label
   static void Function(String message, LogType type, String label)?
       onLogHandler;
 
-  /// 配置日志
+  /// configure log
   static void setConfig({
     bool? enableLog,
     void Function(String message, LogType type, String label)? onLogHandler,

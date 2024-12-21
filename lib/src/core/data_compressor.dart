@@ -1,12 +1,12 @@
 import 'dart:typed_data';
 
-/// 数据压缩器
+/// data compressor
 class DataCompressor {
   final int compressionLevel;
 
   DataCompressor({this.compressionLevel = 6});
 
-  /// 压缩数据 (使用简单的 RLE 压缩算法)
+  /// compress data (using simple RLE compression algorithm)
   Uint8List compress(Uint8List data) {
     if (data.isEmpty) return data;
 
@@ -28,7 +28,7 @@ class DataCompressor {
     return Uint8List.fromList(result);
   }
 
-  /// 解压数据
+  /// decompress data
   Uint8List decompress(Uint8List compressedData) {
     if (compressedData.isEmpty) return compressedData;
 
@@ -43,7 +43,7 @@ class DataCompressor {
     return Uint8List.fromList(result);
   }
 
-  /// 计算校验和 (使用简单的加法校验)
+  /// calculate checksum (using simple addition checksum)
   int calculateChecksum(Uint8List data) {
     int sum = 0;
     for (var byte in data) {
@@ -53,7 +53,7 @@ class DataCompressor {
   }
 }
 
-/// 压缩数据
+/// compressed data
 class CompressedData {
   final Uint8List data;
   final int originalSize;

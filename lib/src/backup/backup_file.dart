@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import '../core/data_compressor.dart';
 
-/// 备份文件
+/// backup file
 class BackupFile {
   final String path;
   final DateTime timestamp;
@@ -18,12 +18,12 @@ class BackupFile {
     required this.checksum,
   });
 
-  /// 查找文件
+  /// find file
   BackupFileEntry? findFile(String name) {
     return entries[name];
   }
 
-  /// 从备份文件加载
+  /// load from backup file
   static Future<BackupFile> fromFile(String path) async {
     final file = File(path);
     if (!await file.exists()) {
@@ -34,7 +34,7 @@ class BackupFile {
     final compressed = await file.readAsBytes();
     final decompressed = compressor.decompress(compressed);
 
-    // 解析备份文件格式
+    // parse backup file format
     final backupData = _parseBackupData(decompressed);
     final entries = <String, BackupFileEntry>{};
 
@@ -48,12 +48,12 @@ class BackupFile {
       );
     }
 
-    // 解析时间戳
+    // parse timestamp
     final timestamp = DateTime.parse(
       path.split('_').last.split('.').first,
     );
 
-    // 读取校验和
+    // read checksum
     final checksumFile = File('$path.checksum');
     final checksum =
         await checksumFile.exists() ? await checksumFile.readAsString() : '';
@@ -66,13 +66,13 @@ class BackupFile {
     );
   }
 
-  /// 获取备份大小
+  /// get backup file size
   Future<int> get size async {
     final file = File(path);
     return await file.length();
   }
 
-  /// 验证完整性
+  /// verify integrity
   Future<bool> verifyIntegrity() async {
     if (checksum.isEmpty) return true;
 
@@ -83,7 +83,7 @@ class BackupFile {
     return actualChecksum == checksum;
   }
 
-  /// 解析备份数据
+  /// parse backup data
   static Map<String, Map<String, dynamic>> _parseBackupData(Uint8List data) {
     final content = utf8.decode(data);
     final Map<String, dynamic> json = jsonDecode(content);
@@ -96,7 +96,7 @@ class BackupFile {
     return result;
   }
 
-  /// 序列化为备份数据
+  /// serialize to backup data
   Future<Uint8List> serialize() async {
     final data = <String, Map<String, dynamic>>{};
 
@@ -112,7 +112,7 @@ class BackupFile {
   }
 }
 
-/// 备份文件条目
+/// backup file entry
 class BackupFileEntry {
   final String name;
   final List<int> content;
@@ -124,16 +124,16 @@ class BackupFileEntry {
     required this.lastModified,
   });
 
-  /// 获取条目大小
+  /// get entry size
   int get size => content.length;
 
-  /// 获取内容的校验和
+  /// get content checksum
   int getChecksum() {
     final compressor = DataCompressor();
     return compressor.calculateChecksum(Uint8List.fromList(content));
   }
 
-  /// 验证内容完整性
+  /// verify content integrity
   bool verifyContent(int expectedChecksum) {
     return getChecksum() == expectedChecksum;
   }

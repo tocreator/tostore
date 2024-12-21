@@ -1,32 +1,32 @@
 import '../handler/logger.dart';
 
-/// 查询条件构造器
+/// query condition builder
 class QueryCondition {
-  // 存储当前的条件组
+  // current condition group
   final List<_ConditionGroup> _groups = [];
-  // 当前活动的条件组
+  // current active condition group
   _ConditionGroup _currentGroup;
-  // 记录条件之间的连接方式
+  // record condition connection method
   final List<String> _operators = [];
 
   QueryCondition() : _currentGroup = _ConditionGroup();
 
-  /// 添加条件
+  /// add condition
   void where(String field, dynamic operator, [dynamic value]) {
     final condition = _buildCondition(field, operator, value);
 
-    // 如果当前组已有条件，保存并创建新组
+    // if current group has conditions, save and create new group
     if (_currentGroup.conditions.isNotEmpty) {
       _groups.add(_currentGroup);
-      _operators.add('AND'); // 默认使用 AND 连接
+      _operators.add('AND'); // default use AND connection
       _currentGroup = _ConditionGroup();
     }
 
-    // 添加新条件
+    // add new condition
     _currentGroup.conditions = condition;
   }
 
-  /// 开始一个新的 OR 组
+  /// start a new OR group
   void or() {
     if (_currentGroup.conditions.isNotEmpty) {
       _currentGroup.isOr = true;
@@ -36,7 +36,7 @@ class QueryCondition {
     }
   }
 
-  /// 构建条件
+  /// build condition
   Map<String, dynamic> _buildCondition(String field, dynamic operator,
       [dynamic value]) {
     if (operator == null) {
@@ -56,7 +56,7 @@ class QueryCondition {
       case '=':
         return {
           field: {'=': value}
-        }; // 始终使用 Map 格式
+        }; // always use Map format
       case '>':
       case '<':
       case '>=':
@@ -82,9 +82,9 @@ class QueryCondition {
     }
   }
 
-  /// 获取最终的查询条件
+  /// get final query conditions
   Map<String, dynamic> build() {
-    // 保存最后一个组
+    // save last group
     if (_currentGroup.conditions.isNotEmpty) {
       _groups.add(_currentGroup);
       _currentGroup = _ConditionGroup();
@@ -94,22 +94,22 @@ class QueryCondition {
       return {};
     }
 
-    // 如果只有一个组，直接返回
+    // if only one group, return directly
     if (_groups.length == 1) {
       return _groups[0].conditions;
     }
 
-    // 按 OR 分组处理条件
+    // group conditions by OR
     final orParts = <Map<String, dynamic>>[];
     var currentAndPart = <Map<String, dynamic>>[
       _groups[0].conditions
-    ]; // 从第一个条件开始
-    var i = 1; // 从第二个条件开始遍历
+    ]; // start from first condition
+    var i = 1; // start from second condition
 
     while (i < _groups.length) {
       if (i - 1 < _operators.length && _operators[i - 1] == 'OR') {
-        // 检查前一个操作符
-        // 保存之前的 AND 组
+        // check previous operator
+        // save previous AND group
         if (currentAndPart.isNotEmpty) {
           if (currentAndPart.length == 1) {
             orParts.add(currentAndPart.first);
@@ -118,11 +118,11 @@ class QueryCondition {
           }
         }
 
-        // 开始新的 AND 组
+        // start new AND group
         currentAndPart = [_groups[i].conditions];
         i++;
 
-        // 收集后续的 AND 条件
+        // collect subsequent AND conditions
         while (i < _groups.length &&
             (i - 1 >= _operators.length || _operators[i - 1] != 'OR')) {
           currentAndPart.add(_groups[i].conditions);
@@ -134,7 +134,7 @@ class QueryCondition {
       }
     }
 
-    // 处理最后的 AND 组
+    // handle last AND group
     if (currentAndPart.isNotEmpty) {
       if (currentAndPart.length == 1) {
         orParts.add(currentAndPart.first);
@@ -143,56 +143,57 @@ class QueryCondition {
       }
     }
 
-    // 如果只有一个结果，直接返回
+    // if only one result, return directly
     if (orParts.length == 1) {
       return orParts[0];
     }
 
-    // 返回 OR 组合
+    // return OR combination
     return {'OR': orParts};
   }
 
-  /// 重置状态
+  /// reset state
   void _reset() {
     _groups.clear();
     _currentGroup = _ConditionGroup();
   }
 
-  /// 清除所有条件
+  /// clear all conditions
   void clear() {
     _reset();
   }
 
-  /// 检查记录是否匹配条件
+  /// check if record matches conditions
   bool matches(Map<String, dynamic> record) {
     try {
-      // 如果没有条件，匹配所有记录
+      // if no conditions, match all records
       if (_groups.isEmpty && _currentGroup.conditions.isEmpty) {
         return true;
       }
 
-      // 保存当前组
+      // save current group
       final allGroups = List<_ConditionGroup>.from(_groups);
       if (_currentGroup.conditions.isNotEmpty) {
         allGroups.add(_currentGroup);
       }
 
-      // 如果只有一个 AND 组，检查所有条件
+      // if only one AND group, check all conditions
       if (allGroups.length == 1 && !allGroups[0].isOr) {
         return _matchAllConditions(record, allGroups[0].conditions);
       }
 
-      // 处理多个组的情况
+      // handle multiple groups
       return allGroups.any((group) => group.isOr
           ? _matchAllConditions(record, group.conditions)
           : _matchAllConditions(record, group.conditions));
     } catch (e) {
-      Logger.error('条件匹配失败: $e', label: 'QueryCondition.matches');
+      Logger.error('condition matching failed: $e',
+          label: 'QueryCondition.matches');
       return false;
     }
   }
 
-  /// 匹配所有条件
+  /// match all conditions
   bool _matchAllConditions(
       Map<String, dynamic> record, Map<String, dynamic> conditions) {
     for (var entry in conditions.entries) {
@@ -203,12 +204,12 @@ class QueryCondition {
     return true;
   }
 
-  /// 匹配单个条件
+  /// match single condition
   bool _matchSingleCondition(dynamic value, dynamic condition) {
     if (condition == null) return value == null;
 
     if (condition is Map) {
-      // 检查所有操作符条件
+      // check all operator conditions
       for (var entry in condition.entries) {
         final operator = entry.key;
         final compareValue = entry.value;
@@ -271,17 +272,17 @@ class QueryCondition {
             matches = false;
         }
 
-        // 如果任何一个条件不满足，直接返回 false
+        // if any condition is not satisfied, return false directly
         if (!matches) return false;
       }
       return true;
     }
 
-    // 简单相等条件
+    // simple equal condition
     return value == condition;
   }
 
-  /// 安全的值比较
+  /// safe value comparison
   int _compareValues(dynamic a, dynamic b) {
     if (a == null || b == null) return 0;
 
@@ -302,7 +303,7 @@ class QueryCondition {
   }
 }
 
-/// 条件组
+/// condition group
 class _ConditionGroup {
   Map<String, dynamic> conditions = {};
   bool isOr = false;

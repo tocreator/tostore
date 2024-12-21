@@ -2,7 +2,7 @@ import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import 'query_plan.dart';
 
-/// 查询优化器
+/// query optimizer
 class QueryOptimizer {
   final DataStoreImpl _dataStore;
 
@@ -10,22 +10,22 @@ class QueryOptimizer {
     this._dataStore,
   );
 
-  /// 优化查询计划
+  /// optimize query plan
   Future<QueryPlan> optimize(
     String tableName,
     Map<String, dynamic>? where,
     List<String>? orderBy,
   ) async {
     try {
-      // 如果没有查询条件，直接返回全表扫描计划
+      // if there is no query condition, directly return full table scan plan
       if (where == null || where.isEmpty) {
         return _createTableScanPlan(tableName, where, orderBy);
       }
 
-      // 获取表结构
+      // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
 
-      // 首先尝试使用主键索引
+      // first try to use primary key index
       if (where.containsKey(schema.primaryKey)) {
         return QueryPlan([
           QueryOperation(
@@ -36,9 +36,9 @@ class QueryOptimizer {
         ]);
       }
 
-      // 尝试使用其他索引
+      // try to use other indexes
       for (var index in schema.indexes) {
-        // 检查是否所有索引字段都在查询条件中
+        // check if all index fields are in query condition
         if (index.fields.every((col) => where.containsKey(col))) {
           return QueryPlan([
             QueryOperation(
@@ -50,16 +50,16 @@ class QueryOptimizer {
         }
       }
 
-      // 如果没有可用的索引，使用全表扫描
+      // if there is no available index, use full table scan
       return _createTableScanPlan(tableName, where, orderBy);
     } catch (e) {
-      Logger.error('查询优化失败: $e', label: 'QueryOptimizer');
-      // 出错时使用全表扫描
+      Logger.error('query optimization failed: $e', label: 'QueryOptimizer');
+      // use full table scan when error occurs
       return _createTableScanPlan(tableName, where, orderBy);
     }
   }
 
-  /// 创建全表扫描查询计划
+  /// create full table scan query plan
   QueryPlan _createTableScanPlan(
     String tableName,
     Map<String, dynamic>? where,
@@ -67,13 +67,13 @@ class QueryOptimizer {
   ) {
     final operations = <QueryOperation>[];
 
-    // 添加全表扫描操作
+    // add full table scan operation
     operations.add(QueryOperation(
       type: QueryOperationType.tableScan,
       value: tableName,
     ));
 
-    // 如果有查询条件，添加过滤操作
+    // if there is query condition, add filter operation
     if (where != null && where.isNotEmpty) {
       operations.add(QueryOperation(
         type: QueryOperationType.filter,
@@ -81,7 +81,7 @@ class QueryOptimizer {
       ));
     }
 
-    // 如果需要排序，添加排序操作
+    // if need sort, add sort operation
     if (orderBy != null && orderBy.isNotEmpty) {
       operations.add(QueryOperation(
         type: QueryOperationType.sort,

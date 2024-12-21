@@ -5,67 +5,67 @@ import '../model/table_info.dart';
 import '../model/table_schema.dart';
 import '../query/query_builder.dart';
 
-/// 数据存储引擎接口
+/// Data store engine interface
 abstract class DataStoreInterface {
-  /// 初始化数据存储引擎
+  /// Initialize data store engine
   Future<void> initialize({
     String? dbPath,
     DataStoreConfig? config,
   });
 
-  /// 查询数据
+  /// query data
   QueryBuilder query(String tableName);
 
-  /// 插入数据
+  /// insert data
   Future<bool> insert(String tableName, Map<String, dynamic> data);
 
-  /// 批量插入数据
+  /// batch insert data
   Future<bool> batchInsert(
       String tableName, List<Map<String, dynamic>> records);
 
-  /// 更新数据
+  /// update data
   UpdateBuilder update(String tableName, Map<String, dynamic> data);
 
-  /// 删除数据
+  /// delete data
   DeleteBuilder delete(String tableName);
 
-  /// 设置键值对
+  /// set key-value pair
   Future<bool> setValue(String key, dynamic value, {bool isGlobal = false});
 
-  /// 获取键值对
+  /// get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false});
 
-  /// 删除键值对
+  /// remove key-value pair
   Future<bool> removeValue(String key, {bool isGlobal = false});
 
-  /// 创建表
+  /// create table
   Future<void> createTable(String tableName, TableSchema schema);
 
-  /// 删除表
+  /// drop table
   Future<void> dropTable(String tableName);
 
-  /// 清空表
+  /// clear table
   Future<void> clear(String tableName);
 
-  /// 获取表结构
+  /// get table schema
   Future<TableSchema> getTableSchema(String tableName);
 
-  /// 获取表信息
+  /// get table info
   Future<TableInfo> getTableInfo(String tableName);
 
-  /// 切换基础空间
+  /// switch base space
   Future<bool> switchBaseSpace({String spaceName = 'default'});
 
-  /// 关闭数据存储引擎
+  /// close data store engine
   Future<void> close();
 
-  /// 备份数据库
+  /// backup database
   Future<String> backup();
 
-  /// 还原数据库
+  /// restore database
   Future<void> restore(String backupPath);
 
-  /// Map方式查询
+  /// query by map
   Future<List<Map<String, dynamic>>> queryByMap(
     String tableName, {
     Map<String, dynamic>? where,
@@ -74,7 +74,7 @@ abstract class DataStoreInterface {
     int? offset,
   });
 
-  /// SQL风格的查询
+  /// query by sql
   Future<List<Map<String, dynamic>>> queryBySql(
     String tableName, {
     String? where,
@@ -84,18 +84,18 @@ abstract class DataStoreInterface {
     int? offset,
   });
 
-  /// 获取当前配置
+  /// get current config
   DataStoreConfig get config;
 
-  /// 获取当前基础空间名
+  /// get current base space name
   String? get currentBaseSpaceName;
 
-  /// 获取数据库版本号
+  /// get database version
   Future<int> getVersion();
 
-  /// 设置数据库版本号
+  /// set database version
   Future<void> setVersion(int version);
 
-  /// 删除数据库
+  /// delete database
   Future<void> deleteDatabase({String? dbPath});
 }

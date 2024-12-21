@@ -1,4 +1,4 @@
-/// 备份信息
+/// backup info
 class BackupInfo {
   final String path;
   final DateTime timestamp;
@@ -12,10 +12,10 @@ class BackupInfo {
     required this.size,
   });
 
-  /// 获取备份类型描述
-  String get type => isIncremental ? '增量备份' : '完整备份';
+  /// get backup type description
+  String get type => isIncremental ? 'incremental backup' : 'full backup';
 
-  /// 获取格式化的大小
+  /// get formatted size
   String get formattedSize {
     if (size < 1024) return '$size B';
     if (size < 1024 * 1024) return '${(size / 1024).toStringAsFixed(2)} KB';
@@ -25,7 +25,7 @@ class BackupInfo {
     return '${(size / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
-  /// 从 JSON 创建
+  /// create from json
   factory BackupInfo.fromJson(Map<String, dynamic> json) {
     return BackupInfo(
       path: json['path'] as String,
@@ -35,7 +35,7 @@ class BackupInfo {
     );
   }
 
-  /// 转换为 JSON
+  /// convert to json
   Map<String, dynamic> toJson() {
     return {
       'path': path,

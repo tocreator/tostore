@@ -3,7 +3,7 @@ import 'dart:async';
 import 'chain_builder.dart';
 import 'future_builder_mixin.dart';
 
-/// 删除构建器
+/// delete builder
 class DeleteBuilder extends ChainBuilder<DeleteBuilder>
     with FutureBuilderMixin<bool> {
   Future<bool>? _future;
@@ -15,6 +15,9 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
     _future ??= $db.deleteInternal(
       $tableName,
       condition,
+      orderBy: $orderBy,
+      limit: $limit,
+      offset: $offset,
     );
     return _future!;
   }

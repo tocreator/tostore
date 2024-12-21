@@ -3,54 +3,84 @@ import 'package:flutter/foundation.dart';
 import '../core/data_store_impl.dart';
 import '../query/query_condition.dart';
 
-/// 链式构建器基类
+/// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final DataStoreImpl _db;
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
 
+  List<String>? _orderBy;
+  int? _limit;
+  int? _offset;
+
   ChainBuilder(this._db, this._tableName);
 
-  /// 获取实际的构建器实例
+  /// get actual builder instance
   SELF get _self => this as SELF;
 
-  /// 基础 where 条件
+  /// set order by (asc)
+  SELF orderByAsc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add(field);
+    return _self;
+  }
+
+  /// set order by (desc)
+  SELF orderByDesc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add('-$field');
+    return _self;
+  }
+
+  /// set limit
+  SELF limit(int value) {
+    _limit = value;
+    return _self;
+  }
+
+  /// set offset
+  SELF offset(int value) {
+    _offset = value;
+    return _self;
+  }
+
+  /// base where condition
   SELF where(String field, String operator, dynamic value) {
     _condition.where(field, operator, value);
     return _self;
   }
 
-  /// whereIn 条件
+  /// whereIn condition
   SELF whereIn(String field, List values) {
     _condition.where(field, 'IN', values);
     return _self;
   }
 
-  /// whereBetween 条件
+  /// whereBetween condition
   SELF whereBetween(String field, dynamic start, dynamic end) {
     _condition.where(field, 'BETWEEN', [start, end]);
     return _self;
   }
 
-  /// whereNull 条件
+  /// whereNull condition
   SELF whereNull(String field) {
     _condition.where(field, 'IS', null);
     return _self;
   }
 
-  /// whereNotNull 条件
+  /// whereNotNull condition
   SELF whereNotNull(String field) {
     _condition.where(field, 'IS NOT', null);
     return _self;
   }
 
-  /// OR 条件
+  /// OR condition
   SELF or() {
     _condition.or();
     return _self;
   }
 
-  /// 获取条件构造器
+  /// get condition builder
   QueryCondition get condition => _condition;
 
   @protected
@@ -58,4 +88,13 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   @protected
   String get $tableName => _tableName;
+
+  @protected
+  List<String>? get $orderBy => _orderBy;
+
+  @protected
+  int? get $limit => _limit;
+
+  @protected
+  int? get $offset => _offset;
 }

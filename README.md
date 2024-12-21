@@ -1,58 +1,47 @@
-<!--
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
-
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages).
-
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/guides/libraries/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages).
--->
-
 # ToStore
 
-[English](README_EN.md) | 简体中文
+English | [简体中文](README.zh-CN.md)
 
-ToStore 是一款重新定义 Dart/Flutter 数据存储的高性能引擎。它完全采用纯 Dart 实现，通过现代化的API设计和创新，表现出超越当前 Flutter 平台上主流数据库数倍的性能。其多空间架构让切换用户数据管理变得前所未有的简单，是目前 Dart 平台上首选的数据存储方案。
+ToStore is a high-performance storage engine built specifically for mobile applications. Implemented purely in Dart, it achieves exceptional performance through B+ tree indexing and intelligent caching strategies. Its multi-space architecture solves the challenges of user data isolation and global data sharing, while enterprise-grade features like transaction protection, automatic repair, incremental backup, and zero-cost idle ensure reliable data storage for mobile applications.
 
-## 为什么选择 ToStore?
+## Why ToStore?
 
-- 🚀 **极致性能**: 
-  - 纯 Dart 实现，无平台限制
-  - 智能缓存策略，性能持续优化
-  - 高并发读写性能远超主流方案
-- 🎯 **简单易用**: 
-  - 流畅的链式 API 设计
-  - 支持 SQL/Map 双风格查询
-  - 5 分钟即可完成迁移
-- 🔄 **创新架构**: 
-  - 突破性的多空间设计
-  - 用户数据完全隔离
-  - 全局表轻松共享
-- 🛡️ **企业级可靠**: 
-  - 自动备份与恢复
-  - 数据完整性校验
-  - ACID 事务支持
+- 🚀 **Ultimate Performance**: 
+  - B+ tree indexing with smart query optimization
+  - Intelligent caching strategy with millisecond response
+  - Non-blocking concurrent read/write with stable performance
+- 🎯 **Easy to Use**: 
+  - Fluent chainable API design
+  - Support for SQL/Map style queries
+  - Smart type inference with complete code hints
+  - Zero configuration, ready out of the box
+- 🔄 **Innovative Architecture**: 
+  - Multi-space data isolation, perfect for multi-user scenarios
+  - Global data sharing solves configuration sync challenges
+  - Support for nested transactions
+  - On-demand space loading minimizes resource usage
+- 🛡️ **Enterprise-Grade Reliability**: 
+  - ACID transaction protection ensures data consistency
+  - Incremental backup mechanism with quick recovery
+  - Data integrity validation with automatic error repair
 
-## 快速开始
+## Quick Start
 
-1. 添加依赖:
+1. Add dependency:
 
 ```yaml
 dependencies:
-  tostore: ^1.8.1
+  tostore: ^1.8.2
 ```
 
-2. 基础使用:
+2. Basic usage:
 
 ```dart
-// 初始化数据库
+// Initialize database
 final db = ToStore(
   version: 1,
   onCreate: (db) async {
-    // 创建表
+    // Create table
     await db.createTable(
       'users',
       TableSchema(
@@ -69,23 +58,24 @@ final db = ToStore(
     );
   },
 );
+await db.initialize(); // Optional, ensures database is fully initialized before operations
 
-// 插入数据
+// Insert data
 await db.insert('users', {
   'id': 1,
   'name': 'John',
   'age': 30,
 });
 
-// 更新数据
+// Update data
 await db.update('users', {
   'age': 31,
 }).where('id', '=', 1);
 
-// 删除数据
+// Delete data
 await db.delete('users').where('id', '!=', 1);
 
-// 链式查询，支持复杂条件
+// Chain query with complex conditions
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('name', 'like', '%John%')
@@ -94,78 +84,85 @@ final users = await db.query('users')
     .orderByDesc('age')
     .limit(10);
 
-// 查询记录数
+// Count records
 final count = await db.query('users').count();
 
-// Sql风格查询
-final users = await db.queryBySql('users',where: 'age > 20 AND name LIKE "%John%" OR id IN (1, 2, 3)', limit: 10);
-
-// Map风格查询
-final users = await db.queryByMap(
-    'users',
-    where: {
-      'age': {'>=': 30},
-      'name': {'like': '%John%'},
-    },
-    orderBy: ['age'],
-    limit: 10,
+// SQL style query
+final users = await db.queryBySql(
+  'users',
+  where: 'age > 20 AND name LIKE "%John%" OR id IN (1, 2, 3)',
+  limit: 10
 );
 
-// 批量插入
+// Map style query
+final users = await db.queryByMap(
+  'users',
+  where: {
+    'age': {'>=': 30},
+    'name': {'like': '%John%'},
+  },
+  orderBy: ['age'],
+  limit: 10,
+);
+
+// Batch insert
 await db.batchInsert('users', [
   {'id': 1, 'name': 'John', 'age': 30},
   {'id': 2, 'name': 'Mary', 'age': 25},
 ]);
 ```
 
-## 多空间架构
+## Multi-Space Architecture
 
-ToStore 的多空间架构设计让多用户数据管理变得轻而易举：
+ToStore's multi-space architecture makes multi-user data management effortless:
 
 ```dart
-// 切换到用户
+// Switch to user space
 await db.switchBaseSpace(spaceName: 'user_123');
 
-// 查询用户数据
+// Query user data
 final followers = await db.query('followers');
 
-// 设置键值对数据或更新，isGlobal: true 表示全局数据
+// Set or update key-value data, isGlobal: true means global data
 await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 
-// 获取全局键值对数据
+// Get global key-value data
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
 
-## 性能测试
+## Performance
 
-在高并发场景下的批量写入、随机读写、条件查询等性能测试，ToStore 均表现出色，远超其它支持dart、flutter的主流数据库。
+In high-concurrency scenarios including batch writes, random read/writes, and conditional queries, ToStore demonstrates exceptional performance, far surpassing other mainstream databases available for Dart/Flutter.
 
-## 更多特性
+## More Features
 
-- 💫 优雅的链式 API
-- 🎯 智能的类型推导
-- 📝 完善的代码提示
-- 🔐 自动增量备份
-- 🛡️ 数据完整性校验
-- 🔄 崩溃自动恢复
-- 📦 智能数据压缩
-- 📊 自动索引优化
-- 💾 分级缓存策略
+- 💫 Elegant chainable API
+- 🎯 Smart type inference
+- 📝 Complete code hints
+- 🔐 Automatic incremental backup
+- 🛡️ Data integrity validation
+- 🔄 Crash auto-recovery
+- 📦 Smart data compression
+- 📊 Automatic index optimization
+- 💾 Tiered caching strategy
 
-## 文档
+Our goal isn't just to create another database. ToStore is extracted from the Toway framework to provide an alternative solution. If you're developing mobile applications, we recommend using the Toway framework, which offers a complete Flutter development ecosystem. With Toway, you won't need to deal with the underlying database directly - data requests, loading, storage, caching, and display are all handled automatically by the framework.
+For more information about the Toway framework, visit the [Toway Repository](https://github.com/tocreator/toway)
 
-访问我们的 [Wiki](https://github.com/tocreator/tostore) 获取详细文档。
+## Documentation
 
-## 支持与反馈
+Visit our [Wiki](https://github.com/tocreator/tostore) for detailed documentation.
 
-- 提交 Issue: [GitHub Issues](https://github.com/tocreator/tostore/issues)
-- 加入讨论: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-- 贡献代码: [Contributing Guide](CONTRIBUTING.md)
+## Support & Feedback
 
-## 许可证
+- Submit Issues: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- Join Discussions: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
+- Contribute: [Contributing Guide](CONTRIBUTING.md)
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件。
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-<p align="center">如果觉得 ToStore 对你有帮助，欢迎给我们一个 ⭐️</p>
+<p align="center">If you find ToStore helpful, please give us a ⭐️</p> 

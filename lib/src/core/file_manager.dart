@@ -6,45 +6,48 @@ import '../handler/logger.dart';
 import 'data_store_impl.dart';
 import '../model/row_pointer.dart';
 
-/// 文件管理器 - 调度数据读写、备份、索引更新等操作
+/// file manager - schedule data read/write, backup, index update, etc.
 class FileManager {
   final DataStoreImpl _dataStore;
 
-  // 写入队列
+  // write queue
   final Map<String, List<Map<String, dynamic>>> _writeQueue = {};
   Map<String, List<Map<String, dynamic>>> get writeQueue => _writeQueue;
 
-  // 写入策略配置
-  static const int _maxQueueSize = 100; // 队列最大容量阈值(每个表)
-  static const Duration _checkInterval = Duration(seconds: 3); // 检查间隔
-  static const int _idleWriteCount = 5; // 闲置写入计数(5次3秒 = 15秒)
+  // write strategy configuration
+  static const int _maxQueueSize =
+      100; // queue max capacity threshold (per table)
+  static const Duration _checkInterval = Duration(seconds: 3); // check interval
+  static const int _idleWriteCount =
+      5; // idle write count (5 times 3 seconds = 15 seconds)
 
   Timer? _timer;
-  int _idleCount = 0; // 闲置计数器
-  bool _isWriting = false; // 写入状态标记
+  int _idleCount = 0; // idle counter
+  bool _isWriting = false; // write status flag
 
-  // 存储表文件大小信息
+  // store table file size information
   final Map<String, int> _fileSizes = {};
-  // 存储文件最后修改时间
+  // store file last modified time
   final Map<String, DateTime> _lastModifiedTimes = {};
 
-  // 添加备份写入锁
+  // add backup write lock
   bool _isBackingUp = false;
-  bool _isNeedBackup = false; // 需要备份待写入
+  bool _isNeedBackup = false; // need backup write queue
 
   FileManager(this._dataStore);
 
-  /// 添加到写入队列
+  /// add to write queue
   void addToWriteQueue(String tableName, Map<String, dynamic> data,
       {bool isUpdate = false}) {
     final queue = _writeQueue.putIfAbsent(tableName, () => []);
     queue.add(data);
-    _idleCount = 0; // 重置闲置计数
+    _idleCount = 0; // reset idle counter
     _isNeedBackup = true;
   }
 
-  /// 启动定时器
+  /// start timer
   void startTimer() {
+    loadBackups();
     _timer?.cancel();
     _timer = Timer.periodic(_checkInterval, (timer) async {
       try {
@@ -53,17 +56,17 @@ class FileManager {
           return;
         }
 
-        // 1. 先创建待写入队列的备份
+        // 1. create backup of write queue
         if (!_isBackingUp && _isNeedBackup) {
           final currentQueue =
               Map<String, List<Map<String, dynamic>>>.from(_writeQueue);
           await _backupWriteQueue(currentQueue);
         }
 
-        // 2. 检查是否需要写入数据文件
+        // 2. check if need to write data file
         if (_isWriting) return;
 
-        // 检查是否有表的队列超过阈值
+        // check if any table queue exceeds threshold
         bool needsImmediateWrite = false;
         for (var queue in _writeQueue.values) {
           if (queue.length >= _maxQueueSize) {
@@ -72,14 +75,14 @@ class FileManager {
           }
         }
 
-        // 3. 检查是否需要写入数据文件
+        // 3. check if need to write data file
         if (needsImmediateWrite || _idleCount >= _idleWriteCount) {
           _idleCount = 0;
           if (_writeQueue.isNotEmpty) {
             _isWriting = true;
             try {
               await flushWriteQueue();
-              // 处理自增ID写入
+              // handle auto-increment ID write
               await _dataStore.flushMaxIds();
             } finally {
               _isWriting = false;
@@ -89,49 +92,49 @@ class FileManager {
           _idleCount++;
         }
       } catch (e) {
-        Logger.error('定时处理失败: $e', label: 'FileManager-startTimer');
+        Logger.error('timer process failed: $e',
+            label: 'FileManager-startTimer');
         _isWriting = false;
       }
     });
   }
 
-  /// 停止定时器
+  /// stop timer
   Future<void> dispose() async {
     _timer?.cancel();
     _timer = null;
 
-    // 最后一次刷新所有待写入数据
+    // last flush all write queue
     if (_writeQueue.isNotEmpty) {
-      // 先备份
+      // first backup
       final currentQueue =
           Map<String, List<Map<String, dynamic>>>.from(_writeQueue);
       await _backupWriteQueue(currentQueue);
-      // 再写入
+      // then write
       await flushWriteQueue();
     }
-    // 清理所有备份文件
+    // cleanup all backup files
     await _cleanupBackupFiles();
-    // 清理文件大小信息
+    // cleanup file size information
     clearFileSizes();
-    // 清理写入队列
+    // cleanup write queue
     _writeQueue.clear();
   }
 
-  /// 刷新写入队列
+  /// flush write queue
   Future<void> flushWriteQueue() async {
     if (_writeQueue.isEmpty) return;
 
-    // 复制当前队列,避免处理过程中的修改
+    // copy current queue to avoid modification during processing
     final currentQueue =
         Map<String, List<Map<String, dynamic>>>.from(_writeQueue);
-
     try {
       for (var entry in currentQueue.entries) {
         final tableName = entry.key;
         final records = entry.value;
         if (records.isEmpty) continue;
 
-        // 获取数据文件写入锁
+        // get data file write lock
         await _dataStore.concurrencyManager?.acquireWriteLock(tableName);
         try {
           final schema = await _dataStore.getTableSchema(tableName);
@@ -142,57 +145,58 @@ class FileManager {
           final primaryKey = schema.primaryKey;
           final allRecords = <String, Map<String, dynamic>>{};
 
-          // 1. 读取现有文件内容
+          // 1. read existing file content
           final lines = await dataFile.readAsLines();
 
-          // 2. 使用 Map 来存储记录，以主键为键，确保唯一性
+          // 2. use Map to store records, ensure uniqueness by primary key
           for (var line in lines) {
             if (line.trim().isEmpty) continue;
             try {
               final record = jsonDecode(line) as Map<String, dynamic>;
               allRecords[record[primaryKey].toString()] = record;
             } catch (e) {
-              Logger.error('解析记录失败: $e', label: 'DataStore-_flushWriteQueue');
+              Logger.error('parse record failed: $e',
+                  label: 'DataStore-_flushWriteQueue');
             }
           }
 
-          // 3. 更新/添加新记录并处理索引
+          // 3. update/add new records and handle indexes
           for (var record in records) {
             final recordId = record[primaryKey].toString();
             final oldRecord = allRecords[recordId];
 
-            // 3.1 如果是更新操作，先删除旧索引
+            // 3.1 if update operation, first delete old index
             if (oldRecord != null) {
               await _dataStore.indexManager
                   ?.deleteFromIndexes(tableName, oldRecord);
             }
 
-            // 3.2 更新记录
+            // 3.2 update record
             allRecords[recordId] = record;
           }
 
-          // 5. 写入所有记录
+          // 5. write all records
           final sink = dataFile.openWrite(mode: FileMode.write);
-          var currentOffset = 0; // 从0开始计算偏移量
+          var currentOffset = 0; // start from 0
 
           try {
             for (var record in allRecords.values) {
               final encoded = jsonEncode(record);
 
-              // 创建行指针（使用当前偏移量）
+              // create row pointer (use current offset)
               final pointer = await RowPointer.create(
                 encoded,
                 currentOffset,
               );
 
-              // 写入记录
+              // write record
               sink.writeln(encoded);
 
-              // 更新索引
+              // update index
               _dataStore.indexManager
                   ?.updateIndexes(tableName, record, pointer);
 
-              // 更新偏移量（加上记录长度和换行符）
+              // update offset (add record length and newline)
               currentOffset += encoded.length + 1;
             }
             await sink.flush();
@@ -200,15 +204,15 @@ class FileManager {
             await sink.close();
           }
 
-          // 更新文件大小信息
+          // update file size information
           await updateFileSize(tableName, currentOffset);
 
-          // 写入成功后再清除对应表的待写入队列
+          // clear write queue after successful write
           _writeQueue.remove(tableName);
 
-          // 删除该表的备份文件(需要获取备份锁)
+          // delete backup file of this table (need backup lock)
           if (!_isBackingUp) {
-            // 如果没有正在进行的备份操作
+            // if no backup operation is in progress
             await _dataStore.concurrencyManager
                 ?.acquireWriteLock('backup_$tableName');
             try {
@@ -223,21 +227,21 @@ class FileManager {
         }
       }
     } catch (e, stackTrace) {
-      Logger.error('写入队列刷新失败: $e', label: 'FileManager-flushWriteQueue');
+      Logger.error('write queue flush failed: $e',
+          label: 'FileManager-flushWriteQueue');
       Logger.error(stackTrace.toString(), label: 'FileManager-flushWriteQueue');
-      // 发生错误时恢复所有备份
+      // restore all backups when error occurs
       await _restoreAllBackups();
     }
   }
 
-  /// 备份待写入队列
+  /// backup write queue
   Future<void> _backupWriteQueue(
       Map<String, List<Map<String, dynamic>>> queue) async {
     if (_isBackingUp) return;
-
     try {
       _isBackingUp = true;
-      final needBackupBeforeStart = _isNeedBackup; // 记录开始备份时的状态
+      final needBackupBeforeStart = _isNeedBackup; // record start backup status
 
       for (var entry in queue.entries) {
         final tableName = entry.key;
@@ -254,8 +258,8 @@ class FileManager {
         }
       }
 
-      // 只有当开始备份时需要备份的标记为true时,才重置标记
-      // 这样可以保留备份过程中新添加数据的备份需求
+      // only reset flag when need backup before start
+      // this can keep backup requirement for new added data during backup
       if (needBackupBeforeStart) {
         _isNeedBackup = false;
       }
@@ -264,7 +268,7 @@ class FileManager {
     }
   }
 
-  /// 从备份恢复单个表的写入队列
+  /// restore single table write queue from backup
   Future<void> _restoreFromBackup(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
     final backupFile = File(
@@ -276,12 +280,13 @@ class FileManager {
             (jsonDecode(content) as List).cast<Map<String, dynamic>>();
         _writeQueue[tableName] = records;
       } catch (e) {
-        Logger.error('恢复写入队列备份失败: $e', label: 'FileManager._restoreFromBackup');
+        Logger.error('restore write queue from backup failed: $e',
+            label: 'FileManager._restoreFromBackup');
       }
     }
   }
 
-  /// 恢复所有备份
+  /// restore all backups
   Future<void> _restoreAllBackups() async {
     final basePath = _dataStore.config.getBasePath();
     final dir = Directory(basePath);
@@ -295,7 +300,7 @@ class FileManager {
     }
   }
 
-  /// 删除备份文件
+  /// delete backup file
   Future<void> _removeBackupFile(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
     final backupFile = File(
@@ -305,13 +310,13 @@ class FileManager {
     }
   }
 
-  /// 从路径中提取表名
+  /// extract table name from path
   String _getTableNameFromPath(String path) {
     final fileName = path.split(Platform.pathSeparator).last;
     return fileName.split('.').first;
   }
 
-  /// 清理所有备份文件
+  /// cleanup all backup files
   Future<void> _cleanupBackupFiles() async {
     final basePath = _dataStore.config.getBasePath();
     final dir = Directory(basePath);
@@ -324,41 +329,41 @@ class FileManager {
     }
   }
 
-  /// 获取表文件大小
+  /// get table file size
   int getFileSize(String tableName) {
     return _fileSizes[tableName] ?? 0;
   }
 
-  /// 更新表文件大小和修改时间
+  /// update table file size and modified time
   Future<void> updateFileSize(String tableName, int size) async {
     _fileSizes[tableName] = size;
     _lastModifiedTimes[tableName] = DateTime.now();
   }
 
-  /// 检查是否允许全表缓存
+  /// check if allow full table cache
   bool allowFullTableCache(String tableName, int maxSize) {
     final size = getFileSize(tableName);
     return size <= maxSize;
   }
 
-  /// 检查文件是否被修改过
+  /// check if file is modified
   bool isFileModified(String tableName, DateTime lastReadTime) {
     final lastModified = _lastModifiedTimes[tableName];
     return lastModified == null || lastModified.isAfter(lastReadTime);
   }
 
-  /// 获取文件最后修改时间
+  /// get file last modified time
   DateTime? getLastModifiedTime(String tableName) {
     return _lastModifiedTimes[tableName];
   }
 
-  /// 清理表大小信息
+  /// cleanup table size information
   void clearFileSizes() {
     _fileSizes.clear();
     _lastModifiedTimes.clear();
   }
 
-  /// 初始化时加载备份
+  /// load backups when initialize
   Future<void> loadBackups() async {
     try {
       final basePath = _dataStore.config.getBasePath();
@@ -372,20 +377,20 @@ class FileManager {
         }
       }
     } catch (e) {
-      Logger.error('加载备份失败: $e', label: 'FileManager.loadBackups');
+      Logger.error('load backups failed: $e', label: 'FileManager.loadBackups');
     }
   }
 
-  /// 获取表的所有文件
+  /// get all files of a table
   Future<List<File>> getTableFiles(String tableName) async {
     final tablePath = await _dataStore.getTablePath(tableName);
     final files = <File>[];
 
-    // 数据文件
+    // data file
     files.add(File('$tablePath.dat'));
-    // Schema文件
+    // schema file
     files.add(File('$tablePath.schema'));
-    // 索引文件
+    // index files
     final dir = Directory(tablePath).parent;
     await for (var entity in dir.list()) {
       if (entity is File &&

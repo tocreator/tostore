@@ -5,7 +5,8 @@ import 'dart:io';
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
 
-/// 事务管理器
+/// Transaction Manager
+/// Handles database transaction lifecycle and ensures ACID properties
 class TransactionManager {
   final DataStoreImpl _dataStore;
   final Map<String, Transaction> _activeTransactions = {};
@@ -15,7 +16,10 @@ class TransactionManager {
 
   TransactionManager(this._dataStore);
 
-  /// 记录操作日志
+  /// Log operation details
+  /// [operation] Operation type
+  /// [tableName] Target table name
+  /// [data] Operation data
   Future<void> logOperation(
     String operation,
     String tableName,
@@ -36,7 +40,8 @@ class TransactionManager {
     );
   }
 
-  /// 开始事务
+  /// Begin a new transaction
+  /// Returns transaction instance with unique ID
   Future<Transaction> beginTransaction() async {
     final transaction = Transaction(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -47,60 +52,66 @@ class TransactionManager {
     return transaction;
   }
 
-  /// 提交事务
+  /// Commit transaction
+  /// [transaction] Transaction to commit
   Future<void> commit(Transaction? transaction) async {
     if (transaction == null) return;
 
     try {
-      // 批量处理事务操作
+      // Process batch operations
       final batch = _transactionBatches[transaction.id];
       if (batch != null && batch.isNotEmpty) {
         await _processBatch(batch);
       }
 
-      // 记录已完成事务
+      // Record completed transaction
       _completedTransactions.addFirst(transaction.id);
       if (_completedTransactions.length > _maxCompletedTransactions) {
         _completedTransactions.removeLast();
       }
 
-      // 清理事务数据
+      // Clean up transaction data
       _activeTransactions.remove(transaction.id);
       _transactionBatches.remove(transaction.id);
     } catch (e) {
-      Logger.error('提交事务失败: $e', label: 'TransactionManager.commit');
+      Logger.error('Transaction commit failed: $e',
+          label: 'TransactionManager.commit');
       await rollback(transaction);
       rethrow;
     }
   }
 
-  /// 回滚事务
+  /// Rollback transaction
+  /// [transaction] Transaction to rollback
   Future<void> rollback(Transaction? transaction) async {
     if (transaction == null) return;
 
     try {
-      // 清理事务数据
+      // Clean up transaction data
       _activeTransactions.remove(transaction.id);
       _transactionBatches.remove(transaction.id);
     } catch (e) {
-      Logger.error('回滚事务失败: $e', label: 'TransactionManager.rollback');
+      Logger.error('Transaction rollback failed: $e',
+          label: 'TransactionManager.rollback');
       rethrow;
     }
   }
 
-  /// 添加操作到事务批处理
+  /// Add operation to transaction batch
+  /// [transactionId] Target transaction ID
+  /// [operation] Operation details
   void addToBatch(String transactionId, Map<String, dynamic> operation) {
     _transactionBatches[transactionId]?.add(operation);
   }
 
-  /// 处理批处理操作
+  /// Process batch operations
   Future<void> _processBatch(List<Map<String, dynamic>> batch) async {
     for (var operation in batch) {
       await _processOperation(operation);
     }
   }
 
-  /// 处理单个操作
+  /// Process single operation
   Future<void> _processOperation(Map<String, dynamic> operation) async {
     final tableName = operation['table'] as String;
     final dataPath = await _dataStore.getTablePath(tableName);
@@ -113,19 +124,19 @@ class TransactionManager {
           mode: FileMode.append,
         );
         break;
-      // ... 其他操作类型处理 ...
+      // Handle other operation types...
     }
   }
 
-  /// 检查事务状态
+  /// Check if transaction is active
   bool isTransactionActive(String transactionId) {
     return _activeTransactions.containsKey(transactionId);
   }
 
-  /// 获取活跃事务数量
+  /// Get count of active transactions
   int get activeTransactionCount => _activeTransactions.length;
 
-  /// 清理过期事务
+  /// Clean up expired transactions
   Future<void> cleanupExpiredTransactions() async {
     final now = DateTime.now();
     final expiredIds = _activeTransactions.entries
@@ -139,7 +150,8 @@ class TransactionManager {
   }
 }
 
-/// 事务类
+/// Transaction class
+/// Represents a database transaction with lifecycle management
 class Transaction {
   final String id;
   final DateTime startTime;
@@ -152,6 +164,6 @@ class Transaction {
     required this.startTime,
   });
 
-  /// 检查事务是否过期
+  /// Check if transaction has expired
   bool get isExpired => DateTime.now().difference(startTime) > _timeout;
 }

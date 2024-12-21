@@ -1,39 +1,39 @@
-/// 数据存储配置
+/// data store config
 class DataStoreConfig {
-  /// 数据库路径
+  /// database path
   final String dbPath;
 
-  /// 当前基础空间名称
+  /// current base name
   final String baseName;
 
-  /// 压缩级别
+  /// compression level
   final int compressionLevel;
 
-  /// 事务超时时间
+  /// transaction timeout
   final Duration transactionTimeout;
 
-  /// B树阶数
+  /// B-tree order
   final int bTreeOrder;
 
-  /// 是否启用监控
+  /// enable monitoring
   final bool enableMonitoring;
 
-  /// 是否启用压缩
+  /// enable compression
   final bool enableCompression;
 
-  /// 是否启用自动修复
+  /// enable auto repair
   final bool enableAutoRepair;
 
-  /// 全表缓存的文件大小限制(默认10MB)，单位：字节
+  /// max table cache size (default 10MB), unit: byte
   final int maxTableCacheSize;
 
-  /// 全表缓存的表数量限制(默认50个表)
+  /// max table cache count (default 50 tables)
   final int maxTableCacheCount;
 
-  /// 查询缓存的数量限制(默认5000条查询)
+  /// max query cache size (default 5000 queries)
   final int maxQueryCacheSize;
 
-  /// 记录缓存的数量限制(默认10000条记录)
+  /// max record cache size (default 10000 records)
   final int maxRecordCacheSize;
 
   const DataStoreConfig({
@@ -51,7 +51,7 @@ class DataStoreConfig {
     this.maxRecordCacheSize = 10000,
   });
 
-  /// 获取表路径
+  /// get table path
   String getTablePath(String tableName, bool isGlobal) {
     if (isGlobal) {
       return '$dbPath/global/$tableName';
@@ -59,62 +59,62 @@ class DataStoreConfig {
     return '$dbPath/bases/$baseName/$tableName';
   }
 
-  /// 获取基础空间路径
+  /// get base path
   String getBasePath() {
     return '$dbPath/bases/$baseName';
   }
 
-  /// 获取全局空间路径
+  /// get global path
   String getGlobalPath() {
     return '$dbPath/global';
   }
 
-  /// 获取备份路径
+  /// get backup path
   String getBackupPath() {
     return '$dbPath/backups';
   }
 
-  /// 获取日志路径
+  /// get log path
   String getLogPath() {
     return '$dbPath/logs';
   }
 
-  /// 获取索引路径
+  /// get index path
   String getIndexPath(String tableName, String indexName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.$indexName.idx';
   }
 
-  /// 获取统计信息路径
+  /// get stats path
   String getStatsPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.stats';
   }
 
-  /// 获取事务日志路径
+  /// get transaction log path
   String getTransactionLogPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.transaction.log';
   }
 
-  /// 获取校验和文件路径
+  /// get checksum path
   String getChecksumPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.checksum';
   }
 
-  /// 获取数据模型文件路径
+  /// get schema path
   String getSchemaPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.schema';
   }
 
-  /// 获取数据文件路径
+  /// get data path
   String getDataPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.dat';
   }
 
-  /// 获取自增ID文件路径
+  /// get auto increment id path
   String getAutoIncrementPath(String tableName, bool isGlobal) {
     return '${getTablePath(tableName, isGlobal)}.maxid';
   }
 
-  /// 从JSON创建配置
+  /// create config from json
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
     return DataStoreConfig(
       dbPath: json['dbPath'] as String,
@@ -133,7 +133,7 @@ class DataStoreConfig {
     );
   }
 
-  /// 转换为JSON
+  /// convert to json
   Map<String, dynamic> toJson() {
     return {
       'dbPath': dbPath,
@@ -151,7 +151,7 @@ class DataStoreConfig {
     };
   }
 
-  /// 创建新的配置实例
+  /// create new config instance
   DataStoreConfig copyWith({
     String? dbPath,
     String? baseName,

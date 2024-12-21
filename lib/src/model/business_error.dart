@@ -1,18 +1,18 @@
-/// 业务错误类型
+/// business error type
 enum BusinessErrorType {
-  // 开发时错误
-  schemaError, // 表结构错误
-  fieldError, // 字段错误
-  typeError, // 类型错误
+  // development error
+  schemaError, // schema error
+  fieldError, // field error
+  typeError, // type error
 
-  // 运行时错误
-  duplicateKey, // 主键重复
-  duplicateValue, // 唯一值重复
-  notFound, // 记录不存在
-  invalidData, // 数据无效
+  // runtime error
+  duplicateKey, // duplicate key
+  duplicateValue, // duplicate value
+  notFound, // not found
+  invalidData, // invalid data
 }
 
-/// 业务错误
+/// business error
 class BusinessError implements Exception {
   final String message;
   final BusinessErrorType type;
@@ -24,7 +24,7 @@ class BusinessError implements Exception {
     this.data,
   });
 
-  /// 是否为开发时错误
+  /// whether it is a development error
   bool get isDevelopmentError =>
       type == BusinessErrorType.schemaError ||
       type == BusinessErrorType.fieldError ||

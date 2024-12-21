@@ -8,7 +8,7 @@ import '../core/index_manager.dart';
 import '../model/row_pointer.dart';
 import '../model/table_schema.dart';
 
-/// 自动修复器
+/// auto repair
 class AutoRepair {
   final DataStoreImpl _dataStore;
   final IndexManager _indexManager;
@@ -20,21 +20,21 @@ class AutoRepair {
     this._backupManager,
   );
 
-  /// 修复损坏的记录
+  /// repair damaged record
   Future<void> repairRecord(String tableName, String recordId) async {
-    // 从最近的备份中恢复记录
+    // restore record from latest backup
     final backups = await _getBackups(tableName);
     if (backups.isEmpty) {
       throw StateError('No backup available for repair');
     }
 
-    // 尝试从最近的备份中恢复
+    // try to restore from latest backup
     for (var backup in backups) {
       try {
         await _restoreRecordFromBackup(tableName, recordId, backup);
         return;
       } catch (e) {
-        // 继续尝试下一个备份
+        // try next backup
         continue;
       }
     }
@@ -42,18 +42,18 @@ class AutoRepair {
     throw StateError('Unable to repair record from any backup');
   }
 
-  /// 重建索引
+  /// rebuild index
   Future<void> rebuildIndex(String tableName, String indexName) async {
     final tablePath = await _dataStore.getTablePath(tableName);
     final schema = await _dataStore.getTableSchema(tableName);
 
-    // 创建新的索引
+    // create new index
     await _indexManager.createIndex(
       tableName,
       schema.indexes.firstWhere((idx) => idx.indexName == indexName),
     );
 
-    // 读取所有数据并重建索引
+    // read all data and rebuild index
     final dataFile = File('$tablePath.dat');
     final lines = await dataFile.readAsLines();
 
@@ -71,29 +71,29 @@ class AutoRepair {
     }
   }
 
-  /// 修复表结构
+  /// repair table structure
   Future<void> repairTableStructure(String tableName) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
 
-      // 创建临时表
+      // create temp table
       final tempTableName = '${tableName}_repair';
 
-      // 创建新表
+      // create new table
       await _createNewTable(tempTableName, schema);
 
-      // 迁移有效数据
+      // migrate valid data
       await _migrateValidData(tableName, tempTableName, schema);
 
-      // 替换原表
+      // replace original table
       await _replaceTable(tableName, tempTableName);
     } catch (e) {
-      Logger.error('修复表结构失败: $e');
+      Logger.error('repair table structure failed: $e');
       rethrow;
     }
   }
 
-  /// 获取可用的备份
+  /// get available backups
   Future<List<String>> _getBackups(String tableName) async {
     final backupPath = _dataStore.config.getBackupPath();
     final backupDir = Directory(backupPath);
@@ -106,12 +106,12 @@ class AutoRepair {
       }
     }
 
-    // 按时间排序，最新的在前
+    // sort by time, latest first
     backups.sort((a, b) => b.compareTo(a));
     return backups;
   }
 
-  /// 从备份中恢复记录
+  /// restore record from backup
   Future<void> _restoreRecordFromBackup(
     String tableName,
     String recordId,
@@ -120,25 +120,25 @@ class AutoRepair {
     try {
       final backupData = await _backupManager.loadBackup(backupPath);
 
-      // 从备份数据中获取表数据
+      // get table data from backup
       final data = backupData['data'] as Map<String, dynamic>;
       final tableData = data[tableName] as Map<String, dynamic>?;
       if (tableData == null) {
-        throw StateError('备份中未找到表: $tableName');
+        throw StateError('table not found: $tableName');
       }
 
-      // 获取表结构
+      // get table schema
       final schema =
           TableSchema.fromJson(tableData['schema'] as Map<String, dynamic>);
       final primaryKey = schema.primaryKey;
 
-      // 获取记录数据并安全转换类型
+      // get record data and safe convert type
       final recordsList = tableData['data'];
       if (recordsList is! List) {
-        throw StateError('备份中的记录数据格式无效');
+        throw StateError('backup record data format invalid');
       }
 
-      // 查找记录
+      // find record
       Map<String, dynamic>? targetRecord;
       for (var item in recordsList) {
         if (item is Map<String, dynamic> &&
@@ -149,10 +149,10 @@ class AutoRepair {
       }
 
       if (targetRecord == null) {
-        throw StateError('备份中未找到记录 ID: $recordId');
+        throw StateError('record not found: $recordId');
       }
 
-      // 恢复记录
+      // restore record
       final tablePath = await _dataStore.getTablePath(tableName);
       final dataFile = File('$tablePath.dat');
       final sink = dataFile.openWrite(mode: FileMode.append);
@@ -163,12 +163,12 @@ class AutoRepair {
         await sink.close();
       }
     } catch (e) {
-      Logger.error('从备份恢复记录失败: $e');
+      Logger.error('restore record from backup failed: $e');
       rethrow;
     }
   }
 
-  /// 创建新表
+  /// create new table
   Future<void> _createNewTable(String tableName, TableSchema schema) async {
     final tablePath = await _dataStore.getTablePath(tableName);
     final dataFile = File('$tablePath.dat');
@@ -177,14 +177,14 @@ class AutoRepair {
     await dataFile.create();
     await schemaFile.writeAsString(jsonEncode(schema.toJson()));
 
-    // 创建索引
+    // create index
     await _indexManager.createPrimaryIndex(tableName, schema.primaryKey);
     for (var index in schema.indexes) {
       await _indexManager.createIndex(tableName, index);
     }
   }
 
-  /// 迁移有效数据
+  /// migrate valid data
   Future<void> _migrateValidData(
     String sourceName,
     String targetName,
@@ -206,7 +206,7 @@ class AutoRepair {
           final data = jsonDecode(line) as Map<String, dynamic>;
           if (_isValidRecord(data, schema)) {
             sink.writeln(line);
-            // 更新索引
+            // update index
             final encoded = jsonEncode(data);
             startOffset += encoded.length + 1;
             final pointer = await RowPointer.create(
@@ -216,7 +216,7 @@ class AutoRepair {
             await _indexManager.updateIndexes(targetName, data, pointer);
           }
         } catch (e) {
-          // 跳过损坏的记录
+          // skip damaged record
           continue;
         }
       }
@@ -225,7 +225,7 @@ class AutoRepair {
     }
   }
 
-  /// 替换表
+  /// replace table
   Future<void> _replaceTable(String oldName, String newName) async {
     final oldPath = await _dataStore.getTablePath(oldName);
     final newPath = await _dataStore.getTablePath(newName);
@@ -237,7 +237,7 @@ class AutoRepair {
     final newDataFile = File('$newPath.dat');
     final newSchemaFile = File('$newPath.schema');
 
-    // 备份原表
+    // backup original table
     final backupSuffix = DateTime.now().millisecondsSinceEpoch.toString();
     await oldDataFile.rename('${oldDataFile.path}.$backupSuffix');
     await oldSchemaFile.rename('${oldSchemaFile.path}.$backupSuffix');
@@ -245,12 +245,12 @@ class AutoRepair {
       await indexFile.rename('${indexFile.path}.$backupSuffix');
     }
 
-    // 替换为新表
+    // replace with new table
     await newDataFile.rename(oldDataFile.path);
     await newSchemaFile.rename(oldSchemaFile.path);
   }
 
-  /// 获取索引文件
+  /// get index files
   Future<List<File>> _getIndexFiles(String tableName) async {
     final tablePath = await _dataStore.getTablePath(tableName);
     final dir = Directory(tablePath);
@@ -267,7 +267,7 @@ class AutoRepair {
     return files;
   }
 
-  /// 检查记录是否有效
+  /// check record is valid
   bool _isValidRecord(Map<String, dynamic> data, TableSchema schema) {
     try {
       for (var field in schema.fields) {
@@ -285,7 +285,7 @@ class AutoRepair {
     }
   }
 
-  /// 检查数据类型是否有效
+  /// check data type is valid
   bool _isValidDataType(dynamic value, DataType type) {
     switch (type) {
       case DataType.integer:

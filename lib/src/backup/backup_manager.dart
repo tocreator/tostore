@@ -9,7 +9,7 @@ import '../core/data_store_impl.dart';
 import '../model/table_schema.dart';
 import 'backup_info.dart';
 
-/// 备份管理器
+/// backup manager
 class BackupManager {
   final DataStoreImpl _dataStore;
   final DataCompressor _compressor;
@@ -18,63 +18,62 @@ class BackupManager {
       : _compressor = DataCompressor(
             compressionLevel: _dataStore.config.compressionLevel);
 
-  /// 从路径中提取文件名
+  /// extract file name from path
   String _getFileName(String path) {
     final normalizedPath = path.replaceAll('\\', '/');
     final parts = normalizedPath.split('/');
     return parts.last.replaceAll('.dat', '');
   }
 
-  /// 创建备份
+  /// create backup file
   Future<String> createBackup() async {
     final timestamp = DateTime.now().toIso8601String();
     final backupPath = _dataStore.config.getBackupPath();
     final backupFile = File('$backupPath/backup_$timestamp.bak');
 
-    // 创建备份目录
+    // create backup directory
     await Directory(backupPath).create(recursive: true);
 
-    // 收集基础空间和公共路径的数据
+    // collect data of base space and public path
     final allData = <String, Map<String, dynamic>>{};
 
-    // 1. 收集基础空间路径数据
+    // 1. collect data of base space
     final basePath = _dataStore.config.getBasePath();
     await _collectPathData(basePath, allData);
 
-    // 2. 收集全局路径数据
+    // 2. collect data of global path
     final globalPath = _dataStore.config.getGlobalPath();
     await _collectPathData(globalPath, allData);
 
-    // 创建备份数据结构
+    // create backup data structure
     final backupData = {
       'timestamp': timestamp,
       'data': allData,
-      'checksum': '', // 先留空，后面计算
+      'checksum': '', // leave empty, calculate later
     };
 
-    // 序列化并压缩数据
+    // serialize and compress data
     final serialized = jsonEncode(backupData);
     final compressed = _compressor.compress(
       Uint8List.fromList(utf8.encode(serialized)),
     );
 
-    // 计算校验和
+    // calculate checksum
     final checksum = _compressor.calculateChecksum(compressed);
     backupData['checksum'] = checksum.toString();
 
-    // 重新序列化并压缩（现在包含校验和）
     final finalSerialized = jsonEncode(backupData);
     final finalCompressed = _compressor.compress(
       Uint8List.fromList(utf8.encode(finalSerialized)),
     );
 
-    // 写入备份文件
+    // write to backup file
     await backupFile.writeAsBytes(finalCompressed);
 
     return backupFile.path;
   }
 
-  /// 收集指定路径下的数据
+  /// collect data of specified path
   Future<void> _collectPathData(
       String path, Map<String, Map<String, dynamic>> allData) async {
     final dir = Directory(path);
@@ -85,15 +84,15 @@ class BackupManager {
         final tablePath = entity.path.replaceAll('.dat', '');
         final tableName = _getFileName(tablePath);
 
-        // 读取数据文件
+        // read data file
         final lines = await entity.readAsLines();
         final tableData = <String, dynamic>{};
 
-        // 读取表结构
+        // read table schema
         final schema = await _dataStore.getTableSchema(tableName);
         tableData['schema'] = schema;
 
-        // 读取表数据
+        // read table data
         final records = <Map<String, dynamic>>[];
         for (var line in lines) {
           if (line.trim().isEmpty) continue;
@@ -106,33 +105,34 @@ class BackupManager {
     }
   }
 
-  /// 加载备份
+  /// load backup
   Future<Map<String, dynamic>> loadBackup(String backupPath) async {
     final backupFile = File(backupPath);
     if (!await backupFile.exists()) {
       throw FileSystemException('备份文件不存在', backupPath);
     }
 
-    // 读取并解压数据
+    // read and decompress data
     final compressed = await backupFile.readAsBytes();
     final decompressed = _compressor.decompress(compressed);
 
-    // 解析数据
+    // parse data
     final decoded = utf8.decode(decompressed);
     final backupData = jsonDecode(decoded) as Map<String, dynamic>;
 
-    // 验证数据结构
+    // verify data structure
     if (!backupData.containsKey('timestamp') ||
         !backupData.containsKey('data') ||
         !backupData.containsKey('checksum')) {
-      Logger.error('备份数据结构无效', label: 'BackupManager.loadBackup');
-      throw const FormatException('无效的备份文件格式');
+      Logger.error('Invalid backup data structure',
+          label: 'BackupManager.loadBackup');
+      throw const FormatException('Invalid backup file format');
     }
 
     return backupData;
   }
 
-  /// 列出所有备份
+  /// list all backups
   Future<List<BackupInfo>> listBackups() async {
     final backups = <BackupInfo>[];
     final backupPath = _dataStore.config.getBackupPath();
@@ -153,106 +153,108 @@ class BackupManager {
             size: await entity.length(),
           ));
         } catch (e) {
-          // 跳过无效的备份文件
-          Logger.error('跳过无效的备份文件: ${entity.path}, 错误: $e',
+          // skip invalid backup file
+          Logger.error('Skip invalid backup file: ${entity.path}, error: $e',
               label: 'BackupManager.listBackups');
           continue;
         }
       }
     }
 
-    // 按时间排序
+    // sort by timestamp
     backups.sort((a, b) => b.timestamp.compareTo(a.timestamp));
     return backups;
   }
 
-  /// 从备份恢复
+  /// restore from backup
   Future<void> restore(String backupPath) async {
     try {
-      // 加载备份数据
+      // load backup data
       final backupData = await loadBackup(backupPath);
       final data = backupData['data'] as Map<String, dynamic>;
 
-      // 清理现有数据
+      // clean existing data
       final dbDir = Directory(_dataStore.config.getBasePath());
       if (await dbDir.exists()) {
         await dbDir.delete(recursive: true);
       }
       await dbDir.create(recursive: true);
 
-      // 恢复每个表的数据
+      // restore each table data
       for (var entry in data.entries) {
         final tableName = entry.key;
         final tableData = entry.value as Map<String, dynamic>;
 
-        // 恢复表结构
+        // restore table schema
         final schema = TableSchema.fromJson(tableData['schema']);
         await _dataStore.createTable(tableName, schema);
 
-        // 恢复表数据
+        // restore table data
         final records = tableData['data'] as List<dynamic>;
         for (var record in records) {
           await _dataStore.insert(tableName, record as Map<String, dynamic>);
         }
 
-        Logger.info('表 $tableName 恢复完成');
+        Logger.info('Table $tableName restored');
       }
 
-      Logger.info('数据库恢复完成');
+      Logger.info('Database restored');
     } catch (e) {
-      Logger.error('从备份恢复失败: $e', label: 'BackupManager.restore');
+      Logger.error('Failed to restore from backup: $e',
+          label: 'BackupManager.restore');
       rethrow;
     }
   }
 
-  /// 验证备份完整性
+  /// verify backup integrity
   Future<bool> verifyBackup(String backupPath) async {
     try {
       final backupData = await loadBackup(backupPath);
       final storedChecksum = backupData['checksum'] as String;
 
-      // 验证校验和
+      // verify checksum
       if (storedChecksum.isNotEmpty) {
         final file = File(backupPath);
         final content = await file.readAsBytes();
         final actualChecksum =
             _compressor.calculateChecksum(content).toString();
         if (actualChecksum != storedChecksum) {
-          Logger.debug('校验和不匹配');
+          Logger.debug('Checksum mismatch');
           return false;
         }
       }
 
-      // 验证数据完整性
+      // verify data integrity
       final data = backupData['data'] as Map<String, dynamic>;
       for (var tableData in data.values) {
         if (tableData == null || tableData is! Map<String, dynamic>) {
-          Logger.debug('表数据格式无效');
+          Logger.debug('Invalid table data format');
           return false;
         }
 
-        // 验证表结构
+        // verify table schema
         if (!tableData.containsKey('schema')) {
-          Logger.debug('缺少表结构定义');
+          Logger.debug('Missing table schema definition');
           return false;
         }
 
-        // 验证表数据
+        // verify table data
         if (!tableData.containsKey('data') || tableData['data'] is! List) {
-          Logger.debug('表数据格式无效');
+          Logger.debug('Invalid table data format');
           return false;
         }
       }
 
       return true;
     } catch (e) {
-      Logger.error('验证备份失败: $e', label: 'BackupManager.verifyBackup');
+      Logger.error('Failed to verify backup: $e',
+          label: 'BackupManager.verifyBackup');
       return false;
     }
   }
 }
 
-/// 文件变更记录
+/// file change record
 class FileChange {
   final String filePath;
   final DateTime modifiedTime;

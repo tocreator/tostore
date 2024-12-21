@@ -6,7 +6,7 @@ import '../core/data_store_impl.dart';
 import '../model/base_path_changed_event.dart';
 import 'table_statistics.dart';
 
-/// 统计信息收集器
+/// statistics collector
 class StatisticsCollector {
   final DataStoreImpl _dataStore;
   final Map<String, TableStatistics> _statistics = {};
@@ -15,7 +15,7 @@ class StatisticsCollector {
 
   StatisticsCollector(this._dataStore);
 
-  /// 获取表统计信息
+  /// get table statistics
   TableStatistics? getTableStatistics(String tableName) {
     final lastUpdate = _lastUpdateTime[tableName];
     if (lastUpdate == null ||
@@ -25,7 +25,7 @@ class StatisticsCollector {
     return _statistics[tableName];
   }
 
-  /// 收集表统计信息
+  /// collect table statistics
   Future<TableStatistics> collectTableStatistics(String tableName) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
@@ -40,7 +40,7 @@ class StatisticsCollector {
       final fieldStats = <String, FieldStatistics>{};
       var totalRows = 0;
 
-      // 收集每条的统计信息
+      // collect statistics of each line
       for (var line in lines) {
         if (line.trim().isEmpty) continue;
         totalRows++;
@@ -65,21 +65,22 @@ class StatisticsCollector {
         totalRows: totalRows,
       );
 
-      // 更新缓存
+      // update cache
       _statistics[tableName] = stats;
       _lastUpdateTime[tableName] = DateTime.now();
 
-      // 保存统计信息到文件
+      // save statistics to file
       await _saveStatistics(tableName, stats);
 
       return stats;
     } catch (e) {
-      Logger.error('收集统计信息失败: $e', label: 'StatisticsCollector');
+      Logger.error('collect statistics failed: $e',
+          label: 'StatisticsCollector');
       rethrow;
     }
   }
 
-  /// 保存统计信息到文件
+  /// save statistics to file
   Future<void> _saveStatistics(String tableName, TableStatistics stats) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
@@ -88,17 +89,17 @@ class StatisticsCollector {
       final statsFile = File(statsPath);
       await statsFile.writeAsString(jsonEncode(stats.toJson()));
     } catch (e) {
-      Logger.error('保存统计信息失败: $e', label: 'StatisticsCollector');
+      Logger.error('save statistics failed: $e', label: 'StatisticsCollector');
     }
   }
 
-  /// 清除缓存
+  /// invalidate cache
   void invalidateCache(String tableName) {
     _statistics.remove(tableName);
     _lastUpdateTime.remove(tableName);
   }
 
-  /// 更新字段统计信息
+  /// update field statistics
   void _updateFieldStats(
     FieldStatistics stats,
     dynamic value,
@@ -115,7 +116,7 @@ class StatisticsCollector {
       return;
     }
 
-    // 更新最小值
+    // update min value
     if (stats.minValue == null || value.compareTo(stats.minValue) < 0) {
       stats = FieldStatistics(
         distinctValues: stats.distinctValues,
@@ -125,7 +126,7 @@ class StatisticsCollector {
       );
     }
 
-    // 更新最大值
+    // update max value
     if (stats.maxValue == null || value.compareTo(stats.maxValue) > 0) {
       stats = FieldStatistics(
         distinctValues: stats.distinctValues,
@@ -136,9 +137,9 @@ class StatisticsCollector {
     }
   }
 
-  /// 处理基础空间变更
+  /// handle base path changed
   void onBasePathChanged(BasePathChangedEvent event) {
-    // 清理统计信息缓存
+    // clear statistics cache
     _statistics.clear();
     _lastUpdateTime.clear();
   }

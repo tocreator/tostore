@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 
-/// 锁请求
+/// lock request
 class _LockRequest {
   final String id;
   final Completer<void> completer;
@@ -16,7 +16,7 @@ class _LockRequest {
   });
 }
 
-/// 并发控制管理器
+/// concurrency control manager
 class ConcurrencyManager {
   final _readLocks = <String, int>{};
   final _writeLocks = <String, bool>{};
@@ -29,7 +29,7 @@ class ConcurrencyManager {
 
   static const _maxWaitingTime = Duration(milliseconds: 500);
 
-  /// 获取写锁
+  /// acquire write lock
   Future<void> acquireWriteLock(String resource) async {
     if (_lockCache[resource] == true) {
       return;
@@ -64,7 +64,7 @@ class ConcurrencyManager {
     }
   }
 
-  /// 释放写锁
+  /// release write lock
   Future<void> releaseWriteLock(String resource) async {
     if (_lockCache[resource] == false) {
       return;
@@ -77,7 +77,7 @@ class ConcurrencyManager {
     _processWaitingQueue(resource);
   }
 
-  /// 尝试获取写锁
+  /// try acquire write lock
   bool _tryAcquireWriteLock(String resource, String requestId) {
     if (!_writeLocks.containsKey(resource) &&
         (!_readLocks.containsKey(resource) || _readLocks[resource] == 0)) {
@@ -103,7 +103,7 @@ class ConcurrencyManager {
     }
   }
 
-  /// 处理等待队列
+  /// process waiting queue
   void _processWaitingQueue(String resource) {
     final queue = _lockQueues[resource];
     if (queue == null || queue.isEmpty) return;
@@ -129,7 +129,7 @@ class ConcurrencyManager {
     }
   }
 
-  /// 设置超时处理
+  /// setup timeout handler
   void _setupTimeout(String resource, _LockRequest request) {
     Future.delayed(_lockTimeout, () {
       if (!request.completer.isCompleted) {
@@ -140,14 +140,14 @@ class ConcurrencyManager {
     });
   }
 
-  /// 清理失败的请求
+  /// cleanup failed request
   void _cleanupFailedRequest(String resource, _LockRequest request) {
     _lockQueues[resource]?.remove(request);
     _lockHolders.remove(resource);
     _lockCache[resource] = false;
   }
 
-  /// 计算请求优先级
+  /// calculate request priority
   int _calculatePriority(String resource) {
     return 0;
   }

@@ -1,10 +1,10 @@
-/// 表结构定义
+/// table schema
 class TableSchema {
-  final String primaryKey; // 主键
-  final bool autoIncrement; // 是否启用自增
-  final List<FieldSchema> fields; // 字段列表
-  final List<IndexSchema> indexes; // 索引
-  final bool isGlobal; // 是否为全局表
+  final String primaryKey; // primary key
+  final bool autoIncrement; // auto increment
+  final List<FieldSchema> fields; // fields
+  final List<IndexSchema> indexes; // indexes
+  final bool isGlobal; // is global table
 
   const TableSchema({
     required this.primaryKey,
@@ -39,16 +39,16 @@ class TableSchema {
     );
   }
 
-  /// 验证数据是否符合表结构
+  /// validate data against table schema
   bool validateData(Map<String, dynamic> data) {
-    // 检查必填字段
+    // check required fields
     for (var field in fields) {
       if (!field.nullable && !data.containsKey(field.name)) {
         return false;
       }
     }
 
-    // 检查数据类型
+    // check data type
     for (var entry in data.entries) {
       final field = fields.firstWhere(
         (col) => col.name == entry.key,
@@ -59,7 +59,7 @@ class TableSchema {
         return false;
       }
 
-      // 检查字符串长度
+      // check string length
       if (field.maxLength != null &&
           entry.value is String &&
           (entry.value as String).length > field.maxLength!) {
@@ -70,7 +70,7 @@ class TableSchema {
     return true;
   }
 
-  /// 检查数据类型是否匹配
+  /// check data type is valid
   bool _isValidDataType(dynamic value, DataType type) {
     if (value == null) return true;
     switch (type) {
@@ -92,7 +92,7 @@ class TableSchema {
   }
 }
 
-/// 字段定义
+/// field schema
 class FieldSchema {
   final String name;
   final DataType type;
@@ -135,7 +135,7 @@ class FieldSchema {
   }
 }
 
-/// 索引定义
+/// index schema
 class IndexSchema {
   final String? indexName;
   final List<String> fields;
@@ -149,10 +149,10 @@ class IndexSchema {
     this.type = IndexType.btree,
   });
 
-  /// 获取实际的索引名称
+  /// get actual index name
   String get actualIndexName {
     final prefix = unique ? 'uniq_' : 'idx_';
-    // 统一前缀
+    // unified prefix
     final baseName = indexName ?? fields.join('_');
     return '$prefix$baseName';
   }
@@ -179,7 +179,7 @@ class IndexSchema {
   }
 }
 
-/// 数据类型枚举
+/// data type enum
 enum DataType {
   integer,
   double,
@@ -189,9 +189,9 @@ enum DataType {
   datetime,
 }
 
-/// 索引类型
+/// index type enum
 enum IndexType {
-  btree, // 默认,B树索引
-  hash, // 哈希索引
-  bitmap, // 位图索引
+  btree, // default, btree index
+  hash, // hash index
+  bitmap, // bitmap index
 }

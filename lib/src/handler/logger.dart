@@ -5,29 +5,30 @@ import 'package:flutter/foundation.dart';
 import 'common.dart';
 import '../model/log_config.dart';
 
-// 日志类型枚举
+// log type enum
 enum LogType { info, debug, warn, error }
 
-/// 日志记录，调试、信息、警告、错误等类型输出控制台，可自定义标签，以快速检索，设置警告、错误接口回调，方便追踪及排查问题。
-/// 检索技巧：搜索"logger"查看所有类型日志，搜索log-error，查看所有错误
+/// log record, output to console, debug, info, warn, error, etc.
+/// can customize label, for quick search, set warn, error callback, for tracking and troubleshooting.
+/// search tips: search "logger" to view all types of logs, search log-error to view all errors
 class Logger {
-  /// 通用标签，方便定位所有日志
+  /// common label, for quick search
   static String _commonLabel = 'logger';
 
-  /// 日志处理回调函数
+  /// log handler callback
   static void Function(String message, LogType type, String label)?
       _onLogHandler;
 
-  /// 配置接口
+  /// config interface
   static void setConfig({
-    /// 日志处理回调函数
+    /// log handler callback
     Function(
-      String message, // 日志内容
-      LogType type, // 默认警告、错误回调类型
-      String label, // 日志标签，比如发生错误的方法名
+      String message, // log content
+      LogType type, // default warn, error callback type
+      String label, // log label, like method name
     )? onLogHandler,
 
-    /// 设置通用标签，方便定位所有日志
+    /// set common label, for quick search
     String? label,
   }) {
     if (onLogHandler != null) {
@@ -38,21 +39,21 @@ class Logger {
     }
   }
 
-  /// 打印信息日志
+  /// print info log
   static void info(Object? message, {String? label}) {
     final text = toStringWithAll(message);
     label = label == null ? "log-info" : "log-info  $label";
     _log(text, label: label);
   }
 
-  /// 打印调试日志
+  /// print debug log
   static void debug(Object? message, {String? label}) {
     final text = toStringWithAll(message);
     label = label == null ? "log-debug" : "log-debug  $label";
     _log(text, label: label);
   }
 
-  /// 打印警告日志
+  /// print warn log
   static void warn(Object? message, {String? label}) {
     final text = toStringWithAll(message);
     label = label == null ? "log-warn" : "log-warn  $label";
@@ -60,7 +61,7 @@ class Logger {
     _handler(text, LogType.warn, label);
   }
 
-  /// 打印错误日志,label可定义发生错误的方法名
+  /// print error log, label can define the method name
   static void error(Object? message, {String? label}) {
     final text = toStringWithAll(message);
     label = label == null ? "log-error" : "log-error  $label";
@@ -68,7 +69,7 @@ class Logger {
     _handler(text, LogType.error, label);
   }
 
-  /// 统一处理日志回调
+  /// unified log handler
   static void _handler(String message, LogType type, String label) {
     if (!kDebugMode && LogConfig.enableLog) {
       if (_onLogHandler != null) {
@@ -80,7 +81,7 @@ class Logger {
     }
   }
 
-  /// 内部日志处理方法
+  /// internal log handler
   static void _log(Object? message, {String label = "log-info"}) {
     if (kDebugMode) {
       final displayLabel = InternalConfig.showLoggerInternalLabel

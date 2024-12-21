@@ -9,20 +9,20 @@ import '../model/row_pointer.dart';
 import '../model/table_schema.dart';
 import '../query/query_plan.dart';
 
-/// 索引管理器
+/// index manager
 class IndexManager {
   final DataStoreImpl _dataStore;
   final Map<String, BPlusTree> _indexes = {};
   final Map<String, List<Map<String, dynamic>>> _indexBatchQueue = {};
   final Map<String, File> _indexFiles = {};
 
-  // 添加最后更新时间记录
+  // add last update time record
   DateTime? _lastUpdateTime;
   Timer? _updateTimer;
   static const Duration _updateInterval = Duration(seconds: 10);
 
   IndexManager(this._dataStore) {
-    // 启动定时器检查更新
+    // start timer to check update
     _startUpdateTimer();
   }
 
@@ -35,12 +35,12 @@ class IndexManager {
     _updateTimer = null;
   }
 
-  /// 检查并执行更新
+  /// check and execute update
   Future<void> _checkAndUpdate() async {
     final now = DateTime.now();
     if (_lastUpdateTime == null ||
         now.difference(_lastUpdateTime!) >= _updateInterval) {
-      // 处理所有表的待更新索引
+      // handle all tables update index
       for (var tableName in _indexBatchQueue.keys.toList()) {
         if (_indexBatchQueue[tableName]?.isNotEmpty ?? false) {
           final batch =
@@ -53,20 +53,20 @@ class IndexManager {
     }
   }
 
-  /// 更新索引
+  /// update index
   Future<void> updateIndexes(
     String tableName,
     Map<String, dynamic> data,
     RowPointer pointer,
   ) async {
-    // 添加到批处理队列
+    // add to batch queue
     _indexBatchQueue.putIfAbsent(tableName, () => []).add({
       'data': data,
       'pointer': pointer.toString(),
     });
   }
 
-  /// 强制执行所有待更新的索引
+  /// force execute all update index
   Future<void> flushIndexes() async {
     for (var tableName in _indexBatchQueue.keys.toList()) {
       if (_indexBatchQueue[tableName]?.isNotEmpty ?? false) {
@@ -78,20 +78,20 @@ class IndexManager {
     }
   }
 
-  /// 创建主键索引
+  /// create primary index
   Future<void> createPrimaryIndex(String tableName, String primaryKey) async {
     try {
       final indexName = 'pk_$tableName';
-      // 创建 B+ 树
+      // create B+ tree
       final tree = BPlusTree(
         order: _dataStore.config.bTreeOrder,
         isUnique: true,
       );
 
-      // 注册索引
+      // register index
       _indexes[indexName] = tree;
 
-      // 创建索引文件
+      // create index file
       final schema = await _dataStore.getTableSchema(tableName);
       final indexPath =
           _dataStore.config.getIndexPath(tableName, indexName, schema.isGlobal);
@@ -99,26 +99,27 @@ class IndexManager {
       await indexFile.create(recursive: true);
       _indexFiles[indexName] = indexFile;
     } catch (e) {
-      Logger.error('创建主键索引失败: $e', label: 'IndexManager.createPrimaryIndex');
+      Logger.error('create primary index failed: $e',
+          label: 'IndexManager.createPrimaryIndex');
       rethrow;
     }
   }
 
-  /// 创建普通索引
+  /// create normal index
   Future<void> createIndex(String tableName, IndexSchema schema) async {
     try {
       final indexName = schema.actualIndexName;
 
-      // 创建 B+ 树
+      // create B+ tree
       final tree = BPlusTree(
         order: _dataStore.config.bTreeOrder,
         isUnique: schema.unique,
       );
 
-      // 注册索引
+      // register index
       _indexes[indexName] = tree;
 
-      // 创建索引文件
+      // create index file
       final tableSchema = await _dataStore.getTableSchema(tableName);
       final indexPath = _dataStore.config
           .getIndexPath(tableName, indexName, tableSchema.isGlobal);
@@ -126,47 +127,49 @@ class IndexManager {
       await indexFile.create(recursive: true);
       _indexFiles[indexName] = indexFile;
     } catch (e) {
-      Logger.error('创建索引失败: $e', label: 'IndexManager.createIndex');
+      Logger.error('create index failed: $e',
+          label: 'IndexManager.createIndex');
       rethrow;
     }
   }
 
-  /// 获取索引
+  /// get index
   BPlusTree? getIndex(String indexName) {
     final index = _indexes[indexName];
     return index;
   }
 
-  /// 提取索引键
+  /// extract index key
   dynamic _extractIndexKey(String indexName, Map<String, dynamic> data) async {
     try {
-      // 获取索引定义
+      // get index definition
       final index = _indexes[indexName];
       if (index == null) {
         Logger.warn('警告: 索引 $indexName 未找到');
         return null;
       }
 
-      // 获取索引字段的值
+      // get index field value
       if (indexName.startsWith('pk_')) {
-        // 主键索引 - 从表名中提取主键字段名
-        final tableName = indexName.substring(3); // 去掉 'pk_' 前缀
+        // primary index - extract primary key field name from table name
+        final tableName = indexName.substring(3); // remove 'pk_' prefix
         final schema = await _dataStore.getTableSchema(tableName);
         final primaryKeyValue = data[schema.primaryKey];
         return primaryKeyValue;
       } else {
-        // 普通索引或唯一索引 - 直接从索引名提取字段名
-        final fieldName = indexName.split('_')[1]; // 获取字段名部分
+        // normal index or unique index - extract field name from index name
+        final fieldName = indexName.split('_')[1]; // get field name
         final value = data[fieldName];
         return value;
       }
     } catch (e) {
-      Logger.error('提取索引键失败: $e', label: 'IndexManager._extractIndexKey');
+      Logger.error('extract index key failed: $e',
+          label: 'IndexManager._extractIndexKey');
       return null;
     }
   }
 
-  /// 创建查询计划
+  /// create query plan
   Future<QueryPlan> createQueryPlan(
     String tableName,
     Map<String, dynamic>? where,
@@ -180,7 +183,7 @@ class IndexManager {
       ]);
     }
 
-    // 查找最佳索引
+    // find best index
     final bestIndex = _findBestIndex(tableName, where);
     if (bestIndex != null) {
       return QueryPlan([
@@ -204,14 +207,14 @@ class IndexManager {
     ]);
   }
 
-  /// 查找最佳索引
+  /// find best index
   String? _findBestIndex(String tableName, Map<String, dynamic> where) {
-    // 首先检查主键索引
+    // first check primary index
     if (where.containsKey('id') && _indexes.containsKey('id_pk')) {
       return 'id_pk';
     }
 
-    // 然后检查普通索引
+    // then check normal index
     for (var key in where.keys) {
       final idxName = '${key}_idx';
       if (_indexes.containsKey(idxName)) {
@@ -222,7 +225,7 @@ class IndexManager {
     return null;
   }
 
-  /// 从所有索引中删除记录
+  /// delete record from all indexes
   Future<void> deleteFromIndexes(
       String tableName, Map<String, dynamic> record) async {
     for (var entry in _indexes.entries) {
@@ -234,30 +237,31 @@ class IndexManager {
     }
   }
 
-  /// 重新初始化所有索引
+  /// reset all indexes
   Future<void> resetIndexes(String tableName) async {
     try {
-      // 获取表结构
+      // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
 
-      // 重新创建主键索引
+      // reset primary index
       await createPrimaryIndex(tableName, schema.primaryKey);
 
-      // 重新创建其他索引
+      // reset other indexes
       for (var index in schema.indexes) {
         await createIndex(tableName, index);
       }
     } catch (e) {
-      Logger.error('重置索引失败: $e', label: 'IndexManager.resetIndexes');
+      Logger.error('reset indexes failed: $e',
+          label: 'IndexManager.resetIndexes');
       rethrow;
     }
   }
 
-  /// 检查唯一约束
+  /// check unique constraints
   Future<void> checkUniqueConstraints(
       String tableName, Map<String, dynamic> data) async {
     try {
-      // 检查所有唯一索引约束
+      // check all unique index constraints
       for (var entry in _indexes.entries) {
         if (entry.value.isUnique) {
           final indexName = entry.key;
@@ -265,51 +269,53 @@ class IndexManager {
           if (indexKey != null) {
             final existingValues = await entry.value.search(indexKey);
             if (existingValues.isNotEmpty) {
-              // 如果是更新操作，检查是否是同一条记录
+              // if update operation, check if it is the same record
               if (existingValues.first['id'] != data['id']) {
-                // 如果是主键索引，抛出重复键错误
+                // if primary index, throw duplicate key error
                 if (indexName == 'id_pk') {
-                  throw StateError('主键重复: ${data['id']}');
+                  throw StateError('duplicate primary key: ${data['id']}');
                 }
-                // 如果是唯一索引，抛出复值错误
-                final fieldName = indexName.split('_')[0]; // 从索引名获取字段名
-                Logger.warn('字段 $fieldName 的值 $indexKey 已存在');
-                throw StateError('字段 $fieldName 的值 $indexKey 已存在');
+                // if unique index, throw duplicate value error
+                final fieldName =
+                    indexName.split('_')[0]; // get field name from index name
+                Logger.warn('field $fieldName value $indexKey already exists');
+                throw StateError(
+                    'field $fieldName value $indexKey already exists');
               }
             }
           }
         }
       }
     } catch (e) {
-      Logger.error('检查唯一约束失败: $e',
+      Logger.error('check unique constraints failed: $e',
           label: 'IndexManager.checkUniqueConstraints');
       rethrow;
     }
   }
 
-  /// 批量更新索引
+  /// batch update indexes
   Future<void> batchUpdateIndexes(
       String tableName, List<Map<String, dynamic>> records) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
       final primaryKey = schema.primaryKey;
 
-      // 收集主键索引更新
+      // collect primary index updates
       final pkUpdates = <dynamic, RowPointer>{};
-      // 收集二级索引更新
+      // collect secondary index updates
       final secondaryUpdates = <String, Map<dynamic, List<dynamic>>>{};
 
-      // 预处理批次数据
+      // preprocess batch data
       for (var record in records) {
         final data = record['data'] as Map<String, dynamic>;
         final pointer = RowPointer.fromString(record['pointer'] as String);
         final primaryKeyValue = data[primaryKey];
 
         if (primaryKeyValue != null) {
-          // 收集主键索引更新
+          // collect primary index updates
           pkUpdates[primaryKeyValue] = pointer;
 
-          // 收集二级索引更新
+          // collect secondary index updates
           for (var index in schema.indexes) {
             final indexName = index.actualIndexName;
             final indexValue = data[index.fields.first];
@@ -323,7 +329,7 @@ class IndexManager {
         }
       }
 
-      // 批量更新主键索引
+      // batch update primary index
       final pkIndex = getIndex('pk_$tableName');
       if (pkIndex != null) {
         for (var entry in pkUpdates.entries) {
@@ -331,7 +337,7 @@ class IndexManager {
         }
       }
 
-      // 批量更新二级索引
+      // batch update secondary indexes
       for (var index in schema.indexes) {
         final indexName = index.actualIndexName;
         final btIndex = getIndex(indexName);
@@ -344,22 +350,22 @@ class IndexManager {
         }
       }
     } catch (e, stack) {
-      Logger.error('''批量更新索引失败: 
+      Logger.error('''batch update indexes failed: 
         error: $e
         stack: $stack
       ''', label: 'IndexManager.batchUpdateIndexes');
     }
   }
 
-  /// 处理基础空间变更
+  /// handle base path changed
   void onBasePathChanged() {
-    // 清理索引缓存
+    // clear index cache
     _indexes.clear();
     _indexFiles.clear();
     _indexBatchQueue.clear();
   }
 
-  /// 异步更新索引
+  /// async update indexes
   void updateIndexesAsync(
     String tableName,
     Map<String, dynamic> data,
@@ -371,7 +377,7 @@ class IndexManager {
     });
   }
 
-  /// 获取所有索引的总大小
+  /// get total size of all indexes
   Future<int> getTotalIndexSize() async {
     int totalSize = 0;
     try {
@@ -382,7 +388,8 @@ class IndexManager {
         }
       }
     } catch (e) {
-      Logger.error('获取索引大小失败: $e', label: 'IndexManager.getTotalIndexSize');
+      Logger.error('get total index size failed: $e',
+          label: 'IndexManager.getTotalIndexSize');
     }
     return totalSize;
   }

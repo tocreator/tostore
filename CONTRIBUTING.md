@@ -1,71 +1,78 @@
-# 贡献指南
+# Contributing to ToStore
 
-感谢你考虑为 ToStore 做出贡献！
+[English](#english) | [中文](#中文)
 
-## 开发流程
+## English
 
-1. Fork 项目
-2. 创建你的特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交你的修改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启一个 Pull Request
+### How to Contribute
 
-## 代码规范
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-- 遵循 [Effective Dart](https://dart.dev/guides/language/effective-dart) 编码规范
-- 使用 `dart format` 格式化代码
-- 确保通过所有测试 (`dart test`)
-- 保持代码覆盖率
+### Development Guidelines
 
-## 提交 Pull Request
+- Follow Dart's style guide
+- Write clear commit messages
+- Add tests for new features
+- Update documentation when needed
+- Keep performance in mind
 
-1. PR 标题清晰描述改动
-2. 详细描述改动的动机和具体实现
-3. 确保所有 CI 检查通过
-4. 更新相关文档
+### Pull Request Process
 
-## 报告 Bug
+1. Update the README.md with details of changes if needed
+2. Update the version numbers following [Semantic Versioning](https://semver.org/)
 
-1. 使用 GitHub Issues
-2. 描述问题和复现步骤
-3. 提供环境信息和错误日志
+### Code Style
 
-## 功能建议
+- Use `dart format` before committing
+- Follow the [Effective Dart](https://dart.dev/guides/language/effective-dart) guidelines
+- Keep code clean and maintainable
 
-1. 先在 Discussions 中讨论
-2. 说明使用场景和解决方案
-3. 等待社区反馈
+### Testing
 
-## 开发环境设置
+- Write unit tests for new features
+- Ensure all tests pass before submitting PR
+- Include performance tests for critical components
 
-```bash
-# 获取依赖
-dart pub get
+## 中文
 
-# 运行测试
-dart test
+### 如何贡献
 
-# 检查代码格式
-dart format .
+1. Fork 本仓库
+2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m '添加某个特性'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 提交 Pull Request
 
-# 运行分析器
-dart analyze
-```
+### 开发指南
 
-## 文档贡献
+- 遵循 Dart 代码风格指南
+- 编写清晰的提交信息
+- 为新功能添加测试
+- 及时更新文档
+- 注意性能优化
 
-- 改进 README
-- 补充 Wiki 文档
-- 添加代码示例
-- 修正错别字
+### Pull Request 流程
 
-## 版本发布
+1. 如有必要，更新 README.md
+2. 遵循[语义化版本](https://semver.org/)更新版本号
 
-- 遵循 [语义化版本](https://semver.org/lang/zh-CN/)
-- 更新 CHANGELOG.md
-- 标记版本号
+### 代码风格
 
+- 提交前使用 `dart format` 格式化代码
+- 遵循 [Effective Dart](https://dart.dev/guides/language/effective-dart) 指南
+- 保持代码整洁和可维护性
 
-## 许可证
+### 测试
 
-贡献代码时，你同意将其授权为 [MIT 许可证](LICENSE)。 
+- 为新功能编写单元测试
+- 提交 PR 前确保所有测试通过
+- 为关键组件包含性能测试
+
+---
+
+Thank you for contributing to ToStore!
+感谢您为 ToStore 做出贡献！

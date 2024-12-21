@@ -1,32 +1,32 @@
 import 'table_schema.dart';
 
-/// 表信息
+/// table info
 class TableInfo {
-  /// 表名
+  /// table name
   final String tableName;
 
-  /// 记录总数
+  /// record count
   final int recordCount;
 
-  /// 缓存记录数量
+  /// cache record count
   final int cacheCount;
 
-  /// 文件大小(字节)
+  /// file size (byte)
   final int fileSize;
 
-  /// 索引数量
+  /// index count
   final int indexCount;
 
-  /// 表结构
+  /// table schema
   final TableSchema schema;
 
-  /// 最后修改时间
+  /// last modified time
   final DateTime? lastModified;
 
-  /// 创建时间
+  /// created time
   final DateTime? createdAt;
 
-  /// 是否为全局表
+  /// is global table
   final bool isGlobal;
 
   const TableInfo({
@@ -41,7 +41,7 @@ class TableInfo {
     this.createdAt,
   });
 
-  /// 获取格式化的文件大小
+  /// get formatted file size
   String get formattedFileSize {
     if (fileSize < 1024) return '$fileSize B';
     if (fileSize < 1024 * 1024) {
@@ -53,7 +53,7 @@ class TableInfo {
     return '${(fileSize / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
-  /// 转换为JSON
+  /// convert to json
   Map<String, dynamic> toJson() => {
         'tableName': tableName,
         'recordCount': recordCount,

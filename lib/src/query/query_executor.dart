@@ -10,7 +10,7 @@ import 'query_cache_manager.dart';
 import 'query_condition.dart';
 import 'query_plan.dart';
 
-/// 查询执行器
+/// query executor
 class QueryExecutor {
   final DataStoreImpl _dataStore;
   final IndexManager _indexManager;
@@ -21,7 +21,7 @@ class QueryExecutor {
     this._indexManager,
   ) : queryCacheManager = QueryCacheManager(_dataStore);
 
-  /// 执行查询
+  /// execute query
   Future<List<Map<String, dynamic>>> execute(
     QueryPlan plan,
     String tableName, {
@@ -31,15 +31,15 @@ class QueryExecutor {
     int? offset,
   }) async {
     try {
-      // 1. 尝试使用缓存
+      // 1. try to use cache
       final cache = queryCacheManager.getEntireTable(tableName);
       if (cache != null) {
-        // 检查缓存类型和查询条件
+        // check cache type and query condition
         final isFullCache = queryCacheManager.isTableFullyCached(tableName);
         final isSpecificQuery =
             condition != null && await _isSpecificQuery(tableName, condition);
 
-        // 决定是否使用缓存
+        // decide whether to use cache
         if (isFullCache || isSpecificQuery) {
           var results = cache;
           if (condition != null) {
@@ -64,35 +64,35 @@ class QueryExecutor {
         offset: offset,
       );
 
-      // 2. 检查查询缓存
+      // 2. check query cache
       final queryResult = queryCacheManager.getQuery(cacheKey);
       if (queryResult != null) {
-        // 获取表结构以获取主键字段
+        // get table schema to get primary key field
         final schema = await _dataStore.getTableSchema(tableName);
         final primaryKey = schema.primaryKey;
 
-        // 将缓存结果转换为 Map 以便更新
+        // convert cache result to Map to update
         final resultMap = <String, Map<String, dynamic>>{};
         for (var record in queryResult) {
           resultMap[record[primaryKey].toString()] =
               Map<String, dynamic>.from(record);
         }
 
-        // 检查待写入队列中的数据
+        // check data in write queue
         final pendingData = _dataStore.fileManager.writeQueue[tableName] ?? [];
         final conditions = condition?.build();
 
         for (var record in pendingData) {
           final recordId = record[primaryKey].toString();
           if (conditions == null || _matchConditions(record, conditions)) {
-            // 更新或添加记录
+            // update or add record
             resultMap[recordId] = Map<String, dynamic>.from(record);
           }
         }
 
-        // 转换回列表
+        // convert back to list
         final updatedResults = resultMap.values.toList();
-        // 应用排序和分页
+        // apply sort and pagination
         if (orderBy != null) {
           _applySort(updatedResults, orderBy);
         }
@@ -101,9 +101,9 @@ class QueryExecutor {
         return finalResults;
       }
 
-      // 3. 执行实际查询
+      // 3. execute actual query
       final results = await _executeQueryPlan(plan, tableName);
-      // 4. 应用查询条件
+      // 4. apply query condition
       var processedResults = results;
       if (condition != null) {
         final conditions = condition.build();
@@ -115,7 +115,7 @@ class QueryExecutor {
         _applySort(processedResults, orderBy);
       }
 
-      // 5. 分页并缓存结果
+      // 5. paginate and cache results
       final paginatedResults =
           _paginateResults(processedResults, limit, offset);
       if (paginatedResults.isNotEmpty) {
@@ -124,13 +124,14 @@ class QueryExecutor {
 
       return paginatedResults;
     } catch (e, stackTrace) {
-      Logger.error('查询执行失败: $e', label: 'QueryExecutor.execute');
-      Logger.debug('堆栈跟踪: $stackTrace');
+      Logger.error('query execution failed: $e',
+          label: 'QueryExecutor.execute');
+      Logger.debug('stack trace: $stackTrace');
       rethrow;
     }
   }
 
-  /// 执行查询计划
+  /// execute query plan
   Future<List<Map<String, dynamic>>> _executeQueryPlan(
     QueryPlan plan,
     String tableName,
@@ -163,18 +164,18 @@ class QueryExecutor {
     return results;
   }
 
-  /// 执行表扫描
+  /// perform table scan
   Future<List<Map<String, dynamic>>> _performTableScan(String tableName) async {
     final tablePath = await _dataStore.getTablePath(tableName);
     final dataFile = File('$tablePath.dat');
 
-    // 获取表结构以获取主键字段
+    // get table schema to get primary key field
     final schema = await _dataStore.getTableSchema(tableName);
     final primaryKey = schema.primaryKey;
 
-    // 1. 检查是否有全表缓存
+    // 1. check if there is full table cache
     if (queryCacheManager.isTableFullyCached(tableName)) {
-      // 检查文件是否被修改过
+      // check if file is modified
       final cache = queryCacheManager.getEntireTable(tableName);
       if (cache != null) {
         final cacheTime = queryCacheManager.getTableCacheTime(tableName);
@@ -185,14 +186,14 @@ class QueryExecutor {
       }
     }
 
-    // 2. 读取文件内容
+    // 2. read file content
     final resultMap = <String, Map<String, dynamic>>{};
     if (await dataFile.exists()) {
-      // 获取文件大小
+      // get file size
       final fileSize = await dataFile.length();
       await _dataStore.fileManager.updateFileSize(tableName, fileSize);
 
-      // 如果文件大小在限制范围内，读取并缓存
+      // if file size is within limit, read and cache
       if (_dataStore.fileManager.allowFullTableCache(
         tableName,
         _dataStore.config.maxTableCacheSize,
@@ -204,25 +205,25 @@ class QueryExecutor {
             final data = jsonDecode(line) as Map<String, dynamic>;
             resultMap[data[primaryKey].toString()] = data;
           } catch (e) {
-            Logger.error('解析记录失败: $e',
+            Logger.error('parse record failed: $e',
                 label: 'QueryExecutor._performTableScan');
             continue;
           }
         }
 
-        // 缓存整个表
+        // cache entire table
         await queryCacheManager.cacheEntireTable(
           tableName,
           resultMap.values.toList(),
           primaryKey,
         );
       } else {
-        Logger.debug('表太大，跳过缓存: $tableName',
+        Logger.debug('table too large, skip cache: $tableName',
             label: 'QueryExecutor._performTableScan');
       }
     }
 
-    // 3. 合并待写入队列中的数据
+    // 3. merge data in write queue
     final pendingData = _dataStore.fileManager.writeQueue[tableName] ?? [];
     for (var record in pendingData) {
       resultMap[record[primaryKey].toString()] =
@@ -232,7 +233,7 @@ class QueryExecutor {
     return resultMap.values.toList();
   }
 
-  /// 执行索引扫描
+  /// perform index scan
   Future<List<Map<String, dynamic>>> _performIndexScan(
     String tableName,
     String indexName,
@@ -243,7 +244,7 @@ class QueryExecutor {
       final index = _indexManager.getIndex(indexName);
       if (index == null) return _performTableScan(tableName);
 
-      // 1. 获取查询值
+      // 1. get search value
       dynamic searchValue;
       if (indexName.startsWith('pk_')) {
         searchValue = conditions[schema.primaryKey];
@@ -255,15 +256,15 @@ class QueryExecutor {
       }
       if (searchValue == null) return _performTableScan(tableName);
 
-      // 2. 使用索引查询
+      // 2. use index to search
       final indexResults = await index.search(searchValue);
       if (indexResults.isEmpty) return _performTableScan(tableName);
 
-      // 3. 获取完整记录
+      // 3. get full record
       final results = <Map<String, dynamic>>[];
 
       if (indexName.startsWith('pk_')) {
-        // 主键索引直接返回行指针
+        // primary key index directly return row pointer
         for (var pointer in indexResults) {
           if (pointer is RowPointer) {
             final record = await _getRecordByPointer(tableName, pointer);
@@ -273,11 +274,11 @@ class QueryExecutor {
           }
         }
       } else {
-        // 二级索引返回主键值，需要先查主键索引
+        // secondary index return primary key value, need to search primary key index first
         final pkIndex = _indexManager.getIndex('pk_$tableName');
         if (pkIndex == null) return _performTableScan(tableName);
         for (var primaryKeyValue in indexResults) {
-          // 通过主键索引获取行指针
+          // get row pointer by primary key index
           final pointers = await pkIndex.search(primaryKeyValue);
           if (pointers.isNotEmpty && pointers.first is RowPointer) {
             final record = await _getRecordByPointer(
@@ -293,30 +294,31 @@ class QueryExecutor {
 
       return results;
     } catch (e) {
-      Logger.error('索引扫描失败: $e', label: 'QueryExecutor-_performIndexScan');
+      Logger.error('index scan failed: $e',
+          label: 'QueryExecutor-_performIndexScan');
       return _performTableScan(tableName);
     }
   }
 
-  /// 匹配记录是否满足条件
+  /// match record whether satisfies conditions
   bool _matchConditions(
       Map<String, dynamic> record, Map<String, dynamic> conditions) {
-    // 处理 OR 条件
+    // handle OR condition
     if (conditions.containsKey('OR')) {
       final orConditions = conditions['OR'] as List;
-      // 先处理非 OR 条件
+      // first handle non-OR conditions
       final baseConditions = Map<String, dynamic>.from(conditions)
         ..remove('OR');
       if (baseConditions.isNotEmpty &&
           !_matchBasicConditions(record, baseConditions)) {
         return false;
       }
-      // 再处理 OR 条件
+      // then handle OR conditions
       return orConditions.any((condition) =>
           _matchConditions(record, condition as Map<String, dynamic>));
     }
 
-    // 处理 AND 条件
+    // handle AND conditions
     if (conditions.containsKey('AND')) {
       final andConditions = conditions['AND'] as List;
       return andConditions.every((condition) =>
@@ -326,7 +328,7 @@ class QueryExecutor {
     return _matchBasicConditions(record, conditions);
   }
 
-  /// 匹配基本条件（非 AND/OR）
+  /// match basic conditions (not AND/OR)
   bool _matchBasicConditions(
       Map<String, dynamic> record, Map<String, dynamic> conditions) {
     for (var entry in conditions.entries) {
@@ -334,14 +336,14 @@ class QueryExecutor {
       final value = entry.value;
 
       if (value is Map) {
-        // 处理操作符条件
+        // handle operator conditions
         for (var op in value.entries) {
           if (!_matchOperator(record[field], op.key, op.value)) {
             return false;
           }
         }
       } else {
-        // 简单相等条件
+        // simple equal condition
         if (record[field] != value) {
           return false;
         }
@@ -350,7 +352,7 @@ class QueryExecutor {
     return true;
   }
 
-  /// 匹配单个操作符条件
+  /// match single operator condition
   bool _matchOperator(
       dynamic fieldValue, String operator, dynamic compareValue) {
     switch (operator.toUpperCase()) {
@@ -404,7 +406,7 @@ class QueryExecutor {
     }
   }
 
-  /// 安全的值比较
+  /// safe value comparison
   int _compareValues(dynamic a, dynamic b) {
     if (a == null || b == null) return 0;
 
@@ -424,7 +426,7 @@ class QueryExecutor {
     return a.toString().compareTo(b.toString());
   }
 
-  /// 应用排序
+  /// apply sort
   void _applySort(List<Map<String, dynamic>> data, List<String> orderBy) {
     try {
       data.sort((a, b) {
@@ -432,16 +434,16 @@ class QueryExecutor {
           final desc = field.startsWith('-');
           final fieldName = desc ? field.substring(1) : field;
 
-          // 获取字段值
+          // get field value
           final valueA = a[fieldName];
           final valueB = b[fieldName];
 
-          // 处理空值
+          // handle null value
           if (valueA == null && valueB == null) continue;
           if (valueA == null) return desc ? -1 : 1;
           if (valueB == null) return desc ? 1 : -1;
 
-          // 比较值
+          // compare value
           int compareResult;
           if (valueA is num && valueB is num) {
             compareResult = valueA.compareTo(valueB);
@@ -456,12 +458,12 @@ class QueryExecutor {
         return 0;
       });
     } catch (e) {
-      Logger.error('排序失败: $e', label: "QueryExecutor-_applySort");
+      Logger.error('sort failed: $e', label: "QueryExecutor-_applySort");
       throw StateError('Error applying sort: ${e.toString()}');
     }
   }
 
-  /// 分页结果
+  /// paginate results
   List<Map<String, dynamic>> _paginateResults(
     List<Map<String, dynamic>> results,
     int? limit,
@@ -476,24 +478,24 @@ class QueryExecutor {
     return results;
   }
 
-  /// 使单条记录的相关缓存失效
+  /// invalidate single record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
     queryCacheManager.removeCachedRecord(tableName, primaryKeyValue.toString());
   }
 
-  /// 使多条记录的相关缓存失效
+  /// invalidate multiple records related cache
   Future<void> invalidateRecords(
       String tableName, Set<dynamic> primaryKeyValues) async {
     await queryCacheManager.invalidateRecords(tableName, primaryKeyValues);
   }
 
-  /// 清除表的所有缓存
+  /// invalidate all cache of a table
   Future<void> invalidateCache(String tableName) async {
     await queryCacheManager.invalidateRecords(tableName, {});
   }
 
-  /// 通过行指针获取记录
+  /// get record by row pointer
   Future<Map<String, dynamic>?> _getRecordByPointer(
     String tableName,
     RowPointer pointer,
@@ -508,7 +510,7 @@ class QueryExecutor {
       }
     }
 
-    // 2. 从文件读取
+    // 2. read from file
     final file = File('${_dataStore.getTablePath(tableName)}.dat');
     if (!await file.exists()) return null;
     try {
@@ -519,7 +521,7 @@ class QueryExecutor {
 
         final line = utf8.decode(bytes);
         final record = jsonDecode(line.trim()) as Map<String, dynamic>;
-        // 验证记录完整性
+        // verify record integrity
         if (pointer.verifyContent(line.trim())) {
           return record;
         }
@@ -528,52 +530,53 @@ class QueryExecutor {
         await raf.close();
       }
     } catch (e) {
-      Logger.error('读取记录失败: $e', label: 'QueryExecutor._getRecordByPointer');
+      Logger.error('read record failed: $e',
+          label: 'QueryExecutor._getRecordByPointer');
       return null;
     }
   }
 
-  /// 判断是否为针对性查询（比如按主键或索引字段查询）
+  /// check if it is a specific query (like query by primary key or index field)
   Future<bool> _isSpecificQuery(
     String tableName,
     QueryCondition condition,
   ) async {
     try {
-      // 获取表结构
+      // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
       final conditions = condition.build();
 
-      // 1. 检查是否是主键查询
+      // 1. check if it is primary key query
       if (conditions.containsKey(schema.primaryKey)) {
         final pkCondition = conditions[schema.primaryKey];
-        // 主键的精确匹配或 IN 查询都认为是针对性查询
+        // primary key exact match or IN query are considered specific queries
         if (pkCondition is Map) {
           final operator = pkCondition.keys.first;
           return operator == '=' || operator == 'IN';
         }
-        // 直接值比较
+        // direct value comparison
         return true;
       }
 
-      // 2. 检查是否使用了索引字段的精确查询
+      // 2. check if index field exact query is used
       for (var index in schema.indexes) {
-        // 只考虑单字段索引的精确查询
+        // only consider single field index exact query
         if (index.fields.length == 1) {
           final fieldName = index.fields.first;
           if (conditions.containsKey(fieldName)) {
             final fieldCondition = conditions[fieldName];
             if (fieldCondition is Map) {
               final operator = fieldCondition.keys.first;
-              // 索引字段的精确匹配或 IN 查询
+              // index field exact match or IN query
               return operator == '=' || operator == 'IN';
             }
-            // 直接值比较
+            // direct value comparison
             return true;
           }
         }
       }
 
-      // 3. 检查是否是唯一字段的精确查询
+      // 3. check if it is unique field exact query
       for (var field in schema.fields) {
         if (field.unique && conditions.containsKey(field.name)) {
           final fieldCondition = conditions[field.name];
@@ -585,16 +588,17 @@ class QueryExecutor {
         }
       }
 
-      // 其他情况都不认为是针对性查询
+      // other cases are not considered specific queries
       return false;
     } catch (e) {
-      Logger.error('判断针对性查询失败: $e', label: 'QueryExecutor._isSpecificQuery');
+      Logger.error('check specific query failed: $e',
+          label: 'QueryExecutor._isSpecificQuery');
       return false;
     }
   }
 }
 
-/// 查询范围
+/// query range
 class QueryRange {
   final dynamic start;
   final dynamic end;

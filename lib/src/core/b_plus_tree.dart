@@ -1,6 +1,6 @@
 import '../handler/logger.dart';
 
-/// B+ 树实现
+/// B+ tree implementation
 class BPlusTree {
   final int order;
   final bool isUnique;
@@ -11,9 +11,9 @@ class BPlusTree {
     this.isUnique = false,
   });
 
-  /// 插入键值对
+  /// insert key-value pair
   Future<void> insert(dynamic key, dynamic value) async {
-    // 处理 null 值
+    // handle null value
     if (key == null) return;
 
     if (root == null) {
@@ -26,7 +26,7 @@ class BPlusTree {
     var node = root!;
     final path = <BPlusTreeNode>[];
 
-    // 查找插入位置
+    // find insert position
     while (!node.isLeaf) {
       path.add(node);
       int i = 0;
@@ -36,62 +36,62 @@ class BPlusTree {
       node = node.children[i];
     }
 
-    // 在叶子节点中插入或更新
+    // insert or update in leaf node
     int insertPosition = 0;
     while (insertPosition < node.keys.length &&
         _compareKeys(key, node.keys[insertPosition]) > 0) {
       insertPosition++;
     }
 
-    // 检查节点状态
+    // check node state
     if (node.keys.length != node.values.length) {
-      Logger.error('''插入前节点状态异常:
-        keys长度: ${node.keys.length}
-        values长度: ${node.values.length}
+      Logger.error('''insert before node state exception:
+        keys length: ${node.keys.length}
+        values length: ${node.values.length}
       ''', label: 'BPlusTree.insert');
-      // 修复节点状态
+      // fix node state
       while (node.values.length < node.keys.length) {
         node.values.add([]);
       }
     }
 
     try {
-      // 检查是否存在相同的键
+      // check if key exists
       if (insertPosition < node.keys.length &&
           _compareKeys(key, node.keys[insertPosition]) == 0) {
         if (isUnique) {
-          // 对于唯一索引，更新值
+          // for unique index, update value
           node.values[insertPosition] = [value];
         } else {
-          // 对于非唯一索引，确保值不重复
+          // for non-unique index, ensure value is not duplicate
           final values = node.values[insertPosition];
           if (!values.contains(value)) {
             values.add(value);
           }
         }
       } else {
-        // 插入新的键值对
+        // insert new key-value pair
         node.keys.insert(insertPosition, key);
         node.values.insert(insertPosition, [value]);
       }
 
-      // 验证插入后的状态
+      // check insert after state
       if (node.keys.length != node.values.length) {
-        Logger.error('''插入后节点状态异常:
-          keys长度: ${node.keys.length}
-          values长度: ${node.values.length}
-          插入位置: $insertPosition
+        Logger.error('''insert after node state exception:
+          keys length: ${node.keys.length}
+          values length: ${node.values.length}
+          insert position: $insertPosition
           key: $key
           value: $value
         ''', label: 'BPlusTree.insert');
       }
 
-      // 处理节点分裂
+      // handle node split
       if (node.keys.length > order) {
         await _split(node, path);
       }
     } catch (e, stack) {
-      Logger.error('''插入操作失败:
+      Logger.error('''insert operation failed:
         error: $e
         stack: $stack
         key: $key
@@ -102,14 +102,14 @@ class BPlusTree {
     }
   }
 
-  /// 安全的键比较方法
+  /// safe key comparison method
   int _compareKeys(dynamic key1, dynamic key2) {
-    // 处理 null 值
+    // handle null value
     if (key1 == null && key2 == null) return 0;
     if (key1 == null) return -1;
     if (key2 == null) return 1;
 
-    // 处理不同类型的比较
+    // handle different type comparison
     if (key1 is num && key2 is num) {
       return key1.compareTo(key2);
     }
@@ -122,19 +122,19 @@ class BPlusTree {
       return key1.compareTo(key2);
     }
 
-    // 转换为字符串进行比较
+    // convert to string for comparison
     return key1.toString().compareTo(key2.toString());
   }
 
-  /// 搜索键对应的值
+  /// search key corresponding value
   Future<List<dynamic>> search(dynamic key) async {
-    // 从条件对象中提取实际值
+    // extract actual value from condition object
     dynamic searchKey = key;
     if (key is Map) {
       if (key.containsKey('=')) {
         searchKey = key['='];
       } else {
-        // 暂不支持其他条件
+        // not support other conditions
         return [];
       }
     }
@@ -159,12 +159,12 @@ class BPlusTree {
     return [];
   }
 
-  /// 范围查询
+  /// range search
   Future<List<Map<String, dynamic>>> range(dynamic start, dynamic end) async {
     final results = <Map<String, dynamic>>[];
     if (root == null) return results;
 
-    // 找到起始叶子节点
+    // find start leaf node
     var node = root!;
     while (!node.isLeaf) {
       int i = 0;
@@ -174,7 +174,7 @@ class BPlusTree {
       node = node.children[i];
     }
 
-    // 收集范围内的值
+    // collect values in range
     BPlusTreeNode? currentNode = node;
     while (currentNode != null) {
       for (int i = 0; i < currentNode.keys.length; i++) {
@@ -192,31 +192,31 @@ class BPlusTree {
     return results;
   }
 
-  /// 节点分裂
+  /// node split
   Future<void> _split(BPlusTreeNode node, List<BPlusTreeNode> path) async {
     try {
-      // 计算分裂点
+      // calculate split point
       final mid = node.keys.length ~/ 2;
 
-      // 验证并修复节点状态
+      // check and fix node state
       while (node.values.length < node.keys.length) {
         node.values.add([]);
       }
 
-      // 创建新节点
+      // create new node
       final newNode = BPlusTreeNode(isLeaf: node.isLeaf);
 
       try {
-        // 确保分裂点有效
+        // ensure split point is valid
         if (mid <= 0 || mid >= node.keys.length) {
           return;
         }
 
-        // 先复制要移动的数据（确保长度一致）
+        // copy data to move (ensure length consistent)
         final keysToMove = node.keys.sublist(mid);
         final valuesToMove = node.values.sublist(mid);
 
-        // 复制数据到新节点（保持一一对应）
+        // copy data to new node (ensure one-to-one correspondence)
         for (var i = 0; i < keysToMove.length; i++) {
           newNode.keys.add(keysToMove[i]);
           if (i < valuesToMove.length) {
@@ -225,11 +225,11 @@ class BPlusTree {
           }
         }
 
-        // 从原节点移除后半部分（同时移除）
+        // remove back half from original node (also remove)
         node.keys.removeRange(mid, node.keys.length);
         node.values.removeRange(mid, node.values.length);
 
-        // 处理子节点
+        // handle child node
         if (!node.isLeaf && node.children.isNotEmpty) {
           final childrenToMove = List.from(node.children.sublist(mid));
           for (var child in childrenToMove) {
@@ -242,7 +242,7 @@ class BPlusTree {
           node.next = newNode;
         }
 
-        // 处理父节点
+        // handle parent node
         if (path.isEmpty) {
           final newRoot = BPlusTreeNode(isLeaf: false);
           if (newNode.keys.isNotEmpty) {
@@ -269,26 +269,27 @@ class BPlusTree {
           }
         }
       } catch (e, stack) {
-        Logger.error('''节点分裂操作失败: 
+        Logger.error('''node split operation failed: 
           error: $e
           stack: $stack
         ''', label: 'BPlusTree._split');
         rethrow;
       }
     } catch (e) {
-      Logger.error('节点分裂失败: $e', label: 'BPlusTree._split');
+      Logger.error('node split operation failed: $e',
+          label: 'BPlusTree._split');
       rethrow;
     }
   }
 
-  /// 删除键值对
+  /// delete key-value pair
   Future<void> delete(dynamic key, dynamic value) async {
     if (root == null) return;
 
     var node = root!;
     final path = <BPlusTreeNode>[];
 
-    // 查找要删除的键
+    // find key to delete
     while (!node.isLeaf) {
       path.add(node);
       int i = 0;
@@ -298,10 +299,10 @@ class BPlusTree {
       node = node.children[i];
     }
 
-    // 在叶子节点中查找并删除值
+    // find and delete value in leaf node
     for (int i = 0; i < node.keys.length; i++) {
       if (_compareKeys(key, node.keys[i]) == 0) {
-        // 如果是更新操作，只删除匹配的值
+        // if update operation, only delete matching value
         if (value != null) {
           node.values[i].removeWhere((v) {
             if (v is Map && value is Map) {
@@ -310,13 +311,13 @@ class BPlusTree {
             return v == value;
           });
 
-          // 如果值列表为空，删除整个键
+          // if value list is empty, delete whole key
           if (node.values[i].isEmpty) {
             node.keys.removeAt(i);
             node.values.removeAt(i);
           }
         } else {
-          // 如果没有指定值，删除整个键值对
+          // if no value specified, delete whole key-value pair
           node.keys.removeAt(i);
           node.values.removeAt(i);
         }
@@ -324,19 +325,19 @@ class BPlusTree {
       }
     }
 
-    // 如果节点为空且不是根节点，需要合并或重新分配
+    // if node is empty and not root, need merge or reallocate
     if (node.keys.isEmpty && node != root) {
       await _rebalanceAfterDelete(node, path);
     }
 
-    // 如果根节点为空且有子节点，更新根节点
+    // if root node is empty and has child node, update root node
     if (root!.keys.isEmpty && !root!.isLeaf && root!.children.isNotEmpty) {
       root = root!.children[0];
       root!.parent = null;
     }
   }
 
-  /// 删除后重新平衡树
+  /// rebalance tree after delete
   Future<void> _rebalanceAfterDelete(
       BPlusTreeNode node, List<BPlusTreeNode> path) async {
     final minKeys = (order / 2).ceil() - 1;
@@ -355,13 +356,13 @@ class BPlusTree {
         rightSibling = parent.children[nodeIndex + 1];
       }
 
-      // 尝试从兄弟节点借键
+      // try borrow key from sibling node
       if (leftSibling != null && leftSibling.keys.length > minKeys) {
         _borrowFromLeft(node, leftSibling, parent, nodeIndex - 1);
       } else if (rightSibling != null && rightSibling.keys.length > minKeys) {
         _borrowFromRight(node, rightSibling, parent, nodeIndex);
       } else {
-        // 需要合并节点
+        // need merge node
         if (leftSibling != null) {
           _mergeWithLeft(node, leftSibling, parent, nodeIndex - 1);
           node = leftSibling;
@@ -370,7 +371,7 @@ class BPlusTree {
         }
       }
 
-      // 更新路径
+      // update path
       path.removeLast();
       if (path.isNotEmpty) {
         node = path.last;
@@ -378,18 +379,18 @@ class BPlusTree {
     }
   }
 
-  /// 从左兄弟借键
+  /// borrow key from left sibling
   void _borrowFromLeft(BPlusTreeNode node, BPlusTreeNode leftSibling,
       BPlusTreeNode parent, int parentIndex) {
     if (node.isLeaf) {
-      // 从左兄弟借最后一个键值对
+      // borrow last key-value pair from left sibling
       node.keys.insert(0, leftSibling.keys.last);
       node.values.insert(0, leftSibling.values.last);
       leftSibling.keys.removeLast();
       leftSibling.values.removeLast();
       parent.keys[parentIndex] = node.keys.first;
     } else {
-      // 非叶子节点的借键操作
+      // borrow key from non-leaf node
       node.keys.insert(0, parent.keys[parentIndex]);
       parent.keys[parentIndex] = leftSibling.keys.last;
       node.children.insert(0, leftSibling.children.last);
@@ -399,18 +400,18 @@ class BPlusTree {
     }
   }
 
-  /// 从右兄弟借键
+  /// borrow key from right sibling
   void _borrowFromRight(BPlusTreeNode node, BPlusTreeNode rightSibling,
       BPlusTreeNode parent, int parentIndex) {
     if (node.isLeaf) {
-      // 从右兄弟借第一个键值对
+      // borrow first key-value pair from right sibling
       node.keys.add(rightSibling.keys.first);
       node.values.add(rightSibling.values.first);
       rightSibling.keys.removeAt(0);
       rightSibling.values.removeAt(0);
       parent.keys[parentIndex] = rightSibling.keys.first;
     } else {
-      // 非叶子节点的借键操作
+      // borrow key from non-leaf node
       node.keys.add(parent.keys[parentIndex]);
       parent.keys[parentIndex] = rightSibling.keys.first;
       node.children.add(rightSibling.children.first);
@@ -420,7 +421,7 @@ class BPlusTree {
     }
   }
 
-  /// 与左兄弟合并
+  /// merge with left sibling
   void _mergeWithLeft(BPlusTreeNode node, BPlusTreeNode leftSibling,
       BPlusTreeNode parent, int parentIndex) {
     if (node.isLeaf) {
@@ -439,7 +440,7 @@ class BPlusTree {
     parent.children.removeAt(parentIndex + 1);
   }
 
-  /// 与右兄弟合并
+  /// merge with right sibling
   void _mergeWithRight(BPlusTreeNode node, BPlusTreeNode rightSibling,
       BPlusTreeNode parent, int parentIndex) {
     if (node.isLeaf) {
@@ -459,7 +460,7 @@ class BPlusTree {
   }
 }
 
-/// B+ 树节点
+/// B+ tree node
 class BPlusTreeNode {
   final List<dynamic> keys;
   final List<List<dynamic>> values;
