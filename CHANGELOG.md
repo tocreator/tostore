@@ -2,13 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.8.2]
+## 1.8.3
+
+* Added multi-language documentation support (日本語, 한국어, Español, Português, Русский, Deutsch, Français, Italiano, Türkçe)
+* Reorganized documentation structure under docs/translations directory
+
+## 1.8.2
 
 ### Changed
 - Optimized multi-space switching
 - Refined documentation examples
 
-## [1.8.1]
+## 1.8.1
 
 ### Added
 - Performance optimization for file operations
@@ -22,7 +27,7 @@ All notable changes to this project will be documented in this file.
 - Improved logging details
 - Updated documentation
 
-## [1.8.0]
+## 1.8.0
 
 ### Added
 - Performance improvements for multi-space operations
@@ -35,7 +40,7 @@ All notable changes to this project will be documented in this file.
 - Enhanced query execution
 - Improved resource utilization
 
-## [1.7.2]
+## 1.7.2
 
 ### Changed
 - Enhanced query performance
@@ -43,7 +48,7 @@ All notable changes to this project will be documented in this file.
 - Improved cache efficiency
 - Better resource management
 
-## [1.7.1]
+## 1.7.1
 
 ### Changed
 - Optimized query execution
@@ -51,7 +56,7 @@ All notable changes to this project will be documented in this file.
 - Improved space management
 - Updated documentation
 
-## [1.7.0]
+## 1.7.0
 
 ### Added
 - Enhanced query optimization
@@ -64,7 +69,7 @@ All notable changes to this project will be documented in this file.
 - Improved performance
 - Enhanced documentation
 
-## [1.6.1]
+## 1.6.1
 
 ### Changed
 - Enhanced operation efficiency
@@ -72,7 +77,7 @@ All notable changes to this project will be documented in this file.
 - Improved documentation
 - Better developer experience
 
-## [1.6.0]
+## 1.6.0
 
 ### Added
 - Basic backup and restore
@@ -85,7 +90,7 @@ All notable changes to this project will be documented in this file.
 - Improved space management
 - Better error handling
 
-## [1.5.0]
+## 1.5.0
 
 ### Added
 - Basic indexing system
@@ -97,7 +102,7 @@ All notable changes to this project will be documented in this file.
 - Enhanced backup system
 - Better error reporting
 
-## [1.4.0]
+## 1.4.0
 
 ### Added
 - Basic transaction support
@@ -110,7 +115,7 @@ All notable changes to this project will be documented in this file.
 - Enhanced error handling
 - Improved documentation
 
-## [1.3.0]
+## 1.3.0
 
 ### Added
 - Basic backup system
@@ -123,7 +128,7 @@ All notable changes to this project will be documented in this file.
 - Improved error handling
 - Enhanced documentation
 
-## [1.2.0]
+## 1.2.0
 
 ### Added
 - Basic query builder
@@ -136,7 +141,7 @@ All notable changes to this project will be documented in this file.
 - Basic security
 - Enhanced documentation
 
-## [1.1.0]
+## 1.1.0
 
 ### Added
 - Enhanced query capabilities
@@ -149,7 +154,7 @@ All notable changes to this project will be documented in this file.
 - Type safety improvements
 - Documentation updates
 
-## [1.0.0]
+## 1.0.0
 
 ### Added
 - First stable release
@@ -158,7 +163,7 @@ All notable changes to this project will be documented in this file.
 - File-based storage
 - Documentation
 
-## [0.5.0]
+## 0.5.0
 
 ### Added
 - Beta release
@@ -173,7 +178,7 @@ All notable changes to this project will be documented in this file.
 - Improved isolation
 - Better data handling
 
-## [0.4.0]
+## 0.4.0
 
 ### Added
 - Enhanced multi-space features
@@ -187,7 +192,7 @@ All notable changes to this project will be documented in this file.
 - Data sharing mechanism
 - Space management
 
-## [0.3.0]
+## 0.3.0
 
 ### Added
 - Multi-space architecture foundation
@@ -202,7 +207,7 @@ All notable changes to this project will be documented in this file.
 - Data isolation mechanism
 - Space management
 
-## [0.2.0]
+## 0.2.0
 
 ### Added
 - Core system implementation
@@ -210,7 +215,7 @@ All notable changes to this project will be documented in this file.
 - Error handling
 - Type support
 
-## [0.1.0]
+## 0.1.0
 
 ### Added
 - Initial development release
@@ -218,7 +223,7 @@ All notable changes to this project will be documented in this file.
 - Core interfaces
 - Simple storage implementation
 
-## [0.0.1]
+## 0.0.1
 
 ### Added
 - Project initialization

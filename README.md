@@ -1,6 +1,6 @@
 # ToStore
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](docs/translations/README.zh-CN.md) | [日本語](docs/translations/README.ja.md) | [한국어](docs/translations/README.ko.md) | [Español](docs/translations/README.es.md) | [Português (Brasil)](docs/translations/README.pt-BR.md) | [Русский](docs/translations/README.ru.md) | [Deutsch](docs/translations/README.de.md) | [Français](docs/translations/README.fr.md) | [Italiano](docs/translations/README.it.md) | [Türkçe](docs/translations/README.tr.md)
 
 ToStore is a high-performance storage engine built specifically for mobile applications. Implemented purely in Dart, it achieves exceptional performance through B+ tree indexing and intelligent caching strategies. Its multi-space architecture solves the challenges of user data isolation and global data sharing, while enterprise-grade features like transaction protection, automatic repair, incremental backup, and zero-cost idle ensure reliable data storage for mobile applications.
 
@@ -27,14 +27,7 @@ ToStore is a high-performance storage engine built specifically for mobile appli
 
 ## Quick Start
 
-1. Add dependency:
-
-```yaml
-dependencies:
-  tostore: ^1.8.2
-```
-
-2. Basic usage:
+Basic usage:
 
 ```dart
 // Initialize database

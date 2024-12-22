@@ -86,8 +86,6 @@ class TableSchema {
         return value is bool;
       case DataType.datetime:
         return value is String && DateTime.tryParse(value) != null;
-      default:
-        return false;
     }
   }
 }

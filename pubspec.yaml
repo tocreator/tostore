@@ -1,7 +1,10 @@
 name: tostore
-description: "A high-performance database implemented in pure Dart, featuring multi-space support, global tables, and outperforming popular alternatives in high-concurrency scenarios."
-version: 1.8.2
+description: "High-performance mobile storage engine with B+ tree indexing, multi-space architecture, and ACID transactions. Supports global data sharing and enterprise-grade reliability."
+version: 1.8.3
 homepage: https://github.com/tocreator/tostore
+repository: https://github.com/tocreator/tostore
+issue_tracker: https://github.com/tocreator/tostore/issues
+documentation: https://github.com/tocreator/tostore/wiki
 
 environment:
   sdk: ^3.5.4

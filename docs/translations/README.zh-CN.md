@@ -1,7 +1,6 @@
-
 # Tostore
 
-[English](README.md) | 简体中文
+[English](../../README.md) | 简体中文 | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 Tostore 是一款专为移动应用打造的高性能数据存储引擎。它采用纯 Dart 实现，通过 B+ 树索引结构和智能缓存策略，实现了卓越的性能表现。其多空间架构不仅解决了用户数据隔离及全局数据共享难点，配合事务保护、自动修复、增量备份、闲置零损耗等企业级特性，为移动应用提供了一个安全可靠的数据存储方案。
 
@@ -28,14 +27,7 @@ Tostore 是一款专为移动应用打造的高性能数据存储引擎。它采
 
 ## 快速开始
 
-1. 添加依赖:
-
-```yaml
-dependencies:
-  tostore: ^1.8.1
-```
-
-2. 基础使用:
+基础使用:
 
 ```dart
 // 初始化数据库
