@@ -16,10 +16,11 @@ ToStore es un motor de almacenamiento de alto rendimiento diseñado específicam
   - Inferencia de tipos inteligente con sugerencias de código completas
   - Sin configuración, listo para usar
 - 🔄 **Arquitectura Innovadora**: 
-  - Aislamiento de datos multi-espacio, perfecto para escenarios multi-usuario
-  - Compartición de datos globales resuelve desafíos de sincronización
+  - Aislamiento de datos multiespacio, perfecto para escenarios multiusuario
+  - Compartición de datos globales, resuelve desafíos de sincronización
   - Soporte para transacciones anidadas
   - Carga de espacio bajo demanda minimiza el uso de recursos
+  - Almacenamiento automático de datos, actualización/inserción inteligente
 - 🛡️ **Fiabilidad de Nivel Empresarial**: 
   - Protección de transacciones ACID asegura consistencia de datos
   - Mecanismo de respaldo incremental con recuperación rápida
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,21 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Obtener datos clave-valor globales
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+### Almacenamiento Automático de Datos
+
+```dart
+// Almacenamiento automático usando condición
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Almacenamiento automático usando clave primaria
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+``` 
 
 ## Rendimiento
 

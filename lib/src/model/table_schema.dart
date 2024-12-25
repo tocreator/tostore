@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// table schema
 class TableSchema {
   final String primaryKey; // primary key
@@ -86,6 +88,37 @@ class TableSchema {
         return value is bool;
       case DataType.datetime:
         return value is String && DateTime.tryParse(value) != null;
+      case DataType.array:
+        return value is List;
+    }
+  }
+
+  /// get default value for a field
+  dynamic getDefaultValue(String fieldName) {
+    final field = fields.firstWhere(
+      (f) => f.name == fieldName,
+      orElse: () => throw StateError('Unknown field $fieldName'),
+    );
+    return field.defaultValue ?? _getTypeDefaultValue(field.type);
+  }
+
+  /// get default value for a data type
+  dynamic _getTypeDefaultValue(DataType type) {
+    switch (type) {
+      case DataType.integer:
+        return 0;
+      case DataType.double:
+        return 0.0;
+      case DataType.text:
+        return '';
+      case DataType.boolean:
+        return false;
+      case DataType.datetime:
+        return DateTime.now().toIso8601String();
+      case DataType.blob:
+        return Uint8List(0);
+      case DataType.array:
+        return [];
     }
   }
 }
@@ -185,6 +218,7 @@ enum DataType {
   blob,
   boolean,
   datetime,
+  array,
 }
 
 /// index type enum

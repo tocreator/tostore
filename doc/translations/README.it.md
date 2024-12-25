@@ -20,6 +20,7 @@ ToStore è un motore di archiviazione ad alte prestazioni progettato specificame
   - La condivisione dei dati globali risolve le sfide di sincronizzazione
   - Supporto per transazioni annidate
   - Caricamento dello spazio su richiesta minimizza l'uso delle risorse
+  - Archiviazione automatica dei dati, aggiornamento/inserimento intelligente
 - 🛡️ **Affidabilità Enterprise**: 
   - Protezione transazioni ACID garantisce la consistenza dei dati
   - Meccanismo di backup incrementale con recupero rapido
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,22 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Ottenere dati chiave-valore globali
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+# Upsert data
+
+```dart
+// Memorizza automaticamente i dati, supporto batch upsert
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Inserimento automatico o aggiornamento basato sulla chiave primaria
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+```
+
 
 ## Prestazioni
 

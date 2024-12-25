@@ -20,6 +20,7 @@ Tostore 是一款专为移动应用打造的高性能数据存储引擎。它采
   - 全局数据共享，解决配置同步难题
   - 支持嵌套事务，数据操作更灵活
   - 空间按需加载，资源占用最小
+  - 自动存储数据，智能更新插入
 - 🛡️ **企业级可靠**: 
   - ACID 事务保护，数据一致性保证
   - 增量备份机制，快速恢复能力
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -118,6 +120,22 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // 获取全局键值对数据
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+### 自动存储数据
+
+```dart
+// 使用条件判断自动存储，支持批量
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// 使用主键自动存储
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+```
+
 
 ## 性能测试
 

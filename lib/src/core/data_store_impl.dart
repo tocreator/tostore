@@ -592,6 +592,8 @@ class DataStoreImpl {
         return DateTime.now();
       case DataType.blob:
         return Uint8List(0);
+      case DataType.array:
+        return [];
     }
   }
 
@@ -617,6 +619,8 @@ class DataStoreImpl {
       case DataType.datetime:
         return value is DateTime ||
             (value is String && DateTime.tryParse(value) != null);
+      case DataType.array:
+        return value is List;
     }
   }
 

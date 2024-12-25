@@ -1,5 +1,6 @@
 import '../chain/delete_builder.dart';
 import '../chain/update_builder.dart';
+import '../chain/upsert_builder.dart';
 import '../model/data_store_config.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
@@ -18,6 +19,9 @@ abstract class DataStoreInterface {
 
   /// insert data
   Future<bool> insert(String tableName, Map<String, dynamic> data);
+
+  /// upsert data
+  UpsertBuilder upsert(String tableName, Map<String, dynamic> data);
 
   /// batch insert data
   Future<bool> batchInsert(

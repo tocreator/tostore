@@ -8,6 +8,7 @@ export 'src/model/log_config.dart';
 
 import 'src/chain/delete_builder.dart';
 import 'src/chain/update_builder.dart';
+import 'src/chain/upsert_builder.dart';
 import 'src/core/data_store_interface.dart';
 import 'src/model/data_store_config.dart';
 import 'src/core/data_store_impl.dart';
@@ -164,6 +165,32 @@ class ToStore implements DataStoreInterface {
   @override
   QueryBuilder query(String tableName) {
     return QueryBuilder(_impl, tableName);
+  }
+
+  /// auto upsert data, if exists, update, if not, insert
+  /// [tableName] Table name
+  /// [data] Data to upsert
+  ///
+  /// Example:
+  /// ```dart
+  /// // Using where condition
+  /// await db.upsert('users', {'name': 'John'})
+  ///   .where('email', '=', 'john@example.com')
+  ///   .execute();
+  ///
+  /// // Using primary key in data
+  /// await db.upsert('users', {
+  ///   'id': 1,
+  ///   'name': 'John'
+  /// }).execute();
+  /// ```
+  ///
+  /// 自动存储数据，存在则更新，不存在则插入
+  /// [tableName] 表名
+  /// [data] 要插入或更新的数据
+  @override
+  UpsertBuilder upsert(String tableName, Map<String, dynamic> data) {
+    return UpsertBuilder(_impl, tableName, data);
   }
 
   /// Switch base space for scenarios like user switching

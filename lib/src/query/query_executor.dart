@@ -422,6 +422,16 @@ class QueryExecutor {
     if (a is bool && b is bool) {
       return a == b ? 0 : (a ? 1 : -1);
     }
+    if (a is List && b is List) {
+      final len = a.length.compareTo(b.length);
+      if (len != 0) return len;
+
+      for (var i = 0; i < a.length; i++) {
+        final comp = _compareValues(a[i], b[i]);
+        if (comp != 0) return comp;
+      }
+      return 0;
+    }
 
     return a.toString().compareTo(b.toString());
   }
@@ -447,6 +457,8 @@ class QueryExecutor {
           int compareResult;
           if (valueA is num && valueB is num) {
             compareResult = valueA.compareTo(valueB);
+          } else if (valueA is List && valueB is List) {
+            compareResult = _compareValues(valueA, valueB);
           } else {
             compareResult = valueA.toString().compareTo(valueB.toString());
           }

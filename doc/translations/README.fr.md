@@ -20,6 +20,7 @@ ToStore est un moteur de stockage haute performance spécialement conçu pour le
   - Le partage de données globales résout les défis de synchronisation
   - Support des transactions imbriquées
   - Chargement d'espace à la demande minimise l'utilisation des ressources
+  - Stockage automatique des données, mise à jour/insertion intelligente
 - 🛡️ **Fiabilité Niveau Entreprise**: 
   - Protection des transactions ACID assure la cohérence des données
   - Mécanisme de sauvegarde incrémentielle avec récupération rapide
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,24 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Obtenir des données clé-valeur globales
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+
+
+### Stockage Automatique des Données
+
+```dart
+// Stockage automatique avec condition
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Stockage automatique avec clé primaire
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+``` 
+
 
 ## Performance
 

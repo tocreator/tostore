@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.8.4
+
+### Added
+  - Added `upsert()` for auto upsert data
+  - Supports both where conditions and primary key matching
+  - Chain-style API consistent with other operations
+  - Added array data type for storing List values
+  - Added array comparison and sorting support
+  - Optimized array type validation
+
+
 ## 1.8.3
 
 * Added multi-language documentation support (日本語, 한국어, Español, Português, Русский, Deutsch, Français, Italiano, Türkçe)

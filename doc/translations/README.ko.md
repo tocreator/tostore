@@ -20,6 +20,7 @@ ToStore는 모바일 애플리케이션을 위해 특별히 설계된 고성능 
   - 설정 동기화 문제를 해결하는 전역 데이터 공유
   - 중첩 트랜잭션 지원
   - 리소스 사용을 최소화하는 온디맨드 스페이스 로딩
+  - 자동 데이터 저장, 스마트 업데이트/삽입
 - 🛡️ **엔터프라이즈급 신뢰성**: 
   - 데이터 일관성을 보장하는 ACID 트랜잭션 보호
   - 빠른 복구가 가능한 증분 백업 메커니즘
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,21 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // 전역 키-값 데이터 가져오기
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+### 자동 데이터 저장
+
+```dart
+// 조건을 사용한 자동 저장
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// 기본 키를 사용한 자동 저장
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+``` 
 
 ## 성능
 

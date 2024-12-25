@@ -43,6 +43,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +123,23 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // グローバルキーバリューデータの取得
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+
+### データの自動保存
+
+```dart
+// 条件による自動保存
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// 主キーによる自動保存
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+```
+
 
 ## パフォーマンス
 

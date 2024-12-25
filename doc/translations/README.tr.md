@@ -20,6 +20,7 @@ ToStore, özellikle mobil uygulamalar için tasarlanmış yüksek performanslı 
   - Global veri paylaşımı senkronizasyon zorluklarını çözer
   - İç içe işlemler için destek
   - İsteğe bağlı alan yükleme kaynak kullanımını minimize eder
+  - Otomatik veri depolama, akıllı güncelleme/ekleme
 - 🛡️ **Kurumsal Düzey Güvenilirlik**: 
   - ACID işlem koruması veri tutarlılığını garanti eder
   - Hızlı kurtarmalı artımlı yedekleme mekanizması
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,23 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Global anahtar-değer verilerini al
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+
+### Otomatik Veri Depolama
+
+```dart
+// Koşulla otomatik depolama
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Birincil anahtarla otomatik depolama
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+``` 
+
 
 ## Performans
 

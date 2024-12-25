@@ -17,9 +17,10 @@ ToStore ist eine hochleistungsfähige Speicher-Engine, die speziell für mobile 
   - Keine Konfiguration, sofort einsatzbereit
 - 🔄 **Innovative Architektur**: 
   - Multi-Space-Datenisolierung, perfekt für Multi-User-Szenarien
-  - Globale Datenaustausch löst Synchronisationsherausforderungen
+  - Globale Datenaustausch löst Synchronisierungsherausforderungen
   - Unterstützung für verschachtelte Transaktionen
   - Bedarfsgerechtes Space-Loading minimiert Ressourcenverbrauch
+  - Automatische Datenspeicherung, intelligentes Update/Insert
 - 🛡️ **Enterprise-Grade Zuverlässigkeit**: 
   - ACID-Transaktionsschutz gewährleistet Datenkonsistenz
   - Inkrementeller Backup-Mechanismus mit schneller Wiederherstellung
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,22 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Globale Schlüssel-Wert-Daten abrufen
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+## Upsert Daten
+
+```dart
+// Daten automatisch speichern,Batch upsert unterstützen
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Automatisches Einfügen oder Aktualisieren basierend auf Primärschlüssel
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+```
+
 
 ## Leistung
 

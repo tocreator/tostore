@@ -300,6 +300,8 @@ class AutoRepair {
         return value is bool;
       case DataType.datetime:
         return value is String && DateTime.tryParse(value) != null;
+      case DataType.array:
+        return value is List;
     }
   }
 }

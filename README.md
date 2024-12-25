@@ -20,6 +20,7 @@ ToStore is a high-performance storage engine built specifically for mobile appli
   - Global data sharing solves configuration sync challenges
   - Support for nested transactions
   - On-demand space loading minimizes resource usage
+  - Automatic storage data operations (upsert)
 - 🛡️ **Enterprise-Grade Reliability**: 
   - ACID transaction protection ensures data consistency
   - Incremental backup mechanism with quick recovery
@@ -43,6 +44,7 @@ final db = ToStore(
           FieldSchema(name: 'id', type: DataType.integer, nullable: false),
           FieldSchema(name: 'name', type: DataType.text, nullable: false),
           FieldSchema(name: 'age', type: DataType.integer),
+          FieldSchema(name: 'tags', type: DataType.array),
         ],
         indexes: [
           IndexSchema(fields: ['name'], unique: true),
@@ -122,6 +124,25 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 // Get global key-value data
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
+
+
+
+### Upsert Data
+
+```dart
+// Automatically store data,Support batch upsert
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+
+// Auto insert or update based on primary key
+await db.upsert('users', {
+  'id': 1,
+  'name': 'John',
+  'email': 'john@example.com'
+});
+```
+
+
 
 ## Performance
 
