@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.8.6
+
+* Update topics in pubspec.yaml
+* Fix data type conversion in DataStoreImpl
+
 ## 1.8.5
 
 ### Added
