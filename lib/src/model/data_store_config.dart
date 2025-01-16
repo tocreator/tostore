@@ -1,3 +1,5 @@
+import 'migration_config.dart';
+
 /// data store config
 class DataStoreConfig {
   /// database path
@@ -36,6 +38,18 @@ class DataStoreConfig {
   /// max record cache size (default 10000 records)
   final int maxRecordCacheSize;
 
+  /// max cache size
+  final int maxCacheSize;
+
+  /// enable encryption
+  final bool enableEncryption;
+
+  /// encryption key
+  final String? encryptionKey;
+
+  /// migration config
+  final MigrationConfig? migrationConfig;
+
   const DataStoreConfig({
     required this.dbPath,
     this.baseName = 'default',
@@ -49,6 +63,10 @@ class DataStoreConfig {
     this.maxTableCacheCount = 50,
     this.maxQueryCacheSize = 5000,
     this.maxRecordCacheSize = 10000,
+    this.maxCacheSize = 10000,
+    this.enableEncryption = false,
+    this.encryptionKey,
+    this.migrationConfig = const MigrationConfig(),
   });
 
   /// get table path
@@ -130,6 +148,13 @@ class DataStoreConfig {
       maxTableCacheCount: json['maxTableCacheCount'] as int? ?? 50,
       maxQueryCacheSize: json['maxQueryCacheSize'] as int? ?? 5000,
       maxRecordCacheSize: json['maxRecordCacheSize'] as int? ?? 10000,
+      maxCacheSize: json['maxCacheSize'] as int? ?? 10000,
+      enableEncryption: json['enableEncryption'] as bool? ?? false,
+      encryptionKey: json['encryptionKey'] as String?,
+      migrationConfig: json['migrationConfig'] != null
+          ? MigrationConfig.fromJson(
+              json['migrationConfig'] as Map<String, dynamic>)
+          : const MigrationConfig(),
     );
   }
 
@@ -148,6 +173,10 @@ class DataStoreConfig {
       'maxTableCacheCount': maxTableCacheCount,
       'maxQueryCacheSize': maxQueryCacheSize,
       'maxRecordCacheSize': maxRecordCacheSize,
+      'maxCacheSize': maxCacheSize,
+      'enableEncryption': enableEncryption,
+      'encryptionKey': encryptionKey,
+      'migrationConfig': migrationConfig?.toJson(),
     };
   }
 
@@ -166,6 +195,10 @@ class DataStoreConfig {
     int? maxTableCacheCount,
     int? maxQueryCacheSize,
     int? maxRecordCacheSize,
+    int? maxCacheSize,
+    bool? enableEncryption,
+    String? encryptionKey,
+    MigrationConfig? migrationConfig,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
@@ -180,6 +213,10 @@ class DataStoreConfig {
       maxTableCacheCount: maxTableCacheCount ?? this.maxTableCacheCount,
       maxQueryCacheSize: maxQueryCacheSize ?? this.maxQueryCacheSize,
       maxRecordCacheSize: maxRecordCacheSize ?? this.maxRecordCacheSize,
+      maxCacheSize: maxCacheSize ?? this.maxCacheSize,
+      enableEncryption: enableEncryption ?? this.enableEncryption,
+      encryptionKey: encryptionKey ?? this.encryptionKey,
+      migrationConfig: migrationConfig ?? this.migrationConfig,
     );
   }
 }

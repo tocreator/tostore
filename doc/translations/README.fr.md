@@ -2,29 +2,40 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | Français | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
-ToStore est un moteur de stockage haute performance spécialement conçu pour les applications mobiles. Implémenté entièrement en Dart, il atteint des performances exceptionnelles grâce à l'indexation B+ tree et aux stratégies de mise en cache intelligentes. Son architecture multi-espace résout les défis de l'isolation des données utilisateur et du partage des données globales, tandis que les fonctionnalités de niveau entreprise comme la protection des transactions, la réparation automatique, la sauvegarde incrémentielle et le coût nul en veille assurent un stockage fiable des données pour les applications mobiles.
+[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
+[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
+[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+
+ToStore est un moteur de stockage haute performance spécialement conçu pour les applications mobiles. Implémenté en Dart pur, il atteint des performances exceptionnelles grâce à l'indexation B+ tree et aux stratégies de cache intelligentes. Son architecture multi-espace résout les défis d'isolation des données utilisateur et de partage des données globales, tandis que des fonctionnalités de niveau entreprise comme la protection des transactions, la réparation automatique, la sauvegarde incrémentielle et le coût nul en inactivité fournissent un stockage de données fiable pour les applications mobiles.
 
 ## Pourquoi ToStore ?
 
-- 🚀 **Performance Ultime**: 
+- 🚀 **Performance Maximale**: 
   - Indexation B+ tree avec optimisation intelligente des requêtes
-  - Stratégie de mise en cache intelligente avec réponse en millisecondes
+  - Stratégie de cache intelligente avec réponse en millisecondes
   - Lecture/écriture concurrente non bloquante avec performance stable
+- 🔄 **Évolution Intelligente des Schémas**: 
+  - Mise à jour automatique de la structure des tables via les schémas
+  - Pas de migrations manuelles version par version
+  - API chaînable pour les changements complexes
+  - Mises à niveau sans temps d'arrêt
 - 🎯 **Facile à Utiliser**: 
-  - Design d'API fluide et chaînable
+  - Design d'API chaînable fluide
   - Support des requêtes style SQL/Map
   - Inférence de type intelligente avec suggestions de code complètes
-  - Zéro configuration, prêt à l'emploi
+  - Prêt à l'emploi sans configuration complexe
 - 🔄 **Architecture Innovante**: 
   - Isolation des données multi-espace, parfait pour les scénarios multi-utilisateurs
-  - Le partage de données globales résout les défis de synchronisation
+  - Partage de données globales résout les défis de synchronisation
   - Support des transactions imbriquées
   - Chargement d'espace à la demande minimise l'utilisation des ressources
-  - Stockage automatique des données, mise à jour/insertion intelligente
+  - Opérations automatiques sur les données (upsert)
 - 🛡️ **Fiabilité Niveau Entreprise**: 
-  - Protection des transactions ACID assure la cohérence des données
+  - Protection des transactions ACID garantit la cohérence des données
   - Mécanisme de sauvegarde incrémentielle avec récupération rapide
-  - Validation d'intégrité des données avec réparation automatique des erreurs
+  - Vérification d'intégrité des données avec réparation automatique
 
 ## Démarrage Rapide
 

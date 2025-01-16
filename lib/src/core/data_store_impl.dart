@@ -2,10 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 
 import '../backup/backup_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
+import '../model/business_error.dart';
+import '../model/migration_config.dart';
 import '../model/table_schema.dart';
 import 'data_compressor.dart';
 import 'concurrency_manager.dart';
@@ -21,6 +25,8 @@ import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
 import '../statistic/statistics_collector.dart';
 import 'transaction_manager.dart';
+import 'migration_manager.dart';
+import '../integrity/integrity_checker.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -37,17 +43,70 @@ class DataStoreImpl {
   final Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
       _onDowngrade;
   final Future<void> Function(DataStoreImpl db)? _onOpen;
+  final List<TableSchema> _schemas;
 
   bool _baseInitialized = false;
   bool _isSwitchingSpace = false;
 
   bool get isInitialized => _isInitialized;
 
+  /// Platform-specific path separator
+  static final String separator = Platform.isWindows ? '\\' : '/';
+
+  /// Join path components
+  String joinPath(List<String> components) {
+    return components.join(separator);
+  }
+
+  /// Get file name without extension
+  String getFileNameWithoutExtension(String path) {
+    final name = path.split(separator).last;
+    final dotIndex = name.lastIndexOf('.');
+    return dotIndex == -1 ? name : name.substring(0, dotIndex);
+  }
+
+  /// Get directory name
+  String getDirName(String path) {
+    final parts = path.split(separator);
+    parts.removeLast();
+    return parts.join(separator);
+  }
+
+  /// Get base name
+  String getBaseName(String path) {
+    return path.split(separator).last;
+  }
+
+  /// Get extension
+  String getExtension(String path) {
+    final name = getBaseName(path);
+    final dotIndex = name.lastIndexOf('.');
+    return dotIndex == -1 ? '' : name.substring(dotIndex);
+  }
+
+  /// Normalize path
+  String normalizePath(String path) {
+    final parts = path.split(RegExp(r'[/\\]'));
+    final normalized = <String>[];
+
+    for (var part in parts) {
+      if (part == '.' || part.isEmpty) continue;
+      if (part == '..') {
+        if (normalized.isNotEmpty) normalized.removeLast();
+        continue;
+      }
+      normalized.add(part);
+    }
+
+    return normalized.join(separator);
+  }
+
   /// Create instance with configuration
   factory DataStoreImpl({
     String? dbPath,
     DataStoreConfig? config,
     int version = 1,
+    List<TableSchema> schemas = const [],
     Future<void> Function(DataStoreImpl db)? onConfigure,
     Future<void> Function(DataStoreImpl db)? onCreate,
     Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
@@ -61,6 +120,7 @@ class DataStoreImpl {
       final instance = DataStoreImpl._internal(
         key,
         version,
+        schemas,
         onConfigure,
         onCreate,
         onUpgrade,
@@ -76,6 +136,7 @@ class DataStoreImpl {
   DataStoreImpl._internal(
     this._instanceKey,
     this._version,
+    this._schemas,
     this._onConfigure,
     this._onCreate,
     this._onUpgrade,
@@ -138,6 +199,8 @@ class DataStoreImpl {
   QueryOptimizer? _queryOptimizer;
   QueryExecutor? _queryExecutor;
   StatisticsCollector? _statisticsCollector;
+  MigrationManager? _migrationManager;
+  IntegrityChecker? _integrityChecker;
 
   // Cache for unique values
   final Map<String, Map<String, Set<dynamic>>> _uniqueValuesCache = {};
@@ -211,6 +274,8 @@ class DataStoreImpl {
       _statisticsCollector = StatisticsCollector(this);
       _fileManager = FileManager(this);
       _fileManager?.startTimer();
+      _migrationManager = MigrationManager(this);
+      _integrityChecker = IntegrityChecker(this);
 
       await Directory(dbPath).create(recursive: true);
 
@@ -250,8 +315,8 @@ class DataStoreImpl {
 
       if (oldVersion == 0 || _isSwitchingSpace) {
         await createTable(
-          _kvStoreName,
           const TableSchema(
+            name: _kvStoreName,
             primaryKey: 'key',
             fields: [
               FieldSchema(name: 'key', type: DataType.text, nullable: false),
@@ -265,8 +330,8 @@ class DataStoreImpl {
         );
 
         await createTable(
-          _globalKvStoreName,
           const TableSchema(
+            name: _globalKvStoreName,
             primaryKey: 'key',
             isGlobal: true,
             fields: [
@@ -280,13 +345,49 @@ class DataStoreImpl {
           ),
         );
 
+        // create tables
+        if (_schemas.isNotEmpty) {
+          for (var schema in _schemas) {
+            if (!await _tableExists(schema.name)) {
+              await createTable(schema);
+            }
+          }
+        }
+
         await _onCreate?.call(this);
 
-        if (oldVersion == 0) {
+        if (_version > 0) {
           await setVersion(_version);
         }
       } else if (oldVersion < _version) {
-        await _onUpgrade?.call(this, oldVersion, _version);
+        if (_schemas.isNotEmpty) {
+          // Get existing tables
+          final existingTables = await getTableNames();
+
+          // Remove tables that are no longer in schemas
+          final newTableNames = _schemas.map((s) => s.name).toSet();
+          for (var tableName in existingTables) {
+            // Skip system tables
+            if (tableName == _kvStoreName || tableName == _globalKvStoreName) {
+              continue;
+            }
+
+            if (!newTableNames.contains(tableName)) {
+              Logger.info(
+                'Dropping removed table: $tableName',
+                label: 'DataStoreImpl._startSetupAndUpgrade',
+              );
+              await dropTable(tableName);
+            }
+          }
+          await autoMigrate(
+            oldVersion: oldVersion,
+            newVersion: _version,
+            schemas: _schemas,
+          );
+        } else if (_onUpgrade != null) {
+          await _onUpgrade.call(this, oldVersion, _version);
+        }
         await setVersion(_version);
       } else if (oldVersion > _version) {
         await _onDowngrade?.call(this, oldVersion, _version);
@@ -294,9 +395,12 @@ class DataStoreImpl {
       }
 
       await _onOpen?.call(this);
-    } catch (e) {
-      Logger.error('Database setup or upgrade failed: $e',
-          label: 'DataStore._startSetupAndUpgrade');
+    } catch (e, stack) {
+      Logger.error(
+        'Database setup/upgrade failed: $e\n$stack',
+        label: 'DataStoreImpl._startSetupAndUpgrade',
+      );
+      rethrow;
     }
   }
 
@@ -323,6 +427,7 @@ class DataStoreImpl {
       _queryExecutor = null;
       _statisticsCollector = null;
       _config = null;
+      _integrityChecker = null;
 
       _maxIds.clear();
       _maxIdsDirty.clear();
@@ -345,7 +450,6 @@ class DataStoreImpl {
 
   /// create table
   Future<void> createTable(
-    String tableName,
     TableSchema schema,
   ) async {
     if (!_baseInitialized) {
@@ -354,16 +458,16 @@ class DataStoreImpl {
 
     try {
       // 1. check global path and base path
-      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
-      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
+      final globalSchemaFile = File(config.getSchemaPath(schema.name, true));
+      final baseSchemaFile = File(config.getSchemaPath(schema.name, false));
 
       if (await globalSchemaFile.exists()) {
-        Logger.warn('Table $tableName already exists in global space',
+        Logger.warn('Table ${schema.name} already exists in global space',
             label: 'DataStore.createTable');
         return;
       }
       if (await baseSchemaFile.exists()) {
-        Logger.warn('Table $tableName already exists in base space',
+        Logger.warn('Table ${schema.name} already exists in base space',
             label: 'DataStore.createTable');
         return;
       }
@@ -378,10 +482,11 @@ class DataStoreImpl {
       }
 
       // 3. get target table path
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
+      final dataFile = File(config.getDataPath(schema.name, schema.isGlobal));
+      final schemaFile =
+          File(config.getSchemaPath(schema.name, schema.isGlobal));
 
-      await _concurrencyManager!.acquireWriteLock(tableName);
+      await _concurrencyManager!.acquireWriteLock(schema.name);
       try {
         // 4. validate table structure
         _validateSchema(schema);
@@ -391,20 +496,20 @@ class DataStoreImpl {
         await schemaFile.writeAsString(jsonEncode(schema));
 
         // 6. create primary key index
-        await _indexManager?.createPrimaryIndex(tableName, schema.primaryKey);
+        await _indexManager?.createPrimaryIndex(schema.name, schema.primaryKey);
 
         // 7. create other indexes
         for (var index in schema.indexes) {
-          await _indexManager?.createIndex(tableName, index);
+          await _indexManager?.createIndex(schema.name, index);
         }
 
-        Logger.info('Table $tableName created successfully');
+        Logger.info('Table ${schema.name} created successfully');
       } finally {
-        await _concurrencyManager!.releaseWriteLock(tableName);
+        await _concurrencyManager!.releaseWriteLock(schema.name);
       }
 
       // 8. cache new created table structure
-      _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
+      _queryExecutor?.queryCacheManager.cacheSchema(schema.name, schema);
     } catch (e) {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       rethrow;
@@ -518,24 +623,30 @@ class DataStoreImpl {
     String tableName,
   ) async {
     try {
-      final result = Map<String, dynamic>.from(data);
       final primaryKey = schema.primaryKey;
+      var result = <String, dynamic>{};
 
       // 1. handle auto increment primary key
-      if (!result.containsKey(primaryKey) || result[primaryKey] == null) {
+      if (!data.containsKey(primaryKey) || data[primaryKey] == null) {
         if (schema.autoIncrement) {
-          result[primaryKey] = await _getNextId(tableName);
+          final nextId = await _getNextId(tableName);
+          result[primaryKey] = nextId;
         }
       } else {
-        final providedId = result[primaryKey];
+        final providedId = data[primaryKey];
         if (providedId is int && schema.autoIncrement) {
           _updateMaxIdInMemory(tableName, providedId);
+          result[primaryKey] = providedId;
         }
       }
 
       // 2. fill default value and null value
       for (var field in schema.fields) {
-        if (!result.containsKey(field.name)) {
+        if (field.name == primaryKey) {
+          continue;
+        }
+
+        if (!data.containsKey(field.name)) {
           if (field.defaultValue != null) {
             result[field.name] = field.defaultValue;
           } else if (!field.nullable) {
@@ -543,6 +654,8 @@ class DataStoreImpl {
           } else {
             result[field.name] = null;
           }
+        } else {
+          result[field.name] = data[field.name];
         }
 
         final value = result[field.name];
@@ -586,12 +699,12 @@ class DataStoreImpl {
         return 0.0;
       case DataType.text:
         return '';
+      case DataType.blob:
+        return Uint8List(0);
       case DataType.boolean:
         return false;
       case DataType.datetime:
-        return DateTime.now();
-      case DataType.blob:
-        return Uint8List(0);
+        return DateTime.now().toIso8601String();
       case DataType.array:
         return [];
     }
@@ -775,35 +888,41 @@ class DataStoreImpl {
   }
 
   /// validate table structure
-  void _validateSchema(TableSchema schema) {
-    // check primary key
-    if (schema.primaryKey.isEmpty) {
-      throw ArgumentError('Primary key cannot be empty');
-    }
+  bool _validateSchema(TableSchema schema) {
+    try {
+      // Check required fields
+      if (schema.name.isEmpty) return false;
+      if (schema.fields.isEmpty) return false;
 
-    // check field definition
-    if (schema.fields.isEmpty) {
-      throw ArgumentError('Table must have at least one field');
-    }
-
-    // check primary key field is exist
-    if (!schema.fields.any((col) => col.name == schema.primaryKey)) {
-      throw ArgumentError('Primary key field not found in fields');
-    }
-
-    // check field name is unique
-    final fieldNames = schema.fields.map((col) => col.name).toSet();
-    if (fieldNames.length != schema.fields.length) {
-      throw ArgumentError('Field names must be unique');
-    }
-
-    // check index field is exist
-    for (var index in schema.indexes) {
-      for (var field in index.fields) {
-        if (!fieldNames.contains(field)) {
-          throw ArgumentError('Index field $field not found in table fields');
-        }
+      // Check primary key
+      if (!schema.fields.any((f) => f.name == schema.primaryKey)) {
+        return false;
       }
+
+      // Check field names
+      final fieldNames = <String>{};
+      for (var field in schema.fields) {
+        if (field.name.isEmpty) return false;
+        if (!fieldNames.add(field.name)) return false;
+      }
+      // Check index names
+      final indexNames = <String>{};
+      for (var index in schema.indexes) {
+        if (index.indexName != null && index.indexName!.isNotEmpty) {
+          if (!indexNames.add(index.indexName!)) {
+            return false;
+          }
+        }
+        // Check index fields exist
+        for (var field in index.fields) {
+          if (!fieldNames.contains(field)) return false;
+        }
+        if (index.fields.isEmpty) return false;
+      }
+
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -825,7 +944,7 @@ class DataStoreImpl {
 
   /// verify data integrity
   Future<bool> _verifyDataIntegrity(String tableName) async {
-    final tablePath = getTablePath(tableName);
+    final tablePath = await getTablePath(tableName);
     final dataFile = File('$tablePath.dat');
     final checksumFile = File('$tablePath.checksum');
 
@@ -899,9 +1018,12 @@ class DataStoreImpl {
         final tableData = entry.value as Map<String, dynamic>;
 
         // restore schema
-        final schema =
-            TableSchema.fromJson(tableData['schema'] as Map<String, dynamic>);
-        await createTable(tableName, schema);
+        final schemaJson = tableData['schema'] as Map<String, dynamic>;
+        if (!schemaJson.containsKey('name')) {
+          schemaJson['name'] = tableName;
+        }
+        final schema = TableSchema.fromJson(schemaJson);
+        await createTable(schema);
 
         // restore data
         final records =
@@ -1103,7 +1225,7 @@ class DataStoreImpl {
     await _concurrencyManager!.acquireWriteLock(tableName);
     try {
       // clear file
-      final tablePath = getTablePath(tableName);
+      final tablePath = await getTablePath(tableName);
       final dataFile = File('$tablePath.dat');
       if (await dataFile.exists()) {
         await dataFile.writeAsString('');
@@ -1173,7 +1295,7 @@ class DataStoreImpl {
       }
 
       // delete from file
-      final dataFile = File('${getTablePath(tableName)}.dat');
+      final dataFile = File('${await getTablePath(tableName)}.dat');
       if (await dataFile.exists()) {
         final lines = await dataFile.readAsLines();
         final remainingLines = lines.where((line) {
@@ -1209,7 +1331,7 @@ class DataStoreImpl {
       await _concurrencyManager!.acquireWriteLock(tableName);
 
       // delete data file
-      final tablePath = getTablePath(tableName);
+      final tablePath = await getTablePath(tableName);
       final dataFile = File('$tablePath.dat');
       if (await dataFile.exists()) {
         await dataFile.delete();
@@ -1259,21 +1381,45 @@ class DataStoreImpl {
       schemaPath = config.getSchemaPath(tableName, false);
       schemaFile = File(schemaPath);
       if (!await schemaFile.exists()) {
-        throw StateError('Table schema not found: $tableName');
+        Logger.error(
+          'Table schema not found: $tableName',
+          label: "DataStoreImpl.getTableSchema",
+        );
       }
     }
 
     try {
       final schemaJson = await schemaFile.readAsString();
-      final schema = TableSchema.fromJson(jsonDecode(schemaJson));
+      final json = jsonDecode(schemaJson) as Map<String, dynamic>;
+      // if name is not in json, add schemaPath
+      if (!json.containsKey('name')) {
+        json['_schemaPath'] = schemaPath;
+      }
+      final schema = TableSchema.fromJson(json);
 
-      // 3. cache and return
+      // Validate schema name matches table name
+      if (schema.name != tableName) {
+        Logger.error(
+          'Schema name (${schema.name}) does not match table name ($tableName)',
+          label: "DataStoreImpl.getTableSchema",
+        );
+      }
+
+      // Cache and return
       _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
       return schema;
     } catch (e) {
-      Logger.error('Load table schema failed: $e',
-          label: 'DataStore.getTableSchema');
-      rethrow;
+      Logger.error(
+        'Failed to get table schema: $e',
+        label: 'DataStoreImpl.getTableSchema',
+      );
+      return TableSchema(
+        name: tableName,
+        fields: [],
+        indexes: [],
+        primaryKey: '',
+        isGlobal: false,
+      );
     }
   }
 
@@ -1566,7 +1712,9 @@ class DataStoreImpl {
           final record = jsonDecode(line) as Map<String, dynamic>;
 
           // collect primary key and unique index values
-          _uniqueValuesCache[tableName]![primaryKey]!.add(record[primaryKey]);
+          if (record[primaryKey] != null) {
+            _uniqueValuesCache[tableName]![primaryKey]!.add(record[primaryKey]);
+          }
           for (var index in schema.indexes.where((idx) => idx.unique)) {
             final fieldName = index.fields.first;
             if (record[fieldName] != null) {
@@ -1576,17 +1724,18 @@ class DataStoreImpl {
         }
       }
     }
-
+    // initialize primary key cache
+    _uniqueValuesCache[tableName]![primaryKey] ??= <dynamic>{};
     // 3. check primary key
     if (_uniqueValuesCache[tableName]![primaryKey]!.contains(primaryValue)) {
       Logger.warn('Warning: primary key duplicate: $primaryValue');
       return false;
     }
-
     // 4. check unique indexes
     for (var index in schema.indexes.where((idx) => idx.unique)) {
       final fieldName = index.fields.first;
       final value = data[fieldName];
+      _uniqueValuesCache[tableName]![fieldName] ??= <dynamic>{};
       if (value != null &&
           _uniqueValuesCache[tableName]![fieldName]!.contains(value)) {
         Logger.warn(
@@ -1628,13 +1777,14 @@ class DataStoreImpl {
         }
       }
     }
-
     // 6. if pass all checks, update cache
+    _uniqueValuesCache[tableName]![primaryKey] ??= <dynamic>{};
     _uniqueValuesCache[tableName]![primaryKey]!.add(primaryValue);
     for (var field in schema.fields) {
       if (field.unique && field.name != primaryKey) {
         final value = data[field.name];
         if (value != null) {
+          _uniqueValuesCache[tableName]![field.name] ??= <dynamic>{};
           _uniqueValuesCache[tableName]![field.name]!.add(value);
         }
       }
@@ -1643,6 +1793,7 @@ class DataStoreImpl {
       final fieldName = index.fields.first;
       final value = data[fieldName];
       if (value != null) {
+        _uniqueValuesCache[tableName]![fieldName] ??= <dynamic>{};
         _uniqueValuesCache[tableName]![fieldName]!.add(value);
       }
     }
@@ -1974,7 +2125,8 @@ class DataStoreImpl {
       }
     }
 
-    final nextId = (_maxIds[tableName] ?? 0) + 1;
+    final currentId = _maxIds[tableName] ?? 0;
+    final nextId = currentId + 1;
     _maxIds[tableName] = nextId;
     _maxIdsDirty[tableName] = true;
 
@@ -1983,34 +2135,30 @@ class DataStoreImpl {
 
   /// Flush max IDs to disk
   Future<void> _flushMaxIds() async {
-    final dirtyTables = _maxIdsDirty.entries
-        .where((entry) => entry.value)
-        .map((entry) => entry.key)
-        .toList();
+    try {
+      for (var entry in _maxIdsDirty.entries) {
+        if (!entry.value) continue;
 
-    if (dirtyTables.isEmpty) return;
-
-    for (var tableName in dirtyTables) {
-      try {
+        final tableName = entry.key;
+        final maxId = _maxIds[tableName] ?? 0;
         final schema = await getTableSchema(tableName);
-        final maxId = _maxIds[tableName];
-        if (maxId != null) {
-          final maxIdFile =
-              File(config.getAutoIncrementPath(tableName, schema.isGlobal));
-          await maxIdFile.writeAsString(maxId.toString());
-          _maxIdsDirty[tableName] = false;
-        }
-      } catch (e) {
-        Logger.error('Write auto-increment ID failed: $e',
-            label: 'DataStore-_flushMaxIds');
+        final maxIdPath =
+            config.getAutoIncrementPath(tableName, schema.isGlobal);
+
+        await File(maxIdPath).writeAsString(maxId.toString());
+        _maxIdsDirty[tableName] = false;
       }
+    } catch (e) {
+      Logger.error(
+        'Failed to flush max IDs: $e',
+        label: 'DataStoreImpl._flushMaxIds',
+      );
     }
   }
 
   /// Key-value store table name
-  static const String _kvStoreName = 'kv_store'; // base space key-value store
-  static const String _globalKvStoreName =
-      'global_kv_store'; // global key-value store
+  static const String _kvStoreName = 'kv_store';
+  static const String _globalKvStoreName = 'global_kv_store';
 
   /// Set key-value pair
   Future<bool> setValue(String key, dynamic value,
@@ -2152,5 +2300,1172 @@ class DataStoreImpl {
   Future<bool> isGlobalTable(String tableName) async {
     final schema = await getTableSchema(tableName);
     return schema.isGlobal;
+  }
+
+  /// Add field to table
+  Future<void> addField(
+    String tableName,
+    FieldSchema field,
+    Transaction? txn,
+  ) async {
+    final schema = await getTableSchema(tableName);
+
+    // Check if field already exists
+    if (schema.fields.any((f) => f.name == field.name)) {
+      Logger.warn(
+        'Field ${field.name} already exists in table $tableName',
+        label: "DataStore.addField",
+      );
+      return;
+    }
+
+    // Add field to schema
+    final newFields = [...schema.fields, field];
+    final newSchema = schema.copyWith(fields: newFields);
+
+    // Update schema file
+    await updateTableSchema(tableName, newSchema);
+  }
+
+  /// Drop field from table
+  Future<void> dropField(
+    String tableName,
+    String fieldName,
+    Transaction? txn,
+  ) async {
+    final schema = await getTableSchema(tableName);
+
+    // Check if field exists
+    if (!schema.fields.any((f) => f.name == fieldName)) {
+      Logger.warn(
+        'Field $fieldName not found in table $tableName',
+        label: "DataStore.dropField",
+      );
+      return;
+    }
+
+    // Remove field from schema
+    final newFields = schema.fields.where((f) => f.name != fieldName).toList();
+    final newSchema = schema.copyWith(fields: newFields);
+
+    // Update schema file
+    await updateTableSchema(tableName, newSchema);
+  }
+
+  /// Rename field
+  Future<void> renameField(
+    String tableName,
+    String oldName,
+    String newName,
+    Transaction? txn,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+
+      // Update schema
+      final fields = List<FieldSchema>.from(schema.fields);
+      final oldFieldIndex = fields.indexWhere((f) => f.name == oldName);
+      if (oldFieldIndex == -1) {
+        Logger.warn(
+          'Field $oldName not found in table $tableName',
+          label: "DataStore.renameField",
+        );
+        return;
+      }
+      fields[oldFieldIndex] = fields[oldFieldIndex].copyWith(name: newName);
+
+      final newSchema = schema.copyWith(fields: fields);
+      await updateTableSchema(tableName, newSchema);
+    } catch (e) {
+      Logger.error(
+        'Failed to rename field: $e',
+        label: 'DataStoreImpl.renameField',
+      );
+      rethrow;
+    }
+  }
+
+  /// Modify field
+  Future<void> modifyField(
+    String tableName,
+    String fieldName,
+    FieldSchema newField,
+    Transaction? txn,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+
+      // Check if field exists
+      final oldField = schema.fields.firstWhere(
+        (f) => f.name == fieldName,
+        orElse: () {
+          Logger.warn(
+            'Field $fieldName not found in table $tableName',
+            label: "DataStore.modifyField",
+          );
+          return FieldSchema(name: fieldName, type: DataType.text);
+        },
+      );
+
+      newField = oldField.copyWith(
+        type: newField.type != DataType.text ? newField.type : null,
+        nullable: newField.nullable != true ? newField.nullable : null,
+        defaultValue: newField.defaultValue,
+        unique: newField.unique != false ? newField.unique : null,
+        comment: newField.comment,
+      );
+
+      // Update schema
+      final fields = List<FieldSchema>.from(schema.fields);
+      final fieldIndex = fields.indexWhere((f) => f.name == fieldName);
+      fields[fieldIndex] = newField;
+
+      final newSchema = schema.copyWith(fields: fields);
+      await updateTableSchema(tableName, newSchema);
+    } catch (e) {
+      Logger.error(
+        'Failed to modify field: $e',
+        label: 'DataStoreImpl.modifyField',
+      );
+      rethrow;
+    }
+  }
+
+  /// Add index to table
+  Future<void> addIndex(
+    String tableName,
+    IndexSchema index,
+    Transaction? txn,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+
+      // Check if index already exists
+      if (schema.indexes.any((i) => i.indexName == index.indexName)) {
+        Logger.warn(
+          'Index ${index.indexName} already exists in table $tableName',
+          label: "DataStore.addIndex",
+        );
+        return;
+      }
+
+      // Add index to schema
+      final newIndexes = [...schema.indexes, index];
+      final newSchema = schema.copyWith(indexes: newIndexes);
+
+      // Create index file and build index
+      await _indexManager?.createIndex(tableName, index);
+      await _buildIndex(tableName, index);
+
+      // Update schema file
+      await updateTableSchema(tableName, newSchema);
+      // Invalidate caches
+      _invalidateTableCaches(tableName);
+    } catch (e) {
+      Logger.error(
+        'Failed to add index: $e',
+        label: 'DataStoreImpl.addIndex',
+      );
+      rethrow;
+    }
+  }
+
+  /// Drop index from table
+  Future<void> dropIndex(
+    String tableName,
+    String indexName,
+    Transaction? txn,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+
+      // Check if index exists
+      if (!schema.indexes.any((i) => i.indexName == indexName)) {
+        Logger.warn(
+          'Index $indexName not found in table $tableName',
+          label: "DataStore.dropIndex",
+        );
+        return;
+      }
+
+      // Remove index from schema
+      final newIndexes =
+          schema.indexes.where((i) => i.indexName != indexName).toList();
+      final newSchema = schema.copyWith(indexes: newIndexes);
+
+      // Remove index file
+      await _removeIndexFile(tableName, indexName);
+
+      // Update schema file
+      await updateTableSchema(tableName, newSchema);
+      // Invalidate caches
+      _invalidateTableCaches(tableName);
+    } catch (e) {
+      Logger.error(
+        'Failed to drop index: $e',
+        label: 'DataStoreImpl.dropIndex',
+      );
+      rethrow;
+    }
+  }
+
+  /// Update table schema
+  Future<void> updateTableSchema(
+    String tableName,
+    TableSchema schema,
+  ) async {
+    try {
+      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
+      final schemaFile = File(schemaPath);
+
+      await schemaFile.writeAsString(jsonEncode(schema.toJson()));
+
+      // Update cache
+      _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
+    } catch (e) {
+      Logger.error(
+        'Failed to update schema: $e',
+        label: 'DataStoreImpl._updateTableSchema',
+      );
+      rethrow;
+    }
+  }
+
+  /// Rename table
+  Future<void> renameTable(
+    String oldName,
+    String newName,
+    Transaction? txn,
+  ) async {
+    try {
+      // Get original schema first to preserve isGlobal setting
+      final schema = await getTableSchema(oldName);
+      final isGlobal = schema.isGlobal;
+
+      // Check if new name is available
+      if (await _tableExists(newName)) {
+        Logger.warn(
+          'Table $newName already exists',
+          label: "DataStore.renameTable",
+        );
+        return;
+      }
+
+      // Update schema name first
+      final newSchema = schema.copyWith(name: newName);
+      await updateTableSchema(newName, newSchema);
+
+      // Rename all table files
+      await _renameTableFiles(oldName, newName, isGlobal);
+
+      // Remove old schema
+      await _removeTableSchema(oldName);
+
+      // Update caches
+      _invalidateTableCaches(oldName);
+      _queryExecutor?.queryCacheManager.cacheSchema(newName, newSchema);
+    } catch (e) {
+      Logger.error(
+        'Failed to rename table: $e',
+        label: 'DataStoreImpl.renameTable',
+      );
+      rethrow;
+    }
+  }
+
+  Future<void> _removeTableSchema(String tableName) async {
+    final schema = await getTableSchema(tableName);
+    final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
+    final schemaFile = File(schemaPath);
+    if (await schemaFile.exists()) {
+      await schemaFile.delete();
+    }
+    _invalidateTableCaches(tableName);
+  }
+
+  Future<void> renameFieldInRecords(
+      String tableName, String oldName, String newName,
+      {int batchSize = 1000}) async {
+    try {
+      final dataPath = config.getDataPath(
+        tableName,
+        (await getTableSchema(tableName)).isGlobal,
+      );
+      final dataFile = File(dataPath);
+
+      if (!await dataFile.exists()) {
+        return;
+      }
+
+      final lines = await dataFile.readAsLines();
+      var modified = false;
+
+      for (var i = 0; i < lines.length; i++) {
+        final line = lines[i].trim();
+        if (line.isEmpty) continue;
+
+        try {
+          final record = jsonDecode(line) as Map<String, dynamic>;
+          if (record.containsKey(oldName)) {
+            record[newName] = record[oldName];
+            record.remove(oldName);
+            lines[i] = jsonEncode(record);
+            modified = true;
+          }
+        } catch (e) {
+          Logger.warn(
+            'Invalid JSON at line $i: $e',
+            label: 'DataStoreImpl.renameFieldInRecords',
+          );
+        }
+      }
+
+      if (modified) {
+        await dataFile.writeAsString(lines.join('\n'));
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to rename field in records: $e',
+        label: 'DataStoreImpl.renameFieldInRecords',
+      );
+      rethrow;
+    }
+  }
+
+  /// Build index for table
+  Future<void> _buildIndex(
+    String tableName,
+    IndexSchema index,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+      final records = await queryByMap(tableName);
+
+      // Build index entries
+      for (var record in records) {
+        final values = <dynamic>[];
+        for (var field in index.fields) {
+          values.add(record[field]);
+        }
+
+        final value = values.length == 1 ? values.first : values;
+        await _indexManager?.addIndexEntry(
+          tableName,
+          index.actualIndexName,
+          value,
+          record[schema.primaryKey].toString(),
+        );
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to build index: $e',
+        label: 'DataStoreImpl._buildIndex',
+      );
+      rethrow;
+    }
+  }
+
+  Future<void> _removeIndexFile(
+    String tableName,
+    String indexName,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+      final indexPath = config.getIndexPath(
+        tableName,
+        indexName,
+        schema.isGlobal,
+      );
+      final indexFile = File(indexPath);
+
+      if (await indexFile.exists()) {
+        await indexFile.delete();
+      }
+
+      // Invalidate index cache
+      _indexManager?.invalidateCache(tableName, indexName);
+    } catch (e) {
+      Logger.error(
+        'Failed to remove index file: $e',
+        label: 'DataStoreImpl._removeIndexFile',
+      );
+      rethrow;
+    }
+  }
+
+  /// Rename table files
+  Future<void> _renameTableFiles(
+    String oldName,
+    String newName,
+    bool isGlobal,
+  ) async {
+    try {
+      // Rename data file
+      final oldDataPath = config.getDataPath(oldName, isGlobal);
+      final newDataPath = config.getDataPath(newName, isGlobal);
+      if (await File(oldDataPath).exists()) {
+        await File(oldDataPath).rename(newDataPath);
+      }
+
+      // Rename index files
+      final schema = await getTableSchema(newName);
+      for (var index in schema.indexes) {
+        final indexName = index.actualIndexName;
+        final oldIndexPath = config.getIndexPath(oldName, indexName, isGlobal);
+        final newIndexPath = config.getIndexPath(newName, indexName, isGlobal);
+        if (await File(oldIndexPath).exists()) {
+          await File(oldIndexPath).rename(newIndexPath);
+        }
+      }
+
+      // Rename auto-increment file
+      if (schema.autoIncrement) {
+        final oldAutoIncrementPath =
+            config.getAutoIncrementPath(oldName, isGlobal);
+        final newAutoIncrementPath =
+            config.getAutoIncrementPath(newName, isGlobal);
+        if (await File(oldAutoIncrementPath).exists()) {
+          await File(oldAutoIncrementPath).rename(newAutoIncrementPath);
+        }
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to rename table files: $e',
+        label: 'DataStoreImpl._renameTableFiles',
+      );
+      rethrow;
+    }
+  }
+
+  /// Process records in batches
+  Future<void> _batchProcessRecords(
+    String tableName,
+    Future<void> Function(List<Map<String, dynamic>>) processor, {
+    int batchSize = 1000,
+  }) async {
+    final schema = await getTableSchema(tableName);
+    final dataPath = config.getDataPath(tableName, schema.isGlobal);
+    final dataFile = File(dataPath);
+
+    if (!await dataFile.exists()) return;
+
+    final lines = await dataFile.readAsLines();
+    final records = <Map<String, dynamic>>[];
+
+    for (var line in lines) {
+      if (line.trim().isEmpty) continue;
+      records.add(jsonDecode(line) as Map<String, dynamic>);
+    }
+
+    for (var i = 0; i < records.length; i += batchSize) {
+      final end =
+          (i + batchSize < records.length) ? i + batchSize : records.length;
+      await processor(records.sublist(i, end));
+    }
+  }
+
+  /// Update records in batch
+  Future<void> _batchUpdateRecords(
+    String tableName,
+    List<Map<String, dynamic>> records,
+    Future<void> Function(Map<String, dynamic>) updater,
+  ) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      for (var record in records) {
+        await updater(record);
+      }
+      await _transactionManager!.commit(txn);
+    } catch (e) {
+      await _transactionManager!.rollback(txn);
+      rethrow;
+    }
+  }
+
+  /// Auto migrate database to new version
+  Future<void> autoMigrate({
+    required int oldVersion,
+    required int newVersion,
+    required List<TableSchema> schemas,
+    MigrationConfig? config,
+  }) async {
+    try {
+      final migrationConfig = config ?? const MigrationConfig();
+
+      // Backup if configured
+      if (migrationConfig.backupBeforeMigrate) {
+        await backup();
+      }
+
+      // Validate schemas
+      for (var schema in schemas) {
+        if (!_validateSchema(schema)) {
+          throw BusinessError(
+            'Invalid schema for table ${schema.name}',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+      }
+
+      // Execute migration in transaction
+      await transaction((txn) async {
+        await _migrationManager?.migrate(
+          oldVersion,
+          newVersion,
+          schemas,
+          batchSize: migrationConfig.batchSize,
+        );
+        await setVersion(newVersion);
+      });
+
+      // Validate after migration if configured
+      if (migrationConfig.validateAfterMigrate) {
+        final isValid = await _validateMigration(schemas);
+        if (!isValid && migrationConfig.strictMode) {
+          throw const BusinessError(
+            'Migration validation failed',
+            type: BusinessErrorType.migrationError,
+          );
+        }
+      }
+
+      Logger.info(
+        'Auto migration completed successfully',
+        label: 'DataStoreImpl.autoMigrate',
+      );
+    } catch (e, stack) {
+      Logger.error(
+        'Auto migration failed: $e\n$stack',
+        label: 'DataStoreImpl.autoMigrate',
+      );
+      rethrow;
+    }
+  }
+
+  /// Validate migration result
+  Future<bool> _validateMigration(List<TableSchema> schemas) async {
+    try {
+      if (_integrityChecker == null) {
+        Logger.error(
+          'IntegrityChecker not initialized',
+          label: 'DataStoreImpl._validateMigration',
+        );
+        return false;
+      }
+
+      for (var schema in schemas) {
+        if (!await _integrityChecker!.validateTableStructure(
+          schema.name,
+          schema,
+          config,
+        )) {
+          return false;
+        }
+        if (!await _integrityChecker!.validateTableData(
+          schema.name,
+          schema,
+          config,
+        )) {
+          return false;
+        }
+      }
+      return true;
+    } catch (e) {
+      Logger.error(
+        'Migration validation failed: $e',
+        label: 'DataStoreImpl._validateMigration',
+      );
+      return false;
+    }
+  }
+
+  /// Get table names
+  Future<List<String>> getTableNames() async {
+    try {
+      final tables = <String>{};
+
+      // Check global space
+      final globalDir = Directory(config.getGlobalPath());
+      if (await globalDir.exists()) {
+        await for (var entity in globalDir.list()) {
+          if (entity is File && entity.path.endsWith('.schema')) {
+            try {
+              final schemaJson = await entity.readAsString();
+              final json = jsonDecode(schemaJson) as Map<String, dynamic>;
+              // if name is not in json, add schemaPath
+              if (!json.containsKey('name')) {
+                json['_schemaPath'] = entity.path;
+              }
+              final schema = TableSchema.fromJson(json);
+              tables.add(schema.name);
+            } catch (e) {
+              Logger.warn(
+                'Failed to read schema file: ${entity.path}, error: $e',
+                label: 'DataStoreImpl.getTableNames',
+              );
+            }
+          }
+        }
+      }
+
+      // Check base space
+      final baseDir = Directory(config.getBasePath());
+      if (await baseDir.exists()) {
+        await for (var entity in baseDir.list()) {
+          if (entity is File && entity.path.endsWith('.schema')) {
+            try {
+              final schemaJson = await entity.readAsString();
+              final json = jsonDecode(schemaJson) as Map<String, dynamic>;
+              // if name is not in json, add schemaPath
+              if (!json.containsKey('name')) {
+                json['_schemaPath'] = entity.path;
+              }
+              final schema = TableSchema.fromJson(json);
+              tables.add(schema.name);
+            } catch (e) {
+              Logger.warn(
+                'Failed to read schema file: ${entity.path}, error: $e',
+                label: 'DataStoreImpl.getTableNames',
+              );
+            }
+          }
+        }
+      }
+
+      return tables.toList();
+    } catch (e) {
+      Logger.error(
+        'Failed to get table names: $e',
+        label: 'DataStoreImpl.getTableNames',
+      );
+      rethrow;
+    }
+  }
+
+  /// Run operations in transaction
+  Future<T> transaction<T>(Future<T> Function(Transaction txn) action) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      final result = await action(txn);
+      await _transactionManager?.commit(txn);
+      return result;
+    } catch (e) {
+      await _transactionManager?.rollback(txn);
+      rethrow;
+    }
+  }
+
+  /// Check if table exists
+  Future<bool> _tableExists(String tableName) async {
+    try {
+      await getTableSchema(tableName);
+      return true;
+    } catch (e) {
+      if (e is BusinessError && e.type == BusinessErrorType.schemaError) {
+        return false;
+      }
+      rethrow;
+    }
+  }
+
+  /// Add field to existing records
+  Future<void> addFieldToRecords(String tableName, FieldSchema field,
+      {int batchSize = 1000}) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      final schema = await getTableSchema(tableName);
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      final dataFile = File(dataPath);
+
+      if (!await dataFile.exists()) {
+        return;
+      }
+
+      await _batchProcessRecords(
+        tableName,
+        (batch) async {
+          final updatedBatch = <String>[];
+          for (var record in batch) {
+            record[field.name] =
+                field.defaultValue ?? _getTypeDefaultValue(field.type);
+            updatedBatch.add(jsonEncode(record));
+          }
+          await _writeRecordBatch(tableName, updatedBatch);
+        },
+        batchSize: batchSize,
+      );
+
+      // Update index if field has index
+      final hasIndex =
+          schema.indexes.any((idx) => idx.fields.contains(field.name));
+      if (hasIndex) {
+        await _rebuildIndexForField(tableName, field.name);
+      }
+
+      await _transactionManager!.commit(txn);
+    } catch (e) {
+      await _transactionManager!.rollback(txn);
+      Logger.error(
+        'Failed to add field to records: $e',
+        label: 'DataStoreImpl.addFieldToRecords',
+      );
+      rethrow;
+    }
+  }
+
+  /// Remove field from records
+  Future<void> removeFieldFromRecords(String tableName, String fieldName,
+      {int batchSize = 1000}) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      final schema = await getTableSchema(tableName);
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      final dataFile = File(dataPath);
+
+      if (!await dataFile.exists()) {
+        return;
+      }
+
+      await _batchProcessRecords(
+        tableName,
+        (batch) async {
+          final updatedBatch = <String>[];
+          for (var record in batch) {
+            record.remove(fieldName);
+            updatedBatch.add(jsonEncode(record));
+          }
+          await _writeRecordBatch(tableName, updatedBatch);
+        },
+        batchSize: batchSize,
+      );
+
+      await _transactionManager!.commit(txn);
+    } catch (e) {
+      await _transactionManager!.rollback(txn);
+      Logger.error(
+        'Failed to remove field from records: $e',
+        label: 'DataStoreImpl.removeFieldFromRecords',
+      );
+      rethrow;
+    }
+  }
+
+  /// Write batch of records
+  Future<void> _writeRecordBatch(
+    String tableName,
+    List<String> records,
+  ) async {
+    final schema = await getTableSchema(tableName);
+    final dataPath = config.getDataPath(tableName, schema.isGlobal);
+    final dataFile = File(dataPath);
+    try {
+      await _concurrencyManager!.acquireWriteLock(tableName);
+
+      await dataFile.writeAsString(
+        '${records.join('\n')}\n',
+        mode: FileMode.append,
+      );
+    } finally {
+      await _concurrencyManager!.releaseWriteLock(tableName);
+    }
+  }
+
+  /// Rebuild index for specific field
+  Future<void> _rebuildIndexForField(
+    String tableName,
+    String fieldName,
+  ) async {
+    final schema = await getTableSchema(tableName);
+    final index = schema.indexes.firstWhere(
+      (idx) => idx.fields.contains(fieldName),
+      orElse: () => const IndexSchema(fields: []),
+    );
+
+    if (index.indexName != null) {
+      await _indexManager?.dropIndex(tableName, index.actualIndexName);
+      await _buildIndex(tableName, index);
+    }
+  }
+
+  /// Update a single record
+  Future<void> _updateRecord(
+    String tableName,
+    Map<String, dynamic> record,
+  ) async {
+    final schema = await getTableSchema(tableName);
+    await updateInternal(
+      tableName,
+      record,
+      QueryCondition()
+        ..where(schema.primaryKey, '=', record[schema.primaryKey]),
+    );
+  }
+
+  /// Convert field data type
+  Future<void> _convertFieldData(String tableName, String fieldName,
+      DataType oldType, DataType newType, dynamic defaultValue,
+      {int batchSize = 1000}) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      await _batchProcessRecords(
+        tableName,
+        (batch) async {
+          await _batchUpdateRecords(
+            tableName,
+            batch,
+            (record) async {
+              final oldValue = record[fieldName];
+              dynamic newValue;
+              try {
+                newValue = _convertValue(oldValue, oldType, newType);
+              } catch (e) {
+                newValue = defaultValue ?? _getTypeDefaultValue(newType);
+                Logger.warn(
+                  'Failed to convert field $fieldName value: $oldValue, using default: $newValue',
+                  label: 'DataStoreImpl._convertFieldData',
+                );
+              }
+              record[fieldName] = newValue;
+              await _updateRecord(tableName, record);
+            },
+          );
+        },
+        batchSize: batchSize,
+      );
+      await _transactionManager!.commit(txn);
+    } catch (e) {
+      await _transactionManager!.rollback(txn);
+      Logger.error(
+        'Failed to convert field data: $e',
+        label: 'DataStoreImpl._convertFieldData',
+      );
+      rethrow;
+    }
+  }
+
+  /// Convert value between data types
+  dynamic _convertValue(dynamic value, DataType from, DataType to) {
+    if (value == null) return null;
+
+    switch (to) {
+      case DataType.integer:
+        return _toInteger(value);
+      case DataType.double:
+        return _toReal(value);
+      case DataType.text:
+        return _toString(value);
+      case DataType.blob:
+        return _toBlob(value);
+      case DataType.boolean:
+        return _toBoolean(value);
+      case DataType.datetime:
+        return _toDateTime(value);
+      case DataType.array:
+        return _toArray(value);
+      default:
+        throw BusinessError(
+          'Unsupported data type conversion: $from -> $to',
+          type: BusinessErrorType.typeError,
+        );
+    }
+  }
+
+  int? _toInteger(dynamic value) {
+    if (value is int) return value;
+    if (value is double) return value.round();
+    if (value is String) return int.tryParse(value);
+    if (value is bool) return value ? 1 : 0;
+    if (value is DateTime) return value.millisecondsSinceEpoch;
+    return null;
+  }
+
+  double? _toReal(dynamic value) {
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    if (value is String) return double.tryParse(value);
+    if (value is bool) return value ? 1.0 : 0.0;
+    if (value is DateTime) return value.millisecondsSinceEpoch.toDouble();
+    return null;
+  }
+
+  String? _toString(dynamic value) {
+    if (value is String) return value;
+    if (value is DateTime) return value.toIso8601String();
+    return value?.toString();
+  }
+
+  Uint8List? _toBlob(dynamic value) {
+    if (value is Uint8List) return value;
+    if (value is String) return Uint8List.fromList(utf8.encode(value));
+    if (value is List<int>) return Uint8List.fromList(value);
+    return null;
+  }
+
+  bool? _toBoolean(dynamic value) {
+    if (value is bool) return value;
+    if (value is int) return value != 0;
+    if (value is double) return value != 0.0;
+    if (value is String) {
+      final lower = value.toLowerCase();
+      return lower == 'true' || lower == '1' || lower == 'yes';
+    }
+    return null;
+  }
+
+  DateTime? _toDateTime(dynamic value) {
+    if (value is DateTime) return value;
+    if (value is int) return DateTime.fromMillisecondsSinceEpoch(value);
+    if (value is String) return DateTime.tryParse(value);
+    return null;
+  }
+
+  List? _toArray(dynamic value) {
+    if (value is List) return value;
+    if (value is String) {
+      try {
+        return jsonDecode(value) as List?;
+      } catch (_) {
+        return [value];
+      }
+    }
+    return value == null ? null : [value];
+  }
+
+  /// Invalidate all caches for table
+  void _invalidateTableCaches(String tableName) {
+    _queryExecutor?.queryCacheManager.invalidateCache(tableName);
+    _queryExecutor?.invalidateCache(tableName);
+    _statisticsCollector?.invalidateCache(tableName);
+    _uniqueValuesCache.remove(tableName);
+  }
+
+  /// Process data migration for field changes
+  Future<void> migrateFieldData(String tableName, FieldSchema oldField,
+      FieldSchema newField, Transaction? txn,
+      {int batchSize = 1000}) async {
+    // Skip if only metadata changed (comment, etc)
+    if (oldField.type == newField.type &&
+        oldField.nullable == newField.nullable &&
+        oldField.defaultValue == newField.defaultValue) {
+      Logger.error('No data migration needed - only metadata changed');
+      return;
+    }
+
+    // Handle type conversion
+    if (oldField.type != newField.type) {
+      await _convertFieldData(
+        tableName,
+        newField.name,
+        oldField.type,
+        newField.type,
+        newField.defaultValue,
+        batchSize: batchSize,
+      );
+    }
+
+    // Handle nullability change
+    if (!oldField.nullable && newField.nullable) {
+      Logger.error('Field became nullable - no action needed');
+    } else if (oldField.nullable && !newField.nullable) {
+      Logger.error('Setting default values for non-nullable field');
+      await _setDefaultForNullFields(
+        tableName,
+        newField.name,
+        newField.defaultValue ?? _getTypeDefaultValue(newField.type),
+        batchSize: batchSize,
+      );
+    }
+
+    // Handle unique constraint change
+    if (oldField.unique != newField.unique) {
+      Logger.error('Updating field indexes for unique constraint change');
+      await _updateFieldIndexes(tableName, newField.name, newField.unique);
+    }
+  }
+
+  /// Set default value for null fields
+  Future<void> _setDefaultForNullFields(
+      String tableName, String fieldName, dynamic defaultValue,
+      {int batchSize = 1000}) async {
+    final txn = await _transactionManager!.beginTransaction();
+    try {
+      await _batchProcessRecords(
+        tableName,
+        (batch) async {
+          await _batchUpdateRecords(
+            tableName,
+            batch,
+            (record) async {
+              if (record[fieldName] == null) {
+                record[fieldName] = defaultValue;
+                await _updateRecord(tableName, record);
+              }
+            },
+          );
+        },
+        batchSize: batchSize,
+      );
+      await _transactionManager!.commit(txn);
+    } catch (e) {
+      await _transactionManager!.rollback(txn);
+      Logger.error(
+        'Failed to set default values: $e',
+        label: 'DataStoreImpl._setDefaultForNullFields',
+      );
+      rethrow;
+    }
+  }
+
+  /// Update field indexes
+  Future<void> _updateFieldIndexes(
+    String tableName,
+    String fieldName,
+    bool unique,
+  ) async {
+    await transaction((txn) async {
+      final schema = await getTableSchema(tableName);
+
+      // Remove old index if exists
+      final oldIndex = schema.indexes.firstWhere(
+        (i) => i.fields.length == 1 && i.fields.first == fieldName,
+        orElse: () => const IndexSchema(fields: []),
+      );
+      if (oldIndex.indexName != null) {
+        await dropIndex(tableName, oldIndex.indexName!, txn);
+      }
+
+      // Add new index if unique
+      if (unique) {
+        final newIndex = IndexSchema(
+          indexName: '${fieldName}_idx',
+          fields: [fieldName],
+          unique: true,
+        );
+        await addIndex(tableName, newIndex, txn);
+      }
+    });
+  }
+
+  /// Get row pointer for given primary key value
+  Future<RowPointer?> getRowPointer(
+    String tableName,
+    dynamic primaryKeyValue,
+  ) async {
+    try {
+      final schema = await getTableSchema(tableName);
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      final dataFile = File(dataPath);
+
+      if (!await dataFile.exists()) {
+        return null;
+      }
+
+      // 1. Check pending writes in queue
+      final pendingData = fileManager.writeQueue[tableName] ?? [];
+      for (var record in pendingData) {
+        if (record[schema.primaryKey] == primaryKeyValue) {
+          final encoded = jsonEncode(record);
+          return RowPointer.create(encoded, 0); // Use temporary offset
+        }
+      }
+
+      // 2. Read from file
+      var offset = 0;
+      final lines = await dataFile.readAsLines();
+
+      for (var line in lines) {
+        if (line.trim().isEmpty) {
+          offset += line.length + 1;
+          continue;
+        }
+
+        try {
+          final record = jsonDecode(line) as Map<String, dynamic>;
+          if (record[schema.primaryKey] == primaryKeyValue) {
+            return RowPointer.create(line, offset);
+          }
+        } catch (e) {
+          Logger.warn(
+            'Invalid JSON at offset $offset: $e',
+            label: 'DataStoreImpl.getRowPointer',
+          );
+        }
+
+        offset += line.length + 1;
+      }
+
+      return null;
+    } catch (e) {
+      Logger.error(
+        'Failed to get row pointer: $e',
+        label: 'DataStoreImpl.getRowPointer',
+      );
+      return null;
+    }
+  }
+
+  /// Get record data by row pointer
+  Future<Map<String, dynamic>?> getRecordByPointer(
+    String tableName,
+    RowPointer pointer,
+  ) async {
+    try {
+      final dataPath = config.getDataPath(
+          tableName, (await getTableSchema(tableName)).isGlobal);
+      final file = File(dataPath);
+
+      if (!await file.exists()) return null;
+
+      final raf = await file.open(mode: FileMode.read);
+      try {
+        await raf.setPosition(pointer.offset);
+        final bytes = await raf.read(pointer.length);
+        final line = utf8.decode(bytes);
+
+        if (pointer.verifyContent(line.trim())) {
+          return jsonDecode(line.trim()) as Map<String, dynamic>;
+        }
+        return null;
+      } finally {
+        await raf.close();
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to get record by pointer: $e',
+        label: 'DataStoreImpl.getRecordByPointer',
+      );
+      return null;
+    }
+  }
+
+  /// Convert field value between data types
+  Future<dynamic> convertFieldValue(
+    dynamic value,
+    DataType fromType,
+    DataType toType,
+  ) async {
+    return _convertValue(value, fromType, toType);
+  }
+
+  /// Modify index
+  Future<void> modifyIndex(
+    String tableName,
+    String oldIndexName,
+    IndexSchema newIndex,
+    Transaction? txn,
+  ) async {
+    try {
+      // 1. Drop old index
+      await dropIndex(tableName, oldIndexName, txn);
+
+      // 2. Create new index
+      await addIndex(tableName, newIndex, txn);
+    } catch (e) {
+      Logger.error(
+        'Failed to modify index: $e',
+        label: 'DataStoreImpl.modifyIndex',
+      );
+      rethrow;
+    }
   }
 }

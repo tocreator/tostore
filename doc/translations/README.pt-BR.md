@@ -2,7 +2,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | Português (Brasil) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
-ToStore é um motor de armazenamento de alto desempenho desenvolvido especificamente para aplicações móveis. Implementado puramente em Dart, alcança desempenho excepcional através de indexação B+ tree e estratégias inteligentes de cache. Sua arquitetura multi-espaço resolve os desafios de isolamento de dados do usuário e compartilhamento de dados globais, enquanto recursos de nível empresarial como proteção de transações, reparo automático, backup incremental e custo zero em ociosidade garantem armazenamento de dados confiável para aplicações móveis.
+[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
+[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
+[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+
+ToStore é um mecanismo de armazenamento de alto desempenho projetado especificamente para aplicativos móveis. Implementado em Dart puro, alcança desempenho excepcional através de indexação B+ tree e estratégias inteligentes de cache. Sua arquitetura multispace resolve os desafios de isolamento de dados do usuário e compartilhamento de dados globais, enquanto recursos de nível empresarial como proteção de transações, reparo automático, backup incremental e zero custo em inatividade fornecem armazenamento de dados confiável para aplicativos móveis.
 
 ## Por que ToStore?
 
@@ -10,21 +16,26 @@ ToStore é um motor de armazenamento de alto desempenho desenvolvido especificam
   - Indexação B+ tree com otimização inteligente de consultas
   - Estratégia de cache inteligente com resposta em milissegundos
   - Leitura/escrita concorrente sem bloqueio com desempenho estável
+- 🔄 **Evolução Inteligente de Esquemas**: 
+  - Atualização automática de estrutura de tabelas através de esquemas
+  - Sem migrações manuais versão por versão
+  - API encadeável para mudanças complexas
+  - Atualizações sem tempo de inatividade
 - 🎯 **Fácil de Usar**: 
-  - Design de API fluente e encadeável
+  - Design de API encadeável fluido
   - Suporte para consultas estilo SQL/Map
   - Inferência de tipos inteligente com dicas de código completas
-  - Sem configuração, pronto para usar
+  - Pronto para usar sem configuração complexa
 - 🔄 **Arquitetura Inovadora**: 
-  - Isolamento de dados multi-espaço, perfeito para cenários multi-usuário
+  - Isolamento de dados multispace, perfeito para cenários multiusuário
   - Compartilhamento de dados globais resolve desafios de sincronização
   - Suporte para transações aninhadas
   - Carregamento de espaço sob demanda minimiza uso de recursos
-  - Armazenamento automático de dados, atualização/inserção inteligente
+  - Operações automáticas de dados (upsert)
 - 🛡️ **Confiabilidade Empresarial**: 
   - Proteção de transações ACID garante consistência de dados
   - Mecanismo de backup incremental com recuperação rápida
-  - Validação de integridade de dados com reparo automático de erros
+  - Verificação de integridade de dados com reparo automático
 
 ## Início Rápido
 
@@ -33,27 +44,36 @@ Uso básico:
 ```dart
 // Inicializar banco de dados
 final db = ToStore(
-  version: 1,
-  onCreate: (db) async {
-    // Criar tabela
-    await db.createTable(
-      'users',
-      TableSchema(
-        primaryKey: 'id',
-        fields: [
-          FieldSchema(name: 'id', type: DataType.integer, nullable: false),
-          FieldSchema(name: 'name', type: DataType.text, nullable: false),
-          FieldSchema(name: 'age', type: DataType.integer),
-          FieldSchema(name: 'tags', type: DataType.array),
-        ],
-        indexes: [
-          IndexSchema(fields: ['name'], unique: true),
-        ],
-      ),
-    );
+  version: 2, // cada vez que o número da versão é incrementado, a estrutura da tabela em schemas será automaticamente criada ou atualizada
+  schemas: [
+    // Simplesmente defina seu esquema mais recente, ToStore lida com a atualização automaticamente
+    const TableSchema(
+      name: 'users',
+      primaryKey: 'id',
+      fields: [
+        FieldSchema(name: 'id', type: DataType.integer, nullable: false),
+        FieldSchema(name: 'name', type: DataType.text, nullable: false),
+        FieldSchema(name: 'age', type: DataType.integer),
+      ],
+      indexes: [
+        IndexSchema(fields: ['name'], unique: true),
+      ],
+    ),
+  ],
+  // atualizações e migrações complexas podem ser feitas usando db.updateSchema
+  // se o número de tabelas for pequeno, recomenda-se ajustar diretamente a estrutura em schemas para atualização automática
+  onUpgrade: (db, oldVersion, newVersion) async {
+    if (oldVersion == 1) {
+      await db.updateSchema('users')
+          .addField("fans", type: DataType.array, comment: "seguidores")
+          .addIndex("follow", fields: ["follow", "name"])
+          .dropField("last_login")
+          .modifyField('email', unique: true)
+          .renameField("last_login", "last_login_time");
+    }
   },
 );
-await db.initialize(); // Opcional, garante que o banco de dados esteja inicializado antes das operações
+await db.initialize(); // Opcional, garante que o banco de dados esteja completamente inicializado antes das operações
 
 // Inserir dados
 await db.insert('users', {

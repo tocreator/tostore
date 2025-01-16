@@ -64,6 +64,9 @@ class TransactionManager {
         await _processBatch(batch);
       }
 
+      // Mark transaction as committed
+      transaction.isCommitted = true;
+
       // Record completed transaction
       _completedTransactions.addFirst(transaction.id);
       if (_completedTransactions.length > _maxCompletedTransactions) {
@@ -87,6 +90,9 @@ class TransactionManager {
     if (transaction == null) return;
 
     try {
+      // Mark transaction as rolled back
+      transaction.isCommitted = false;
+
       // Clean up transaction data
       _activeTransactions.remove(transaction.id);
       _transactionBatches.remove(transaction.id);

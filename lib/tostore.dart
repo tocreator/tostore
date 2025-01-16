@@ -15,6 +15,7 @@ import 'src/core/data_store_impl.dart';
 import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/query/query_builder.dart';
+import 'src/chain/schema_builder.dart';
 
 /// High-performance storage engine built specifically for mobile applications.
 /// Features:
@@ -57,6 +58,7 @@ class ToStore implements DataStoreInterface {
     String? dbPath,
     DataStoreConfig? config,
     int version = 1,
+    List<TableSchema> schemas = const [],
     Future<void> Function(ToStore db)? onConfigure,
     Future<void> Function(ToStore db)? onCreate,
     Future<void> Function(ToStore db, int oldVersion, int newVersion)?
@@ -71,6 +73,7 @@ class ToStore implements DataStoreInterface {
         dbPath: dbPath,
         config: config,
         version: version,
+        schemas: schemas,
         onConfigure: onConfigure != null
             ? (db) => onConfigure(ToStore._fromImpl(db))
             : null,
@@ -136,8 +139,8 @@ class ToStore implements DataStoreInterface {
   /// [schema] 表结构定义
   /// 全局表数据共享，其他表在切换空间后数据隔离
   @override
-  Future<void> createTable(String tableName, TableSchema schema) async {
-    return await _impl.createTable(tableName, schema);
+  Future<void> createTable(TableSchema schema) async {
+    return await _impl.createTable(schema);
   }
 
   /// Insert data into table
@@ -484,6 +487,25 @@ class ToStore implements DataStoreInterface {
     if (instanceKey != null) {
       _instances.remove(instanceKey);
     }
+  }
+
+  /// Update table schema, supports chain operations
+  /// [tableName] Table name
+  ///
+  /// Example:
+  /// ```dart
+  /// await db.updateSchema('users')
+  ///   .addField('age', DataType.integer)
+  ///   .dropField('old_field')
+  ///   .renameField('name', 'full_name')
+  ///   .modifyField('email', (field) => field.unique());
+  /// ```
+  ///
+  /// 更新表结构，支持链式操作
+  /// [tableName] 表名
+  @override
+  SchemaBuilder updateSchema(String tableName) {
+    return SchemaBuilder(_impl, tableName);
   }
 
   /// @nodoc

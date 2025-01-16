@@ -3,6 +3,7 @@ import 'dart:io';
 
 import '../handler/logger.dart';
 
+import '../model/business_error.dart';
 import 'data_store_impl.dart';
 import 'b_plus_tree.dart';
 import '../model/row_pointer.dart';
@@ -56,14 +57,36 @@ class IndexManager {
   /// update index
   Future<void> updateIndexes(
     String tableName,
-    Map<String, dynamic> data,
+    Map<String, dynamic> record,
     RowPointer pointer,
   ) async {
-    // add to batch queue
-    _indexBatchQueue.putIfAbsent(tableName, () => []).add({
-      'data': data,
-      'pointer': pointer.toString(),
-    });
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      final primaryKeyValue = record[schema.primaryKey];
+
+      // Update primary index
+      final pkIndex = getIndex('pk_$tableName');
+      if (pkIndex != null) {
+        await pkIndex.insert(primaryKeyValue, pointer.toString());
+      }
+
+      // Update secondary indexes
+      for (var index in schema.indexes) {
+        final indexKey = await _extractIndexKey(index.actualIndexName, record);
+        if (indexKey != null) {
+          final btIndex = getIndex(index.actualIndexName);
+          if (btIndex != null) {
+            await btIndex.insert(indexKey, primaryKeyValue.toString());
+          }
+        }
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to update indexes: $e',
+        label: 'IndexManager.updateIndexes',
+      );
+      rethrow;
+    }
   }
 
   /// force execute all update index
@@ -145,7 +168,6 @@ class IndexManager {
       // get index definition
       final index = _indexes[indexName];
       if (index == null) {
-        Logger.warn('警告: 索引 $indexName 未找到');
         return null;
       }
 
@@ -184,7 +206,7 @@ class IndexManager {
     }
 
     // find best index
-    final bestIndex = _findBestIndex(tableName, where);
+    final bestIndex = await _findBestIndex(tableName, where);
     if (bestIndex != null) {
       return QueryPlan([
         QueryOperation(
@@ -208,32 +230,65 @@ class IndexManager {
   }
 
   /// find best index
-  String? _findBestIndex(String tableName, Map<String, dynamic> where) {
-    // first check primary index
-    if (where.containsKey('id') && _indexes.containsKey('id_pk')) {
-      return 'id_pk';
-    }
+  Future<String?> _findBestIndex(
+      String tableName, Map<String, dynamic> where) async {
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
 
-    // then check normal index
-    for (var key in where.keys) {
-      final idxName = '${key}_idx';
-      if (_indexes.containsKey(idxName)) {
-        return idxName;
+      // first check primary index
+      if (where.containsKey(schema.primaryKey)) {
+        return 'pk_$tableName';
       }
-    }
 
-    return null;
+      // then check normal index
+      for (var index in schema.indexes) {
+        // Check if any index field is in where clause
+        if (index.fields.any((field) => where.containsKey(field))) {
+          return index.actualIndexName;
+        }
+      }
+
+      return null;
+    } catch (e) {
+      Logger.error(
+        'Failed to find best index: $e',
+        label: 'IndexManager._findBestIndex',
+      );
+      return null;
+    }
   }
 
   /// delete record from all indexes
   Future<void> deleteFromIndexes(
-      String tableName, Map<String, dynamic> record) async {
-    for (var entry in _indexes.entries) {
-      final indexName = entry.key;
-      final indexKey = await _extractIndexKey(indexName, record);
-      if (indexKey != null) {
-        await entry.value.delete(indexKey, record);
+    String tableName,
+    Map<String, dynamic> record,
+  ) async {
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      final primaryKeyValue = record[schema.primaryKey];
+
+      // Delete from primary index
+      final pkIndex = getIndex('pk_$tableName');
+      if (pkIndex != null) {
+        await pkIndex.delete(primaryKeyValue, primaryKeyValue.toString());
       }
+
+      // Delete from secondary indexes
+      for (var index in schema.indexes) {
+        final indexKey = await _extractIndexKey(index.actualIndexName, record);
+        if (indexKey != null) {
+          final btIndex = getIndex(index.actualIndexName);
+          if (btIndex != null) {
+            await btIndex.delete(indexKey, primaryKeyValue.toString());
+          }
+        }
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to delete from indexes: $e',
+        label: 'IndexManager.deleteFromIndexes',
+      );
+      rethrow;
     }
   }
 
@@ -257,45 +312,45 @@ class IndexManager {
     }
   }
 
-  /// check unique constraints
+  /// Check unique constraints
   Future<void> checkUniqueConstraints(
-      String tableName, Map<String, dynamic> data) async {
+      String tableName, Map<String, dynamic> record,
+      {bool isUpdate = false}) async {
     try {
-      // check all unique index constraints
-      for (var entry in _indexes.entries) {
-        if (entry.value.isUnique) {
-          final indexName = entry.key;
-          final indexKey = await _extractIndexKey(indexName, data);
-          if (indexKey != null) {
-            final existingValues = await entry.value.search(indexKey);
-            if (existingValues.isNotEmpty) {
-              // if update operation, check if it is the same record
-              if (existingValues.first['id'] != data['id']) {
-                // if primary index, throw duplicate key error
-                if (indexName == 'id_pk') {
-                  throw StateError('duplicate primary key: ${data['id']}');
-                }
-                // if unique index, throw duplicate value error
-                final fieldName =
-                    indexName.split('_')[0]; // get field name from index name
-                Logger.warn('field $fieldName value $indexKey already exists');
-                throw StateError(
-                    'field $fieldName value $indexKey already exists');
-              }
-            }
-          }
+      final schema = await _dataStore.getTableSchema(tableName);
+      final primaryKeyValue = record[schema.primaryKey];
+
+      // Check unique indexes
+      for (var index in schema.indexes.where((i) => i.unique)) {
+        final indexKey = _createIndexKey(record, index.fields);
+        if (indexKey == null) continue;
+
+        final btIndex = getIndex(index.actualIndexName);
+        if (btIndex == null) continue;
+
+        final existingIds = await btIndex.search(indexKey);
+        if (existingIds.isNotEmpty &&
+            !existingIds.contains(primaryKeyValue.toString())) {
+          throw BusinessError(
+            'Unique constraint violation: ${index.fields.join(",")} = $indexKey',
+            type: BusinessErrorType.uniqueError,
+          );
         }
       }
     } catch (e) {
-      Logger.error('check unique constraints failed: $e',
-          label: 'IndexManager.checkUniqueConstraints');
+      Logger.error(
+        'Failed to check unique constraints: $e',
+        label: 'IndexManager.checkUniqueConstraints',
+      );
       rethrow;
     }
   }
 
   /// batch update indexes
   Future<void> batchUpdateIndexes(
-      String tableName, List<Map<String, dynamic>> records) async {
+    String tableName,
+    List<Map<String, dynamic>> records,
+  ) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
       final primaryKey = schema.primaryKey;
@@ -318,11 +373,11 @@ class IndexManager {
           // collect secondary index updates
           for (var index in schema.indexes) {
             final indexName = index.actualIndexName;
-            final indexValue = data[index.fields.first];
-            if (indexValue != null) {
+            final indexKey = _createIndexKey(data, index.fields);
+            if (indexKey != null) {
               secondaryUpdates
                   .putIfAbsent(indexName, () => {})
-                  .putIfAbsent(indexValue, () => [])
+                  .putIfAbsent(indexKey, () => [])
                   .add(primaryKeyValue);
             }
           }
@@ -333,7 +388,7 @@ class IndexManager {
       final pkIndex = getIndex('pk_$tableName');
       if (pkIndex != null) {
         for (var entry in pkUpdates.entries) {
-          await pkIndex.insert(entry.key, entry.value);
+          await pkIndex.insert(entry.key, entry.value.toString());
         }
       }
 
@@ -392,5 +447,101 @@ class IndexManager {
           label: 'IndexManager.getTotalIndexSize');
     }
     return totalSize;
+  }
+
+  /// Add index entry during migration
+  Future<void> addIndexEntry(
+    String tableName,
+    String indexName,
+    dynamic value,
+    String recordId,
+  ) async {
+    try {
+      final btIndex = getIndex(indexName);
+      if (btIndex != null) {
+        await btIndex.insert(value, recordId);
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to add index entry: $e',
+        label: 'IndexManager.addIndexEntry',
+      );
+      rethrow;
+    }
+  }
+
+  /// Invalidate index cache
+  void invalidateCache(String tableName, String indexName) {
+    final indexKey = '${tableName}_$indexName';
+    _indexes.remove(indexKey);
+    _indexBatchQueue.remove(indexKey);
+  }
+
+  /// Drop index for table
+  Future<void> dropIndex(
+    String tableName,
+    String indexName,
+  ) async {
+    try {
+      // Remove index from memory
+      final key = '${tableName}_$indexName';
+      _indexes.remove(key);
+      _indexBatchQueue.remove(key);
+      _indexFiles.remove(key);
+
+      // Remove index file
+      final schema = await _dataStore.getTableSchema(tableName);
+      final indexPath = _dataStore.config.getIndexPath(
+        tableName,
+        indexName,
+        schema.isGlobal,
+      );
+      final indexFile = File(indexPath);
+
+      if (await indexFile.exists()) {
+        await indexFile.delete();
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to drop index: $e',
+        label: 'IndexManager.dropIndex',
+      );
+      rethrow;
+    }
+  }
+
+  /// Create index key
+  dynamic _createIndexKey(Map<String, dynamic> record, List<String> fields) {
+    dynamic key;
+    for (var field in fields) {
+      key = record[field];
+      if (key != null) {
+        break;
+      }
+    }
+    return key;
+  }
+
+  Future<Map<String, dynamic>?> getRecordByIndex(
+    String tableName,
+    String indexName,
+    dynamic indexValue,
+  ) async {
+    try {
+      final btIndex = getIndex(indexName);
+      if (btIndex == null) return null;
+
+      final pointer = await btIndex.search(indexValue);
+      final rowPointer = await _dataStore.getRowPointer(tableName, pointer);
+      if (rowPointer == null) return null;
+
+      return await _dataStore.getRecordByPointer(tableName, rowPointer);
+    } catch (e) {
+      Logger.error(
+        'Failed to get record by index: $e',
+        label: 'IndexManager.getRecordByIndex',
+      );
+      return null;
+    }
   }
 }

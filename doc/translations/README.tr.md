@@ -2,29 +2,40 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | Türkçe
 
-ToStore, özellikle mobil uygulamalar için tasarlanmış yüksek performanslı bir depolama motorudur. Tamamen Dart ile uygulanmış olup, B+ ağacı indeksleme ve akıllı önbellek stratejileri sayesinde olağanüstü performans elde eder. Çok alanlı mimarisi, kullanıcı verilerinin izolasyonu ve global veri paylaşımı zorluklarını çözerken, işlem koruması, otomatik onarım, artımlı yedekleme ve sıfır maliyetli boşta kalma gibi kurumsal düzey özellikleri ile mobil uygulamalar için güvenilir veri depolama sağlar.
+[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
+[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
+[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+
+ToStore, özellikle mobil uygulamalar için tasarlanmış yüksek performanslı bir depolama motorudur. Saf Dart ile uygulanmış olup, B+ ağacı indeksleme ve akıllı önbellek stratejileri sayesinde olağanüstü performans elde eder. Çok alanlı mimarisi, kullanıcı verilerinin izolasyonu ve global veri paylaşımı zorluklarını çözerken, işlem koruması, otomatik onarım, artımlı yedekleme ve boşta sıfır maliyet gibi kurumsal düzey özellikler mobil uygulamalar için güvenilir veri depolama sağlar.
 
 ## Neden ToStore?
 
-- 🚀 **Üstün Performans**: 
+- 🚀 **Maksimum Performans**: 
   - Akıllı sorgu optimizasyonlu B+ ağacı indeksleme
   - Milisaniye yanıt süreli akıllı önbellek stratejisi
   - Kararlı performanslı engellemesiz eşzamanlı okuma/yazma
+- 🔄 **Akıllı Şema Evrimi**: 
+  - Şemalar aracılığıyla otomatik tablo yapısı güncellemesi
+  - Manuel sürüm sürüm migrasyonlar yok
+  - Karmaşık değişiklikler için zincirleme API
+  - Kesintisiz güncellemeler
 - 🎯 **Kullanımı Kolay**: 
-  - Akıcı zincirleme API tasarım
-  - SQL/Map tarzı sorgular için destek
+  - Akıcı zincirleme API tasarımı
+  - SQL/Map tarzı sorgu desteği
   - Tam kod önerileriyle akıllı tip çıkarımı
-  - Sıfır yapılandırma, kutudan çıktığı gibi hazır
+  - Karmaşık yapılandırma olmadan kullanıma hazır
 - 🔄 **Yenilikçi Mimari**: 
   - Çok kullanıcılı senaryolar için mükemmel çok alanlı veri izolasyonu
-  - Global veri paylaşımı senkronizasyon zorluklarını çözer
-  - İç içe işlemler için destek
-  - İsteğe bağlı alan yükleme kaynak kullanımını minimize eder
-  - Otomatik veri depolama, akıllı güncelleme/ekleme
-- 🛡️ **Kurumsal Düzey Güvenilirlik**: 
-  - ACID işlem koruması veri tutarlılığını garanti eder
-  - Hızlı kurtarmalı artımlı yedekleme mekanizması
-  - Otomatik hata onarımlı veri bütünlüğü doğrulaması
+  - Senkronizasyon zorluklarını çözen global veri paylaşımı
+  - İç içe işlem desteği
+  - Kaynak kullanımını minimize eden talep üzerine alan yükleme
+  - Otomatik veri işlemleri (upsert)
+- 🛡️ **Kurumsal Güvenilirlik**: 
+  - Veri tutarlılığını garanti eden ACID işlem koruması
+  - Hızlı kurtarma özellikli artımlı yedekleme mekanizması
+  - Otomatik onarımlı veri bütünlüğü doğrulaması
 
 ## Hızlı Başlangıç
 
@@ -33,27 +44,36 @@ Temel kullanım:
 ```dart
 // Veritabanını başlat
 final db = ToStore(
-  version: 1,
-  onCreate: (db) async {
-    // Tablo oluştur
-    await db.createTable(
-      'users',
-      TableSchema(
-        primaryKey: 'id',
-        fields: [
-          FieldSchema(name: 'id', type: DataType.integer, nullable: false),
-          FieldSchema(name: 'name', type: DataType.text, nullable: false),
-          FieldSchema(name: 'age', type: DataType.integer),
-          FieldSchema(name: 'tags', type: DataType.array),
-        ],
-        indexes: [
-          IndexSchema(fields: ['name'], unique: true),
-        ],
-      ),
-    );
+  version: 2, // sürüm numarası her artırıldığında, schemas'daki tablo yapısı otomatik olarak oluşturulacak veya güncellenecek
+  schemas: [
+    // Sadece en son şemanızı tanımlayın, ToStore güncellemeyi otomatik olarak halleder
+    const TableSchema(
+      name: 'users',
+      primaryKey: 'id',
+      fields: [
+        FieldSchema(name: 'id', type: DataType.integer, nullable: false),
+        FieldSchema(name: 'name', type: DataType.text, nullable: false),
+        FieldSchema(name: 'age', type: DataType.integer),
+      ],
+      indexes: [
+        IndexSchema(fields: ['name'], unique: true),
+      ],
+    ),
+  ],
+  // karmaşık güncellemeler ve migrasyonlar db.updateSchema kullanılarak yapılabilir
+  // tablo sayısı azsa, otomatik güncelleme için yapıyı doğrudan schemas'da ayarlamanız önerilir
+  onUpgrade: (db, oldVersion, newVersion) async {
+    if (oldVersion == 1) {
+      await db.updateSchema('users')
+          .addField("fans", type: DataType.array, comment: "takipçiler")
+          .addIndex("follow", fields: ["follow", "name"])
+          .dropField("last_login")
+          .modifyField('email', unique: true)
+          .renameField("last_login", "last_login_time");
+    }
   },
 );
-await db.initialize(); // İsteğe bağlı, işlemlerden önce veritabanının tam olarak başlatıldığından emin olur
+await db.initialize(); // İsteğe bağlı, işlemlerden önce veritabanının tamamen başlatıldığından emin olur
 
 // Veri ekle
 await db.insert('users', {

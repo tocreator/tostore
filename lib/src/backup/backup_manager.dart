@@ -187,7 +187,7 @@ class BackupManager {
 
         // restore table schema
         final schema = TableSchema.fromJson(tableData['schema']);
-        await _dataStore.createTable(tableName, schema);
+        await _dataStore.createTable(schema);
 
         // restore table data
         final records = tableData['data'] as List<dynamic>;

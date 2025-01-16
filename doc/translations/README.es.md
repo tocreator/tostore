@@ -2,7 +2,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | Español | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
-ToStore es un motor de almacenamiento de alto rendimiento diseñado específicamente para aplicaciones móviles. Implementado puramente en Dart, logra un rendimiento excepcional a través de indexación B+ tree y estrategias de caché inteligentes. Su arquitectura multi-espacio resuelve los desafíos de aislamiento de datos de usuario y compartición de datos globales, mientras que características de nivel empresarial como protección de transacciones, reparación automática, respaldo incremental y costo cero en inactividad aseguran un almacenamiento de datos confiable para aplicaciones móviles.
+[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
+[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
+[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+
+ToStore es un motor de almacenamiento de alto rendimiento diseñado específicamente para aplicaciones móviles. Implementado en Dart puro, logra un rendimiento excepcional a través de indexación B+ tree y estrategias de caché inteligentes. Su arquitectura multiespacio resuelve los desafíos de aislamiento de datos de usuario y compartición de datos globales, mientras que características de nivel empresarial como protección de transacciones, reparación automática, respaldo incremental y cero costos en inactividad proporcionan almacenamiento de datos confiable para aplicaciones móviles.
 
 ## ¿Por qué ToStore?
 
@@ -10,21 +16,26 @@ ToStore es un motor de almacenamiento de alto rendimiento diseñado específicam
   - Indexación B+ tree con optimización inteligente de consultas
   - Estrategia de caché inteligente con respuesta en milisegundos
   - Lectura/escritura concurrente sin bloqueo con rendimiento estable
+- 🔄 **Evolución Inteligente de Esquemas**: 
+  - Actualización automática de estructura de tablas a través de esquemas
+  - Sin migraciones manuales versión por versión
+  - API encadenable para cambios complejos
+  - Actualizaciones sin tiempo de inactividad
 - 🎯 **Fácil de Usar**: 
-  - Diseño de API fluido y encadenable
+  - Diseño de API encadenable fluido
   - Soporte para consultas estilo SQL/Map
   - Inferencia de tipos inteligente con sugerencias de código completas
-  - Sin configuración, listo para usar
+  - Listo para usar sin configuración compleja
 - 🔄 **Arquitectura Innovadora**: 
   - Aislamiento de datos multiespacio, perfecto para escenarios multiusuario
-  - Compartición de datos globales, resuelve desafíos de sincronización
+  - Compartición de datos globales resuelve desafíos de sincronización
   - Soporte para transacciones anidadas
-  - Carga de espacio bajo demanda minimiza el uso de recursos
-  - Almacenamiento automático de datos, actualización/inserción inteligente
-- 🛡️ **Fiabilidad de Nivel Empresarial**: 
-  - Protección de transacciones ACID asegura consistencia de datos
+  - Carga de espacio bajo demanda minimiza uso de recursos
+  - Operaciones automáticas de datos (upsert)
+- 🛡️ **Fiabilidad Empresarial**: 
+  - Protección de transacciones ACID garantiza consistencia de datos
   - Mecanismo de respaldo incremental con recuperación rápida
-  - Validación de integridad de datos con reparación automática de errores
+  - Verificación de integridad de datos con reparación automática
 
 ## Inicio Rápido
 
@@ -33,27 +44,36 @@ Uso básico:
 ```dart
 // Inicializar base de datos
 final db = ToStore(
-  version: 1,
-  onCreate: (db) async {
-    // Crear tabla
-    await db.createTable(
-      'users',
-      TableSchema(
-        primaryKey: 'id',
-        fields: [
-          FieldSchema(name: 'id', type: DataType.integer, nullable: false),
-          FieldSchema(name: 'name', type: DataType.text, nullable: false),
-          FieldSchema(name: 'age', type: DataType.integer),
-          FieldSchema(name: 'tags', type: DataType.array),
-        ],
-        indexes: [
-          IndexSchema(fields: ['name'], unique: true),
-        ],
-      ),
-    );
+  version: 2, // cada vez que se incrementa el número de versión, la estructura de tabla en schemas se creará o actualizará automáticamente
+  schemas: [
+    // Simplemente define tu esquema más reciente, ToStore maneja la actualización automáticamente
+    const TableSchema(
+      name: 'users',
+      primaryKey: 'id',
+      fields: [
+        FieldSchema(name: 'id', type: DataType.integer, nullable: false),
+        FieldSchema(name: 'name', type: DataType.text, nullable: false),
+        FieldSchema(name: 'age', type: DataType.integer),
+      ],
+      indexes: [
+        IndexSchema(fields: ['name'], unique: true),
+      ],
+    ),
+  ],
+  // actualizaciones y migraciones complejas pueden hacerse usando db.updateSchema
+  // si el número de tablas es pequeño, se recomienda ajustar directamente la estructura en schemas para actualización automática
+  onUpgrade: (db, oldVersion, newVersion) async {
+    if (oldVersion == 1) {
+      await db.updateSchema('users')
+          .addField("fans", type: DataType.array, comment: "seguidores")
+          .addIndex("follow", fields: ["follow", "name"])
+          .dropField("last_login")
+          .modifyField('email', unique: true)
+          .renameField("last_login", "last_login_time");
+    }
   },
 );
-await db.initialize(); // Opcional, asegura que la base de datos esté inicializada antes de operaciones
+await db.initialize(); // Opcional, asegura que la base de datos esté completamente inicializada antes de operaciones
 
 // Insertar datos
 await db.insert('users', {

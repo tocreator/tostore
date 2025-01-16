@@ -14,40 +14,89 @@ class TostoreExample {
   /// Initialize database and create tables
   Future<void> initialize() async {
     db = ToStore(
-      version: 1,
-      onCreate: (db) async {
-        // Create users table
-        await db.createTable(
-          'users',
-          const TableSchema(
-            primaryKey: 'id',
-            fields: [
-              FieldSchema(name: 'id', type: DataType.integer, nullable: false),
-              FieldSchema(
-                  name: 'username', type: DataType.text, nullable: false),
-              FieldSchema(name: 'email', type: DataType.text, nullable: false),
-              FieldSchema(name: 'last_login', type: DataType.datetime),
-            ],
-            indexes: [
-              IndexSchema(fields: ['username'], unique: true),
-              IndexSchema(fields: ['email'], unique: true),
-            ],
-          ),
-        );
+      version:
+          2, // every time the version number is increased, the data table structure in schemas will be automatically created or upgraded
+      schemas: [
+        // schemas is used to automatically create or upgrade data table structure
+        const TableSchema(
+          name: 'users',
+          primaryKey: 'id',
+          fields: [
+            FieldSchema(name: 'id', type: DataType.integer, nullable: false),
+            FieldSchema(name: 'username', type: DataType.text, nullable: false),
+            FieldSchema(name: 'email', type: DataType.text, nullable: false),
+            FieldSchema(name: 'last_login', type: DataType.datetime),
+          ],
+          indexes: [
+            IndexSchema(fields: ['username'], unique: true),
+            IndexSchema(fields: ['email'], unique: true),
+          ],
+        ),
+        const TableSchema(
+          name: 'settings',
+          primaryKey: 'key',
+          isGlobal: true,
+          fields: [
+            FieldSchema(name: 'key', type: DataType.text, nullable: false),
+            FieldSchema(name: 'value', type: DataType.text),
+            FieldSchema(name: 'updated_at', type: DataType.datetime),
+          ],
+        ),
+      ],
 
-        // Create settings table (global table, shared across all spaces)
-        await db.createTable(
-          'settings',
-          const TableSchema(
-            primaryKey: 'key',
-            isGlobal: true,
-            fields: [
-              FieldSchema(name: 'key', type: DataType.text, nullable: false),
-              FieldSchema(name: 'value', type: DataType.text),
-              FieldSchema(name: 'updated_at', type: DataType.datetime),
-            ],
-          ),
-        );
+      // if you want to manually create data table structure, you can use db.createTable in onCreate
+      // onCreate: (db) async {
+      //   // Create users table
+      //   await db.createTable(
+      //     const TableSchema(
+      //       name: 'users',
+      //       primaryKey: 'id',
+      //       fields: [
+      //         FieldSchema(name: 'id', type: DataType.integer, nullable: false),
+      //         FieldSchema(
+      //             name: 'username', type: DataType.text, nullable: false),
+      //         FieldSchema(name: 'email', type: DataType.text, nullable: false),
+      //         FieldSchema(name: 'last_login', type: DataType.datetime),
+      //       ],
+      //       indexes: [
+      //         IndexSchema(fields: ['username'], unique: true),
+      //         IndexSchema(fields: ['email'], unique: true),
+      //       ],
+      //     ),
+      //   );
+
+      //   // Create settings table (global table, shared across all spaces)
+      //   await db.createTable(
+      //     const TableSchema(
+      //       name: 'settings',
+      //       primaryKey: 'key',
+      //       isGlobal: true,
+      //       fields: [
+      //         FieldSchema(name: 'key', type: DataType.text, nullable: false),
+      //         FieldSchema(name: 'value', type: DataType.text),
+      //         FieldSchema(name: 'updated_at', type: DataType.datetime),
+      //       ],
+      //     ),
+      //   );
+      // },
+      // complex upgrade and migration can be done using db.updateSchema
+      // if the number of data tables is small, it is recommended to directly adjust the data structure in schemas for automatic upgrade
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion == 1) {
+          await db
+              .updateSchema('users') // update users table structure
+              .addField("fans",
+                  type: DataType.array, comment: "fans") // add fans field
+              .addIndex("follow",
+                  fields: ["follow", "username"]) // add follow index
+              .dropField("last_login") // drop last_login field
+              .renameField("last_login",
+                  "last_login_time"); // rename last_login to last_login_time
+        } else if (oldVersion == 2) {
+          await db
+              .updateSchema('users')
+              .renameTo('users_new'); // rename users table to users_new
+        }
       },
     );
     await db.initialize();
@@ -69,6 +118,14 @@ class TostoreExample {
     await db.update('users', {
       'last_login': DateTime.now().toIso8601String(),
     }).where('username', '=', 'john_doe');
+
+    // Automatically store data,Support batch upsert
+    await db.upsert('users', {'name': 'John'}).where(
+        'email', '=', 'john@example.com');
+
+    // Auto insert or update based on primary key
+    await db.upsert(
+        'users', {'id': 1, 'name': 'John', 'email': 'john@example.com'});
 
     // Delete: Remove user
     await db.delete('users').where('username', '=', 'john_doe');

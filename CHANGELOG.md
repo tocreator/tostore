@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.8.5
+
+### Added
+- Added automatic schema upgrade support through `schemas` parameter
+- Added chainable schema update operations for table structure modifications
+- Added comprehensive example for schema upgrades and migrations
+
+### Changed
+- Improved table structure upgrade mechanism
+- Enhanced documentation with schema upgrade examples
+- Optimized constraint checking
+
+
 ## 1.8.4
 
 ### Added

@@ -1,4 +1,5 @@
 import '../chain/delete_builder.dart';
+import '../chain/schema_builder.dart';
 import '../chain/update_builder.dart';
 import '../chain/upsert_builder.dart';
 import '../model/data_store_config.dart';
@@ -43,7 +44,10 @@ abstract class DataStoreInterface {
   Future<bool> removeValue(String key, {bool isGlobal = false});
 
   /// create table
-  Future<void> createTable(String tableName, TableSchema schema);
+  Future<void> createTable(TableSchema schema);
+
+  /// update table schema
+  SchemaBuilder updateSchema(String tableName);
 
   /// drop table
   Future<void> dropTable(String tableName);

@@ -4,7 +4,9 @@ import 'dart:typed_data';
 
 import '../core/data_compressor.dart';
 import '../core/data_store_impl.dart';
+import '../model/business_error.dart';
 import '../model/table_schema.dart';
+import '../model/data_store_config.dart';
 
 /// data integrity checker
 class IntegrityChecker {
@@ -147,23 +149,30 @@ class IntegrityChecker {
 
     // infer referenced table name (e.g. user_id -> users)
     final referencedTable = _inferReferencedTable(fieldName);
-    final tablePath = await _dataStore.getTablePath(referencedTable);
-    final referencedFile = File('$tablePath.dat');
 
-    if (!await referencedFile.exists()) {
+    try {
+      // Get schema of referenced table
+      final referencedSchema = await _loadTableSchema(referencedTable);
+      final tablePath = await _dataStore.getTablePath(referencedTable);
+      final referencedFile = File('$tablePath.dat');
+
+      if (!await referencedFile.exists()) {
+        return false;
+      }
+
+      // find record in referenced table
+      final lines = await referencedFile.readAsLines();
+      for (var line in lines) {
+        final record = jsonDecode(line) as Map<String, dynamic>;
+        if (record[referencedSchema.primaryKey] == value) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (e) {
       return false;
     }
-
-    // find record in referenced table
-    final lines = await referencedFile.readAsLines();
-    for (var line in lines) {
-      final record = jsonDecode(line) as Map<String, dynamic>;
-      if (record['id'] == value) {
-        return true;
-      }
-    }
-
-    return false;
   }
 
   /// infer referenced table name
@@ -205,11 +214,41 @@ class IntegrityChecker {
 
   /// load table schema
   Future<TableSchema> _loadTableSchema(String tableName) async {
+    // Try to get from cache first
     if (_schemas.containsKey(tableName)) {
       return _schemas[tableName]!;
     }
 
-    final schema = await _dataStore.getTableSchema(tableName);
+    // Load schema from file
+    final schemaPath = _dataStore.config.getSchemaPath(tableName, true);
+    final schemaFile = File(schemaPath);
+    if (!await schemaFile.exists()) {
+      final baseSchemaPath = _dataStore.config.getSchemaPath(tableName, false);
+      final baseSchemaFile = File(baseSchemaPath);
+      if (!await baseSchemaFile.exists()) {
+        throw BusinessError(
+          'Table schema not found: $tableName',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+      final content = await baseSchemaFile.readAsString();
+      final json = jsonDecode(content) as Map<String, dynamic>;
+
+      if (!json.containsKey('name')) {
+        json['name'] = tableName;
+      }
+      final schema = TableSchema.fromJson(json);
+      _schemas[tableName] = schema;
+      return schema;
+    }
+
+    final content = await schemaFile.readAsString();
+    final json = jsonDecode(content) as Map<String, dynamic>;
+
+    if (!json.containsKey('name')) {
+      json['name'] = tableName;
+    }
+    final schema = TableSchema.fromJson(json);
     _schemas[tableName] = schema;
     return schema;
   }
@@ -291,6 +330,83 @@ class IntegrityChecker {
         return value is String && DateTime.tryParse(value) != null;
       case DataType.array:
         return value is List;
+    }
+  }
+
+  Future<bool> validateMigration(
+    String tableName,
+    TableSchema oldSchema,
+    TableSchema newSchema,
+  ) async {
+    // 1. Validate table structure
+    if (!await validateTableStructure(
+      tableName,
+      newSchema,
+      _dataStore.config,
+    )) {
+      return false;
+    }
+
+    // 2. Validate data integrity
+    if (!await validateTableData(
+      tableName,
+      newSchema,
+      _dataStore.config,
+    )) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /// Validate table structure matches schema
+  Future<bool> validateTableStructure(
+    String tableName,
+    TableSchema schema,
+    DataStoreConfig config,
+  ) async {
+    try {
+      // Check table structure integrity
+      if (!await checkTableStructure(tableName)) {
+        return false;
+      }
+
+      // Check index integrity
+      if (!await checkIndexIntegrity(tableName)) {
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Validate table data integrity
+  Future<bool> validateTableData(
+    String tableName,
+    TableSchema schema,
+    DataStoreConfig config,
+  ) async {
+    try {
+      // Check data consistency
+      if (!await checkDataConsistency(tableName)) {
+        return false;
+      }
+
+      // Check unique constraints
+      if (!await checkUniqueConstraints(tableName)) {
+        return false;
+      }
+
+      // Check foreign key constraints if any
+      if (!await checkForeignKeyConstraints(tableName)) {
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 }

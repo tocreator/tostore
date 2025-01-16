@@ -306,7 +306,7 @@ class BPlusTree {
         if (value != null) {
           node.values[i].removeWhere((v) {
             if (v is Map && value is Map) {
-              return v['id'] == value['id'];
+              return v == value;
             }
             return v == value;
           });

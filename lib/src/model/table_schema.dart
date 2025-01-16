@@ -1,7 +1,11 @@
 import 'dart:typed_data';
+import 'dart:io';
+
+import 'business_error.dart';
 
 /// table schema
 class TableSchema {
+  final String name; // table name
   final String primaryKey; // primary key
   final bool autoIncrement; // auto increment
   final List<FieldSchema> fields; // fields
@@ -9,6 +13,7 @@ class TableSchema {
   final bool isGlobal; // is global table
 
   const TableSchema({
+    required this.name,
     required this.primaryKey,
     this.autoIncrement = true,
     required this.fields,
@@ -16,8 +21,27 @@ class TableSchema {
     this.isGlobal = false,
   });
 
+  TableSchema copyWith({
+    String? name,
+    String? primaryKey,
+    bool? autoIncrement,
+    List<FieldSchema>? fields,
+    List<IndexSchema>? indexes,
+    bool? isGlobal,
+  }) {
+    return TableSchema(
+      name: name ?? this.name,
+      primaryKey: primaryKey ?? this.primaryKey,
+      autoIncrement: autoIncrement ?? this.autoIncrement,
+      fields: fields ?? this.fields,
+      indexes: indexes ?? this.indexes,
+      isGlobal: isGlobal ?? this.isGlobal,
+    );
+  }
+
   Map<String, dynamic> toJson() {
     return {
+      'name': name,
       'primaryKey': primaryKey,
       'autoIncrement': autoIncrement,
       'fields': fields.map((c) => c.toJson()).toList(),
@@ -27,7 +51,24 @@ class TableSchema {
   }
 
   factory TableSchema.fromJson(Map<String, dynamic> json) {
+    String tableName;
+    if (json.containsKey('name')) {
+      tableName = json['name'] as String;
+    } else {
+      final schemaPath = json['_schemaPath'] as String?;
+      if (schemaPath != null) {
+        final fileName = schemaPath.split(Platform.pathSeparator).last;
+        tableName = fileName.replaceAll('.schema', '');
+      } else {
+        throw const BusinessError(
+          'Cannot determine table name from schema',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+    }
+
     return TableSchema(
+      name: tableName,
       primaryKey: json['primaryKey'] as String,
       autoIncrement: json['autoIncrement'] as bool? ?? true,
       fields: (json['fields'] as List)
@@ -125,21 +166,47 @@ class TableSchema {
 
 /// field schema
 class FieldSchema {
+  static const _unsetValue = Object();
+
   final String name;
   final DataType type;
   final bool nullable;
   final dynamic defaultValue;
-  final int? maxLength;
   final bool unique;
+  final String? comment;
+  final int? maxLength;
 
   const FieldSchema({
     required this.name,
     required this.type,
     this.nullable = true,
     this.defaultValue,
-    this.maxLength,
     this.unique = false,
+    this.comment,
+    this.maxLength,
   });
+
+  /// Create copy with modifications
+  FieldSchema copyWith({
+    String? name,
+    DataType? type,
+    bool? nullable,
+    dynamic defaultValue = _unsetValue,
+    bool? unique,
+    String? comment,
+    int? maxLength,
+  }) {
+    return FieldSchema(
+      name: name ?? this.name,
+      type: type ?? this.type,
+      nullable: nullable ?? this.nullable,
+      defaultValue:
+          defaultValue == _unsetValue ? this.defaultValue : defaultValue,
+      unique: unique ?? this.unique,
+      comment: comment ?? this.comment,
+      maxLength: maxLength ?? this.maxLength,
+    );
+  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -149,19 +216,33 @@ class FieldSchema {
       'defaultValue': defaultValue,
       'maxLength': maxLength,
       'unique': unique,
+      'comment': comment,
     };
   }
 
+  /// Create from partial updates
   factory FieldSchema.fromJson(Map<String, dynamic> json) {
+    DataType getType() {
+      if (json['type'] == null) return DataType.text;
+      if (json['type'] is DataType) return json['type'] as DataType;
+
+      try {
+        return DataType.values.firstWhere(
+          (e) => e.toString() == json['type'],
+        );
+      } catch (_) {
+        return DataType.text;
+      }
+    }
+
     return FieldSchema(
       name: json['name'] as String,
-      type: DataType.values.firstWhere(
-        (e) => e.toString() == json['type'],
-      ),
+      type: getType(),
       nullable: json['nullable'] as bool? ?? true,
       defaultValue: json['defaultValue'],
-      maxLength: json['maxLength'] as int?,
       unique: json['unique'] as bool? ?? false,
+      comment: json['comment'] as String?,
+      maxLength: json['maxLength'] as int?,
     );
   }
 }
@@ -207,6 +288,20 @@ class IndexSchema {
       'unique': unique,
       'type': type.toString().split('.').last,
     };
+  }
+
+  IndexSchema copyWith({
+    String? indexName,
+    List<String>? fields,
+    bool? unique,
+    IndexType? type,
+  }) {
+    return IndexSchema(
+      indexName: indexName ?? this.indexName,
+      fields: fields ?? this.fields,
+      unique: unique ?? this.unique,
+      type: type ?? this.type,
+    );
   }
 }
 
