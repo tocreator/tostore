@@ -10,18 +10,8 @@ topics:
   - database
   - storage
   - sql
-  - key-value
-  - cache
-  - mobile-database
-  - persistent-storage
-  - relational-database
-  - multi-space
-  - transaction
-  - indexing
-  - schema
-  - local-storage
-  - file-storage
-  - smart-caching
+  - data
+  - db
 
 environment:
   sdk: ^3.5.4

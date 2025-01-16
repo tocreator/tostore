@@ -3162,11 +3162,6 @@ class DataStoreImpl {
         return _toDateTime(value);
       case DataType.array:
         return _toArray(value);
-      default:
-        throw BusinessError(
-          'Unsupported data type conversion: $from -> $to',
-          type: BusinessErrorType.typeError,
-        );
     }
   }
 
