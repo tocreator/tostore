@@ -66,8 +66,8 @@ class MigrationManager {
             );
             break;
 
-          case MigrationType.dropField:
-            await _dataStore.dropField(tableName, operation.oldName!, txn);
+          case MigrationType.removeField:
+            await _dataStore.removeField(tableName, operation.oldName!, txn);
             await _dataStore.removeFieldFromRecords(
               tableName,
               operation.oldName!,
@@ -113,9 +113,9 @@ class MigrationManager {
             await _dataStore.addIndex(tableName, operation.index!, txn);
             break;
 
-          case MigrationType.dropIndex:
+          case MigrationType.removeIndex:
             if (operation.indexName != null) {
-              await _dataStore.dropIndex(
+              await _dataStore.removeIndex(
                 tableName,
                 operation.indexName!,
                 txn,
@@ -190,7 +190,7 @@ class MigrationManager {
     for (var oldField in oldSchema.fields) {
       if (!newSchema.fields.any((f) => f.name == oldField.name)) {
         operations.add(MigrationOperation(
-          type: MigrationType.dropField,
+          type: MigrationType.removeField,
           oldName: oldField.name,
         ));
       }
@@ -230,11 +230,11 @@ class MigrationManager {
       }
     }
 
-    // Check for dropped indexes
+    // Check for remove indexes
     for (var oldIndex in oldSchema.indexes) {
       if (!newSchema.indexes.any((i) => _areIndexesSame(i, oldIndex))) {
         operations.add(MigrationOperation(
-          type: MigrationType.dropIndex,
+          type: MigrationType.removeIndex,
           indexName: oldIndex.indexName,
           fields: oldIndex.fields,
         ));
@@ -270,7 +270,7 @@ class MigrationManager {
         !_areFieldListsEqual(oldIndex.fields, newIndex.fields);
   }
 
-  /// Detect renamed fields using heuristics
+  /// Detect renamed fields using strict matching
   void _detectRenamedFields(
     TableSchema oldSchema,
     TableSchema newSchema,
@@ -278,7 +278,7 @@ class MigrationManager {
   ) {
     // Get removed and added fields
     final removedFields = operations
-        .where((op) => op.type == MigrationType.dropField)
+        .where((op) => op.type == MigrationType.removeField)
         .map((op) => op.oldName!)
         .toList();
     final addedFields = operations
@@ -286,45 +286,41 @@ class MigrationManager {
         .map((op) => op.field!)
         .toList();
 
-    // Try to match removed and added fields with similar types
-    for (var oldName in removedFields) {
-      final oldField = oldSchema.fields.firstWhere((f) => f.name == oldName);
+    // Only process when exactly one field is removed and one field is added
+    if (removedFields.isEmpty || addedFields.isEmpty) return;
+    if (removedFields.length != 1 || addedFields.length != 1) return;
+    final oldName = removedFields.first;
+    final newField = addedFields.first;
+    final oldField = oldSchema.fields.firstWhere((f) => f.name == oldName);
 
-      for (var newField in addedFields) {
-        if (_areFieldsSimilar(oldField, newField)) {
-          // Remove the add and drop operations
-          operations.removeWhere((op) =>
-              (op.type == MigrationType.dropField && op.oldName == oldName) ||
-              (op.type == MigrationType.addField && op.field == newField));
+    // Check if all attributes match exactly
+    if (_calculateFieldSimilarity(oldField, newField) == 1.0) {
+      // Convert add and remove operations to rename
+      operations.removeWhere((op) =>
+          (op.type == MigrationType.removeField && op.oldName == oldName) ||
+          (op.type == MigrationType.addField && op.field == newField));
 
-          // Add rename operation
-          operations.add(MigrationOperation(
-            type: MigrationType.renameField,
-            oldName: oldName,
-            newName: newField.name,
-          ));
-          break;
-        }
-      }
+      operations.add(MigrationOperation(
+        type: MigrationType.renameField,
+        oldName: oldName,
+        newName: newField.name,
+      ));
     }
   }
 
-  /// Check if two fields are similar (likely renamed)
-  bool _areFieldsSimilar(FieldSchema oldField, FieldSchema newField) {
-    // Same type is a strong indicator
-    if (oldField.type != newField.type) {
-      return false;
+  /// Calculate similarity between fields - strict matching
+  double _calculateFieldSimilarity(FieldSchema oldField, FieldSchema newField) {
+    // All critical attributes must match exactly
+    if (oldField.type != newField.type ||
+        oldField.nullable != newField.nullable ||
+        oldField.unique != newField.unique ||
+        oldField.maxLength != newField.maxLength ||
+        oldField.defaultValue != newField.defaultValue) {
+      return 0.0;
     }
 
-    // Similar constraints increase likelihood
-    int similarity = 0;
-    if (oldField.nullable == newField.nullable) similarity++;
-    if (oldField.unique == newField.unique) similarity++;
-    if (oldField.maxLength == newField.maxLength) similarity++;
-    if (oldField.defaultValue == newField.defaultValue) similarity++;
-
-    // Consider fields similar if they share most properties
-    return similarity >= 3;
+    // If all attributes match, return full score
+    return 1.0;
   }
 
   /// Check if field is modified
@@ -356,11 +352,11 @@ class MigrationManager {
 /// Migration operation type
 enum MigrationType {
   addField,
-  dropField,
+  removeField,
   renameField,
   modifyField,
   addIndex,
-  dropIndex,
+  removeIndex,
   modifyIndex,
 }
 
@@ -391,7 +387,7 @@ class MigrationOperation {
     switch (type) {
       case MigrationType.addField:
         return 'Add field: ${field?.name}';
-      case MigrationType.dropField:
+      case MigrationType.removeField:
         return 'Drop field: $oldName';
       case MigrationType.renameField:
         return 'Rename field: $oldName -> $newName';
@@ -399,7 +395,7 @@ class MigrationOperation {
         return 'Modify field: ${field?.name}';
       case MigrationType.addIndex:
         return 'Add index: ${index?.indexName ?? index?.fields.join("_")}';
-      case MigrationType.dropIndex:
+      case MigrationType.removeIndex:
         return 'Drop index: ${indexName ?? fields?.join("_")}';
       case MigrationType.modifyIndex:
         return 'Modify index: ${indexName ?? fields?.join("_")}';

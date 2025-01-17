@@ -1,5 +1,3 @@
-import 'package:tostore/src/handler/logger.dart';
-
 import '../core/data_store_impl.dart';
 import '../core/transaction_manager.dart';
 import '../model/table_schema.dart';
@@ -11,7 +9,7 @@ class SchemaBuilder with FutureBuilderMixin {
 
   final DataStoreImpl _dataStore;
   final String _tableName;
-  final List<_UpdateSchemaOperation> _operations = [];
+  final List<_SchemaOperation> _operations = [];
 
   SchemaBuilder(this._dataStore, this._tableName);
 
@@ -24,8 +22,8 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? unique,
     String? comment,
   }) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.addField,
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.addField,
       field: FieldSchema(
         name: name,
         type: type,
@@ -39,9 +37,9 @@ class SchemaBuilder with FutureBuilderMixin {
   }
 
   /// Drop field from table
-  SchemaBuilder dropField(String fieldName) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.dropField,
+  SchemaBuilder removeField(String fieldName) {
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.removeField,
       fieldName: fieldName,
     ));
     return this;
@@ -49,8 +47,8 @@ class SchemaBuilder with FutureBuilderMixin {
 
   /// Rename field
   SchemaBuilder renameField(String oldName, String newName) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.renameField,
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.renameField,
       fieldName: oldName,
       newName: newName,
     ));
@@ -66,8 +64,8 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? unique,
     String? comment,
   }) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.modifyField,
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.modifyField,
       fieldName: name,
       field: FieldSchema(
         name: name,
@@ -88,8 +86,8 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? unique,
     IndexType type = IndexType.btree,
   }) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.addIndex,
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.addIndex,
       index: IndexSchema(
         indexName: name,
         fields: fields,
@@ -101,18 +99,18 @@ class SchemaBuilder with FutureBuilderMixin {
   }
 
   /// Drop index
-  SchemaBuilder dropIndex(String indexName) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.dropIndex,
+  SchemaBuilder removeIndex(String indexName) {
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.removeIndex,
       indexName: indexName,
     ));
     return this;
   }
 
   /// Rename table
-  SchemaBuilder renameTo(String newTableName) {
-    _operations.add(_UpdateSchemaOperation(
-      type: _UpdateSchemaType.renameTable,
+  SchemaBuilder renameTable(String newTableName) {
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.renameTable,
       newTableName: newTableName,
     ));
     return this;
@@ -129,31 +127,58 @@ class SchemaBuilder with FutureBuilderMixin {
   }
 
   Future<void> _executeOperation(
-      _UpdateSchemaOperation operation, Transaction txn) async {
+      _SchemaOperation operation, Transaction txn) async {
     switch (operation.type) {
-      case _UpdateSchemaType.addField:
+      case _SchemaOperationType.addField:
         await _dataStore.addField(_tableName, operation.field!, txn);
+        await _dataStore.addFieldToRecords(
+          _tableName,
+          operation.field!,
+          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
+        );
         break;
-      case _UpdateSchemaType.dropField:
-        await _dataStore.dropField(_tableName, operation.fieldName!, txn);
+
+      case _SchemaOperationType.removeField:
+        await _dataStore.removeField(_tableName, operation.fieldName!, txn);
+        await _dataStore.removeFieldFromRecords(
+          _tableName,
+          operation.fieldName!,
+          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
+        );
         break;
-      case _UpdateSchemaType.renameField:
-        await _dataStore.renameField(
-            _tableName, operation.fieldName!, operation.newName!, txn);
-        break;
-      case _UpdateSchemaType.modifyField:
-        Logger.error(
-            "operation${operation.fieldName},${operation.field?.toJson()}");
+
+      case _SchemaOperationType.modifyField:
+        final oldSchema = await _dataStore.getTableSchema(_tableName);
+        final oldField =
+            oldSchema.fields.firstWhere((f) => f.name == operation.fieldName);
         await _dataStore.modifyField(
             _tableName, operation.fieldName!, operation.field!, txn);
+        await _dataStore.migrateFieldData(
+          _tableName,
+          oldField,
+          operation.field!,
+          txn,
+          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
+        );
         break;
-      case _UpdateSchemaType.addIndex:
+
+      case _SchemaOperationType.renameField:
+        await _dataStore.renameField(
+            _tableName, operation.fieldName!, operation.newName!, txn);
+        await _dataStore.renameFieldInRecords(
+          _tableName,
+          operation.fieldName!,
+          operation.newName!,
+          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
+        );
+        break;
+      case _SchemaOperationType.addIndex:
         await _dataStore.addIndex(_tableName, operation.index!, txn);
         break;
-      case _UpdateSchemaType.dropIndex:
-        await _dataStore.dropIndex(_tableName, operation.indexName!, txn);
+      case _SchemaOperationType.removeIndex:
+        await _dataStore.removeIndex(_tableName, operation.indexName!, txn);
         break;
-      case _UpdateSchemaType.renameTable:
+      case _SchemaOperationType.renameTable:
         await _dataStore.renameTable(_tableName, operation.newTableName!, txn);
         break;
     }
@@ -161,19 +186,19 @@ class SchemaBuilder with FutureBuilderMixin {
 }
 
 /// Operation type for schema update
-enum _UpdateSchemaType {
+enum _SchemaOperationType {
   addField,
-  dropField,
+  removeField,
   renameField,
   modifyField,
   addIndex,
-  dropIndex,
+  removeIndex,
   renameTable,
 }
 
 /// Operation class for schema update
-class _UpdateSchemaOperation {
-  final _UpdateSchemaType type;
+class _SchemaOperation {
+  final _SchemaOperationType type;
   final FieldSchema? field;
   final String? fieldName;
   final String? newName;
@@ -181,7 +206,7 @@ class _UpdateSchemaOperation {
   final String? indexName;
   final String? newTableName;
 
-  _UpdateSchemaOperation({
+  _SchemaOperation({
     required this.type,
     this.field,
     this.fieldName,

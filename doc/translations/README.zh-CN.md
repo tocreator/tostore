@@ -68,7 +68,7 @@ final db = ToStore(
       await db.updateSchema('users')
           .addField("fans", type: DataType.array, comment: "粉丝") // 添加字段
           .addIndex("follow", fields: ["follow", "username"]) // 添加索引
-          .dropField("last_login") // 删除字段
+          .removeField("last_login") // 删除字段
           .modifyField('email', unique: true) // 修改字段更多方法
           .renameField("last_login", "last_login_time"); // 重命名字段
     }

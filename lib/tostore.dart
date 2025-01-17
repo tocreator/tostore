@@ -143,6 +143,16 @@ class ToStore implements DataStoreInterface {
     return await _impl.createTable(schema);
   }
 
+  /// Create multiple tables
+  /// [schemas] List of table schemas
+  ///
+  /// 创建多个表
+  /// [schemas] 表结构定义列表
+  @override
+  Future<void> createTables(List<TableSchema> schemas) async {
+    return await _impl.createTables(schemas);
+  }
+
   /// Insert data into table
   /// [tableName] Table name
   /// [data] Data to insert
@@ -496,7 +506,7 @@ class ToStore implements DataStoreInterface {
   /// ```dart
   /// await db.updateSchema('users')
   ///   .addField('age', DataType.integer)
-  ///   .dropField('old_field')
+  ///   .removeField('old_field')
   ///   .renameField('name', 'full_name')
   ///   .modifyField('email', (field) => field.unique());
   /// ```

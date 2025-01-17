@@ -478,7 +478,7 @@ class IndexManager {
   }
 
   /// Drop index for table
-  Future<void> dropIndex(
+  Future<void> removeIndex(
     String tableName,
     String indexName,
   ) async {
@@ -503,8 +503,8 @@ class IndexManager {
       }
     } catch (e) {
       Logger.error(
-        'Failed to drop index: $e',
-        label: 'IndexManager.dropIndex',
+        'Failed to remove index: $e',
+        label: 'IndexManager.removeIndex',
       );
       rethrow;
     }

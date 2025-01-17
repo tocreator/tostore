@@ -133,98 +133,7 @@ class FileManager {
         final tableName = entry.key;
         final records = entry.value;
         if (records.isEmpty) continue;
-
-        // get data file write lock
-        await _dataStore.concurrencyManager?.acquireWriteLock(tableName);
-        try {
-          final schema = await _dataStore.getTableSchema(tableName);
-          final dataFile =
-              File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-          if (!await dataFile.exists()) continue;
-
-          final primaryKey = schema.primaryKey;
-          final allRecords = <String, Map<String, dynamic>>{};
-
-          // 1. read existing file content
-          final lines = await dataFile.readAsLines();
-
-          // 2. use Map to store records, ensure uniqueness by primary key
-          for (var line in lines) {
-            if (line.trim().isEmpty) continue;
-            try {
-              final record = jsonDecode(line) as Map<String, dynamic>;
-              allRecords[record[primaryKey].toString()] = record;
-            } catch (e) {
-              Logger.error('parse record failed: $e',
-                  label: 'DataStore-_flushWriteQueue');
-            }
-          }
-
-          // 3. update/add new records and handle indexes
-          for (var record in records) {
-            final recordId = record[primaryKey].toString();
-            final oldRecord = allRecords[recordId];
-
-            // 3.1 if update operation, first delete old index
-            if (oldRecord != null) {
-              await _dataStore.indexManager
-                  ?.deleteFromIndexes(tableName, oldRecord);
-            }
-
-            // 3.2 update record
-            allRecords[recordId] = record;
-          }
-
-          // 5. write all records
-          final sink = dataFile.openWrite(mode: FileMode.write);
-          var currentOffset = 0; // start from 0
-
-          try {
-            for (var record in allRecords.values) {
-              final encoded = jsonEncode(record);
-
-              // create row pointer (use current offset)
-              final pointer = await RowPointer.create(
-                encoded,
-                currentOffset,
-              );
-
-              // write record
-              sink.writeln(encoded);
-
-              // update index
-              _dataStore.indexManager
-                  ?.updateIndexes(tableName, record, pointer);
-
-              // update offset (add record length and newline)
-              currentOffset += encoded.length + 1;
-            }
-            await sink.flush();
-          } finally {
-            await sink.close();
-          }
-
-          // update file size information
-          await updateFileSize(tableName, currentOffset);
-
-          // clear write queue after successful write
-          _writeQueue.remove(tableName);
-
-          // delete backup file of this table (need backup lock)
-          if (!_isBackingUp) {
-            // if no backup operation is in progress
-            await _dataStore.concurrencyManager
-                ?.acquireWriteLock('backup_$tableName');
-            try {
-              await _removeBackupFile(tableName);
-            } finally {
-              await _dataStore.concurrencyManager
-                  ?.releaseWriteLock('backup_$tableName');
-            }
-          }
-        } finally {
-          await _dataStore.concurrencyManager?.releaseWriteLock(tableName);
-        }
+        await writeRecords(tableName: tableName, records: records);
       }
     } catch (e, stackTrace) {
       Logger.error('write queue flush failed: $e',
@@ -400,5 +309,117 @@ class FileManager {
       }
     }
     return files;
+  }
+
+  /// Read records from data file
+  /// Returns a map of records with primary key as key
+  Future<Map<String, Map<String, dynamic>>> readRecords(
+      String tableName) async {
+    final schema = await _dataStore.getTableSchema(tableName);
+    final dataFile =
+        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+    if (!await dataFile.exists()) return {};
+
+    final records = <String, Map<String, dynamic>>{};
+    final primaryKey = schema.primaryKey;
+
+    final lines = await dataFile.readAsLines();
+    for (var line in lines) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final record = jsonDecode(line) as Map<String, dynamic>;
+        records[record[primaryKey].toString()] = record;
+      } catch (e) {
+        Logger.error('Parse record failed: $e',
+            label: 'FileManager.readRecords');
+      }
+    }
+
+    return records;
+  }
+
+  /// write records to data file
+  Future<void> writeRecords({
+    required String tableName,
+    required List<Map<String, dynamic>> records,
+    bool isSchemaChanged = false,
+  }) async {
+    if (records.isEmpty) return;
+    // get data file write lock
+    await _dataStore.concurrencyManager?.acquireWriteLock(tableName);
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      final dataFile =
+          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+      if (!await dataFile.exists()) {
+        // create new file if not exists
+        await dataFile.create(recursive: true);
+      }
+
+      final primaryKey = schema.primaryKey;
+      var allRecords = <String, Map<String, dynamic>>{};
+
+      if (!isSchemaChanged) {
+        // read existing file content
+        allRecords = await readRecords(tableName);
+      }
+
+      // update/add new records
+      for (var record in records) {
+        final recordId = record[primaryKey].toString();
+
+        // update record
+        allRecords[recordId] = record;
+      }
+
+      // write all records
+      final sink = dataFile.openWrite(mode: FileMode.write);
+      var currentOffset = 0; // start from 0
+
+      try {
+        for (var record in allRecords.values) {
+          final encoded = jsonEncode(record);
+
+          // create row pointer (use current offset)
+          final pointer = await RowPointer.create(
+            encoded,
+            currentOffset,
+          );
+
+          // write record
+          sink.writeln(encoded);
+
+          // update index
+          _dataStore.indexManager?.updateIndexes(tableName, record, pointer);
+
+          // update offset (add record length and newline)
+          currentOffset += encoded.length + 1;
+        }
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
+
+      // update file size information
+      await updateFileSize(tableName, currentOffset);
+
+      // clear write queue after successful write
+      _writeQueue.remove(tableName);
+
+      // delete backup file of this table (need backup lock)
+      if (!_isBackingUp) {
+        // if no backup operation is in progress
+        await _dataStore.concurrencyManager
+            ?.acquireWriteLock('backup_$tableName');
+        try {
+          await _removeBackupFile(tableName);
+        } finally {
+          await _dataStore.concurrencyManager
+              ?.releaseWriteLock('backup_$tableName');
+        }
+      }
+    } finally {
+      await _dataStore.concurrencyManager?.releaseWriteLock(tableName);
+    }
   }
 }

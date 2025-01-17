@@ -84,18 +84,21 @@ class TostoreExample {
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion == 1) {
           await db
-              .updateSchema('users') // update users table structure
+              .updateSchema('users') // update table structure
               .addField("fans",
-                  type: DataType.array, comment: "fans") // add fans field
-              .addIndex("follow",
-                  fields: ["follow", "username"]) // add follow index
-              .dropField("last_login") // drop last_login field
-              .renameField("last_login",
-                  "last_login_time"); // rename last_login to last_login_time
+                  type: DataType.array, comment: "fans") // add field
+              .addIndex("follow", fields: ["follow", "username"]) // add index
+              .removeIndex("follow") // remove index
+              .removeField("last_login") // remove field
+              .renameField("last_login", "last_login_time") // rename field
+              .modifyField("age",
+                  type: DataType.integer,
+                  nullable: true,
+                  unique: true); // modify field
         } else if (oldVersion == 2) {
           await db
               .updateSchema('users')
-              .renameTo('users_new'); // rename users table to users_new
+              .renameTable('users_new'); // rename users table to users_new
         }
       },
     );

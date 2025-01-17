@@ -67,7 +67,7 @@ final db = ToStore(
       await db.updateSchema('users')
           .addField("fans", type: DataType.array, comment: "팔로워")
           .addIndex("follow", fields: ["follow", "name"])
-          .dropField("last_login")
+          .removeField("last_login")
           .modifyField('email', unique: true)
           .renameField("last_login", "last_login_time");
     }

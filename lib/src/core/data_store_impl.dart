@@ -283,10 +283,11 @@ class DataStoreImpl {
       _queryExecutor = QueryExecutor(this, _indexManager!);
 
       await _recoveryIncompleteTransactions();
-      await _loadDataToCache();
 
       _baseInitialized = true;
       await _startSetupAndUpgrade();
+
+      await _loadDataToCache();
 
       _isInitialized = true;
       if (!_initCompleter.isCompleted) {
@@ -314,6 +315,7 @@ class DataStoreImpl {
       final oldVersion = await getVersion();
 
       if (oldVersion == 0 || _isSwitchingSpace) {
+        // Create system tables
         await createTable(
           const TableSchema(
             name: _kvStoreName,
@@ -345,12 +347,10 @@ class DataStoreImpl {
           ),
         );
 
-        // create tables
+        // Create user tables
         if (_schemas.isNotEmpty) {
           for (var schema in _schemas) {
-            if (!await _tableExists(schema.name)) {
-              await createTable(schema);
-            }
+            await createTable(schema);
           }
         }
 
@@ -448,10 +448,8 @@ class DataStoreImpl {
     }
   }
 
-  /// create table
-  Future<void> createTable(
-    TableSchema schema,
-  ) async {
+  /// Create a single table
+  Future<void> createTable(TableSchema schema) async {
     if (!_baseInitialized) {
       await _ensureInitialized();
     }
@@ -513,6 +511,13 @@ class DataStoreImpl {
     } catch (e) {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       rethrow;
+    }
+  }
+
+  /// Create multiple tables
+  Future<void> createTables(List<TableSchema> schemas) async {
+    for (var schema in schemas) {
+      await createTable(schema);
     }
   }
 
@@ -586,21 +591,22 @@ class DataStoreImpl {
       }
 
       // 4. remove last record from file (if written)
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      if (await dataFile.exists()) {
-        final lines = await dataFile.readAsLines();
-        if (lines.isNotEmpty) {
-          final lastLine = lines.last;
-          try {
-            final lastRecord = jsonDecode(lastLine) as Map<String, dynamic>;
-            if (lastRecord[primaryKeyField] == primaryKeyValue) {
-              lines.removeLast();
-              await dataFile.writeAsString('${lines.join('\n')}\n');
-            }
-          } catch (e) {
-            Logger.error('Failed to parse last record: $e',
-                label: 'DataStore._rollbackTransaction');
+      final allRecords = await fileManager.readRecords(tableName);
+      if (allRecords.isNotEmpty) {
+        try {
+          final records = allRecords.values.toList();
+          final lastRecord = records.last;
+          if (lastRecord[primaryKeyField] == primaryKeyValue) {
+            records.removeLast();
+            await fileManager.writeRecords(
+              tableName: tableName,
+              records: records,
+              isSchemaChanged: false,
+            );
           }
+        } catch (e) {
+          Logger.error('Failed to rollback last record: $e',
+              label: 'DataStore._rollbackTransaction');
         }
       }
 
@@ -677,7 +683,7 @@ class DataStoreImpl {
         if (value != null && field.maxLength != null) {
           if (value is String && value.length > field.maxLength!) {
             Logger.warn('Warning: field ${field.name} exceeds max length');
-            return null;
+            result[field.name] = value.substring(0, field.maxLength!);
           }
         }
       }
@@ -1294,25 +1300,25 @@ class DataStoreImpl {
         await _indexManager!.deleteFromIndexes(tableName, record);
       }
 
-      // delete from file
-      final dataFile = File('${await getTablePath(tableName)}.dat');
-      if (await dataFile.exists()) {
-        final lines = await dataFile.readAsLines();
-        final remainingLines = lines.where((line) {
-          if (line.trim().isEmpty) return true;
-          final record = jsonDecode(line) as Map<String, dynamic>;
-          // use primary key to determine if it needs to be deleted
-          return !recordsToDelete
-              .any((r) => r[schema.primaryKey] == record[schema.primaryKey]);
-        }).toList();
+      // Read all records and filter out deleted ones
+      final allRecords = await fileManager.readRecords(tableName);
+      final remainingRecords = allRecords.values.where((record) {
+        return !recordsToDelete
+            .any((r) => r[schema.primaryKey] == record[schema.primaryKey]);
+      }).toList();
 
-        await dataFile.writeAsString('${remainingLines.join('\n')}\n');
-      }
+      // Write remaining records using fileManager
+      await fileManager.writeRecords(
+        tableName: tableName,
+        records: remainingRecords,
+        isSchemaChanged: false,
+      );
 
       // update statistics
       await _statisticsCollector?.collectTableStatistics(tableName);
 
       await _transactionManager!.commit(transaction);
+      return true;
     } catch (e) {
       Logger.info('Delete failed: $e', label: 'DataStore-delete');
       await _transactionManager!.rollback(transaction);
@@ -1321,8 +1327,6 @@ class DataStoreImpl {
     } finally {
       await _concurrencyManager!.releaseWriteLock(tableName);
     }
-
-    return true;
   }
 
   /// drop table
@@ -2328,7 +2332,7 @@ class DataStoreImpl {
   }
 
   /// Drop field from table
-  Future<void> dropField(
+  Future<void> removeField(
     String tableName,
     String fieldName,
     Transaction? txn,
@@ -2339,7 +2343,7 @@ class DataStoreImpl {
     if (!schema.fields.any((f) => f.name == fieldName)) {
       Logger.warn(
         'Field $fieldName not found in table $tableName',
-        label: "DataStore.dropField",
+        label: "DataStore.removeField",
       );
       return;
     }
@@ -2471,7 +2475,7 @@ class DataStoreImpl {
   }
 
   /// Drop index from table
-  Future<void> dropIndex(
+  Future<void> removeIndex(
     String tableName,
     String indexName,
     Transaction? txn,
@@ -2483,7 +2487,7 @@ class DataStoreImpl {
       if (!schema.indexes.any((i) => i.indexName == indexName)) {
         Logger.warn(
           'Index $indexName not found in table $tableName',
-          label: "DataStore.dropIndex",
+          label: "DataStore.removeIndex",
         );
         return;
       }
@@ -2502,8 +2506,8 @@ class DataStoreImpl {
       _invalidateTableCaches(tableName);
     } catch (e) {
       Logger.error(
-        'Failed to drop index: $e',
-        label: 'DataStoreImpl.dropIndex',
+        'Failed to remove index: $e',
+        label: 'DataStoreImpl.removeIndex',
       );
       rethrow;
     }
@@ -2581,55 +2585,6 @@ class DataStoreImpl {
       await schemaFile.delete();
     }
     _invalidateTableCaches(tableName);
-  }
-
-  Future<void> renameFieldInRecords(
-      String tableName, String oldName, String newName,
-      {int batchSize = 1000}) async {
-    try {
-      final dataPath = config.getDataPath(
-        tableName,
-        (await getTableSchema(tableName)).isGlobal,
-      );
-      final dataFile = File(dataPath);
-
-      if (!await dataFile.exists()) {
-        return;
-      }
-
-      final lines = await dataFile.readAsLines();
-      var modified = false;
-
-      for (var i = 0; i < lines.length; i++) {
-        final line = lines[i].trim();
-        if (line.isEmpty) continue;
-
-        try {
-          final record = jsonDecode(line) as Map<String, dynamic>;
-          if (record.containsKey(oldName)) {
-            record[newName] = record[oldName];
-            record.remove(oldName);
-            lines[i] = jsonEncode(record);
-            modified = true;
-          }
-        } catch (e) {
-          Logger.warn(
-            'Invalid JSON at line $i: $e',
-            label: 'DataStoreImpl.renameFieldInRecords',
-          );
-        }
-      }
-
-      if (modified) {
-        await dataFile.writeAsString(lines.join('\n'));
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to rename field in records: $e',
-        label: 'DataStoreImpl.renameFieldInRecords',
-      );
-      rethrow;
-    }
   }
 
   /// Build index for table
@@ -2733,51 +2688,6 @@ class DataStoreImpl {
         'Failed to rename table files: $e',
         label: 'DataStoreImpl._renameTableFiles',
       );
-      rethrow;
-    }
-  }
-
-  /// Process records in batches
-  Future<void> _batchProcessRecords(
-    String tableName,
-    Future<void> Function(List<Map<String, dynamic>>) processor, {
-    int batchSize = 1000,
-  }) async {
-    final schema = await getTableSchema(tableName);
-    final dataPath = config.getDataPath(tableName, schema.isGlobal);
-    final dataFile = File(dataPath);
-
-    if (!await dataFile.exists()) return;
-
-    final lines = await dataFile.readAsLines();
-    final records = <Map<String, dynamic>>[];
-
-    for (var line in lines) {
-      if (line.trim().isEmpty) continue;
-      records.add(jsonDecode(line) as Map<String, dynamic>);
-    }
-
-    for (var i = 0; i < records.length; i += batchSize) {
-      final end =
-          (i + batchSize < records.length) ? i + batchSize : records.length;
-      await processor(records.sublist(i, end));
-    }
-  }
-
-  /// Update records in batch
-  Future<void> _batchUpdateRecords(
-    String tableName,
-    List<Map<String, dynamic>> records,
-    Future<void> Function(Map<String, dynamic>) updater,
-  ) async {
-    final txn = await _transactionManager!.beginTransaction();
-    try {
-      for (var record in records) {
-        await updater(record);
-      }
-      await _transactionManager!.commit(txn);
-    } catch (e) {
-      await _transactionManager!.rollback(txn);
       rethrow;
     }
   }
@@ -2958,49 +2868,57 @@ class DataStoreImpl {
   /// Check if table exists
   Future<bool> _tableExists(String tableName) async {
     try {
-      await getTableSchema(tableName);
-      return true;
-    } catch (e) {
-      if (e is BusinessError && e.type == BusinessErrorType.schemaError) {
-        return false;
+      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
+      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
+
+      if (await globalSchemaFile.exists() || await baseSchemaFile.exists()) {
+        try {
+          await getTableSchema(tableName);
+          return true;
+        } catch (e) {
+          Logger.warn(
+            'Schema file exists but invalid for table: $tableName',
+            label: 'DataStoreImpl._tableExists',
+          );
+          return false;
+        }
       }
-      rethrow;
+
+      return false;
+    } catch (e) {
+      Logger.error(
+        'Failed to check table existence: $e',
+        label: 'DataStoreImpl._tableExists',
+      );
+      return false;
     }
   }
 
   /// Add field to existing records
-  Future<void> addFieldToRecords(String tableName, FieldSchema field,
-      {int batchSize = 1000}) async {
+  Future<void> addFieldToRecords(
+    String tableName,
+    FieldSchema field, {
+    int batchSize = 1000,
+  }) async {
     final txn = await _transactionManager!.beginTransaction();
     try {
-      final schema = await getTableSchema(tableName);
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      final dataFile = File(dataPath);
+      final records = await fileManager.readRecords(tableName);
+      if (records.isEmpty) return;
 
-      if (!await dataFile.exists()) {
-        return;
+      // add new field
+      for (var record in records.values) {
+        if (!record.containsKey(field.name)) {
+          record[field.name] =
+              field.defaultValue ?? _getTypeDefaultValue(field.type);
+        }
       }
 
-      await _batchProcessRecords(
-        tableName,
-        (batch) async {
-          final updatedBatch = <String>[];
-          for (var record in batch) {
-            record[field.name] =
-                field.defaultValue ?? _getTypeDefaultValue(field.type);
-            updatedBatch.add(jsonEncode(record));
-          }
-          await _writeRecordBatch(tableName, updatedBatch);
-        },
-        batchSize: batchSize,
+      // write converted records
+      await fileManager.writeRecords(
+        tableName: tableName,
+        records: records.values.toList(),
+        isSchemaChanged: true,
       );
-
-      // Update index if field has index
-      final hasIndex =
-          schema.indexes.any((idx) => idx.fields.contains(field.name));
-      if (hasIndex) {
-        await _rebuildIndexForField(tableName, field.name);
-      }
 
       await _transactionManager!.commit(txn);
     } catch (e) {
@@ -3014,132 +2932,69 @@ class DataStoreImpl {
   }
 
   /// Remove field from records
-  Future<void> removeFieldFromRecords(String tableName, String fieldName,
-      {int batchSize = 1000}) async {
+  Future<void> removeFieldFromRecords(
+    String tableName,
+    String fieldName, {
+    int batchSize = 1000,
+  }) async {
     final txn = await _transactionManager!.beginTransaction();
     try {
-      final schema = await getTableSchema(tableName);
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      final dataFile = File(dataPath);
+      final records = await fileManager.readRecords(tableName);
+      if (records.isEmpty) return;
 
-      if (!await dataFile.exists()) {
-        return;
+      // remove field
+      for (var record in records.values) {
+        record.remove(fieldName);
       }
 
-      await _batchProcessRecords(
-        tableName,
-        (batch) async {
-          final updatedBatch = <String>[];
-          for (var record in batch) {
-            record.remove(fieldName);
-            updatedBatch.add(jsonEncode(record));
-          }
-          await _writeRecordBatch(tableName, updatedBatch);
-        },
-        batchSize: batchSize,
+      // write converted records
+      await fileManager.writeRecords(
+        tableName: tableName,
+        records: records.values.toList(),
+        isSchemaChanged: true,
       );
 
       await _transactionManager!.commit(txn);
     } catch (e) {
       await _transactionManager!.rollback(txn);
-      Logger.error(
-        'Failed to remove field from records: $e',
-        label: 'DataStoreImpl.removeFieldFromRecords',
-      );
       rethrow;
     }
   }
 
-  /// Write batch of records
-  Future<void> _writeRecordBatch(
+  /// Rename field in records
+  Future<void> renameFieldInRecords(
     String tableName,
-    List<String> records,
-  ) async {
-    final schema = await getTableSchema(tableName);
-    final dataPath = config.getDataPath(tableName, schema.isGlobal);
-    final dataFile = File(dataPath);
-    try {
-      await _concurrencyManager!.acquireWriteLock(tableName);
-
-      await dataFile.writeAsString(
-        '${records.join('\n')}\n',
-        mode: FileMode.append,
-      );
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
-    }
-  }
-
-  /// Rebuild index for specific field
-  Future<void> _rebuildIndexForField(
-    String tableName,
-    String fieldName,
-  ) async {
-    final schema = await getTableSchema(tableName);
-    final index = schema.indexes.firstWhere(
-      (idx) => idx.fields.contains(fieldName),
-      orElse: () => const IndexSchema(fields: []),
-    );
-
-    if (index.indexName != null) {
-      await _indexManager?.dropIndex(tableName, index.actualIndexName);
-      await _buildIndex(tableName, index);
-    }
-  }
-
-  /// Update a single record
-  Future<void> _updateRecord(
-    String tableName,
-    Map<String, dynamic> record,
-  ) async {
-    final schema = await getTableSchema(tableName);
-    await updateInternal(
-      tableName,
-      record,
-      QueryCondition()
-        ..where(schema.primaryKey, '=', record[schema.primaryKey]),
-    );
-  }
-
-  /// Convert field data type
-  Future<void> _convertFieldData(String tableName, String fieldName,
-      DataType oldType, DataType newType, dynamic defaultValue,
-      {int batchSize = 1000}) async {
+    String oldName,
+    String newName, {
+    int batchSize = 1000,
+  }) async {
     final txn = await _transactionManager!.beginTransaction();
     try {
-      await _batchProcessRecords(
-        tableName,
-        (batch) async {
-          await _batchUpdateRecords(
-            tableName,
-            batch,
-            (record) async {
-              final oldValue = record[fieldName];
-              dynamic newValue;
-              try {
-                newValue = _convertValue(oldValue, oldType, newType);
-              } catch (e) {
-                newValue = defaultValue ?? _getTypeDefaultValue(newType);
-                Logger.warn(
-                  'Failed to convert field $fieldName value: $oldValue, using default: $newValue',
-                  label: 'DataStoreImpl._convertFieldData',
-                );
-              }
-              record[fieldName] = newValue;
-              await _updateRecord(tableName, record);
-            },
-          );
-        },
-        batchSize: batchSize,
+      final records = await fileManager.readRecords(tableName);
+      if (records.isEmpty) return;
+
+      // rename field
+      for (var record in records.values) {
+        if (record.containsKey(oldName)) {
+          record[newName] = record[oldName];
+          record.remove(oldName);
+        }
+      }
+
+      // write converted records
+      await fileManager.writeRecords(
+        tableName: tableName,
+        records: records.values.toList(),
+        isSchemaChanged: true,
       );
+
       await _transactionManager!.commit(txn);
     } catch (e) {
       await _transactionManager!.rollback(txn);
       Logger.error(
-        'Failed to convert field data: $e',
-        label: 'DataStoreImpl._convertFieldData',
+        'Failed to rename field in records: $e',
+        label: 'DataStoreImpl.renameFieldInRecords',
       );
-      rethrow;
     }
   }
 
@@ -3234,111 +3089,142 @@ class DataStoreImpl {
     _uniqueValuesCache.remove(tableName);
   }
 
-  /// Process data migration for field changes
-  Future<void> migrateFieldData(String tableName, FieldSchema oldField,
-      FieldSchema newField, Transaction? txn,
-      {int batchSize = 1000}) async {
-    // Skip if only metadata changed (comment, etc)
-    if (oldField.type == newField.type &&
-        oldField.nullable == newField.nullable &&
-        oldField.defaultValue == newField.defaultValue) {
-      Logger.error('No data migration needed - only metadata changed');
-      return;
-    }
-
-    // Handle type conversion
-    if (oldField.type != newField.type) {
-      await _convertFieldData(
-        tableName,
-        newField.name,
-        oldField.type,
-        newField.type,
-        newField.defaultValue,
-        batchSize: batchSize,
-      );
-    }
-
-    // Handle nullability change
-    if (!oldField.nullable && newField.nullable) {
-      Logger.error('Field became nullable - no action needed');
-    } else if (oldField.nullable && !newField.nullable) {
-      Logger.error('Setting default values for non-nullable field');
-      await _setDefaultForNullFields(
-        tableName,
-        newField.name,
-        newField.defaultValue ?? _getTypeDefaultValue(newField.type),
-        batchSize: batchSize,
-      );
-    }
-
-    // Handle unique constraint change
-    if (oldField.unique != newField.unique) {
-      Logger.error('Updating field indexes for unique constraint change');
-      await _updateFieldIndexes(tableName, newField.name, newField.unique);
-    }
-  }
-
-  /// Set default value for null fields
-  Future<void> _setDefaultForNullFields(
-      String tableName, String fieldName, dynamic defaultValue,
-      {int batchSize = 1000}) async {
-    final txn = await _transactionManager!.beginTransaction();
+  /// Migrate field data when field attributes change
+  Future<void> migrateFieldData(
+    String tableName,
+    FieldSchema oldField,
+    FieldSchema newField,
+    Transaction txn, {
+    int batchSize = 1000,
+  }) async {
     try {
-      await _batchProcessRecords(
-        tableName,
-        (batch) async {
-          await _batchUpdateRecords(
-            tableName,
-            batch,
-            (record) async {
-              if (record[fieldName] == null) {
-                record[fieldName] = defaultValue;
-                await _updateRecord(tableName, record);
+      // Skip if only metadata changed (comment, etc)
+      if (oldField.type == newField.type &&
+          oldField.nullable == newField.nullable &&
+          oldField.defaultValue == newField.defaultValue &&
+          oldField.unique == newField.unique &&
+          oldField.name == newField.name) {
+        return;
+      }
+
+      final schema = await getTableSchema(tableName);
+      final records = await fileManager.readRecords(tableName);
+      if (records.isEmpty) return;
+
+      // 1. Handle type conversion
+      if (oldField.type != newField.type) {
+        for (var record in records.values) {
+          if (record.containsKey(oldField.name)) {
+            try {
+              // Convert and store in new field
+              record[newField.name] = _convertValue(
+                record[oldField.name],
+                oldField.type,
+                newField.type,
+              );
+              // Remove old field if names are different
+              if (oldField.name != newField.name) {
+                record.remove(oldField.name);
               }
-            },
+            } catch (e) {
+              // if conversion fails, use default value
+              record[newField.name] =
+                  newField.defaultValue ?? _getTypeDefaultValue(newField.type);
+              Logger.warn(
+                'Failed to convert field value: ${record[oldField.name]} from ${oldField.type} to ${newField.type}, using default value',
+                label: 'DataStoreImpl.migrateFieldData',
+              );
+            }
+          }
+        }
+      }
+
+      // 2. Handle nullability change
+      if (!oldField.nullable && newField.nullable) {
+        // Field became nullable - no action needed
+      } else if (oldField.nullable && !newField.nullable) {
+        // Set default value for null fields
+        for (var record in records.values) {
+          if (record[newField.name] == null) {
+            record[newField.name] =
+                newField.defaultValue ?? _getTypeDefaultValue(newField.type);
+          }
+        }
+      }
+
+      // 3. Handle default value change
+      if (oldField.defaultValue != newField.defaultValue) {
+        for (var record in records.values) {
+          if (record[newField.name] == oldField.defaultValue) {
+            record[newField.name] = newField.defaultValue;
+          }
+        }
+      }
+
+      // 4. Handle unique constraint change
+      if (oldField.unique != newField.unique) {
+        if (newField.unique) {
+          // Check uniqueness
+          final values = <dynamic>{};
+          for (var record in records.values) {
+            final value = record[oldField.name];
+            if (values.contains(value)) {
+              Logger.warn(
+                'Duplicate value found for field ${oldField.name}: $value',
+                label: 'DataStoreImpl.migrateFieldData',
+              );
+            }
+            values.add(value);
+          }
+        }
+
+        // 4.2 Handle indexes
+        // Remove old field index if exists
+        final oldIndex = schema.indexes.firstWhere(
+          (i) => i.fields.length == 1 && i.fields.first == oldField.name,
+          orElse: () => const IndexSchema(fields: []),
+        );
+        if (oldIndex.indexName != null) {
+          await removeIndex(tableName, oldIndex.indexName!, txn);
+        }
+
+        // Add new index if needed
+        if (newField.unique) {
+          final newIndex = IndexSchema(
+            indexName: '${newField.name}_idx',
+            fields: [newField.name],
+            unique: true,
           );
-        },
-        batchSize: batchSize,
+          await addIndex(tableName, newIndex, txn);
+        }
+      }
+
+      // 5. check max length
+      if (oldField.maxLength != null) {
+        for (var record in records.values) {
+          if (record[oldField.name] != null &&
+              record[oldField.name] is String &&
+              record[oldField.name].length > oldField.maxLength!) {
+            Logger.warn('Warning: field ${oldField.name} exceeds max length');
+            record[oldField.name] =
+                record[oldField.name].substring(0, oldField.maxLength!);
+          }
+        }
+      }
+
+      // 6. Write converted records
+      await fileManager.writeRecords(
+        tableName: tableName,
+        records: records.values.toList(),
+        isSchemaChanged: true,
       );
-      await _transactionManager!.commit(txn);
     } catch (e) {
-      await _transactionManager!.rollback(txn);
       Logger.error(
-        'Failed to set default values: $e',
-        label: 'DataStoreImpl._setDefaultForNullFields',
+        'Failed to migrate field data: $e',
+        label: 'DataStoreImpl.migrateFieldData',
       );
       rethrow;
     }
-  }
-
-  /// Update field indexes
-  Future<void> _updateFieldIndexes(
-    String tableName,
-    String fieldName,
-    bool unique,
-  ) async {
-    await transaction((txn) async {
-      final schema = await getTableSchema(tableName);
-
-      // Remove old index if exists
-      final oldIndex = schema.indexes.firstWhere(
-        (i) => i.fields.length == 1 && i.fields.first == fieldName,
-        orElse: () => const IndexSchema(fields: []),
-      );
-      if (oldIndex.indexName != null) {
-        await dropIndex(tableName, oldIndex.indexName!, txn);
-      }
-
-      // Add new index if unique
-      if (unique) {
-        final newIndex = IndexSchema(
-          indexName: '${fieldName}_idx',
-          fields: [fieldName],
-          unique: true,
-        );
-        await addIndex(tableName, newIndex, txn);
-      }
-    });
   }
 
   /// Get row pointer for given primary key value
@@ -3451,7 +3337,7 @@ class DataStoreImpl {
   ) async {
     try {
       // 1. Drop old index
-      await dropIndex(tableName, oldIndexName, txn);
+      await removeIndex(tableName, oldIndexName, txn);
 
       // 2. Create new index
       await addIndex(tableName, newIndex, txn);

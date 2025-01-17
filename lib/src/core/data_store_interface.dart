@@ -46,6 +46,9 @@ abstract class DataStoreInterface {
   /// create table
   Future<void> createTable(TableSchema schema);
 
+  /// create multiple tables
+  Future<void> createTables(List<TableSchema> schemas);
+
   /// update table schema
   SchemaBuilder updateSchema(String tableName);
 

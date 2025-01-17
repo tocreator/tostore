@@ -93,11 +93,11 @@ final db = ToStore(
       await db.updateSchema('users') // update users table structure
           .addField("fans", type: DataType.array, comment: "fans") // add fans field
           .addIndex("follow",fields: ["follow", "username"]) // add follow index
-          .dropField("last_login") // drop last_login field
+          .removeField("last_login") // drop last_login field
           .modifyField('email', unique: true)   // more complex field modification
           .renameField("last_login", "last_login_time"); // rename last_login to last_login_time
     } else if (oldVersion == 2) {
-      await db.updateSchema('users').renameTo('users_new'); // rename users table to users_new
+      await db.updateSchema('users').renameTable('users_new'); // rename users table to users_new
     }
   },
 );

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.8.7
+
+### Breaking Changes
+- Renamed `renameTo` to `renameTable`
+- Changed field operation naming to be more consistent:
+  - `dropField` -> `removeField`
+  - `dropIndex` -> `removeIndex`
+
+### Enhancements
+- Improved schema migration logic
+- Optimized file operations using FileManager
+
+### Bug Fixes
+- Fixed transaction handling in schema operations
+
 ## 1.8.6
 
 * Update topics in pubspec.yaml
