@@ -32,8 +32,10 @@ class TransactionManager {
       'data': data,
     };
 
-    final logPath = await _dataStore.getTablePath(tableName);
-    final logFile = File('$logPath.transaction.log');
+    final schema = await _dataStore.getTableSchema(tableName);
+    final logPath =
+        _dataStore.config.getTransactionLogPath(tableName, schema.isGlobal);
+    final logFile = File(logPath);
     await logFile.writeAsString(
       '${jsonEncode(logEntry)}\n',
       mode: FileMode.append,
@@ -120,8 +122,9 @@ class TransactionManager {
   /// Process single operation
   Future<void> _processOperation(Map<String, dynamic> operation) async {
     final tableName = operation['table'] as String;
-    final dataPath = await _dataStore.getTablePath(tableName);
-    final dataFile = File('$dataPath.dat');
+    final schema = await _dataStore.getTableSchema(tableName);
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+    final dataFile = File(dataPath);
 
     switch (operation['type']) {
       case 'insert':

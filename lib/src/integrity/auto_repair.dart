@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-
 import '../handler/logger.dart';
 import '../backup/backup_manager.dart';
 import '../core/data_store_impl.dart';
@@ -44,7 +43,6 @@ class AutoRepair {
 
   /// rebuild index
   Future<void> rebuildIndex(String tableName, String indexName) async {
-    final tablePath = await _dataStore.getTablePath(tableName);
     final schema = await _dataStore.getTableSchema(tableName);
 
     // create new index
@@ -54,7 +52,8 @@ class AutoRepair {
     );
 
     // read all data and rebuild index
-    final dataFile = File('$tablePath.dat');
+    final dataFile =
+        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
     final lines = await dataFile.readAsLines();
 
     var startOffset = await dataFile.length();
@@ -153,8 +152,8 @@ class AutoRepair {
       }
 
       // restore record
-      final tablePath = await _dataStore.getTablePath(tableName);
-      final dataFile = File('$tablePath.dat');
+      final dataFile =
+          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
       final sink = dataFile.openWrite(mode: FileMode.append);
       try {
         sink.writeln(jsonEncode(targetRecord));
@@ -170,11 +169,12 @@ class AutoRepair {
 
   /// create new table
   Future<void> _createNewTable(String tableName, TableSchema schema) async {
-    final tablePath = await _dataStore.getTablePath(tableName);
-    final dataFile = File('$tablePath.dat');
-    final schemaFile = File('$tablePath.schema');
+    final dataFile =
+        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+    final schemaFile =
+        File(_dataStore.config.getSchemaPath(tableName, schema.isGlobal));
 
-    await dataFile.create();
+    await dataFile.create(recursive: true);
     await schemaFile.writeAsString(jsonEncode(schema.toJson()));
 
     // create index
@@ -190,10 +190,10 @@ class AutoRepair {
     String targetName,
     TableSchema schema,
   ) async {
-    final sourcePath = await _dataStore.getTablePath(sourceName);
-    final targetPath = await _dataStore.getTablePath(targetName);
-    final sourceFile = File('$sourcePath.dat');
-    final targetFile = File('$targetPath.dat');
+    final sourceFile =
+        File(_dataStore.config.getDataPath(sourceName, schema.isGlobal));
+    final targetFile =
+        File(_dataStore.config.getDataPath(targetName, schema.isGlobal));
 
     final lines = await sourceFile.readAsLines();
     final sink = targetFile.openWrite();
@@ -227,22 +227,29 @@ class AutoRepair {
 
   /// replace table
   Future<void> _replaceTable(String oldName, String newName) async {
-    final oldPath = await _dataStore.getTablePath(oldName);
-    final newPath = await _dataStore.getTablePath(newName);
-
-    final oldDataFile = File('$oldPath.dat');
-    final oldSchemaFile = File('$oldPath.schema');
+    final schema = await _dataStore.getTableSchema(oldName);
+    final oldDataFile =
+        File(_dataStore.config.getDataPath(oldName, schema.isGlobal));
+    final oldSchemaFile =
+        File(_dataStore.config.getSchemaPath(oldName, schema.isGlobal));
+    final newDataFile =
+        File(_dataStore.config.getDataPath(newName, schema.isGlobal));
+    final newSchemaFile =
+        File(_dataStore.config.getSchemaPath(newName, schema.isGlobal));
     final oldIndexFiles = await _getIndexFiles(oldName);
-
-    final newDataFile = File('$newPath.dat');
-    final newSchemaFile = File('$newPath.schema');
 
     // backup original table
     final backupSuffix = DateTime.now().millisecondsSinceEpoch.toString();
-    await oldDataFile.rename('${oldDataFile.path}.$backupSuffix');
-    await oldSchemaFile.rename('${oldSchemaFile.path}.$backupSuffix');
+
+    final oldDataBackupPath = '${oldDataFile.path}.$backupSuffix';
+    final oldSchemaBackupPath = '${oldSchemaFile.path}.$backupSuffix';
+
+    await oldDataFile.rename(oldDataBackupPath);
+    await oldSchemaFile.rename(oldSchemaBackupPath);
+
     for (var indexFile in oldIndexFiles) {
-      await indexFile.rename('${indexFile.path}.$backupSuffix');
+      final indexBackupPath = '${indexFile.path}.$backupSuffix';
+      await indexFile.rename(indexBackupPath);
     }
 
     // replace with new table
@@ -252,16 +259,28 @@ class AutoRepair {
 
   /// get index files
   Future<List<File>> _getIndexFiles(String tableName) async {
-    final tablePath = await _dataStore.getTablePath(tableName);
-    final dir = Directory(tablePath);
+    final schema = await _dataStore.getTableSchema(tableName);
     final files = <File>[];
 
-    await for (var entity in dir.list()) {
-      if (entity is File &&
-          entity.path.startsWith('$tablePath/${tableName}_') &&
-          entity.path.endsWith('.idx')) {
-        files.add(entity);
+    for (var index in schema.indexes) {
+      final indexFile = File(_dataStore.config.getIndexPath(
+        tableName,
+        index.actualIndexName,
+        schema.isGlobal,
+      ));
+      if (await indexFile.exists()) {
+        files.add(indexFile);
       }
+    }
+
+    // Add primary index file
+    final pkIndexFile = File(_dataStore.config.getIndexPath(
+      tableName,
+      'pk_$tableName',
+      schema.isGlobal,
+    ));
+    if (await pkIndexFile.exists()) {
+      files.add(pkIndexFile);
     }
 
     return files;

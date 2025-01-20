@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../core/data_compressor.dart';
 import '../core/data_store_impl.dart';
@@ -20,16 +21,16 @@ class BackupManager {
 
   /// extract file name from path
   String _getFileName(String path) {
-    final normalizedPath = path.replaceAll('\\', '/');
-    final parts = normalizedPath.split('/');
-    return parts.last.replaceAll('.dat', '');
+    final parts = path.split(Platform.pathSeparator);
+    final fileName = parts.last;
+    return fileName.split('.').first;
   }
 
   /// create backup file
   Future<String> createBackup() async {
     final timestamp = DateTime.now().toIso8601String();
     final backupPath = _dataStore.config.getBackupPath();
-    final backupFile = File('$backupPath/backup_$timestamp.bak');
+    final backupFile = File(pathJoin(backupPath, 'backup_$timestamp.bak'));
 
     // create backup directory
     await Directory(backupPath).create(recursive: true);
@@ -81,8 +82,7 @@ class BackupManager {
 
     await for (var entity in dir.list()) {
       if (entity is File && entity.path.endsWith('.dat')) {
-        final tablePath = entity.path.replaceAll('.dat', '');
-        final tableName = _getFileName(tablePath);
+        final tableName = _getFileName(entity.path);
 
         // read data file
         final lines = await entity.readAsLines();

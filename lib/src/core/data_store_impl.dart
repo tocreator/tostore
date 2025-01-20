@@ -167,7 +167,7 @@ class DataStoreImpl {
   /// Get database version
   Future<int> getVersion() async {
     try {
-      final versionFile = File('${config.dbPath}/version');
+      final versionFile = File(pathJoin(config.dbPath, 'version'));
       if (!await versionFile.exists()) {
         return 0;
       }
@@ -179,7 +179,7 @@ class DataStoreImpl {
 
   /// Set database version
   Future<void> setVersion(int version) async {
-    final versionFile = File('${config.dbPath}/version');
+    final versionFile = File(pathJoin(config.dbPath, 'version'));
     await versionFile.writeAsString(version.toString());
   }
 
@@ -229,16 +229,10 @@ class DataStoreImpl {
     if (_config != null && isInitialized) {
       return _config!.dbPath;
     } else if (dbPath != null) {
-      return "$dbPath/db";
+      return pathJoin(dbPath, 'db');
     }
     final appPath = await getPathApp();
-    return "$appPath/db";
-  }
-
-  /// Get table path
-  Future<String> getTablePath(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    return config.getTablePath(tableName, schema.isGlobal);
+    return pathJoin(appPath, 'db');
   }
 
   /// Get table path (sync version)
@@ -950,9 +944,10 @@ class DataStoreImpl {
 
   /// verify data integrity
   Future<bool> _verifyDataIntegrity(String tableName) async {
-    final tablePath = await getTablePath(tableName);
-    final dataFile = File('$tablePath.dat');
-    final checksumFile = File('$tablePath.checksum');
+    final schema = await getTableSchema(tableName);
+    final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
+    final checksumFile =
+        File(config.getChecksumPath(tableName, schema.isGlobal));
 
     if (!await dataFile.exists() || !await checksumFile.exists()) {
       return false;
@@ -1231,8 +1226,8 @@ class DataStoreImpl {
     await _concurrencyManager!.acquireWriteLock(tableName);
     try {
       // clear file
-      final tablePath = await getTablePath(tableName);
-      final dataFile = File('$tablePath.dat');
+      final schema = await getTableSchema(tableName);
+      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
       if (await dataFile.exists()) {
         await dataFile.writeAsString('');
       }
@@ -1333,24 +1328,26 @@ class DataStoreImpl {
   Future<void> dropTable(String tableName) async {
     try {
       await _concurrencyManager!.acquireWriteLock(tableName);
+      final schema = await getTableSchema(tableName);
 
       // delete data file
-      final tablePath = await getTablePath(tableName);
-      final dataFile = File('$tablePath.dat');
+      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
       if (await dataFile.exists()) {
         await dataFile.delete();
       }
 
       // delete schema file
-      final schemaFile = File('$tablePath.schema');
+      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
       if (await schemaFile.exists()) {
         await schemaFile.delete();
 
-        // delete index file
-        final schema = await getTableSchema(tableName);
+        // delete index files
         for (var index in schema.indexes) {
-          final indexFile = File(
-              '${_config!.getTablePath(tableName, schema.isGlobal)}_${index.actualIndexName}.idx');
+          final indexFile = File(config.getIndexPath(
+            tableName,
+            index.actualIndexName,
+            schema.isGlobal,
+          ));
           if (await indexFile.exists()) {
             await indexFile.delete();
           }
@@ -1645,9 +1642,9 @@ class DataStoreImpl {
 
   /// extract file name from path
   String _getFileName(String path) {
-    final normalizedPath = path.replaceAll('\\', '/');
-    final parts = normalizedPath.split('/');
-    return parts.last.replaceAll('.dat', '');
+    final parts = path.split(Platform.pathSeparator);
+    final fileName = parts.last;
+    return fileName.replaceAll('.dat', '');
   }
 
   /// check unique constraints

@@ -221,7 +221,8 @@ class FileManager {
 
   /// extract table name from path
   String _getTableNameFromPath(String path) {
-    final fileName = path.split(Platform.pathSeparator).last;
+    final parts = path.split(Platform.pathSeparator);
+    final fileName = parts.last;
     return fileName.split('.').first;
   }
 
@@ -292,19 +293,14 @@ class FileManager {
 
   /// get all files of a table
   Future<List<File>> getTableFiles(String tableName) async {
-    final tablePath = await _dataStore.getTablePath(tableName);
+    final schema = await _dataStore.getTableSchema(tableName);
+    final tablePath =
+        _dataStore.config.getTablePath(tableName, schema.isGlobal);
     final files = <File>[];
 
-    // data file
-    files.add(File('$tablePath.dat'));
-    // schema file
-    files.add(File('$tablePath.schema'));
-    // index files
     final dir = Directory(tablePath).parent;
     await for (var entity in dir.list()) {
-      if (entity is File &&
-          entity.path.startsWith('$tablePath.') &&
-          entity.path.endsWith('.idx')) {
+      if (entity is File && entity.path.startsWith('$tablePath.')) {
         files.add(entity);
       }
     }

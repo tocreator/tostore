@@ -36,7 +36,7 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
-  /// Drop field from table
+  /// Remove field from table
   SchemaBuilder removeField(String fieldName) {
     _operations.add(_SchemaOperation(
       type: _SchemaOperationType.removeField,
@@ -98,7 +98,7 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
-  /// Drop index
+  /// Remove index
   SchemaBuilder removeIndex(String indexName) {
     _operations.add(_SchemaOperation(
       type: _SchemaOperationType.removeIndex,

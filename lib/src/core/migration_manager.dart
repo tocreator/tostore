@@ -388,7 +388,7 @@ class MigrationOperation {
       case MigrationType.addField:
         return 'Add field: ${field?.name}';
       case MigrationType.removeField:
-        return 'Drop field: $oldName';
+        return 'Remove field: $oldName';
       case MigrationType.renameField:
         return 'Rename field: $oldName -> $newName';
       case MigrationType.modifyField:
@@ -396,7 +396,7 @@ class MigrationOperation {
       case MigrationType.addIndex:
         return 'Add index: ${index?.indexName ?? index?.fields.join("_")}';
       case MigrationType.removeIndex:
-        return 'Drop index: ${indexName ?? fields?.join("_")}';
+        return 'Remove index: ${indexName ?? fields?.join("_")}';
       case MigrationType.modifyIndex:
         return 'Modify index: ${indexName ?? fields?.join("_")}';
     }

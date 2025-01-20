@@ -1,4 +1,5 @@
 import 'migration_config.dart';
+import '../handler/common.dart';
 
 /// data store config
 class DataStoreConfig {
@@ -72,29 +73,29 @@ class DataStoreConfig {
   /// get table path
   String getTablePath(String tableName, bool isGlobal) {
     if (isGlobal) {
-      return '$dbPath/global/$tableName';
+      return pathJoin(dbPath, 'global', tableName);
     }
-    return '$dbPath/bases/$baseName/$tableName';
+    return pathJoin(dbPath, 'bases', baseName, tableName);
   }
 
   /// get base path
   String getBasePath() {
-    return '$dbPath/bases/$baseName';
+    return pathJoin(dbPath, 'bases', baseName);
   }
 
   /// get global path
   String getGlobalPath() {
-    return '$dbPath/global';
+    return pathJoin(dbPath, 'global');
   }
 
   /// get backup path
   String getBackupPath() {
-    return '$dbPath/backups';
+    return pathJoin(dbPath, 'backups');
   }
 
   /// get log path
   String getLogPath() {
-    return '$dbPath/logs';
+    return pathJoin(dbPath, 'logs');
   }
 
   /// get index path

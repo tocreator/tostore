@@ -38,20 +38,22 @@ class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
   /// [dbPath] Database path (optional, excluding filename)
   /// [config] Database configuration
-  /// [version] Database version number
+  /// [version] Database version number,every time the data structure is adjusted, increase the version number to trigger upgrade
+  /// [schemas] Database table schemas, auto upgrade
   /// [onConfigure] Callback when configuring database
   /// [onCreate] Callback when database is first created
-  /// [onUpgrade] Callback when database is upgraded
+  /// [onUpgrade] Callback when database is upgraded, complex data structure upgrade scenarios use
   /// [onDowngrade] Callback when database is downgraded
   /// [onOpen] Callback when database is opened
   ///
   /// 以数据库路径的不同创建独立的实例
   /// [dbPath] 数据库路径，可选，不含文件名
   /// [config] 数据库配置
-  /// [version] 数据库版本号
+  /// [version] 数据库版本号，每次调整了数据结构增加版本号则触发升级
+  /// [schemas] 数据库表结构定义，自动化升级
   /// [onConfigure] 数据库配置时的回调
   /// [onCreate] 数据库首次创建时的回调
-  /// [onUpgrade] 数据库升级时的回调
+  /// [onUpgrade] 数据库升级时的回调，复杂的数据结构升级场景使用
   /// [onDowngrade] 数据库降级时的回调
   /// [onOpen] 数据库打开时的回调
   factory ToStore({
@@ -105,13 +107,12 @@ class ToStore implements DataStoreInterface {
   }
 
   /// Create table with schema
-  /// [tableName] Table name
   /// [schema] Table schema definition
   /// Example:
   /// ```dart
   /// await db.createTable(
-  /// 'table_name',
   ///  TableSchema(
+  ///   name: 'table_name',
   ///   primaryKey: 'userId',
   ///   fields: [
   ///     FieldSchema(
@@ -135,7 +136,6 @@ class ToStore implements DataStoreInterface {
   /// ```
   ///
   /// 创建数据表
-  /// [tableName] 表名
   /// [schema] 表结构定义
   /// 全局表数据共享，其他表在切换空间后数据隔离
   @override
@@ -148,6 +148,24 @@ class ToStore implements DataStoreInterface {
   ///
   /// 创建多个表
   /// [schemas] 表结构定义列表
+  ///
+  /// Example:
+  /// ```dart
+  /// await db.createTables([
+  ///   TableSchema(
+  ///     name: 'table_name',
+  ///     primaryKey: 'userId',
+  ///     fields: [
+  ///       FieldSchema(
+  ///         name: 'userId',
+  ///         type: DataType.integer,
+  ///         nullable: false,
+  ///       ),
+  ///     ],
+  ///   ),
+  ///   TableSchema(...),
+  /// ]);
+  /// ```
   @override
   Future<void> createTables(List<TableSchema> schemas) async {
     return await _impl.createTables(schemas);

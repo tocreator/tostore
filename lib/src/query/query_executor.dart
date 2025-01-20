@@ -166,11 +166,11 @@ class QueryExecutor {
 
   /// perform table scan
   Future<List<Map<String, dynamic>>> _performTableScan(String tableName) async {
-    final tablePath = await _dataStore.getTablePath(tableName);
-    final dataFile = File('$tablePath.dat');
+    final schema = await _dataStore.getTableSchema(tableName);
+    final dataFile =
+        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
 
     // get table schema to get primary key field
-    final schema = await _dataStore.getTableSchema(tableName);
     final primaryKey = schema.primaryKey;
 
     // 1. check if there is full table cache
@@ -523,7 +523,9 @@ class QueryExecutor {
     }
 
     // 2. read from file
-    final file = File('${_dataStore.getTablePath(tableName)}.dat');
+    final schema = await _dataStore.getTableSchema(tableName);
+    final file =
+        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
     if (!await file.exists()) return null;
     try {
       final raf = await file.open(mode: FileMode.read);

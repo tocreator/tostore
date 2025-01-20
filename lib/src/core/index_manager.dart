@@ -116,9 +116,8 @@ class IndexManager {
 
       // create index file
       final schema = await _dataStore.getTableSchema(tableName);
-      final indexPath =
-          _dataStore.config.getIndexPath(tableName, indexName, schema.isGlobal);
-      final indexFile = File(indexPath);
+      final indexFile =
+          File(_getIndexPath(tableName, indexName, schema.isGlobal));
       await indexFile.create(recursive: true);
       _indexFiles[indexName] = indexFile;
     } catch (e) {
@@ -131,7 +130,10 @@ class IndexManager {
   /// create normal index
   Future<void> createIndex(String tableName, IndexSchema schema) async {
     try {
-      final indexName = schema.actualIndexName;
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      final indexFile = File(_getIndexPath(
+          tableName, schema.actualIndexName, tableSchema.isGlobal));
+      await indexFile.create(recursive: true);
 
       // create B+ tree
       final tree = BPlusTree(
@@ -140,17 +142,12 @@ class IndexManager {
       );
 
       // register index
-      _indexes[indexName] = tree;
+      _indexes[schema.actualIndexName] = tree;
 
       // create index file
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      final indexPath = _dataStore.config
-          .getIndexPath(tableName, indexName, tableSchema.isGlobal);
-      final indexFile = File(indexPath);
-      await indexFile.create(recursive: true);
-      _indexFiles[indexName] = indexFile;
+      _indexFiles[schema.actualIndexName] = indexFile;
     } catch (e) {
-      Logger.error('create index failed: $e',
+      Logger.error('Create index failed: $e',
           label: 'IndexManager.createIndex');
       rethrow;
     }
@@ -477,7 +474,7 @@ class IndexManager {
     _indexBatchQueue.remove(indexKey);
   }
 
-  /// Drop index for table
+  /// Remove index for table
   Future<void> removeIndex(
     String tableName,
     String indexName,
@@ -491,12 +488,8 @@ class IndexManager {
 
       // Remove index file
       final schema = await _dataStore.getTableSchema(tableName);
-      final indexPath = _dataStore.config.getIndexPath(
-        tableName,
-        indexName,
-        schema.isGlobal,
-      );
-      final indexFile = File(indexPath);
+      final indexFile =
+          File(_getIndexPath(tableName, indexName, schema.isGlobal));
 
       if (await indexFile.exists()) {
         await indexFile.delete();
@@ -543,5 +536,9 @@ class IndexManager {
       );
       return null;
     }
+  }
+
+  String _getIndexPath(String tableName, String indexName, bool isGlobal) {
+    return _dataStore.config.getIndexPath(tableName, indexName, isGlobal);
   }
 }
