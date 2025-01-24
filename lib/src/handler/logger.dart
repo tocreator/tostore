@@ -13,7 +13,7 @@ enum LogType { info, debug, warn, error }
 /// search tips: search "logger" to view all types of logs, search log-error to view all errors
 class Logger {
   /// common label, for quick search
-  static String _commonLabel = 'logger';
+  static String _commonLabel = InternalConfig.publicLabel;
 
   /// log handler callback
   static void Function(String message, LogType type, String label)?
@@ -42,21 +42,27 @@ class Logger {
   /// print info log
   static void info(Object? message, {String? label}) {
     final text = toStringWithAll(message);
-    label = label == null ? "log-info" : "log-info  $label";
+    label = label == null || !InternalConfig.showLoggerInternalLabel
+        ? "log-info"
+        : "log-info  $label";
     _log(text, label: label);
   }
 
   /// print debug log
   static void debug(Object? message, {String? label}) {
     final text = toStringWithAll(message);
-    label = label == null ? "log-debug" : "log-debug  $label";
+    label = label == null || !InternalConfig.showLoggerInternalLabel
+        ? "log-debug"
+        : "log-debug  $label";
     _log(text, label: label);
   }
 
   /// print warn log
   static void warn(Object? message, {String? label}) {
     final text = toStringWithAll(message);
-    label = label == null ? "log-warn" : "log-warn  $label";
+    label = label == null || !InternalConfig.showLoggerInternalLabel
+        ? "log-warn"
+        : "log-warn  $label";
     _log(text, label: "💡  $label");
     _handler(text, LogType.warn, label);
   }
@@ -64,7 +70,9 @@ class Logger {
   /// print error log, label can define the method name
   static void error(Object? message, {String? label}) {
     final text = toStringWithAll(message);
-    label = label == null ? "log-error" : "log-error  $label";
+    label = label == null || !InternalConfig.showLoggerInternalLabel
+        ? "log-error"
+        : "log-error  $label";
     _log(text, label: "🔴  $label");
     _handler(text, LogType.error, label);
   }
@@ -84,14 +92,14 @@ class Logger {
   /// internal log handler
   static void _log(Object? message, {String label = "log-info"}) {
     if (kDebugMode) {
-      final displayLabel = InternalConfig.showLoggerInternalLabel
-          ? label
-          : InternalConfig.publicLabel;
-      String startDash = "${'-' * 20}    $displayLabel    ${'-' * 18}>>";
+      String startDash = "${'-' * 20}    $label    ${'-' * 18}>>";
       String endDash = "${'-' * (startDash.length - 2)}<<";
       if (startDash.length > 130) {
-        startDash = "${'-' * 40}>>\n    $displayLabel\n";
+        startDash = "${'-' * 40}>>\n    $label\n";
         endDash = "${'-' * 40}<<";
+      }
+      if (message is DateTime) {
+        message = message.toIso8601String();
       }
       log(
         "\n$startDash\n$message\n$endDash\n",

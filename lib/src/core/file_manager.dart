@@ -91,8 +91,8 @@ class FileManager {
         } else {
           _idleCount++;
         }
-      } catch (e) {
-        Logger.error('timer process failed: $e',
+      } catch (e, stackTrace) {
+        Logger.error('timer process failed: $e\n$stackTrace',
             label: 'FileManager-startTimer');
         _isWriting = false;
       }

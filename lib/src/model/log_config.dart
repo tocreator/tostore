@@ -3,7 +3,8 @@ import '../handler/logger.dart';
 /// global log config
 class LogConfig {
   /// enable log
-  static bool enableLog = true;
+  static bool _enableLog = true;
+  static get enableLog => _enableLog;
 
   /// log callback method, for custom log processing
   /// [message] log content
@@ -16,12 +17,16 @@ class LogConfig {
   static void setConfig({
     bool? enableLog,
     void Function(String message, LogType type, String label)? onLogHandler,
+    String? publicLabel,
   }) {
     if (enableLog != null) {
-      LogConfig.enableLog = enableLog;
+      _enableLog = enableLog;
     }
     if (onLogHandler != null) {
-      LogConfig.onLogHandler = onLogHandler;
+      onLogHandler = onLogHandler;
+    }
+    if (publicLabel != null) {
+      Logger.setConfig(label: publicLabel);
     }
   }
 }

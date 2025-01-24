@@ -116,6 +116,15 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
+  /// Set auto increment setting
+  SchemaBuilder setAutoIncrement(bool enabled) {
+    _operations.add(_SchemaOperation(
+      type: _SchemaOperationType.setAutoIncrement,
+      autoIncrement: enabled,
+    ));
+    return this;
+  }
+
   @override
   Future<void> get future async {
     // Execute all operations in a transaction
@@ -181,6 +190,12 @@ class SchemaBuilder with FutureBuilderMixin {
       case _SchemaOperationType.renameTable:
         await _dataStore.renameTable(_tableName, operation.newTableName!, txn);
         break;
+      case _SchemaOperationType.setAutoIncrement:
+        await _dataStore.setAutoIncrement(
+          _tableName,
+          operation.autoIncrement ?? false,
+        );
+        break;
     }
   }
 }
@@ -194,6 +209,7 @@ enum _SchemaOperationType {
   addIndex,
   removeIndex,
   renameTable,
+  setAutoIncrement,
 }
 
 /// Operation class for schema update
@@ -205,6 +221,7 @@ class _SchemaOperation {
   final IndexSchema? index;
   final String? indexName;
   final String? newTableName;
+  final bool? autoIncrement;
 
   _SchemaOperation({
     required this.type,
@@ -214,5 +231,6 @@ class _SchemaOperation {
     this.index,
     this.indexName,
     this.newTableName,
+    this.autoIncrement,
   });
 }

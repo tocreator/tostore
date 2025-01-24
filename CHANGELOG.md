@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+
+## 1.8.8
+
+### Changed
+* Improved auto increment setting validation and handling
+* Enhanced data type validation with better error messages
+* Added automatic primary key type conversion for auto increment
+* Fixed DateTime serialization and validation
+* Improved error handling in file operations
+
 ## 1.8.7
 
 ### Breaking Changes

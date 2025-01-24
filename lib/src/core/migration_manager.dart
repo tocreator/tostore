@@ -135,6 +135,13 @@ class MigrationManager {
               txn,
             );
             break;
+
+          case MigrationType.setAutoIncrement:
+            await _dataStore.setAutoIncrement(
+              tableName,
+              operation.autoIncrement ?? false,
+            );
+            break;
         }
       }
       // Update schema file with new schema
@@ -149,8 +156,28 @@ class MigrationManager {
   ) {
     final operations = <MigrationOperation>[];
 
-    // Check fields changes
+    // Check field changes
     _compareFields(oldSchema, newSchema, operations);
+
+    // Check auto increment setting changes
+    if (oldSchema.autoIncrement != newSchema.autoIncrement) {
+      final primaryField = newSchema.fields.firstWhere(
+        (f) => f.name == newSchema.primaryKey,
+      );
+
+      // Only allow enabling auto increment for integer primary key
+      if (newSchema.autoIncrement && primaryField.type != DataType.integer) {
+        Logger.warn(
+          'Auto increment cannot be enabled for table ${newSchema.name}, auto increment only supports integer primary key',
+          label: 'MigrationManager._compareSchemas',
+        );
+      } else {
+        operations.add(MigrationOperation(
+          type: MigrationType.setAutoIncrement,
+          autoIncrement: newSchema.autoIncrement,
+        ));
+      }
+    }
 
     // Check indexes changes
     _compareIndexes(oldSchema, newSchema, operations);
@@ -358,6 +385,7 @@ enum MigrationType {
   addIndex,
   removeIndex,
   modifyIndex,
+  setAutoIncrement,
 }
 
 /// Migration operation
@@ -370,6 +398,7 @@ class MigrationOperation {
   final String? indexName;
   final List<String>? fields;
   final bool? unique;
+  final bool? autoIncrement;
 
   const MigrationOperation({
     required this.type,
@@ -380,6 +409,7 @@ class MigrationOperation {
     this.indexName,
     this.fields,
     this.unique,
+    this.autoIncrement,
   });
 
   @override
@@ -399,6 +429,8 @@ class MigrationOperation {
         return 'Remove index: ${indexName ?? fields?.join("_")}';
       case MigrationType.modifyIndex:
         return 'Modify index: ${indexName ?? fields?.join("_")}';
+      case MigrationType.setAutoIncrement:
+        return 'Set auto increment: ${autoIncrement ?? false}';
     }
   }
 }

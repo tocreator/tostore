@@ -56,7 +56,13 @@ class StatisticsCollector {
               nullPercentage: 0.0,
             ),
           );
-          _updateFieldStats(stats, entry.value, totalRows);
+
+          var value = entry.value;
+          if (value is DateTime) {
+            value = value.toIso8601String();
+          }
+
+          _updateFieldStats(stats, value, totalRows);
         }
       }
 
@@ -105,6 +111,10 @@ class StatisticsCollector {
     dynamic value,
     int totalRows,
   ) {
+    if (value is DateTime) {
+      value = value.toIso8601String();
+    }
+
     if (value == null) {
       stats = FieldStatistics(
         distinctValues: stats.distinctValues,

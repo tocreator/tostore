@@ -314,6 +314,7 @@ class DataStoreImpl {
           const TableSchema(
             name: _kvStoreName,
             primaryKey: 'key',
+            autoIncrement: false,
             fields: [
               FieldSchema(name: 'key', type: DataType.text, nullable: false),
               FieldSchema(name: 'value', type: DataType.text),
@@ -329,6 +330,7 @@ class DataStoreImpl {
           const TableSchema(
             name: _globalKvStoreName,
             primaryKey: 'key',
+            autoIncrement: false,
             isGlobal: true,
             fields: [
               FieldSchema(name: 'key', type: DataType.text, nullable: false),
@@ -449,7 +451,25 @@ class DataStoreImpl {
     }
 
     try {
-      // 1. check global path and base path
+      var schemaValid = schema;
+      // table name cannot be empty
+      if (schema.name.isEmpty) {
+        throw const BusinessError(
+          'Table name cannot be empty',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+
+      // table name must start with letter and contain only letters, numbers and underscore
+      final tableNameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
+      if (!tableNameRegex.hasMatch(schema.name)) {
+        throw BusinessError(
+          'Invalid table name: ${schema.name}, table name must start with letter and contain only letters, numbers and underscore',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+
+      // check if table already exists
       final globalSchemaFile = File(config.getSchemaPath(schema.name, true));
       final baseSchemaFile = File(config.getSchemaPath(schema.name, false));
 
@@ -464,44 +484,69 @@ class DataStoreImpl {
         return;
       }
 
-      // 2. create target directory
-      final isGlobal = schema.isGlobal;
+      // create target directory
       final targetPath =
-          isGlobal ? config.getGlobalPath() : config.getBasePath();
+          schema.isGlobal ? config.getGlobalPath() : config.getBasePath();
       final targetDir = Directory(targetPath);
       if (!await targetDir.exists()) {
         await targetDir.create(recursive: true);
       }
 
-      // 3. get target table path
-      final dataFile = File(config.getDataPath(schema.name, schema.isGlobal));
-      final schemaFile =
-          File(config.getSchemaPath(schema.name, schema.isGlobal));
+      // get schema file path
+      final schemaFile = schema.isGlobal ? globalSchemaFile : baseSchemaFile;
 
       await _concurrencyManager!.acquireWriteLock(schema.name);
       try {
-        // 4. validate table structure
-        _validateSchema(schema);
+        final primaryField =
+            schema.fields.firstWhere((f) => f.name == schema.primaryKey);
 
-        // 5. create new table file
-        await dataFile.create(recursive: true);
-        await schemaFile.writeAsString(jsonEncode(schema));
+        // auto increment only supports integer primary key
+        if (schema.autoIncrement && primaryField.type != DataType.integer) {
+          Logger.warn(
+            'Auto increment is disabled for table ${schema.name}, auto increment only supports integer primary key, auto increment is set to false',
+            label: 'DataStore.createTable',
+          );
+          schemaValid = schema.copyWith(autoIncrement: false);
+        }
 
-        // 6. create primary key index
+        // validate table structure
+        await _validateSchema(schemaValid);
+
+        // write schema file
+        await schemaFile.writeAsString(jsonEncode(schemaValid));
+
+        // create primary key index
         await _indexManager?.createPrimaryIndex(schema.name, schema.primaryKey);
 
-        // 7. create other indexes
+        // create other indexes
         for (var index in schema.indexes) {
           await _indexManager?.createIndex(schema.name, index);
         }
 
-        Logger.info('Table ${schema.name} created successfully');
+        // if auto increment, initialize id file
+        if (schemaValid.autoIncrement) {
+          final maxIdFile =
+              File(config.getAutoIncrementPath(schema.name, schema.isGlobal));
+          await maxIdFile.writeAsString('0');
+        }
+
+        Logger.info(
+          'Table ${schema.name} created successfully${schema.isGlobal ? ' (global)' : ' (base)'}',
+          label: 'DataStore.createTable',
+        );
+
+        // cache schema
+        _queryExecutor?.queryCacheManager.cacheSchema(schema.name, schemaValid);
+      } catch (e) {
+        // cleanup schema file if creation failed
+        if (await schemaFile.exists()) {
+          await schemaFile.delete();
+        }
+        Logger.error('Create table failed: $e', label: 'DataStore.createTable');
+        rethrow;
       } finally {
         await _concurrencyManager!.releaseWriteLock(schema.name);
       }
-
-      // 8. cache new created table structure
-      _queryExecutor?.queryCacheManager.cacheSchema(schema.name, schema);
     } catch (e) {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       rethrow;
@@ -626,18 +671,51 @@ class DataStoreImpl {
       final primaryKey = schema.primaryKey;
       var result = <String, dynamic>{};
 
-      // 1. handle auto increment primary key
+      // get primary key field
+      final primaryField =
+          schema.fields.firstWhere((f) => f.name == primaryKey);
+
+      // 1. handle primary key
       if (!data.containsKey(primaryKey) || data[primaryKey] == null) {
+        // auto increment only supports integer primary key
+        if (schema.autoIncrement && primaryField.type != DataType.integer) {
+          throw const BusinessError(
+            'Auto increment only supports integer primary key',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+
         if (schema.autoIncrement) {
           final nextId = await _getNextId(tableName);
           result[primaryKey] = nextId;
+        } else {
+          throw const BusinessError(
+            'Primary key value cannot be null',
+            type: BusinessErrorType.invalidData,
+          );
         }
       } else {
         final providedId = data[primaryKey];
+
+        // check primary key type
+        if (primaryField.type == DataType.text && providedId is! String) {
+          throw const BusinessError(
+            'Primary key must be text type',
+            type: BusinessErrorType.typeError,
+          );
+        } else if (primaryField.type == DataType.integer &&
+            providedId is! int) {
+          throw const BusinessError(
+            'Primary key must be integer type',
+            type: BusinessErrorType.typeError,
+          );
+        }
+
+        // only integer type primary key can auto increment
         if (providedId is int && schema.autoIncrement) {
           _updateMaxIdInMemory(tableName, providedId);
-          result[primaryKey] = providedId;
         }
+        result[primaryKey] = providedId;
       }
 
       // 2. fill default value and null value
@@ -648,46 +726,93 @@ class DataStoreImpl {
 
         if (!data.containsKey(field.name)) {
           if (field.defaultValue != null) {
-            result[field.name] = field.defaultValue;
+            final convertedDefault =
+                _convertValue(field.defaultValue, field.type);
+            if (convertedDefault == null) {
+              Logger.warn(
+                'Invalid default value for field ${field.name}',
+                label: 'DataStore._validateAndProcessData',
+              );
+              return null;
+            }
+            result[field.name] = convertedDefault;
           } else if (!field.nullable) {
-            result[field.name] = _getTypeDefaultValue(field.type);
+            Logger.warn(
+              'Field ${field.name} cannot be null and has no default value',
+              label: 'DataStore._validateAndProcessData',
+            );
+            return null;
           } else {
             result[field.name] = null;
           }
         } else {
-          result[field.name] = data[field.name];
-        }
+          final value = data[field.name];
 
-        final value = result[field.name];
+          // check non-null constraint
+          if (!field.nullable && value == null) {
+            Logger.warn(
+              'Field ${field.name} cannot be null',
+              label: 'DataStore._validateAndProcessData',
+            );
+            return null;
+          }
 
-        // check non-null constraint
-        if (!field.nullable && value == null) {
-          Logger.warn('Warning: field ${field.name} cannot be null');
-          return null;
-        }
-
-        // check data type
-        if (value != null && !_isValidDataType(value, field.type)) {
-          Logger.warn(
-              'Warning: value type of field ${field.name} is incorrect');
-          return null;
+          // if value is not null, try to convert type
+          if (value != null) {
+            if (_isValidDataType(value, field.type)) {
+              result[field.name] = value; // type match, use directly
+            } else {
+              try {
+                // try to convert type
+                final convertedValue = _convertValue(value, field.type);
+                if (convertedValue == null) {
+                  Logger.warn(
+                    'Failed to convert value for field ${field.name}: $value to ${field.type}',
+                    label: 'DataStore._validateAndProcessData',
+                  );
+                  return null;
+                }
+                result[field.name] = convertedValue;
+              } catch (e) {
+                Logger.warn(
+                  'Failed to convert value for field ${field.name}: $value to ${field.type}: $e',
+                  label: 'DataStore._validateAndProcessData',
+                );
+                return null;
+              }
+            }
+          } else {
+            result[field.name] = null;
+          }
         }
 
         // check max length
-        if (value != null && field.maxLength != null) {
-          if (value is String && value.length > field.maxLength!) {
+        if (result[field.name] != null && field.maxLength != null) {
+          if (result[field.name] is String &&
+              (result[field.name] as String).length > field.maxLength!) {
             Logger.warn('Warning: field ${field.name} exceeds max length');
-            result[field.name] = value.substring(0, field.maxLength!);
+            result[field.name] =
+                (result[field.name] as String).substring(0, field.maxLength!);
           }
         }
       }
 
-      return result;
+      return _prepareDataForStorage(result);
     } catch (e) {
       Logger.error('Data validation failed: $e',
           label: 'DataStore-_validateAndProcessData');
       return null;
     }
+  }
+
+  /// Convert data for storage
+  Map<String, dynamic> _prepareDataForStorage(Map<String, dynamic> data) {
+    return data.map((key, value) {
+      if (value is DateTime) {
+        return MapEntry(key, value.toIso8601String());
+      }
+      return MapEntry(key, value);
+    });
   }
 
   /// get type default value
@@ -710,30 +835,33 @@ class DataStoreImpl {
     }
   }
 
-  /// check data type is valid
+  /// Check if value matches data type
   bool _isValidDataType(dynamic value, DataType type) {
     if (value == null) return true;
     switch (type) {
       case DataType.integer:
-        return value is int || (value is String && int.tryParse(value) != null);
+        return value is int; // only allow int type
       case DataType.double:
         return value is double ||
-            value is int ||
-            (value is String && double.tryParse(value) != null);
+            value is int; // allow int to be converted to double
       case DataType.text:
-        return value is String;
+        return value is String; // only allow string type
       case DataType.blob:
-        return value is List<int>;
+        return value is Uint8List; // only allow binary data
       case DataType.boolean:
-        return value is bool ||
-            (value is String &&
-                (value.toLowerCase() == 'true' ||
-                    value.toLowerCase() == 'false'));
+        return value is bool; // only allow boolean type
       case DataType.datetime:
-        return value is DateTime ||
-            (value is String && DateTime.tryParse(value) != null);
+        if (value is String) {
+          try {
+            DateTime.parse(value);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }
+        return false; // DateTime对象不是有效的存储格式
       case DataType.array:
-        return value is List;
+        return value is List; // only allow list type
     }
   }
 
@@ -887,42 +1015,71 @@ class DataStoreImpl {
     return [];
   }
 
-  /// validate table structure
-  bool _validateSchema(TableSchema schema) {
+  /// Validate schema
+  Future<bool> _validateSchema(TableSchema schema) async {
     try {
-      // Check required fields
-      if (schema.name.isEmpty) return false;
-      if (schema.fields.isEmpty) return false;
+      // get primary key field
+      final primaryField = schema.fields.firstWhere(
+        (f) => f.name == schema.primaryKey,
+        orElse: () => throw const BusinessError(
+          'Primary key field not found in fields',
+          type: BusinessErrorType.schemaError,
+        ),
+      );
 
-      // Check primary key
-      if (!schema.fields.any((f) => f.name == schema.primaryKey)) {
-        return false;
+      // validate auto increment setting
+      if (schema.autoIncrement && primaryField.type != DataType.integer) {
+        throw const BusinessError(
+          'Auto increment only supports integer primary key',
+          type: BusinessErrorType.schemaError,
+        );
       }
 
-      // Check field names
-      final fieldNames = <String>{};
-      for (var field in schema.fields) {
-        if (field.name.isEmpty) return false;
-        if (!fieldNames.add(field.name)) return false;
+      // validate primary key cannot be null
+      if (primaryField.nullable) {
+        throw const BusinessError(
+          'Primary key field cannot be nullable',
+          type: BusinessErrorType.schemaError,
+        );
       }
-      // Check index names
-      final indexNames = <String>{};
+
+      // validate field name uniqueness
+      final fieldNames = schema.fields.map((f) => f.name).toList();
+      if (fieldNames.toSet().length != fieldNames.length) {
+        throw const BusinessError(
+          'Duplicate field names found',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+
+      // validate index fields exist
       for (var index in schema.indexes) {
-        if (index.indexName != null && index.indexName!.isNotEmpty) {
-          if (!indexNames.add(index.indexName!)) {
-            return false;
+        for (var field in index.fields) {
+          if (!schema.fields.any((f) => f.name == field)) {
+            throw BusinessError(
+              'Index field $field not found in table fields',
+              type: BusinessErrorType.schemaError,
+            );
           }
         }
-        // Check index fields exist
-        for (var field in index.fields) {
-          if (!fieldNames.contains(field)) return false;
+      }
+
+      // validate field name format
+      final fieldNameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
+      for (var field in schema.fields) {
+        if (!fieldNameRegex.hasMatch(field.name)) {
+          throw BusinessError(
+            'Invalid field name: ${field.name}',
+            type: BusinessErrorType.schemaError,
+          );
         }
-        if (index.fields.isEmpty) return false;
       }
 
       return true;
     } catch (e) {
-      return false;
+      Logger.error('Schema validation failed: $e',
+          label: 'DataStore._validateSchema');
+      rethrow;
     }
   }
 
@@ -1089,28 +1246,74 @@ class DataStoreImpl {
     String tableName,
   ) async {
     try {
-      final result = Map<String, dynamic>.from(data);
+      var result = <String, dynamic>{};
+      final primaryKey = schema.primaryKey;
 
-      // remove primary key field (if exists)
-      result.remove(schema.primaryKey);
+      // Process each field
+      for (var field in schema.fields) {
+        // Skip primary key
+        if (field.name == primaryKey) {
+          continue;
+        }
 
-      // check data type
-      for (var entry in result.entries) {
-        final field = schema.fields.firstWhere(
-          (col) => col.name == entry.key,
-          orElse: () => throw StateError('Unknown field ${entry.key}'),
-        );
+        // Skip if field not in update data
+        if (!data.containsKey(field.name)) {
+          continue;
+        }
 
-        if (entry.value != null && !_isValidDataType(entry.value, field.type)) {
-          Logger.warn('Warning: value type of field ${entry.key} is incorrect');
+        final value = data[field.name];
+
+        // Check non-null constraint
+        if (!field.nullable && value == null) {
+          Logger.warn(
+            'Field ${field.name} cannot be null',
+            label: 'DataStore._validateAndProcessUpdateData',
+          );
           return null;
+        }
+
+        // If value is not null, validate and convert type
+        if (value != null) {
+          if (_isValidDataType(value, field.type)) {
+            result[field.name] = value;
+          } else {
+            try {
+              final convertedValue = _convertValue(value, field.type);
+              if (convertedValue == null) {
+                Logger.warn(
+                  'Failed to convert value for field ${field.name}: $value to ${field.type}',
+                  label: 'DataStore._validateAndProcessUpdateData',
+                );
+                return null;
+              }
+              result[field.name] = convertedValue;
+            } catch (e) {
+              Logger.warn(
+                'Failed to convert value for field ${field.name}: $value to ${field.type}: $e',
+                label: 'DataStore._validateAndProcessUpdateData',
+              );
+              return null;
+            }
+          }
+        } else {
+          result[field.name] = null;
+        }
+
+        // Check max length constraint
+        if (result[field.name] != null && field.maxLength != null) {
+          if (result[field.name] is String &&
+              (result[field.name] as String).length > field.maxLength!) {
+            Logger.warn('Warning: field ${field.name} exceeds max length');
+            result[field.name] =
+                (result[field.name] as String).substring(0, field.maxLength!);
+          }
         }
       }
 
-      return result;
+      return _prepareDataForStorage(result);
     } catch (e) {
       Logger.error('Update data validation failed: $e',
-          label: 'DataStore-_validateAndProcessUpdateData');
+          label: 'DataStore._validateAndProcessUpdateData');
       return null;
     }
   }
@@ -1366,53 +1569,89 @@ class DataStoreImpl {
     }
   }
 
-  /// get table schema
+  /// Get table schema
   Future<TableSchema> getTableSchema(String tableName) async {
-    // 1. get from cache first
-    final cachedSchema = _queryExecutor?.queryCacheManager.getSchema(tableName);
-    if (cachedSchema != null) {
-      return cachedSchema;
-    }
-
-    // 2. load from file
-    // try to get schema file from global space first, if not exist, then get from base space
-    var schemaPath = config.getSchemaPath(tableName, true);
-    var schemaFile = File(schemaPath);
-    if (!await schemaFile.exists()) {
-      schemaPath = config.getSchemaPath(tableName, false);
-      schemaFile = File(schemaPath);
-      if (!await schemaFile.exists()) {
-        Logger.error(
-          'Table schema not found: $tableName',
-          label: "DataStoreImpl.getTableSchema",
-        );
-      }
-    }
-
     try {
-      final schemaJson = await schemaFile.readAsString();
-      final json = jsonDecode(schemaJson) as Map<String, dynamic>;
-      // if name is not in json, add schemaPath
-      if (!json.containsKey('name')) {
-        json['_schemaPath'] = schemaPath;
+      // 1. Try to get from cache first
+      final cachedSchema =
+          _queryExecutor?.queryCacheManager.getSchema(tableName);
+      if (cachedSchema != null) {
+        return cachedSchema;
       }
-      final schema = TableSchema.fromJson(json);
+
+      // 2. Load schema from file
+      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
+      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
+
+      TableSchema? schema;
+      bool isGlobal = false;
+
+      if (await globalSchemaFile.exists()) {
+        final schemaJson = await globalSchemaFile.readAsString();
+        final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
+        // if name is not in json, add schemaPath
+        if (!schemaMap.containsKey('name')) {
+          schemaMap['_schemaPath'] = config.getSchemaPath(tableName, true);
+        }
+        schema = TableSchema.fromJson(schemaMap);
+        isGlobal = true;
+      } else if (await baseSchemaFile.exists()) {
+        final schemaJson = await baseSchemaFile.readAsString();
+        final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
+        // if name is not in json, add schemaPath
+        if (!schemaMap.containsKey('name')) {
+          schemaMap['_schemaPath'] = config.getSchemaPath(tableName, false);
+        }
+        schema = TableSchema.fromJson(schemaMap);
+      }
 
       // Validate schema name matches table name
-      if (schema.name != tableName) {
+      if (schema?.name != tableName) {
         Logger.error(
-          'Schema name (${schema.name}) does not match table name ($tableName)',
+          'Schema name (${schema?.name}) does not match table name ($tableName)',
           label: "DataStoreImpl.getTableSchema",
         );
       }
 
-      // Cache and return
-      _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
-      return schema;
+      if (schema != null) {
+        // 3. Check and adjust auto increment setting for text primary key
+        final primaryField =
+            schema.fields.firstWhere((f) => f.name == schema?.primaryKey);
+        if (schema.autoIncrement && primaryField.type != DataType.integer) {
+          Logger.warn(
+            'Auto increment was disabled for table ${schema.name}, auto increment only supports integer primary key, auto increment is set to false',
+            label: 'DataStore.getTableSchema',
+          );
+
+          // Create adjusted schema
+          final adjustedSchema = schema.copyWith(autoIncrement: false);
+
+          // Update schema file
+          final schemaFile = isGlobal ? globalSchemaFile : baseSchemaFile;
+          await schemaFile.writeAsString(jsonEncode(adjustedSchema));
+
+          // Update cache
+          _queryExecutor?.queryCacheManager
+              .cacheSchema(tableName, adjustedSchema);
+
+          return adjustedSchema;
+        }
+
+        // Cache and return original schema
+        _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
+        return schema;
+      }
+
+      // Return empty schema if not found
+      return TableSchema(
+        name: tableName,
+        primaryKey: '',
+        fields: const [],
+      );
     } catch (e) {
       Logger.error(
         'Failed to get table schema: $e',
-        label: 'DataStoreImpl.getTableSchema',
+        label: 'DataStore.getTableSchema',
       );
       return TableSchema(
         name: tableName,
@@ -2704,14 +2943,24 @@ class DataStoreImpl {
         await backup();
       }
 
-      // Validate schemas
+      // Validate schemas and adjust auto increment for text primary keys
+      var adjustedSchemas = <TableSchema>[];
       for (var schema in schemas) {
-        if (!_validateSchema(schema)) {
-          throw BusinessError(
-            'Invalid schema for table ${schema.name}',
-            type: BusinessErrorType.schemaError,
+        var schemaValid = schema;
+        final primaryField =
+            schema.fields.firstWhere((f) => f.name == schema.primaryKey);
+
+        // auto increment only supports integer primary key
+        if (schema.autoIncrement && primaryField.type != DataType.integer) {
+          Logger.warn(
+            'Auto increment is disabled for table ${schema.name}, auto increment only supports integer primary key,auto increment is set to false',
+            label: 'DataStore.autoMigrate',
           );
+          schemaValid = schema.copyWith(autoIncrement: false);
         }
+
+        await _validateSchema(schemaValid);
+        adjustedSchemas.add(schemaValid);
       }
 
       // Execute migration in transaction
@@ -2719,7 +2968,7 @@ class DataStoreImpl {
         await _migrationManager?.migrate(
           oldVersion,
           newVersion,
-          schemas,
+          adjustedSchemas,
           batchSize: migrationConfig.batchSize,
         );
         await setVersion(newVersion);
@@ -2727,7 +2976,8 @@ class DataStoreImpl {
 
       // Validate after migration if configured
       if (migrationConfig.validateAfterMigrate) {
-        final isValid = await _validateMigration(schemas);
+        final isValid =
+            await _validateMigration(adjustedSchemas); // use adjusted schemas
         if (!isValid && migrationConfig.strictMode) {
           throw const BusinessError(
             'Migration validation failed',
@@ -2996,10 +3246,10 @@ class DataStoreImpl {
   }
 
   /// Convert value between data types
-  dynamic _convertValue(dynamic value, DataType from, DataType to) {
+  dynamic _convertValue(dynamic value, DataType type) {
     if (value == null) return null;
 
-    switch (to) {
+    switch (type) {
       case DataType.integer:
         return _toInteger(value);
       case DataType.double:
@@ -3011,7 +3261,7 @@ class DataStoreImpl {
       case DataType.boolean:
         return _toBoolean(value);
       case DataType.datetime:
-        return _toDateTime(value);
+        return _toDateTimeString(value);
       case DataType.array:
         return _toArray(value);
     }
@@ -3037,7 +3287,17 @@ class DataStoreImpl {
 
   String? _toString(dynamic value) {
     if (value is String) return value;
-    if (value is DateTime) return value.toIso8601String();
+    if (value is DateTime) {
+      try {
+        return value.toIso8601String();
+      } catch (e) {
+        Logger.warn(
+          'Failed to convert DateTime to string: $value',
+          label: 'DataStore._toString',
+        );
+        return null;
+      }
+    }
     return value?.toString();
   }
 
@@ -3059,13 +3319,36 @@ class DataStoreImpl {
     return null;
   }
 
-  DateTime? _toDateTime(dynamic value) {
-    if (value is DateTime) return value;
-    if (value is int) return DateTime.fromMillisecondsSinceEpoch(value);
-    if (value is String) return DateTime.tryParse(value);
+  /// DateTime convert to ISO8601 string
+  String? _toDateTimeString(dynamic value) {
+    if (value == null) return null;
+    if (value is DateTime) return value.toIso8601String();
+    if (value is String) {
+      try {
+        return DateTime.parse(value).toIso8601String();
+      } catch (e) {
+        Logger.warn(
+          'Failed to parse DateTime from string: $value',
+          label: 'DataStore._toDateTimeString',
+        );
+        return null;
+      }
+    }
+    if (value is int) {
+      try {
+        return DateTime.fromMillisecondsSinceEpoch(value).toIso8601String();
+      } catch (e) {
+        Logger.warn(
+          'Failed to convert timestamp to DateTime: $value',
+          label: 'DataStore._toDateTimeString',
+        );
+        return null;
+      }
+    }
     return null;
   }
 
+  /// Array convert to List
   List? _toArray(dynamic value) {
     if (value is List) return value;
     if (value is String) {
@@ -3116,7 +3399,6 @@ class DataStoreImpl {
               // Convert and store in new field
               record[newField.name] = _convertValue(
                 record[oldField.name],
-                oldField.type,
                 newField.type,
               );
               // Remove old field if names are different
@@ -3316,15 +3598,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Convert field value between data types
-  Future<dynamic> convertFieldValue(
-    dynamic value,
-    DataType fromType,
-    DataType toType,
-  ) async {
-    return _convertValue(value, fromType, toType);
-  }
-
   /// Modify index
   Future<void> modifyIndex(
     String tableName,
@@ -3342,6 +3615,82 @@ class DataStoreImpl {
       Logger.error(
         'Failed to modify index: $e',
         label: 'DataStoreImpl.modifyIndex',
+      );
+      rethrow;
+    }
+  }
+
+  /// Set auto increment setting for a table
+  Future<void> setAutoIncrement(String tableName, bool enabled) async {
+    if (!_baseInitialized) {
+      await _ensureInitialized();
+    }
+
+    try {
+      // 1. get table schema
+      final schema = await getTableSchema(tableName);
+      if (schema.fields.isEmpty) {
+        throw BusinessError(
+          'Table $tableName not found',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+
+      // 2. validate primary key type
+      final primaryField =
+          schema.fields.firstWhere((f) => f.name == schema.primaryKey);
+      if (enabled && primaryField.type != DataType.integer) {
+        throw const BusinessError(
+          'Auto increment only supports integer primary key',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+
+      // 3. if setting is unchanged, return
+      if (schema.autoIncrement == enabled) {
+        return;
+      }
+
+      // 4. create new schema
+      final newSchema = schema.copyWith(autoIncrement: enabled);
+
+      // 5. get schema file
+      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
+
+      await _concurrencyManager!.acquireWriteLock(tableName);
+      try {
+        // 6. update schema file
+        await schemaFile.writeAsString(jsonEncode(newSchema));
+
+        // 7. if auto increment is enabled, create auto increment id file
+        if (enabled) {
+          final maxIdFile =
+              File(config.getAutoIncrementPath(tableName, schema.isGlobal));
+          if (!await maxIdFile.exists()) {
+            await maxIdFile.writeAsString('0');
+          }
+        }
+
+        // 8. update cache
+        _queryExecutor?.queryCacheManager.cacheSchema(tableName, newSchema);
+
+        Logger.info(
+          'Auto increment ${enabled ? 'enabled' : 'disabled'} for table $tableName',
+          label: 'DataStore.setAutoIncrement',
+        );
+      } catch (e) {
+        Logger.error(
+          'Failed to update auto increment setting: $e',
+          label: 'DataStore.setAutoIncrement',
+        );
+        rethrow;
+      } finally {
+        await _concurrencyManager!.releaseWriteLock(tableName);
+      }
+    } catch (e) {
+      Logger.error(
+        'Set auto increment failed: $e',
+        label: 'DataStore.setAutoIncrement',
       );
       rethrow;
     }

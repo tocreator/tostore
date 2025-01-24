@@ -91,6 +91,7 @@ class TostoreExample {
               .removeIndex("follow") // remove index
               .removeField("last_login") // remove field
               .renameField("last_login", "last_login_time") // rename field
+              .setAutoIncrement(true) // set auto increment
               .modifyField("age",
                   type: DataType.integer,
                   nullable: true,
