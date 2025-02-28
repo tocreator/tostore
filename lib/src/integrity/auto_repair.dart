@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
+
 import '../handler/logger.dart';
 import '../backup/backup_manager.dart';
 import '../core/data_store_impl.dart';
@@ -52,21 +54,20 @@ class AutoRepair {
     );
 
     // read all data and rebuild index
-    final dataFile =
-        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-    final lines = await dataFile.readAsLines();
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+    final lines = await _dataStore.storage.readLines(dataPath);
 
-    var startOffset = await dataFile.length();
+    var startOffset = 0;
 
     for (var line in lines) {
       final data = jsonDecode(line) as Map<String, dynamic>;
       final encoded = jsonEncode(line);
-      startOffset += encoded.length + 1;
       final pointer = await RowPointer.create(
         encoded,
         startOffset,
       );
       await _indexManager.updateIndexes(tableName, data, pointer);
+      startOffset += encoded.length + 1;
     }
   }
 
@@ -95,13 +96,12 @@ class AutoRepair {
   /// get available backups
   Future<List<String>> _getBackups(String tableName) async {
     final backupPath = _dataStore.config.getBackupPath();
-    final backupDir = Directory(backupPath);
-    if (!await backupDir.exists()) return [];
+    if (!await _dataStore.storage.exists(backupPath)) return [];
 
     final backups = <String>[];
-    await for (var entity in backupDir.list()) {
-      if (entity is File && entity.path.contains(tableName)) {
-        backups.add(entity.path);
+    for (var path in await _dataStore.storage.listDirectory(backupPath)) {
+      if (path.contains(tableName)) {
+        backups.add(path);
       }
     }
 
@@ -152,30 +152,39 @@ class AutoRepair {
       }
 
       // restore record
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-      final sink = dataFile.openWrite(mode: FileMode.append);
-      try {
-        sink.writeln(jsonEncode(targetRecord));
-        await sink.flush();
-      } finally {
-        await sink.close();
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+
+      if (kIsWeb) {
+        final content = await _dataStore.storage.readAsString(dataPath) ?? '';
+        final contentWithNewRecord = '$content\n${jsonEncode(targetRecord)}';
+        await _dataStore.storage.writeAsString(dataPath, contentWithNewRecord);
+      } else {
+        final dataFile = File(dataPath);
+        final sink = dataFile.openWrite(mode: FileMode.append);
+        try {
+          sink.writeln(jsonEncode(targetRecord));
+          await sink.flush();
+        } finally {
+          await sink.close();
+        }
       }
     } catch (e) {
       Logger.error('restore record from backup failed: $e');
-      rethrow;
     }
   }
 
   /// create new table
   Future<void> _createNewTable(String tableName, TableSchema schema) async {
-    final dataFile =
-        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-    final schemaFile =
-        File(_dataStore.config.getSchemaPath(tableName, schema.isGlobal));
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+    final schemaPath =
+        _dataStore.config.getSchemaPath(tableName, schema.isGlobal);
 
-    await dataFile.create(recursive: true);
-    await schemaFile.writeAsString(jsonEncode(schema.toJson()));
+    // Create empty data file
+    await _dataStore.storage.writeAsString(dataPath, '');
+    // Write schema file
+    await _dataStore.storage
+        .writeAsString(schemaPath, jsonEncode(schema.toJson()));
 
     // create index
     await _indexManager.createPrimaryIndex(tableName, schema.primaryKey);
@@ -190,100 +199,160 @@ class AutoRepair {
     String targetName,
     TableSchema schema,
   ) async {
-    final sourceFile =
-        File(_dataStore.config.getDataPath(sourceName, schema.isGlobal));
-    final targetFile =
-        File(_dataStore.config.getDataPath(targetName, schema.isGlobal));
+    final sourceDataPath =
+        _dataStore.config.getDataPath(sourceName, schema.isGlobal);
+    final targetDataPath =
+        _dataStore.config.getDataPath(targetName, schema.isGlobal);
 
-    final lines = await sourceFile.readAsLines();
-    final sink = targetFile.openWrite();
+    final lines = await _dataStore.storage.readLines(sourceDataPath);
 
-    var startOffset = await sourceFile.length();
+    if (kIsWeb) {
+      final validLines = <String>[];
+      var startOffset = 0;
 
-    try {
       for (var line in lines) {
         try {
+          if (line.trim().isEmpty) continue;
+
           final data = jsonDecode(line) as Map<String, dynamic>;
           if (_isValidRecord(data, schema)) {
-            sink.writeln(line);
+            validLines.add(line);
             // update index
             final encoded = jsonEncode(data);
-            startOffset += encoded.length + 1;
-            final pointer = await RowPointer.create(
-              encoded,
-              startOffset,
-            );
+            final pointer = await RowPointer.create(encoded, startOffset);
             await _indexManager.updateIndexes(targetName, data, pointer);
+            startOffset += encoded.length + 1; // +1 for newline
           }
         } catch (e) {
           // skip damaged record
+          Logger.warn('Skipping damaged record: $e');
           continue;
         }
       }
-    } finally {
-      await sink.close();
+
+      // write all valid lines at once
+      if (validLines.isNotEmpty) {
+        await _dataStore.storage.writeLines(targetDataPath, validLines);
+      }
+    } else {
+      // native platform implementation: use streaming write
+      final file = File(targetDataPath);
+      final sink = file.openWrite(mode: FileMode.write);
+
+      var startOffset = 0;
+
+      try {
+        for (var line in lines) {
+          try {
+            if (line.trim().isEmpty) continue;
+
+            final data = jsonDecode(line) as Map<String, dynamic>;
+            if (_isValidRecord(data, schema)) {
+              // stream write each line
+              sink.writeln(line);
+
+              // update index
+              final encoded = jsonEncode(data);
+              final pointer = await RowPointer.create(encoded, startOffset);
+              await _indexManager.updateIndexes(targetName, data, pointer);
+              startOffset += encoded.length + 1; // +1 for newline
+            }
+          } catch (e) {
+            // skip damaged record
+            Logger.warn('Skipping damaged record: $e');
+            continue;
+          }
+        }
+
+        // ensure all data is written
+        await sink.flush();
+      } finally {
+        // close file stream
+        await sink.close();
+      }
     }
   }
 
   /// replace table
   Future<void> _replaceTable(String oldName, String newName) async {
     final schema = await _dataStore.getTableSchema(oldName);
-    final oldDataFile =
-        File(_dataStore.config.getDataPath(oldName, schema.isGlobal));
-    final oldSchemaFile =
-        File(_dataStore.config.getSchemaPath(oldName, schema.isGlobal));
-    final newDataFile =
-        File(_dataStore.config.getDataPath(newName, schema.isGlobal));
-    final newSchemaFile =
-        File(_dataStore.config.getSchemaPath(newName, schema.isGlobal));
-    final oldIndexFiles = await _getIndexFiles(oldName);
+    final oldDataPath = _dataStore.config.getDataPath(oldName, schema.isGlobal);
+    final oldSchemaPath =
+        _dataStore.config.getSchemaPath(oldName, schema.isGlobal);
+    final newDataPath = _dataStore.config.getDataPath(newName, schema.isGlobal);
+    final newSchemaPath =
+        _dataStore.config.getSchemaPath(newName, schema.isGlobal);
 
-    // backup original table
+    // Get all index files for old table
+    final oldIndexPaths = await _getIndexPaths(oldName, schema);
+
+    // Backup original files
     final backupSuffix = DateTime.now().millisecondsSinceEpoch.toString();
 
-    final oldDataBackupPath = '${oldDataFile.path}.$backupSuffix';
-    final oldSchemaBackupPath = '${oldSchemaFile.path}.$backupSuffix';
-
-    await oldDataFile.rename(oldDataBackupPath);
-    await oldSchemaFile.rename(oldSchemaBackupPath);
-
-    for (var indexFile in oldIndexFiles) {
-      final indexBackupPath = '${indexFile.path}.$backupSuffix';
-      await indexFile.rename(indexBackupPath);
+    // Backup data and schema files
+    if (await _dataStore.storage.exists(oldDataPath)) {
+      final oldDataContent = await _dataStore.storage.readAsString(oldDataPath);
+      await _dataStore.storage
+          .writeAsString('$oldDataPath.$backupSuffix', oldDataContent ?? '');
     }
 
-    // replace with new table
-    await newDataFile.rename(oldDataFile.path);
-    await newSchemaFile.rename(oldSchemaFile.path);
-  }
+    if (await _dataStore.storage.exists(oldSchemaPath)) {
+      final oldSchemaContent =
+          await _dataStore.storage.readAsString(oldSchemaPath);
+      await _dataStore.storage.writeAsString(
+          '$oldSchemaPath.$backupSuffix', oldSchemaContent ?? '');
+    }
 
-  /// get index files
-  Future<List<File>> _getIndexFiles(String tableName) async {
-    final schema = await _dataStore.getTableSchema(tableName);
-    final files = <File>[];
-
-    for (var index in schema.indexes) {
-      final indexFile = File(_dataStore.config.getIndexPath(
-        tableName,
-        index.actualIndexName,
-        schema.isGlobal,
-      ));
-      if (await indexFile.exists()) {
-        files.add(indexFile);
+    // Backup index files
+    for (var indexPath in oldIndexPaths) {
+      if (await _dataStore.storage.exists(indexPath)) {
+        final content = await _dataStore.storage.readAsString(indexPath);
+        await _dataStore.storage
+            .writeAsString('$indexPath.$backupSuffix', content ?? '');
       }
     }
 
-    // Add primary index file
-    final pkIndexFile = File(_dataStore.config.getIndexPath(
+    // Replace files
+    if (await _dataStore.storage.exists(newDataPath)) {
+      final content = await _dataStore.storage.readAsString(newDataPath);
+      await _dataStore.storage.writeAsString(oldDataPath, content ?? '');
+      await _dataStore.storage.deleteFile(newDataPath);
+    }
+
+    if (await _dataStore.storage.exists(newSchemaPath)) {
+      final content = await _dataStore.storage.readAsString(newSchemaPath);
+      await _dataStore.storage.writeAsString(oldSchemaPath, content ?? '');
+      await _dataStore.storage.deleteFile(newSchemaPath);
+    }
+  }
+
+  /// get index paths
+  Future<List<String>> _getIndexPaths(
+      String tableName, TableSchema schema) async {
+    final paths = <String>[];
+
+    for (var index in schema.indexes) {
+      final indexPath = _dataStore.config.getIndexPath(
+        tableName,
+        index.actualIndexName,
+        schema.isGlobal,
+      );
+      if (await _dataStore.storage.exists(indexPath)) {
+        paths.add(indexPath);
+      }
+    }
+
+    // Add primary index path
+    final pkIndexPath = _dataStore.config.getIndexPath(
       tableName,
       'pk_$tableName',
       schema.isGlobal,
-    ));
-    if (await pkIndexFile.exists()) {
-      files.add(pkIndexFile);
+    );
+    if (await _dataStore.storage.exists(pkIndexPath)) {
+      paths.add(pkIndexPath);
     }
 
-    return files;
+    return paths;
   }
 
   /// check record is valid

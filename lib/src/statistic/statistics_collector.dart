@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
@@ -31,12 +30,12 @@ class StatisticsCollector {
       final schema = await _dataStore.getTableSchema(tableName);
       final dataPath =
           _dataStore.config.getDataPath(tableName, schema.isGlobal);
-      final dataFile = File(dataPath);
-      if (!await dataFile.exists()) {
+
+      if (!await _dataStore.storage.exists(dataPath)) {
         throw StateError('Table $tableName does not exist');
       }
 
-      final lines = await dataFile.readAsLines();
+      final lines = await _dataStore.storage.readLines(dataPath);
       final fieldStats = <String, FieldStatistics>{};
       var totalRows = 0;
 
@@ -92,8 +91,9 @@ class StatisticsCollector {
       final schema = await _dataStore.getTableSchema(tableName);
       final statsPath =
           _dataStore.config.getStatsPath(tableName, schema.isGlobal);
-      final statsFile = File(statsPath);
-      await statsFile.writeAsString(jsonEncode(stats.toJson()));
+
+      await _dataStore.storage
+          .writeAsString(statsPath, jsonEncode(stats.toJson()));
     } catch (e) {
       Logger.error('save statistics failed: $e', label: 'StatisticsCollector');
     }

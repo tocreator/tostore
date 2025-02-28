@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import '../handler/logger.dart';
 
 import '../model/business_error.dart';
@@ -15,7 +17,7 @@ class IndexManager {
   final DataStoreImpl _dataStore;
   final Map<String, BPlusTree> _indexes = {};
   final Map<String, List<Map<String, dynamic>>> _indexBatchQueue = {};
-  final Map<String, File> _indexFiles = {};
+  final Map<String, String> _indexPaths = {};
 
   // add last update time record
   DateTime? _lastUpdateTime;
@@ -116,10 +118,22 @@ class IndexManager {
 
       // create index file
       final schema = await _dataStore.getTableSchema(tableName);
-      final indexFile =
-          File(_getIndexPath(tableName, indexName, schema.isGlobal));
-      await indexFile.create(recursive: true);
-      _indexFiles[indexName] = indexFile;
+      final indexPath = _getIndexPath(tableName, indexName, schema.isGlobal);
+
+      // ensure directory exists
+      if (!kIsWeb) {
+        final dir = File(indexPath).parent;
+        if (!await dir.exists()) {
+          await dir.create(recursive: true);
+        }
+      }
+
+      // create file (if not exists)
+      if (!await _dataStore.storage.exists(indexPath)) {
+        await _dataStore.storage.writeAsString(indexPath, '');
+      }
+
+      _indexPaths[indexName] = indexPath;
     } catch (e) {
       Logger.error('create primary index failed: $e',
           label: 'IndexManager.createPrimaryIndex');
@@ -131,9 +145,12 @@ class IndexManager {
   Future<void> createIndex(String tableName, IndexSchema schema) async {
     try {
       final tableSchema = await _dataStore.getTableSchema(tableName);
-      final indexFile = File(_getIndexPath(
-          tableName, schema.actualIndexName, tableSchema.isGlobal));
-      await indexFile.create(recursive: true);
+      final indexPath = _getIndexPath(
+          tableName, schema.actualIndexName, tableSchema.isGlobal);
+
+      if (!await _dataStore.storage.exists(indexPath)) {
+        await _dataStore.storage.writeAsString(indexPath, '');
+      }
 
       // create B+ tree
       final tree = BPlusTree(
@@ -144,8 +161,7 @@ class IndexManager {
       // register index
       _indexes[schema.actualIndexName] = tree;
 
-      // create index file
-      _indexFiles[schema.actualIndexName] = indexFile;
+      _indexPaths[schema.actualIndexName] = indexPath;
     } catch (e) {
       Logger.error('Create index failed: $e',
           label: 'IndexManager.createIndex');
@@ -413,7 +429,7 @@ class IndexManager {
   void onBasePathChanged() {
     // clear index cache
     _indexes.clear();
-    _indexFiles.clear();
+    _indexPaths.clear();
     _indexBatchQueue.clear();
   }
 
@@ -433,10 +449,10 @@ class IndexManager {
   Future<int> getTotalIndexSize() async {
     int totalSize = 0;
     try {
-      for (var entry in _indexFiles.entries) {
-        final file = entry.value;
-        if (await file.exists()) {
-          totalSize += await file.length();
+      for (var indexPath in _indexPaths.values) {
+        if (await _dataStore.storage.exists(indexPath)) {
+          final content = await _dataStore.storage.readAsString(indexPath);
+          totalSize += content?.length ?? 0;
         }
       }
     } catch (e) {
@@ -484,15 +500,14 @@ class IndexManager {
       final key = '${tableName}_$indexName';
       _indexes.remove(key);
       _indexBatchQueue.remove(key);
-      _indexFiles.remove(key);
+      _indexPaths.remove(key);
 
       // Remove index file
       final schema = await _dataStore.getTableSchema(tableName);
-      final indexFile =
-          File(_getIndexPath(tableName, indexName, schema.isGlobal));
+      final indexPath = _getIndexPath(tableName, indexName, schema.isGlobal);
 
-      if (await indexFile.exists()) {
-        await indexFile.delete();
+      if (await _dataStore.storage.exists(indexPath)) {
+        await _dataStore.storage.deleteFile(indexPath);
       }
     } catch (e) {
       Logger.error(

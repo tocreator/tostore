@@ -1,6 +1,6 @@
 name: tostore
-description: A high-performance relational database for Dart with multi-space architecture. data smart cache, file/local storage, SQL & key-value persistent store.
-version: 1.8.8
+description: A advanced storage engine that supports relational and NoSQL database,data smart cache, multi-space architecture,file/local storage, SQL & key-value persistent store.
+version: 1.9.0
 homepage: https://github.com/tocreator/tostore
 repository: https://github.com/tocreator/tostore
 issue_tracker: https://github.com/tocreator/tostore/issues
@@ -22,6 +22,7 @@ dependencies:
     sdk: flutter
   path_provider: ^2.1.5
   path: ^1.9.0
+  web: ^1.1.0
 
 dev_dependencies:
   flutter_test:

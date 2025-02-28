@@ -1,12 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../core/data_compressor.dart';
 import '../core/data_store_impl.dart';
 
+import '../model/row_pointer.dart';
 import '../model/table_schema.dart';
 import 'backup_info.dart';
 
@@ -21,19 +23,25 @@ class BackupManager {
 
   /// extract file name from path
   String _getFileName(String path) {
-    final parts = path.split(Platform.pathSeparator);
-    final fileName = parts.last;
-    return fileName.split('.').first;
+    final normalizedPath = path.replaceAll('\\', '/');
+    final parts = normalizedPath.split('/');
+    final fileName = parts.isEmpty ? path : parts.last;
+
+    if (fileName.contains('.')) {
+      return fileName.substring(0, fileName.lastIndexOf('.'));
+    }
+
+    return fileName;
   }
 
   /// create backup file
   Future<String> createBackup() async {
     final timestamp = DateTime.now().toIso8601String();
     final backupPath = _dataStore.config.getBackupPath();
-    final backupFile = File(pathJoin(backupPath, 'backup_$timestamp.bak'));
+    final backupFilePath = pathJoin(backupPath, 'backup_$timestamp.bak');
 
     // create backup directory
-    await Directory(backupPath).create(recursive: true);
+    await _dataStore.storage.writeAsString(backupFilePath, '');
 
     // collect data of base space and public path
     final allData = <String, Map<String, dynamic>>{};
@@ -64,28 +72,25 @@ class BackupManager {
     backupData['checksum'] = checksum.toString();
 
     final finalSerialized = jsonEncode(backupData);
-    final finalCompressed = _compressor.compress(
-      Uint8List.fromList(utf8.encode(finalSerialized)),
-    );
 
     // write to backup file
-    await backupFile.writeAsBytes(finalCompressed);
+    await _dataStore.storage.writeAsString(backupFilePath, finalSerialized);
 
-    return backupFile.path;
+    return backupFilePath;
   }
 
   /// collect data of specified path
   Future<void> _collectPathData(
       String path, Map<String, Map<String, dynamic>> allData) async {
-    final dir = Directory(path);
-    if (!await dir.exists()) return;
+    if (!await _dataStore.storage.exists(path)) return;
 
-    await for (var entity in dir.list()) {
-      if (entity is File && entity.path.endsWith('.dat')) {
-        final tableName = _getFileName(entity.path);
+    final files = await _dataStore.storage.listDirectory(path);
+    for (var file in files) {
+      if (file.endsWith('.dat')) {
+        final tableName = _getFileName(file);
 
         // read data file
-        final lines = await entity.readAsLines();
+        final lines = await _dataStore.storage.readLines(file);
         final tableData = <String, dynamic>{};
 
         // read table schema
@@ -107,13 +112,12 @@ class BackupManager {
 
   /// load backup
   Future<Map<String, dynamic>> loadBackup(String backupPath) async {
-    final backupFile = File(backupPath);
-    if (!await backupFile.exists()) {
-      throw FileSystemException('备份文件不存在', backupPath);
+    if (!await _dataStore.storage.exists(backupPath)) {
+      throw FileSystemException('backup file not found', backupPath);
     }
 
     // read and decompress data
-    final compressed = await backupFile.readAsBytes();
+    final compressed = await _dataStore.storage.readAsBytes(backupPath);
     final decompressed = _compressor.decompress(compressed);
 
     // parse data
@@ -136,25 +140,33 @@ class BackupManager {
   Future<List<BackupInfo>> listBackups() async {
     final backups = <BackupInfo>[];
     final backupPath = _dataStore.config.getBackupPath();
-    final dir = Directory(backupPath);
+    final files = await _dataStore.storage.listDirectory(backupPath);
 
-    if (!await dir.exists()) {
+    if (!await _dataStore.storage.exists(backupPath)) {
       return backups;
     }
 
-    await for (var entity in dir.list()) {
-      if (entity is File && entity.path.endsWith('.bak')) {
+    for (var file in files) {
+      if (file.endsWith('.bak')) {
         try {
-          final backupData = await loadBackup(entity.path);
+          final backupData = await loadBackup(file);
+          int size = 0;
+          if (kIsWeb) {
+            final compressed = await _dataStore.storage.readAsBytes(file);
+            size = compressed.length;
+          } else {
+            final fileEntity = File(file);
+            size = await fileEntity.length();
+          }
           backups.add(BackupInfo(
-            path: entity.path,
+            path: file,
             timestamp: DateTime.parse(backupData['timestamp'] as String),
-            isIncremental: entity.path.contains('incr_'),
-            size: await entity.length(),
+            isIncremental: file.contains('incr_'),
+            size: size,
           ));
         } catch (e) {
           // skip invalid backup file
-          Logger.error('Skip invalid backup file: ${entity.path}, error: $e',
+          Logger.error('Skip invalid backup file: $file, error: $e',
               label: 'BackupManager.listBackups');
           continue;
         }
@@ -169,36 +181,80 @@ class BackupManager {
   /// restore from backup
   Future<void> restore(String backupPath) async {
     try {
-      // load backup data
+      // Load backup data
       final backupData = await loadBackup(backupPath);
       final data = backupData['data'] as Map<String, dynamic>;
 
-      // clean existing data
-      final dbDir = Directory(_dataStore.config.getBasePath());
-      if (await dbDir.exists()) {
-        await dbDir.delete(recursive: true);
+      // Clean existing data
+      final basePath = _dataStore.config.getBasePath();
+      if (kIsWeb) {
+        // Web platform: clean via storage API
+        final files = await _dataStore.storage.listDirectory(basePath);
+        for (var file in files) {
+          await _dataStore.storage.deleteFile(file);
+        }
+      } else {
+        // Native platform: use directory operations
+        final dbDir = Directory(basePath);
+        if (await dbDir.exists()) {
+          await dbDir.delete(recursive: true);
+        }
+        await dbDir.create(recursive: true);
       }
-      await dbDir.create(recursive: true);
 
-      // restore each table data
+      // Restore each table data
       for (var entry in data.entries) {
         final tableName = entry.key;
         final tableData = entry.value as Map<String, dynamic>;
 
-        // restore table schema
+        // Restore table schema
         final schema = TableSchema.fromJson(tableData['schema']);
         await _dataStore.createTable(schema);
 
-        // restore table data
+        // Restore table data
         final records = tableData['data'] as List<dynamic>;
+
+        // Write data to files using appropriate file modes
+        final dataPath =
+            _dataStore.config.getDataPath(tableName, schema.isGlobal);
+
+        if (kIsWeb) {
+          // Web implementation: build content and write at once
+          final lines = records
+              .map((r) => jsonEncode(r as Map<String, dynamic>))
+              .toList();
+          await _dataStore.storage.writeLines(dataPath, lines);
+        } else {
+          // Native implementation: use FileMode.write to ensure we're replacing contents
+          final file = File(dataPath);
+          final sink = file.openWrite(mode: FileMode.write);
+          try {
+            for (var record in records) {
+              sink.writeln(jsonEncode(record));
+            }
+            await sink.flush();
+          } finally {
+            await sink.close();
+          }
+        }
+
+        // Update indexes for all records
+        await _dataStore.indexManager?.resetIndexes(tableName);
+
+        var offset = 0;
         for (var record in records) {
-          await _dataStore.insert(tableName, record as Map<String, dynamic>);
+          final data = record as Map<String, dynamic>;
+          final encoded = jsonEncode(data);
+          final pointer = await RowPointer.create(encoded, offset);
+          await _dataStore.indexManager
+              ?.updateIndexes(tableName, data, pointer);
+          offset += encoded.length + 1; // +1 for newline
         }
 
         Logger.info('Table $tableName restored');
       }
 
-      Logger.info('Database restored');
+      Logger.info('Database restored successfully');
     } catch (e) {
       Logger.error('Failed to restore from backup: $e',
           label: 'BackupManager.restore');
@@ -214,10 +270,9 @@ class BackupManager {
 
       // verify checksum
       if (storedChecksum.isNotEmpty) {
-        final file = File(backupPath);
-        final content = await file.readAsBytes();
+        final compressed = await _dataStore.storage.readAsBytes(backupPath);
         final actualChecksum =
-            _compressor.calculateChecksum(content).toString();
+            _compressor.calculateChecksum(compressed).toString();
         if (actualChecksum != storedChecksum) {
           Logger.debug('Checksum mismatch');
           return false;

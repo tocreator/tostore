@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
 import '../model/row_pointer.dart';
@@ -13,6 +15,10 @@ class FileManager {
   // write queue
   final Map<String, List<Map<String, dynamic>>> _writeQueue = {};
   Map<String, List<Map<String, dynamic>>> get writeQueue => _writeQueue;
+
+  // last write time
+  DateTime _lastWriteTime =
+      DateTime.now().subtract(const Duration(seconds: 15));
 
   // write strategy configuration
   static const int _maxQueueSize =
@@ -75,15 +81,23 @@ class FileManager {
           }
         }
 
-        // 3. check if need to write data file
+        // 3. if time since last write is >= 15 seconds, trigger flush
+        final idleWriteDuration = DateTime.now().difference(_lastWriteTime);
+        if (idleWriteDuration >= const Duration(seconds: 15)) {
+          needsImmediateWrite = true;
+        }
+
+        // check if need to write based on idle count or immediate need
         if (needsImmediateWrite || _idleCount >= _idleWriteCount) {
           _idleCount = 0;
-          if (_writeQueue.isNotEmpty) {
+          if (_writeQueue.isNotEmpty && !_isWriting) {
             _isWriting = true;
             try {
               await flushWriteQueue();
               // handle auto-increment ID write
               await _dataStore.flushMaxIds();
+              // update last write time
+              _lastWriteTime = DateTime.now();
             } finally {
               _isWriting = false;
             }
@@ -124,7 +138,6 @@ class FileManager {
   /// flush write queue
   Future<void> flushWriteQueue() async {
     if (_writeQueue.isEmpty) return;
-
     // copy current queue to avoid modification during processing
     final currentQueue =
         Map<String, List<Map<String, dynamic>>>.from(_writeQueue);
@@ -158,9 +171,10 @@ class FileManager {
             ?.acquireWriteLock('backup_$tableName');
         try {
           final schema = await _dataStore.getTableSchema(tableName);
-          final backupFile = File(
-              '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak');
-          await backupFile.writeAsString(jsonEncode(entry.value));
+          final backupPath =
+              '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak';
+          await _dataStore.storage
+              .writeAsString(backupPath, jsonEncode(entry.value));
         } finally {
           await _dataStore.concurrencyManager
               ?.releaseWriteLock('backup_$tableName');
@@ -180,13 +194,13 @@ class FileManager {
   /// restore single table write queue from backup
   Future<void> _restoreFromBackup(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
-    final backupFile = File(
-        '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak');
-    if (await backupFile.exists()) {
+    final backupPath =
+        '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak';
+    if (await _dataStore.storage.exists(backupPath)) {
       try {
-        final content = await backupFile.readAsString();
+        final content = await _dataStore.storage.readAsString(backupPath);
         final records =
-            (jsonDecode(content) as List).cast<Map<String, dynamic>>();
+            (jsonDecode(content ?? '') as List).cast<Map<String, dynamic>>();
         _writeQueue[tableName] = records;
       } catch (e) {
         Logger.error('restore write queue from backup failed: $e',
@@ -198,12 +212,12 @@ class FileManager {
   /// restore all backups
   Future<void> _restoreAllBackups() async {
     final basePath = _dataStore.config.getBasePath();
-    final dir = Directory(basePath);
-    if (!await dir.exists()) return;
 
-    await for (var entity in dir.list(recursive: true)) {
-      if (entity is File && entity.path.endsWith('.write.bak')) {
-        final tableName = _getTableNameFromPath(entity.path);
+    if (!await _dataStore.storage.exists(basePath)) return;
+
+    for (var path in await _dataStore.storage.listDirectory(basePath)) {
+      if (path.endsWith('.write.bak')) {
+        final tableName = _getTableNameFromPath(path);
         await _restoreFromBackup(tableName);
       }
     }
@@ -212,29 +226,41 @@ class FileManager {
   /// delete backup file
   Future<void> _removeBackupFile(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
-    final backupFile = File(
-        '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak');
-    if (await backupFile.exists()) {
-      await backupFile.delete();
+    final backupPath =
+        '${_dataStore.config.getTablePath(tableName, schema.isGlobal)}.write.bak';
+    if (await _dataStore.storage.exists(backupPath)) {
+      await _dataStore.storage.deleteFile(backupPath);
     }
   }
 
   /// extract table name from path
   String _getTableNameFromPath(String path) {
-    final parts = path.split(Platform.pathSeparator);
-    final fileName = parts.last;
-    return fileName.split('.').first;
+    final normalizedPath = path.replaceAll('\\', '/');
+    final parts = normalizedPath.split('/');
+    final fileName = parts.isEmpty ? path : parts.last;
+
+    // Handle backup files first
+    if (fileName.endsWith('.write.bak')) {
+      return fileName.replaceAll('.write.bak', '');
+    }
+
+    // Handle regular files
+    final dotIndex = fileName.indexOf('.');
+    if (dotIndex != -1) {
+      return fileName.substring(0, dotIndex);
+    }
+
+    return fileName;
   }
 
   /// cleanup all backup files
   Future<void> _cleanupBackupFiles() async {
     final basePath = _dataStore.config.getBasePath();
-    final dir = Directory(basePath);
-    if (!await dir.exists()) return;
+    if (!await _dataStore.storage.exists(basePath)) return;
 
-    await for (var entity in dir.list(recursive: true)) {
-      if (entity is File && entity.path.endsWith('.write.bak')) {
-        await entity.delete();
+    for (var path in await _dataStore.storage.listDirectory(basePath)) {
+      if (path.endsWith('.write.bak')) {
+        await _dataStore.storage.deleteFile(path);
       }
     }
   }
@@ -277,12 +303,10 @@ class FileManager {
   Future<void> loadBackups() async {
     try {
       final basePath = _dataStore.config.getBasePath();
-      final dir = Directory(basePath);
-      if (!await dir.exists()) return;
-
-      await for (var entity in dir.list(recursive: true)) {
-        if (entity is File && entity.path.endsWith('.write.bak')) {
-          final tableName = _getTableNameFromPath(entity.path);
+      if (!await _dataStore.storage.exists(basePath)) return;
+      for (var path in await _dataStore.storage.listDirectory(basePath)) {
+        if (path.endsWith('.write.bak')) {
+          final tableName = _getTableNameFromPath(path);
           await _restoreFromBackup(tableName);
         }
       }
@@ -292,18 +316,32 @@ class FileManager {
   }
 
   /// get all files of a table
-  Future<List<File>> getTableFiles(String tableName) async {
+  Future<List<String>> getTableFiles(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
     final tablePath =
         _dataStore.config.getTablePath(tableName, schema.isGlobal);
-    final files = <File>[];
+    final files = <String>[];
 
-    final dir = Directory(tablePath).parent;
-    await for (var entity in dir.list()) {
-      if (entity is File && entity.path.startsWith('$tablePath.')) {
-        files.add(entity);
+    if (kIsWeb) {
+      // Web implementation: use storage to list files
+      final allFiles = await _dataStore.storage
+          .listDirectory(tablePath.substring(0, tablePath.lastIndexOf('/')));
+
+      for (var path in allFiles) {
+        if (path.startsWith('$tablePath.')) {
+          files.add(path);
+        }
+      }
+    } else {
+      // native platform implementation: use Directory API
+      final dir = Directory(tablePath).parent;
+      await for (var entity in dir.list()) {
+        if (entity is File && entity.path.startsWith('$tablePath.')) {
+          files.add(entity.path);
+        }
       }
     }
+
     return files;
   }
 
@@ -312,23 +350,28 @@ class FileManager {
   Future<Map<String, Map<String, dynamic>>> readRecords(
       String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
-    final dataFile =
-        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-    if (!await dataFile.exists()) return {};
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+    if (!await _dataStore.storage.exists(dataPath)) return {};
 
     final records = <String, Map<String, dynamic>>{};
     final primaryKey = schema.primaryKey;
 
-    final lines = await dataFile.readAsLines();
-    for (var line in lines) {
-      if (line.trim().isEmpty) continue;
-      try {
-        final record = jsonDecode(line) as Map<String, dynamic>;
-        records[record[primaryKey].toString()] = record;
-      } catch (e) {
-        Logger.error('Parse record failed: $e',
-            label: 'FileManager.readRecords');
+    try {
+      // use storage interface to read file
+      final lines = await _dataStore.storage.readLines(dataPath);
+
+      for (final line in lines) {
+        if (line.trim().isEmpty) continue;
+        try {
+          final record = jsonDecode(line) as Map<String, dynamic>;
+          records[record[primaryKey].toString()] = record;
+        } catch (e) {
+          Logger.error('Parse record failed: $e',
+              label: 'FileManager.readRecords');
+        }
       }
+    } catch (e) {
+      Logger.error('Read records failed: $e', label: 'FileManager.readRecords');
     }
 
     return records;
@@ -338,62 +381,82 @@ class FileManager {
   Future<void> writeRecords({
     required String tableName,
     required List<Map<String, dynamic>> records,
-    bool isSchemaChanged = false,
+    bool fullRewrite = false,
   }) async {
     if (records.isEmpty) return;
     // get data file write lock
     await _dataStore.concurrencyManager?.acquireWriteLock(tableName);
     try {
       final schema = await _dataStore.getTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-      if (!await dataFile.exists()) {
-        // create new file if not exists
-        await dataFile.create(recursive: true);
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+
+      if (!await _dataStore.storage.exists(dataPath)) {
+        await _dataStore.storage.writeAsString(dataPath, '');
       }
 
       final primaryKey = schema.primaryKey;
       var allRecords = <String, Map<String, dynamic>>{};
 
-      if (!isSchemaChanged) {
+      var currentOffset = 0; // start from 0
+      if (!fullRewrite) {
         // read existing file content
         allRecords = await readRecords(tableName);
+        currentOffset = allRecords.length;
       }
 
       // update/add new records
       for (var record in records) {
         final recordId = record[primaryKey].toString();
-
         // update record
         allRecords[recordId] = record;
       }
 
-      // write all records
-      final sink = dataFile.openWrite(mode: FileMode.write);
-      var currentOffset = 0; // start from 0
-
-      try {
+      if (kIsWeb) {
+        final lines = <String>[];
         for (var record in allRecords.values) {
           final encoded = jsonEncode(record);
+          lines.add(encoded);
 
           // create row pointer (use current offset)
-          final pointer = await RowPointer.create(
-            encoded,
-            currentOffset,
-          );
-
-          // write record
-          sink.writeln(encoded);
+          final pointer = await RowPointer.create(encoded, currentOffset);
 
           // update index
-          _dataStore.indexManager?.updateIndexes(tableName, record, pointer);
+          await _dataStore.indexManager
+              ?.updateIndexes(tableName, record, pointer);
 
           // update offset (add record length and newline)
           currentOffset += encoded.length + 1;
         }
-        await sink.flush();
-      } finally {
-        await sink.close();
+
+        // write all lines
+        await _dataStore.storage.writeLines(dataPath, lines);
+      } else {
+        // native platform implementation: use file stream
+        final file = File(dataPath);
+        final sink = file.openWrite(mode: FileMode.write);
+
+        try {
+          for (var record in allRecords.values) {
+            final encoded = jsonEncode(record);
+
+            // create row pointer (use current offset)
+            final pointer = await RowPointer.create(encoded, currentOffset);
+
+            // write record
+            sink.writeln(encoded);
+
+            // update index
+            await _dataStore.indexManager
+                ?.updateIndexes(tableName, record, pointer);
+
+            // update offset (add record length and newline)
+            currentOffset += encoded.length + 1;
+          }
+          await sink.flush();
+        } finally {
+          await sink.close();
+        }
       }
 
       // update file size information
@@ -416,6 +479,50 @@ class FileManager {
       }
     } finally {
       await _dataStore.concurrencyManager?.releaseWriteLock(tableName);
+    }
+  }
+
+  /// Stream interface for reading large datasets
+  Stream<Map<String, dynamic>> streamRecords(String tableName) async* {
+    final schema = await _dataStore.getTableSchema(tableName);
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+
+    if (!await _dataStore.storage.exists(dataPath)) return;
+
+    if (kIsWeb) {
+      // Web implementation
+      final content = await _dataStore.storage.readAsString(dataPath);
+      if (content == null) return;
+
+      final lines = content.split('\n');
+      for (var line in lines) {
+        if (line.trim().isEmpty) continue;
+        try {
+          final record = jsonDecode(line) as Map<String, dynamic>;
+          yield record;
+        } catch (e) {
+          Logger.error('Parse record failed: $e',
+              label: 'FileManager.streamRecords');
+        }
+      }
+    } else {
+      // native platform implementation: use file stream
+      final file = File(dataPath);
+      final stream = file
+          .openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
+
+      await for (final line in stream) {
+        if (line.trim().isEmpty) continue;
+        try {
+          final record = jsonDecode(line) as Map<String, dynamic>;
+          yield record;
+        } catch (e) {
+          Logger.error('Parse record failed: $e',
+              label: 'FileManager.streamRecords');
+        }
+      }
     }
   }
 }

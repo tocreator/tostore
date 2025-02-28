@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
-import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 
 import '../backup/backup_manager.dart';
@@ -27,6 +25,7 @@ import '../statistic/statistics_collector.dart';
 import 'transaction_manager.dart';
 import 'migration_manager.dart';
 import '../integrity/integrity_checker.dart';
+import 'storage_adapter.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -167,11 +166,11 @@ class DataStoreImpl {
   /// Get database version
   Future<int> getVersion() async {
     try {
-      final versionFile = File(pathJoin(config.dbPath, 'version'));
-      if (!await versionFile.exists()) {
+      final versionPath = pathJoin(config.dbPath, 'version');
+      if (!await storage.exists(versionPath)) {
         return 0;
       }
-      return int.parse(await versionFile.readAsString());
+      return int.parse(await storage.readAsString(versionPath) ?? '0');
     } catch (e) {
       return 0;
     }
@@ -179,8 +178,8 @@ class DataStoreImpl {
 
   /// Set database version
   Future<void> setVersion(int version) async {
-    final versionFile = File(pathJoin(config.dbPath, 'version'));
-    await versionFile.writeAsString(version.toString());
+    final versionPath = pathJoin(config.dbPath, 'version');
+    await storage.writeAsString(versionPath, version.toString());
   }
 
   /// Ensure initialization is complete
@@ -201,6 +200,7 @@ class DataStoreImpl {
   StatisticsCollector? _statisticsCollector;
   MigrationManager? _migrationManager;
   IntegrityChecker? _integrityChecker;
+  late StorageAdapter storage;
 
   // Cache for unique values
   final Map<String, Map<String, Set<dynamic>>> _uniqueValuesCache = {};
@@ -230,6 +230,9 @@ class DataStoreImpl {
       return _config!.dbPath;
     } else if (dbPath != null) {
       return pathJoin(dbPath, 'db');
+    }
+    if (kIsWeb) {
+      return 'db';
     }
     final appPath = await getPathApp();
     return pathJoin(appPath, 'db');
@@ -263,6 +266,7 @@ class DataStoreImpl {
 
       _config = config ?? DataStoreConfig(dbPath: dbPath);
       _concurrencyManager = ConcurrencyManager();
+      storage = StorageAdapter(_config!);
       _transactionManager = TransactionManager(this);
       _indexManager = IndexManager(this);
       _statisticsCollector = StatisticsCollector(this);
@@ -271,7 +275,9 @@ class DataStoreImpl {
       _migrationManager = MigrationManager(this);
       _integrityChecker = IntegrityChecker(this);
 
-      await Directory(dbPath).create(recursive: true);
+      if (!kIsWeb) {
+        await Directory(dbPath).create(recursive: true);
+      }
 
       _queryOptimizer = QueryOptimizer(this);
       _queryExecutor = QueryExecutor(this, _indexManager!);
@@ -404,6 +410,7 @@ class DataStoreImpl {
   Future<void> close() async {
     try {
       await _fileManager?.dispose();
+      await storage.close();
 
       if (_maxIdsDirty.values.any((isDirty) => isDirty)) {
         await _flushMaxIds();
@@ -470,15 +477,15 @@ class DataStoreImpl {
       }
 
       // check if table already exists
-      final globalSchemaFile = File(config.getSchemaPath(schema.name, true));
-      final baseSchemaFile = File(config.getSchemaPath(schema.name, false));
+      final globalSchemaPath = config.getSchemaPath(schema.name, true);
+      final baseSchemaPath = config.getSchemaPath(schema.name, false);
 
-      if (await globalSchemaFile.exists()) {
+      if (await storage.exists(globalSchemaPath)) {
         Logger.warn('Table ${schema.name} already exists in global space',
             label: 'DataStore.createTable');
         return;
       }
-      if (await baseSchemaFile.exists()) {
+      if (await storage.exists(baseSchemaPath)) {
         Logger.warn('Table ${schema.name} already exists in base space',
             label: 'DataStore.createTable');
         return;
@@ -487,13 +494,12 @@ class DataStoreImpl {
       // create target directory
       final targetPath =
           schema.isGlobal ? config.getGlobalPath() : config.getBasePath();
-      final targetDir = Directory(targetPath);
-      if (!await targetDir.exists()) {
-        await targetDir.create(recursive: true);
+      if (!await storage.exists(targetPath)) {
+        await storage.writeAsString(targetPath, '');
       }
 
       // get schema file path
-      final schemaFile = schema.isGlobal ? globalSchemaFile : baseSchemaFile;
+      final schemaPath = schema.isGlobal ? globalSchemaPath : baseSchemaPath;
 
       await _concurrencyManager!.acquireWriteLock(schema.name);
       try {
@@ -513,7 +519,7 @@ class DataStoreImpl {
         await _validateSchema(schemaValid);
 
         // write schema file
-        await schemaFile.writeAsString(jsonEncode(schemaValid));
+        await storage.writeAsString(schemaPath, jsonEncode(schemaValid));
 
         // create primary key index
         await _indexManager?.createPrimaryIndex(schema.name, schema.primaryKey);
@@ -525,9 +531,9 @@ class DataStoreImpl {
 
         // if auto increment, initialize id file
         if (schemaValid.autoIncrement) {
-          final maxIdFile =
-              File(config.getAutoIncrementPath(schema.name, schema.isGlobal));
-          await maxIdFile.writeAsString('0');
+          final maxIdPath =
+              config.getAutoIncrementPath(schema.name, schema.isGlobal);
+          await storage.writeAsString(maxIdPath, '0');
         }
 
         Logger.info(
@@ -539,8 +545,8 @@ class DataStoreImpl {
         _queryExecutor?.queryCacheManager.cacheSchema(schema.name, schemaValid);
       } catch (e) {
         // cleanup schema file if creation failed
-        if (await schemaFile.exists()) {
-          await schemaFile.delete();
+        if (await storage.exists(schemaPath)) {
+          await storage.deleteFile(schemaPath);
         }
         Logger.error('Create table failed: $e', label: 'DataStore.createTable');
         rethrow;
@@ -640,7 +646,7 @@ class DataStoreImpl {
             await fileManager.writeRecords(
               tableName: tableName,
               records: records,
-              isSchemaChanged: false,
+              fullRewrite: true,
             );
           }
         } catch (e) {
@@ -1102,19 +1108,35 @@ class DataStoreImpl {
   /// verify data integrity
   Future<bool> _verifyDataIntegrity(String tableName) async {
     final schema = await getTableSchema(tableName);
-    final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-    final checksumFile =
-        File(config.getChecksumPath(tableName, schema.isGlobal));
+    final dataPath = config.getDataPath(tableName, schema.isGlobal);
+    final checksumPath = config.getChecksumPath(tableName, schema.isGlobal);
 
-    if (!await dataFile.exists() || !await checksumFile.exists()) {
+    if (!await storage.exists(dataPath) ||
+        !await storage.exists(checksumPath)) {
       return false;
     }
 
-    final data = await dataFile.readAsBytes();
-    final storedChecksum = await checksumFile.readAsString();
-    final actualChecksum = _calculateChecksum(data);
+    try {
+      // read data file content
+      final dataContent = await storage.readAsString(dataPath);
+      if (dataContent == null) return false;
+      final dataBytes = Uint8List.fromList(utf8.encode(dataContent));
 
-    return storedChecksum.trim() == actualChecksum;
+      // read checksum file content
+      final checksumContent = await storage.readAsString(checksumPath);
+      if (checksumContent == null) return false;
+
+      // calculate data file checksum
+      final actualChecksum = _calculateChecksum(dataBytes);
+
+      return actualChecksum == checksumContent.trim();
+    } catch (e) {
+      Logger.error(
+        'Verify data integrity failed: $e',
+        label: 'DataStore._verifyDataIntegrity',
+      );
+      return false;
+    }
   }
 
   /// repair data
@@ -1147,75 +1169,21 @@ class DataStoreImpl {
     }
   }
 
-  /// restore from backup
+  /// Restore database from backup
   Future<bool> restore(String backupPath) async {
+    if (!_baseInitialized) {
+      await _ensureInitialized();
+    }
+
     try {
-      // 1. create backup manager
       final backupManager = BackupManager(this);
-
-      // 2. load backup data
-      final backupData = await backupManager.loadBackup(backupPath);
-
-      // 3. get actual data part
-      final data = backupData['data'] as Map<String, dynamic>;
-      if (data.isEmpty) {
-        Logger.error('Backup data is empty', label: 'DataStore-restore');
-        return false;
-      }
-
-      // 4. clean existing data
-      final dbDir = Directory(_config!.getBasePath());
-      if (await dbDir.exists()) {
-        await dbDir.delete(recursive: true);
-      }
-      await dbDir.create();
-
-      // 5. restore each table data
-      for (var entry in data.entries) {
-        final tableName = entry.key;
-        final tableData = entry.value as Map<String, dynamic>;
-
-        // restore schema
-        final schemaJson = tableData['schema'] as Map<String, dynamic>;
-        if (!schemaJson.containsKey('name')) {
-          schemaJson['name'] = tableName;
-        }
-        final schema = TableSchema.fromJson(schemaJson);
-        await createTable(schema);
-
-        // restore data
-        final records =
-            (tableData['data'] as List).cast<Map<String, dynamic>>();
-
-        // write data to file
-        final dataFile = File(_config!.getDataPath(tableName, schema.isGlobal));
-        final sink = dataFile.openWrite(mode: FileMode.append);
-        await _indexManager?.resetIndexes(tableName);
-        var startOffset = await dataFile.length();
-        try {
-          for (var record in records) {
-            sink.writeln(jsonEncode(record));
-            _queryExecutor?.queryCacheManager
-                .addCachedRecord(tableName, record);
-            final encoded = jsonEncode(record);
-            startOffset += encoded.length + 1;
-            final pointer = await RowPointer.create(
-              encoded,
-              startOffset,
-            );
-            await _indexManager?.updateIndexes(tableName, record, pointer);
-          }
-          await sink.flush();
-        } finally {
-          await sink.close();
-        }
-      }
-
-      Logger.info('Restore from backup successfully');
+      await backupManager.restore(backupPath);
       return true;
     } catch (e) {
-      Logger.error('Restore from backup failed: $e',
-          label: 'DataStore-restore');
+      Logger.error(
+        'Failed to restore database: $e',
+        label: 'DataStoreImpl.restore',
+      );
       return false;
     }
   }
@@ -1430,9 +1398,9 @@ class DataStoreImpl {
     try {
       // clear file
       final schema = await getTableSchema(tableName);
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      if (await dataFile.exists()) {
-        await dataFile.writeAsString('');
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      if (await storage.exists(dataPath)) {
+        await storage.writeAsString(dataPath, '');
       }
 
       // clear record cache
@@ -1509,7 +1477,7 @@ class DataStoreImpl {
       await fileManager.writeRecords(
         tableName: tableName,
         records: remainingRecords,
-        isSchemaChanged: false,
+        fullRewrite: true,
       );
 
       // update statistics
@@ -1534,26 +1502,26 @@ class DataStoreImpl {
       final schema = await getTableSchema(tableName);
 
       // delete data file
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      if (await dataFile.exists()) {
-        await dataFile.delete();
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      if (await storage.exists(dataPath)) {
+        await storage.deleteFile(dataPath);
       }
 
       // delete schema file
-      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
-      if (await schemaFile.exists()) {
-        await schemaFile.delete();
+      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
+      if (await storage.exists(schemaPath)) {
+        await storage.deleteFile(schemaPath);
+      }
 
-        // delete index files
-        for (var index in schema.indexes) {
-          final indexFile = File(config.getIndexPath(
-            tableName,
-            index.actualIndexName,
-            schema.isGlobal,
-          ));
-          if (await indexFile.exists()) {
-            await indexFile.delete();
-          }
+      // delete index files
+      for (var index in schema.indexes) {
+        final indexPath = config.getIndexPath(
+          tableName,
+          index.actualIndexName,
+          schema.isGlobal,
+        );
+        if (await storage.exists(indexPath)) {
+          await storage.deleteFile(indexPath);
         }
       }
 
@@ -1580,29 +1548,54 @@ class DataStoreImpl {
       }
 
       // 2. Load schema from file
-      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
-      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
+      final globalSchemaPath = config.getSchemaPath(tableName, true);
+      final baseSchemaPath = config.getSchemaPath(tableName, false);
 
       TableSchema? schema;
       bool isGlobal = false;
 
-      if (await globalSchemaFile.exists()) {
-        final schemaJson = await globalSchemaFile.readAsString();
-        final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
-        // if name is not in json, add schemaPath
-        if (!schemaMap.containsKey('name')) {
-          schemaMap['_schemaPath'] = config.getSchemaPath(tableName, true);
+      if (await storage.exists(globalSchemaPath)) {
+        final content = await storage.readAsString(globalSchemaPath);
+        if (content != null) {
+          final schemaMap = jsonDecode(content) as Map<String, dynamic>;
+          // if name is not in json, add schemaPath
+          if (!schemaMap.containsKey('name')) {
+            schemaMap['_schemaPath'] = globalSchemaPath;
+          }
+          schema = TableSchema.fromJson(schemaMap);
+          isGlobal = true;
         }
-        schema = TableSchema.fromJson(schemaMap);
-        isGlobal = true;
-      } else if (await baseSchemaFile.exists()) {
-        final schemaJson = await baseSchemaFile.readAsString();
-        final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
-        // if name is not in json, add schemaPath
-        if (!schemaMap.containsKey('name')) {
-          schemaMap['_schemaPath'] = config.getSchemaPath(tableName, false);
+      } else if (await storage.exists(baseSchemaPath)) {
+        final schemaJson = await storage.readAsString(baseSchemaPath);
+        if (schemaJson == null || schemaJson.isEmpty) {
+          Logger.error('Schema file is empty: $baseSchemaPath',
+              label: 'DataStoreImpl.getTableSchema');
+          return TableSchema(
+            name: tableName,
+            primaryKey: '',
+            fields: const [],
+          );
         }
-        schema = TableSchema.fromJson(schemaMap);
+
+        try {
+          final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
+
+          // if name is not in json, add schemaPath
+          if (!schemaMap.containsKey('name')) {
+            schemaMap['_schemaPath'] = baseSchemaPath;
+          }
+          schema = TableSchema.fromJson(schemaMap);
+        } catch (e) {
+          Logger.error(
+            'Failed to parse schema JSON: $e\nJSON Content: $schemaJson',
+            label: "DataStoreImpl.getTableSchema",
+          );
+          return TableSchema(
+            name: tableName,
+            primaryKey: '',
+            fields: const [],
+          );
+        }
       }
 
       // Validate schema name matches table name
@@ -1626,9 +1619,8 @@ class DataStoreImpl {
           // Create adjusted schema
           final adjustedSchema = schema.copyWith(autoIncrement: false);
 
-          // Update schema file
-          final schemaFile = isGlobal ? globalSchemaFile : baseSchemaFile;
-          await schemaFile.writeAsString(jsonEncode(adjustedSchema));
+          final schemaPath = isGlobal ? globalSchemaPath : baseSchemaPath;
+          await storage.writeAsString(schemaPath, jsonEncode(adjustedSchema));
 
           // Update cache
           _queryExecutor?.queryCacheManager
@@ -1722,16 +1714,25 @@ class DataStoreImpl {
       final allData = [...pendingData, ...uniqueRecords];
 
       // 5. write to file, cache and index
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      final sink = dataFile.openWrite(mode: FileMode.append);
-      try {
-        for (var data in allData) {
-          sink.writeln(jsonEncode(data));
-          _queryExecutor?.queryCacheManager.addCachedRecord(tableName, data);
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+
+      if (kIsWeb) {
+        // Web implementation: write all data at once
+        final lines = allData.map((data) => jsonEncode(data)).toList();
+        await storage.writeLines(dataPath, lines);
+      } else {
+        // Native implementation: use file stream
+        final file = File(dataPath);
+        final sink = file.openWrite(mode: FileMode.append);
+        try {
+          for (var data in allData) {
+            sink.writeln(jsonEncode(data));
+            _queryExecutor?.queryCacheManager.addCachedRecord(tableName, data);
+          }
+          await sink.flush();
+        } finally {
+          await sink.close();
         }
-        await sink.flush();
-      } finally {
-        await sink.close();
       }
 
       // 6. async update information
@@ -1789,16 +1790,14 @@ class DataStoreImpl {
   /// load data to cache
   Future<void> _loadDataToCache() async {
     try {
-      // 1. load data from base space
-      final baseDir = Directory(_config!.getBasePath());
-      if (await baseDir.exists()) {
-        await _loadPathData(baseDir);
+      final globalPath = config.getGlobalPath();
+      if (await storage.exists(globalPath)) {
+        await _loadPathData(globalPath);
       }
 
-      // 2. load data from global space
-      final globalDir = Directory(_config!.getGlobalPath());
-      if (await globalDir.exists()) {
-        await _loadPathData(globalDir);
+      final basePath = config.getBasePath();
+      if (await storage.exists(basePath)) {
+        await _loadPathData(basePath);
       }
     } catch (e) {
       Logger.error('Load data to cache failed: $e',
@@ -1807,20 +1806,23 @@ class DataStoreImpl {
   }
 
   /// load data from specified path
-  Future<void> _loadPathData(Directory dir) async {
-    final files = await dir
-        .list()
-        .where((f) => f.path.endsWith('.dat'))
-        .map((f) => File(f.path))
-        .toList();
+  Future<void> _loadPathData(String path) async {
+    final files = await storage.listDirectory(path);
+    final dataFiles = files.where((f) => f.endsWith('.dat')).toList();
 
-    for (var file in files) {
+    for (var file in dataFiles) {
       try {
-        final tableName = _getFileName(file.path);
+        final tableName = _getFileName(file);
         final schema = await getTableSchema(tableName);
 
         // get file size
-        final fileSize = await file.length();
+        int fileSize;
+        if (kIsWeb) {
+          final content = await storage.readAsString(file);
+          fileSize = content?.length ?? 0;
+        } else {
+          fileSize = await (File(file)).length();
+        }
 
         // only cache small files
         if (fileSize <= _config!.maxTableCacheSize) {
@@ -1837,8 +1839,10 @@ class DataStoreImpl {
               'Table $tableName file $fileSize exceeds size limit, cache partial data',
               label: 'DataStore._loadPathData');
         }
-      } catch (e) {
-        Logger.error('Load table data failed: ${file.path}, error: $e',
+      } catch (e, stackTrace) {
+        Logger.error('Load table data failed: $file, error: $e',
+            label: 'DataStore._loadPathData');
+        Logger.error('Stack trace: $stackTrace',
             label: 'DataStore._loadPathData');
         continue; // continue loading other tables
       }
@@ -1847,11 +1851,11 @@ class DataStoreImpl {
 
   /// load recent records
   Future<void> _loadRecentRecords(
-    File file,
+    String file,
     String tableName,
     TableSchema schema,
   ) async {
-    final lines = await file.readAsLines();
+    final lines = await storage.readLines(file);
     final recentLines =
         lines.reversed.take(1000); // only load recent 1000 records
 
@@ -1866,9 +1870,9 @@ class DataStoreImpl {
   }
 
   /// load all records
-  Future<List<Map<String, dynamic>>> _loadAllRecords(File file) async {
+  Future<List<Map<String, dynamic>>> _loadAllRecords(String file) async {
     final results = <Map<String, dynamic>>[];
-    final lines = await file.readAsLines();
+    final lines = await storage.readLines(file);
 
     for (var line in lines) {
       if (line.trim().isEmpty) continue;
@@ -1881,9 +1885,15 @@ class DataStoreImpl {
 
   /// extract file name from path
   String _getFileName(String path) {
-    final parts = path.split(Platform.pathSeparator);
-    final fileName = parts.last;
-    return fileName.replaceAll('.dat', '');
+    final normalizedPath = path.replaceAll('\\', '/');
+    final parts = normalizedPath.split('/');
+    final fileName = parts.isEmpty ? path : parts.last;
+
+    if (fileName.contains('.')) {
+      return fileName.substring(0, fileName.lastIndexOf('.'));
+    }
+
+    return fileName;
   }
 
   /// check unique constraints
@@ -1907,10 +1917,9 @@ class DataStoreImpl {
             _uniqueValuesCache[tableName]![field.name] = <dynamic>{};
 
             // initialize cache
-            final dataFile =
-                File(config.getDataPath(tableName, schema.isGlobal));
-            if (await dataFile.exists()) {
-              final lines = await dataFile.readAsLines();
+            final dataPath = config.getDataPath(tableName, schema.isGlobal);
+            if (await storage.exists(dataPath)) {
+              final lines = await storage.readLines(dataPath);
               for (var line in lines) {
                 if (line.trim().isEmpty) continue;
                 final record = jsonDecode(line) as Map<String, dynamic>;
@@ -1944,9 +1953,9 @@ class DataStoreImpl {
       }
 
       // load all data to cache at once
-      final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-      if (await dataFile.exists()) {
-        final lines = await dataFile.readAsLines();
+      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      if (await storage.exists(dataPath)) {
+        final lines = await storage.readLines(dataPath);
         for (var line in lines) {
           if (line.trim().isEmpty) continue;
           final record = jsonDecode(line) as Map<String, dynamic>;
@@ -2317,9 +2326,8 @@ class DataStoreImpl {
       final dbDirPath = await getDatabasePath(dbPath: dbPath);
       await close();
 
-      final dbDir = Directory(dbDirPath);
-      if (await dbDir.exists()) {
-        await dbDir.delete(recursive: true);
+      if (await storage.exists(dbDirPath)) {
+        await storage.deleteFile(dbDirPath);
         Logger.info('Database deleted: $dbDirPath');
       }
 
@@ -2355,11 +2363,10 @@ class DataStoreImpl {
     final schema = await getTableSchema(tableName);
     if (!_maxIds.containsKey(tableName)) {
       // Load from file on first access
-      final maxIdFile =
-          File(config.getAutoIncrementPath(tableName, schema.isGlobal));
-      if (await maxIdFile.exists()) {
-        final content = await maxIdFile.readAsString();
-        _maxIds[tableName] = int.parse(content);
+      final maxIdPath = config.getAutoIncrementPath(tableName, schema.isGlobal);
+      if (await storage.exists(maxIdPath)) {
+        final content = await storage.readAsString(maxIdPath);
+        _maxIds[tableName] = int.parse(content ?? '0');
       } else {
         _maxIds[tableName] = 0;
       }
@@ -2385,7 +2392,7 @@ class DataStoreImpl {
         final maxIdPath =
             config.getAutoIncrementPath(tableName, schema.isGlobal);
 
-        await File(maxIdPath).writeAsString(maxId.toString());
+        await storage.writeAsString(maxIdPath, maxId.toString());
         _maxIdsDirty[tableName] = false;
       }
     } catch (e) {
@@ -2487,12 +2494,11 @@ class DataStoreImpl {
   /// Get table info
   Future<TableInfo> getTableInfo(String tableName) async {
     final schema = await getTableSchema(tableName);
-    final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
+    final dataPath = config.getDataPath(tableName, schema.isGlobal);
 
     DateTime? createdAt;
-    if (await dataFile.exists()) {
-      final stat = await dataFile.stat();
-      createdAt = stat.changed;
+    if (await storage.exists(dataPath)) {
+      createdAt = await storage.getFileCreationTime(dataPath);
     }
 
     return TableInfo(
@@ -2512,13 +2518,13 @@ class DataStoreImpl {
   /// Get table record count
   Future<int> _getRecordCount(String tableName) async {
     final schema = await getTableSchema(tableName);
-    final dataFile = File(config.getDataPath(tableName, schema.isGlobal));
-    if (!await dataFile.exists()) return 0;
+    final dataPath = config.getDataPath(tableName, schema.isGlobal);
+    if (!await storage.exists(dataPath)) return 0;
 
     final allRecords = <String, bool>{};
 
     // 1. Read records from file
-    final lines = await dataFile.readAsLines();
+    final lines = await storage.readLines(dataPath);
     for (var line in lines) {
       if (line.trim().isEmpty) continue;
       final data = jsonDecode(line) as Map<String, dynamic>;
@@ -2756,10 +2762,7 @@ class DataStoreImpl {
   ) async {
     try {
       final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-      final schemaFile = File(schemaPath);
-
-      await schemaFile.writeAsString(jsonEncode(schema.toJson()));
-
+      await storage.writeAsString(schemaPath, jsonEncode(schema.toJson()));
       // Update cache
       _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
     } catch (e) {
@@ -2816,9 +2819,8 @@ class DataStoreImpl {
   Future<void> _removeTableSchema(String tableName) async {
     final schema = await getTableSchema(tableName);
     final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-    final schemaFile = File(schemaPath);
-    if (await schemaFile.exists()) {
-      await schemaFile.delete();
+    if (await storage.exists(schemaPath)) {
+      await storage.deleteFile(schemaPath);
     }
     _invalidateTableCaches(tableName);
   }
@@ -2867,10 +2869,8 @@ class DataStoreImpl {
         indexName,
         schema.isGlobal,
       );
-      final indexFile = File(indexPath);
-
-      if (await indexFile.exists()) {
-        await indexFile.delete();
+      if (await storage.exists(indexPath)) {
+        await storage.deleteFile(indexPath);
       }
 
       // Invalidate index cache
@@ -2894,8 +2894,17 @@ class DataStoreImpl {
       // Rename data file
       final oldDataPath = config.getDataPath(oldName, isGlobal);
       final newDataPath = config.getDataPath(newName, isGlobal);
-      if (await File(oldDataPath).exists()) {
-        await File(oldDataPath).rename(newDataPath);
+      if (await storage.exists(oldDataPath)) {
+        if (kIsWeb) {
+          final content = await storage.readAsString(oldDataPath);
+          if (content != null) {
+            await storage.writeAsString(newDataPath, content);
+            await storage.deleteFile(oldDataPath);
+          }
+        } else {
+          final file = File(oldDataPath);
+          await file.rename(newDataPath);
+        }
       }
 
       // Rename index files
@@ -2904,8 +2913,17 @@ class DataStoreImpl {
         final indexName = index.actualIndexName;
         final oldIndexPath = config.getIndexPath(oldName, indexName, isGlobal);
         final newIndexPath = config.getIndexPath(newName, indexName, isGlobal);
-        if (await File(oldIndexPath).exists()) {
-          await File(oldIndexPath).rename(newIndexPath);
+        if (await storage.exists(oldIndexPath)) {
+          if (kIsWeb) {
+            final content = await storage.readAsString(oldIndexPath);
+            if (content != null) {
+              await storage.writeAsString(newIndexPath, content);
+              await storage.deleteFile(oldIndexPath);
+            }
+          } else {
+            final file = File(oldIndexPath);
+            await file.rename(newIndexPath);
+          }
         }
       }
 
@@ -2915,8 +2933,17 @@ class DataStoreImpl {
             config.getAutoIncrementPath(oldName, isGlobal);
         final newAutoIncrementPath =
             config.getAutoIncrementPath(newName, isGlobal);
-        if (await File(oldAutoIncrementPath).exists()) {
-          await File(oldAutoIncrementPath).rename(newAutoIncrementPath);
+        if (await storage.exists(oldAutoIncrementPath)) {
+          if (kIsWeb) {
+            final content = await storage.readAsString(oldAutoIncrementPath);
+            if (content != null) {
+              await storage.writeAsString(newAutoIncrementPath, content);
+              await storage.deleteFile(oldAutoIncrementPath);
+            }
+          } else {
+            final file = File(oldAutoIncrementPath);
+            await file.rename(newAutoIncrementPath);
+          }
         }
       }
     } catch (e) {
@@ -3041,53 +3068,23 @@ class DataStoreImpl {
     try {
       final tables = <String>{};
 
-      // Check global space
-      final globalDir = Directory(config.getGlobalPath());
-      if (await globalDir.exists()) {
-        await for (var entity in globalDir.list()) {
-          if (entity is File && entity.path.endsWith('.schema')) {
-            try {
-              final schemaJson = await entity.readAsString();
-              final json = jsonDecode(schemaJson) as Map<String, dynamic>;
-              // if name is not in json, add schemaPath
-              if (!json.containsKey('name')) {
-                json['_schemaPath'] = entity.path;
-              }
-              final schema = TableSchema.fromJson(json);
-              tables.add(schema.name);
-            } catch (e) {
-              Logger.warn(
-                'Failed to read schema file: ${entity.path}, error: $e',
-                label: 'DataStoreImpl.getTableNames',
-              );
-            }
-          }
+      await _processSchemaFiles(config.getGlobalPath(), (schemaJson, path) {
+        final json = jsonDecode(schemaJson) as Map<String, dynamic>;
+        if (!json.containsKey('name')) {
+          json['_schemaPath'] = path;
         }
-      }
+        final schema = TableSchema.fromJson(json);
+        tables.add(schema.name);
+      });
 
-      // Check base space
-      final baseDir = Directory(config.getBasePath());
-      if (await baseDir.exists()) {
-        await for (var entity in baseDir.list()) {
-          if (entity is File && entity.path.endsWith('.schema')) {
-            try {
-              final schemaJson = await entity.readAsString();
-              final json = jsonDecode(schemaJson) as Map<String, dynamic>;
-              // if name is not in json, add schemaPath
-              if (!json.containsKey('name')) {
-                json['_schemaPath'] = entity.path;
-              }
-              final schema = TableSchema.fromJson(json);
-              tables.add(schema.name);
-            } catch (e) {
-              Logger.warn(
-                'Failed to read schema file: ${entity.path}, error: $e',
-                label: 'DataStoreImpl.getTableNames',
-              );
-            }
-          }
+      await _processSchemaFiles(config.getBasePath(), (schemaJson, path) {
+        final json = jsonDecode(schemaJson) as Map<String, dynamic>;
+        if (!json.containsKey('name')) {
+          json['_schemaPath'] = path;
         }
-      }
+        final schema = TableSchema.fromJson(json);
+        tables.add(schema.name);
+      });
 
       return tables.toList();
     } catch (e) {
@@ -3096,6 +3093,49 @@ class DataStoreImpl {
         label: 'DataStoreImpl.getTableNames',
       );
       rethrow;
+    }
+  }
+
+  Future<void> _processSchemaFiles(String dirPath,
+      Function(String schemaJson, String path) processFile) async {
+    if (kIsWeb) {
+      // web platform implementation
+      if (await storage.exists(dirPath)) {
+        final files = await storage.listDirectory(dirPath);
+        for (var file in files) {
+          if (file.endsWith('.schema')) {
+            try {
+              final schemaJson = await storage.readAsString(file);
+              if (schemaJson != null) {
+                processFile(schemaJson, file);
+              }
+            } catch (e) {
+              Logger.warn(
+                'Failed to read schema file: $file, error: $e',
+                label: 'DataStoreImpl._processSchemaFiles',
+              );
+            }
+          }
+        }
+      }
+    } else {
+      // native platform implementation
+      final dir = Directory(dirPath);
+      if (await dir.exists()) {
+        await for (var entity in dir.list()) {
+          if (entity is File && entity.path.endsWith('.schema')) {
+            try {
+              final schemaJson = await entity.readAsString();
+              processFile(schemaJson, entity.path);
+            } catch (e) {
+              Logger.warn(
+                'Failed to read schema file: ${entity.path}, error: $e',
+                label: 'DataStoreImpl._processSchemaFiles',
+              );
+            }
+          }
+        }
+      }
     }
   }
 
@@ -3115,10 +3155,11 @@ class DataStoreImpl {
   /// Check if table exists
   Future<bool> _tableExists(String tableName) async {
     try {
-      final globalSchemaFile = File(config.getSchemaPath(tableName, true));
-      final baseSchemaFile = File(config.getSchemaPath(tableName, false));
+      final globalSchemaPath = config.getSchemaPath(tableName, true);
+      final baseSchemaPath = config.getSchemaPath(tableName, false);
 
-      if (await globalSchemaFile.exists() || await baseSchemaFile.exists()) {
+      if (await storage.exists(globalSchemaPath) ||
+          await storage.exists(baseSchemaPath)) {
         try {
           await getTableSchema(tableName);
           return true;
@@ -3164,7 +3205,7 @@ class DataStoreImpl {
       await fileManager.writeRecords(
         tableName: tableName,
         records: records.values.toList(),
-        isSchemaChanged: true,
+        fullRewrite: true,
       );
 
       await _transactionManager!.commit(txn);
@@ -3198,7 +3239,7 @@ class DataStoreImpl {
       await fileManager.writeRecords(
         tableName: tableName,
         records: records.values.toList(),
-        isSchemaChanged: true,
+        fullRewrite: true,
       );
 
       await _transactionManager!.commit(txn);
@@ -3232,7 +3273,7 @@ class DataStoreImpl {
       await fileManager.writeRecords(
         tableName: tableName,
         records: records.values.toList(),
-        isSchemaChanged: true,
+        fullRewrite: true,
       );
 
       await _transactionManager!.commit(txn);
@@ -3495,7 +3536,7 @@ class DataStoreImpl {
       await fileManager.writeRecords(
         tableName: tableName,
         records: records.values.toList(),
-        isSchemaChanged: true,
+        fullRewrite: true,
       );
     } catch (e) {
       Logger.error(
@@ -3514,9 +3555,8 @@ class DataStoreImpl {
     try {
       final schema = await getTableSchema(tableName);
       final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      final dataFile = File(dataPath);
 
-      if (!await dataFile.exists()) {
+      if (!await storage.exists(dataPath)) {
         return null;
       }
 
@@ -3531,7 +3571,7 @@ class DataStoreImpl {
 
       // 2. Read from file
       var offset = 0;
-      final lines = await dataFile.readAsLines();
+      final lines = await storage.readLines(dataPath);
 
       for (var line in lines) {
         if (line.trim().isEmpty) {
@@ -3572,22 +3612,42 @@ class DataStoreImpl {
     try {
       final dataPath = config.getDataPath(
           tableName, (await getTableSchema(tableName)).isGlobal);
-      final file = File(dataPath);
 
-      if (!await file.exists()) return null;
+      if (!await storage.exists(dataPath)) return null;
 
-      final raf = await file.open(mode: FileMode.read);
-      try {
-        await raf.setPosition(pointer.offset);
-        final bytes = await raf.read(pointer.length);
-        final line = utf8.decode(bytes);
+      if (kIsWeb) {
+        final content = await storage.readAsString(dataPath);
+        if (content == null) return null;
 
-        if (pointer.verifyContent(line.trim())) {
-          return jsonDecode(line.trim()) as Map<String, dynamic>;
+        int currentPos = 0;
+        for (var line in content.split('\n')) {
+          if (currentPos <= pointer.offset &&
+              currentPos + line.length >= pointer.offset) {
+            if (pointer.verifyContent(line.trim())) {
+              return jsonDecode(line.trim()) as Map<String, dynamic>;
+            }
+            return null;
+          }
+          currentPos += line.length + 1; // +1 for newline
         }
         return null;
-      } finally {
-        await raf.close();
+      } else {
+        final file = File(dataPath);
+        if (!await file.exists()) return null;
+
+        final raf = await file.open(mode: FileMode.read);
+        try {
+          await raf.setPosition(pointer.offset);
+          final bytes = await raf.read(pointer.length);
+          final line = utf8.decode(bytes);
+
+          if (pointer.verifyContent(line.trim())) {
+            return jsonDecode(line.trim()) as Map<String, dynamic>;
+          }
+          return null;
+        } finally {
+          await raf.close();
+        }
       }
     } catch (e) {
       Logger.error(
@@ -3654,20 +3714,20 @@ class DataStoreImpl {
       // 4. create new schema
       final newSchema = schema.copyWith(autoIncrement: enabled);
 
-      // 5. get schema file
-      final schemaFile = File(config.getSchemaPath(tableName, schema.isGlobal));
+      // 5. get schema file path
+      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
 
       await _concurrencyManager!.acquireWriteLock(tableName);
       try {
         // 6. update schema file
-        await schemaFile.writeAsString(jsonEncode(newSchema));
+        await storage.writeAsString(schemaPath, jsonEncode(newSchema));
 
         // 7. if auto increment is enabled, create auto increment id file
         if (enabled) {
-          final maxIdFile =
-              File(config.getAutoIncrementPath(tableName, schema.isGlobal));
-          if (!await maxIdFile.exists()) {
-            await maxIdFile.writeAsString('0');
+          final maxIdPath =
+              config.getAutoIncrementPath(tableName, schema.isGlobal);
+          if (!await storage.exists(maxIdPath)) {
+            await storage.writeAsString(maxIdPath, '0');
           }
         }
 

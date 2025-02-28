@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
 import '../core/data_compressor.dart';
 import '../core/data_store_impl.dart';
@@ -20,15 +20,15 @@ class IntegrityChecker {
   Future<bool> checkTableStructure(String tableName) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
 
-      if (!await dataFile.exists()) {
+      if (!await _dataStore.storage.exists(dataPath)) {
         return false;
       }
 
       // check each record is valid
-      final lines = await dataFile.readAsLines();
+      final lines = await _dataStore.storage.readLines(dataPath);
       for (var line in lines) {
         try {
           final data = jsonDecode(line) as Map<String, dynamic>;
@@ -50,22 +50,22 @@ class IntegrityChecker {
   Future<bool> checkIndexIntegrity(String tableName) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
 
       // check each index file
       for (var index in schema.indexes) {
-        final indexFile = File(_dataStore.config.getIndexPath(
+        final indexPath = _dataStore.config.getIndexPath(
           tableName,
           index.actualIndexName,
           schema.isGlobal,
-        ));
-        if (!await indexFile.exists()) {
+        );
+        if (!await _dataStore.storage.exists(indexPath)) {
           return false;
         }
 
         // validate index content
-        if (!await _validateIndex(tableName, index, dataFile)) {
+        if (!await _validateIndex(tableName, index, dataPath)) {
           return false;
         }
       }
@@ -80,18 +80,19 @@ class IntegrityChecker {
   Future<bool> checkDataConsistency(String tableName) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-      final checksumFile =
-          File(_dataStore.config.getChecksumPath(tableName, schema.isGlobal));
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final checksumPath =
+          _dataStore.config.getChecksumPath(tableName, schema.isGlobal);
 
-      if (!await dataFile.exists() || !await checksumFile.exists()) {
+      if (!await _dataStore.storage.exists(dataPath) ||
+          !await _dataStore.storage.exists(checksumPath)) {
         return false;
       }
 
       // read checksum file
-      final lines = await dataFile.readAsLines();
-      final checksums = await checksumFile.readAsLines();
+      final lines = await _dataStore.storage.readLines(dataPath);
+      final checksums = await _dataStore.storage.readLines(checksumPath);
 
       if (lines.length != checksums.length) {
         return false;
@@ -118,9 +119,9 @@ class IntegrityChecker {
   Future<bool> checkForeignKeyConstraints(String tableName) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-      final lines = await dataFile.readAsLines();
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final lines = await _dataStore.storage.readLines(dataPath);
 
       for (var line in lines) {
         final data = jsonDecode(line) as Map<String, dynamic>;
@@ -156,17 +157,17 @@ class IntegrityChecker {
     final referencedTable = _inferReferencedTable(fieldName);
     try {
       final referencedSchema = await _loadTableSchema(referencedTable);
-      final dataFile = File(_dataStore.config.getDataPath(
+      final dataPath = _dataStore.config.getDataPath(
         referencedTable,
         referencedSchema.isGlobal,
-      ));
+      );
 
-      if (!await dataFile.exists()) {
+      if (!await _dataStore.storage.exists(dataPath)) {
         return false;
       }
 
       // find record in referenced table
-      final lines = await dataFile.readAsLines();
+      final lines = await _dataStore.storage.readLines(dataPath);
       for (var line in lines) {
         final record = jsonDecode(line) as Map<String, dynamic>;
         if (record[referencedSchema.primaryKey] == value) {
@@ -192,9 +193,9 @@ class IntegrityChecker {
   Future<bool> checkUniqueConstraints(String tableName) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final dataFile =
-          File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-      final lines = await dataFile.readAsLines();
+      final dataPath =
+          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final lines = await _dataStore.storage.readLines(dataPath);
 
       final uniqueValues = <String, Set<String>>{};
       for (var index in schema.indexes.where((idx) => idx.unique)) {
@@ -226,18 +227,16 @@ class IntegrityChecker {
 
     // Load schema from file
     final schemaPath = _dataStore.config.getSchemaPath(tableName, true);
-    final schemaFile = File(schemaPath);
-    if (!await schemaFile.exists()) {
+    if (!await _dataStore.storage.exists(schemaPath)) {
       final baseSchemaPath = _dataStore.config.getSchemaPath(tableName, false);
-      final baseSchemaFile = File(baseSchemaPath);
-      if (!await baseSchemaFile.exists()) {
+      if (!await _dataStore.storage.exists(baseSchemaPath)) {
         throw BusinessError(
           'Table schema not found: $tableName',
           type: BusinessErrorType.schemaError,
         );
       }
-      final content = await baseSchemaFile.readAsString();
-      final json = jsonDecode(content) as Map<String, dynamic>;
+      final content = await _dataStore.storage.readAsString(baseSchemaPath);
+      final json = jsonDecode(content!) as Map<String, dynamic>;
 
       if (!json.containsKey('name')) {
         json['name'] = tableName;
@@ -247,8 +246,8 @@ class IntegrityChecker {
       return schema;
     }
 
-    final content = await schemaFile.readAsString();
-    final json = jsonDecode(content) as Map<String, dynamic>;
+    final content = await _dataStore.storage.readAsString(schemaPath);
+    final json = jsonDecode(content!) as Map<String, dynamic>;
 
     if (!json.containsKey('name')) {
       json['name'] = tableName;
@@ -286,26 +285,26 @@ class IntegrityChecker {
   Future<bool> _validateIndex(
     String tableName,
     IndexSchema index,
-    File dataFile,
+    String dataPath,
   ) async {
     try {
       final schema = await _loadTableSchema(tableName);
-      final indexFile = File(_dataStore.config.getIndexPath(
+      final indexPath = _dataStore.config.getIndexPath(
         tableName,
         index.actualIndexName,
         schema.isGlobal,
-      ));
+      );
 
-      if (!await indexFile.exists()) {
+      if (!await _dataStore.storage.exists(indexPath)) {
         return false;
       }
 
-      final indexContent = await indexFile.readAsString();
-      final lines = await dataFile.readAsLines();
+      final indexContent = await _dataStore.storage.readAsString(indexPath);
+      final lines = await _dataStore.storage.readLines(dataPath);
 
       // check index record count is match
       final indexEntries =
-          indexContent.split('\n').where((line) => line.isNotEmpty);
+          indexContent!.split('\n').where((line) => line.isNotEmpty);
       final uniqueKeys = <String>{};
 
       for (var line in lines) {

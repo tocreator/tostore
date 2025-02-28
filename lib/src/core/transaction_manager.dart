@@ -1,6 +1,5 @@
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:io';
 
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
@@ -35,10 +34,11 @@ class TransactionManager {
     final schema = await _dataStore.getTableSchema(tableName);
     final logPath =
         _dataStore.config.getTransactionLogPath(tableName, schema.isGlobal);
-    final logFile = File(logPath);
-    await logFile.writeAsString(
+
+    await _dataStore.storage.writeAsString(
+      logPath,
       '${jsonEncode(logEntry)}\n',
-      mode: FileMode.append,
+      append: true,
     );
   }
 
@@ -124,13 +124,13 @@ class TransactionManager {
     final tableName = operation['table'] as String;
     final schema = await _dataStore.getTableSchema(tableName);
     final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
-    final dataFile = File(dataPath);
 
     switch (operation['type']) {
       case 'insert':
-        await dataFile.writeAsString(
+        await _dataStore.storage.writeAsString(
+          dataPath,
           '${jsonEncode(operation['data'])}\n',
-          mode: FileMode.append,
+          append: true,
         );
         break;
       // Handle other operation types...

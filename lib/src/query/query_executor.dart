@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
@@ -167,8 +168,7 @@ class QueryExecutor {
   /// perform table scan
   Future<List<Map<String, dynamic>>> _performTableScan(String tableName) async {
     final schema = await _dataStore.getTableSchema(tableName);
-    final dataFile =
-        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
 
     // get table schema to get primary key field
     final primaryKey = schema.primaryKey;
@@ -188,9 +188,9 @@ class QueryExecutor {
 
     // 2. read file content
     final resultMap = <String, Map<String, dynamic>>{};
-    if (await dataFile.exists()) {
-      // get file size
-      final fileSize = await dataFile.length();
+    if (await _dataStore.storage.exists(dataPath)) {
+      // get file size (for web storage, may need fallback if not directly supported)
+      final fileSize = await _getFileSize(tableName, dataPath);
       await _dataStore.fileManager.updateFileSize(tableName, fileSize);
 
       // if file size is within limit, read and cache
@@ -198,7 +198,7 @@ class QueryExecutor {
         tableName,
         _dataStore.config.maxTableCacheSize,
       )) {
-        final lines = await dataFile.readAsLines();
+        final lines = await _dataStore.storage.readLines(dataPath);
         for (var line in lines) {
           try {
             if (line.trim().isEmpty) continue;
@@ -231,6 +231,18 @@ class QueryExecutor {
     }
 
     return resultMap.values.toList();
+  }
+
+  /// get file size helper
+  Future<int> _getFileSize(String tableName, String path) async {
+    try {
+      final content = await _dataStore.storage.readAsString(path);
+      return content?.length ?? 0;
+    } catch (e) {
+      Logger.error('get file size failed: $e',
+          label: 'QueryExecutor._getFileSize');
+      return 0;
+    }
   }
 
   /// perform index scan
@@ -524,25 +536,52 @@ class QueryExecutor {
 
     // 2. read from file
     final schema = await _dataStore.getTableSchema(tableName);
-    final file =
-        File(_dataStore.config.getDataPath(tableName, schema.isGlobal));
-    if (!await file.exists()) return null;
-    try {
-      final raf = await file.open(mode: FileMode.read);
-      try {
-        await raf.setPosition(pointer.offset);
-        final bytes = await raf.read(pointer.length);
+    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
 
-        final line = utf8.decode(bytes);
-        final record = jsonDecode(line.trim()) as Map<String, dynamic>;
-        // verify record integrity
-        if (pointer.verifyContent(line.trim())) {
-          return record;
+    if (!await _dataStore.storage.exists(dataPath)) return null;
+
+    try {
+      if (kIsWeb) {
+        // For Web platform: read the entire file and extract the needed part
+        final content = await _dataStore.storage.readAsString(dataPath);
+        if (content == null || content.isEmpty) return null;
+
+        if (pointer.offset < content.length) {
+          final endOffset = pointer.offset + pointer.length;
+          final maxOffset = content.length;
+          final safeEndOffset = endOffset < maxOffset ? endOffset : maxOffset;
+
+          final lineSubstring =
+              content.substring(pointer.offset, safeEndOffset);
+          final line = lineSubstring.trim();
+
+          if (line.isNotEmpty) {
+            final record = jsonDecode(line) as Map<String, dynamic>;
+            if (pointer.verifyContent(line)) {
+              return record;
+            }
+          }
         }
-        return null;
-      } finally {
-        await raf.close();
+      } else {
+        final file = File(dataPath);
+        final raf = await file.open(mode: FileMode.read);
+        try {
+          await raf.setPosition(pointer.offset);
+          final bytes = await raf.read(pointer.length);
+
+          final line = utf8.decode(bytes);
+          final record = jsonDecode(line.trim()) as Map<String, dynamic>;
+          // verify record integrity
+          if (pointer.verifyContent(line.trim())) {
+            return record;
+          }
+          return null;
+        } finally {
+          await raf.close();
+        }
       }
+
+      return null;
     } catch (e) {
       Logger.error('read record failed: $e',
           label: 'QueryExecutor._getRecordByPointer');

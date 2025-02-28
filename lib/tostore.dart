@@ -206,14 +206,13 @@ class ToStore implements DataStoreInterface {
   /// ```dart
   /// // Using where condition
   /// await db.upsert('users', {'name': 'John'})
-  ///   .where('email', '=', 'john@example.com')
-  ///   .execute();
+  ///   .where('email', '=', 'john@example.com');
   ///
   /// // Using primary key in data
   /// await db.upsert('users', {
   ///   'id': 1,
   ///   'name': 'John'
-  /// }).execute();
+  /// });
   /// ```
   ///
   /// 自动存储数据，存在则更新，不存在则插入

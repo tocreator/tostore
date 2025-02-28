@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 
+## 1.9.0
+
+### Added
+- Web platform support using IndexedDB as storage backend
+- Storage abstraction layer unifying API across platforms
+
+### Changed
+- Optimized large file handling with chunked storage support
+
+### Fixed
+- Fixed file path handling issues in cross-platform environments
+
 ## 1.8.8
 
 ### Changed

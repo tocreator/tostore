@@ -80,3 +80,29 @@ Future<String> getPathApp() async {
   }
   return cachePath.path;
 }
+
+/// calculate utf8 length
+int calculateUtf8Length(String content) {
+  try {
+    return content.isEmpty ? 0 : utf8.encode(content).length;
+  } catch (e) {
+    Logger.error('UTF8 encode error: $e');
+    // downgrade: return character count (non-exact value)
+    return content.length;
+  }
+}
+
+/// calculate stream length
+Future<int> calculateStreamLength(Stream<String> stream) async {
+  int total = 0;
+  await for (final chunk in stream) {
+    total += calculateUtf8Length(chunk);
+  }
+  return total;
+}
+
+/// get file name utf8 byte length
+int fileNameByteLength(String path) {
+  final fileName = p.basename(path);
+  return calculateUtf8Length(fileName);
+}

@@ -1,5 +1,4 @@
 import 'dart:typed_data';
-import 'dart:io';
 
 import 'business_error.dart';
 
@@ -57,8 +56,11 @@ class TableSchema {
     } else {
       final schemaPath = json['_schemaPath'] as String?;
       if (schemaPath != null) {
-        final fileName = schemaPath.split(Platform.pathSeparator).last;
-        tableName = fileName.replaceAll('.schema', '');
+        final cleanPath =
+            schemaPath.replaceAll('.schema', '').replaceAll('.write.bak', '');
+        final normalizedPath = cleanPath.replaceAll('\\', '/');
+        final parts = normalizedPath.split('/');
+        tableName = parts.last;
       } else {
         throw const BusinessError(
           'Cannot determine table name from schema',

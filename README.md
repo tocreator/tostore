@@ -3,12 +3,11 @@
 English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/translations/README.ja.md) | [한국어](doc/translations/README.ko.md) | [Español](doc/translations/README.es.md) | [Português (Brasil)](doc/translations/README.pt-BR.md) | [Русский](doc/translations/README.ru.md) | [Deutsch](doc/translations/README.de.md) | [Français](doc/translations/README.fr.md) | [Italiano](doc/translations/README.it.md) | [Türkçe](doc/translations/README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
-ToStore is a fast, high-performance relational database and storage engine for Dart/Flutter applications. it provides both SQL and key-value data persistence with smart caching and efficient indexing. The multi-space architecture enables concurrent query capabilities and optimized local storage.
+ToStore is an intelligent storage engine that supports both relational and NoSQL database, smart caching, multi-space architecture, and file/local storage with SQL & key-value persistence. The multi-space architecture enables concurrent query capabilities and optimized local storage.
 
 
 
@@ -21,6 +20,7 @@ Built with mobile apps in mind, ToStore offers:
 - Concurrent access with optimized performance
 - Lightweight and easy to integrate
 - Automatic schema upgrades without manual version migration
+- Cross-Platform Support: Seamless operation on mobile, web, and desktop environments
 
 Implemented purely in Dart, ToStore achieves exceptional performance through B+ tree indexing and intelligent caching strategies. Enterprise-grade features like transaction protection, automatic repair, and incremental backup ensure reliable data storage for your applications.
 
