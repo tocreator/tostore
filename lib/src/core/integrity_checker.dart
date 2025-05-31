@@ -1,4 +1,4 @@
-import '../core/data_store_impl.dart';
+import 'data_store_impl.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../model/data_store_config.dart';

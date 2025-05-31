@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:tostore/src/core/lock_manager.dart';
-import '../backup/backup_manager.dart';
+import '../backup/backup_manager.dart'
+    if (dart.library.html) '../Interface/backup_manager_stub.dart';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
@@ -30,7 +31,7 @@ import '../query/query_optimizer.dart';
 import '../statistic/statistics_collector.dart';
 import 'transaction_manager.dart';
 import 'migration_manager.dart';
-import '../integrity/integrity_checker.dart';
+import 'integrity_checker.dart';
 import 'storage_adapter.dart';
 import 'key_manager.dart';
 import '../model/space_config.dart';
@@ -1205,6 +1206,7 @@ class DataStoreImpl {
 
   /// clear table
   Future<void> clear(String tableName) async {
+    await ensureInitialized();
     final schema = await getTableSchema(tableName);
     if (schema == null) {
       Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
@@ -1318,7 +1320,7 @@ class DataStoreImpl {
             .getTableDirectoryPath(tableName, spaceName: _currentSpaceName);
 
         // Delete table directory
-        if (tablePath != null && await storage.existsFile(tablePath)) {
+        if (tablePath != null && await storage.existsDirectory(tablePath)) {
           await storage.deleteDirectory(tablePath);
           Logger.info(
             'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
@@ -1395,7 +1397,6 @@ class DataStoreImpl {
   /// Get table schema
   Future<TableSchema?> getTableSchema(String tableName) async {
     try {
-      await ensureInitialized();
       // 1. Try to get from cache first
       final cachedSchema = dataCacheManager.getSchema(tableName);
       if (cachedSchema != null) {
@@ -2015,6 +2016,7 @@ class DataStoreImpl {
 
   /// Get table info
   Future<TableInfo?> getTableInfo(String tableName) async {
+    await ensureInitialized();
     final schema = await getTableSchema(tableName);
     if (schema == null) {
       Logger.error('Table $tableName does not exist',

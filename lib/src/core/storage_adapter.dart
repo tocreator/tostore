@@ -1,11 +1,14 @@
 import 'package:flutter/foundation.dart';
 import '../model/data_store_config.dart';
-import 'file_storage_impl.dart';
 import '../Interface/storage_interface.dart';
 import 'lock_manager.dart';
+import 'package:path/path.dart' as path;
+
+// Import platform-specific implementations with conditional imports
 import 'web_storage_impl.dart'
     if (dart.library.io) '../Interface/web_storage_impl_stub.dart';
-import 'package:path/path.dart' as path;
+import '../Interface/file_storage_impl_stub.dart'
+    if (dart.library.io) 'file_storage_impl.dart';
 
 /// Storage adapter to handle platform-specific storage implementations
 class StorageAdapter implements StorageInterface {

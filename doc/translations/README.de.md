@@ -48,67 +48,11 @@ Tostore ist eine plattformübergreifende Datenbank-Engine mit verteilter Archite
 | ✅ Atomare Migrationsoperationen gewährleisten Datenkonsistenz | ❌ Migrationsunterbrechungen können zu Dateninkonsistenzen führen |
 | ✅ Vollautomatisierte Schemaaktualisierungen ohne manuelle Eingriffe | ❌ Komplexe Upgrade-Logik und hohe Wartungskosten mit zunehmender Versionszahl |
 
-### 5. Multi-Space-Architektur vs. einzelner Speicherraum
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Multi-Space-Architektur, isoliert Daten verschiedener Benutzer perfekt | ❌ Einzelner Speicherraum, gemischte Speicherung von Daten mehrerer Benutzer |
-| ✅ Space-Wechsel mit einer Codezeile, einfach und effizient | ❌ Erfordert mehrere Datenbankinstanzen oder komplexe Isolationslogik |
-| ✅ Flexibler Mechanismus für Space-Isolation und globale Datenfreigabe | ❌ Schwierig, Isolierung und Freigabe von Benutzerdaten auszubalancieren |
-| ✅ Einfache API zum Kopieren oder Migrieren von Daten zwischen Spaces | ❌ Komplexe Operationen für Tenant-Migration oder Datenkopie |
-| ✅ Abfragen werden automatisch auf den aktuellen Space beschränkt, keine zusätzliche Filterung nötig | ❌ Abfragen für verschiedene Benutzer erfordern komplexe Filterung |
 
-### 6. Plattformübergreifende Unterstützung vs. Plattformbeschränkungen
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Einheitliche API über Linux-, Web-, Mobile-, Desktop-Plattformen | ❌ Verschiedene Plattformen erfordern unterschiedliche Speicher-Engines und APIs |
-| ✅ Automatische Anpassung an verschiedene plattformübergreifende Speicher-Backends, konsistente Entwicklungserfahrung | ❌ Plattformübergreifende Entwicklung muss Plattformunterschiede handhaben |
-| ✅ Einmal definieren, Datenmodelle auf allen Plattformen verwenden | ❌ Erfordert Neugestaltung von Datenmodellen für verschiedene Plattformen |
-| ✅ Optimierte plattformübergreifende Leistung, konsistente Benutzererfahrung | ❌ Inkonsistente Leistungsmerkmale zwischen Plattformen |
-| ✅ Einheitliche Sicherheitsstandards über alle Plattformen implementiert | ❌ Plattformspezifische Sicherheitsmechanismen und Konfigurationen |
 
-### 7. Verteilte Primärschlüsselalgorithmen vs. traditionelle Auto-Increment-IDs
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Vier verteilte Primärschlüsselalgorithmen für verschiedene Szenarioanforderungen | ❌ Einfache Auto-Increment-IDs, anfällig für Konflikte in Cluster-Umgebungen |
-| ✅ Verteilte ID-Generierung, unterstützt extrem hohe Paralleloperationen | ❌ Serielle ID-Generierung wird zum Engpass bei hoher Parallelität |
-| ✅ Zufällige Schrittlänge und verteilte Algorithmen verhindern Offenlegung des Geschäftsumfangs | ❌ IDs lecken Geschäftsvolumeninformationen, erzeugen Sicherheitsrisiken |
-| ✅ Von Kurzcodes bis Zeitstempeln, erfüllt verschiedene Lesbarkeits- und Leistungsanforderungen | ❌ Begrenzte ID-Typen und Anpassungsoptionen |
 
-### 8. Streaming-Datenverarbeitung vs. Batch-Loading
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Streaming-Abfrageschnittstelle, On-Demand-Datenverarbeitung, geringer Speicherverbrauch | ❌ Lädt alle Ergebnisse auf einmal, anfällig für OOM bei großen Datensätzen |
-| ✅ Unterstützung für asynchrone Iteration und reaktive Programmiermuster | ❌ Synchrones Verarbeitungsmodell blockiert UI-Thread, beeinträchtigt Benutzererfahrung |
-| ✅ Parallele Verarbeitung von Streaming-Daten, maximale Nutzung der Mehrkernleistung | ❌ Sequentielle Verarbeitung von Massendaten, niedrige CPU-Auslastung |
-| ✅ Unterstützung für Datenpipelines und Transformationsoperationen | ❌ Erfordert benutzerdefinierte Implementierung der Datenverarbeitungslogik |
-| ✅ Integrierte Drosselungs- und Backpressure-Handhabungsmechanismen | ❌ Mangelnde Flusskontrolle, leichte Ressourcenerschöpfung |
 
-### 9. Intelligente Caching-Strategien vs. traditionelles Caching
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Mehrstufige intelligente Caching-Strategien, adaptiv an Zugriffsmuster | ❌ Einfaches LRU-Caching, mangelnde Flexibilität |
-| ✅ Automatische Anpassung der Caching-Strategie basierend auf Nutzungsmustern | ❌ Feste Cache-Konfiguration, schwierig dynamisch anzupassen |
-| ✅ Startup-Caching-Mechanismus reduziert Kaltstartzeiten drastisch | ❌ Kein Startup-Cache, langsame Kaltstarts, Cache muss neu aufgebaut werden |
-| ✅ Speicher-Engine tief mit Cache integriert für optimale Leistung | ❌ Getrennte Caching- und Speicherlogik, erfordert zusätzliche Synchronisationsmechanismen |
-| ✅ Automatische Cache-Synchronisierung und Invalidierungsverwaltung, kein zusätzlicher Code nötig | ❌ Cache-Konsistenz erfordert manuelle Wartung, fehleranfällig |
 
-### 10. Serverlose Architektur vs. traditionelle Serverabhängigkeit
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Eingebettetes Design, keine zusätzlichen Server oder Konfigurationen erforderlich | ❌ Erfordert separaten Datenbankserver oder Cloud-Dienst |
-| ✅ Null Wartungskosten, in Anwendung eingebettete Datenschicht | ❌ Erfordert dedizierte DBAs und Betriebsteams |
-| ✅ Kann offline arbeiten, keine Abhängigkeit von Netzwerkverbindungen | ❌ Abhängig von Netzwerkzuverlässigkeit, unbrauchbar in Offline-Szenarien |
-| ✅ Einfache Bereitstellung, Anwendung umfasst vollständige Datenfunktionalität | ❌ Komplexe Serverkonfiguration und Verbindungsverwaltung |
-| ✅ Kombiniert Unabhängigkeit mit verteilten Skalierungsfähigkeiten | ❌ Entweder einfach ohne Skalierbarkeit oder komplex und schwer zu warten |
-
-### 11. Intelligente Ressourcenoptimierung vs. feste Ressourcenzuweisung
-| Tostore | Traditionelle Datenbanken |
-|:---------|:-----------|
-| ✅ Dynamische Anpassung des Ressourcenverbrauchs basierend auf tatsächlichen Anforderungen | ❌ Feste Ressourcenzuweisung unabhängig von der Arbeitslast |
-| ✅ Automatische Anpassung der Parallelität basierend auf Gerätefähigkeiten | ❌ Berücksichtigt keine Gerätefähigkeiten, komplex und schwer zu optimieren |
-| ✅ Intelligente Batch-Verarbeitungsstrategien, automatische Optimierung von Batch-Operationen | ❌ Erfordert manuelle Implementierung von Batch-Verarbeitungslogik, mühsam und fehleranfällig |
-| ✅ Speichernutzung entspricht dem aktiven Datenvolumen, unabhängig vom Gesamtdatenvolumen | ❌ Speichernutzung stark korreliert mit der Gesamtdatenbankgröße |
-| ✅ Automatischer Ausgleich zwischen Energieverbrauch und Leistung, mobilfreundlich | ❌ Nicht optimiert für batteriebetriebene Geräte, hoher Energieverbrauch und Wärmeerzeugung |
 
 ## Technische Highlights
 

@@ -48,67 +48,11 @@ Tostore è un motore di database con architettura distribuita multipiattaforma p
 | ✅ Operazioni di migrazione atomiche che garantiscono la coerenza dei dati | ❌ Le interruzioni della migrazione possono causare incoerenze dei dati |
 | ✅ Aggiornamenti dello schema completamente automatizzati senza intervento manuale | ❌ Logica di aggiornamento complessa e costi di manutenzione elevati con l'aumento delle versioni |
 
-### 5. Architettura multi-spazio vs. spazio di archiviazione singolo
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Architettura multi-spazio, che isola perfettamente i dati di diversi utenti | ❌ Spazio di archiviazione singolo, archiviazione mista dei dati di più utenti |
-| ✅ Cambio di spazio con una linea di codice, semplice ed efficace | ❌ Richiede più istanze di database o una logica di isolamento complessa |
-| ✅ Meccanismo flessibile di isolamento degli spazi e condivisione dei dati globali | ❌ Difficile bilanciare isolamento e condivisione dei dati utente |
-| ✅ API semplice per copiare o migrare dati tra spazi | ❌ Operazioni complesse di migrazione o copia dei dati tra tenant |
-| ✅ Query automaticamente limitate allo spazio corrente, nessun bisogno di filtraggio aggiuntivo | ❌ Le query per diversi utenti richiedono un filtraggio complesso |
 
-### 6. Supporto multipiattaforma vs. limitazioni di piattaforma
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ API unificata sulle piattaforme Linux, Web, Mobile, Desktop | ❌ Piattaforme diverse richiedono diversi motori di archiviazione e API |
-| ✅ Adattamento automatico a vari backend di archiviazione multipiattaforma, esperienza di sviluppo coerente | ❌ Lo sviluppo multipiattaforma deve gestire le differenze tra piattaforme |
-| ✅ Definire una volta, utilizzare i modelli di dati su tutte le piattaforme | ❌ Richiede di riprogettare i modelli di dati per piattaforme diverse |
-| ✅ Prestazioni multipiattaforma ottimizzate, mantiene un'esperienza utente coerente | ❌ Caratteristiche di prestazioni incoerenti tra piattaforme |
-| ✅ Standard di sicurezza unificati implementati su tutte le piattaforme | ❌ Meccanismi e configurazioni di sicurezza specifici per piattaforma |
 
-### 7. Algoritmi di chiavi primarie distribuite vs. ID auto-incrementali tradizionali
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Quattro algoritmi di chiavi primarie distribuite adatti a vari requisiti di scenario | ❌ ID auto-incrementali semplici, soggetti a conflitti negli ambienti cluster |
-| ✅ Generazione di ID distribuita, supporta operazioni parallele estremamente elevate | ❌ La generazione di ID in serie diventa un collo di bottiglia in alto parallelismo |
-| ✅ Lunghezza di passo casuale e algoritmi distribuiti che evitano l'esposizione della scala aziendale | ❌ Gli ID rivelano informazioni sul volume di affari, creando rischi per la sicurezza |
-| ✅ Dai codici brevi ai timestamp, soddisfa vari requisiti di leggibilità e prestazioni | ❌ Tipi di ID limitati e opzioni di personalizzazione |
 
-### 8. Elaborazione dei dati in streaming vs. caricamento in batch
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Interfaccia di query in streaming, elaborazione dei dati on-demand, basso utilizzo della memoria | ❌ Carica tutti i risultati in una volta, suscettibile a OOM con grandi set di dati |
-| ✅ Supporto per l'iterazione asincrona e i pattern di programmazione reattiva | ❌ Il modello di elaborazione sincrona blocca il thread UI, influenzando l'esperienza utente |
-| ✅ Elaborazione parallela dei dati in streaming, massimizza le prestazioni multi-core | ❌ Elaborazione sequenziale dei dati massivi, basso utilizzo della CPU |
-| ✅ Supporto per pipeline di dati e operazioni di trasformazione | ❌ Richiede un'implementazione personalizzata della logica di elaborazione dei dati |
-| ✅ Meccanismi integrati di limitazione e gestione della contropressione | ❌ Mancanza di controllo del flusso, facile esaurimento delle risorse |
 
-### 9. Strategie di cache intelligente vs. cache tradizionale
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Strategie di cache intelligente multilivello, adattive ai pattern di accesso | ❌ Cache LRU semplice, mancanza di flessibilità |
-| ✅ Regolazione automatica della strategia di cache basata sui pattern di utilizzo | ❌ Configurazione di cache fissa, difficile da regolare dinamicamente |
-| ✅ Meccanismo di cache di avvio che riduce drasticamente i tempi di avvio a freddo | ❌ Nessuna cache di avvio, avvii a freddo lenti, necessità di ricostruire la cache |
-| ✅ Motore di archiviazione profondamente integrato con la cache per prestazioni ottimali | ❌ Logica di cache e archiviazione separata, che richiede meccanismi di sincronizzazione aggiuntivi |
-| ✅ Gestione automatica della sincronizzazione e invalidazione della cache, nessun codice aggiuntivo necessario | ❌ La coerenza della cache richiede manutenzione manuale, soggetta a errori |
 
-### 10. Architettura serverless vs. dipendenza dal server tradizionale
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Design embedded, nessun bisogno di server o configurazioni aggiuntive | ❌ Richiede un server di database separato o un servizio cloud |
-| ✅ Costo di manutenzione zero, livello dati integrato nell'applicazione | ❌ Richiede DBA dedicati e team operativi |
-| ✅ Capace di funzionare offline, nessuna dipendenza dalla connettività di rete | ❌ Dipende dall'affidabilità della rete, inutilizzabile negli scenari offline |
-| ✅ Deployment semplice, l'applicazione include tutte le funzionalità di dati | ❌ Configurazione del server complessa e gestione delle connessioni |
-| ✅ Combina indipendenza e capacità di estensione distribuita | ❌ O semplice senza scalabilità, o complesso e difficile da mantenere |
-
-### 11. Ottimizzazione intelligente delle risorse vs. allocazione fissa delle risorse
-| Tostore | Database tradizionali |
-|:---------|:-----------|
-| ✅ Regolazione dinamica del consumo di risorse basata sulle richieste reali | ❌ Allocazione fissa delle risorse indipendentemente dal carico di lavoro |
-| ✅ Regolazione automatica del parallelismo basata sulle capacità del dispositivo | ❌ Non tiene conto delle capacità del dispositivo, complesso e difficile da ottimizzare |
-| ✅ Strategie intelligenti di elaborazione in batch, ottimizza automaticamente le operazioni in batch | ❌ Richiede un'implementazione manuale della logica di elaborazione in batch, laborioso e soggetto a errori |
-| ✅ Utilizzo della memoria corrispondente al volume di dati attivi, indipendente dal volume totale dei dati | ❌ Utilizzo della memoria fortemente correlato alla dimensione totale del database |
-| ✅ Bilancia automaticamente il consumo di energia e le prestazioni, adatto ai dispositivi mobili | ❌ Non ottimizzato per i dispositivi a batteria, alto consumo energetico e generazione di calore |
 
 ## Punti di forza tecnici
 

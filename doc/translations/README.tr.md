@@ -48,67 +48,7 @@ Tostore, projenize derinlemesine entegre edilmiş çok platformlu dağıtık mim
 | ✅ Veri tutarlılığını garanti eden atomik göç işlemleri | ❌ Göç kesintileri veri tutarsızlıklarına neden olabilir |
 | ✅ Manuel müdahale olmadan tamamen otomatik şema güncellemeleri | ❌ Sürümler arttıkça karmaşık yükseltme mantığı ve yüksek bakım maliyetleri |
 
-### 5. Çoklu Alan Mimarisi vs. Tek Depolama Alanı
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Çoklu alan mimarisi, farklı kullanıcıların verilerini mükemmel şekilde izole eder | ❌ Tek depolama alanı, birden çok kullanıcının verilerinin karışık depolanması |
-| ✅ Tek satır kodla alan değiştirme, basit ve etkili | ❌ Birden çok veritabanı örneği veya karmaşık izolasyon mantığı gerektirir |
-| ✅ Esnek alan izolasyonu ve global veri paylaşım mekanizması | ❌ Kullanıcı verilerinin izolasyonu ve paylaşımını dengelemek zor |
-| ✅ Alanlar arasında veri kopyalama veya taşıma için basit API | ❌ Kiracılar arasında karmaşık veri geçiş veya kopyalama işlemleri |
-| ✅ Sorgular otomatik olarak mevcut alanla sınırlıdır, ek filtreleme gerekmez | ❌ Farklı kullanıcılar için sorgular karmaşık filtreleme gerektirir |
 
-### 6. Çoklu Platform Desteği vs. Platform Sınırlamaları
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Linux, Web, Mobil, Masaüstü platformlarında birleşik API | ❌ Farklı platformlar farklı depolama motorları ve API'ler gerektirir |
-| ✅ Çeşitli çok platformlu depolama backend'lerine otomatik adaptasyon, tutarlı geliştirme deneyimi | ❌ Çok platformlu geliştirme platform farklılıklarını yönetmelidir |
-| ✅ Bir kez tanımla, tüm platformlarda veri modellerini kullan | ❌ Farklı platformlar için veri modellerini yeniden tasarlama gerekliliği |
-| ✅ Optimize edilmiş çok platformlu performans, tutarlı kullanıcı deneyimini korur | ❌ Platformlar arasında tutarsız performans özellikleri |
-| ✅ Tüm platformlarda uygulanan birleşik güvenlik standartları | ❌ Platforma özgü güvenlik mekanizmaları ve yapılandırmaları |
-
-### 7. Dağıtık Birincil Anahtar Algoritmaları vs. Geleneksel Otomatik Artan ID'ler
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Çeşitli senaryo gereksinimlerine uygun dört dağıtık birincil anahtar algoritması | ❌ Basit otomatik artan ID'ler, küme ortamlarında çakışmalara maruz kalır |
-| ✅ Dağıtık ID oluşturma, son derece yüksek paralel işlemleri destekler | ❌ Seri ID oluşturma yüksek paralellikte darboğaz haline gelir |
-| ✅ İş ölçeğinin açığa çıkmasını önleyen rastgele adım uzunluğu ve dağıtık algoritmalar | ❌ ID'ler iş hacmi hakkında bilgi ifşa eder, güvenlik riskleri oluşturur |
-| ✅ Kısa kodlardan zaman damgalarına, çeşitli okunabilirlik ve performans gereksinimlerini karşılar | ❌ Sınırlı ID türleri ve özelleştirme seçenekleri |
-
-### 8. Akış Veri İşleme vs. Toplu Yükleme
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Akış sorgu arayüzü, talep üzerine veri işleme, düşük bellek kullanımı | ❌ Tüm sonuçları bir kerede yükler, büyük veri kümeleriyle OOM'a duyarlı |
-| ✅ Asenkron yineleme ve reaktif programlama modellerine destek | ❌ Senkron işleme modeli UI iş parçacığını engeller, kullanıcı deneyimini etkiler |
-| ✅ Akış verilerinin paralel işlenmesi, çok çekirdekli performansı en üst düzeye çıkarır | ❌ Büyük verilerin sıralı işlenmesi, düşük CPU kullanımı |
-| ✅ Veri hatları ve dönüşüm işlemlerine destek | ❌ Özel veri işleme mantığı uygulaması gerektirir |
-| ✅ Yerleşik hız sınırlama ve geri basınç yönetimi mekanizmaları | ❌ Akış kontrolü eksikliği, kolay kaynak tükenmesi |
-
-### 9. Akıllı Önbellek Stratejileri vs. Geleneksel Önbellek
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Erişim kalıplarına uyarlanabilir çok seviyeli akıllı önbellek stratejileri | ❌ Basit LRU önbelleği, esneklik eksikliği |
-| ✅ Kullanım kalıplarına dayalı otomatik önbellek strateji ayarlaması | ❌ Sabit önbellek yapılandırması, dinamik olarak ayarlanması zor |
-| ✅ Soğuk başlatma sürelerini önemli ölçüde azaltan başlatma önbellek mekanizması | ❌ Başlatma önbelleği yok, yavaş soğuk başlatmalar, önbelleği yeniden oluşturma ihtiyacı |
-| ✅ Optimal performans için önbellekle derinlemesine entegre depolama motoru | ❌ Ayrı önbellek ve depolama mantığı, ek senkronizasyon mekanizmaları gerektirir |
-| ✅ Otomatik önbellek senkronizasyonu ve geçersiz kılma yönetimi, ek kod gerekmez | ❌ Önbellek tutarlılığı manuel bakım gerektirir, hatalara açık |
-
-### 10. Sunucusuz Mimari vs. Geleneksel Sunucu Bağımlılığı
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Gömülü tasarım, ek sunucular veya yapılandırmalar gerekmez | ❌ Ayrı bir veritabanı sunucusu veya bulut hizmeti gerektirir |
-| ✅ Sıfır bakım maliyeti, uygulamaya entegre veri katmanı | ❌ Özel DBA'lar ve operasyon ekipleri gerektirir |
-| ✅ Çevrimdışı çalışabilir, ağ bağlantısına bağımlılık yok | ❌ Ağ güvenilirliğine bağlıdır, çevrimdışı senaryolarda kullanılamaz |
-| ✅ Basit dağıtım, uygulama tüm veri özelliklerini içerir | ❌ Karmaşık sunucu yapılandırması ve bağlantı yönetimi |
-| ✅ Bağımsızlık ve dağıtık ölçeklendirme yeteneklerini birleştirir | ❌ Ya ölçeklenebilirlik olmadan basit, ya da karmaşık ve bakımı zor |
-
-### 11. Akıllı Kaynak Optimizasyonu vs. Sabit Kaynak Tahsisi
-| Tostore | Geleneksel Veritabanları |
-|:---------|:-----------|
-| ✅ Gerçek taleplere dayalı dinamik kaynak tüketimi ayarlaması | ❌ İş yükünden bağımsız sabit kaynak tahsisi |
-| ✅ Cihaz yeteneklerine dayalı otomatik paralellik ayarlaması | ❌ Cihaz yeteneklerini dikkate almaz, karmaşık ve optimize edilmesi zor |
-| ✅ Akıllı toplu işlem stratejileri, toplu işlemleri otomatik olarak optimize eder | ❌ Toplu işleme mantığının manuel uygulamasını gerektirir, zahmetli ve hatalara açık |
-| ✅ Bellek kullanımı aktif veri hacmine karşılık gelir, toplam veri hacminden bağımsız | ❌ Bellek kullanımı toplam veritabanı boyutuyla yüksek oranda ilişkili |
-| ✅ Enerji tüketimi ve performansı otomatik olarak dengeler, mobil cihazlara uygun | ❌ Pil ile çalışan cihazlar için optimize edilmemiş, yüksek enerji tüketimi ve ısı üretimi |
 
 ## Teknik Öne Çıkan Özellikler
 

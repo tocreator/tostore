@@ -162,11 +162,11 @@ class QueryExecutor {
   ]) async {
     List<Map<String, dynamic>> results = [];
     // Save original conditions to apply after JOIN
-    final originalConditions = condition?.build() ?? {};
+    final Map<String, dynamic> originalConditions = condition?.build() ?? {};
     Map<String, dynamic> remainingConditions =
         Map<String, dynamic>.from(originalConditions);
 
-    for (var operation in plan.operations) {
+    for (QueryOperation operation in plan.operations) {
       switch (operation.type) {
         case QueryOperationType.tableScan:
           // Scan the main table, only apply main table related conditions

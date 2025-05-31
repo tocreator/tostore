@@ -1,5 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
+// Use dart:io only when not on web platform
+import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'package:path/path.dart' as p;
 
 import 'package:flutter/foundation.dart';

@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:async';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';

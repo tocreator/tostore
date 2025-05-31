@@ -197,16 +197,19 @@ class TostoreExample {
     // create database instance
     final db = ToStore(
       config: DataStoreConfig(
-          enableEncoding: true, // enable security encoding for table data
-          encodingKey: 'YouEncodingKey', // encoding key, can be adjusted
-          encryptionKey:
-              'YouEncryptionKey', // encryption key, note: adjusting this key will make it impossible to decode old data
-          distributedNodeConfig: const DistributedNodeConfig(
-            enableDistributed: true, // enable distributed mode
-            clusterId: 1, // configure cluster id
-            centralServerUrl: 'http://127.0.0.1:8080',
-            accessToken: 'b7628a4f9b4d269b98649129',
-          )),
+        enableEncoding: true, // enable security encoding for table data
+        encodingKey: 'YouEncodingKey', // encoding key, can be adjusted
+        encryptionKey:
+            'YouEncryptionKey', // encryption key, note: adjusting this key will make it impossible to decode old data
+        distributedNodeConfig: const DistributedNodeConfig(
+          enableDistributed: true, // enable distributed mode
+          clusterId: 1, // configure cluster id
+          centralServerUrl: 'http://127.0.0.1:8080',
+          accessToken: 'b7628a4f9b4d269b98649129',
+        ),
+        enableLog: true, // enable log
+        logLevel: LogLevel.warn, // log level
+      ),
     );
 
     // create tables

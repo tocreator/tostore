@@ -117,7 +117,7 @@ class DataStoreConfig {
     int? maxStartupIndexCacheSize,
     int? maxSchemaCacheSize,
     this.enableLog = true,
-    this.logLevel = LogLevel.debug,
+    this.logLevel = LogLevel.warn,
     int? maxConcurrent,
     DistributedNodeConfig? distributedNodeConfig,
     int? maxFlushBatchSize,

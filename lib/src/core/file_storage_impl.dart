@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:tostore/src/handler/common.dart';

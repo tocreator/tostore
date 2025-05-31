@@ -56,58 +56,7 @@ Tostore is a cross-platform distributed architecture database engine deeply inte
 | ✅ Simple API for copying or migrating data between spaces | ❌ Complex operations for tenant migration or data copying |
 | ✅ Queries automatically limited to current space, no additional filtering needed | ❌ Queries for different users require complex filtering |
 
-### 6. Cross-Platform Support vs. Platform Limitations
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Unified API across Linux, Web, Mobile, Desktop platforms | ❌ Different platforms require different storage engines and APIs |
-| ✅ Automatic adaptation to various cross-platform storage backends, consistent development experience | ❌ Cross-platform development must handle platform differences |
-| ✅ Define once, use data models across all platforms | ❌ Requires redesigning data models for different platforms |
-| ✅ Optimized cross-platform performance, maintains consistent user experience | ❌ Inconsistent performance characteristics across platforms |
-| ✅ Unified security standards implemented across all platforms | ❌ Platform-specific security mechanisms and configurations |
 
-### 7. Distributed Primary Key Algorithms vs. Traditional Auto-Increment IDs
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Four distributed primary key algorithms suited to various scenario requirements | ❌ Simple auto-increment IDs, subject to conflicts in cluster environments |
-| ✅ Distributed ID generation, supports extremely high parallel operations | ❌ Serial ID generation becomes bottleneck in high parallelism |
-| ✅ Random step length and distributed algorithms avoiding exposure of business scale | ❌ IDs leak business volume information, creating security risks |
-| ✅ From short codes to timestamps, satisfies various readability and performance requirements | ❌ Limited ID types and customization options |
-
-### 8. Streaming Data Processing vs. Batch Loading
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Streaming query interface, on-demand data processing, low memory usage | ❌ Loads all results at once, susceptible to OOM with large datasets |
-| ✅ Support for asynchronous iteration and reactive programming patterns | ❌ Synchronous processing model blocks UI thread, affecting user experience |
-| ✅ Parallel processing of streaming data, maximizes multi-core performance | ❌ Sequential processing of massive data, low CPU utilization |
-| ✅ Support for data pipelines and transformation operations | ❌ Requires custom implementation of data processing logic |
-| ✅ Built-in throttling and backpressure handling mechanisms | ❌ Lack of flow control, easy resource exhaustion |
-
-### 9. Intelligent Caching Strategies vs. Traditional Caching
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Multi-level intelligent caching strategies, adaptive to access patterns | ❌ Simple LRU caching, lack of flexibility |
-| ✅ Automatic caching strategy adjustment based on usage patterns | ❌ Fixed cache configuration, difficult to adjust dynamically |
-| ✅ Startup caching mechanism dramatically reducing cold start times | ❌ No startup cache, slow cold starts, need to rebuild cache |
-| ✅ Storage engine deeply integrated with cache for optimal performance | ❌ Separate caching and storage logic, requiring additional synchronization mechanisms |
-| ✅ Automatic cache synchronization and invalidation management, no additional code needed | ❌ Cache consistency requires manual maintenance, prone to errors |
-
-### 10. Serverless Architecture vs. Traditional Server Dependency
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Embedded design, no need for additional servers or configurations | ❌ Requires separate database server or cloud service |
-| ✅ Zero maintenance cost, application-embedded data layer | ❌ Requires dedicated DBAs and operations teams |
-| ✅ Capable of offline operation, no dependency on network connectivity | ❌ Depends on network reliability, unusable in offline scenarios |
-| ✅ Simple deployment, application includes full data functionality | ❌ Complex server configuration and connection management |
-| ✅ Combines independence with distributed scaling capabilities | ❌ Either simple without scalability, or complex and difficult to maintain |
-
-### 11. Intelligent Resource Optimization vs. Fixed Resource Allocation
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Dynamic adjustment of resource consumption based on actual demands | ❌ Fixed resource allocation regardless of workload |
-| ✅ Automatic parallelism adjustment based on device capabilities | ❌ Doesn't account for device capabilities, complex and difficult to optimize |
-| ✅ Intelligent batch processing strategies, automatically optimizes batch operations | ❌ Requires manual implementation of batch processing logic, laborious and error-prone |
-| ✅ Memory usage corresponding to active data volume, independent of total data volume | ❌ Memory usage highly correlated with total database size |
-| ✅ Automatically balances power consumption and performance, mobile-friendly | ❌ Not optimized for battery-powered devices, high energy consumption and heat generation |
 
 ## Technical Highlights
 

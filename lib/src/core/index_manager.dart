@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:isolate';
+import '../Interface/isolate_provider.dart';
 import 'dart:math';
 
 import '../handler/logger.dart';
@@ -1754,10 +1754,31 @@ class IndexManager {
     }
   }
 
+  /// Check if running in a WASM environment
+  static bool get isWasmPlatform {
+    try {
+      // In Dart 3 with WASM support, you can detect WASM with this:
+      return const bool.fromEnvironment('dart.library.wasm',
+          defaultValue: false);
+    } catch (e) {
+      return false;
+    }
+  }
+
   /// Build index using Isolate (for large data)
   Future<void> _buildIndexWithIsolate(String tableName, String indexName,
       List<String> fields, IndexMeta meta) async {
     try {
+      // For WASM platforms, use the main thread with smaller batches instead of Isolate
+      if (isWasmPlatform) {
+        Logger.info('Running on WASM platform, using main thread for indexing',
+            label: 'IndexManager._buildIndexWithIsolate');
+
+        // Use a more efficient approach for WASM without isolates
+        await _buildIndexOnMainThread(tableName, indexName, fields, meta);
+        return;
+      }
+
       // Pre-calculate all required paths
       final tableDataDirPath =
           await _dataStore.pathManager.getDataDirPath(tableName);
@@ -3679,6 +3700,15 @@ class IndexManager {
       return;
     }
 
+    // For WASM platforms, use the main thread instead of Isolate
+    if (isWasmPlatform) {
+      Logger.info(
+          'Running on WASM platform, using main thread for weight processing',
+          label: 'IndexManager._processWeightsWithIsolate');
+      await _calculateWeightsDecay();
+      return;
+    }
+
     try {
       // Prepare data to pass to Isolate
       final weightsData = <String, Map<String, dynamic>>{};
@@ -3988,5 +4018,235 @@ class IndexManager {
 
     Logger.debug('Index manager close preparation completed',
         label: 'IndexManager.prepareForClose');
+  }
+
+  /// Build index on the main thread (for WASM platform or small data)
+  Future<void> _buildIndexOnMainThread(String tableName, String indexName,
+      List<String> fields, IndexMeta meta) async {
+    try {
+      Logger.debug('Building index on main thread: $tableName.$indexName',
+          label: 'IndexManager._buildIndexOnMainThread');
+
+      // Create B+ tree
+      final btree = BPlusTree(
+        order: meta.bTreeOrder,
+        isUnique: meta.isUnique,
+      );
+
+      // Get table schema
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        throw Exception('Table schema not found: $tableName');
+      }
+
+      final primaryKey = schema.primaryKey;
+      final isGlobal = schema.isGlobal;
+
+      // Process records in smaller batches
+      int totalProcessed = 0;
+      const chunkSize = 200; // Smaller batch size for WASM
+
+      // Get table metadata
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableFileMeta(tableName);
+
+      if (fileMeta != null &&
+          fileMeta.partitions != null &&
+          fileMeta.partitions!.isNotEmpty) {
+        // Process all partitions
+        for (final partition in fileMeta.partitions!) {
+          // Report progress
+          Logger.info('Processing partition ${partition.index}',
+              label: 'IndexManager._buildIndexOnMainThread');
+
+          // Read partition data in chunks
+          int offset = 0;
+          while (true) {
+            // Read a chunk of records
+            final records = await _dataStore.tableDataManager
+                .readRecordsFromPartition(
+                    tableName, isGlobal, partition.index, primaryKey);
+
+            if (records.isEmpty) break;
+
+            // Apply manual offset and limit as the method doesn't support them directly
+            final startIndex = offset;
+            final endIndex = min(offset + chunkSize, records.length);
+            final chunkRecords = records.sublist(startIndex, endIndex);
+
+            // Process records in this chunk
+            for (var i = 0; i < chunkRecords.length; i++) {
+              final record = chunkRecords[i];
+              final primaryValue = record[primaryKey];
+              if (primaryValue == null) continue;
+
+              // Create record pointer
+              final recordPointer = await StoreIndex.create(
+                  jsonEncode(record), offset + i,
+                  partitionId: partition.index);
+
+              final recordId = recordPointer.toString();
+
+              // Process fields
+              if (fields.length == 1) {
+                // Single field index
+                final fieldName = fields[0];
+                final fieldValue = record[fieldName];
+
+                if (fieldValue != null) {
+                  await btree.insert(fieldValue, recordId);
+                }
+              } else {
+                // Composite index
+                final compositeKey = _createIndexKey(record, fields);
+                if (compositeKey != null) {
+                  await btree.insert(compositeKey, recordId);
+                }
+              }
+
+              totalProcessed++;
+            }
+
+            // Move to next chunk
+            offset += records.length;
+
+            // Report progress periodically
+            if (totalProcessed % 1000 == 0) {
+              Logger.info('Processed $totalProcessed records',
+                  label: 'IndexManager._buildIndexOnMainThread');
+            }
+
+            // Add small delays between chunks to avoid blocking UI
+            await Future.delayed(const Duration(milliseconds: 10));
+          }
+        }
+      } else {
+        // When there is no partition data, read directly using stream
+        await for (final record
+            in _dataStore.tableDataManager.streamRecords(tableName)) {
+          final primaryValue = record[primaryKey];
+          if (primaryValue == null) continue;
+
+          // Create record pointer (approximate as we don't have position info)
+          final recordPointer = await StoreIndex.create(
+              jsonEncode(record), totalProcessed,
+              partitionId: 0);
+
+          final recordId = recordPointer.toString();
+
+          // Process fields
+          if (fields.length == 1) {
+            // Single field index
+            final fieldName = fields[0];
+            final fieldValue = record[fieldName];
+
+            if (fieldValue != null) {
+              await btree.insert(fieldValue, recordId);
+            }
+          } else {
+            // Composite index
+            final compositeKey = _createIndexKey(record, fields);
+            if (compositeKey != null) {
+              await btree.insert(compositeKey, recordId);
+            }
+          }
+
+          totalProcessed++;
+
+          // Report progress periodically
+          if (totalProcessed % 1000 == 0) {
+            Logger.info('Processed $totalProcessed records',
+                label: 'IndexManager._buildIndexOnMainThread');
+
+            // Add small delays to avoid blocking UI
+            await Future.delayed(const Duration(milliseconds: 5));
+          }
+        }
+      }
+
+      // Calculate index value range (for primary key indexes)
+      dynamic minKey, maxKey;
+      bool? isPrimaryKeyOrdered;
+
+      if (indexName == 'pk_$tableName') {
+        // For primary key index, check if ordered
+        isPrimaryKeyOrdered = _isPrimaryKeyOrdered(schema);
+
+        if (isPrimaryKeyOrdered) {
+          try {
+            final allKeys = await btree.getKeys();
+            if (allKeys.isNotEmpty) {
+              minKey = _calculateMinKey(allKeys);
+              maxKey = _calculateMaxKey(allKeys);
+            }
+          } catch (e) {
+            Logger.error('Failed to calculate index range: $e',
+                label: 'IndexManager._buildIndexOnMainThread');
+          }
+        }
+      }
+
+      // Serialize B+ tree
+      final serialized = btree.toStringHandle();
+
+      // Create partition directory
+      final partitionDirPath = await _dataStore.pathManager
+          .getIndexPartitionDirPath(tableName, indexName, 0);
+      await _dataStore.storage.ensureDirectoryExists(partitionDirPath);
+
+      // Write partition file
+      final partitionPath = await _dataStore.pathManager
+          .getIndexPartitionPath(tableName, indexName, 0);
+      await _dataStore.storage.writeAsString(partitionPath, serialized);
+
+      // Calculate checksum
+      final checksum = _calculateChecksum(serialized);
+
+      // Create partition metadata
+      final newPartition = IndexPartitionMeta(
+        version: 1,
+        index: 0,
+        fileSizeInBytes: serialized.length,
+        minKey: minKey,
+        maxKey: maxKey,
+        bTreeSize: serialized.length,
+        entries: btree.count(),
+        timestamps: Timestamps(
+          created: DateTime.now(),
+          modified: DateTime.now(),
+        ),
+        checksum: checksum,
+      );
+
+      // Update index metadata
+      final updatedMeta = meta.copyWith(
+        partitions: [newPartition],
+        timestamps: Timestamps(
+          created: meta.timestamps.created,
+          modified: DateTime.now(),
+        ),
+        isOrdered: indexName == 'pk_$tableName' ? isPrimaryKeyOrdered : null,
+      );
+
+      // Write metadata file
+      final metaPath =
+          await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+      await _dataStore.storage
+          .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+
+      // Update cache
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
+      _indexMetaCache[cacheKey] = updatedMeta;
+      _indexCache[cacheKey] = btree;
+      _indexFullyCached[cacheKey] = true;
+
+      Logger.info(
+          'Index build on main thread completed: $totalProcessed records processed',
+          label: 'IndexManager._buildIndexOnMainThread');
+    } catch (e) {
+      Logger.error('Failed to build index on main thread: $e',
+          label: 'IndexManager._buildIndexOnMainThread');
+      rethrow;
+    }
   }
 }

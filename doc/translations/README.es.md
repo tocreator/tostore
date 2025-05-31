@@ -48,40 +48,10 @@ Tostore es un motor de base de datos con arquitectura distribuida multiplataform
 | ✅ API simple para copiar o migrar datos entre espacios | ❌ Operaciones complejas para migración de inquilinos o copia de datos |
 | ✅ Consultas automáticamente limitadas al espacio actual, sin necesidad de filtrado adicional | ❌ Las consultas para diferentes usuarios requieren filtrado complejo |
 
-### 5. Soporte Multiplataforma vs. Limitaciones de Plataforma
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ API unificada en plataformas Linux, Web, Mobile, Desktop | ❌ Diferentes plataformas requieren diferentes motores de almacenamiento y APIs |
-| ✅ Adaptación automática a varios backends de almacenamiento multiplataforma, experiencia de desarrollo consistente | ❌ El desarrollo multiplataforma debe manejar diferencias de plataforma |
-| ✅ Define una vez, usa modelos de datos en todas las plataformas | ❌ Requiere rediseñar modelos de datos para diferentes plataformas |
-| ✅ Rendimiento multiplataforma optimizado, mantiene experiencia de usuario consistente | ❌ Características de rendimiento inconsistentes entre plataformas |
-| ✅ Estándares de seguridad unificados implementados en todas las plataformas | ❌ Mecanismos y configuraciones de seguridad específicos de plataforma |
 
-### 6. Algoritmos de Clave Primaria Distribuidos vs. IDs Autoincremental Tradicionales
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Cuatro algoritmos de clave primaria distribuidos adaptados a varios requisitos de escenario | ❌ IDs autoincremental simples, sujetos a conflictos en entornos de cluster |
-| ✅ Generación de ID distribuida, soporta operaciones paralelas extremadamente altas | ❌ La generación de ID serial se convierte en cuello de botella en alto paralelismo |
-| ✅ Longitud de paso aleatorio y algoritmos distribuidos evitando exposición de escala de negocio | ❌ Los IDs filtran información de volumen de negocio, creando riesgos de seguridad |
-| ✅ Desde códigos cortos hasta marcas de tiempo, satisface varios requisitos de legibilidad y rendimiento | ❌ Tipos de ID limitados y opciones de personalización |
 
-### 7. Procesamiento de Datos en Streaming vs. Carga por Lotes
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Interfaz de consulta en streaming, procesamiento de datos bajo demanda, bajo uso de memoria | ❌ Carga todos los resultados a la vez, susceptible a OOM con grandes conjuntos de datos |
-| ✅ Soporte para iteración asíncrona y patrones de programación reactiva | ❌ Modelo de procesamiento síncrono bloquea el hilo de UI, afectando la experiencia del usuario |
-| ✅ Procesamiento paralelo de datos en streaming, maximiza el rendimiento multi-núcleo | ❌ Procesamiento secuencial de datos masivos, baja utilización de CPU |
-| ✅ Soporte para tuberías de datos y operaciones de transformación | ❌ Requiere implementación personalizada de lógica de procesamiento de datos |
-| ✅ Mecanismos incorporados de limitación y manejo de contrapresión | ❌ Falta de control de flujo, fácil agotamiento de recursos |
 
-### 8. Estrategias de Caché Inteligentes vs. Caché Tradicional
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Estrategias de caché inteligentes multinivel, adaptativas a patrones de acceso | ❌ Caché LRU simple, falta de flexibilidad |
-| ✅ Ajuste automático de estrategia de caché basado en patrones de uso | ❌ Configuración de caché fija, difícil de ajustar dinámicamente |
-| ✅ Mecanismo de caché de inicio reduciendo dramáticamente tiempos de inicio en frío | ❌ Sin caché de inicio, inicios en frío lentos, necesidad de reconstruir caché |
-| ✅ Motor de almacenamiento profundamente integrado con caché para rendimiento óptimo | ❌ Lógica de caché y almacenamiento separada, requiriendo mecanismos de sincronización adicionales |
-| ✅ Sincronización automática de caché y gestión de invalidación, sin código adicional necesario | ❌ La consistencia de caché requiere mantenimiento manual, propensa a errores |
+
 
 ## Aspectos Técnicos Destacados
 

@@ -5,7 +5,7 @@ import 'cache.dart';
 /// Database structure cache
 /// Used to store index data
 class StructureCache {
-  /// Index data cache - Map<cache key(tableName:indexName), index data>
+  /// Index data cache - key(tableName:indexName)
   final Map<String, Map<String, dynamic>> indices;
 
   /// Creation time
@@ -18,7 +18,7 @@ class StructureCache {
     Map<String, Map<String, dynamic>>? indices,
     DateTime? createTime,
     this.cacheType = CacheType.runtime,
-  })  : indices = indices ?? {},
+  })  : indices = indices ?? <String, Map<String, dynamic>>{},
         createTime = createTime ?? DateTime.now();
 
   /// Create startup cache instance

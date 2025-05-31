@@ -44,7 +44,7 @@ class Logger {
     if (!LogConfig.shouldLogType(LogType.info)) {
       return;
     }
-    
+
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-info"
@@ -57,7 +57,7 @@ class Logger {
     if (!LogConfig.shouldLogType(LogType.debug)) {
       return;
     }
-    
+
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-debug"
@@ -70,12 +70,12 @@ class Logger {
     if (!LogConfig.shouldLogType(LogType.warn)) {
       return;
     }
-    
+
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-warn"
         : "log-warn  $label";
-    _log(text, label: "💡  $label");
+    _log(text, label: "[!] $label");
     _handler(text, LogType.warn, label);
   }
 
@@ -84,12 +84,12 @@ class Logger {
     if (!LogConfig.shouldLogType(LogType.error)) {
       return;
     }
-    
+
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-error"
         : "log-error  $label";
-    _log(text, label: "🔴  $label");
+    _log(text, label: "[X] $label");
     _handler(text, LogType.error, label);
   }
 

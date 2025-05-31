@@ -48,40 +48,9 @@ Tostore é um mecanismo de banco de dados de arquitetura distribuída multiplata
 | ✅ API simples para copiar ou migrar dados entre espaços | ❌ Operações complexas para migração de inquilinos ou cópia de dados |
 | ✅ Consultas automaticamente limitadas ao espaço atual, sem necessidade de filtragem adicional | ❌ Consultas para diferentes usuários requerem filtragem complexa |
 
-### 5. Suporte Multiplataforma vs. Limitações de Plataforma
-| Tostore | Bancos de Dados Tradicionais |
-|:---------|:-----------|
-| ✅ API unificada em plataformas Linux, Web, Mobile, Desktop | ❌ Diferentes plataformas requerem diferentes motores de armazenamento e APIs |
-| ✅ Adaptação automática a vários backends de armazenamento multiplataforma, experiência de desenvolvimento consistente | ❌ Desenvolvimento multiplataforma deve lidar com diferenças de plataforma |
-| ✅ Defina uma vez, use modelos de dados em todas as plataformas | ❌ Requer redesenho de modelos de dados para diferentes plataformas |
-| ✅ Desempenho multiplataforma otimizado, mantém experiência de usuário consistente | ❌ Características de desempenho inconsistentes entre plataformas |
-| ✅ Padrões de segurança unificados implementados em todas as plataformas | ❌ Mecanismos e configurações de segurança específicos da plataforma |
 
-### 6. Algoritmos de Chave Primária Distribuídos vs. IDs de Auto-Incremento Tradicionais
-| Tostore | Bancos de Dados Tradicionais |
-|:---------|:-----------|
-| ✅ Quatro algoritmos de chave primária distribuídos adequados a vários requisitos de cenário | ❌ IDs de auto-incremento simples, sujeitos a conflitos em ambientes de cluster |
-| ✅ Geração de ID distribuída, suporta operações paralelas extremamente altas | ❌ Geração de ID serial torna-se gargalo em alto paralelismo |
-| ✅ Comprimento de passo aleatório e algoritmos distribuídos evitando exposição da escala de negócios | ❌ IDs vazam informações de volume de negócios, criando riscos de segurança |
-| ✅ De códigos curtos a carimbos de data/hora, satisfaz vários requisitos de legibilidade e desempenho | ❌ Tipos de ID limitados e opções de personalização |
 
-### 7. Processamento de Dados em Streaming vs. Carregamento em Lote
-| Tostore | Bancos de Dados Tradicionais |
-|:---------|:-----------|
-| ✅ Interface de consulta em streaming, processamento de dados sob demanda, baixo uso de memória | ❌ Carrega todos os resultados de uma vez, suscetível a OOM com grandes conjuntos de dados |
-| ✅ Suporte para iteração assíncrona e padrões de programação reativa | ❌ Modelo de processamento síncrono bloqueia thread da UI, afetando a experiência do usuário |
-| ✅ Processamento paralelo de dados em streaming, maximiza o desempenho multicore | ❌ Processamento sequencial de dados massivos, baixa utilização da CPU |
-| ✅ Suporte para pipelines de dados e operações de transformação | ❌ Requer implementação personalizada de lógica de processamento de dados |
-| ✅ Mecanismos integrados de controle de taxa e tratamento de contrapressão | ❌ Falta de controle de fluxo, fácil esgotamento de recursos |
 
-### 8. Estratégias de Cache Inteligentes vs. Cache Tradicional
-| Tostore | Bancos de Dados Tradicionais |
-|:---------|:-----------|
-| ✅ Estratégias de cache inteligentes multinível, adaptativas a padrões de acesso | ❌ Cache LRU simples, falta de flexibilidade |
-| ✅ Ajuste automático de estratégia de cache baseado em padrões de uso | ❌ Configuração de cache fixa, difícil de ajustar dinamicamente |
-| ✅ Mecanismo de cache de inicialização reduzindo drasticamente tempos de início a frio | ❌ Sem cache de inicialização, inícios a frio lentos, necessidade de reconstruir cache |
-| ✅ Motor de armazenamento profundamente integrado com cache para desempenho ideal | ❌ Lógica de cache e armazenamento separada, requerendo mecanismos de sincronização adicionais |
-| ✅ Sincronização automática de cache e gerenciamento de invalidação, sem código adicional necessário | ❌ Consistência de cache requer manutenção manual, propensa a erros |
 
 ## Destaques Técnicos
 

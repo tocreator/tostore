@@ -4,8 +4,11 @@ import 'dart:typed_data';
 /// Storage interface for cross-platform compatibility
 abstract class StorageInterface {
   /// Write string to file
-  Future<void> writeAsString(String path, String content,
-      {bool append = false});
+  Future<void> writeAsString(
+    String path,
+    String content, {
+    bool append = false,
+  });
 
   /// Write binary data to file
   Future<void> writeAsBytes(String path, Uint8List bytes);
@@ -29,7 +32,7 @@ abstract class StorageInterface {
   Future<void> ensureDirectoryExists(String path);
 
   /// List directory contents
-  /// 
+  ///
   /// If [recursive] is true, lists all files in the directory and its subdirectories.
   /// If [recursive] is false, only lists direct children (files and directories).
   Future<List<String>> listDirectory(String path, {bool recursive = false});
@@ -59,6 +62,9 @@ abstract class StorageInterface {
   Stream<String> readLinesStream(String path, {int offset = 0});
 
   /// Write lines to a file using a stream
-  Future<void> writeLinesStream(String path, Stream<String> lines,
-      {bool append = false});
+  Future<void> writeLinesStream(
+    String path,
+    Stream<String> lines, {
+    bool append = false,
+  });
 }

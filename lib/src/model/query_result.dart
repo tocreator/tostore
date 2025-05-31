@@ -74,14 +74,14 @@ class QueryResult<T> {
     };
   }
 
-  /// create an instance from json (only for T is Map<String, dynamic>)
+  /// create an instance from json
   static QueryResult<Map<String, dynamic>> fromJson(Map<String, dynamic> json) {
     return QueryResult<Map<String, dynamic>>(
       success: json['success'] as bool,
       code: ResultCode.fromCode(json['code'] as int),
       message: json['message'] as String,
       data: (json['data'] as List?)
-              ?.map((e) => Map<String, dynamic>.from(e as Map))
+              ?.map((e) => Map<String, dynamic>.from(e as Map<String, dynamic>))
               .toList() ??
           [],
       count: json['count'] as int? ?? 0,

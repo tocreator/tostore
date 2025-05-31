@@ -48,67 +48,10 @@ Tostore est un moteur de base de données à architecture distribuée multiplate
 | ✅ Opérations de migration atomiques garantissant la cohérence des données | ❌ Les interruptions de migration peuvent causer des incohérences de données |
 | ✅ Mises à jour de schéma entièrement automatisées sans intervention manuelle | ❌ Logique de mise à niveau complexe et coûts de maintenance élevés avec l'augmentation des versions |
 
-### 5. Architecture multi-espaces vs. espace de stockage unique
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Architecture multi-espaces, isolant parfaitement les données des différents utilisateurs | ❌ Espace de stockage unique, stockage mixte des données de plusieurs utilisateurs |
-| ✅ Changement d'espace avec une ligne de code, simple et efficace | ❌ Nécessite plusieurs instances de base de données ou une logique d'isolation complexe |
-| ✅ Mécanisme flexible d'isolation des espaces et de partage des données globales | ❌ Difficile d'équilibrer l'isolation et le partage des données utilisateur |
-| ✅ API simple pour copier ou migrer des données entre espaces | ❌ Opérations complexes de migration ou de copie de données entre locataires |
-| ✅ Requêtes automatiquement limitées à l'espace actuel, pas besoin de filtrage supplémentaire | ❌ Les requêtes pour différents utilisateurs nécessitent un filtrage complexe |
 
-### 6. Support multiplateforme vs. limitations de plateforme
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ API unifiée sur les plateformes Linux, Web, Mobile, Desktop | ❌ Différentes plateformes nécessitent différents moteurs de stockage et APIs |
-| ✅ Adaptation automatique à divers backends de stockage multiplateformes, expérience de développement cohérente | ❌ Le développement multiplateforme doit gérer les différences entre plateformes |
-| ✅ Définir une fois, utiliser les modèles de données sur toutes les plateformes | ❌ Nécessite de reconcevoir les modèles de données pour différentes plateformes |
-| ✅ Performance multiplateforme optimisée, maintient une expérience utilisateur cohérente | ❌ Caractéristiques de performance incohérentes entre plateformes |
-| ✅ Standards de sécurité unifiés implémentés sur toutes les plateformes | ❌ Mécanismes et configurations de sécurité spécifiques à la plateforme |
 
-### 7. Algorithmes de clés primaires distribuées vs. IDs auto-incrémentés traditionnels
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Quatre algorithmes de clés primaires distribuées adaptés à diverses exigences de scénario | ❌ IDs auto-incrémentés simples, sujets aux conflits dans les environnements en cluster |
-| ✅ Génération d'ID distribuée, supporte des opérations parallèles extrêmement élevées | ❌ La génération d'ID en série devient un goulot d'étranglement en haute parallélisme |
-| ✅ Longueur de pas aléatoire et algorithmes distribués évitant l'exposition de l'échelle commerciale | ❌ Les IDs divulguent des informations sur le volume d'affaires, créant des risques de sécurité |
-| ✅ Des codes courts aux horodatages, satisfait diverses exigences de lisibilité et de performance | ❌ Types d'ID limités et options de personnalisation |
 
-### 8. Traitement des données en streaming vs. chargement par lots
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Interface de requête en streaming, traitement des données à la demande, faible utilisation de la mémoire | ❌ Charge tous les résultats en une fois, susceptible aux OOM avec de grands ensembles de données |
-| ✅ Support pour l'itération asynchrone et les modèles de programmation réactive | ❌ Le modèle de traitement synchrone bloque le thread UI, affectant l'expérience utilisateur |
-| ✅ Traitement parallèle des données en streaming, maximise les performances multicœurs | ❌ Traitement séquentiel des données massives, faible utilisation du CPU |
-| ✅ Support pour les pipelines de données et les opérations de transformation | ❌ Nécessite une implémentation personnalisée de la logique de traitement des données |
-| ✅ Mécanismes intégrés de limitation et de gestion de contre-pression | ❌ Manque de contrôle de flux, épuisement facile des ressources |
 
-### 9. Stratégies de cache intelligent vs. cache traditionnel
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Stratégies de cache intelligent multiniveau, adaptatives aux modèles d'accès | ❌ Cache LRU simple, manque de flexibilité |
-| ✅ Ajustement automatique de la stratégie de cache basé sur les modèles d'utilisation | ❌ Configuration de cache fixe, difficile à ajuster dynamiquement |
-| ✅ Mécanisme de cache de démarrage réduisant drastiquement les temps de démarrage à froid | ❌ Pas de cache de démarrage, démarrages à froid lents, nécessite de reconstruire le cache |
-| ✅ Moteur de stockage profondément intégré avec le cache pour des performances optimales | ❌ Logique de cache et de stockage séparée, nécessitant des mécanismes de synchronisation supplémentaires |
-| ✅ Gestion automatique de la synchronisation et de l'invalidation du cache, pas de code supplémentaire nécessaire | ❌ La cohérence du cache nécessite une maintenance manuelle, sujette aux erreurs |
-
-### 10. Architecture sans serveur vs. dépendance de serveur traditionnelle
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Design embarqué, pas besoin de serveurs ou configurations supplémentaires | ❌ Nécessite un serveur de base de données séparé ou un service cloud |
-| ✅ Coût de maintenance zéro, couche de données intégrée à l'application | ❌ Nécessite des DBAs dédiés et des équipes opérationnelles |
-| ✅ Capable de fonctionner hors ligne, pas de dépendance à la connectivité réseau | ❌ Dépend de la fiabilité du réseau, inutilisable dans les scénarios hors ligne |
-| ✅ Déploiement simple, l'application inclut toutes les fonctionnalités de données | ❌ Configuration de serveur complexe et gestion des connexions |
-| ✅ Combine indépendance et capacités d'extension distribuée | ❌ Soit simple sans évolutivité, soit complexe et difficile à maintenir |
-
-### 11. Optimisation intelligente des ressources vs. allocation fixe des ressources
-| Tostore | Bases de données traditionnelles |
-|:---------|:-----------|
-| ✅ Ajustement dynamique de la consommation de ressources basé sur les demandes réelles | ❌ Allocation fixe des ressources indépendamment de la charge de travail |
-| ✅ Ajustement automatique du parallélisme basé sur les capacités de l'appareil | ❌ Ne tient pas compte des capacités de l'appareil, complexe et difficile à optimiser |
-| ✅ Stratégies intelligentes de traitement par lots, optimise automatiquement les opérations par lots | ❌ Nécessite une implémentation manuelle de la logique de traitement par lots, fastidieux et sujet aux erreurs |
-| ✅ Utilisation de la mémoire correspondant au volume de données actives, indépendante du volume total de données | ❌ Utilisation de la mémoire fortement corrélée à la taille totale de la base de données |
-| ✅ Équilibre automatiquement la consommation d'énergie et les performances, adapté aux mobiles | ❌ Non optimisé pour les appareils à batterie, consommation d'énergie élevée et génération de chaleur |
 
 ## Points forts techniques
 
