@@ -246,7 +246,7 @@ class DataStoreImpl {
   }
 
   /// Ensure initialization is complete
-  Future<void> _ensureInitialized() async {
+  Future<void> ensureInitialized() async {
     if (!_isInitialized && !_initCompleter.isCompleted) {
       await _initCompleter.future;
     }
@@ -559,7 +559,7 @@ class DataStoreImpl {
   /// Create a single table
   Future<void> createTable(TableSchema schema) async {
     if (!_baseInitialized) {
-      await _ensureInitialized();
+      await ensureInitialized();
     }
 
     try {
@@ -677,7 +677,7 @@ class DataStoreImpl {
   Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
     // Need to be fully initialized
     if (!_isInitialized) {
-      await _ensureInitialized();
+      await ensureInitialized();
     }
 
     // 1. Begin transaction
@@ -987,7 +987,7 @@ class DataStoreImpl {
   /// Restore database from backup
   Future<bool> restore(String backupPath) async {
     if (!_baseInitialized) {
-      await _ensureInitialized();
+      await ensureInitialized();
     }
 
     try {
@@ -1091,7 +1091,7 @@ class DataStoreImpl {
     int? limit,
     int? offset,
   }) async {
-    await _ensureInitialized();
+    await ensureInitialized();
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
@@ -1242,6 +1242,7 @@ class DataStoreImpl {
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
+      await ensureInitialized();
       // Find records to delete
       final recordsToDelete = await executeQuery(tableName, condition,
           orderBy: orderBy, limit: limit, offset: offset);
@@ -1394,6 +1395,7 @@ class DataStoreImpl {
   /// Get table schema
   Future<TableSchema?> getTableSchema(String tableName) async {
     try {
+      await ensureInitialized();
       // 1. Try to get from cache first
       final cachedSchema = dataCacheManager.getSchema(tableName);
       if (cachedSchema != null) {
@@ -1470,7 +1472,7 @@ class DataStoreImpl {
   /// batch insert data
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records) async {
-    await _ensureInitialized();
+    await ensureInitialized();
 
     try {
       // 1. Get table schema and validate data
@@ -1775,7 +1777,7 @@ class DataStoreImpl {
 
   /// Switch space
   Future<bool> switchSpace({String spaceName = 'default'}) async {
-    await _ensureInitialized();
+    await ensureInitialized();
 
     if (_currentSpaceName == spaceName) {
       return true;
@@ -1942,7 +1944,7 @@ class DataStoreImpl {
   /// Set key-value pair
   Future<bool> setValue(String key, dynamic value,
       {bool isGlobal = false}) async {
-    await _ensureInitialized();
+    await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
 
@@ -1979,7 +1981,7 @@ class DataStoreImpl {
 
   /// Get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
-    await _ensureInitialized();
+    await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final result =
@@ -1996,7 +1998,7 @@ class DataStoreImpl {
 
   /// Remove key-value pair
   Future<bool> removeValue(String key, {bool isGlobal = false}) async {
-    await _ensureInitialized();
+    await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     // Build delete condition
@@ -2869,7 +2871,6 @@ class DataStoreImpl {
           // Ordered primary keys should be strictly increasing
           return compareResult > 0;
         case PrimaryKeyType.none:
-        default:
           // Other primary key types, more relaxed check
           return true;
       }
@@ -2938,6 +2939,7 @@ class DataStoreImpl {
     List<String>? selectedFields,
   }) async* {
     try {
+      await ensureInitialized();
       // Check if table exists
       if (!await tableExists(tableName)) {
         Logger.error('Table $tableName does not exist',

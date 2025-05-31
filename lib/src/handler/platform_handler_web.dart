@@ -38,4 +38,9 @@ class PlatformHandlerImpl implements PlatformInterface {
   Future<int> getSystemMemoryMB() async {
     return 512;
   }
+
+  @override
+  Future<String> getPathApp() async {
+    return '';
+  }
 }

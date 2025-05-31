@@ -148,7 +148,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (_joins.isNotEmpty) {
       whereConditions = _convertWhereClauses(whereConditions, _joins);
     }
-
+    await $db.ensureInitialized();
     // build query plan
     final queryPlan = await $db.getQueryOptimizer()?.optimize(
           $tableName,

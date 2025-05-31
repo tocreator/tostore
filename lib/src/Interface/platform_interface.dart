@@ -32,4 +32,7 @@ abstract class PlatformInterface {
 
   /// Get system memory (MB)
   Future<int> getSystemMemoryMB();
+
+  /// Get app save directory, for data, config, etc.
+  Future<String> getPathApp();
 }

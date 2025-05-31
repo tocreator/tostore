@@ -53,7 +53,8 @@ class QueryCondition {
       return {field: operator};
     }
 
-    switch (operator.toString().toUpperCase()) {
+    final operatorStr = operator.toString().toUpperCase();
+    switch (operatorStr) {
       case '=':
         return {
           field: {'=': value}
@@ -76,11 +77,10 @@ class QueryCondition {
             'BETWEEN': {'start': value[0], 'end': value[1]}
           }
         };
-      default:
-        return {
-          field: {operator: value}
-        };
     }
+    return {
+      field: {operator: value}
+    };
   }
 
   /// get final query conditions
@@ -268,8 +268,6 @@ class QueryCondition {
           case 'IS NOT':
             matches = value != null;
             break;
-          default:
-            matches = false;
         }
 
         // if any condition is not satisfied, return false directly

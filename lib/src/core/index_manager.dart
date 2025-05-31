@@ -3225,21 +3225,26 @@ class IndexManager {
       final results = await btIndex.search(indexValue);
       if (results.isEmpty) return null;
 
-      // For non-primary key indexes, the value is the primary key
+      // handle index results
       if (!indexName.startsWith('pk_')) {
-        final pkIndex = await getIndex(tableName, 'pk_$tableName');
-        if (pkIndex == null) return null;
+        // secondary index also return StoreIndex value directly
+        if (results.first is String) {
+          final storeIndex = StoreIndex.fromString(results.first.toString());
+          return await _dataStore.tableDataManager
+              .getRecordByPointer(tableName, storeIndex);
+        } else if (results.first is StoreIndex) {
+          return await _dataStore.tableDataManager
+              .getRecordByPointer(tableName, results.first as StoreIndex);
+        }
 
-        // Use primary key to get actual record pointer
-        final pkResults = await pkIndex.search(results.first);
-        if (pkResults.isEmpty) return null;
-
-        final storeIndex = StoreIndex.fromString(pkResults.first.toString());
-        return await _dataStore.tableDataManager
-            .getRecordByPointer(tableName, storeIndex);
+        Logger.error(
+          'Unexpected index result type: ${results.first.runtimeType}',
+          label: 'IndexManager.getRecordByIndex',
+        );
+        return null;
       }
 
-      // For primary key indexes, the value is directly the StoreIndex string
+      // for primary key index, keep the original logic
       final storeIndex = StoreIndex.fromString(results.first.toString());
       return await _dataStore.tableDataManager
           .getRecordByPointer(tableName, storeIndex);
@@ -3889,7 +3894,6 @@ class IndexManager {
         // These types of primary keys are ordered
         return true;
       case PrimaryKeyType.none:
-      default:
         // User-defined primary key, default认为无序
         return false;
     }

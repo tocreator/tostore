@@ -320,6 +320,11 @@ class QueryExecutor {
       if (field.startsWith('$tableName.')) {
         result[field] = entry.value;
       }
+      // handle fields without table name prefix (only when tableName is main table)
+      else if (!field.contains('.')) {
+        // fields without table name prefix are considered main table fields
+        result[field] = entry.value;
+      }
     }
 
     return result;
@@ -1025,31 +1030,31 @@ class QueryExecutor {
           }
         }
       } else {
-        // secondary index returns primary key value, need to search primary key index first
-        final pkIndex =
-            await _indexManager.getIndex(tableName, 'pk_$tableName');
-        if (pkIndex == null) {
-          return _performTableScan(tableName, queryCondition);
-        }
+        // secondary index also return StoreIndex value directly, no need to query primary key index
+        for (var pointer in indexResults) {
+          // handle string format StoreIndex
+          StoreIndex storeIndex;
+          if (pointer is String) {
+            storeIndex = StoreIndex.fromString(pointer);
+          } else if (pointer is StoreIndex) {
+            storeIndex = pointer;
+          } else {
+            continue; // skip unrecognized format
+          }
 
-        for (var pkValue in indexResults) {
-          final pkPointer = await pkIndex.search(pkValue);
-          if (pkPointer.isEmpty) continue;
+          // directly use StoreIndex to get record
+          final record = await _dataStore.tableDataManager
+              .getRecordByPointer(tableName, storeIndex);
 
-          if (pkPointer.first is StoreIndex) {
-            final record = await _dataStore.tableDataManager.getRecordByPointer(
-              tableName,
-              pkPointer.first as StoreIndex,
-            );
-            if (record != null) {
-              if (queryCondition != null) {
-                final conditions = queryCondition.build();
-                if (_matchConditions(record, conditions)) {
-                  results.add(record);
-                }
-              } else {
+          if (record != null) {
+            // apply additional conditions (if any)
+            if (queryCondition != null) {
+              final conditions = queryCondition.build();
+              if (_matchConditions(record, conditions)) {
                 results.add(record);
               }
+            } else {
+              results.add(record);
             }
           }
         }

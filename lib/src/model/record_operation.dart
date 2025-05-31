@@ -27,18 +27,19 @@ class WriteBufferEntry {
   }
 
   static RecordOperationType _parseOperationType(String value) {
-    switch (value.toLowerCase()) {
-      case 'insert':
-        return RecordOperationType.insert;
-      case 'update':
-        return RecordOperationType.update;
-      case 'delete':
-        return RecordOperationType.delete;
-      case 'rewrite':
-        return RecordOperationType.rewrite;
-      default:
-        return RecordOperationType.insert;
+    final lowerValue = value.toLowerCase();
+
+    // only create explicit branches for non-insert cases
+    if (lowerValue == 'update') {
+      return RecordOperationType.update;
+    } else if (lowerValue == 'delete') {
+      return RecordOperationType.delete;
+    } else if (lowerValue == 'rewrite') {
+      return RecordOperationType.rewrite;
     }
+
+    // all other cases
+    return RecordOperationType.insert;
   }
 }
 

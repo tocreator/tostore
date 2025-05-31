@@ -696,6 +696,7 @@ class DataCacheManager {
       // If total record count from metadata is empty, it's considered full table cache
       final meta =
           await _dataStore.tableDataManager.getTableFileMeta(tableName);
+
       return meta?.totalRecords == 0;
     }
     return cache.isFullTableCache;

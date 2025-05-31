@@ -127,8 +127,6 @@ class BPlusTree {
         return DateTime.tryParse(data);
       case 's': // string
         return data;
-      default:
-        return data;
     }
   }
 

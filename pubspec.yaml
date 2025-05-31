@@ -1,9 +1,8 @@
 name: tostore
 description: A advanced storage engine that supports relational and NoSQL database,data smart cache, multi-space architecture,file/local storage, SQL & key-value persistent store.
-version: 2.0.0
+version: 2.0.1
 homepage: https://github.com/tocreator/tostore
 repository: https://github.com/tocreator/tostore
-issue_tracker: https://github.com/tocreator/tostore/issues
 documentation: https://github.com/tocreator/tostore/wiki
 
 topics:

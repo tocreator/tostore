@@ -37,6 +37,9 @@ class PlatformHandler {
     return memoryMB / 1024.0;
   }
 
+  /// Get app save directory, for data, config, etc.
+  static Future<String> getPathApp() => _instance.getPathApp();
+
   /// Recommended IO concurrency (optimized by platform and memory)
   static Future<int> getRecommendedConcurrency() async {
     if (isWeb) return 2;

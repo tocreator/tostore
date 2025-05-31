@@ -301,7 +301,6 @@ class TableSchema {
         return false;
 
       case PrimaryKeyType.none:
-      default:
         // User-defined primary key, accept any string
         return true;
     }
@@ -326,7 +325,6 @@ class TableSchema {
           // These types of primary keys are ordered
           return true;
         case PrimaryKeyType.none:
-        default:
           // User-defined primary key, default to unordered
           return false;
       }
@@ -1097,7 +1095,6 @@ class PrimaryKeyConfig {
           return PrimaryKeyType.datePrefixed;
         case 'shortcode':
           return PrimaryKeyType.shortCode;
-        case 'sequential':
         default:
           return PrimaryKeyType.sequential;
       }

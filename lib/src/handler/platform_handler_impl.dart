@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'dart:async';
+import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
 import '../Interface/platform_interface.dart';
 
 /// Native platform implementation
@@ -65,6 +68,23 @@ class PlatformHandlerImpl implements PlatformInterface {
     } catch (e) {
       // Return a safe default value based on platform
       return isMobile ? 2048 : 4096;
+    }
+  }
+
+  /// Get app save directory, for data, config, etc.
+  @override
+  Future<String> getPathApp() async {
+    try {
+      final docDir = await getApplicationDocumentsDirectory();
+      final cachePath = Directory(path.join(docDir.path, 'common'));
+      if (!cachePath.existsSync()) {
+        cachePath.create();
+      }
+      return cachePath.path;
+    } catch (e) {
+      // Fallback to temporary directory
+      final tempDir = await Directory.systemTemp.createTemp('tostore_');
+      return tempDir.path;
     }
   }
 

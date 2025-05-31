@@ -189,8 +189,6 @@ class DataStoreConfig {
           return LogLevel.warn;
         case 'error':
           return LogLevel.error;
-        default:
-          return LogLevel.debug;
       }
     } else if (value is int) {
       try {

@@ -164,8 +164,6 @@ class TransactionManager {
           },
         );
         break;
-      default:
-        throw Exception('Unsupported operation type: ${operation['type']}');
     }
   }
 

@@ -27,6 +27,19 @@ class ValueComparator {
       return aBig.compareTo(bBig);
     }
 
+    // special handling: if the value is a string type, add smart string comparison
+    if (a is String && b is String) {
+      // if they are directly equal, return 0
+      if (a == b) return 0;
+
+      // normalize the string - remove the extra quotes
+      String normalizedA = _normalizeString(a);
+      String normalizedB = _normalizeString(b);
+
+      // after normalization, compare again
+      if (normalizedA == normalizedB) return 0;
+    }
+
     // Convert to strings for string comparison
     String aStr = a.toString();
     String bStr = b.toString();
@@ -228,5 +241,23 @@ class ValueComparator {
         .replaceAll('\\', '\\\\'); // Escape backslashes
 
     return RegExp('^$regex\$', caseSensitive: false).hasMatch(value);
+  }
+
+  /// normalize the string - remove the extra quotes
+  static String _normalizeString(String value) {
+    String result = value;
+
+    // remove the quotes at the beginning and end of the string
+    if ((result.startsWith('"') && result.endsWith('"')) ||
+        (result.startsWith("'") && result.endsWith("'"))) {
+      result = result.substring(1, result.length - 1);
+    }
+
+    // handle the case of escaped quotes: \"value\"
+    if (result.startsWith('\\"') && result.endsWith('\\"')) {
+      result = result.substring(2, result.length - 2);
+    }
+
+    return result;
   }
 }

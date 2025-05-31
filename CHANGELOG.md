@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.1
+
+### Fixed
+- Fixed string comparison issue where values with and without quotes weren't being matched comparison
+- Improved query execution for secondary indexes when handling string values
+- Fixed empty results when querying non-primary index fields with quoted string values
+
+
 
 ## 2.0.0
 

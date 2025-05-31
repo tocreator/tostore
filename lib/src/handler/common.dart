@@ -1,9 +1,8 @@
 import 'dart:convert';
-import 'dart:io';
-import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 
 import 'logger.dart';
+import 'platform_handler.dart';
 
 /// internal configuration
 class InternalConfig {
@@ -73,12 +72,7 @@ String pathJoin(
 
 /// get app save directory, for data, config, etc.
 Future<String> getPathApp() async {
-  final docDir = await getApplicationDocumentsDirectory();
-  final cachePath = Directory(pathJoin(docDir.path, 'common'));
-  if (!cachePath.existsSync()) {
-    cachePath.create();
-  }
-  return cachePath.path;
+  return await PlatformHandler.getPathApp();
 }
 
 /// calculate utf8 length

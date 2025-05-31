@@ -1133,7 +1133,6 @@ class IdGeneratorFactory {
         );
 
       case PrimaryKeyType.none:
-      default:
         // Return an empty implementation, user needs to provide ID
         throw UnsupportedError(
             'Unsupported primary key generation type: ${pkConfig.type}');
