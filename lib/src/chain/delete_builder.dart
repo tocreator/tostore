@@ -1,17 +1,18 @@
 import 'dart:async';
 
-import 'chain_builder.dart';
-import 'future_builder_mixin.dart';
+import '../Interface/chain_builder.dart';
+import '../Interface/future_builder_mixin.dart';
+import '../model/db_result.dart';
 
 /// delete builder
 class DeleteBuilder extends ChainBuilder<DeleteBuilder>
-    with FutureBuilderMixin<bool> {
-  Future<bool>? _future;
+    with FutureBuilderMixin<DbResult> {
+  Future<DbResult>? _future;
 
   DeleteBuilder(super.db, super.tableName);
 
   @override
-  Future<bool> get future {
+  Future<DbResult> get future async {
     _future ??= $db.deleteInternal(
       $tableName,
       condition,

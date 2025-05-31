@@ -1,15 +1,13 @@
 import '../core/data_store_impl.dart';
-import '../core/transaction_manager.dart';
+import '../model/migration_task.dart';
 import '../model/table_schema.dart';
-import 'future_builder_mixin.dart';
+import '../Interface/future_builder_mixin.dart';
 
 /// Schema builder for chain operations
 class SchemaBuilder with FutureBuilderMixin {
-  static const _unsetValue = Object();
-
   final DataStoreImpl _dataStore;
   final String _tableName;
-  final List<_SchemaOperation> _operations = [];
+  final List<MigrationOperation> _operations = [];
 
   SchemaBuilder(this._dataStore, this._tableName);
 
@@ -22,8 +20,8 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? unique,
     String? comment,
   }) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.addField,
+    _operations.add(MigrationOperation(
+      type: MigrationType.addField,
       field: FieldSchema(
         name: name,
         type: type,
@@ -38,8 +36,8 @@ class SchemaBuilder with FutureBuilderMixin {
 
   /// Remove field from table
   SchemaBuilder removeField(String fieldName) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.removeField,
+    _operations.add(MigrationOperation(
+      type: MigrationType.removeField,
       fieldName: fieldName,
     ));
     return this;
@@ -47,8 +45,8 @@ class SchemaBuilder with FutureBuilderMixin {
 
   /// Rename field
   SchemaBuilder renameField(String oldName, String newName) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.renameField,
+    _operations.add(MigrationOperation(
+      type: MigrationType.renameField,
       fieldName: oldName,
       newName: newName,
     ));
@@ -57,23 +55,31 @@ class SchemaBuilder with FutureBuilderMixin {
 
   /// Modify field
   SchemaBuilder modifyField(
-    String name, {
+    String fieldName, {
     DataType? type,
     bool? nullable,
-    dynamic defaultValue = _unsetValue,
+    dynamic defaultValue,
     bool? unique,
+    int? maxLength,
+    int? minLength,
+    num? minValue,
+    num? maxValue,
     String? comment,
   }) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.modifyField,
-      fieldName: name,
-      field: FieldSchema(
-        name: name,
-        type: type ?? DataType.text,
-        nullable: nullable ?? true,
-        defaultValue: defaultValue == _unsetValue ? null : defaultValue,
-        unique: unique ?? false,
+    _operations.add(MigrationOperation(
+      type: MigrationType.modifyField,
+      fieldName: fieldName,
+      fieldUpdate: FieldSchemaUpdate(
+        name: fieldName,
+        type: type,
+        nullable: nullable,
+        defaultValue: defaultValue,
+        unique: unique,
         comment: comment,
+        minLength: minLength,
+        maxLength: maxLength,
+        minValue: minValue,
+        maxValue: maxValue,
       ),
     ));
     return this;
@@ -86,8 +92,8 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? unique,
     IndexType type = IndexType.btree,
   }) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.addIndex,
+    _operations.add(MigrationOperation(
+      type: MigrationType.addIndex,
       index: IndexSchema(
         indexName: name,
         fields: fields,
@@ -99,138 +105,58 @@ class SchemaBuilder with FutureBuilderMixin {
   }
 
   /// Remove index
-  SchemaBuilder removeIndex(String indexName) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.removeIndex,
+  SchemaBuilder removeIndex({String? indexName, List<String>? fields}) {
+    if (indexName == null && (fields == null || fields.isEmpty)) {
+      throw ArgumentError('must provide indexName or fields');
+    }
+
+    _operations.add(MigrationOperation(
+      type: MigrationType.removeIndex,
       indexName: indexName,
+      fields: fields,
     ));
     return this;
   }
 
   /// Rename table
   SchemaBuilder renameTable(String newTableName) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.renameTable,
+    _operations.add(MigrationOperation(
+      type: MigrationType.renameTable,
       newTableName: newTableName,
     ));
     return this;
   }
 
-  /// Set auto increment setting
-  SchemaBuilder setAutoIncrement(bool enabled) {
-    _operations.add(_SchemaOperation(
-      type: _SchemaOperationType.setAutoIncrement,
-      autoIncrement: enabled,
+  /// Set primary key config
+  SchemaBuilder setPrimaryKeyConfig(PrimaryKeyConfig config) {
+    _operations.add(MigrationOperation(
+      type: MigrationType.setPrimaryKeyConfig,
+      primaryKeyConfig: config,
     ));
     return this;
   }
 
+  /// Get future result - returns migration task ID for tracking
   @override
-  Future<void> get future async {
-    // Execute all operations in a transaction
-    await _dataStore.transaction((txn) async {
-      for (var operation in _operations) {
-        await _executeOperation(operation, txn);
-      }
-    });
-  }
+  Future<String> get future async {
+    // create migration task
+    final task = await _dataStore.migrationManager
+        ?.addMigrationTask(_tableName, _operations, startProcessing: false);
 
-  Future<void> _executeOperation(
-      _SchemaOperation operation, Transaction txn) async {
-    switch (operation.type) {
-      case _SchemaOperationType.addField:
-        await _dataStore.addField(_tableName, operation.field!, txn);
-        await _dataStore.addFieldToRecords(
-          _tableName,
-          operation.field!,
-          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
-        );
-        break;
+    if (task == null) {
+      return ''; // Return empty string to indicate creation failed
+    }
 
-      case _SchemaOperationType.removeField:
-        await _dataStore.removeField(_tableName, operation.fieldName!, txn);
-        await _dataStore.removeFieldFromRecords(
-          _tableName,
-          operation.fieldName!,
-          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
-        );
-        break;
+    // Create task ID
+    final taskId = task.taskId;
 
-      case _SchemaOperationType.modifyField:
-        final oldSchema = await _dataStore.getTableSchema(_tableName);
-        final oldField =
-            oldSchema.fields.firstWhere((f) => f.name == operation.fieldName);
-        await _dataStore.modifyField(
-            _tableName, operation.fieldName!, operation.field!, txn);
-        await _dataStore.migrateFieldData(
-          _tableName,
-          oldField,
-          operation.field!,
-          txn,
-          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
-        );
-        break;
-
-      case _SchemaOperationType.renameField:
-        await _dataStore.renameField(
-            _tableName, operation.fieldName!, operation.newName!, txn);
-        await _dataStore.renameFieldInRecords(
-          _tableName,
-          operation.fieldName!,
-          operation.newName!,
-          batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
-        );
-        break;
-      case _SchemaOperationType.addIndex:
-        await _dataStore.addIndex(_tableName, operation.index!, txn);
-        break;
-      case _SchemaOperationType.removeIndex:
-        await _dataStore.removeIndex(_tableName, operation.indexName!, txn);
-        break;
-      case _SchemaOperationType.renameTable:
-        await _dataStore.renameTable(_tableName, operation.newTableName!, txn);
-        break;
-      case _SchemaOperationType.setAutoIncrement:
-        await _dataStore.setAutoIncrement(
-          _tableName,
-          operation.autoIncrement ?? false,
-        );
-        break;
+    // Start task processing and wait for completion
+    try {
+      await _dataStore.migrationManager?.processMigrationTasks();
+      return taskId;
+    } catch (e) {
+      // Return task ID even if failed, for subsequent query
+      return taskId;
     }
   }
-}
-
-/// Operation type for schema update
-enum _SchemaOperationType {
-  addField,
-  removeField,
-  renameField,
-  modifyField,
-  addIndex,
-  removeIndex,
-  renameTable,
-  setAutoIncrement,
-}
-
-/// Operation class for schema update
-class _SchemaOperation {
-  final _SchemaOperationType type;
-  final FieldSchema? field;
-  final String? fieldName;
-  final String? newName;
-  final IndexSchema? index;
-  final String? indexName;
-  final String? newTableName;
-  final bool? autoIncrement;
-
-  _SchemaOperation({
-    required this.type,
-    this.field,
-    this.fieldName,
-    this.newName,
-    this.index,
-    this.indexName,
-    this.newTableName,
-    this.autoIncrement,
-  });
 }

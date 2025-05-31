@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:typed_data';
-import '../model/file_meta.dart';
 import 'storage_interface.dart';
 
 /// not supported on web platform
@@ -20,7 +19,17 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<bool> exists(String path) async {
+  Future<void> deleteDirectory(String path) async {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Future<bool> existsDirectory(String path) async {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Future<bool> existsFile(String path) async {
     throw UnsupportedError('WebStorageImpl is only supported on Web platform');
   }
 
@@ -30,7 +39,8 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<List<String>> listDirectory(String path) async {
+  Future<List<String>> listDirectory(String path,
+      {bool recursive = false}) async {
     throw UnsupportedError('WebStorageImpl is only supported on Web platform');
   }
 
@@ -45,7 +55,7 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<List<String>> readLines(String path) async {
+  Future<void> writeAsBytes(String path, Uint8List bytes) async {
     throw UnsupportedError('WebStorageImpl is only supported on Web platform');
   }
 
@@ -56,22 +66,7 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<void> writeLines(String path, List<String> lines) async {
-    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
-  }
-
-  @override
-  Future<FileMeta?> getFileMeta(String path) async {
-    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
-  }
-
-  @override
   Future<DateTime?> getFileModifiedTime(String path) async {
-    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
-  }
-
-  @override
-  Future<DateTime?> getFileAccessedTime(String path) async {
     throw UnsupportedError('WebStorageImpl is only supported on Web platform');
   }
 
@@ -81,7 +76,28 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<int> getFileRecordCount(String path) async {
+  Future<void> copyDirectory(String sourcePath, String destinationPath) async {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Future<void> copyFile(String sourcePath, String destinationPath) async {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Stream<String> readLinesStream(String path, {int offset = 0}) async* {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Future<void> writeLinesStream(String path, Stream<String> lines,
+      {bool append = false}) async {
+    throw UnsupportedError('WebStorageImpl is only supported on Web platform');
+  }
+
+  @override
+  Future<void> ensureDirectoryExists(String path) async {
     throw UnsupportedError('WebStorageImpl is only supported on Web platform');
   }
 }

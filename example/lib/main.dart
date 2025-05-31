@@ -1,12 +1,13 @@
+import 'dart:developer';
+
 import 'package:flutter/material.dart';
 import 'package:tostore/tostore.dart';
 
 /// This example demonstrates the core features of Tostore using a user management system
 /// with global settings. It shows how to:
 /// - Create tables (both regular and global)
-/// - Perform CRUD operations
-/// - Use different query styles
 /// - Work with multi-space architecture
+/// - Distributed example
 /// - Handle global data
 class TostoreExample {
   late ToStore db;
@@ -14,15 +15,14 @@ class TostoreExample {
   /// Initialize database and create tables
   Future<void> initialize() async {
     db = ToStore(
-      version:
-          2, // every time the version number is increased, the data table structure in schemas will be automatically created or upgraded
       schemas: [
-        // schemas is used to automatically create or upgrade data table structure
+        // suitable for table structure definition in frequent startup scenarios of mobile applications, accurately identifying table structure changes, automatically upgrading and migrating data
         const TableSchema(
           name: 'users',
-          primaryKey: 'id',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'id',
+          ),
           fields: [
-            FieldSchema(name: 'id', type: DataType.integer, nullable: false),
             FieldSchema(name: 'username', type: DataType.text, nullable: false),
             FieldSchema(name: 'email', type: DataType.text, nullable: false),
             FieldSchema(name: 'last_login', type: DataType.datetime),
@@ -30,78 +30,28 @@ class TostoreExample {
           indexes: [
             IndexSchema(fields: ['username'], unique: true),
             IndexSchema(fields: ['email'], unique: true),
+            IndexSchema(fields: ['last_login'], unique: false),
           ],
         ),
         const TableSchema(
           name: 'settings',
-          primaryKey: 'key',
+          primaryKeyConfig: PrimaryKeyConfig(),
           isGlobal: true,
           fields: [
-            FieldSchema(name: 'key', type: DataType.text, nullable: false),
+            FieldSchema(
+                name: 'key',
+                type: DataType.text,
+                nullable: false,
+                unique: true),
             FieldSchema(name: 'value', type: DataType.text),
             FieldSchema(name: 'updated_at', type: DataType.datetime),
           ],
+          indexes: [
+            IndexSchema(fields: ['key'], unique: true),
+            IndexSchema(fields: ['updated_at'], unique: false),
+          ],
         ),
       ],
-
-      // if you want to manually create data table structure, you can use db.createTable in onCreate
-      // onCreate: (db) async {
-      //   // Create users table
-      //   await db.createTable(
-      //     const TableSchema(
-      //       name: 'users',
-      //       primaryKey: 'id',
-      //       fields: [
-      //         FieldSchema(name: 'id', type: DataType.integer, nullable: false),
-      //         FieldSchema(
-      //             name: 'username', type: DataType.text, nullable: false),
-      //         FieldSchema(name: 'email', type: DataType.text, nullable: false),
-      //         FieldSchema(name: 'last_login', type: DataType.datetime),
-      //       ],
-      //       indexes: [
-      //         IndexSchema(fields: ['username'], unique: true),
-      //         IndexSchema(fields: ['email'], unique: true),
-      //       ],
-      //     ),
-      //   );
-
-      //   // Create settings table (global table, shared across all spaces)
-      //   await db.createTable(
-      //     const TableSchema(
-      //       name: 'settings',
-      //       primaryKey: 'key',
-      //       isGlobal: true,
-      //       fields: [
-      //         FieldSchema(name: 'key', type: DataType.text, nullable: false),
-      //         FieldSchema(name: 'value', type: DataType.text),
-      //         FieldSchema(name: 'updated_at', type: DataType.datetime),
-      //       ],
-      //     ),
-      //   );
-      // },
-      // complex upgrade and migration can be done using db.updateSchema
-      // if the number of data tables is small, it is recommended to directly adjust the data structure in schemas for automatic upgrade
-      onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion == 1) {
-          await db
-              .updateSchema('users') // update table structure
-              .addField("fans",
-                  type: DataType.array, comment: "fans") // add field
-              .addIndex("follow", fields: ["follow", "username"]) // add index
-              .removeIndex("follow") // remove index
-              .removeField("last_login") // remove field
-              .renameField("last_login", "last_login_time") // rename field
-              .setAutoIncrement(true) // set auto increment
-              .modifyField("age",
-                  type: DataType.integer,
-                  nullable: true,
-                  unique: true); // modify field
-        } else if (oldVersion == 2) {
-          await db
-              .updateSchema('users')
-              .renameTable('users_new'); // rename users table to users_new
-        }
-      },
     );
     await db.initialize();
   }
@@ -134,18 +84,14 @@ class TostoreExample {
     // Delete: Remove user
     await db.delete('users').where('username', '=', 'john_doe');
 
-    // Read: Query using SQL style
-    await db.queryBySql(
-      'users',
-      where: 'email = ?',
-      whereArgs: ['john@example.com'],
-    );
-
-    // Read: Query using Map style
-    await db.queryByMap(
-      'users',
-      where: {'username': 'john_doe'},
-    );
+    // use stream query to handle large data
+    db
+        .streamQuery('users')
+        .where('email', 'like', '%@example.com')
+        .listen((userData) {
+      // handle each data as needed, avoid memory pressure
+      log('handle user: ${userData['username']}');
+    });
   }
 
   /// Example: Working with global settings
@@ -178,7 +124,7 @@ class TostoreExample {
   /// Example: Multi-space feature for user data isolation
   Future<void> multiSpaceExamples() async {
     // Switch to user1's space
-    await db.switchBaseSpace(spaceName: 'user1');
+    await db.switchSpace(spaceName: 'user1');
     await db.insert('users', {
       'username': 'user1',
       'email': 'user1@example.com',
@@ -186,7 +132,7 @@ class TostoreExample {
     });
 
     // Switch to user2's space
-    await db.switchBaseSpace(spaceName: 'user2');
+    await db.switchSpace(spaceName: 'user2');
     await db.insert('users', {
       'username': 'user2',
       'email': 'user2@example.com',
@@ -195,6 +141,10 @@ class TostoreExample {
 
     // Global settings remain accessible in any space
     await db.getValue('theme', isGlobal: true);
+
+    // get current space info
+    final spaceInfo = await db.getSpaceInfo();
+    log("${spaceInfo.toJson()}");
   }
 
   /// Example: Advanced queries
@@ -240,6 +190,75 @@ class TostoreExample {
 
     // Restore from backup
     await db.restore(backupPath);
+  }
+
+  /// backend server or distributed example
+  Future<void> distributedExample() async {
+    // create database instance
+    final db = ToStore(
+      config: DataStoreConfig(
+          enableEncoding: true, // enable security encoding for table data
+          encodingKey: 'YouEncodingKey', // encoding key, can be adjusted
+          encryptionKey:
+              'YouEncryptionKey', // encryption key, note: adjusting this key will make it impossible to decode old data
+          distributedNodeConfig: const DistributedNodeConfig(
+            enableDistributed: true, // enable distributed mode
+            clusterId: 1, // configure cluster id
+            centralServerUrl: 'http://127.0.0.1:8080',
+            accessToken: 'b7628a4f9b4d269b98649129',
+          )),
+    );
+
+    // create tables
+    await db.createTables([
+      const TableSchema(
+          name: 'users',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'id',
+            type: PrimaryKeyType.sequential, // sequential key type
+            sequentialConfig: SequentialIdConfig(
+              initialValue: 10000, // initial value
+              increment: 50, // increment
+              useRandomIncrement:
+                  true, // use random increment, avoid exposing business volume
+            ),
+          ),
+          // field and index definition ...
+          fields: []),
+      const TableSchema(
+          name: 'vector',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'vector_id',
+            type: PrimaryKeyType.timestampBased, // timestamp based key type
+          ),
+          // field and index definition ...
+          fields: [
+            FieldSchema(
+              name: 'vector_data',
+              type: DataType.blob, // vector data
+            ),
+          ]),
+      // other tables ...
+    ]);
+
+    // update table structure
+    final taskId = await db
+        .updateSchema('users')
+        .renameTable('newTableName') // rename table
+        .modifyField('username',
+            minLength: 5,
+            maxLength: 20,
+            unique: true) // modify field attributes
+        .renameField('oldName', 'newName') // rename field
+        .removeField('fieldName') // remove field
+        .addField('name', type: DataType.text) // add field
+        .removeIndex(fields: ['age']) // remove index
+        .setPrimaryKeyConfig(// set primary key config
+            const PrimaryKeyConfig(type: PrimaryKeyType.shortCode));
+
+    // query migration task status
+    final status = await db.queryMigrationTaskStatus(taskId);
+    log('migration progress: ${status?.progressPercentage}%');
   }
 }
 

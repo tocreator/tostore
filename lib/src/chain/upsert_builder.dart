@@ -1,32 +1,56 @@
 import 'dart:async';
 
-import 'chain_builder.dart';
-import 'future_builder_mixin.dart';
+import '../Interface/chain_builder.dart';
+import '../Interface/future_builder_mixin.dart';
+import '../model/db_result.dart';
+import '../model/result_code.dart';
+import '../query/query_condition.dart';
 
 /// upsert builder for chain operations
 class UpsertBuilder extends ChainBuilder<UpsertBuilder>
-    with FutureBuilderMixin<bool> {
+    with FutureBuilderMixin<DbResult> {
   final Map<String, dynamic> _data;
-  Future<bool>? _future;
 
   UpsertBuilder(super.db, super.tableName, this._data);
 
   @override
-  Future<bool> get future async {
-    final schema = await $db.getTableSchema($tableName);
-    final primaryKey = schema.primaryKey;
+  Future<DbResult> get future async {
+    try {
+      final schema = await $db.getTableSchema($tableName);
+      if (schema == null) {
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'Table does not exist',
+        );
+      }
 
-    // 1. Prefer using chained conditions.
-    if (condition.build().isNotEmpty) {
-      final existing = await $db.queryByMap(
-        $tableName,
-        where: condition.build(),
-        orderBy: $orderBy,
-        limit: $limit,
-        offset: $offset,
-      );
-      if (existing.isNotEmpty) {
-        _future ??= $db.updateInternal(
+      final primaryKey = schema.primaryKey;
+      bool recordExists = false;
+
+      // 1. If there are conditions, check if a matching record exists first
+      if (condition.build().isNotEmpty) {
+        final existingResult = await $db.executeQuery(
+          $tableName,
+          condition,
+          limit: 1,
+        );
+
+        recordExists = existingResult.isNotEmpty;
+      }
+      // 2. If the data contains the primary key, use the primary key to check
+      else if (_data.containsKey(primaryKey)) {
+        final existingResult = await $db.executeQuery(
+          $tableName,
+          QueryCondition()..where(primaryKey, '=', _data[primaryKey]),
+          limit: 1,
+        );
+
+        recordExists = existingResult.isNotEmpty;
+      }
+
+      // Decide whether to update or insert based on whether the record exists
+      if (recordExists) {
+        return await $db.updateInternal(
           $tableName,
           _data,
           condition,
@@ -34,31 +58,15 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
           limit: $limit,
           offset: $offset,
         );
-        return _future!;
+      } else {
+        // Perform insert
+        return await $db.insert($tableName, _data);
       }
-      return await $db.insert($tableName, _data);
-    }
-
-    // 2. if the data contains a primary key,use it for judgment
-    if (_data.containsKey(primaryKey)) {
-      final existing = await $db.queryByMap(
-        $tableName,
-        where: {primaryKey: _data[primaryKey]},
-        limit: 1,
+    } catch (e) {
+      return DbResult.error(
+        code: ResultCode.dbError,
+        message: 'Operation failed: $e',
       );
-      if (existing.isNotEmpty) {
-        _future ??= $db.updateInternal(
-          $tableName,
-          _data,
-          condition,
-          orderBy: $orderBy,
-          limit: $limit,
-          offset: $offset,
-        );
-        return _future!;
-      }
     }
-
-    return await $db.insert($tableName, _data);
   }
 }

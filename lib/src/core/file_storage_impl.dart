@@ -2,8 +2,9 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:typed_data';
-import '../model/file_meta.dart';
-import 'storage_interface.dart';
+import 'package:tostore/src/handler/common.dart';
+
+import '../Interface/storage_interface.dart';
 import '../handler/logger.dart';
 import 'package:path/path.dart' as p;
 
@@ -25,7 +26,33 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<bool> exists(String path) async {
+  Future<void> deleteDirectory(String path) async {
+    try {
+      final directory = Directory(path);
+      if (await directory.exists()) {
+        await directory.delete(recursive: true);
+      }
+    } catch (e) {
+      Logger.error('Delete directory failed: $e', label: 'FileStorageImpl');
+      rethrow;
+    }
+  }
+
+  /// Check if a directory exists at the specified path
+  @override
+  Future<bool> existsDirectory(String path) async {
+    try {
+      return await Directory(path).exists();
+    } catch (e) {
+      Logger.error('Check directory exists failed: $e',
+          label: 'FileStorageImpl');
+      return false;
+    }
+  }
+
+  /// Check if a file exists at the specified path
+  @override
+  Future<bool> existsFile(String path) async {
     try {
       return await File(path).exists();
     } catch (e) {
@@ -35,18 +62,23 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<List<String>> listDirectory(String path) async {
+  Future<List<String>> listDirectory(String path,
+      {bool recursive = false}) async {
     try {
       final dir = Directory(path);
       if (!await dir.exists()) return [];
 
-      final files = <String>[];
-      await for (final entity in dir.list(recursive: true)) {
-        if (entity is File) {
-          files.add(entity.path);
+      final entries = <String>[];
+      await for (final entity in dir.list(recursive: recursive)) {
+        if (recursive) {
+          if (entity is File) {
+            entries.add(entity.path);
+          }
+        } else {
+          entries.add(entity.path);
         }
       }
-      return files;
+      return entries;
     } catch (e) {
       Logger.error('List directory failed: $e', label: 'FileStorageImpl');
       return [];
@@ -76,24 +108,22 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<void> writeLines(String path, List<String> lines) async {
+  Future<void> writeAsBytes(String path, Uint8List bytes) async {
     try {
       final file = File(path);
       await file.parent.create(recursive: true);
-
-      final sink = file.openWrite(mode: FileMode.write);
-      try {
-        for (final line in lines) {
-          sink.writeln(line);
-        }
-        await sink.flush();
-      } finally {
-        await sink.close();
-      }
+      await file.writeAsBytes(bytes);
     } catch (e) {
-      Logger.error('Write lines failed: $e', label: 'FileStorageImpl');
+      Logger.error('Write bytes failed: $e', label: 'FileStorageImpl');
       rethrow;
     }
+  }
+
+  @override
+  Future<Uint8List> readAsBytes(String path) async {
+    final file = File(path);
+    if (!await file.exists()) return Uint8List(0);
+    return await file.readAsBytes();
   }
 
   @override
@@ -105,29 +135,6 @@ class FileStorageImpl implements StorageInterface {
     } catch (e) {
       Logger.error('Read string failed: $e', label: 'FileStorageImpl');
       return null;
-    }
-  }
-
-  @override
-  Future<List<String>> readLines(String path) async {
-    try {
-      final file = File(path);
-      if (!await file.exists()) return [];
-
-      final lines = <String>[];
-      final stream = file
-          .openRead()
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
-
-      await for (final line in stream) {
-        lines.add(line);
-      }
-
-      return lines;
-    } catch (e) {
-      Logger.error('Read lines failed: $e', label: 'FileStorageImpl');
-      return [];
     }
   }
 
@@ -147,54 +154,10 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<Uint8List> readAsBytes(String path) async {
-    final file = File(path);
-    if (!await file.exists()) return Uint8List(0);
-    return await file.readAsBytes();
-  }
-
-  @override
-  Future<FileMeta?> getFileMeta(String path) async {
-    final file = File(path);
-    if (!await file.exists()) return null;
-
-    final stat = await file.stat();
-    final lines = await readLines(path);
-    if (lines.isEmpty) return null;
-
-    return FileMeta(
-      name: path,
-      version: 1,
-      type: _getFileType(path),
-      size: await file.length(),
-      records: lines.length,
-      timestamps: Timestamps(
-        created: stat.accessed,
-        modified: stat.modified,
-        accessed: stat.accessed,
-      ),
-      chunks: null, // file is not chunked
-    );
-  }
-
-  String _getFileType(String path) {
-    final ext = p.extension(path).replaceFirst('.', '');
-    if (ext == 'dat') return 'data';
-    if (ext == 'schema') return 'schema';
-    return 'other';
-  }
-
-  @override
   Future<int> getFileSize(String path) async {
     final file = File(path);
     if (!await file.exists()) return 0;
     return await file.length();
-  }
-
-  @override
-  Future<int> getFileRecordCount(String path) async {
-    final lines = await readLines(path);
-    return lines.length;
   }
 
   @override
@@ -205,9 +168,108 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
-  Future<DateTime?> getFileAccessedTime(String path) async {
-    final file = File(path);
-    if (!await file.exists()) return null;
-    return await file.lastAccessed();
+  Future<void> copyDirectory(String sourcePath, String destinationPath) async {
+    try {
+      final sourceDir = Directory(sourcePath);
+      final destDir = Directory(destinationPath);
+      if (await destDir.exists()) {
+        await destDir.delete(recursive: true);
+      }
+      await destDir.create(recursive: true);
+      await for (final entity in sourceDir.list(recursive: true)) {
+        if (entity is File) {
+          final relativePath = entity.path.substring(sourcePath.length);
+          final newPath = pathJoin(destinationPath, relativePath);
+          await Directory(p.dirname(newPath)).create(recursive: true);
+          await entity.copy(newPath);
+        } else if (entity is Directory) {
+          final relativePath = entity.path.substring(sourcePath.length);
+          final newDirPath = pathJoin(destinationPath, relativePath);
+          await Directory(newDirPath).create(recursive: true);
+        }
+      }
+    } catch (e) {
+      Logger.error('Copy directory failed: $e',
+          label: 'FileStorageImpl.copyDirectory');
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> copyFile(String sourcePath, String destinationPath) async {
+    try {
+      final srcFile = File(sourcePath);
+      if (!await srcFile.exists()) {
+        Logger.error('Source file does not exist',
+            label: 'FileStorageImpl.copyFile');
+        return;
+      }
+      final destDir = Directory(p.dirname(destinationPath));
+      await destDir.create(recursive: true);
+      await srcFile.copy(destinationPath);
+    } catch (e) {
+      Logger.error('Copy file failed: $e', label: 'FileStorageImpl.copyFile');
+      rethrow;
+    }
+  }
+
+  @override
+  Stream<String> readLinesStream(String path, {int offset = 0}) {
+    final controller = StreamController<String>();
+
+    File(path)
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .skip(offset)
+        .listen(
+          (line) => controller.add(line),
+          onError: (e) {
+            Logger.error('Read lines stream failed: $e',
+                label: 'FileStorageImpl');
+            controller.addError(e);
+          },
+          onDone: () => controller.close(),
+        );
+
+    return controller.stream;
+  }
+
+  @override
+  Future<void> writeLinesStream(String path, Stream<String> lines,
+      {bool append = false}) async {
+    try {
+      final file = File(path);
+      await file.parent.create(recursive: true);
+      final sink =
+          file.openWrite(mode: append ? FileMode.append : FileMode.write);
+
+      try {
+        await for (final line in lines) {
+          sink.writeln(line);
+        }
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
+    } catch (e) {
+      Logger.error('Write lines stream failed: $e', label: 'FileStorageImpl');
+      rethrow;
+    }
+  }
+
+  /// Creates directory if it doesn't already exist
+  @override
+  Future<void> ensureDirectoryExists(String path) async {
+    try {
+      final directory = Directory(path);
+      if (!await directory.exists()) {
+        await directory.create(recursive: true);
+      }
+    } catch (e) {
+      Logger.error('Ensure directory exists failed: $e',
+          label: 'FileStorageImpl.ensureDirectoryExists');
+      rethrow;
+    }
   }
 }

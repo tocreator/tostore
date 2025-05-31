@@ -1,12 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:archive/archive_io.dart';
 import 'package:flutter/foundation.dart';
 
 import '../handler/logger.dart';
+import '../handler/common.dart';
 import '../backup/backup_manager.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
-import '../model/row_pointer.dart';
+import '../model/store_index.dart';
 import '../model/table_schema.dart';
 
 /// auto repair
@@ -24,17 +26,19 @@ class AutoRepair {
   /// repair damaged record
   Future<void> repairRecord(String tableName, String recordId) async {
     // restore record from latest backup
-    final backups = await _getBackups(tableName);
+    final backups = await _getBackups();
     if (backups.isEmpty) {
       throw StateError('No backup available for repair');
     }
 
     // try to restore from latest backup
-    for (var backup in backups) {
+    for (var backupPath in backups) {
       try {
-        await _restoreRecordFromBackup(tableName, recordId, backup);
+        await _restoreRecordFromBackup(tableName, recordId, backupPath);
         return;
       } catch (e) {
+        Logger.error('Failed to restore from backup $backupPath: $e',
+            label: 'AutoRepair.repairRecord');
         // try next backup
         continue;
       }
@@ -45,29 +49,102 @@ class AutoRepair {
 
   /// rebuild index
   Future<void> rebuildIndex(String tableName, String indexName) async {
-    final schema = await _dataStore.getTableSchema(tableName);
+    try {
+      Logger.info('Starting to rebuild index $indexName for table $tableName',
+          label: 'AutoRepair.rebuildIndex');
 
-    // create new index
-    await _indexManager.createIndex(
-      tableName,
-      schema.indexes.firstWhere((idx) => idx.indexName == indexName),
-    );
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return;
+      }
+      final indexSchema =
+          schema.indexes.firstWhere((idx) => idx.actualIndexName == indexName);
+      final primaryKey = schema.primaryKey;
 
-    // read all data and rebuild index
-    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
-    final lines = await _dataStore.storage.readLines(dataPath);
+      // remove old index
+      await _indexManager.removeIndex(tableName, indexName);
 
-    var startOffset = 0;
+      // create new index
+      await _indexManager.createIndex(tableName, indexSchema);
 
-    for (var line in lines) {
-      final data = jsonDecode(line) as Map<String, dynamic>;
-      final encoded = jsonEncode(line);
-      final pointer = await RowPointer.create(
-        encoded,
-        startOffset,
-      );
-      await _indexManager.updateIndexes(tableName, data, pointer);
-      startOffset += encoded.length + 1;
+      Logger.info('Created new index structure for $indexName',
+          label: 'AutoRepair.rebuildIndex');
+
+      // First get the real physical locations of all records in the table
+      final recordStoreIndexes = <String, StoreIndex>{};
+
+      // Step 1: Scan all partitions to get record physical location mapping
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableFileMeta(tableName);
+      if (fileMeta != null && fileMeta.partitions != null) {
+        for (final partition in fileMeta.partitions!) {
+          final partitionId = partition.index;
+          final partitionRecords = await _dataStore.tableDataManager
+              .readRecordsFromPartition(
+                  tableName, schema.isGlobal, partitionId, primaryKey);
+
+          // Calculate the physical offset for each record
+          int recordOffset = 0;
+          for (final record in partitionRecords) {
+            final pk = record[primaryKey]?.toString() ?? '';
+            if (pk.isNotEmpty) {
+              // Encode record as JSON to get accurate size
+              final encoded = jsonEncode(record);
+              final storeIndex = await StoreIndex.create(encoded, recordOffset,
+                  partitionId: partitionId);
+
+              recordStoreIndexes[pk] = storeIndex;
+              recordOffset += encoded.length; // Update offset for next record
+            }
+          }
+        }
+      }
+
+      // Step 2: Rebuild index using real StoreIndex
+      var recordCount = 0;
+      await for (final record
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
+        final pk = record[primaryKey]?.toString() ?? '';
+
+        if (pk.isNotEmpty) {
+          // Find the actual physical location of the record
+          final storeIndex = recordStoreIndexes[pk];
+
+          if (storeIndex != null) {
+            // Update index using actual physical location
+            await _indexManager.updateIndexes(tableName, record, storeIndex);
+            recordCount++;
+
+            if (recordCount % 1000 == 0) {
+              Logger.info('Processed $recordCount records',
+                  label: 'AutoRepair.rebuildIndex');
+            }
+          } else {
+            // If physical location not found, might be a new record or in cache
+            Logger.warn(
+                'Cannot find physical location for record $pk, might be data in cache',
+                label: 'AutoRepair.rebuildIndex');
+
+            // Create a temporary index for cached data (using a special partition ID, e.g. -1 for cache area)
+            final encoded = jsonEncode(record);
+            final tempIndex = await StoreIndex.create(
+                encoded, recordCount, // As temporary offset
+                partitionId: -1 // Indicates record in cache
+                );
+
+            await _indexManager.updateIndexes(tableName, record, tempIndex);
+            recordCount++;
+          }
+        }
+      }
+
+      Logger.info(
+          'Successfully rebuilt index $indexName with $recordCount records',
+          label: 'AutoRepair.rebuildIndex');
+    } catch (e) {
+      Logger.error('Failed to rebuild index: $e',
+          label: 'AutoRepair.rebuildIndex');
+      rethrow;
     }
   }
 
@@ -75,6 +152,9 @@ class AutoRepair {
   Future<void> repairTableStructure(String tableName) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return;
+      }
 
       // create temp table
       final tempTableName = '${tableName}_repair';
@@ -94,20 +174,15 @@ class AutoRepair {
   }
 
   /// get available backups
-  Future<List<String>> _getBackups(String tableName) async {
-    final backupPath = _dataStore.config.getBackupPath();
-    if (!await _dataStore.storage.exists(backupPath)) return [];
-
-    final backups = <String>[];
-    for (var path in await _dataStore.storage.listDirectory(backupPath)) {
-      if (path.contains(tableName)) {
-        backups.add(path);
-      }
+  Future<List<String>> _getBackups() async {
+    try {
+      final backups = await _backupManager.listBackups();
+      return backups.map((b) => b.path).toList();
+    } catch (e) {
+      Logger.error('Failed to get backups: $e',
+          label: 'AutoRepair._getBackups');
+      return [];
     }
-
-    // sort by time, latest first
-    backups.sort((a, b) => b.compareTo(a));
-    return backups;
   }
 
   /// restore record from backup
@@ -117,74 +192,168 @@ class AutoRepair {
     String backupPath,
   ) async {
     try {
-      final backupData = await _backupManager.loadBackup(backupPath);
+      final isZip = backupPath.endsWith('.zip');
+      String workingPath = backupPath;
+      bool needsCleanup = false;
 
-      // get table data from backup
-      final data = backupData['data'] as Map<String, dynamic>;
-      final tableData = data[tableName] as Map<String, dynamic>?;
-      if (tableData == null) {
-        throw StateError('table not found: $tableName');
-      }
+      try {
+        if (isZip) {
+          workingPath = await _extractBackupForRecordRecovery(backupPath);
+          needsCleanup = true;
+        }
 
-      // get table schema
-      final schema =
-          TableSchema.fromJson(tableData['schema'] as Map<String, dynamic>);
-      final primaryKey = schema.primaryKey;
+        final schemaInfo =
+            await _getTableSchemaFromBackup(workingPath, tableName);
+        if (schemaInfo == null) {
+          throw StateError('Schema for table $tableName not found in backup');
+        }
 
-      // get record data and safe convert type
-      final recordsList = tableData['data'];
-      if (recordsList is! List) {
-        throw StateError('backup record data format invalid');
-      }
+        final schema = schemaInfo.schema;
+        final isGlobal = schema.isGlobal;
+        final primaryKey = schema.primaryKey;
 
-      // find record
-      Map<String, dynamic>? targetRecord;
-      for (var item in recordsList) {
-        if (item is Map<String, dynamic> &&
-            item[primaryKey].toString() == recordId) {
-          targetRecord = item;
+        Map<String, dynamic>? targetRecord;
+
+        await for (final record
+            in _dataStore.tableDataManager.streamRecordsFromCustomPath(
+          customRootPath: workingPath,
+          tableName: tableName,
+          isGlobal: isGlobal,
+          targetKey: recordId,
+          primaryKey: primaryKey,
+          spaceName: _dataStore.config.spaceName,
+        )) {
+          targetRecord = record;
           break;
         }
-      }
 
-      if (targetRecord == null) {
-        throw StateError('record not found: $recordId');
-      }
+        if (targetRecord == null) {
+          throw StateError('Record $recordId not found in backup');
+        }
 
-      // restore record
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
-
-      if (kIsWeb) {
-        final content = await _dataStore.storage.readAsString(dataPath) ?? '';
-        final contentWithNewRecord = '$content\n${jsonEncode(targetRecord)}';
-        await _dataStore.storage.writeAsString(dataPath, contentWithNewRecord);
-      } else {
-        final dataFile = File(dataPath);
-        final sink = dataFile.openWrite(mode: FileMode.append);
-        try {
-          sink.writeln(jsonEncode(targetRecord));
-          await sink.flush();
-        } finally {
-          await sink.close();
+        await _dataStore.insert(tableName, targetRecord);
+      } finally {
+        if (needsCleanup && workingPath != backupPath) {
+          try {
+            await _dataStore.storage.deleteDirectory(workingPath);
+          } catch (e) {
+            Logger.error('Failed to cleanup temporary directory: $e',
+                label: 'AutoRepair._restoreRecordFromBackup');
+          }
         }
       }
     } catch (e) {
-      Logger.error('restore record from backup failed: $e');
+      Logger.error('Failed to restore record from backup: $e',
+          label: 'AutoRepair._restoreRecordFromBackup');
+      rethrow;
+    }
+  }
+
+  /// get table schema from backup
+  Future<_SchemaInfo?> _getTableSchemaFromBackup(
+      String backupPath, String tableName) async {
+    // try to find table in spaces directory
+    final spacesPath = pathJoin(backupPath, 'spaces');
+    if (await _dataStore.storage.existsDirectory(spacesPath)) {
+      // traverse all base directories
+      final baseDirs = await _dataStore.storage.listDirectory(spacesPath);
+      for (final baseDir in baseDirs) {
+        if (await _dataStore.storage.existsDirectory(baseDir)) {
+          final tablePath = pathJoin(baseDir, tableName);
+          if (await _dataStore.storage.existsDirectory(tablePath)) {
+            final schemaPath = pathJoin(tablePath, 'schema.sch');
+            if (await _dataStore.storage.existsFile(schemaPath)) {
+              final schemaJson =
+                  await _dataStore.storage.readAsString(schemaPath);
+              if (schemaJson != null) {
+                final schema = TableSchema.fromJson(jsonDecode(schemaJson));
+                return _SchemaInfo(schema, tablePath);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // try to find table in global directory
+    final globalPath = pathJoin(backupPath, 'global');
+    if (await _dataStore.storage.existsDirectory(globalPath)) {
+      final tablePath = pathJoin(globalPath, tableName);
+      if (await _dataStore.storage.existsDirectory(tablePath)) {
+        final schemaPath = pathJoin(tablePath, 'schema.sch');
+        if (await _dataStore.storage.existsFile(schemaPath)) {
+          final schemaJson = await _dataStore.storage.readAsString(schemaPath);
+          if (schemaJson != null) {
+            final schema = TableSchema.fromJson(jsonDecode(schemaJson));
+            return _SchemaInfo(schema, tablePath);
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /// from zip backup
+  Future<String> _extractBackupForRecordRecovery(String zipPath) async {
+    if (kIsWeb) {
+      throw UnsupportedError('ZIP extraction not supported on web platform');
+    }
+
+    final tempDir = await Directory.systemTemp.createTemp('tostore_repair_');
+    final tempPath = tempDir.path;
+
+    try {
+      try {
+        await extractFileToDisk(zipPath, tempPath);
+      } catch (e) {
+        Logger.error('Failed to extract ZIP file using standard method: $e',
+            label: 'AutoRepair._extractBackupForRecordRecovery');
+
+        // try alternative unzip method
+        final bytes = await File(zipPath).readAsBytes();
+        final archive = ZipDecoder().decodeBytes(bytes);
+
+        for (final file in archive) {
+          final filename = file.name;
+          if (file.isFile) {
+            final data = file.content as List<int>;
+            final outFile = File('$tempPath/$filename');
+            await outFile.parent.create(recursive: true);
+            await outFile.writeAsBytes(data);
+          } else {
+            await Directory('$tempPath/$filename').create(recursive: true);
+          }
+        }
+      }
+
+      return tempPath;
+    } catch (e) {
+      await tempDir.delete(recursive: true);
+      Logger.error('Failed to extract backup ZIP for record recovery: $e',
+          label: 'AutoRepair._extractBackupForRecordRecovery');
+      rethrow;
     }
   }
 
   /// create new table
   Future<void> _createNewTable(String tableName, TableSchema schema) async {
-    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
-    final schemaPath =
-        _dataStore.config.getSchemaPath(tableName, schema.isGlobal);
+    final dataPath = await _dataStore.pathManager.getDataMetaPath(tableName);
+
+    // use partitioned table structure storage
+    final schemaMetaPath = _dataStore.pathManager.getSchemaMetaPath();
+    final schemaPartitionPath = _dataStore.pathManager
+        .getSchemaPartitionFilePath(0); // use first partition
+
+    // ensure directory exists
+    await _dataStore.storage.ensureDirectoryExists(schemaMetaPath);
+    await _dataStore.storage.ensureDirectoryExists(schemaPartitionPath);
 
     // Create empty data file
     await _dataStore.storage.writeAsString(dataPath, '');
-    // Write schema file
-    await _dataStore.storage
-        .writeAsString(schemaPath, jsonEncode(schema.toJson()));
+
+    // store table schema
+    await _dataStore.updateTableSchema(schema.name, schema);
 
     // create index
     await _indexManager.createPrimaryIndex(tableName, schema.primaryKey);
@@ -199,130 +368,84 @@ class AutoRepair {
     String targetName,
     TableSchema schema,
   ) async {
-    final sourceDataPath =
-        _dataStore.config.getDataPath(sourceName, schema.isGlobal);
-    final targetDataPath =
-        _dataStore.config.getDataPath(targetName, schema.isGlobal);
+    try {
+      final recordStream = _dataStore.tableDataManager
+          .streamRecords(sourceName)
+          .where((record) => _isValidRecord(record, schema));
 
-    final lines = await _dataStore.storage.readLines(sourceDataPath);
+      final batchSize = _dataStore.config.migrationConfig?.batchSize ?? 1000;
 
-    if (kIsWeb) {
-      final validLines = <String>[];
-      var startOffset = 0;
-
-      for (var line in lines) {
-        try {
-          if (line.trim().isEmpty) continue;
-
-          final data = jsonDecode(line) as Map<String, dynamic>;
-          if (_isValidRecord(data, schema)) {
-            validLines.add(line);
-            // update index
-            final encoded = jsonEncode(data);
-            final pointer = await RowPointer.create(encoded, startOffset);
-            await _indexManager.updateIndexes(targetName, data, pointer);
-            startOffset += encoded.length + 1; // +1 for newline
-          }
-        } catch (e) {
-          // skip damaged record
-          Logger.warn('Skipping damaged record: $e');
-          continue;
-        }
-      }
-
-      // write all valid lines at once
-      if (validLines.isNotEmpty) {
-        await _dataStore.storage.writeLines(targetDataPath, validLines);
-      }
-    } else {
-      // native platform implementation: use streaming write
-      final file = File(targetDataPath);
-      final sink = file.openWrite(mode: FileMode.write);
-
-      var startOffset = 0;
-
-      try {
-        for (var line in lines) {
-          try {
-            if (line.trim().isEmpty) continue;
-
-            final data = jsonDecode(line) as Map<String, dynamic>;
-            if (_isValidRecord(data, schema)) {
-              // stream write each line
-              sink.writeln(line);
-
-              // update index
-              final encoded = jsonEncode(data);
-              final pointer = await RowPointer.create(encoded, startOffset);
-              await _indexManager.updateIndexes(targetName, data, pointer);
-              startOffset += encoded.length + 1; // +1 for newline
-            }
-          } catch (e) {
-            // skip damaged record
-            Logger.warn('Skipping damaged record: $e');
-            continue;
-          }
-        }
-
-        // ensure all data is written
-        await sink.flush();
-      } finally {
-        // close file stream
-        await sink.close();
-      }
+      // Write filtered records to target table using partitioned approach
+      await _dataStore.tableDataManager.rewriteRecordsFromStream(
+        tableName: targetName,
+        recordStream: recordStream,
+        batchSize: batchSize,
+      );
+    } catch (e) {
+      Logger.error('Failed to migrate valid data: $e',
+          label: 'AutoRepair._migrateValidData');
+      rethrow;
     }
   }
 
   /// replace table
   Future<void> _replaceTable(String oldName, String newName) async {
-    final schema = await _dataStore.getTableSchema(oldName);
-    final oldDataPath = _dataStore.config.getDataPath(oldName, schema.isGlobal);
-    final oldSchemaPath =
-        _dataStore.config.getSchemaPath(oldName, schema.isGlobal);
-    final newDataPath = _dataStore.config.getDataPath(newName, schema.isGlobal);
-    final newSchemaPath =
-        _dataStore.config.getSchemaPath(newName, schema.isGlobal);
+    try {
+      final schema = await _dataStore.getTableSchema(oldName);
+      if (schema == null) {
+        return;
+      }
 
-    // Get all index files for old table
-    final oldIndexPaths = await _getIndexPaths(oldName, schema);
+      // 1. backup original indexes - for safety
+      await _backupIndexes(oldName, schema);
 
-    // Backup original files
+      // 2. read all records from temp table
+      var recordsStream = _dataStore.tableDataManager.streamRecords(newName);
+
+      // 3. rewrite records from temp table to original table, using partitioned approach
+      await _dataStore.tableDataManager.rewriteRecordsFromStream(
+        tableName: oldName,
+        recordStream: recordsStream,
+        batchSize: _dataStore.config.migrationConfig?.batchSize ?? 1000,
+      );
+
+      // 4. delete temp table
+      await _deleteTable(newName);
+
+      Logger.info('Table $oldName successfully restored from repair table',
+          label: 'AutoRepair._replaceTable');
+    } catch (e) {
+      Logger.error('Failed to replace table: $e',
+          label: 'AutoRepair._replaceTable');
+      rethrow;
+    }
+  }
+
+  /// backup indexes
+  Future<void> _backupIndexes(String tableName, TableSchema schema) async {
     final backupSuffix = DateTime.now().millisecondsSinceEpoch.toString();
+    final oldIndexPaths = await _getIndexPaths(tableName, schema);
 
-    // Backup data and schema files
-    if (await _dataStore.storage.exists(oldDataPath)) {
-      final oldDataContent = await _dataStore.storage.readAsString(oldDataPath);
-      await _dataStore.storage
-          .writeAsString('$oldDataPath.$backupSuffix', oldDataContent ?? '');
-    }
-
-    if (await _dataStore.storage.exists(oldSchemaPath)) {
-      final oldSchemaContent =
-          await _dataStore.storage.readAsString(oldSchemaPath);
-      await _dataStore.storage.writeAsString(
-          '$oldSchemaPath.$backupSuffix', oldSchemaContent ?? '');
-    }
-
-    // Backup index files
     for (var indexPath in oldIndexPaths) {
-      if (await _dataStore.storage.exists(indexPath)) {
+      if (await _dataStore.storage.existsFile(indexPath)) {
         final content = await _dataStore.storage.readAsString(indexPath);
         await _dataStore.storage
             .writeAsString('$indexPath.$backupSuffix', content ?? '');
       }
     }
+  }
 
-    // Replace files
-    if (await _dataStore.storage.exists(newDataPath)) {
-      final content = await _dataStore.storage.readAsString(newDataPath);
-      await _dataStore.storage.writeAsString(oldDataPath, content ?? '');
-      await _dataStore.storage.deleteFile(newDataPath);
-    }
+  /// delete table
+  Future<void> _deleteTable(String tableName) async {
+    try {
+      final tablePath = await _dataStore.pathManager.getTablePath(tableName);
 
-    if (await _dataStore.storage.exists(newSchemaPath)) {
-      final content = await _dataStore.storage.readAsString(newSchemaPath);
-      await _dataStore.storage.writeAsString(oldSchemaPath, content ?? '');
-      await _dataStore.storage.deleteFile(newSchemaPath);
+      if (await _dataStore.storage.existsDirectory(tablePath)) {
+        await _dataStore.storage.deleteDirectory(tablePath);
+      }
+    } catch (e) {
+      Logger.error('Failed to delete table: $e',
+          label: 'AutoRepair._deleteTable');
     }
   }
 
@@ -331,25 +454,22 @@ class AutoRepair {
       String tableName, TableSchema schema) async {
     final paths = <String>[];
 
+    // get all index paths
     for (var index in schema.indexes) {
-      final indexPath = _dataStore.config.getIndexPath(
-        tableName,
-        index.actualIndexName,
-        schema.isGlobal,
-      );
-      if (await _dataStore.storage.exists(indexPath)) {
-        paths.add(indexPath);
+      final indexPartitions = await _indexManager.getIndexPartitions(
+          tableName, index.actualIndexName);
+      if (indexPartitions.isNotEmpty) {
+        for (var partition in indexPartitions.values) {
+          paths.add(partition.path);
+        }
       }
     }
 
-    // Add primary index path
-    final pkIndexPath = _dataStore.config.getIndexPath(
-      tableName,
-      'pk_$tableName',
-      schema.isGlobal,
-    );
-    if (await _dataStore.storage.exists(pkIndexPath)) {
-      paths.add(pkIndexPath);
+    // add primary key index path
+    final pkIndexPartitions =
+        await _indexManager.getIndexPartitions(tableName, 'pk_$tableName');
+    for (var partition in pkIndexPartitions.values) {
+      paths.add(partition.path);
     }
 
     return paths;
@@ -363,7 +483,7 @@ class AutoRepair {
         if (!field.nullable && value == null) {
           return false;
         }
-        if (value != null && !_isValidDataType(value, field.type)) {
+        if (value != null && !field.isValidDataType(value, field.type)) {
           return false;
         }
       }
@@ -372,24 +492,12 @@ class AutoRepair {
       return false;
     }
   }
+}
 
-  /// check data type is valid
-  bool _isValidDataType(dynamic value, DataType type) {
-    switch (type) {
-      case DataType.integer:
-        return value is int;
-      case DataType.double:
-        return value is double;
-      case DataType.text:
-        return value is String;
-      case DataType.blob:
-        return value is List<int>;
-      case DataType.boolean:
-        return value is bool;
-      case DataType.datetime:
-        return value is String && DateTime.tryParse(value) != null;
-      case DataType.array:
-        return value is List;
-    }
-  }
+/// schema info
+class _SchemaInfo {
+  final TableSchema schema;
+  final String basePath;
+
+  _SchemaInfo(this.schema, this.basePath);
 }

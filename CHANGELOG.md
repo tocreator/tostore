@@ -3,11 +3,28 @@
 All notable changes to this project will be documented in this file.
 
 
-## 1.9.0
+## 2.0.0
 
 ### Added
-- Web platform support using IndexedDB as storage backend
-- Storage abstraction layer unifying API across platforms
+- Cross-platform support for Web, Linux, Windows, Mobile, and Mac platforms
+- Neural network-inspired distributed architecture with interconnected node topology
+- Efficient data partitioning mechanism for distributed processing
+- Isolate parallel processing for improved read/write operations with dynamic workload balancing
+- Multi-node computational network for parallel data operations
+- Resource-aware distributed processing framework
+- Distributed primary key algorithms (sequential, timestampBased, datePrefixed, shortCode)
+- Support for unlimited node expansion with adaptive scaling
+- Intelligent schema migration with precise table/field rename detection and automatic data migration
+- Stream query interface (`streamQuery`) for efficient large data processing
+- ChaCha20Poly1305 encryption algorithm for secure table data encoding/decoding
+- Startup caching mechanism for faster application launch
+- Enhanced data retrieval capabilities with optimized indexing and search patterns
+
+### Changed
+- Complete architecture overhaul to support network-based distributed processing
+- Enhanced cross-platform storage abstraction with efficient data distribution
+- Intelligent workload distribution across computational nodes
+
 
 ### Changed
 - Optimized large file handling with chunked storage support

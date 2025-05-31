@@ -31,9 +31,8 @@ class TransactionManager {
       'data': data,
     };
 
-    final schema = await _dataStore.getTableSchema(tableName);
     final logPath =
-        _dataStore.config.getTransactionLogPath(tableName, schema.isGlobal);
+        await _dataStore.pathManager.getTransactionLogPath(tableName);
 
     await _dataStore.storage.writeAsString(
       logPath,
@@ -115,25 +114,58 @@ class TransactionManager {
   /// Process batch operations
   Future<void> _processBatch(List<Map<String, dynamic>> batch) async {
     for (var operation in batch) {
-      await _processOperation(operation);
+      try {
+        await _processOperation(operation);
+        await logOperation(
+            operation['type'], operation['table'], operation['data']);
+      } catch (e) {
+        Logger.error('Processing operation failed: $e',
+            label: 'TransactionManager._processBatch');
+        rethrow;
+      }
     }
   }
 
   /// Process single operation
   Future<void> _processOperation(Map<String, dynamic> operation) async {
     final tableName = operation['table'] as String;
-    final schema = await _dataStore.getTableSchema(tableName);
-    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+    final tableDataManager = _dataStore.tableDataManager;
 
     switch (operation['type']) {
       case 'insert':
-        await _dataStore.storage.writeAsString(
-          dataPath,
-          '${jsonEncode(operation['data'])}\n',
-          append: true,
+        tableDataManager.addToWriteBuffer(tableName, operation['data'],
+            isUpdate: false);
+        break;
+      case 'update':
+        await tableDataManager.processTablePartitions(
+          tableName: tableName,
+          processFunction:
+              (List<Map<String, dynamic>> records, int partitionIndex) async {
+            return records
+                .map<Map<String, dynamic>>((Map<String, dynamic> record) {
+              if (record['id'] == operation['data']['id']) {
+                return {...record, ...operation['data']};
+              }
+              return record;
+            }).toList();
+          },
         );
         break;
-      // Handle other operation types...
+      case 'delete':
+        await tableDataManager.processTablePartitions(
+          tableName: tableName,
+          processFunction:
+              (List<Map<String, dynamic>> records, int partitionIndex) async {
+            return records
+                .where((Map<String, dynamic> record) =>
+                    record['id'] != operation['data']['id'])
+                .toList()
+                .cast<Map<String, dynamic>>();
+          },
+        );
+        break;
+      default:
+        throw Exception('Unsupported operation type: ${operation['type']}');
     }
   }
 

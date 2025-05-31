@@ -1,4 +1,5 @@
 import '../handler/logger.dart';
+import '../handler/value_comparator.dart';
 
 /// query condition builder
 class QueryCondition {
@@ -224,16 +225,20 @@ class QueryCondition {
             matches = value != compareValue;
             break;
           case '>':
-            matches = value != null && _compareValues(value, compareValue) > 0;
+            matches = value != null &&
+                ValueComparator.compare(value, compareValue) > 0;
             break;
           case '>=':
-            matches = value != null && _compareValues(value, compareValue) >= 0;
+            matches = value != null &&
+                ValueComparator.compare(value, compareValue) >= 0;
             break;
           case '<':
-            matches = value != null && _compareValues(value, compareValue) < 0;
+            matches = value != null &&
+                ValueComparator.compare(value, compareValue) < 0;
             break;
           case '<=':
-            matches = value != null && _compareValues(value, compareValue) <= 0;
+            matches = value != null &&
+                ValueComparator.compare(value, compareValue) <= 0;
             break;
           case 'IN':
             if (compareValue is! List) return false;
@@ -250,17 +255,12 @@ class QueryCondition {
               return false;
             }
             matches = value != null &&
-                _compareValues(value, compareValue['start']) >= 0 &&
-                _compareValues(value, compareValue['end']) <= 0;
+                ValueComparator.compare(value, compareValue['start']) >= 0 &&
+                ValueComparator.compare(value, compareValue['end']) <= 0;
             break;
           case 'LIKE':
             if (value == null || compareValue is! String) return false;
-            final pattern = compareValue
-                .replaceAll('%', '.*')
-                .replaceAll('_', '.')
-                .replaceAll('\\', '\\\\');
-            matches = RegExp('^$pattern\$', caseSensitive: false)
-                .hasMatch(value.toString());
+            matches = ValueComparator.matchesLikePattern(value, compareValue);
             break;
           case 'IS':
             matches = value == null;
@@ -282,24 +282,20 @@ class QueryCondition {
     return value == condition;
   }
 
-  /// safe value comparison
-  int _compareValues(dynamic a, dynamic b) {
-    if (a == null || b == null) return 0;
-
-    if (a is num && b is num) {
-      return a.compareTo(b);
-    }
-    if (a is String && b is String) {
-      return a.compareTo(b);
-    }
-    if (a is DateTime && b is DateTime) {
-      return a.compareTo(b);
-    }
-    if (a is bool && b is bool) {
-      return a == b ? 0 : (a ? 1 : -1);
+  // check if there are any conditions
+  bool get isEmpty {
+    // check if any saved group has conditions
+    if (_groups.isNotEmpty) {
+      // check if any group contains conditions
+      for (var group in _groups) {
+        if (group.conditions.isNotEmpty) {
+          return false;
+        }
+      }
     }
 
-    return a.toString().compareTo(b.toString());
+    // check current group
+    return _currentGroup.conditions.isEmpty;
   }
 }
 

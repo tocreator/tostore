@@ -1,5 +1,6 @@
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
+import '../model/join_clause.dart';
 import 'query_plan.dart';
 
 /// query optimizer
@@ -14,9 +15,57 @@ class QueryOptimizer {
   Future<QueryPlan> optimize(
     String tableName,
     Map<String, dynamic>? where,
-    List<String>? orderBy,
-  ) async {
+    List<String>? orderBy, {
+    List<JoinClause>? joins,
+  }) async {
     try {
+      // First check if there is a full table cache and no join queries
+      if (joins == null || joins.isEmpty) {
+        // Only consider cache query under the following conditions:
+        // 1. Table is fully cached
+        // 2. Table file has not been modified (cache is valid)
+        if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
+          final cacheTime =
+              _dataStore.dataCacheManager.getTableCacheTime(tableName);
+          final isModified = cacheTime != null &&
+              _dataStore.tableDataManager.isFileModified(tableName, cacheTime);
+
+          if (cacheTime != null && !isModified) {
+            // Create cache query plan, may need to add filter and sort operations later
+            final operations = <QueryOperation>[];
+
+            // Add cache query operation
+            operations.add(QueryOperation(
+              type: QueryOperationType.cacheQuery,
+              value: tableName,
+            ));
+
+            // If there are query conditions, add filter operation
+            if (where != null && where.isNotEmpty) {
+              operations.add(QueryOperation(
+                type: QueryOperationType.filter,
+                value: where,
+              ));
+            }
+
+            // If sorting is needed, add sort operation
+            if (orderBy != null && orderBy.isNotEmpty) {
+              operations.add(QueryOperation(
+                type: QueryOperationType.sort,
+                value: orderBy,
+              ));
+            }
+
+            return QueryPlan(operations);
+          }
+        }
+      }
+
+      // If there are join queries, use specific join query plan
+      if (joins != null && joins.isNotEmpty) {
+        return _createJoinQueryPlan(tableName, where, orderBy, joins);
+      }
+
       // if there is no query condition, directly return full table scan plan
       if (where == null || where.isEmpty) {
         return _createTableScanPlan(tableName, where, orderBy);
@@ -24,6 +73,9 @@ class QueryOptimizer {
 
       // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return _createTableScanPlan(tableName, where, orderBy);
+      }
 
       // first try to use primary key index
       if (where.containsKey(schema.primaryKey)) {
@@ -57,6 +109,54 @@ class QueryOptimizer {
       // use full table scan when error occurs
       return _createTableScanPlan(tableName, where, orderBy);
     }
+  }
+
+  /// create query plan for joins
+  QueryPlan _createJoinQueryPlan(
+    String tableName,
+    Map<String, dynamic>? where,
+    List<String>? orderBy,
+    List<JoinClause> joins,
+  ) {
+    final operations = <QueryOperation>[];
+
+    // Add main table scan operation
+    operations.add(QueryOperation(
+      type: QueryOperationType.tableScan,
+      value: tableName,
+    ));
+
+    // Add each JOIN operation
+    for (var join in joins) {
+      operations.add(QueryOperation(
+        type: QueryOperationType.join,
+        value: {
+          'type': join.type.toString().split('.').last,
+          'table': join.table,
+          'firstKey': join.firstKey,
+          'operator': join.operator,
+          'secondKey': join.secondKey,
+        },
+      ));
+    }
+
+    // Add filter operation
+    if (where != null && where.isNotEmpty) {
+      operations.add(QueryOperation(
+        type: QueryOperationType.filter,
+        value: where,
+      ));
+    }
+
+    // Add sort operation
+    if (orderBy != null && orderBy.isNotEmpty) {
+      operations.add(QueryOperation(
+        type: QueryOperationType.sort,
+        value: orderBy,
+      ));
+    }
+
+    return QueryPlan(operations);
   }
 
   /// create full table scan query plan

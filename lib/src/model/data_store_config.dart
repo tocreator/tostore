@@ -1,13 +1,15 @@
 import 'migration_config.dart';
-import '../handler/common.dart';
+import '../handler/platform_handler.dart';
+import '../model/log_config.dart';
+import 'dart:math';
 
 /// data store config
 class DataStoreConfig {
   /// database path
-  final String dbPath;
+  final String? dbPath;
 
-  /// current base name
-  final String baseName;
+  /// current space name
+  final String spaceName;
 
   /// compression level
   final int compressionLevel;
@@ -27,135 +29,260 @@ class DataStoreConfig {
   /// enable auto repair
   final bool enableAutoRepair;
 
-  /// max table cache size (default 10MB), unit: byte
-  final int maxTableCacheSize;
+  /// enable content encoding
+  final bool enableEncoding;
 
-  /// max table cache count (default 50 tables)
-  final int maxTableCacheCount;
+  /// enable encoding obfuscation
+  final bool enableEncodingObfuscation;
 
-  /// max query cache size (default 5000 queries)
+  /// encoding key, used for encoding/decoding table data
+  /// can be freely modified, old key-encoded data will be automatically migrated
+  final String encodingKey;
+
+  /// encryption key, used to encrypt the encodingKey and other critical information
+  /// Note: After changing the encryption key, data encoded with the old key cannot be decoded. Please protect it carefully
+  final String encryptionKey;
+
+  /// max table cache file size
+  final int maxTableCacheFileSize;
+
+  /// max query cache size
   final int maxQueryCacheSize;
 
-  /// max record cache size (default 10000 records)
+  /// max record cache size
   final int maxRecordCacheSize;
 
-  /// max cache size
-  final int maxCacheSize;
-
-  /// enable encryption
-  final bool enableEncryption;
-
-  /// encryption key
-  final String? encryptionKey;
+  /// max index cache size
+  final int maxIndexCacheSize;
 
   /// migration config
   final MigrationConfig? migrationConfig;
 
-  const DataStoreConfig({
-    required this.dbPath,
-    this.baseName = 'default',
+  /// max entries (files or subdirectories) per directory (default 500)
+  final int maxEntriesPerDir;
+
+  /// max partition file size based on platform
+  /// Web: 64KB, Mobile: 256KB, Desktop: 4MB
+  final int maxPartitionFileSize;
+
+  /// Startup cache collection duration (milliseconds)
+  /// Query results within this time window after application startup are marked as startup cache data
+  final int startupCacheCollectionDurationMs;
+
+  /// Maximum startup index cache size
+  final int maxStartupIndexCacheSize;
+
+  /// Table schema cache size limit
+  final int maxSchemaCacheSize;
+
+  /// Enable logging
+  final bool enableLog;
+
+  /// Log level
+  final LogLevel logLevel;
+
+  /// Maximum concurrency
+  final int maxConcurrent;
+
+  /// Distributed node configuration
+  final DistributedNodeConfig distributedNodeConfig;
+
+  /// Maximum records per batch processing
+  final int maxFlushBatchSize;
+
+  /// Maximum number of tables to process per flush
+  final int maxTablesPerFlush;
+
+  DataStoreConfig({
+    this.dbPath,
+    this.spaceName = 'default',
     this.compressionLevel = 6,
     this.transactionTimeout = const Duration(minutes: 5),
-    this.bTreeOrder = 100,
+    this.bTreeOrder = 200,
     this.enableMonitoring = true,
     this.enableCompression = true,
     this.enableAutoRepair = true,
-    this.maxTableCacheSize = 10 * 1024 * 1024, // 10MB
-    this.maxTableCacheCount = 50,
-    this.maxQueryCacheSize = 5000,
-    this.maxRecordCacheSize = 10000,
-    this.maxCacheSize = 10000,
-    this.enableEncryption = false,
-    this.encryptionKey,
+    this.enableEncoding = true,
+    this.enableEncodingObfuscation = true,
+    this.encodingKey = "E9n8C7o6D7I8n3gkEY",
+    this.encryptionKey = "E9n8C7r6y7P8T3ioNkEy",
+    int? maxTableCacheFileSize,
+    int? maxQueryCacheSize,
+    int? maxRecordCacheSize,
+    int? maxIndexCacheSize,
     this.migrationConfig = const MigrationConfig(),
-  });
+    this.maxEntriesPerDir = 500,
+    int? maxPartitionFileSize,
+    this.startupCacheCollectionDurationMs = 10000, // 10 seconds
+    int? maxStartupIndexCacheSize,
+    int? maxSchemaCacheSize,
+    this.enableLog = true,
+    this.logLevel = LogLevel.debug,
+    int? maxConcurrent,
+    DistributedNodeConfig? distributedNodeConfig,
+    int? maxFlushBatchSize,
+    int? maxTablesPerFlush,
+  })  : maxPartitionFileSize =
+            maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
+        maxTableCacheFileSize =
+            maxTableCacheFileSize ?? CacheSettings.maxTableCacheFileSize,
+        maxQueryCacheSize = maxQueryCacheSize ?? _getDefaultPlatformCacheSize(),
+        maxRecordCacheSize =
+            maxRecordCacheSize ?? _getDefaultPlatformCacheSize(),
+        maxIndexCacheSize = maxIndexCacheSize ?? _getDefaultPlatformCacheSize(),
+        maxStartupIndexCacheSize =
+            maxStartupIndexCacheSize ?? _getDefaultMaxStartupIndexCacheSize(),
+        maxSchemaCacheSize = maxSchemaCacheSize ?? _getDefaultSchemaCacheSize(),
+        maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
+        distributedNodeConfig =
+            distributedNodeConfig ?? const DistributedNodeConfig(),
+        maxFlushBatchSize = maxFlushBatchSize ?? _getDefaultBatchSize(),
+        maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush() {
+    // Initialize async memory detection and cache optimization
+    CacheSettings.startMemoryOptimization();
+  }
 
-  /// get table path
-  String getTablePath(String tableName, bool isGlobal) {
-    if (isGlobal) {
-      return pathJoin(dbPath, 'global', tableName);
+  /// get default platform cache size
+  static int _getDefaultPlatformCacheSize() {
+    if (PlatformHandler.isWeb) {
+      return 5000; // Web platform
+    } else if (PlatformHandler.isMobile) {
+      return 10000; // Mobile devices
+    } else {
+      return 100000; // Desktop devices
     }
-    return pathJoin(dbPath, 'bases', baseName, tableName);
   }
 
-  /// get base path
-  String getBasePath() {
-    return pathJoin(dbPath, 'bases', baseName);
+  /// get default schema cache size
+  static int _getDefaultSchemaCacheSize() {
+    if (PlatformHandler.isWeb) {
+      return 1000; // Web platform
+    } else if (PlatformHandler.isMobile) {
+      return 2000; // Mobile devices
+    } else {
+      return 50000; // Desktop devices
+    }
   }
 
-  /// get global path
-  String getGlobalPath() {
-    return pathJoin(dbPath, 'global');
+  /// get default partition file size limit, based on platform
+  static int _getDefaultMaxPartitionFileSize() {
+    if (PlatformHandler.isWeb) {
+      return 64 * 1024; // Web: 64KB
+    } else if (PlatformHandler.isMobile) {
+      return 256 * 1024; // mobile platform: 256KB
+    } else {
+      return 4 * 1024 * 1024; // desktop platform: 4MB
+    }
   }
 
-  /// get backup path
-  String getBackupPath() {
-    return pathJoin(dbPath, 'backups');
+  /// Parse log level from string
+  static LogLevel _parseLogLevel(dynamic value) {
+    if (value == null) return LogLevel.debug;
+
+    if (value is String) {
+      switch (value.toLowerCase()) {
+        case 'debug':
+          return LogLevel.debug;
+        case 'info':
+          return LogLevel.info;
+        case 'warn':
+          return LogLevel.warn;
+        case 'error':
+          return LogLevel.error;
+        default:
+          return LogLevel.debug;
+      }
+    } else if (value is int) {
+      try {
+        return LogLevel.values[value];
+      } catch (_) {
+        return LogLevel.debug;
+      }
+    }
+
+    return LogLevel.debug;
   }
 
-  /// get log path
-  String getLogPath() {
-    return pathJoin(dbPath, 'logs');
+  /// Get default max concurrency
+  static int _getDefaultMaxConcurrent() {
+    if (PlatformHandler.isTestEnvironment) return 1;
+    return PlatformHandler.recommendedConcurrency;
   }
 
-  /// get index path
-  String getIndexPath(String tableName, String indexName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.$indexName.idx';
+  /// Get default batch size
+  static int _getDefaultBatchSize() {
+    if (PlatformHandler.isWeb) {
+      return 500; // Web environment, avoid browser freezing
+    } else if (PlatformHandler.isMobile) {
+      return 1000; // Mobile devices, balance performance and memory usage
+    } else {
+      return 1000; // Desktop devices, leverage more powerful hardware
+    }
   }
 
-  /// get stats path
-  String getStatsPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.stats';
+  /// Get default number of tables to process per flush
+  static int _getDefaultTablesPerFlush() {
+    if (PlatformHandler.isWeb) {
+      return 2; // Web environment, limit concurrency
+    } else if (PlatformHandler.isMobile) {
+      return 5; // Mobile devices, moderate concurrency
+    } else {
+      return 8; // Desktop devices, fully utilize multi-core processors
+    }
   }
 
-  /// get transaction log path
-  String getTransactionLogPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.transaction.log';
+  /// Get default max startup index cache size
+  static int _getDefaultMaxStartupIndexCacheSize() {
+    if (PlatformHandler.isWeb) {
+      return 500; // Web platform has more limitations
+    } else if (PlatformHandler.isMobile) {
+      return 1500; // Moderate for mobile devices
+    } else {
+      return 2500; // Maximum for desktop devices
+    }
   }
 
-  /// get checksum path
-  String getChecksumPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.checksum';
-  }
-
-  /// get schema path
-  String getSchemaPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.schema';
-  }
-
-  /// get data path
-  String getDataPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.dat';
-  }
-
-  /// get auto increment id path
-  String getAutoIncrementPath(String tableName, bool isGlobal) {
-    return '${getTablePath(tableName, isGlobal)}.maxid';
-  }
-
-  /// create config from json
+  /// from json create config
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
     return DataStoreConfig(
       dbPath: json['dbPath'] as String,
-      baseName: json['baseName'] as String? ?? 'default',
+      spaceName: json['spaceName'] as String? ?? 'default',
       compressionLevel: json['compressionLevel'] as int? ?? 6,
-      transactionTimeout: Duration(
-          milliseconds: json['transactionTimeoutMs'] as int? ?? 300000),
-      bTreeOrder: json['bTreeOrder'] as int? ?? 100,
+      transactionTimeout:
+          Duration(milliseconds: json['transactionTimeout'] as int? ?? 300000),
+      bTreeOrder: json['bTreeOrder'] as int? ?? 200,
       enableMonitoring: json['enableMonitoring'] as bool? ?? true,
       enableCompression: json['enableCompression'] as bool? ?? true,
       enableAutoRepair: json['enableAutoRepair'] as bool? ?? true,
-      maxTableCacheSize: json['maxTableCacheSize'] as int? ?? 10 * 1024 * 1024,
-      maxTableCacheCount: json['maxTableCacheCount'] as int? ?? 50,
+      enableEncoding: json['enableEncoding'] as bool? ?? false,
+      enableEncodingObfuscation:
+          json['enableEncodingObfuscation'] as bool? ?? true,
+      encodingKey: json['encodingKey'] ?? "E9n8C7o6D7I8n3gkEY",
+      maxTableCacheFileSize:
+          json['maxTableCacheFileSize'] as int? ?? 10 * 1024 * 1024,
       maxQueryCacheSize: json['maxQueryCacheSize'] as int? ?? 5000,
       maxRecordCacheSize: json['maxRecordCacheSize'] as int? ?? 10000,
-      maxCacheSize: json['maxCacheSize'] as int? ?? 10000,
-      enableEncryption: json['enableEncryption'] as bool? ?? false,
-      encryptionKey: json['encryptionKey'] as String?,
+      maxIndexCacheSize: json['maxIndexCacheSize'] as int? ?? 10000,
+      encryptionKey: json['encryptionKey'] ?? "E9n8C7r6y7P8T3ioNkEy",
       migrationConfig: json['migrationConfig'] != null
           ? MigrationConfig.fromJson(
               json['migrationConfig'] as Map<String, dynamic>)
           : const MigrationConfig(),
+      maxEntriesPerDir: json['maxEntriesPerDir'] as int? ?? 500,
+      maxPartitionFileSize: json['maxPartitionFileSize'] as int?,
+      startupCacheCollectionDurationMs:
+          json['startupCacheCollectionDurationMs'] as int? ?? 10000,
+      maxStartupIndexCacheSize: json['maxStartupIndexCacheSize'] as int?,
+      maxSchemaCacheSize: json['maxSchemaCacheSize'] as int?,
+      enableLog: json['enableLog'] as bool? ?? true,
+      logLevel: _parseLogLevel(json['logLevel']),
+      maxConcurrent: json['maxConcurrent'] as int?,
+      distributedNodeConfig: json['distributedNodeConfig'] != null
+          ? DistributedNodeConfig.fromJson(
+              json['distributedNodeConfig'] as Map<String, dynamic>)
+          : const DistributedNodeConfig(),
+      maxFlushBatchSize: json['maxFlushBatchSize'] as int?,
+      maxTablesPerFlush: json['maxTablesPerFlush'] as int?,
     );
   }
 
@@ -163,61 +290,292 @@ class DataStoreConfig {
   Map<String, dynamic> toJson() {
     return {
       'dbPath': dbPath,
-      'baseName': baseName,
+      'spaceName': spaceName,
       'compressionLevel': compressionLevel,
-      'transactionTimeoutMs': transactionTimeout.inMilliseconds,
+      'transactionTimeout': transactionTimeout.inMilliseconds,
       'bTreeOrder': bTreeOrder,
       'enableMonitoring': enableMonitoring,
       'enableCompression': enableCompression,
       'enableAutoRepair': enableAutoRepair,
-      'maxTableCacheSize': maxTableCacheSize,
-      'maxTableCacheCount': maxTableCacheCount,
+      'enableEncoding': enableEncoding,
+      'enableEncodingObfuscation': enableEncodingObfuscation,
+      'encodingKey': encodingKey,
+      'maxTableCacheSize': maxTableCacheFileSize,
       'maxQueryCacheSize': maxQueryCacheSize,
       'maxRecordCacheSize': maxRecordCacheSize,
-      'maxCacheSize': maxCacheSize,
-      'enableEncryption': enableEncryption,
+      'maxCacheSize': maxIndexCacheSize,
       'encryptionKey': encryptionKey,
       'migrationConfig': migrationConfig?.toJson(),
+      'maxEntriesPerDir': maxEntriesPerDir,
+      'maxPartitionFileSize': maxPartitionFileSize,
+      'startupCacheCollectionDurationMs': startupCacheCollectionDurationMs,
+      'maxStartupIndexCacheSize': maxStartupIndexCacheSize,
+      'maxSchemaCacheSize': maxSchemaCacheSize,
+      'enableLog': enableLog,
+      'logLevel': logLevel.toString().split('.').last,
+      'maxConcurrent': maxConcurrent,
+      'distributedNodeConfig': distributedNodeConfig.toJson(),
+      'maxFlushBatchSize': maxFlushBatchSize,
+      'maxTablesPerFlush': maxTablesPerFlush,
     };
   }
 
   /// create new config instance
   DataStoreConfig copyWith({
     String? dbPath,
-    String? baseName,
-    int? cacheSize,
+    String? spaceName,
     int? compressionLevel,
     Duration? transactionTimeout,
     int? bTreeOrder,
     bool? enableMonitoring,
     bool? enableCompression,
     bool? enableAutoRepair,
-    int? maxTableCacheSize,
-    int? maxTableCacheCount,
+    bool? enableEncoding,
+    bool? enableEncodingObfuscation,
+    dynamic encodingKey,
+    int? maxTableCacheFileSize,
     int? maxQueryCacheSize,
     int? maxRecordCacheSize,
-    int? maxCacheSize,
-    bool? enableEncryption,
+    int? maxIndexCacheSize,
     String? encryptionKey,
     MigrationConfig? migrationConfig,
+    int? maxEntriesPerDir,
+    int? maxPartitionFileSize,
+    int? startupCacheCollectionDurationMs,
+    int? maxStartupIndexCacheSize,
+    int? maxSchemaCacheSize,
+    bool? enableLog,
+    LogLevel? logLevel,
+    int? maxConcurrent,
+    DistributedNodeConfig? distributedNodeConfig,
+    int? maxFlushBatchSize,
+    int? maxTablesPerFlush,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
-      baseName: baseName ?? this.baseName,
+      spaceName: spaceName ?? this.spaceName,
       compressionLevel: compressionLevel ?? this.compressionLevel,
       transactionTimeout: transactionTimeout ?? this.transactionTimeout,
       bTreeOrder: bTreeOrder ?? this.bTreeOrder,
       enableMonitoring: enableMonitoring ?? this.enableMonitoring,
       enableCompression: enableCompression ?? this.enableCompression,
       enableAutoRepair: enableAutoRepair ?? this.enableAutoRepair,
-      maxTableCacheSize: maxTableCacheSize ?? this.maxTableCacheSize,
-      maxTableCacheCount: maxTableCacheCount ?? this.maxTableCacheCount,
+      enableEncoding: enableEncoding ?? this.enableEncoding,
+      enableEncodingObfuscation:
+          enableEncodingObfuscation ?? this.enableEncodingObfuscation,
+      encodingKey: encodingKey ?? this.encodingKey,
+      maxTableCacheFileSize:
+          maxTableCacheFileSize ?? this.maxTableCacheFileSize,
       maxQueryCacheSize: maxQueryCacheSize ?? this.maxQueryCacheSize,
       maxRecordCacheSize: maxRecordCacheSize ?? this.maxRecordCacheSize,
-      maxCacheSize: maxCacheSize ?? this.maxCacheSize,
-      enableEncryption: enableEncryption ?? this.enableEncryption,
+      maxIndexCacheSize: maxIndexCacheSize ?? this.maxIndexCacheSize,
       encryptionKey: encryptionKey ?? this.encryptionKey,
       migrationConfig: migrationConfig ?? this.migrationConfig,
+      maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
+      maxPartitionFileSize: maxPartitionFileSize ?? this.maxPartitionFileSize,
+      startupCacheCollectionDurationMs: startupCacheCollectionDurationMs ??
+          this.startupCacheCollectionDurationMs,
+      maxStartupIndexCacheSize:
+          maxStartupIndexCacheSize ?? this.maxStartupIndexCacheSize,
+      maxSchemaCacheSize: maxSchemaCacheSize ?? this.maxSchemaCacheSize,
+      enableLog: enableLog ?? this.enableLog,
+      logLevel: logLevel ?? this.logLevel,
+      maxConcurrent: maxConcurrent ?? this.maxConcurrent,
+      distributedNodeConfig:
+          distributedNodeConfig ?? this.distributedNodeConfig,
+      maxFlushBatchSize: maxFlushBatchSize ?? this.maxFlushBatchSize,
+      maxTablesPerFlush: maxTablesPerFlush ?? this.maxTablesPerFlush,
     );
+  }
+}
+
+/// Distributed node configuration
+class DistributedNodeConfig {
+  /// Whether to enable distributed mode
+  final bool enableDistributed;
+
+  /// Cluster ID affiliation
+  final int clusterId;
+
+  /// Node ID
+  final int nodeId;
+
+  /// Central server URL
+  final String? centralServerUrl;
+
+  /// Node access token
+  final String? accessToken;
+
+  /// Whether to automatically fetch node information from central server
+  final bool autoFetchNodeInfo;
+
+  /// Central node communication timeout
+  final Duration connectionTimeout;
+
+  /// ID pre-allocation threshold percentage (async request for new batch when reaching this percentage)
+  final double idFetchThreshold;
+
+  const DistributedNodeConfig({
+    this.enableDistributed = false,
+    this.clusterId = 0,
+    this.nodeId = 0,
+    this.centralServerUrl,
+    this.accessToken,
+    this.autoFetchNodeInfo = true,
+    this.connectionTimeout = const Duration(seconds: 30),
+    this.idFetchThreshold = 0.7,
+  });
+
+  DistributedNodeConfig copyWith({
+    bool? enableDistributed,
+    int? clusterId,
+    int? nodeId,
+    String? centralServerUrl,
+    String? accessToken,
+    bool? autoFetchNodeInfo,
+    Duration? connectionTimeout,
+    double? idFetchThreshold,
+  }) {
+    return DistributedNodeConfig(
+      enableDistributed: enableDistributed ?? this.enableDistributed,
+      clusterId: clusterId ?? this.clusterId,
+      nodeId: nodeId ?? this.nodeId,
+      centralServerUrl: centralServerUrl ?? this.centralServerUrl,
+      accessToken: accessToken ?? this.accessToken,
+      autoFetchNodeInfo: autoFetchNodeInfo ?? this.autoFetchNodeInfo,
+      connectionTimeout: connectionTimeout ?? this.connectionTimeout,
+      idFetchThreshold: idFetchThreshold ?? this.idFetchThreshold,
+    );
+  }
+
+  factory DistributedNodeConfig.fromJson(Map<String, dynamic> json) {
+    return DistributedNodeConfig(
+      enableDistributed: json['enableDistributed'] as bool? ?? false,
+      clusterId: json['clusterId'] as int? ?? 0,
+      nodeId: json['nodeId'] as int? ?? 0,
+      centralServerUrl: json['centralServerUrl'] as String?,
+      accessToken: json['accessToken'] as String?,
+      autoFetchNodeInfo: json['autoFetchNodeInfo'] as bool? ?? true,
+      connectionTimeout:
+          Duration(milliseconds: json['connectionTimeoutMs'] as int? ?? 30000),
+      idFetchThreshold: json['idFetchThreshold'] as double? ?? 0.7,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'enableDistributed': enableDistributed,
+      'clusterId': clusterId,
+      'nodeId': nodeId,
+      'centralServerUrl': centralServerUrl,
+      'accessToken': accessToken,
+      'autoFetchNodeInfo': autoFetchNodeInfo,
+      'connectionTimeoutMs': connectionTimeout.inMilliseconds,
+      'idFetchThreshold': idFetchThreshold,
+    };
+  }
+}
+
+/// Cache settings manager (Singleton)
+class CacheSettings {
+  static final CacheSettings _instance = CacheSettings._internal();
+  factory CacheSettings() => _instance;
+  CacheSettings._internal();
+
+  // Optimized cache values
+  int _optimizedTableCacheSize = 0;
+  bool _optimizationInProgress = false;
+
+  // Get current table cache size
+  int get tableCacheSize => _optimizedTableCacheSize > 0
+      ? _optimizedTableCacheSize
+      : _getDefaultMaxTableCacheFileSize();
+
+  // Static access point
+  static int get maxTableCacheFileSize => CacheSettings().tableCacheSize;
+
+  /// Get default table file cache size (static method)
+  static int _getDefaultMaxTableCacheFileSize() {
+    if (PlatformHandler.isWeb) {
+      // Fixed smaller cache for Web environment
+      return 2 * 1024 * 1024; // 2MB
+    } else if (PlatformHandler.isMobile) {
+      // Medium configuration for mobile devices
+      return 10 * 1024 * 1024; // 10MB
+    } else if (PlatformHandler.isServerEnvironment) {
+      // Larger default cache for server environment
+      return 500 * 1024 * 1024; // 500MB
+    } else {
+      // Higher configuration for desktop devices
+      return 100 * 1024 * 1024; // 100MB
+    }
+  }
+
+  /// Start memory detection and cache optimization
+  static void startMemoryOptimization() {
+    final instance = CacheSettings();
+    if (instance._optimizationInProgress) return;
+
+    instance._optimizationInProgress = true;
+
+    PlatformHandler.getSystemMemoryMB().then((memoryMB) {
+      int newCacheSize;
+
+      if (PlatformHandler.isWeb) {
+        newCacheSize = 2 * 1024 * 1024; // Fixed 2MB for Web
+      } else if (PlatformHandler.isMobile) {
+        // Adjust based on available memory for mobile devices
+        if (memoryMB < 1024) {
+          newCacheSize = 5 * 1024 * 1024; // <1GB memory: 5MB cache
+        } else if (memoryMB < 2048) {
+          newCacheSize = 10 * 1024 * 1024; // 1-2GB memory: 10MB cache
+        } else if (memoryMB < 4096) {
+          newCacheSize = 20 * 1024 * 1024; // 2-4GB memory: 20MB cache
+        } else {
+          newCacheSize = 30 * 1024 * 1024; // >4GB memory: 30MB cache
+        }
+      } else if (PlatformHandler.isServerEnvironment) {
+        // Server environment - use larger proportion of available memory for cache
+        final memoryGB = memoryMB / 1024.0;
+
+        // Server memory tiering strategy (50-70% of total memory)
+        if (memoryGB < 8) {
+          // Small server (<8GB): 50% memory for cache, max 1GB
+          newCacheSize = min((memoryMB * 0.5).toInt(), 1024) * 1024 * 1024;
+        } else if (memoryGB < 16) {
+          // Medium server (8-16GB): max 2GB cache
+          newCacheSize = min((memoryMB * 0.55).toInt(), 2048) * 1024 * 1024;
+        } else if (memoryGB < 32) {
+          // Large server (16-32GB): max 5GB cache
+          newCacheSize = min((memoryMB * 0.6).toInt(), 5120) * 1024 * 1024;
+        } else if (memoryGB < 64) {
+          // Extra large server (32-64GB): max 10GB cache
+          newCacheSize = min((memoryMB * 0.65).toInt(), 10240) * 1024 * 1024;
+        } else {
+          // Enterprise server (>64GB): max 20GB cache
+          newCacheSize = min((memoryMB * 0.7).toInt(), 20480) * 1024 * 1024;
+        }
+      } else {
+        // Adjust based on available memory for desktop devices
+        if (memoryMB < 2048) {
+          newCacheSize = 20 * 1024 * 1024; // <2GB memory: 20MB cache
+        } else if (memoryMB < 4096) {
+          newCacheSize = 50 * 1024 * 1024; // 2-4GB memory: 50MB cache
+        } else if (memoryMB < 8192) {
+          newCacheSize = 100 * 1024 * 1024; // 4-8GB memory: 100MB cache
+        } else if (memoryMB < 16384) {
+          newCacheSize = 200 * 1024 * 1024; // 8-16GB memory: 200MB cache
+        } else {
+          newCacheSize = 300 * 1024 * 1024; // >16GB memory: 300MB cache
+        }
+      }
+
+      // Update cache configuration
+      instance._optimizedTableCacheSize = newCacheSize;
+      instance._optimizationInProgress = false;
+    }).catchError((e) {
+      // Don't change default value on error
+      instance._optimizationInProgress = false;
+    });
   }
 }

@@ -1,11 +1,15 @@
 import '../chain/delete_builder.dart';
 import '../chain/schema_builder.dart';
+import '../chain/stream_query_builder.dart';
 import '../chain/update_builder.dart';
 import '../chain/upsert_builder.dart';
 import '../model/data_store_config.dart';
+import '../model/db_result.dart';
+import '../model/migration_task.dart';
+import '../model/space_info.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
-import '../query/query_builder.dart';
+import '../chain/query_builder.dart';
 
 /// Data store engine interface
 abstract class DataStoreInterface {
@@ -18,14 +22,17 @@ abstract class DataStoreInterface {
   /// query data
   QueryBuilder query(String tableName);
 
-  /// insert data
-  Future<bool> insert(String tableName, Map<String, dynamic> data);
+  /// stream query data
+  StreamQueryBuilder streamQuery(String tableName);
+
+  /// insert data, returns the operation result with primary key if successful
+  Future<DbResult> insert(String tableName, Map<String, dynamic> data);
 
   /// upsert data
   UpsertBuilder upsert(String tableName, Map<String, dynamic> data);
 
-  /// batch insert data
-  Future<bool> batchInsert(
+  /// batch insert data, returns the operation result with successful and failed keys
+  Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records);
 
   /// update data
@@ -59,13 +66,13 @@ abstract class DataStoreInterface {
   Future<void> clear(String tableName);
 
   /// get table schema
-  Future<TableSchema> getTableSchema(String tableName);
+  Future<TableSchema?> getTableSchema(String tableName);
 
   /// get table info
-  Future<TableInfo> getTableInfo(String tableName);
+  Future<TableInfo?> getTableInfo(String tableName);
 
-  /// switch base space
-  Future<bool> switchBaseSpace({String spaceName = 'default'});
+  /// switch space
+  Future<bool> switchSpace({String spaceName = 'default'});
 
   /// close data store engine
   Future<void> close();
@@ -74,32 +81,13 @@ abstract class DataStoreInterface {
   Future<String> backup();
 
   /// restore database
-  Future<void> restore(String backupPath);
-
-  /// query by map
-  Future<List<Map<String, dynamic>>> queryByMap(
-    String tableName, {
-    Map<String, dynamic>? where,
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-  });
-
-  /// query by sql
-  Future<List<Map<String, dynamic>>> queryBySql(
-    String tableName, {
-    String? where,
-    List<dynamic>? whereArgs,
-    String? orderBy,
-    int? limit,
-    int? offset,
-  });
+  Future<bool> restore(String backupPath);
 
   /// get current config
   DataStoreConfig get config;
 
-  /// get current base space name
-  String? get currentBaseSpaceName;
+  /// get current space name
+  String? get currentSpaceName;
 
   /// get database version
   Future<int> getVersion();
@@ -107,6 +95,12 @@ abstract class DataStoreInterface {
   /// set database version
   Future<void> setVersion(int version);
 
+  /// Query migration task status
+  Future<MigrationStatus?> queryMigrationTaskStatus(String taskId);
+
   /// delete database
   Future<void> deleteDatabase({String? dbPath});
+
+  /// Get information about the current space
+  Future<SpaceInfo> getSpaceInfo();
 }

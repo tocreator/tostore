@@ -2,12 +2,33 @@ import 'package:flutter/foundation.dart';
 
 import '../core/data_store_impl.dart';
 import '../query/query_condition.dart';
+import '../handler/logger.dart';
+
+// List of valid operators for validation
+const List<String> _validOperators = [
+  '=',
+  '!=',
+  '<>',
+  '>',
+  '>=',
+  '<',
+  '<=',
+  'IN',
+  'NOT IN',
+  'BETWEEN',
+  'LIKE',
+  'IS',
+  'IS NOT'
+];
 
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final DataStoreImpl _db;
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
+
+  // Track operators that have already been warned about
+  static final Set<String> _warnedInvalidOperators = {};
 
   List<String>? _orderBy;
   int? _limit;
@@ -46,6 +67,18 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// base where condition
   SELF where(String field, String operator, dynamic value) {
+    // Validate the operator before passing to the query condition
+    if (!_validOperators.contains(operator.toUpperCase())) {
+      // Only warn about each invalid operator once
+      if (!_warnedInvalidOperators.contains(operator)) {
+        Logger.error(
+            'Invalid operator: "$operator". Valid operators are: ${_validOperators.join(', ')}',
+            label: 'ChainBuilder.where');
+        _warnedInvalidOperators.add(operator);
+      }
+      // Use equals as a safe fallback
+      operator = '=';
+    }
     _condition.where(field, operator, value);
     return _self;
   }

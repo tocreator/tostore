@@ -1,22 +1,28 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/foundation.dart';
-
+import 'package:tostore/src/core/lock_manager.dart';
 import '../backup/backup_manager.dart';
+import '../handler/chacha20_poly1305.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
+import '../handler/value_comparator.dart';
 import '../model/business_error.dart';
+import '../model/db_result.dart';
+import '../model/file_info.dart';
+import '../model/global_config.dart';
 import '../model/migration_config.dart';
+import '../model/migration_task.dart';
+import '../model/record_operation.dart';
+import '../model/result_code.dart';
+import '../model/system_table.dart';
 import '../model/table_schema.dart';
+import 'data_cache_manager.dart';
 import 'data_compressor.dart';
-import 'concurrency_manager.dart';
 import '../model/data_store_config.dart';
-import '../model/base_path_changed_event.dart';
-import 'file_manager.dart';
+import '../model/space_path_changed_event.dart';
+import 'table_data_manager.dart';
 import 'index_manager.dart';
-import '../integrity/auto_repair.dart';
-import '../model/row_pointer.dart';
 import '../model/table_info.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
@@ -26,6 +32,15 @@ import 'transaction_manager.dart';
 import 'migration_manager.dart';
 import '../integrity/integrity_checker.dart';
 import 'storage_adapter.dart';
+import 'key_manager.dart';
+import '../model/space_config.dart';
+import 'schema_manager.dart';
+import 'path_manager.dart';
+import 'crontab_manager.dart';
+import '../model/log_config.dart';
+import 'old_structure_migration_handler.dart';
+import 'directory_manager.dart';
+import '../model/space_info.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -34,113 +49,120 @@ class DataStoreImpl {
   bool _isInitialized = false;
   bool _initializing = false;
   final String _instanceKey;
-  final int _version;
   final Future<void> Function(DataStoreImpl db)? _onConfigure;
   final Future<void> Function(DataStoreImpl db)? _onCreate;
-  final Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
-      _onUpgrade;
-  final Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
-      _onDowngrade;
   final Future<void> Function(DataStoreImpl db)? _onOpen;
   final List<TableSchema> _schemas;
 
   bool _baseInitialized = false;
-  bool _isSwitchingSpace = false;
 
   bool get isInitialized => _isInitialized;
+  final bool isMigrationInstance;
 
-  /// Platform-specific path separator
-  static final String separator = Platform.isWindows ? '\\' : '/';
+  // Global configuration cache
+  static GlobalConfig? _globalConfigCache;
 
-  /// Join path components
-  String joinPath(List<String> components) {
-    return components.join(separator);
-  }
+  String _currentSpaceName = 'default';
+  DataStoreConfig? _config;
 
-  /// Get file name without extension
-  String getFileNameWithoutExtension(String path) {
-    final name = path.split(separator).last;
-    final dotIndex = name.lastIndexOf('.');
-    return dotIndex == -1 ? name : name.substring(0, dotIndex);
-  }
-
-  /// Get directory name
-  String getDirName(String path) {
-    final parts = path.split(separator);
-    parts.removeLast();
-    return parts.join(separator);
-  }
-
-  /// Get base name
-  String getBaseName(String path) {
-    return path.split(separator).last;
-  }
-
-  /// Get extension
-  String getExtension(String path) {
-    final name = getBaseName(path);
-    final dotIndex = name.lastIndexOf('.');
-    return dotIndex == -1 ? '' : name.substring(dotIndex);
-  }
-
-  /// Normalize path
-  String normalizePath(String path) {
-    final parts = path.split(RegExp(r'[/\\]'));
-    final normalized = <String>[];
-
-    for (var part in parts) {
-      if (part == '.' || part.isEmpty) continue;
-      if (part == '..') {
-        if (normalized.isNotEmpty) normalized.removeLast();
-        continue;
-      }
-      normalized.add(part);
+  TransactionManager? _transactionManager;
+  IndexManager? _indexManager;
+  QueryOptimizer? _queryOptimizer;
+  QueryExecutor? _queryExecutor;
+  late DataCacheManager dataCacheManager;
+  StatisticsCollector? _statisticsCollector;
+  MigrationManager? migrationManager;
+  IntegrityChecker? _integrityChecker;
+  KeyManager? _keyManager;
+  late StorageAdapter storage;
+  SpaceConfig? _spaceConfigCache;
+  SchemaManager? schemaManager;
+  PathManager? _pathManager;
+  DirectoryManager? directoryManager;
+  LockManager? lockManager;
+  PathManager get pathManager {
+    if (_pathManager == null) {
+      throw StateError('PathManager not initialized');
     }
+    return _pathManager!;
+  }
 
-    return normalized.join(separator);
+  TableDataManager? _tableDataManager;
+  TableDataManager get tableDataManager {
+    if (_tableDataManager == null) {
+      throw StateError('TableDataManager not initialized');
+    }
+    return _tableDataManager!;
+  }
+
+  /// Get current space name
+  String get currentSpaceName => _currentSpaceName;
+
+  /// Get query optimizer
+  QueryOptimizer? getQueryOptimizer() => _queryOptimizer;
+
+  /// Get query executor
+  QueryExecutor? getQueryExecutor() => _queryExecutor;
+
+  IndexManager? get indexManager => _indexManager;
+
+  /// Get current configuration
+  DataStoreConfig get config {
+    if (_config == null) {
+      throw StateError('DataStore not initialized');
+    }
+    return _config!;
   }
 
   /// Create instance with configuration
   factory DataStoreImpl({
     String? dbPath,
     DataStoreConfig? config,
-    int version = 1,
     List<TableSchema> schemas = const [],
     Future<void> Function(DataStoreImpl db)? onConfigure,
     Future<void> Function(DataStoreImpl db)? onCreate,
-    Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
-        onUpgrade,
-    Future<void> Function(DataStoreImpl db, int oldVersion, int newVersion)?
-        onDowngrade,
     Future<void> Function(DataStoreImpl db)? onOpen,
+    isMigrationInstance = false,
   }) {
     final key = dbPath ?? 'default';
-    if (!_instances.containsKey(key)) {
+    if (!_instances.containsKey(key) && !isMigrationInstance) {
       final instance = DataStoreImpl._internal(
         key,
-        version,
         schemas,
         onConfigure,
         onCreate,
-        onUpgrade,
-        onDowngrade,
         onOpen,
+        isMigrationInstance,
       );
       _instances[key] = instance;
       instance._startInitialize(dbPath, config);
+    }
+    // If it's a migration instance, always create a new instance, don't use existing instances
+    if (isMigrationInstance) {
+      final instance = DataStoreImpl._internal(
+        '$key-migration-${DateTime.now().millisecondsSinceEpoch}',
+        schemas,
+        onConfigure,
+        onCreate,
+        onOpen,
+        isMigrationInstance,
+      );
+      if (config != null) {
+        instance._currentSpaceName = config.spaceName;
+      }
+      instance._startInitialize(dbPath, config);
+      return instance;
     }
     return _instances[key]!;
   }
 
   DataStoreImpl._internal(
     this._instanceKey,
-    this._version,
     this._schemas,
     this._onConfigure,
     this._onCreate,
-    this._onUpgrade,
-    this._onDowngrade,
     this._onOpen,
+    this.isMigrationInstance,
   );
 
   /// Start initialization process
@@ -163,23 +185,64 @@ class DataStoreImpl {
     });
   }
 
-  /// Get database version
-  Future<int> getVersion() async {
+  // Helper method to load the space configuration from the space_config.json file and update the cache
+  Future<SpaceConfig?> getSpaceConfig({bool nowGetFromFile = false}) async {
+    if (!nowGetFromFile && _spaceConfigCache != null) {
+      return _spaceConfigCache;
+    }
+
+    final spaceFilePath = pathManager.getSpaceConfigPath(_currentSpaceName);
+
     try {
-      final versionPath = pathJoin(config.dbPath, 'version');
-      if (!await storage.exists(versionPath)) {
-        return 0;
-      }
-      return int.parse(await storage.readAsString(versionPath) ?? '0');
+      final content = await storage.readAsString(spaceFilePath) ?? "";
+      if (content.isEmpty) return null;
+
+      _spaceConfigCache =
+          SpaceConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
+      return _spaceConfigCache;
     } catch (e) {
-      return 0;
+      Logger.error('Failed to parse init config: $e');
+      return null;
     }
   }
 
+  /// Save space config to file
+  Future<void> saveSpaceConfigToFile(SpaceConfig config) async {
+    try {
+      final spaceFilePath = pathManager.getSpaceConfigPath(_currentSpaceName);
+
+      final content = jsonEncode(config.toJson());
+      await storage.writeAsString(spaceFilePath, content);
+      _spaceConfigCache = config;
+    } catch (e) {
+      Logger.error('Failed to save space config: $e', label: 'spaceConfig');
+    }
+  }
+
+  /// Get database version
+  Future<int> getVersion() async {
+    if (_spaceConfigCache != null) return _spaceConfigCache!.version;
+    final loadedConfig = await getSpaceConfig();
+    return loadedConfig?.version ?? 0;
+  }
+
   /// Set database version
-  Future<void> setVersion(int version) async {
-    final versionPath = pathJoin(config.dbPath, 'version');
-    await storage.writeAsString(versionPath, version.toString());
+  Future<void> setVersion(int newVersion) async {
+    // Load existing config if not already cached
+    SpaceConfig? currentConfig = _spaceConfigCache ?? await getSpaceConfig();
+    if (currentConfig != null) {
+      await saveSpaceConfigToFile(currentConfig.copyWith(version: newVersion));
+    } else {
+      final encryptedBytes = ChaCha20Poly1305.encrypt(
+          plaintext: config.encodingKey,
+          key: ChaCha20Poly1305.generateKeyFromString(config.encryptionKey));
+      final encryptedBase64 = base64.encode(encryptedBytes);
+      final newConfig = SpaceConfig(
+          current: EncryptionKeyInfo(key: encryptedBase64, keyId: 1),
+          previous: null,
+          version: newVersion);
+      await saveSpaceConfigToFile(newConfig);
+    }
   }
 
   /// Ensure initialization is complete
@@ -189,59 +252,31 @@ class DataStoreImpl {
     }
   }
 
-  String _currentSpaceName = 'default';
-  DataStoreConfig? _config;
-
-  TransactionManager? _transactionManager;
-  IndexManager? _indexManager;
-  ConcurrencyManager? _concurrencyManager;
-  QueryOptimizer? _queryOptimizer;
-  QueryExecutor? _queryExecutor;
-  StatisticsCollector? _statisticsCollector;
-  MigrationManager? _migrationManager;
-  IntegrityChecker? _integrityChecker;
-  late StorageAdapter storage;
-
-  // Cache for unique values
-  final Map<String, Map<String, Set<dynamic>>> _uniqueValuesCache = {};
-
-  FileManager? _fileManager;
-  FileManager get fileManager {
-    if (_fileManager == null) {
-      throw StateError('FileManager not initialized');
-    }
-    return _fileManager!;
-  }
-
-  /// Get current base space name
-  String get currentBaseSpaceName => _currentSpaceName;
-
-  /// Get current configuration
-  DataStoreConfig get config {
-    if (_config == null) {
-      throw StateError('DataStore not initialized');
-    }
-    return _config!;
-  }
-
   /// Get database path
   Future<String> getDatabasePath({String? dbPath}) async {
-    if (_config != null && isInitialized) {
-      return _config!.dbPath;
-    } else if (dbPath != null) {
-      return pathJoin(dbPath, 'db');
-    }
-    if (kIsWeb) {
-      return 'db';
-    }
-    final appPath = await getPathApp();
-    return pathJoin(appPath, 'db');
-  }
+    const baseDir = 'db';
+    String? finalPath;
 
-  /// Get table path (sync version)
-  String getTablePathSync(String tableName, {bool isGlobal = false}) {
-    final schema = _queryExecutor?.queryCacheManager.getSchema(tableName);
-    return config.getTablePath(tableName, schema?.isGlobal ?? isGlobal);
+    if (dbPath != null) {
+      finalPath = dbPath;
+    } else if (_config != null) {
+      finalPath = _config?.dbPath;
+    }
+
+    if (finalPath != null) {
+      if (finalPath.startsWith(baseDir) || finalPath.endsWith(baseDir)) {
+        return finalPath;
+      }
+      return pathJoin(finalPath, baseDir);
+    }
+
+    if (kIsWeb) {
+      return baseDir;
+    }
+
+    // Other platforms: app path/baseDir
+    final appPath = await getPathApp();
+    return pathJoin(appPath, baseDir);
   }
 
   /// Initialize storage engine
@@ -264,34 +299,77 @@ class DataStoreImpl {
 
       dbPath = await getDatabasePath(dbPath: dbPath);
 
-      _config = config ?? DataStoreConfig(dbPath: dbPath);
-      _concurrencyManager = ConcurrencyManager();
-      storage = StorageAdapter(_config!);
-      _transactionManager = TransactionManager(this);
-      _indexManager = IndexManager(this);
-      _statisticsCollector = StatisticsCollector(this);
-      _fileManager = FileManager(this);
-      _fileManager?.startTimer();
-      _migrationManager = MigrationManager(this);
-      _integrityChecker = IntegrityChecker(this);
-
-      if (!kIsWeb) {
-        await Directory(dbPath).create(recursive: true);
+      if (config == null) {
+        _config = DataStoreConfig(dbPath: dbPath);
+      } else {
+        _config = config.copyWith(dbPath: dbPath);
       }
 
-      _queryOptimizer = QueryOptimizer(this);
-      _queryExecutor = QueryExecutor(this, _indexManager!);
+      // Ensure _currentSpaceName is synchronized with config.spaceName
+      _currentSpaceName = _config!.spaceName;
 
-      await _recoveryIncompleteTransactions();
+      storage = StorageAdapter(_config!);
+      lockManager = LockManager();
+
+      schemaManager = SchemaManager(this);
+      _pathManager = PathManager(this);
+
+      // Apply log configuration
+      LogConfig.setConfig(
+        enableLog: _config!.enableLog,
+        logLevel: _config!.logLevel,
+      );
+
+      // Initialize key components in parallel
+      final initTasks = <Future<void>>[
+        Future(() async {
+          await getGlobalConfig();
+          await getSpaceConfig();
+          _keyManager = KeyManager(this);
+          await _keyManager!.initialize();
+        }),
+        Future(() {
+          directoryManager = DirectoryManager(this);
+          _transactionManager = TransactionManager(this);
+          _indexManager = IndexManager(this);
+          _statisticsCollector = StatisticsCollector(this);
+          _tableDataManager = TableDataManager(this);
+          migrationManager = MigrationManager(this);
+          _integrityChecker = IntegrityChecker(this);
+          _queryOptimizer = QueryOptimizer(this);
+          _queryExecutor = QueryExecutor(this, _indexManager!);
+          dataCacheManager = DataCacheManager(this);
+        })
+      ];
+
+      // Wait for all initialization tasks to complete
+      await Future.wait(initTasks);
 
       _baseInitialized = true;
-      await _startSetupAndUpgrade();
 
+      if (!isMigrationInstance) {
+        // Execute old structure migration if needed
+        await _migrateOldStructureIfNeeded();
+
+        // Initialize migration manager, restore unfinished migration tasks
+        await migrationManager?.initialize();
+
+        await _startSetupAndUpgrade();
+      }
+
+      // load data to cache
       await _loadDataToCache();
 
       _isInitialized = true;
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
+      }
+
+      if (!isMigrationInstance) {
+        CrontabManager.start();
+
+        // Database open callback
+        await _onOpen?.call(this);
       }
 
       return true;
@@ -312,91 +390,51 @@ class DataStoreImpl {
   Future<void> _startSetupAndUpgrade() async {
     try {
       await _onConfigure?.call(this);
-      final oldVersion = await getVersion();
 
-      if (oldVersion == 0 || _isSwitchingSpace) {
+      // Check if global configuration has migration tasks
+      final globalConfig = await getGlobalConfig();
+      if (globalConfig?.hasMigrationTask == true) {
+        return;
+      }
+
+      // Check if initialization or upgrade is needed
+      bool needInitialize = false;
+      bool needUpgrade = false;
+
+      // Check if there are existing table structures
+      final schemaMeta = await schemaManager!.getSchemaMeta();
+      if (schemaMeta.tablePartitionMap.isEmpty) {
+        // First run, need to initialize
+        needInitialize = true;
+      } else {
+        // Compare hash values to check if upgrade is needed
+        needUpgrade = await schemaManager!.isSchemaChanged(getInitialSchema());
+      }
+
+      // First run - create system tables and user tables
+      if (needInitialize) {
         // Create system tables
-        await createTable(
-          const TableSchema(
-            name: _kvStoreName,
-            primaryKey: 'key',
-            autoIncrement: false,
-            fields: [
-              FieldSchema(name: 'key', type: DataType.text, nullable: false),
-              FieldSchema(name: 'value', type: DataType.text),
-              FieldSchema(name: 'updated_at', type: DataType.datetime),
-            ],
-            indexes: [
-              IndexSchema(fields: ['updated_at']),
-            ],
-          ),
-        );
-
-        await createTable(
-          const TableSchema(
-            name: _globalKvStoreName,
-            primaryKey: 'key',
-            autoIncrement: false,
-            isGlobal: true,
-            fields: [
-              FieldSchema(name: 'key', type: DataType.text, nullable: false),
-              FieldSchema(name: 'value', type: DataType.text),
-              FieldSchema(name: 'updated_at', type: DataType.datetime),
-            ],
-            indexes: [
-              IndexSchema(fields: ['updated_at']),
-            ],
-          ),
-        );
+        await createTables(SystemTable.gettableSchemas);
 
         // Create user tables
         if (_schemas.isNotEmpty) {
           for (var schema in _schemas) {
             await createTable(schema);
           }
+          await schemaManager?.updateInitialSchemaHash();
         }
 
+        // Call creation callback
         await _onCreate?.call(this);
-
-        if (_version > 0) {
-          await setVersion(_version);
-        }
-      } else if (oldVersion < _version) {
-        if (_schemas.isNotEmpty) {
-          // Get existing tables
-          final existingTables = await getTableNames();
-
-          // Remove tables that are no longer in schemas
-          final newTableNames = _schemas.map((s) => s.name).toSet();
-          for (var tableName in existingTables) {
-            // Skip system tables
-            if (tableName == _kvStoreName || tableName == _globalKvStoreName) {
-              continue;
-            }
-
-            if (!newTableNames.contains(tableName)) {
-              Logger.info(
-                'Dropping removed table: $tableName',
-                label: 'DataStoreImpl._startSetupAndUpgrade',
-              );
-              await dropTable(tableName);
-            }
-          }
-          await autoMigrate(
-            oldVersion: oldVersion,
-            newVersion: _version,
-            schemas: _schemas,
-          );
-        } else if (_onUpgrade != null) {
-          await _onUpgrade.call(this, oldVersion, _version);
-        }
-        await setVersion(_version);
-      } else if (oldVersion > _version) {
-        await _onDowngrade?.call(this, oldVersion, _version);
-        await setVersion(_version);
       }
-
-      await _onOpen?.call(this);
+      // Need upgrade - perform table structure migration
+      else if (needUpgrade) {
+        // Perform automatic table structure migration
+        if (_schemas.isNotEmpty) {
+          await schemaManager?.updateInitialSchemaHash();
+          await autoSchemaMigrate(getInitialSchema());
+        }
+      }
     } catch (e, stack) {
       Logger.error(
         'Database setup/upgrade failed: $e\n$stack',
@@ -406,42 +444,109 @@ class DataStoreImpl {
     }
   }
 
-  /// close database
-  Future<void> close() async {
+  /// Automatic table structure migration - based on table structure hash comparison
+  Future<void> autoSchemaMigrate(List<TableSchema> schemas) async {
+    String backupPath = '';
     try {
-      await _fileManager?.dispose();
-      await storage.close();
+      final migrationConfig = config.migrationConfig ?? const MigrationConfig();
 
-      if (_maxIdsDirty.values.any((isDirty) => isDirty)) {
-        await _flushMaxIds();
+      // Backup database according to configuration
+      if (migrationConfig.backupBeforeMigrate) {
+        backupPath = await backup();
       }
 
-      await _indexManager?.flushIndexes();
+      for (var schema in schemas) {
+        if (!schema.validateTableSchema()) {
+          throw const BusinessError(
+            'Invalid table structure',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+      }
+
+      await migrationManager?.migrate(
+        schemas,
+        batchSize: migrationConfig.batchSize,
+      );
+
+      // Validate migration results according to configuration
+      if (migrationConfig.validateAfterMigrate) {
+        final isValid = await _validateMigration(schemas);
+        if (!isValid && migrationConfig.strictMode) {
+          throw const BusinessError(
+            'Migration validation failed',
+            type: BusinessErrorType.migrationError,
+          );
+        }
+      }
+
+      // After successful migration, delete backup
+      if (backupPath.isNotEmpty) {
+        await storage.deleteDirectory(backupPath);
+      }
+
+      Logger.info(
+        'Table structure auto-migration completed',
+        label: 'DataStoreImpl.autoSchemaMigrate',
+      );
+    } catch (e, stack) {
+      Logger.error(
+        'Table structure auto-migration failed: $e\n$stack',
+        label: 'DataStoreImpl.autoSchemaMigrate',
+      );
+      // Restore backup on failure
+      if (backupPath.isNotEmpty) {
+        await restore(backupPath);
+      }
+      rethrow;
+    }
+  }
+
+  /// Close database
+  Future<void> close() async {
+    if (!_isInitialized) return;
+
+    try {
+      // Attempt to save cache before closing
+      try {
+        await saveAllCacheBeforeExit();
+      } catch (e) {
+        Logger.error('Failed to save cache when closing: $e',
+            label: 'DataStoreImpl.close');
+      }
+
+      CrontabManager.dispose();
+      await _tableDataManager?.dispose();
+      await storage.close(isMigrationInstance: isMigrationInstance);
+
+      lockManager = null;
+
+      // Release all managers
       _indexManager?.dispose();
-
-      _queryExecutor?.queryCacheManager.clear();
-
+      dataCacheManager.clear();
       await _transactionManager?.commit(null);
 
+      // Clear instance variables
       _transactionManager = null;
-      _indexManager = null;
-      _concurrencyManager = null;
       _queryOptimizer = null;
+      _indexManager = null;
       _queryExecutor = null;
       _statisticsCollector = null;
       _config = null;
       _integrityChecker = null;
+      _keyManager = null;
+      migrationManager = null;
+      schemaManager = null;
+      _tableDataManager = null;
 
-      _maxIds.clear();
-      _maxIdsDirty.clear();
+      _globalConfigCache = null;
+      _spaceConfigCache = null;
 
       _isInitialized = false;
       _initializing = false;
       _initCompleter = Completer<void>();
 
       _instances.remove(_instanceKey);
-
-      _fileManager = null;
 
       Logger.info('The database instance has been closed: $_instanceKey',
           label: 'DataStoreImpl.close');
@@ -459,99 +564,101 @@ class DataStoreImpl {
 
     try {
       var schemaValid = schema;
-      // table name cannot be empty
-      if (schema.name.isEmpty) {
-        throw const BusinessError(
-          'Table name cannot be empty',
-          type: BusinessErrorType.schemaError,
-        );
-      }
 
-      // table name must start with letter and contain only letters, numbers and underscore
-      final tableNameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
-      if (!tableNameRegex.hasMatch(schema.name)) {
-        throw BusinessError(
-          'Invalid table name: ${schema.name}, table name must start with letter and contain only letters, numbers and underscore',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      // check if table already exists
-      final globalSchemaPath = config.getSchemaPath(schema.name, true);
-      final baseSchemaPath = config.getSchemaPath(schema.name, false);
-
-      if (await storage.exists(globalSchemaPath)) {
-        Logger.warn('Table ${schema.name} already exists in global space',
-            label: 'DataStore.createTable');
-        return;
-      }
-      if (await storage.exists(baseSchemaPath)) {
-        Logger.warn('Table ${schema.name} already exists in base space',
+      // Check if table already exists
+      final tableExists = await this.tableExists(schema.name);
+      if (tableExists) {
+        Logger.warn('Table ${schema.name} already exists',
             label: 'DataStore.createTable');
         return;
       }
 
-      // create target directory
-      final targetPath =
-          schema.isGlobal ? config.getGlobalPath() : config.getBasePath();
-      if (!await storage.exists(targetPath)) {
-        await storage.writeAsString(targetPath, '');
-      }
-
-      // get schema file path
-      final schemaPath = schema.isGlobal ? globalSchemaPath : baseSchemaPath;
-
-      await _concurrencyManager!.acquireWriteLock(schema.name);
       try {
-        final primaryField =
-            schema.fields.firstWhere((f) => f.name == schema.primaryKey);
-
-        // auto increment only supports integer primary key
-        if (schema.autoIncrement && primaryField.type != DataType.integer) {
-          Logger.warn(
-            'Auto increment is disabled for table ${schema.name}, auto increment only supports integer primary key, auto increment is set to false',
-            label: 'DataStore.createTable',
+        // Validate primary key configuration and field types
+        if (!schemaValid.validateTableSchema()) {
+          throw BusinessError(
+            'The structure of table ${schema.name} is invalid, please check primary key configuration and index fields',
+            type: BusinessErrorType.schemaError,
           );
-          schemaValid = schema.copyWith(autoIncrement: false);
         }
 
-        // validate table structure
-        await _validateSchema(schemaValid);
+        // Create table path
+        await _pathManager!.createTablePath(schema.name, schema.isGlobal);
 
-        // write schema file
-        await storage.writeAsString(schemaPath, jsonEncode(schemaValid));
+        // Write schema file
+        await updateTableSchema(schema.name, schemaValid);
 
-        // create primary key index
+        // Create primary key index
         await _indexManager?.createPrimaryIndex(schema.name, schema.primaryKey);
 
-        // create other indexes
+        // Create other indexes
         for (var index in schema.indexes) {
           await _indexManager?.createIndex(schema.name, index);
         }
 
-        // if auto increment, initialize id file
-        if (schemaValid.autoIncrement) {
-          final maxIdPath =
-              config.getAutoIncrementPath(schema.name, schema.isGlobal);
-          await storage.writeAsString(maxIdPath, '0');
+        // Automatically create unique indexes for all fields with unique attribute (if not already existing)
+        for (var field in schema.fields) {
+          if (field.unique && field.name != schema.primaryKey) {
+            // Check if the field already has an index (whether unique or not)
+            final hasIndex = schema.indexes.any((idx) =>
+                idx.fields.length == 1 && idx.fields.first == field.name);
+
+            // If no index exists, automatically create a unique index
+            if (!hasIndex) {
+              // Create index schema, don't specify indexName parameter, let actualIndexName create a consistent naming based on field name
+              final indexSchema =
+                  IndexSchema(fields: [field.name], unique: true);
+              await _indexManager?.createIndex(schema.name, indexSchema);
+              Logger.debug(
+                'Automatically created unique index ${indexSchema.actualIndexName} for unique field ${schema.name}.${field.name}',
+                label: 'DataStore.createTable',
+              );
+            }
+          }
         }
 
-        Logger.info(
-          'Table ${schema.name} created successfully${schema.isGlobal ? ' (global)' : ' (base)'}',
-          label: 'DataStore.createTable',
+        // If auto primary key generation is configured, initialize id file
+        if (schemaValid.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+          final maxIdPath =
+              await _pathManager!.getAutoIncrementPath(schema.name);
+
+          // Get initial auto-increment value
+          int initialValue = 0;
+          if (schemaValid.primaryKeyConfig.sequentialConfig != null) {
+            initialValue =
+                schemaValid.primaryKeyConfig.sequentialConfig!.initialValue;
+          }
+
+          await storage.writeAsString(maxIdPath, initialValue.toString());
+        }
+
+        // Mark new table as full table cache
+        await dataCacheManager.cacheEntireTable(
+          schema.name,
+          [],
+          schema.primaryKey,
+          isFullTableCache: true,
         );
 
-        // cache schema
-        _queryExecutor?.queryCacheManager.cacheSchema(schema.name, schemaValid);
-      } catch (e) {
-        // cleanup schema file if creation failed
-        if (await storage.exists(schemaPath)) {
-          await storage.deleteFile(schemaPath);
+        // New table created successfully, call table creation statistics method
+        tableDataManager.tableCreated(schema.name);
+
+        if (!SystemTable.isSystemTable(schema.name)) {
+          Logger.info(
+            'Table ${schema.name} created successfully${schema.isGlobal ? ' (global)' : ' (space)'}',
+            label: 'DataStore.createTable',
+          );
         }
+      } catch (e) {
+        // Cleanup schema
+        if (schemaManager != null) {
+          await schemaManager!.deleteTableSchema(schema.name);
+          // Release directory
+          await directoryManager!.releaseTableDirectory(schema.name);
+        }
+
         Logger.error('Create table failed: $e', label: 'DataStore.createTable');
         rethrow;
-      } finally {
-        await _concurrencyManager!.releaseWriteLock(schema.name);
       }
     } catch (e) {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
@@ -566,104 +673,105 @@ class DataStoreImpl {
     }
   }
 
-  /// insert data complete process
-  Future<bool> insert(String tableName, Map<String, dynamic> data) async {
-    // need to be fully initialized
+  /// Insert data complete process
+  Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
+    // Need to be fully initialized
     if (!_isInitialized) {
       await _ensureInitialized();
     }
 
-    // 1. transaction and lock
+    // 1. Begin transaction
     final transaction = await _transactionManager!.beginTransaction();
-    await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
-      // 2. data validation
+      // 2. Data validation
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.insert');
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'Table $tableName does not exist',
+        );
+      }
       final validData = await _validateAndProcessData(schema, data, tableName);
       if (validData == null) {
-        return false;
+        return DbResult.error(
+          code: ResultCode.validationFailed,
+          message: 'Data validation failed',
+        );
       }
 
-      // 3. unique check
-      if (!await _checkUniqueConstraints(tableName, validData)) {
-        return false;
+      // 3. Unique check
+      if (await _indexManager?.checkUniqueConstraints(tableName, validData) ==
+          false) {
+        // For primary key conflicts, try to update the maximum ID value to avoid assigning the same ID in the future
+        final primaryKey = schema.primaryKey;
+        final providedId = validData[primaryKey];
+
+        // Only handle integer primary keys and auto-increment primary key configurations
+        if (providedId is int &&
+            schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+          // Notify TableDataManager to handle primary key conflict
+          await tableDataManager.handlePrimaryKeyConflict(
+              tableName, providedId);
+        }
+
+        return DbResult.error(
+          code: ResultCode.uniqueViolation,
+          message: 'Unique constraint violation',
+          failedKeys: providedId != null ? [providedId.toString()] : [],
+        );
       }
 
-      // 4. update cache
-      _queryExecutor?.queryCacheManager.addCachedRecord(tableName, validData);
+      // 4. Update cache
+      dataCacheManager.addCachedRecord(tableName, validData);
 
-      // 5. add to write queue (insert operation)
-      fileManager.addToWriteQueue(tableName, validData, isUpdate: false);
+      // 5. Add to write queue (insert operation)
+      tableDataManager.addToWriteBuffer(tableName, validData, isUpdate: false);
 
-      // 6. commit transaction
+      // 6. Commit transaction
       await _transactionManager!.commit(transaction);
-      return true;
+
+      // Return string type primary key value
+      final primaryKeyValue = validData[schema.primaryKey];
+      return DbResult.success(
+        primaryKey: primaryKeyValue?.toString(),
+        message: 'Insert successful',
+      );
     } catch (e) {
       Logger.error('Insert failed: $e', label: 'DataStore.insert');
-      await _rollbackTransaction(transaction, tableName, data);
-      return false;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
-    }
-  }
 
-  /// rollback transaction
-  Future<void> _rollbackTransaction(
-    Transaction? transaction,
-    String tableName,
-    Map<String, dynamic> data,
-  ) async {
-    try {
-      // 1. rollback transaction
-      await _transactionManager!.rollback(transaction);
+      try {
+        // Rollback transaction
+        await _transactionManager!.rollback(transaction);
 
-      // 2. remove from cache
-      final schema = await getTableSchema(tableName);
-      final primaryKeyField = schema.primaryKey;
-      final primaryKeyValue = data[primaryKeyField];
-
-      _queryExecutor?.queryCacheManager.removeCachedRecord(
-        tableName,
-        primaryKeyValue.toString(),
-      );
-
-      // 3. remove from write queue
-      final queue = fileManager.writeQueue[tableName];
-      if (queue != null) {
-        queue.removeWhere(
-            (record) => record[primaryKeyField] == primaryKeyValue);
-      }
-
-      // 4. remove last record from file (if written)
-      final allRecords = await fileManager.readRecords(tableName);
-      if (allRecords.isNotEmpty) {
-        try {
-          final records = allRecords.values.toList();
-          final lastRecord = records.last;
-          if (lastRecord[primaryKeyField] == primaryKeyValue) {
-            records.removeLast();
-            await fileManager.writeRecords(
-              tableName: tableName,
-              records: records,
-              fullRewrite: true,
-            );
-          }
-        } catch (e) {
-          Logger.error('Failed to rollback last record: $e',
-              label: 'DataStore._rollbackTransaction');
+        // Clear cache
+        final schema = await getTableSchema(tableName);
+        final primaryKeyValue = schema != null ? data[schema.primaryKey] : null;
+        if (primaryKeyValue != null) {
+          dataCacheManager.removeCachedRecord(
+              tableName, primaryKeyValue.toString());
         }
+
+        // clear write queue
+        final queue = tableDataManager.writeBuffer[tableName];
+        if (queue != null && schema != null) {
+          final primaryKey = schema.primaryKey;
+          final recordId = data[primaryKey]?.toString();
+          if (recordId != null) {
+            queue.remove(recordId);
+          }
+        }
+      } catch (rollbackError) {
+        Logger.error('Rollback failed: $rollbackError',
+            label: 'DataStore.insert');
       }
 
-      // 5. rollback indexes
-      await _indexManager?.deleteFromIndexes(tableName, data);
-
-      Logger.info('Transaction rollback successfully');
-    } catch (e) {
-      Logger.error('Transaction rollback failed: $e',
-          label: 'DataStore._rollbackTransaction');
-      _queryExecutor?.queryCacheManager.invalidateCache(tableName);
-      rethrow;
+      return DbResult.error(
+        code: ResultCode.dbError,
+        message: 'Insert failed: $e',
+      );
     }
   }
 
@@ -677,22 +785,16 @@ class DataStoreImpl {
       final primaryKey = schema.primaryKey;
       var result = <String, dynamic>{};
 
-      // get primary key field
-      final primaryField =
-          schema.fields.firstWhere((f) => f.name == primaryKey);
-
       // 1. handle primary key
       if (!data.containsKey(primaryKey) || data[primaryKey] == null) {
-        // auto increment only supports integer primary key
-        if (schema.autoIncrement && primaryField.type != DataType.integer) {
-          throw const BusinessError(
-            'Auto increment only supports integer primary key',
-            type: BusinessErrorType.schemaError,
-          );
-        }
-
-        if (schema.autoIncrement) {
-          final nextId = await _getNextId(tableName);
+        if (schema.primaryKeyConfig.type != PrimaryKeyType.none) {
+          final nextId = await tableDataManager.getNextId(tableName);
+          if (nextId.isEmpty) {
+            throw const BusinessError(
+              'Failed to generate primary key',
+              type: BusinessErrorType.invalidData,
+            );
+          }
           result[primaryKey] = nextId;
         } else {
           throw const BusinessError(
@@ -703,23 +805,29 @@ class DataStoreImpl {
       } else {
         final providedId = data[primaryKey];
 
-        // check primary key type
-        if (primaryField.type == DataType.text && providedId is! String) {
-          throw const BusinessError(
-            'Primary key must be text type',
-            type: BusinessErrorType.typeError,
-          );
-        } else if (primaryField.type == DataType.integer &&
-            providedId is! int) {
-          throw const BusinessError(
-            'Primary key must be integer type',
-            type: BusinessErrorType.typeError,
-          );
+        // Validate primary key format and ordering
+        if (providedId != null) {
+          // Format validation
+          if (!schema.validatePrimaryKeyFormat(providedId)) {
+            throw BusinessError(
+              'The provided primary key value $providedId does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
+              type: BusinessErrorType.invalidData,
+            );
+          }
+
+          // Ordering validation
+          if (!await _validatePrimaryKeyOrder(
+              tableName, providedId, schema.primaryKeyConfig.type)) {
+            throw BusinessError(
+              'The provided primary key value $providedId violates the key ordering of table $tableName, data insertion rejected',
+              type: BusinessErrorType.invalidData,
+            );
+          }
         }
 
-        // only integer type primary key can auto increment
-        if (providedId is int && schema.autoIncrement) {
-          _updateMaxIdInMemory(tableName, providedId);
+        if (providedId is String &&
+            schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+          tableDataManager.updateMaxIdInMemory(tableName, providedId);
         }
         result[primaryKey] = providedId;
       }
@@ -732,8 +840,7 @@ class DataStoreImpl {
 
         if (!data.containsKey(field.name)) {
           if (field.defaultValue != null) {
-            final convertedDefault =
-                _convertValue(field.defaultValue, field.type);
+            final convertedDefault = field.convertValue();
             if (convertedDefault == null) {
               Logger.warn(
                 'Invalid default value for field ${field.name}',
@@ -765,12 +872,12 @@ class DataStoreImpl {
 
           // if value is not null, try to convert type
           if (value != null) {
-            if (_isValidDataType(value, field.type)) {
+            if (field.isValidDataType(value, field.type)) {
               result[field.name] = value; // type match, use directly
             } else {
               try {
                 // try to convert type
-                final convertedValue = _convertValue(value, field.type);
+                final convertedValue = field.convertValue(value: value);
                 if (convertedValue == null) {
                   Logger.warn(
                     'Failed to convert value for field ${field.name}: $value to ${field.type}',
@@ -791,19 +898,20 @@ class DataStoreImpl {
             result[field.name] = null;
           }
         }
-
-        // check max length
-        if (result[field.name] != null && field.maxLength != null) {
-          if (result[field.name] is String &&
-              (result[field.name] as String).length > field.maxLength!) {
-            Logger.warn('Warning: field ${field.name} exceeds max length');
-            result[field.name] =
-                (result[field.name] as String).substring(0, field.maxLength!);
-          }
-        }
       }
 
-      return _prepareDataForStorage(result);
+      // 3. validate data using schema constraints and apply constraints if needed
+      final validatedResult =
+          schema.validateData(result, applyConstraints: true);
+      if (validatedResult == null) {
+        Logger.warn(
+          'Data validation failed for table $tableName',
+          label: 'DataStore._validateAndProcessData',
+        );
+        return null;
+      }
+
+      return _prepareDataForStorage(validatedResult);
     } catch (e) {
       Logger.error('Data validation failed: $e',
           label: 'DataStore-_validateAndProcessData');
@@ -821,347 +929,54 @@ class DataStoreImpl {
     });
   }
 
-  /// get type default value
-  dynamic _getTypeDefaultValue(DataType type) {
-    switch (type) {
-      case DataType.integer:
-        return 0;
-      case DataType.double:
-        return 0.0;
-      case DataType.text:
-        return '';
-      case DataType.blob:
-        return Uint8List(0);
-      case DataType.boolean:
-        return false;
-      case DataType.datetime:
-        return DateTime.now().toIso8601String();
-      case DataType.array:
-        return [];
-    }
-  }
-
-  /// Check if value matches data type
-  bool _isValidDataType(dynamic value, DataType type) {
-    if (value == null) return true;
-    switch (type) {
-      case DataType.integer:
-        return value is int; // only allow int type
-      case DataType.double:
-        return value is double ||
-            value is int; // allow int to be converted to double
-      case DataType.text:
-        return value is String; // only allow string type
-      case DataType.blob:
-        return value is Uint8List; // only allow binary data
-      case DataType.boolean:
-        return value is bool; // only allow boolean type
-      case DataType.datetime:
-        if (value is String) {
-          try {
-            DateTime.parse(value);
-            return true;
-          } catch (_) {
-            return false;
-          }
-        }
-        return false; // DateTime对象不是有效的存储格式
-      case DataType.array:
-        return value is List; // only allow list type
-    }
-  }
-
-  /// query data by map
-  Future<List<Map<String, dynamic>>> queryByMap(
-    String tableName, {
-    Map<String, dynamic>? where,
+  /// Execute query
+  Future<List<Map<String, dynamic>>> executeQuery(
+    String tableName,
+    QueryCondition condition, {
     List<String>? orderBy,
     int? limit,
     int? offset,
   }) async {
-    await _ensureInitialized();
+    // build query plan
+    final queryPlan = await _queryOptimizer?.optimize(
+      tableName,
+      condition.build(),
+      orderBy,
+    );
 
-    try {
-      // convert map condition to QueryCondition
-      final condition = _convertMapToCondition(where);
-
-      // build query plan
-      final queryPlan = await _queryOptimizer?.optimize(
-        tableName,
-        where ?? {},
-        orderBy,
-      );
-
-      if (queryPlan == null) {
-        throw StateError('Query optimizer not initialized');
-      }
-
-      // execute query by QueryExecutor
-      final results = await _queryExecutor?.execute(
-            queryPlan,
-            tableName,
-            condition: condition,
-            orderBy: orderBy,
-            limit: limit,
-            offset: offset,
-          ) ??
-          [];
-
-      return results;
-    } catch (e) {
-      Logger.error('Query failed: $e', label: 'DataStore.queryByMap');
-      rethrow;
-    }
-  }
-
-  /// convert map condition to QueryCondition
-  QueryCondition _convertMapToCondition(Map<String, dynamic>? where) {
-    if (where == null || where.isEmpty) {
-      return QueryCondition();
+    if (queryPlan == null) {
+      throw StateError('Query optimizer not initialized');
     }
 
-    final condition = QueryCondition();
-
-    // handle OR condition
-    if (where.containsKey('OR')) {
-      final orGroups = where['OR'] as List<Map<String, dynamic>>;
-      for (var group in orGroups) {
-        // add first group condition
-        for (var entry in group.entries) {
-          _addCondition(condition, entry.key, entry.value);
-        }
-        // use OR for subsequent groups
-        if (group != orGroups.last) {
-          condition.or();
-        }
-      }
-    } else {
-      // handle normal AND condition
-      for (var entry in where.entries) {
-        _addCondition(condition, entry.key, entry.value);
-      }
-    }
-
-    return condition;
-  }
-
-  /// add single condition
-  void _addCondition(QueryCondition condition, String field, dynamic value) {
-    if (value == null) {
-      condition.where(field, 'IS', null);
-      return;
-    }
-
-    if (value is Map) {
-      final operator = value.keys.first.toString().toUpperCase();
-      final compareValue = value.values.first;
-
-      switch (operator) {
-        case 'IN':
-        case 'NOT IN':
-          if (compareValue is! List) {
-            Logger.warn('IN/NOT IN operator needs List type value',
-                label: 'DataStore._addCondition');
-            return;
-          }
-          condition.where(field, operator, compareValue);
-          break;
-
-        case 'BETWEEN':
-          if (compareValue is! Map ||
-              !compareValue.containsKey('start') ||
-              !compareValue.containsKey('end')) {
-            Logger.warn('BETWEEN operator needs Map with start and end',
-                label: 'DataStore._addCondition');
-            return;
-          }
-          condition.where(
-              field, 'BETWEEN', [compareValue['start'], compareValue['end']]);
-          break;
-
-        case 'LIKE':
-        case 'NOT LIKE':
-          if (compareValue is! String) {
-            Logger.warn('LIKE/NOT LIKE operator needs String type value',
-                label: 'DataStore._addCondition');
-            return;
-          }
-          condition.where(field, operator, compareValue);
-          break;
-
-        case 'IS':
-        case 'IS NOT':
-          condition.where(field, operator, null);
-          break;
-
-        default:
-          // handle other operators (>, <, >=, <=, !=)
-          condition.where(field, operator, compareValue);
-          break;
-      }
-    } else {
-      // simple equal condition
-      condition.where(field, '=', value);
-    }
-  }
-
-  Future<void> _recoveryIncompleteTransactions() async {
-    final transactions = await _loadIncompleteTransactions();
-    for (final transaction in transactions) {
-      if (transaction.isExpired) {
-        await rollback(transaction);
-      } else {
-        await _applyChanges(transaction);
-      }
-    }
-  }
-
-  Future<List<Transaction>> _loadIncompleteTransactions() async {
-    // implement loading incomplete transactions from transaction log
-    return [];
-  }
-
-  /// Validate schema
-  Future<bool> _validateSchema(TableSchema schema) async {
-    try {
-      // get primary key field
-      final primaryField = schema.fields.firstWhere(
-        (f) => f.name == schema.primaryKey,
-        orElse: () => throw const BusinessError(
-          'Primary key field not found in fields',
-          type: BusinessErrorType.schemaError,
-        ),
-      );
-
-      // validate auto increment setting
-      if (schema.autoIncrement && primaryField.type != DataType.integer) {
-        throw const BusinessError(
-          'Auto increment only supports integer primary key',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      // validate primary key cannot be null
-      if (primaryField.nullable) {
-        throw const BusinessError(
-          'Primary key field cannot be nullable',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      // validate field name uniqueness
-      final fieldNames = schema.fields.map((f) => f.name).toList();
-      if (fieldNames.toSet().length != fieldNames.length) {
-        throw const BusinessError(
-          'Duplicate field names found',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      // validate index fields exist
-      for (var index in schema.indexes) {
-        for (var field in index.fields) {
-          if (!schema.fields.any((f) => f.name == field)) {
-            throw BusinessError(
-              'Index field $field not found in table fields',
-              type: BusinessErrorType.schemaError,
-            );
-          }
-        }
-      }
-
-      // validate field name format
-      final fieldNameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
-      for (var field in schema.fields) {
-        if (!fieldNameRegex.hasMatch(field.name)) {
-          throw BusinessError(
-            'Invalid field name: ${field.name}',
-            type: BusinessErrorType.schemaError,
-          );
-        }
-      }
-
-      return true;
-    } catch (e) {
-      Logger.error('Schema validation failed: $e',
-          label: 'DataStore._validateSchema');
-      rethrow;
-    }
+    // execute query using QueryExecutor
+    return await _queryExecutor?.execute(
+          queryPlan,
+          tableName,
+          condition: condition,
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+        ) ??
+        [];
   }
 
   /// calculate checksum
-  String _calculateChecksum(Uint8List data) {
+  String calculateChecksum(Uint8List data) {
     final compressor = DataCompressor();
     return compressor.calculateChecksum(data).toString();
-  }
-
-  /// rollback transaction
-  Future<void> rollback(Transaction transaction) async {
-    await _transactionManager!.rollback(transaction);
-  }
-
-  /// apply transaction changes
-  Future<void> _applyChanges(Transaction transaction) async {
-    await _transactionManager!.commit(transaction);
-  }
-
-  /// verify data integrity
-  Future<bool> _verifyDataIntegrity(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    final dataPath = config.getDataPath(tableName, schema.isGlobal);
-    final checksumPath = config.getChecksumPath(tableName, schema.isGlobal);
-
-    if (!await storage.exists(dataPath) ||
-        !await storage.exists(checksumPath)) {
-      return false;
-    }
-
-    try {
-      // read data file content
-      final dataContent = await storage.readAsString(dataPath);
-      if (dataContent == null) return false;
-      final dataBytes = Uint8List.fromList(utf8.encode(dataContent));
-
-      // read checksum file content
-      final checksumContent = await storage.readAsString(checksumPath);
-      if (checksumContent == null) return false;
-
-      // calculate data file checksum
-      final actualChecksum = _calculateChecksum(dataBytes);
-
-      return actualChecksum == checksumContent.trim();
-    } catch (e) {
-      Logger.error(
-        'Verify data integrity failed: $e',
-        label: 'DataStore._verifyDataIntegrity',
-      );
-      return false;
-    }
-  }
-
-  /// repair data
-  Future<void> _repairData(String tableName) async {
-    // use auto repair to repair data
-    final autoRepair = AutoRepair(
-      this,
-      _indexManager!,
-      BackupManager(this),
-    );
-    await autoRepair.repairTableStructure(tableName);
   }
 
   /// backup data and return backup path
   Future<String> backup() async {
     try {
       // 1. flush all pending data
-      await fileManager.flushWriteQueue();
+      await tableDataManager.flushWriteBuffer();
 
       // 2. create backup manager
       final backupManager = BackupManager(this);
 
       // 3. create backup
-      final backupPath = await backupManager.createBackup();
-      Logger.info('Backup created successfully: $backupPath');
+      final backupPath = await backupManager.createBackup(compress: kIsWeb);
       return backupPath;
     } catch (e) {
       Logger.error('Create backup failed: $e', label: 'DataStore-backup');
@@ -1188,25 +1003,6 @@ class DataStoreImpl {
     }
   }
 
-  /// update statistics
-  Future<void> updateStatistics(String tableName) async {
-    await _statisticsCollector!.collectTableStatistics(tableName);
-  }
-
-  /// get query plan
-  Future<String> explainQuery(
-    String tableName, {
-    Map<String, dynamic>? where,
-    List<String>? orderBy,
-  }) async {
-    final queryPlan = await _queryOptimizer!.optimize(
-      tableName,
-      where,
-      orderBy,
-    );
-    return queryPlan.explain();
-  }
-
   /// validate and process update data
   Future<Map<String, dynamic>?> _validateAndProcessUpdateData(
     TableSchema schema,
@@ -1231,10 +1027,10 @@ class DataStoreImpl {
 
         final value = data[field.name];
 
-        // Check non-null constraint
-        if (!field.nullable && value == null) {
+        // Validate value using update-specific method
+        if (!field.validateUpdateValue(value)) {
           Logger.warn(
-            'Field ${field.name} cannot be null',
+            'Field ${field.name} value does not meet constraints: $value',
             label: 'DataStore._validateAndProcessUpdateData',
           );
           return null;
@@ -1242,11 +1038,11 @@ class DataStoreImpl {
 
         // If value is not null, validate and convert type
         if (value != null) {
-          if (_isValidDataType(value, field.type)) {
+          if (field.isValidDataType(value, field.type)) {
             result[field.name] = value;
           } else {
             try {
-              final convertedValue = _convertValue(value, field.type);
+              final convertedValue = field.convertValue(value: value);
               if (convertedValue == null) {
                 Logger.warn(
                   'Failed to convert value for field ${field.name}: $value to ${field.type}',
@@ -1287,7 +1083,7 @@ class DataStoreImpl {
   }
 
   /// update record
-  Future<bool> updateInternal(
+  Future<DbResult> updateInternal(
     String tableName,
     Map<String, dynamic> data,
     QueryCondition condition, {
@@ -1297,22 +1093,35 @@ class DataStoreImpl {
   }) async {
     await _ensureInitialized();
     final transaction = await _transactionManager!.beginTransaction();
-    await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
       // validate data
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.updateInternal');
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'Table $tableName does not exist',
+        );
+      }
       final validData =
           await _validateAndProcessUpdateData(schema, data, tableName);
       if (validData == null || validData.isEmpty) {
-        return false;
+        return DbResult.error(
+          code: ResultCode.validationFailed,
+          message: 'Data validation failed',
+        );
       }
 
       // find matching records
-      final records = await _executeQuery(tableName, condition,
+      final records = await executeQuery(tableName, condition,
           orderBy: orderBy, limit: limit, offset: offset);
       if (records.isEmpty) {
-        return false;
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'No matching records found',
+        );
       }
 
       // check unique constraints
@@ -1326,7 +1135,7 @@ class DataStoreImpl {
           if (field.unique && validData.containsKey(field.name)) {
             final value = validData[field.name];
             // find if other records are using this value
-            final existing = await _executeQuery(
+            final existing = await executeQuery(
                 tableName,
                 QueryCondition()
                   ..where(field.name, '=', value)
@@ -1334,7 +1143,10 @@ class DataStoreImpl {
             if (existing.isNotEmpty) {
               Logger.warn(
                   'Warning: value $value of field ${field.name} already exists');
-              return false;
+              return DbResult.error(
+                code: ResultCode.uniqueViolation,
+                message: 'Field ${field.name} value $value already exists',
+              );
             }
           }
         }
@@ -1354,68 +1166,61 @@ class DataStoreImpl {
             condition.where(schema.primaryKey, '!=',
                 record[schema.primaryKey]); // exclude current record
 
-            final existing = await _executeQuery(tableName, condition);
+            final existing = await executeQuery(tableName, condition);
             if (existing.isNotEmpty) {
               Logger.warn(
                   'Warning: value ${record[schema.primaryKey]} of unique index ${index.actualIndexName} already exists');
-              return false;
+              return DbResult.error(
+                code: ResultCode.uniqueViolation,
+                message: 'Index ${index.actualIndexName} value already exists',
+              );
             }
           }
         }
 
         // update cache and write queue, index
-        _queryExecutor?.queryCacheManager.removeCachedRecord(
+        dataCacheManager.removeCachedRecord(
             tableName, record[schema.primaryKey].toString());
-        _queryExecutor?.queryCacheManager
-            .addCachedRecord(tableName, updatedRecord);
-
+        dataCacheManager.addCachedRecord(tableName, updatedRecord);
         // update write queue
-        fileManager.addToWriteQueue(tableName, updatedRecord, isUpdate: true);
+        tableDataManager.addToWriteBuffer(tableName, updatedRecord,
+            isUpdate: true);
       }
 
       // commit transaction
       await _transactionManager!.commit(transaction);
 
-      // invalidate related query cache of affected records
-      final affectedPrimaryKeys =
-          records.map((r) => r[schema.primaryKey]).toSet();
-      await _queryExecutor?.invalidateRecords(tableName, affectedPrimaryKeys);
-
-      return true;
+      return DbResult.success(
+        message: 'Update successful, affected ${records.length} records',
+      );
     } catch (e) {
       Logger.error('Update failed: $e', label: 'DataStore-update');
       await _transactionManager!.rollback(transaction);
-      rethrow;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
+      return DbResult.error(
+        code: ResultCode.dbError,
+        message: 'Update failed: $e',
+      );
     }
   }
 
   /// clear table
   Future<void> clear(String tableName) async {
+    final schema = await getTableSchema(tableName);
+    if (schema == null) {
+      Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
+      return;
+    }
     final transaction = await _transactionManager!.beginTransaction();
-    await _concurrencyManager!.acquireWriteLock(tableName);
+
     try {
-      // clear file
-      final schema = await getTableSchema(tableName);
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      if (await storage.exists(dataPath)) {
-        await storage.writeAsString(dataPath, '');
-      }
+      //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
+      await tableDataManager.clearTable(tableName);
 
-      // clear record cache
-      _queryExecutor?.queryCacheManager.invalidateCache(tableName);
-
-      // clear write queue
-      fileManager.writeQueue.remove(tableName);
-
-      // reset index
+      //  reset index
       await _indexManager?.resetIndexes(tableName);
 
-      // clear unique value cache
-      _uniqueValuesCache.remove(tableName);
-
-      // clear statistics
+      //   clear application layer cache
+      dataCacheManager.invalidateCache(tableName);
       _statisticsCollector?.invalidateCache(tableName);
 
       await _transactionManager!.commit(transaction);
@@ -1423,13 +1228,11 @@ class DataStoreImpl {
       Logger.info('Clear table failed: $e', label: 'DataStore-clear');
       await _transactionManager!.rollback(transaction);
       rethrow;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
     }
   }
 
   /// delete record
-  Future<bool> deleteInternal(
+  Future<DbResult> deleteInternal(
     String tableName,
     QueryCondition condition, {
     List<String>? orderBy,
@@ -1437,246 +1240,252 @@ class DataStoreImpl {
     int? offset,
   }) async {
     final transaction = await _transactionManager!.beginTransaction();
-    await _concurrencyManager!.acquireWriteLock(tableName);
 
     try {
-      // find records to delete
-      final recordsToDelete = await _executeQuery(tableName, condition,
+      // Find records to delete
+      final recordsToDelete = await executeQuery(tableName, condition,
           orderBy: orderBy, limit: limit, offset: offset);
 
       if (recordsToDelete.isEmpty) {
-        return true;
+        return DbResult.success(
+          message: 'No records found to delete',
+        );
       }
-
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.deleteInternal');
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'Table $tableName does not exist',
+        );
+      }
       final primaryKey = schema.primaryKey;
-      final queue = fileManager.writeQueue[tableName];
+      final queue = tableDataManager.writeBuffer[tableName];
 
       for (var record in recordsToDelete) {
-        // remove from record cache
-        _queryExecutor?.queryCacheManager
-            .removeCachedRecord(tableName, record[primaryKey].toString());
+        final pkValue = record[primaryKey]?.toString();
+        if (pkValue == null) {
+          continue;
+        }
+        // Remove from record cache
+        dataCacheManager.removeCachedRecord(tableName, pkValue);
 
-        // invalidate related query cache
-        _queryExecutor?.invalidateRecord(tableName, record[primaryKey]);
-
-        queue?.removeWhere(
-            (r) => r[schema.primaryKey] == record[schema.primaryKey]);
+        queue?.remove(pkValue);
 
         await _indexManager!.deleteFromIndexes(tableName, record);
       }
 
-      // Read all records and filter out deleted ones
-      final allRecords = await fileManager.readRecords(tableName);
-      final remainingRecords = allRecords.values.where((record) {
-        return !recordsToDelete
-            .any((r) => r[schema.primaryKey] == record[schema.primaryKey]);
-      }).toList();
-
-      // Write remaining records using fileManager
-      await fileManager.writeRecords(
+      // Use streaming to filter out deleted records and rewrite the table without loading all data into memory
+      await tableDataManager.writeRecords(
         tableName: tableName,
-        records: remainingRecords,
-        fullRewrite: true,
+        records: recordsToDelete,
+        operationType: RecordOperationType.delete,
       );
 
-      // update statistics
+      // Update statistics
       await _statisticsCollector?.collectTableStatistics(tableName);
 
       await _transactionManager!.commit(transaction);
-      return true;
+      return DbResult.success(
+        message: 'Successfully deleted ${recordsToDelete.length} records',
+      );
     } catch (e) {
       Logger.info('Delete failed: $e', label: 'DataStore-delete');
       await _transactionManager!.rollback(transaction);
-      // clear cache, ensure data consistency
-      return false;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
+      // Clear cache, ensure data consistency
+      return DbResult.error(
+        code: ResultCode.dbError,
+        message: 'Delete failed: $e',
+      );
     }
   }
 
   /// drop table
-  Future<void> dropTable(String tableName) async {
+  /// [isMigration] is true when dropping space table during migration,
+  Future<void> dropTable(String tableName, {bool isMigration = false}) async {
     try {
-      await _concurrencyManager!.acquireWriteLock(tableName);
-      final schema = await getTableSchema(tableName);
-
-      // delete data file
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      if (await storage.exists(dataPath)) {
-        await storage.deleteFile(dataPath);
-      }
-
-      // delete schema file
-      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-      if (await storage.exists(schemaPath)) {
-        await storage.deleteFile(schemaPath);
-      }
-
-      // delete index files
-      for (var index in schema.indexes) {
-        final indexPath = config.getIndexPath(
-          tableName,
-          index.actualIndexName,
-          schema.isGlobal,
+      if (isMigration) {
+        // During migration, only delete the table data directory in the current space
+        Logger.info(
+          'Deleting table $tableName data in space $_currentSpaceName during migration',
+          label: 'DataStore.dropTable',
         );
-        if (await storage.exists(indexPath)) {
-          await storage.deleteFile(indexPath);
-        }
-      }
 
-      // clear all related caches
-      _queryExecutor?.queryCacheManager.invalidateCache(tableName);
-      _queryExecutor?.invalidateCache(tableName);
-      _statisticsCollector?.invalidateCache(tableName);
+        // Get table directory path
+        final tablePath = await directoryManager!
+            .getTableDirectoryPath(tableName, spaceName: _currentSpaceName);
+
+        // Delete table directory
+        if (tablePath != null && await storage.existsFile(tablePath)) {
+          await storage.deleteDirectory(tablePath);
+          Logger.info(
+            'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
+            label: 'DataStore.dropTable',
+          );
+        }
+
+        // Remove table directory mapping from space configuration
+        await directoryManager!.removeTableDirectoryMapping(tableName,
+            spaceName: _currentSpaceName);
+
+        return;
+      } else {
+        // Non-migration process, normal table deletion
+
+        // Deleting a table requires updating statistics
+        await tableDataManager.tableDeleted(tableName);
+
+        // Get table path
+        String? tablePath;
+        try {
+          tablePath = await _pathManager!.getTablePath(tableName);
+        } catch (e) {
+          Logger.warn('Failed to get table path: $e',
+              label: 'DataStore.dropTable');
+        }
+
+        // Delete table structure
+        if (schemaManager != null) {
+          await schemaManager!.deleteTableSchema(tableName);
+          // Release directory
+          await directoryManager!.releaseTableDirectory(tableName);
+        }
+
+        // Delete table directory and all related files
+        if (tablePath != null && await storage.existsDirectory(tablePath)) {
+          await storage.deleteDirectory(tablePath);
+        }
+
+        // Clear table cache and other memory caches
+        _invalidateTableCaches(tableName);
+
+        // Clear path cache
+        _pathManager?.clearTableCache(tableName);
+
+        // Add migration task to delete table data in each space
+        await migrationManager?.addMigrationTask(tableName,
+            [const MigrationOperation(type: MigrationType.dropTable)]);
+
+        Logger.info('Table $tableName has been successfully deleted',
+            label: 'DataStore.dropTable');
+        return;
+      }
     } catch (e) {
-      Logger.error('Drop table failed: $e', label: 'DataStore-dropTable');
+      Logger.error('Failed to delete table: $e', label: 'DataStore-dropTable');
       rethrow;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
     }
   }
 
+  /// get initial schema
+  List<TableSchema> getInitialSchema() {
+    final existingTableNames = _schemas.map((schema) => schema.name).toSet();
+
+    // Add system tables
+    for (final systemTable in SystemTable.gettableSchemas) {
+      if (!existingTableNames.contains(systemTable.name)) {
+        _schemas.add(systemTable);
+      }
+    }
+
+    return _schemas;
+  }
+
   /// Get table schema
-  Future<TableSchema> getTableSchema(String tableName) async {
+  Future<TableSchema?> getTableSchema(String tableName) async {
     try {
       // 1. Try to get from cache first
-      final cachedSchema =
-          _queryExecutor?.queryCacheManager.getSchema(tableName);
+      final cachedSchema = dataCacheManager.getSchema(tableName);
       if (cachedSchema != null) {
         return cachedSchema;
       }
 
-      // 2. Load schema from file
-      final globalSchemaPath = config.getSchemaPath(tableName, true);
-      final baseSchemaPath = config.getSchemaPath(tableName, false);
+      // 2. Use SchemaPartitionManager to load schema
+      if (schemaManager == null) {
+        throw StateError('SchemaPartitionManager not initialized');
+      }
 
-      TableSchema? schema;
-      bool isGlobal = false;
+      final schemaJson = await schemaManager!.readTableSchema(tableName);
 
-      if (await storage.exists(globalSchemaPath)) {
-        final content = await storage.readAsString(globalSchemaPath);
-        if (content != null) {
-          final schemaMap = jsonDecode(content) as Map<String, dynamic>;
-          // if name is not in json, add schemaPath
-          if (!schemaMap.containsKey('name')) {
-            schemaMap['_schemaPath'] = globalSchemaPath;
-          }
-          schema = TableSchema.fromJson(schemaMap);
-          isGlobal = true;
-        }
-      } else if (await storage.exists(baseSchemaPath)) {
-        final schemaJson = await storage.readAsString(baseSchemaPath);
-        if (schemaJson == null || schemaJson.isEmpty) {
-          Logger.error('Schema file is empty: $baseSchemaPath',
-              label: 'DataStoreImpl.getTableSchema');
-          return TableSchema(
-            name: tableName,
-            primaryKey: '',
-            fields: const [],
-          );
-        }
-
+      if (schemaJson != null) {
         try {
           final schemaMap = jsonDecode(schemaJson) as Map<String, dynamic>;
+          final schema = TableSchema.fromJson(schemaMap);
 
-          // if name is not in json, add schemaPath
-          if (!schemaMap.containsKey('name')) {
-            schemaMap['_schemaPath'] = baseSchemaPath;
-          }
-          schema = TableSchema.fromJson(schemaMap);
+          // Cache and return schema
+          dataCacheManager.cacheSchema(tableName, schema);
+          return schema;
         } catch (e) {
-          Logger.error(
-            'Failed to parse schema JSON: $e\nJSON Content: $schemaJson',
-            label: "DataStoreImpl.getTableSchema",
-          );
-          return TableSchema(
-            name: tableName,
-            primaryKey: '',
-            fields: const [],
-          );
+          Logger.error('Failed to parse schema JSON: $e',
+              label: 'DataStoreImpl.getTableSchema');
         }
-      }
-
-      // Validate schema name matches table name
-      if (schema?.name != tableName) {
-        Logger.error(
-          'Schema name (${schema?.name}) does not match table name ($tableName)',
-          label: "DataStoreImpl.getTableSchema",
-        );
-      }
-
-      if (schema != null) {
-        // 3. Check and adjust auto increment setting for text primary key
-        final primaryField =
-            schema.fields.firstWhere((f) => f.name == schema?.primaryKey);
-        if (schema.autoIncrement && primaryField.type != DataType.integer) {
-          Logger.warn(
-            'Auto increment was disabled for table ${schema.name}, auto increment only supports integer primary key, auto increment is set to false',
-            label: 'DataStore.getTableSchema',
-          );
-
-          // Create adjusted schema
-          final adjustedSchema = schema.copyWith(autoIncrement: false);
-
-          final schemaPath = isGlobal ? globalSchemaPath : baseSchemaPath;
-          await storage.writeAsString(schemaPath, jsonEncode(adjustedSchema));
-
-          // Update cache
-          _queryExecutor?.queryCacheManager
-              .cacheSchema(tableName, adjustedSchema);
-
-          return adjustedSchema;
-        }
-
-        // Cache and return original schema
-        _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
-        return schema;
       }
 
       // Return empty schema if not found
-      return TableSchema(
-        name: tableName,
-        primaryKey: '',
-        fields: const [],
-      );
+      return null;
     } catch (e) {
       Logger.error(
         'Failed to get table schema: $e',
         label: 'DataStore.getTableSchema',
       );
-      return TableSchema(
-        name: tableName,
-        fields: [],
-        indexes: [],
-        primaryKey: '',
-        isGlobal: false,
-      );
+      return null;
     }
   }
 
-  /// verify data integrity
-  Future<bool> verifyIntegrity(String tableName) async {
-    return _verifyDataIntegrity(tableName);
+  /// check table exists
+  Future<bool> tableExists(String tableName) async {
+    try {
+      if (schemaManager == null) {
+        throw StateError('SchemaPartitionManager not initialized');
+      }
+
+      final schema = await schemaManager!.readTableSchema(tableName);
+      return schema != null;
+    } catch (e) {
+      Logger.error(
+        'Failed to check table existence: $e',
+        label: 'DataStoreImpl._tableExists',
+      );
+      return false;
+    }
   }
 
-  /// repair data
-  Future<void> repair(String tableName) async {
-    await _repairData(tableName);
+  /// get all table names
+  Future<List<String>> getTableNames() async {
+    try {
+      if (schemaManager == null) {
+        throw StateError('SchemaPartitionManager not initialized');
+      }
+
+      return await schemaManager!.listAllTables();
+    } catch (e) {
+      Logger.error(
+        'Failed to get table names: $e',
+        label: 'DataStoreImpl.getTableNames',
+      );
+      return [];
+    }
   }
 
   /// batch insert data
-  Future<bool> batchInsert(
+  Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records) async {
     await _ensureInitialized();
 
     try {
-      await _concurrencyManager!.acquireWriteLock(tableName);
-
-      // 1. get table schema and validate data
+      // 1. Get table schema and validate data
       final schema = await getTableSchema(tableName);
-      final validRecords = <Map<String, dynamic>>[];
+      if (schema == null || schema.name.isEmpty) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.batchInsert');
+        return DbResult.error(
+          code: ResultCode.notFound,
+          message: 'Table $tableName does not exist',
+        );
+      }
 
+      final primaryKey = schema.primaryKey;
+      final validRecords = <Map<String, dynamic>>[];
       for (var record in records) {
         final validData =
             await _validateAndProcessData(schema, record, tableName);
@@ -1686,15 +1495,21 @@ class DataStoreImpl {
       }
 
       if (validRecords.isEmpty) {
-        return false;
+        return DbResult.error(
+          code: ResultCode.validationFailed,
+          message: 'All data validation failed',
+        );
       }
 
-      // 2. check unique constraints and filter duplicate data
+      // 2. Check unique constraints and filter duplicate data
       final uniqueRecords = <Map<String, dynamic>>[];
+      final failedRecords = <Map<String, dynamic>>[];
       for (var record in validRecords) {
-        if (await _checkUniqueConstraints(tableName, record)) {
+        if (await _indexManager?.checkUniqueConstraints(tableName, record) ==
+            true) {
           uniqueRecords.add(record);
         } else {
+          failedRecords.add(record);
           Logger.warn('Skip duplicate data: $record',
               label: 'DataStore-batchInsert');
         }
@@ -1703,57 +1518,86 @@ class DataStoreImpl {
       if (uniqueRecords.isEmpty) {
         Logger.warn('All data are duplicates, batch insert canceled',
             label: 'DataStore-batchInsert');
-        return false;
+        // Collect primary keys of all failed records
+        final failedKeys = failedRecords
+            .map((record) => record[primaryKey]?.toString() ?? '')
+            .where((key) => key.isNotEmpty)
+            .toList();
+        return DbResult.error(
+          code: ResultCode.uniqueViolation,
+          message: 'All records have unique constraint conflicts',
+          failedKeys: failedKeys,
+        );
       }
 
-      // 3. get data in write queue (if any)
-      final pendingData = fileManager.writeQueue[tableName] ?? [];
-      fileManager.writeQueue.remove(tableName); // clear queue
+      // 3. Get data in write queue (if any)
+      final pendingEntries = tableDataManager.writeBuffer[tableName] ?? {};
+      tableDataManager.writeBuffer.remove(tableName); // Clear queue
 
-      // 4. merge all data to write
-      final allData = [...pendingData, ...uniqueRecords];
+      // 4. Convert pending WriteBufferEntry to raw data
+      final pendingRecords = pendingEntries.values.map((e) => e.data).toList();
 
-      // 5. write to file, cache and index
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
+      // 5. Merge all data to write
+      final allData = [...pendingRecords, ...uniqueRecords];
 
-      if (kIsWeb) {
-        // Web implementation: write all data at once
-        final lines = allData.map((data) => jsonEncode(data)).toList();
-        await storage.writeLines(dataPath, lines);
-      } else {
-        // Native implementation: use file stream
-        final file = File(dataPath);
-        final sink = file.openWrite(mode: FileMode.append);
-        try {
-          for (var data in allData) {
-            sink.writeln(jsonEncode(data));
-            _queryExecutor?.queryCacheManager.addCachedRecord(tableName, data);
-          }
-          await sink.flush();
-        } finally {
-          await sink.close();
-        }
+      // 6. Use TableDataManager's partition approach to write data
+      // Create a stream from the records list
+      final recordStream = Stream.fromIterable(allData);
+
+      // Use a batch size that balances performance and memory usage
+      final batchSize = config.migrationConfig?.batchSize ?? 1000;
+
+      // Write data in batches using TableDataManager
+      await tableDataManager.rewriteRecordsFromStream(
+        tableName: tableName,
+        recordStream: recordStream,
+        batchSize: batchSize,
+      );
+
+      // Update cache
+      for (var data in allData) {
+        dataCacheManager.addCachedRecord(tableName, data);
       }
 
-      // 6. async update information
+      // 7. Async update information
       _updateStatisticsAsync(tableName);
 
-      // 7. async log transaction
+      // 8. Async log transaction
       _logTransactionAsync('batchInsert', tableName, {
         'count': allData.length,
         'timestamp': DateTime.now().millisecondsSinceEpoch,
       });
 
-      return true;
+      // Return primary keys of all successfully inserted records (converted to strings)
+      final List<String> primaryKeys = uniqueRecords
+          .map((record) => record[primaryKey]?.toString() ?? '')
+          .where((key) => key.isNotEmpty)
+          .toList();
+
+      // Calculate number of failed records
+      final List<String> failedKeys = failedRecords
+          .map((record) => record[primaryKey]?.toString() ?? '')
+          .where((key) => key.isNotEmpty)
+          .toList();
+
+      return DbResult.batch(
+        successKeys: primaryKeys,
+        failedKeys: failedKeys,
+        message: uniqueRecords.length == records.length
+            ? 'All records inserted successfully'
+            : 'Partial records inserted successfully, ${uniqueRecords.length} successful, ${failedKeys.length} failed',
+      );
     } catch (e) {
-      Logger.error('Batch insert failed: $e', label: 'DataStore-batchInsert');
-      return false;
-    } finally {
-      await _concurrencyManager!.releaseWriteLock(tableName);
+      Logger.error('Batch insertion failed: $e',
+          label: 'DataStore-batchInsert');
+      return DbResult.error(
+        code: ResultCode.dbError,
+        message: 'Batch insertion failed: $e',
+      );
     }
   }
 
-  /// async update statistics
+  /// Async update statistics
   void _updateStatisticsAsync(String tableName) {
     Future(() async {
       try {
@@ -1765,7 +1609,7 @@ class DataStoreImpl {
     });
   }
 
-  /// async log transaction
+  /// Async log transaction
   void _logTransactionAsync(String operation, String tableName, dynamic data) {
     Future(() async {
       try {
@@ -1777,27 +1621,18 @@ class DataStoreImpl {
     });
   }
 
-  /// synchronized lock wrapper method
-  Future<T> synchronized<T>(Object lock, Future<T> Function() callback) async {
-    try {
-      await _concurrencyManager?.acquireWriteLock('global');
-      return await callback();
-    } finally {
-      await _concurrencyManager?.releaseWriteLock('global');
-    }
-  }
-
   /// load data to cache
   Future<void> _loadDataToCache() async {
     try {
-      final globalPath = config.getGlobalPath();
-      if (await storage.exists(globalPath)) {
-        await _loadPathData(globalPath);
+      // 1. Load startup cache
+      final spaceConfig = await getSpaceConfig();
+      if (spaceConfig?.enableStartupCache == true) {
+        await dataCacheManager.loadStartupCache();
       }
 
-      final basePath = config.getBasePath();
-      if (await storage.exists(basePath)) {
-        await _loadPathData(basePath);
+      // 2. Async load table record to cache
+      if (!isMigrationInstance) {
+        _loadTableRecordToCache();
       }
     } catch (e) {
       Logger.error('Load data to cache failed: $e',
@@ -1806,257 +1641,105 @@ class DataStoreImpl {
   }
 
   /// load data from specified path
-  Future<void> _loadPathData(String path) async {
-    final files = await storage.listDirectory(path);
-    final dataFiles = files.where((f) => f.endsWith('.dat')).toList();
-
-    for (var file in dataFiles) {
-      try {
-        final tableName = _getFileName(file);
-        final schema = await getTableSchema(tableName);
-
-        // get file size
-        int fileSize;
-        if (kIsWeb) {
-          final content = await storage.readAsString(file);
-          fileSize = content?.length ?? 0;
-        } else {
-          fileSize = await (File(file)).length();
-        }
-
-        // only cache small files
-        if (fileSize <= _config!.maxTableCacheSize) {
-          // use public constant
-          final records = await _loadAllRecords(file);
-          await _queryExecutor?.queryCacheManager.cacheEntireTable(
-            tableName,
-            records,
-            schema.primaryKey,
-          );
-        } else {
-          await _loadRecentRecords(file, tableName, schema);
-          Logger.info(
-              'Table $tableName file $fileSize exceeds size limit, cache partial data',
-              label: 'DataStore._loadPathData');
-        }
-      } catch (e, stackTrace) {
-        Logger.error('Load table data failed: $file, error: $e',
-            label: 'DataStore._loadPathData');
-        Logger.error('Stack trace: $stackTrace',
-            label: 'DataStore._loadPathData');
-        continue; // continue loading other tables
+  Future<void> _loadTableRecordToCache() async {
+    try {
+      // From schemaManager get all tables
+      final allTables = await getTableNames();
+      if (allTables.isEmpty) {
+        return;
       }
+
+      // Sort tables by priority
+      final prioritizedTables = await _prioritizeTables(allTables);
+
+      // Load tables
+      for (var tableName in prioritizedTables) {
+        try {
+          // Check if table exists in current space
+          final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
+          if (!tableExistsInSpace) {
+            continue;
+          }
+
+          final schema = await getTableSchema(tableName);
+          if (schema == null || schema.name.isEmpty) {
+            continue;
+          }
+
+          // Load all records
+          if (await tableDataManager.allowFullTableCache(tableName)) {
+            final records = await _loadAllRecords(tableName);
+            await dataCacheManager.cacheEntireTable(
+              tableName,
+              records,
+              schema.primaryKey,
+            );
+          }
+        } catch (e, stackTrace) {
+          Logger.error('Load table data failed: $tableName, error: $e',
+              label: 'DataStore._loadTableRecordToCache');
+          Logger.error('Stack trace: $stackTrace',
+              label: 'DataStore._loadTableRecordToCache');
+          continue; // Continue load other tables
+        }
+      }
+    } catch (e, stackTrace) {
+      Logger.error('Error in _loadTableRecordToCache: $e',
+          label: 'DataStore._loadTableRecordToCache');
+      Logger.error('Stack trace: $stackTrace',
+          label: 'DataStore._loadTableRecordToCache');
     }
-  }
-
-  /// load recent records
-  Future<void> _loadRecentRecords(
-    String file,
-    String tableName,
-    TableSchema schema,
-  ) async {
-    final lines = await storage.readLines(file);
-    final recentLines =
-        lines.reversed.take(1000); // only load recent 1000 records
-
-    for (var line in recentLines) {
-      if (line.trim().isEmpty) continue;
-      final data = jsonDecode(line) as Map<String, dynamic>;
-      _queryExecutor?.queryCacheManager.addCachedRecord(tableName, data);
-    }
-
-    Logger.info(
-        'Table $tableName partially loaded to cache (recent 1000 records)');
   }
 
   /// load all records
-  Future<List<Map<String, dynamic>>> _loadAllRecords(String file) async {
+  Future<List<Map<String, dynamic>>> _loadAllRecords(String tableName) async {
     final results = <Map<String, dynamic>>[];
-    final lines = await storage.readLines(file);
 
-    for (var line in lines) {
-      if (line.trim().isEmpty) continue;
-      final data = jsonDecode(line) as Map<String, dynamic>;
-      results.add(Map<String, dynamic>.from(data));
+    try {
+      await for (final record in tableDataManager.streamRecords(tableName)) {
+        results.add(Map<String, dynamic>.from(record));
+      }
+    } catch (e) {
+      Logger.error('Failed to load records from $tableName: $e',
+          label: 'DataStore._loadAllRecords');
     }
 
     return results;
   }
 
-  /// extract file name from path
-  String _getFileName(String path) {
-    final normalizedPath = path.replaceAll('\\', '/');
-    final parts = normalizedPath.split('/');
-    final fileName = parts.isEmpty ? path : parts.last;
+  /// Sort tables by priority
+  Future<List<String>> _prioritizeTables(List<String> allTables) async {
+    // Priority groups: global tables, normal tables
+    final startupTables = <String>[];
+    final globalTables = <String>[];
+    final normalTables = <String>[];
 
-    if (fileName.contains('.')) {
-      return fileName.substring(0, fileName.lastIndexOf('.'));
-    }
-
-    return fileName;
-  }
-
-  /// check unique constraints
-  Future<bool> _checkUniqueConstraints(
-      String tableName, Map<String, dynamic> data) async {
-    final schema = await getTableSchema(tableName);
-    final primaryKey = schema.primaryKey;
-    final primaryValue = data[primaryKey];
-
-    // 1. check unique constraints of fields
-    for (var field in schema.fields) {
-      if (field.unique && field.name != primaryKey) {
-        // exclude primary key field
-        final value = data[field.name];
-        if (value != null) {
-          // check if value of unique field already exists
-          if (!_uniqueValuesCache.containsKey(tableName)) {
-            _uniqueValuesCache[tableName] = {};
-          }
-          if (!_uniqueValuesCache[tableName]!.containsKey(field.name)) {
-            _uniqueValuesCache[tableName]![field.name] = <dynamic>{};
-
-            // initialize cache
-            final dataPath = config.getDataPath(tableName, schema.isGlobal);
-            if (await storage.exists(dataPath)) {
-              final lines = await storage.readLines(dataPath);
-              for (var line in lines) {
-                if (line.trim().isEmpty) continue;
-                final record = jsonDecode(line) as Map<String, dynamic>;
-                if (record[field.name] != null) {
-                  _uniqueValuesCache[tableName]![field.name]!
-                      .add(record[field.name]);
-                }
-              }
-            }
-          }
-        }
-
-        // check if value already exists
-        if (_uniqueValuesCache[tableName]![field.name]!.contains(value)) {
-          Logger.warn(
-              'Warning: value $value of field ${field.name} already exists');
-          return false;
-        }
+    for (final tableName in allTables) {
+      // Check if it's a global table
+      final isGlobal = await schemaManager?.isTableGlobal(tableName) ?? false;
+      if (isGlobal) {
+        globalTables.add(tableName);
+      } else {
+        normalTables.add(tableName);
       }
     }
 
-    // 2. check unique constraints of indexes
-    if (!_uniqueValuesCache.containsKey(tableName)) {
-      _uniqueValuesCache[tableName] = {
-        primaryKey: <dynamic>{},
-      };
-
-      // initialize unique index collections
-      for (var index in schema.indexes.where((idx) => idx.unique)) {
-        _uniqueValuesCache[tableName]![index.fields.first] = <dynamic>{};
-      }
-
-      // load all data to cache at once
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-      if (await storage.exists(dataPath)) {
-        final lines = await storage.readLines(dataPath);
-        for (var line in lines) {
-          if (line.trim().isEmpty) continue;
-          final record = jsonDecode(line) as Map<String, dynamic>;
-
-          // collect primary key and unique index values
-          if (record[primaryKey] != null) {
-            _uniqueValuesCache[tableName]![primaryKey]!.add(record[primaryKey]);
-          }
-          for (var index in schema.indexes.where((idx) => idx.unique)) {
-            final fieldName = index.fields.first;
-            if (record[fieldName] != null) {
-              _uniqueValuesCache[tableName]![fieldName]!.add(record[fieldName]);
-            }
-          }
-        }
-      }
-    }
-    // initialize primary key cache
-    _uniqueValuesCache[tableName]![primaryKey] ??= <dynamic>{};
-    // 3. check primary key
-    if (_uniqueValuesCache[tableName]![primaryKey]!.contains(primaryValue)) {
-      Logger.warn('Warning: primary key duplicate: $primaryValue');
-      return false;
-    }
-    // 4. check unique indexes
-    for (var index in schema.indexes.where((idx) => idx.unique)) {
-      final fieldName = index.fields.first;
-      final value = data[fieldName];
-      _uniqueValuesCache[tableName]![fieldName] ??= <dynamic>{};
-      if (value != null &&
-          _uniqueValuesCache[tableName]![fieldName]!.contains(value)) {
-        Logger.warn(
-            'Warning: value $value of unique index ${index.actualIndexName} already exists');
-        return false;
-      }
-    }
-
-    // 5. check values in write queue
-    final pendingData = fileManager.writeQueue[tableName] ?? [];
-    for (var record in pendingData) {
-      // check primary key
-      if (record[primaryKey] == primaryValue) {
-        Logger.warn(
-            'Warning: primary key duplicate in write queue: $primaryValue');
-        return false;
-      }
-
-      // check unique fields
-      for (var field in schema.fields) {
-        if (field.unique && field.name != primaryKey) {
-          final value = data[field.name];
-          if (value != null && record[field.name] == value) {
-            Logger.warn(
-                'Warning: value $value of field ${field.name} already exists in write queue');
-            return false;
-          }
-        }
-      }
-
-      // check unique indexes
-      for (var index in schema.indexes.where((idx) => idx.unique)) {
-        final fieldName = index.fields.first;
-        final value = data[fieldName];
-        if (value != null && record[fieldName] == value) {
-          Logger.warn(
-              'Warning: unique index duplicate in write queue: $fieldName = $value');
-          return false;
-        }
-      }
-    }
-    // 6. if pass all checks, update cache
-    _uniqueValuesCache[tableName]![primaryKey] ??= <dynamic>{};
-    _uniqueValuesCache[tableName]![primaryKey]!.add(primaryValue);
-    for (var field in schema.fields) {
-      if (field.unique && field.name != primaryKey) {
-        final value = data[field.name];
-        if (value != null) {
-          _uniqueValuesCache[tableName]![field.name] ??= <dynamic>{};
-          _uniqueValuesCache[tableName]![field.name]!.add(value);
-        }
-      }
-    }
-    for (var index in schema.indexes.where((idx) => idx.unique)) {
-      final fieldName = index.fields.first;
-      final value = data[fieldName];
-      if (value != null) {
-        _uniqueValuesCache[tableName]![fieldName] ??= <dynamic>{};
-        _uniqueValuesCache[tableName]![fieldName]!.add(value);
-      }
-    }
-
-    return true;
+    // Combine priorities: startup cache tables > global tables > normal tables
+    return [...startupTables, ...globalTables, ...normalTables];
   }
 
   /// query by id
   Future<Map<String, dynamic>?> queryById(String tableName, dynamic id) async {
     try {
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.queryById');
+        return null;
+      }
       final condition = QueryCondition()..where(schema.primaryKey, '=', id);
 
-      final results = await _executeQuery(
+      final results = await executeQuery(
         tableName,
         condition,
         limit: 1,
@@ -2075,216 +1758,104 @@ class DataStoreImpl {
     dynamic value,
   ) async {
     try {
+      final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStore.queryBy');
+        return [];
+      }
       final condition = QueryCondition()..where(field, '=', value);
 
-      return await _executeQuery(tableName, condition);
+      return await executeQuery(tableName, condition);
     } catch (e) {
       Logger.error('Query by field failed: $e', label: 'DataStore.queryBy');
       rethrow;
     }
   }
 
-  /// SQL query (convert SQL conditions to QueryCondition)
-  Future<List<Map<String, dynamic>>> queryBySql(
-    String tableName, {
-    String? where,
-    List<dynamic>? whereArgs,
-    String? orderBy,
-    int? limit,
-    int? offset,
-  }) async {
-    try {
-      // parse SQL conditions to QueryCondition
-      QueryCondition? condition;
-      if (where != null) {
-        condition = _parseSqlWhereClause(where, whereArgs);
-      }
-
-      // parse order by
-      List<String>? orderByList;
-      if (orderBy != null) {
-        orderByList = orderBy.split(',').map((e) => e.trim()).toList();
-      }
-
-      // execute query
-      return await _executeQuery(
-        tableName,
-        condition ?? QueryCondition(),
-        orderBy: orderByList,
-        limit: limit,
-        offset: offset,
-      );
-    } catch (e) {
-      Logger.error('SQL query failed: $e', label: 'DataStore.queryBySql');
-      rethrow;
-    }
-  }
-
-  /// Execute query
-  Future<List<Map<String, dynamic>>> _executeQuery(
-    String tableName,
-    QueryCondition condition, {
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-  }) async {
-    // build query plan
-    final queryPlan = await _queryOptimizer?.optimize(
-      tableName,
-      condition.build(),
-      orderBy,
-    );
-
-    if (queryPlan == null) {
-      throw StateError('Query optimizer not initialized');
-    }
-
-    // execute query using QueryExecutor
-    return await _queryExecutor?.execute(
-          queryPlan,
-          tableName,
-          condition: condition,
-          orderBy: orderBy,
-          limit: limit,
-          offset: offset,
-        ) ??
-        [];
-  }
-
-  /// Parse SQL where clause to QueryCondition
-  QueryCondition _parseSqlWhereClause(String where, List<dynamic>? whereArgs) {
-    final condition = QueryCondition();
-    if (where.isEmpty) return condition;
-
-    // Replace operators
-    where = where.replaceAll('||', 'OR').replaceAll('&&', 'AND');
-
-    // Split by OR
-    final orGroups = where.split(RegExp(r'\s+OR\s+', caseSensitive: false));
-    var argIndex = 0;
-
-    for (var group in orGroups) {
-      // Parse AND conditions in each OR group
-      final conditions =
-          group.trim().split(RegExp(r'\s+AND\s+', caseSensitive: false));
-
-      for (var condStr in conditions) {
-        _parseSingleCondition(condition, condStr.trim(), whereArgs, argIndex);
-        argIndex += _countPlaceholders(condStr);
-      }
-
-      if (group != orGroups.last) {
-        condition.or();
-      }
-    }
-
-    return condition;
-  }
-
-  /// Parse single SQL condition
-  void _parseSingleCondition(
-    QueryCondition condition,
-    String condStr,
-    List<dynamic>? whereArgs,
-    int startArgIndex,
-  ) {
-    String? operator;
-    for (var op in ['>=', '<=', '!=', '=', '>', '<', 'LIKE', 'IS NOT', 'IS']) {
-      if (RegExp('\\s+$op\\s+', caseSensitive: false).hasMatch(condStr)) {
-        operator = op.toUpperCase();
-        break;
-      }
-    }
-
-    if (operator == null) return;
-
-    final parts =
-        condStr.split(RegExp('\\s+$operator\\s+', caseSensitive: false));
-    if (parts.length != 2) return;
-
-    final field = parts[0].trim();
-    String valueStr = parts[1].trim();
-
-    // handle value
-    dynamic value;
-    if (valueStr == '?' &&
-        whereArgs != null &&
-        startArgIndex < whereArgs.length) {
-      // handle parameter placeholder
-      value = whereArgs[startArgIndex];
-    } else if ((valueStr.startsWith("'") && valueStr.endsWith("'")) ||
-        (valueStr.startsWith('"') && valueStr.endsWith('"'))) {
-      // handle string value
-      value = valueStr.substring(1, valueStr.length - 1);
-    } else if (valueStr.toLowerCase() == 'null') {
-      // handle NULL value
-      value = null;
-    } else {
-      // try to parse to number
-      value = num.tryParse(valueStr) ?? valueStr;
-    }
-
-    // add condition
-    switch (operator) {
-      case '=':
-        condition.where(field, '=', value);
-        break;
-      case '!=':
-      case '<>':
-        condition.where(field, '!=', value);
-        break;
-      case '>':
-        condition.where(field, '>', value);
-        break;
-      case '>=':
-        condition.where(field, '>=', value);
-        break;
-      case '<':
-        condition.where(field, '<', value);
-        break;
-      case '<=':
-        condition.where(field, '<=', value);
-        break;
-      case 'LIKE':
-        condition.where(field, 'LIKE', value);
-        break;
-      case 'IS':
-        condition.where(field, 'IS', null);
-        break;
-      case 'IS NOT':
-        condition.where(field, 'IS NOT', null);
-        break;
-    }
-  }
-
-  /// Count placeholders
-  int _countPlaceholders(String condition) {
-    return '?'.allMatches(condition).length;
-  }
-
-  /// Switch base space
-  Future<bool> switchBaseSpace({String spaceName = 'default'}) async {
+  /// Switch space
+  Future<bool> switchSpace({String spaceName = 'default'}) async {
     await _ensureInitialized();
 
     if (_currentSpaceName == spaceName) {
       return true;
     }
 
+    // Check if global configuration has migration tasks
+    final globalConfig = await getGlobalConfig();
+    if (globalConfig?.hasMigrationTask == true) {
+      // Check if currently migrating the space to switch to
+      bool isTargetSpaceMigrating = false;
+
+      if (migrationManager != null) {
+        // Check if current migration tasks include the target space
+        isTargetSpaceMigrating =
+            await migrationManager!.isSpaceBeingMigrated(spaceName);
+      }
+
+      if (isTargetSpaceMigrating) {
+        // 1. Adjust space priority, prioritize migrating this space
+        final updatedSpaces = List<String>.from(globalConfig!.spaceNames)
+          ..remove(spaceName)
+          ..insert(0, spaceName);
+        final updatedConfig =
+            globalConfig.copyWith(spaceNames: updatedSpaces.toSet());
+        await saveGlobalConfig(updatedConfig);
+
+        // 2. Wait for this space's migration to complete
+        Logger.info(
+          'Space [$spaceName] is being migrated, waiting for migration to complete before switching',
+          label: 'DataStoreImpl.switchSpace',
+        );
+
+        // Use timeout protection to avoid infinite waiting
+        bool migrationCompleted = false;
+        try {
+          migrationCompleted = await migrationManager!.waitForSpaceMigration(
+              spaceName,
+              timeout: const Duration(minutes: 5));
+        } catch (e) {
+          Logger.error(
+            'Error occurred while waiting for space migration to complete: $e',
+            label: 'DataStoreImpl.switchSpace',
+          );
+        }
+
+        if (!migrationCompleted) {
+          Logger.warn(
+            'Timeout waiting for space [$spaceName] migration to complete, cannot switch space',
+            label: 'DataStoreImpl.switchSpace',
+          );
+          return false;
+        }
+
+        // Migration completed, continue switching space
+        Logger.info(
+          'Space [$spaceName] migration has completed, continuing switch',
+          label: 'DataStoreImpl.switchSpace',
+        );
+      } else {
+        // Currently migrating other spaces, but not the target space
+        Logger.info(
+          'Migration tasks are in progress, but do not affect switching to space [$spaceName]',
+          label: 'DataStoreImpl.switchSpace',
+        );
+      }
+    }
+
     final oldSpaceName = _currentSpaceName;
     _currentSpaceName = spaceName;
-
     try {
+      await saveAllCacheBeforeExit();
+
       // Update configuration
       if (_config != null) {
-        _config = _config!.copyWith(baseName: _currentSpaceName);
+        _config = _config!.copyWith(spaceName: _currentSpaceName);
       }
 
       // Clear caches
-      _queryExecutor?.queryCacheManager.onBasePathChanged();
-      fileManager.writeQueue.clear();
-      _uniqueValuesCache.clear();
-
-      _isSwitchingSpace = true;
+      dataCacheManager.onBasePathChanged();
+      tableDataManager.writeBuffer.clear();
 
       // Reinitialize database
       _isInitialized = false;
@@ -2292,31 +1863,57 @@ class DataStoreImpl {
       await initialize(dbPath: _config?.dbPath, config: _config);
 
       // Notify space change
-      _notifyBasePathChanged(BasePathChangedEvent(oldSpaceName, spaceName));
+      _notifyBasePathChanged(SpacePathChangedEvent(oldSpaceName, spaceName));
 
-      Logger.info('Base space switched: $oldSpaceName -> $spaceName');
-
-      // Clear non-global indexes
-      _indexManager?.onBasePathChanged();
+      // Add new space to GlobalConfig
+      final globalConfig = await getGlobalConfig();
+      if (globalConfig != null &&
+          !globalConfig.spaceNames.contains(spaceName)) {
+        final updatedConfig = globalConfig.addSpace(spaceName);
+        await saveGlobalConfig(updatedConfig);
+      }
 
       return true;
     } catch (e) {
       // Rollback on failure
       _currentSpaceName = oldSpaceName;
       if (_config != null) {
-        _config = _config!.copyWith(baseName: oldSpaceName);
+        _config = _config!.copyWith(spaceName: oldSpaceName);
       }
-      Logger.error('Space switch failed: $e',
-          label: 'DataStore.switchBaseSpace');
+      Logger.error('Space switch failed: $e', label: 'DataStore.switchSpace');
       return false;
-    } finally {
-      _isSwitchingSpace = false;
+    }
+  }
+
+  /// Save all cache data before application exit
+  Future<bool> saveAllCacheBeforeExit() async {
+    try {
+      if (!_isInitialized) return false;
+
+      // Process table data write buffer
+      await tableDataManager.flushWriteBuffer();
+
+      // Process index write buffer
+      await _indexManager?.prepareForClose();
+
+      // Save all caches
+      final hasChanges = await dataCacheManager.persistAllCaches();
+
+      Logger.debug(
+          'Data saved successfully before application exit${hasChanges ? "" : ", no changes"}',
+          label: 'DataStoreImpl.saveAllCacheBeforeExit');
+
+      return hasChanges;
+    } catch (e) {
+      Logger.error('Failed to save cache before exit: $e',
+          label: 'DataStoreImpl.saveAllCacheBeforeExit');
+      return false;
     }
   }
 
   /// Notify base path change event
-  void _notifyBasePathChanged(BasePathChangedEvent event) {
-    _indexManager?.onBasePathChanged();
+  void _notifyBasePathChanged(SpacePathChangedEvent event) {
+    _indexManager?.onSpacePathChanged();
     _statisticsCollector?.onBasePathChanged(event);
   }
 
@@ -2326,16 +1923,13 @@ class DataStoreImpl {
       final dbDirPath = await getDatabasePath(dbPath: dbPath);
       await close();
 
-      if (await storage.exists(dbDirPath)) {
-        await storage.deleteFile(dbDirPath);
+      if (await storage.existsDirectory(dbDirPath)) {
+        await storage.deleteDirectory(dbDirPath);
         Logger.info('Database deleted: $dbDirPath');
       }
 
-      _indexManager?.onBasePathChanged();
-      _queryExecutor?.queryCacheManager.clear();
-      _maxIds.clear();
-      _maxIdsDirty.clear();
-      _uniqueValuesCache.clear();
+      _indexManager?.onSpacePathChanged();
+      dataCacheManager.clear();
 
       _instances.remove(_instanceKey);
     } catch (e) {
@@ -2345,76 +1939,14 @@ class DataStoreImpl {
     }
   }
 
-  /// Add auto-increment ID to write queue
-  final Map<String, int> _maxIds = {};
-  final Map<String, bool> _maxIdsDirty = {}; // mark if need to write
-
-  /// Update max ID value (only in memory)
-  void _updateMaxIdInMemory(String tableName, int id) {
-    final currentMaxId = _maxIds[tableName] ?? 0;
-    if (id > currentMaxId) {
-      _maxIds[tableName] = id;
-      _maxIdsDirty[tableName] = true; // mark if need to write
-    }
-  }
-
-  /// Get next auto-increment ID
-  Future<int> _getNextId(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    if (!_maxIds.containsKey(tableName)) {
-      // Load from file on first access
-      final maxIdPath = config.getAutoIncrementPath(tableName, schema.isGlobal);
-      if (await storage.exists(maxIdPath)) {
-        final content = await storage.readAsString(maxIdPath);
-        _maxIds[tableName] = int.parse(content ?? '0');
-      } else {
-        _maxIds[tableName] = 0;
-      }
-    }
-
-    final currentId = _maxIds[tableName] ?? 0;
-    final nextId = currentId + 1;
-    _maxIds[tableName] = nextId;
-    _maxIdsDirty[tableName] = true;
-
-    return nextId;
-  }
-
-  /// Flush max IDs to disk
-  Future<void> _flushMaxIds() async {
-    try {
-      for (var entry in _maxIdsDirty.entries) {
-        if (!entry.value) continue;
-
-        final tableName = entry.key;
-        final maxId = _maxIds[tableName] ?? 0;
-        final schema = await getTableSchema(tableName);
-        final maxIdPath =
-            config.getAutoIncrementPath(tableName, schema.isGlobal);
-
-        await storage.writeAsString(maxIdPath, maxId.toString());
-        _maxIdsDirty[tableName] = false;
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to flush max IDs: $e',
-        label: 'DataStoreImpl._flushMaxIds',
-      );
-    }
-  }
-
-  /// Key-value store table name
-  static const String _kvStoreName = 'kv_store';
-  static const String _globalKvStoreName = 'global_kv_store';
-
   /// Set key-value pair
   Future<bool> setValue(String key, dynamic value,
       {bool isGlobal = false}) async {
     await _ensureInitialized();
 
-    final tableName = isGlobal ? _globalKvStoreName : _kvStoreName;
+    final tableName = SystemTable.getKeyValueName(isGlobal);
 
-    // build data
+    // Build data
     final data = {
       'key': key,
       'value': jsonEncode(value),
@@ -2422,19 +1954,21 @@ class DataStoreImpl {
     };
 
     try {
-      final existing = await _executeQuery(
+      final existing = await executeQuery(
           tableName, QueryCondition()..where('key', '=', key));
 
       if (existing.isEmpty) {
-        return await insert(tableName, data);
+        final result = await insert(tableName, data);
+        return result.success;
       } else {
-        // build update condition
+        // Build update condition
         final condition = QueryCondition()..where('key', '=', key);
-        return await updateInternal(
+        final result = await updateInternal(
           tableName,
           data,
           condition,
         );
+        return result.success;
       }
     } catch (e) {
       Logger.error('Set key-value pair failed: $e',
@@ -2447,9 +1981,9 @@ class DataStoreImpl {
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
     await _ensureInitialized();
 
-    final tableName = isGlobal ? _globalKvStoreName : _kvStoreName;
-    final result = await _executeQuery(
-        tableName, QueryCondition()..where('key', '=', key));
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final result =
+        await executeQuery(tableName, QueryCondition()..where('key', '=', key));
     if (result.isEmpty) return null;
 
     try {
@@ -2464,97 +1998,54 @@ class DataStoreImpl {
   Future<bool> removeValue(String key, {bool isGlobal = false}) async {
     await _ensureInitialized();
 
-    final tableName = isGlobal ? _globalKvStoreName : _kvStoreName;
-    // build delete condition
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    // Build delete condition
     final condition = QueryCondition()..where('key', '=', key);
     await deleteInternal(tableName, condition);
     return true;
   }
 
-  /// Get query optimizer
-  QueryOptimizer? getQueryOptimizer() => _queryOptimizer;
-
-  /// Get query executor
-  QueryExecutor? getQueryExecutor() => _queryExecutor;
-
-  ConcurrencyManager? get concurrencyManager => _concurrencyManager;
-  IndexManager? get indexManager => _indexManager;
-
-  /// Flush auto-increment ID to file
-  Future<void> flushMaxIds() async {
-    await _flushMaxIds();
-  }
-
   /// Get cache stats
   Map<String, int> getCacheStats() {
-    return fileManager.writeQueue
+    return tableDataManager.writeBuffer
         .map((key, value) => MapEntry(key, value.length));
   }
 
   /// Get table info
-  Future<TableInfo> getTableInfo(String tableName) async {
+  Future<TableInfo?> getTableInfo(String tableName) async {
     final schema = await getTableSchema(tableName);
-    final dataPath = config.getDataPath(tableName, schema.isGlobal);
-
+    if (schema == null) {
+      Logger.error('Table $tableName does not exist',
+          label: 'DataStore.getTableInfo');
+      return null;
+    }
+    final dataPath = await pathManager.getDataMetaPath(tableName);
     DateTime? createdAt;
-    if (await storage.exists(dataPath)) {
+    if (await storage.existsFile(dataPath)) {
       createdAt = await storage.getFileCreationTime(dataPath);
     }
-
     return TableInfo(
       tableName: tableName,
-      recordCount: await _getRecordCount(tableName),
-      cacheCount:
-          _queryExecutor?.queryCacheManager.getTableCacheCount(tableName) ?? 0,
-      fileSize: fileManager.getFileSize(tableName),
+      recordCount: await tableDataManager.getTableRecordCount(tableName),
+      cacheCount: dataCacheManager.getTableCacheCount(tableName),
+      fileSize: await tableDataManager.getTableFileSize(tableName),
       indexCount: schema.indexes.length,
       schema: schema,
-      isGlobal: await isGlobalTable(tableName),
-      lastModified: fileManager.getLastModifiedTime(tableName),
+      isGlobal: schema.isGlobal,
+      lastModified: tableDataManager.getLastModifiedTime(tableName),
       createdAt: createdAt,
     );
-  }
-
-  /// Get table record count
-  Future<int> _getRecordCount(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    final dataPath = config.getDataPath(tableName, schema.isGlobal);
-    if (!await storage.exists(dataPath)) return 0;
-
-    final allRecords = <String, bool>{};
-
-    // 1. Read records from file
-    final lines = await storage.readLines(dataPath);
-    for (var line in lines) {
-      if (line.trim().isEmpty) continue;
-      final data = jsonDecode(line) as Map<String, dynamic>;
-      final primaryKeyValue = data[schema.primaryKey].toString();
-      allRecords[primaryKeyValue] = true;
-    }
-
-    // 2. Merge records in pending write queue
-    final pendingRecords = fileManager.writeQueue[tableName] ?? [];
-    for (var record in pendingRecords) {
-      final primaryKeyValue = record[schema.primaryKey].toString();
-      allRecords[primaryKeyValue] = true;
-    }
-
-    return allRecords.length;
-  }
-
-  /// Check if it is a global table
-  Future<bool> isGlobalTable(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    return schema.isGlobal;
   }
 
   /// Add field to table
   Future<void> addField(
     String tableName,
     FieldSchema field,
-    Transaction? txn,
   ) async {
     final schema = await getTableSchema(tableName);
+    if (schema == null) {
+      return;
+    }
 
     // Check if field already exists
     if (schema.fields.any((f) => f.name == field.name)) {
@@ -2577,9 +2068,11 @@ class DataStoreImpl {
   Future<void> removeField(
     String tableName,
     String fieldName,
-    Transaction? txn,
   ) async {
     final schema = await getTableSchema(tableName);
+    if (schema == null) {
+      return;
+    }
 
     // Check if field exists
     if (!schema.fields.any((f) => f.name == fieldName)) {
@@ -2589,6 +2082,9 @@ class DataStoreImpl {
       );
       return;
     }
+
+    // Delete all indexes that include this field
+    await removeIndex(tableName, fields: [fieldName]);
 
     // Remove field from schema
     final newFields = schema.fields.where((f) => f.name != fieldName).toList();
@@ -2603,11 +2099,12 @@ class DataStoreImpl {
     String tableName,
     String oldName,
     String newName,
-    Transaction? txn,
   ) async {
     try {
       final schema = await getTableSchema(tableName);
-
+      if (schema == null) {
+        return;
+      }
       // Update schema
       final fields = List<FieldSchema>.from(schema.fields);
       final oldFieldIndex = fields.indexWhere((f) => f.name == oldName);
@@ -2631,15 +2128,20 @@ class DataStoreImpl {
     }
   }
 
-  /// Modify field
+  /// Modify a field in the table schema
   Future<void> modifyField(
     String tableName,
     String fieldName,
-    FieldSchema newField,
-    Transaction? txn,
+    FieldSchemaUpdate newField,
   ) async {
     try {
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        throw BusinessError(
+          'Table $tableName not found',
+          type: BusinessErrorType.invalidData,
+        );
+      }
 
       // Check if field exists
       final oldField = schema.fields.firstWhere(
@@ -2653,18 +2155,23 @@ class DataStoreImpl {
         },
       );
 
-      newField = oldField.copyWith(
-        type: newField.type != DataType.text ? newField.type : null,
-        nullable: newField.nullable != true ? newField.nullable : null,
-        defaultValue: newField.defaultValue,
-        unique: newField.unique != false ? newField.unique : null,
-        comment: newField.comment,
+      // Use newField's properties directly, ensuring all provided values are applied
+      final updatedField = oldField.copyWith(
+        type: newField.type ?? oldField.type,
+        nullable: newField.nullable ?? oldField.nullable,
+        defaultValue: newField.defaultValue ?? oldField.defaultValue,
+        unique: newField.unique ?? oldField.unique,
+        comment: newField.comment ?? oldField.comment,
+        minLength: newField.minLength ?? oldField.minLength,
+        maxLength: newField.maxLength ?? oldField.maxLength,
+        minValue: newField.minValue ?? oldField.minValue,
+        maxValue: newField.maxValue ?? oldField.maxValue,
       );
 
       // Update schema
       final fields = List<FieldSchema>.from(schema.fields);
       final fieldIndex = fields.indexWhere((f) => f.name == fieldName);
-      fields[fieldIndex] = newField;
+      fields[fieldIndex] = updatedField;
 
       final newSchema = schema.copyWith(fields: fields);
       await updateTableSchema(tableName, newSchema);
@@ -2681,18 +2188,29 @@ class DataStoreImpl {
   Future<void> addIndex(
     String tableName,
     IndexSchema index,
-    Transaction? txn,
   ) async {
     try {
       final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        return;
+      }
 
       // Check if index already exists
-      if (schema.indexes.any((i) => i.indexName == index.indexName)) {
+      if (schema.indexes
+          .any((i) => i.actualIndexName == index.actualIndexName)) {
         Logger.warn(
-          'Index ${index.indexName} already exists in table $tableName',
+          'Index ${index.actualIndexName} already exists in table $tableName',
           label: "DataStore.addIndex",
         );
         return;
+      }
+
+      // Validate that the fields referenced by the index exist
+      if (!schema.validateIndexFields(index)) {
+        throw BusinessError(
+          'Index uses fields that do not exist in table $tableName',
+          type: BusinessErrorType.schemaError,
+        );
       }
 
       // Add index to schema
@@ -2718,33 +2236,100 @@ class DataStoreImpl {
 
   /// Drop index from table
   Future<void> removeIndex(
-    String tableName,
-    String indexName,
-    Transaction? txn,
-  ) async {
+    String tableName, {
+    String? indexName,
+    List<String>? fields,
+  }) async {
     try {
-      final schema = await getTableSchema(tableName);
+      if (indexName == null && (fields == null || fields.isEmpty)) {
+        throw ArgumentError(
+            'Must provide either index name or field list parameter');
+      }
 
-      // Check if index exists
-      if (!schema.indexes.any((i) => i.indexName == indexName)) {
-        Logger.warn(
-          'Index $indexName not found in table $tableName',
-          label: "DataStore.removeIndex",
-        );
+      final schema = await getTableSchema(tableName);
+      if (schema == null) {
         return;
       }
 
+      // Find matching index
+      IndexSchema? targetIndex;
+
+      // 1. If index name is provided, try to match by index name
+      if (indexName != null) {
+        // Try to match directly by indexName
+        for (var index in schema.indexes) {
+          if (index.indexName == indexName ||
+              index.actualIndexName == indexName) {
+            targetIndex = index;
+            break;
+          }
+        }
+
+        // If not found, try to match by field-generated index name
+        if (targetIndex == null) {
+          // Check if it's an auto-generated index name format
+          final autoGenPattern = RegExp(r'^' + tableName + r'_\w+');
+          if (autoGenPattern.hasMatch(indexName)) {
+            for (var index in schema.indexes) {
+              if (index.actualIndexName == indexName) {
+                targetIndex = index;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // 2. If field list is provided, find index based on field list
+      if (targetIndex == null && fields != null && fields.isNotEmpty) {
+        // Sort field list to ensure matching consistency
+        final sortedFields = List<String>.from(fields)..sort();
+
+        for (var index in schema.indexes) {
+          // Sort index fields
+          final indexFields = List<String>.from(index.fields)..sort();
+
+          // Check if field lists match
+          if (_areFieldListsEqual(indexFields, sortedFields)) {
+            targetIndex = index;
+            break;
+          }
+        }
+      }
+
+      // If index still not found
+      if (targetIndex == null) {
+        // If index name is provided, try to delete index file directly
+        if (indexName != null) {
+          Logger.warn(
+            'Cannot find index $indexName, attempting to delete index file directly',
+            label: "DataStore.removeIndex",
+          );
+
+          await _removeIndexFile(tableName, indexName);
+        }
+        // If only field list is provided, cannot proceed
+        else {
+          Logger.warn(
+            'Cannot find index containing fields [${fields!.join(", ")}]',
+            label: "DataStore.removeIndex",
+          );
+        }
+        return;
+      }
+
+      // Use actualIndexName to delete index file
+      final actualName = targetIndex.actualIndexName;
+      await _removeIndexFile(tableName, actualName);
+
       // Remove index from schema
-      final newIndexes =
-          schema.indexes.where((i) => i.indexName != indexName).toList();
+      final newIndexes = schema.indexes.where((i) => i != targetIndex).toList();
       final newSchema = schema.copyWith(indexes: newIndexes);
 
-      // Remove index file
-      await _removeIndexFile(tableName, indexName);
-
-      // Update schema file
+      // Update table structure
       await updateTableSchema(tableName, newSchema);
-      // Invalidate caches
+
+      // Clear cache
       _invalidateTableCaches(tableName);
     } catch (e) {
       Logger.error(
@@ -2755,74 +2340,35 @@ class DataStoreImpl {
     }
   }
 
+  /// Compare if two field lists are equal (ignoring order)
+  bool _areFieldListsEqual(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    final setA = Set<String>.from(a);
+    final setB = Set<String>.from(b);
+    return setA.difference(setB).isEmpty;
+  }
+
   /// Update table schema
   Future<void> updateTableSchema(
     String tableName,
     TableSchema schema,
   ) async {
     try {
-      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-      await storage.writeAsString(schemaPath, jsonEncode(schema.toJson()));
-      // Update cache
-      _queryExecutor?.queryCacheManager.cacheSchema(tableName, schema);
+      if (schemaManager == null) {
+        throw StateError('SchemaPartitionManager not initialized');
+      }
+      await schemaManager!
+          .saveTableSchema(tableName, jsonEncode(schema.toJson()));
+
+      dataCacheManager.cacheSchema(tableName, schema);
+      dataCacheManager.persistAllCaches();
     } catch (e) {
       Logger.error(
         'Failed to update schema: $e',
-        label: 'DataStoreImpl._updateTableSchema',
+        label: 'DataStoreImpl.updateTableSchema',
       );
       rethrow;
     }
-  }
-
-  /// Rename table
-  Future<void> renameTable(
-    String oldName,
-    String newName,
-    Transaction? txn,
-  ) async {
-    try {
-      // Get original schema first to preserve isGlobal setting
-      final schema = await getTableSchema(oldName);
-      final isGlobal = schema.isGlobal;
-
-      // Check if new name is available
-      if (await _tableExists(newName)) {
-        Logger.warn(
-          'Table $newName already exists',
-          label: "DataStore.renameTable",
-        );
-        return;
-      }
-
-      // Update schema name first
-      final newSchema = schema.copyWith(name: newName);
-      await updateTableSchema(newName, newSchema);
-
-      // Rename all table files
-      await _renameTableFiles(oldName, newName, isGlobal);
-
-      // Remove old schema
-      await _removeTableSchema(oldName);
-
-      // Update caches
-      _invalidateTableCaches(oldName);
-      _queryExecutor?.queryCacheManager.cacheSchema(newName, newSchema);
-    } catch (e) {
-      Logger.error(
-        'Failed to rename table: $e',
-        label: 'DataStoreImpl.renameTable',
-      );
-      rethrow;
-    }
-  }
-
-  Future<void> _removeTableSchema(String tableName) async {
-    final schema = await getTableSchema(tableName);
-    final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-    if (await storage.exists(schemaPath)) {
-      await storage.deleteFile(schemaPath);
-    }
-    _invalidateTableCaches(tableName);
   }
 
   /// Build index for table
@@ -2832,10 +2378,17 @@ class DataStoreImpl {
   ) async {
     try {
       final schema = await getTableSchema(tableName);
-      final records = await queryByMap(tableName);
+      if (schema == null) {
+        return;
+      }
+      final queryResult = await executeQuery(tableName, QueryCondition());
+
+      if (!queryResult.isNotEmpty) {
+        return;
+      }
 
       // Build index entries
-      for (var record in records) {
+      for (var record in queryResult) {
         final values = <dynamic>[];
         for (var field in index.fields) {
           values.add(record[field]);
@@ -2863,164 +2416,88 @@ class DataStoreImpl {
     String indexName,
   ) async {
     try {
-      final schema = await getTableSchema(tableName);
-      final indexPath = config.getIndexPath(
-        tableName,
-        indexName,
-        schema.isGlobal,
-      );
-      if (await storage.exists(indexPath)) {
-        await storage.deleteFile(indexPath);
+      // Get index file name - optimize handling logic
+      String fileName;
+
+      // 1. If it's a primary key index, keep unchanged
+      if (indexName.startsWith('pk_')) {
+        fileName = indexName;
+      }
+      // 2. If it's already a compound index name with table name prefix, keep unchanged
+      else if (indexName.startsWith('${tableName}_')) {
+        fileName = indexName;
+      }
+      // 3. If it's a regular index name, add table name prefix
+      else {
+        fileName = indexName;
       }
 
-      // Invalidate index cache
+      Logger.debug(
+        'Preparing to delete index file, index name: $indexName, constructed file name: $fileName',
+        label: 'DataStoreImpl._removeIndexFile',
+      );
+
+      // Get index metadata path
+      final metaPath = await pathManager.getIndexMetaPath(
+        tableName,
+        fileName,
+      );
+
+      // Handle meta and partition file deletion
+      if (await storage.existsFile(metaPath)) {
+        // Read meta to get partition info
+        final content = await storage.readAsString(metaPath);
+
+        if (content != null && content.isNotEmpty) {
+          try {
+            final indexMeta = IndexMeta.fromJson(jsonDecode(content));
+
+            // Delete all partition files
+            for (final partitionMeta in indexMeta.partitions) {
+              final partitionPath = await pathManager.getIndexPartitionPath(
+                  tableName, fileName, partitionMeta.index);
+
+              if (await storage.existsFile(partitionPath)) {
+                await storage.deleteFile(partitionPath);
+              }
+            }
+          } catch (e) {
+            Logger.error(
+              'Failed to parse index meta: $e',
+              label: 'DataStoreImpl._removeIndexFile',
+            );
+          }
+        }
+
+        // Delete meta file
+        await storage.deleteFile(metaPath);
+      } else {
+        Logger.warn(
+          'Index metadata file does not exist: $metaPath',
+          label: 'DataStoreImpl._removeIndexFile',
+        );
+      }
+
+      // Check and delete old index file (compatible with old version)
+      if (fileName != indexName) {
+        final oldPath = await pathManager.getIndexMetaPath(
+          tableName,
+          indexName,
+        );
+        if (await storage.existsFile(oldPath)) {
+          await storage.deleteFile(oldPath);
+        }
+      }
+
+      // Clear index cache using both possible names
       _indexManager?.invalidateCache(tableName, indexName);
+      if (fileName != indexName) {
+        _indexManager?.invalidateCache(tableName, fileName);
+      }
     } catch (e) {
       Logger.error(
         'Failed to remove index file: $e',
         label: 'DataStoreImpl._removeIndexFile',
-      );
-      rethrow;
-    }
-  }
-
-  /// Rename table files
-  Future<void> _renameTableFiles(
-    String oldName,
-    String newName,
-    bool isGlobal,
-  ) async {
-    try {
-      // Rename data file
-      final oldDataPath = config.getDataPath(oldName, isGlobal);
-      final newDataPath = config.getDataPath(newName, isGlobal);
-      if (await storage.exists(oldDataPath)) {
-        if (kIsWeb) {
-          final content = await storage.readAsString(oldDataPath);
-          if (content != null) {
-            await storage.writeAsString(newDataPath, content);
-            await storage.deleteFile(oldDataPath);
-          }
-        } else {
-          final file = File(oldDataPath);
-          await file.rename(newDataPath);
-        }
-      }
-
-      // Rename index files
-      final schema = await getTableSchema(newName);
-      for (var index in schema.indexes) {
-        final indexName = index.actualIndexName;
-        final oldIndexPath = config.getIndexPath(oldName, indexName, isGlobal);
-        final newIndexPath = config.getIndexPath(newName, indexName, isGlobal);
-        if (await storage.exists(oldIndexPath)) {
-          if (kIsWeb) {
-            final content = await storage.readAsString(oldIndexPath);
-            if (content != null) {
-              await storage.writeAsString(newIndexPath, content);
-              await storage.deleteFile(oldIndexPath);
-            }
-          } else {
-            final file = File(oldIndexPath);
-            await file.rename(newIndexPath);
-          }
-        }
-      }
-
-      // Rename auto-increment file
-      if (schema.autoIncrement) {
-        final oldAutoIncrementPath =
-            config.getAutoIncrementPath(oldName, isGlobal);
-        final newAutoIncrementPath =
-            config.getAutoIncrementPath(newName, isGlobal);
-        if (await storage.exists(oldAutoIncrementPath)) {
-          if (kIsWeb) {
-            final content = await storage.readAsString(oldAutoIncrementPath);
-            if (content != null) {
-              await storage.writeAsString(newAutoIncrementPath, content);
-              await storage.deleteFile(oldAutoIncrementPath);
-            }
-          } else {
-            final file = File(oldAutoIncrementPath);
-            await file.rename(newAutoIncrementPath);
-          }
-        }
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to rename table files: $e',
-        label: 'DataStoreImpl._renameTableFiles',
-      );
-      rethrow;
-    }
-  }
-
-  /// Auto migrate database to new version
-  Future<void> autoMigrate({
-    required int oldVersion,
-    required int newVersion,
-    required List<TableSchema> schemas,
-    MigrationConfig? config,
-  }) async {
-    try {
-      final migrationConfig = config ?? const MigrationConfig();
-
-      // Backup if configured
-      if (migrationConfig.backupBeforeMigrate) {
-        await backup();
-      }
-
-      // Validate schemas and adjust auto increment for text primary keys
-      var adjustedSchemas = <TableSchema>[];
-      for (var schema in schemas) {
-        var schemaValid = schema;
-        final primaryField =
-            schema.fields.firstWhere((f) => f.name == schema.primaryKey);
-
-        // auto increment only supports integer primary key
-        if (schema.autoIncrement && primaryField.type != DataType.integer) {
-          Logger.warn(
-            'Auto increment is disabled for table ${schema.name}, auto increment only supports integer primary key,auto increment is set to false',
-            label: 'DataStore.autoMigrate',
-          );
-          schemaValid = schema.copyWith(autoIncrement: false);
-        }
-
-        await _validateSchema(schemaValid);
-        adjustedSchemas.add(schemaValid);
-      }
-
-      // Execute migration in transaction
-      await transaction((txn) async {
-        await _migrationManager?.migrate(
-          oldVersion,
-          newVersion,
-          adjustedSchemas,
-          batchSize: migrationConfig.batchSize,
-        );
-        await setVersion(newVersion);
-      });
-
-      // Validate after migration if configured
-      if (migrationConfig.validateAfterMigrate) {
-        final isValid =
-            await _validateMigration(adjustedSchemas); // use adjusted schemas
-        if (!isValid && migrationConfig.strictMode) {
-          throw const BusinessError(
-            'Migration validation failed',
-            type: BusinessErrorType.migrationError,
-          );
-        }
-      }
-
-      Logger.info(
-        'Auto migration completed successfully',
-        label: 'DataStoreImpl.autoMigrate',
-      );
-    } catch (e, stack) {
-      Logger.error(
-        'Auto migration failed: $e\n$stack',
-        label: 'DataStoreImpl.autoMigrate',
       );
       rethrow;
     }
@@ -3038,17 +2515,9 @@ class DataStoreImpl {
       }
 
       for (var schema in schemas) {
-        if (!await _integrityChecker!.validateTableStructure(
+        if (!await _integrityChecker!.validateMigration(
           schema.name,
           schema,
-          config,
-        )) {
-          return false;
-        }
-        if (!await _integrityChecker!.validateTableData(
-          schema.name,
-          schema,
-          config,
         )) {
           return false;
         }
@@ -3063,598 +2532,36 @@ class DataStoreImpl {
     }
   }
 
-  /// Get table names
-  Future<List<String>> getTableNames() async {
-    try {
-      final tables = <String>{};
-
-      await _processSchemaFiles(config.getGlobalPath(), (schemaJson, path) {
-        final json = jsonDecode(schemaJson) as Map<String, dynamic>;
-        if (!json.containsKey('name')) {
-          json['_schemaPath'] = path;
-        }
-        final schema = TableSchema.fromJson(json);
-        tables.add(schema.name);
-      });
-
-      await _processSchemaFiles(config.getBasePath(), (schemaJson, path) {
-        final json = jsonDecode(schemaJson) as Map<String, dynamic>;
-        if (!json.containsKey('name')) {
-          json['_schemaPath'] = path;
-        }
-        final schema = TableSchema.fromJson(json);
-        tables.add(schema.name);
-      });
-
-      return tables.toList();
-    } catch (e) {
-      Logger.error(
-        'Failed to get table names: $e',
-        label: 'DataStoreImpl.getTableNames',
-      );
-      rethrow;
-    }
-  }
-
-  Future<void> _processSchemaFiles(String dirPath,
-      Function(String schemaJson, String path) processFile) async {
-    if (kIsWeb) {
-      // web platform implementation
-      if (await storage.exists(dirPath)) {
-        final files = await storage.listDirectory(dirPath);
-        for (var file in files) {
-          if (file.endsWith('.schema')) {
-            try {
-              final schemaJson = await storage.readAsString(file);
-              if (schemaJson != null) {
-                processFile(schemaJson, file);
-              }
-            } catch (e) {
-              Logger.warn(
-                'Failed to read schema file: $file, error: $e',
-                label: 'DataStoreImpl._processSchemaFiles',
-              );
-            }
-          }
-        }
-      }
-    } else {
-      // native platform implementation
-      final dir = Directory(dirPath);
-      if (await dir.exists()) {
-        await for (var entity in dir.list()) {
-          if (entity is File && entity.path.endsWith('.schema')) {
-            try {
-              final schemaJson = await entity.readAsString();
-              processFile(schemaJson, entity.path);
-            } catch (e) {
-              Logger.warn(
-                'Failed to read schema file: ${entity.path}, error: $e',
-                label: 'DataStoreImpl._processSchemaFiles',
-              );
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /// Run operations in transaction
-  Future<T> transaction<T>(Future<T> Function(Transaction txn) action) async {
-    final txn = await _transactionManager!.beginTransaction();
-    try {
-      final result = await action(txn);
-      await _transactionManager?.commit(txn);
-      return result;
-    } catch (e) {
-      await _transactionManager?.rollback(txn);
-      rethrow;
-    }
-  }
-
-  /// Check if table exists
-  Future<bool> _tableExists(String tableName) async {
-    try {
-      final globalSchemaPath = config.getSchemaPath(tableName, true);
-      final baseSchemaPath = config.getSchemaPath(tableName, false);
-
-      if (await storage.exists(globalSchemaPath) ||
-          await storage.exists(baseSchemaPath)) {
-        try {
-          await getTableSchema(tableName);
-          return true;
-        } catch (e) {
-          Logger.warn(
-            'Schema file exists but invalid for table: $tableName',
-            label: 'DataStoreImpl._tableExists',
-          );
-          return false;
-        }
-      }
-
-      return false;
-    } catch (e) {
-      Logger.error(
-        'Failed to check table existence: $e',
-        label: 'DataStoreImpl._tableExists',
-      );
-      return false;
-    }
-  }
-
-  /// Add field to existing records
-  Future<void> addFieldToRecords(
-    String tableName,
-    FieldSchema field, {
-    int batchSize = 1000,
-  }) async {
-    final txn = await _transactionManager!.beginTransaction();
-    try {
-      final records = await fileManager.readRecords(tableName);
-      if (records.isEmpty) return;
-
-      // add new field
-      for (var record in records.values) {
-        if (!record.containsKey(field.name)) {
-          record[field.name] =
-              field.defaultValue ?? _getTypeDefaultValue(field.type);
-        }
-      }
-
-      // write converted records
-      await fileManager.writeRecords(
-        tableName: tableName,
-        records: records.values.toList(),
-        fullRewrite: true,
-      );
-
-      await _transactionManager!.commit(txn);
-    } catch (e) {
-      await _transactionManager!.rollback(txn);
-      Logger.error(
-        'Failed to add field to records: $e',
-        label: 'DataStoreImpl.addFieldToRecords',
-      );
-      rethrow;
-    }
-  }
-
-  /// Remove field from records
-  Future<void> removeFieldFromRecords(
-    String tableName,
-    String fieldName, {
-    int batchSize = 1000,
-  }) async {
-    final txn = await _transactionManager!.beginTransaction();
-    try {
-      final records = await fileManager.readRecords(tableName);
-      if (records.isEmpty) return;
-
-      // remove field
-      for (var record in records.values) {
-        record.remove(fieldName);
-      }
-
-      // write converted records
-      await fileManager.writeRecords(
-        tableName: tableName,
-        records: records.values.toList(),
-        fullRewrite: true,
-      );
-
-      await _transactionManager!.commit(txn);
-    } catch (e) {
-      await _transactionManager!.rollback(txn);
-      rethrow;
-    }
-  }
-
-  /// Rename field in records
-  Future<void> renameFieldInRecords(
-    String tableName,
-    String oldName,
-    String newName, {
-    int batchSize = 1000,
-  }) async {
-    final txn = await _transactionManager!.beginTransaction();
-    try {
-      final records = await fileManager.readRecords(tableName);
-      if (records.isEmpty) return;
-
-      // rename field
-      for (var record in records.values) {
-        if (record.containsKey(oldName)) {
-          record[newName] = record[oldName];
-          record.remove(oldName);
-        }
-      }
-
-      // write converted records
-      await fileManager.writeRecords(
-        tableName: tableName,
-        records: records.values.toList(),
-        fullRewrite: true,
-      );
-
-      await _transactionManager!.commit(txn);
-    } catch (e) {
-      await _transactionManager!.rollback(txn);
-      Logger.error(
-        'Failed to rename field in records: $e',
-        label: 'DataStoreImpl.renameFieldInRecords',
-      );
-    }
-  }
-
-  /// Convert value between data types
-  dynamic _convertValue(dynamic value, DataType type) {
-    if (value == null) return null;
-
-    switch (type) {
-      case DataType.integer:
-        return _toInteger(value);
-      case DataType.double:
-        return _toReal(value);
-      case DataType.text:
-        return _toString(value);
-      case DataType.blob:
-        return _toBlob(value);
-      case DataType.boolean:
-        return _toBoolean(value);
-      case DataType.datetime:
-        return _toDateTimeString(value);
-      case DataType.array:
-        return _toArray(value);
-    }
-  }
-
-  int? _toInteger(dynamic value) {
-    if (value is int) return value;
-    if (value is double) return value.round();
-    if (value is String) return int.tryParse(value);
-    if (value is bool) return value ? 1 : 0;
-    if (value is DateTime) return value.millisecondsSinceEpoch;
-    return null;
-  }
-
-  double? _toReal(dynamic value) {
-    if (value is double) return value;
-    if (value is int) return value.toDouble();
-    if (value is String) return double.tryParse(value);
-    if (value is bool) return value ? 1.0 : 0.0;
-    if (value is DateTime) return value.millisecondsSinceEpoch.toDouble();
-    return null;
-  }
-
-  String? _toString(dynamic value) {
-    if (value is String) return value;
-    if (value is DateTime) {
-      try {
-        return value.toIso8601String();
-      } catch (e) {
-        Logger.warn(
-          'Failed to convert DateTime to string: $value',
-          label: 'DataStore._toString',
-        );
-        return null;
-      }
-    }
-    return value?.toString();
-  }
-
-  Uint8List? _toBlob(dynamic value) {
-    if (value is Uint8List) return value;
-    if (value is String) return Uint8List.fromList(utf8.encode(value));
-    if (value is List<int>) return Uint8List.fromList(value);
-    return null;
-  }
-
-  bool? _toBoolean(dynamic value) {
-    if (value is bool) return value;
-    if (value is int) return value != 0;
-    if (value is double) return value != 0.0;
-    if (value is String) {
-      final lower = value.toLowerCase();
-      return lower == 'true' || lower == '1' || lower == 'yes';
-    }
-    return null;
-  }
-
-  /// DateTime convert to ISO8601 string
-  String? _toDateTimeString(dynamic value) {
-    if (value == null) return null;
-    if (value is DateTime) return value.toIso8601String();
-    if (value is String) {
-      try {
-        return DateTime.parse(value).toIso8601String();
-      } catch (e) {
-        Logger.warn(
-          'Failed to parse DateTime from string: $value',
-          label: 'DataStore._toDateTimeString',
-        );
-        return null;
-      }
-    }
-    if (value is int) {
-      try {
-        return DateTime.fromMillisecondsSinceEpoch(value).toIso8601String();
-      } catch (e) {
-        Logger.warn(
-          'Failed to convert timestamp to DateTime: $value',
-          label: 'DataStore._toDateTimeString',
-        );
-        return null;
-      }
-    }
-    return null;
-  }
-
-  /// Array convert to List
-  List? _toArray(dynamic value) {
-    if (value is List) return value;
-    if (value is String) {
-      try {
-        return jsonDecode(value) as List?;
-      } catch (_) {
-        return [value];
-      }
-    }
-    return value == null ? null : [value];
-  }
-
   /// Invalidate all caches for table
-  void _invalidateTableCaches(String tableName) {
-    _queryExecutor?.queryCacheManager.invalidateCache(tableName);
-    _queryExecutor?.invalidateCache(tableName);
+  Future<void> _invalidateTableCaches(String tableName) async {
+    dataCacheManager.invalidateCache(tableName);
     _statisticsCollector?.invalidateCache(tableName);
-    _uniqueValuesCache.remove(tableName);
-  }
+    tableDataManager.writeBuffer.remove(tableName);
 
-  /// Migrate field data when field attributes change
-  Future<void> migrateFieldData(
-    String tableName,
-    FieldSchema oldField,
-    FieldSchema newField,
-    Transaction txn, {
-    int batchSize = 1000,
-  }) async {
+    // Clear index cache
     try {
-      // Skip if only metadata changed (comment, etc)
-      if (oldField.type == newField.type &&
-          oldField.nullable == newField.nullable &&
-          oldField.defaultValue == newField.defaultValue &&
-          oldField.unique == newField.unique &&
-          oldField.name == newField.name) {
-        return;
-      }
+      // Clear primary key index cache
+      indexManager?.invalidateCache(tableName, 'pk_$tableName');
 
+      // Get table structure, clear all index caches
       final schema = await getTableSchema(tableName);
-      final records = await fileManager.readRecords(tableName);
-      if (records.isEmpty) return;
-
-      // 1. Handle type conversion
-      if (oldField.type != newField.type) {
-        for (var record in records.values) {
-          if (record.containsKey(oldField.name)) {
-            try {
-              // Convert and store in new field
-              record[newField.name] = _convertValue(
-                record[oldField.name],
-                newField.type,
-              );
-              // Remove old field if names are different
-              if (oldField.name != newField.name) {
-                record.remove(oldField.name);
-              }
-            } catch (e) {
-              // if conversion fails, use default value
-              record[newField.name] =
-                  newField.defaultValue ?? _getTypeDefaultValue(newField.type);
-              Logger.warn(
-                'Failed to convert field value: ${record[oldField.name]} from ${oldField.type} to ${newField.type}, using default value',
-                label: 'DataStoreImpl.migrateFieldData',
-              );
-            }
+      if (schema != null) {
+        for (var index in schema.indexes) {
+          // Use actualIndexName to ensure clearing the correct cache
+          if (index.actualIndexName.isNotEmpty) {
+            indexManager?.invalidateCache(tableName, index.actualIndexName);
           }
-        }
-      }
-
-      // 2. Handle nullability change
-      if (!oldField.nullable && newField.nullable) {
-        // Field became nullable - no action needed
-      } else if (oldField.nullable && !newField.nullable) {
-        // Set default value for null fields
-        for (var record in records.values) {
-          if (record[newField.name] == null) {
-            record[newField.name] =
-                newField.defaultValue ?? _getTypeDefaultValue(newField.type);
+          // If index has explicit name, also clear cache for that name
+          if (index.indexName != null && index.indexName!.isNotEmpty) {
+            indexManager?.invalidateCache(tableName, index.indexName!);
           }
-        }
-      }
-
-      // 3. Handle default value change
-      if (oldField.defaultValue != newField.defaultValue) {
-        for (var record in records.values) {
-          if (record[newField.name] == oldField.defaultValue) {
-            record[newField.name] = newField.defaultValue;
-          }
-        }
-      }
-
-      // 4. Handle unique constraint change
-      if (oldField.unique != newField.unique) {
-        if (newField.unique) {
-          // Check uniqueness
-          final values = <dynamic>{};
-          for (var record in records.values) {
-            final value = record[oldField.name];
-            if (values.contains(value)) {
-              Logger.warn(
-                'Duplicate value found for field ${oldField.name}: $value',
-                label: 'DataStoreImpl.migrateFieldData',
-              );
-            }
-            values.add(value);
-          }
-        }
-
-        // 4.2 Handle indexes
-        // Remove old field index if exists
-        final oldIndex = schema.indexes.firstWhere(
-          (i) => i.fields.length == 1 && i.fields.first == oldField.name,
-          orElse: () => const IndexSchema(fields: []),
-        );
-        if (oldIndex.indexName != null) {
-          await removeIndex(tableName, oldIndex.indexName!, txn);
-        }
-
-        // Add new index if needed
-        if (newField.unique) {
-          final newIndex = IndexSchema(
-            indexName: '${newField.name}_idx',
-            fields: [newField.name],
-            unique: true,
-          );
-          await addIndex(tableName, newIndex, txn);
-        }
-      }
-
-      // 5. check max length
-      if (oldField.maxLength != null) {
-        for (var record in records.values) {
-          if (record[oldField.name] != null &&
-              record[oldField.name] is String &&
-              record[oldField.name].length > oldField.maxLength!) {
-            Logger.warn('Warning: field ${oldField.name} exceeds max length');
-            record[oldField.name] =
-                record[oldField.name].substring(0, oldField.maxLength!);
-          }
-        }
-      }
-
-      // 6. Write converted records
-      await fileManager.writeRecords(
-        tableName: tableName,
-        records: records.values.toList(),
-        fullRewrite: true,
-      );
-    } catch (e) {
-      Logger.error(
-        'Failed to migrate field data: $e',
-        label: 'DataStoreImpl.migrateFieldData',
-      );
-      rethrow;
-    }
-  }
-
-  /// Get row pointer for given primary key value
-  Future<RowPointer?> getRowPointer(
-    String tableName,
-    dynamic primaryKeyValue,
-  ) async {
-    try {
-      final schema = await getTableSchema(tableName);
-      final dataPath = config.getDataPath(tableName, schema.isGlobal);
-
-      if (!await storage.exists(dataPath)) {
-        return null;
-      }
-
-      // 1. Check pending writes in queue
-      final pendingData = fileManager.writeQueue[tableName] ?? [];
-      for (var record in pendingData) {
-        if (record[schema.primaryKey] == primaryKeyValue) {
-          final encoded = jsonEncode(record);
-          return RowPointer.create(encoded, 0); // Use temporary offset
-        }
-      }
-
-      // 2. Read from file
-      var offset = 0;
-      final lines = await storage.readLines(dataPath);
-
-      for (var line in lines) {
-        if (line.trim().isEmpty) {
-          offset += line.length + 1;
-          continue;
-        }
-
-        try {
-          final record = jsonDecode(line) as Map<String, dynamic>;
-          if (record[schema.primaryKey] == primaryKeyValue) {
-            return RowPointer.create(line, offset);
-          }
-        } catch (e) {
-          Logger.warn(
-            'Invalid JSON at offset $offset: $e',
-            label: 'DataStoreImpl.getRowPointer',
-          );
-        }
-
-        offset += line.length + 1;
-      }
-
-      return null;
-    } catch (e) {
-      Logger.error(
-        'Failed to get row pointer: $e',
-        label: 'DataStoreImpl.getRowPointer',
-      );
-      return null;
-    }
-  }
-
-  /// Get record data by row pointer
-  Future<Map<String, dynamic>?> getRecordByPointer(
-    String tableName,
-    RowPointer pointer,
-  ) async {
-    try {
-      final dataPath = config.getDataPath(
-          tableName, (await getTableSchema(tableName)).isGlobal);
-
-      if (!await storage.exists(dataPath)) return null;
-
-      if (kIsWeb) {
-        final content = await storage.readAsString(dataPath);
-        if (content == null) return null;
-
-        int currentPos = 0;
-        for (var line in content.split('\n')) {
-          if (currentPos <= pointer.offset &&
-              currentPos + line.length >= pointer.offset) {
-            if (pointer.verifyContent(line.trim())) {
-              return jsonDecode(line.trim()) as Map<String, dynamic>;
-            }
-            return null;
-          }
-          currentPos += line.length + 1; // +1 for newline
-        }
-        return null;
-      } else {
-        final file = File(dataPath);
-        if (!await file.exists()) return null;
-
-        final raf = await file.open(mode: FileMode.read);
-        try {
-          await raf.setPosition(pointer.offset);
-          final bytes = await raf.read(pointer.length);
-          final line = utf8.decode(bytes);
-
-          if (pointer.verifyContent(line.trim())) {
-            return jsonDecode(line.trim()) as Map<String, dynamic>;
-          }
-          return null;
-        } finally {
-          await raf.close();
         }
       }
     } catch (e) {
       Logger.error(
-        'Failed to get record by pointer: $e',
-        label: 'DataStoreImpl.getRecordByPointer',
+        'Error clearing cache for table [$tableName]: $e',
+        label: 'DataStoreImpl._invalidateTableCaches',
       );
-      return null;
     }
   }
 
@@ -3663,14 +2570,13 @@ class DataStoreImpl {
     String tableName,
     String oldIndexName,
     IndexSchema newIndex,
-    Transaction? txn,
   ) async {
     try {
       // 1. Drop old index
-      await removeIndex(tableName, oldIndexName, txn);
+      await removeIndex(tableName, indexName: oldIndexName);
 
       // 2. Create new index
-      await addIndex(tableName, newIndex, txn);
+      await addIndex(tableName, newIndex);
     } catch (e) {
       Logger.error(
         'Failed to modify index: $e',
@@ -3680,79 +2586,407 @@ class DataStoreImpl {
     }
   }
 
-  /// Set auto increment setting for a table
-  Future<void> setAutoIncrement(String tableName, bool enabled) async {
-    if (!_baseInitialized) {
-      await _ensureInitialized();
-    }
-
+  /// Get global configuration
+  Future<GlobalConfig?> getGlobalConfig() async {
     try {
-      // 1. get table schema
+      // Get from cache first
+      if (_globalConfigCache != null) {
+        return _globalConfigCache;
+      }
+
+      final configPath = pathManager.getGlobalConfigPath();
+
+      if (!await storage.existsFile(configPath)) {
+        return null;
+      }
+
+      final content = await storage.readAsString(configPath);
+      if (content == null || content.isEmpty) return null;
+
+      final config =
+          GlobalConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
+
+      // Update cache
+      _globalConfigCache = config;
+
+      return config;
+    } catch (e) {
+      Logger.error('Failed to get global config: $e',
+          label: 'DataStoreImpl.getGlobalConfig');
+      return null;
+    }
+  }
+
+  /// Save global configuration
+  Future<void> saveGlobalConfig(GlobalConfig config) async {
+    try {
+      // Update memory cache
+      _globalConfigCache = config;
+
+      final configPath = pathManager.getGlobalConfigPath();
+
+      // Ensure directory exists
+      await storage.ensureDirectoryExists(
+        configPath.substring(0, configPath.lastIndexOf('/')),
+      );
+
+      // Serialize and save
+      final content = jsonEncode(config.toJson());
+      await storage.writeAsString(configPath, content);
+    } catch (e) {
+      Logger.error('Failed to save global config: $e',
+          label: 'DataStoreImpl.saveGlobalConfig');
+    }
+  }
+
+  /// Get all space names
+  Future<Set<String>> getAllSpaceNames() async {
+    try {
+      // First load global configuration
+      final globalConfig = await getGlobalConfig();
+      if (globalConfig != null && globalConfig.spaceNames.isNotEmpty) {
+        return globalConfig.spaceNames;
+      }
+
+      // If no configuration record, get from file system
+      final spacesPath = pathJoin(config.dbPath!, 'spaces');
+      final spaceNames = <String>{};
+
+      try {
+        if (await storage.existsDirectory(spacesPath)) {
+          // Use non-recursive mode to get direct subdirectories
+          final entries =
+              await storage.listDirectory(spacesPath, recursive: false);
+
+          for (final entry in entries) {
+            if (await storage.existsDirectory(entry)) {
+              // Extract directory name
+              final name = entry.split('/').last.split('\\').last;
+              if (name != '.' && name != '..') {
+                spaceNames.add(name);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        Logger.error('Failed to read space directory: $e',
+            label: 'DataStoreImpl.getAllSpaceNames');
+      }
+
+      // If spaces were found, update global configuration
+      if (spaceNames.isNotEmpty) {
+        // Ensure default space is included
+        if (!spaceNames.contains('default')) {
+          spaceNames.add('default');
+        }
+        final newConfig = GlobalConfig(spaceNames: spaceNames);
+        await saveGlobalConfig(newConfig);
+      }
+
+      return spaceNames.isEmpty ? {'default'} : spaceNames;
+    } catch (e) {
+      Logger.error('Failed to get all space names: $e',
+          label: 'DataStoreImpl.getAllSpaceNames');
+      return {'default'};
+    }
+  }
+
+  /// Add space to global configuration
+  Future<void> addSpaceToGlobalConfig(String spaceName) async {
+    try {
+      if (spaceName.isEmpty) return;
+
+      // Load existing configuration
+      final existingConfig = await getGlobalConfig() ?? GlobalConfig();
+
+      // Add new space
+      final updatedConfig = existingConfig.addSpace(spaceName);
+
+      // If there are changes, save the updated configuration
+      if (updatedConfig.spaceNames.length != existingConfig.spaceNames.length) {
+        await saveGlobalConfig(updatedConfig);
+      }
+    } catch (e) {
+      Logger.error('Failed to add space to global config: $e',
+          label: 'DataStoreImpl.addSpaceToGlobalConfig');
+    }
+  }
+
+  /// Check and migrate old path structure (if needed)
+  Future<void> _migrateOldStructureIfNeeded() async {
+    try {
+      // Create old structure migration handler
+      final migrationHandler = OldStructureMigrationHandler(
+        dataStore: this,
+        pathManager: _pathManager!,
+        storage: storage,
+      );
+
+      // Execute migration (this operation will block the main thread)
+      await migrationHandler.migrate();
+    } catch (e) {
+      Logger.error('Error checking and migrating old path structure: $e',
+          label: 'DataStoreImpl._migrateOldStructureIfNeeded');
+      // Error doesn't affect continued use, just log it
+    }
+  }
+
+  /// Check if table exists in current space
+  Future<bool> tableExistsInCurrentSpace(String tableName) async {
+    try {
+      final spaceConfig = await getSpaceConfig();
+      if (spaceConfig == null) {
+        return false;
+      }
+
+      final spacePrefix = _currentSpaceName;
+      final tableKey = '$spacePrefix:$tableName';
+      return spaceConfig.tableDirectoryMap.containsKey(tableKey);
+    } catch (e) {
+      Logger.error('Error checking if table exists in current space: $e',
+          label: 'DataStoreImpl.tableExistsInCurrentSpace');
+      return false;
+    }
+  }
+
+  /// Set table's primary key configuration
+  Future<void> setPrimaryKeyConfig(
+      String tableName, PrimaryKeyConfig config) async {
+    try {
+      // 1. Get table structure
       final schema = await getTableSchema(tableName);
-      if (schema.fields.isEmpty) {
+      if (schema == null || schema.fields.isEmpty) {
         throw BusinessError(
           'Table $tableName not found',
           type: BusinessErrorType.schemaError,
         );
       }
 
-      // 2. validate primary key type
-      final primaryField =
-          schema.fields.firstWhere((f) => f.name == schema.primaryKey);
-      if (enabled && primaryField.type != DataType.integer) {
-        throw const BusinessError(
-          'Auto increment only supports integer primary key',
-          type: BusinessErrorType.schemaError,
+      final newSchema = schema.copyWith(primaryKeyConfig: config);
+
+      // 4. If settings haven't changed, return directly
+      if (schema.primaryKeyConfig.type == config.type &&
+          schema.primaryKeyConfig.isOrdered == config.isOrdered &&
+          schema.primaryKeyConfig.name == config.name) {
+        // For sequential auto-increment mode, check detailed configuration
+        if (config.type == PrimaryKeyType.sequential &&
+            schema.primaryKeyConfig.sequentialConfig?.toJson().toString() ==
+                config.sequentialConfig?.toJson().toString()) {
+          return;
+        }
+        // For timestamp or date prefix mode, no need for additional configuration checks
+        if (config.type == PrimaryKeyType.timestampBased ||
+            config.type == PrimaryKeyType.datePrefixed ||
+            config.type == PrimaryKeyType.shortCode) {
+          return;
+        }
+      }
+
+      // 5. If primary key generation method has changed, output warning
+      if (schema.primaryKeyConfig.type != config.type) {
+        Logger.warn(
+          'Primary key generation method changed: table[$tableName] from ${schema.primaryKeyConfig.type} to ${config.type}, existing record primary key values will be preserved, this change only affects new records',
+          label: 'DataStoreImpl.setPrimaryKeyConfig',
         );
       }
 
-      // 3. if setting is unchanged, return
-      if (schema.autoIncrement == enabled) {
-        return;
-      }
-
-      // 4. create new schema
-      final newSchema = schema.copyWith(autoIncrement: enabled);
-
-      // 5. get schema file path
-      final schemaPath = config.getSchemaPath(tableName, schema.isGlobal);
-
-      await _concurrencyManager!.acquireWriteLock(tableName);
       try {
-        // 6. update schema file
-        await storage.writeAsString(schemaPath, jsonEncode(newSchema));
+        // 6. Update table structure
+        await updateTableSchema(tableName, newSchema);
 
-        // 7. if auto increment is enabled, create auto increment id file
-        if (enabled) {
-          final maxIdPath =
-              config.getAutoIncrementPath(tableName, schema.isGlobal);
-          if (!await storage.exists(maxIdPath)) {
-            await storage.writeAsString(maxIdPath, '0');
+        // 7. If auto primary key generation is enabled, create auto-increment ID file
+        if (config.type == PrimaryKeyType.sequential) {
+          final maxIdPath = await pathManager.getAutoIncrementPath(tableName);
+          if (!await storage.existsFile(maxIdPath)) {
+            // Get initial value
+            int initialValue = 0;
+            if (config.sequentialConfig != null) {
+              initialValue = config.sequentialConfig!.initialValue;
+            }
+            await storage.writeAsString(maxIdPath, initialValue.toString());
           }
         }
 
-        // 8. update cache
-        _queryExecutor?.queryCacheManager.cacheSchema(tableName, newSchema);
+        // 8. Update cache
+        dataCacheManager.cacheSchema(tableName, newSchema);
 
         Logger.info(
-          'Auto increment ${enabled ? 'enabled' : 'disabled'} for table $tableName',
-          label: 'DataStore.setAutoIncrement',
+          'Table $tableName primary key configuration has been updated to ${config.type}',
+          label: 'DataStore.setPrimaryKeyConfig',
         );
       } catch (e) {
         Logger.error(
-          'Failed to update auto increment setting: $e',
-          label: 'DataStore.setAutoIncrement',
+          'Failed to update primary key configuration: $e',
+          label: 'DataStore.setPrimaryKeyConfig',
         );
         rethrow;
-      } finally {
-        await _concurrencyManager!.releaseWriteLock(tableName);
       }
     } catch (e) {
       Logger.error(
-        'Set auto increment failed: $e',
-        label: 'DataStore.setAutoIncrement',
+        'Failed to set primary key configuration: $e',
+        label: 'DataStore.setPrimaryKeyConfig',
       );
       rethrow;
     }
+  }
+
+  /// Validate if primary key value maintains ordering
+  Future<bool> _validatePrimaryKeyOrder(
+      String tableName, dynamic newId, PrimaryKeyType type) async {
+    try {
+      // Get table metadata
+      final fileMeta = await tableDataManager.getTableFileMeta(tableName);
+      if (fileMeta == null ||
+          fileMeta.partitions == null ||
+          fileMeta.partitions!.isEmpty) {
+        return true; // New table, no need to check ordering
+      }
+
+      // Only find the last non-empty partition (usually contains the maximum primary key value)
+      PartitionMeta? lastPartition;
+      for (final partition in fileMeta.partitions!) {
+        if (partition.totalRecords > 0 && partition.maxPrimaryKey != null) {
+          if (lastPartition == null || partition.index > lastPartition.index) {
+            lastPartition = partition;
+          }
+        }
+      }
+
+      if (lastPartition == null || lastPartition.maxPrimaryKey == null) {
+        return true; // Cannot determine maximum primary key value, skip check
+      }
+
+      // Compare new ID with maximum ID
+      int compareResult =
+          ValueComparator.compare(newId, lastPartition.maxPrimaryKey);
+
+      // Determine if strict incremental ordering is required based on primary key type
+      switch (type) {
+        case PrimaryKeyType.sequential:
+        case PrimaryKeyType.timestampBased:
+        case PrimaryKeyType.datePrefixed:
+        case PrimaryKeyType.shortCode:
+          // Ordered primary keys should be strictly increasing
+          return compareResult > 0;
+        case PrimaryKeyType.none:
+        default:
+          // Other primary key types, more relaxed check
+          return true;
+      }
+    } catch (e) {
+      Logger.error('Failed to check primary key ordering: $e',
+          label: 'DataStore._validatePrimaryKeyOrder');
+      // On error, allow insertion to be safe
+      return true;
+    }
+  }
+
+  /// Get information about the current space
+  Future<SpaceInfo> getSpaceInfo() async {
+    try {
+      // Get space configuration
+      final config = await getSpaceConfig();
+      // Get only user-created tables by using onlyUserTables=true
+      final allTables =
+          await schemaManager?.listAllTables(onlyUserTables: true) ?? [];
+
+      // Check if statistics are stale (older than 1 hour)
+      final currentTime = DateTime.now();
+      final lastStatsTime = config?.lastStatisticsTime ?? DateTime(2000);
+      final statsDuration = currentTime.difference(lastStatsTime);
+
+      if (statsDuration.inHours > 1) {
+        // Schedule statistics recalculation without waiting for it to complete
+        tableDataManager.recalculateAllStatistics();
+      }
+
+      // Get only tables that exist in the current space
+      final userTables = <String>[];
+      for (final tableName in allTables) {
+        // Check if the table is used in the current space
+        if (await tableExistsInCurrentSpace(tableName)) {
+          userTables.add(tableName);
+        }
+      }
+
+      // Create the SpaceInfo object with user-table information
+      return SpaceInfo(
+        spaceName: _currentSpaceName,
+        version: await getVersion(),
+        tableCount: userTables.length, // Use actual count of user tables
+        recordCount: config?.totalRecordCount ?? 0,
+        dataSizeBytes: config?.totalDataSizeBytes ?? 0,
+        lastStatisticsTime: config?.lastStatisticsTime,
+        tables: userTables,
+      );
+    } catch (e) {
+      Logger.error('Failed to get space info: $e',
+          label: 'DataStoreImpl.getSpaceInfo');
+      rethrow;
+    }
+  }
+
+  /// Stream records from a table with filtering
+  /// This method provides an efficient way to process large datasets by streaming records one at a time
+  ///
+  /// @param tableName The name of the table to stream records from
+  /// @param condition Optional query conditions to filter records
+  /// @param selectedFields Optional list of fields to include in the results
+  Stream<Map<String, dynamic>> streamRecords(
+    String tableName, {
+    QueryCondition? condition,
+    List<String>? selectedFields,
+  }) async* {
+    try {
+      // Check if table exists
+      if (!await tableExists(tableName)) {
+        Logger.error('Table $tableName does not exist',
+            label: 'DataStoreImpl.streamRecords');
+        return;
+      }
+
+      // Get table schema
+      final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Failed to get schema for $tableName',
+            label: 'DataStoreImpl.streamRecords');
+        return;
+      }
+
+      // Stream all records from table using the existing tableDataManager method
+      final recordStream = tableDataManager.streamRecords(tableName);
+
+      // Stream and filter records one by one
+      await for (final record in recordStream) {
+        // Apply filters if condition is provided
+        if (condition != null && !condition.isEmpty) {
+          if (!condition.matches(record)) {
+            continue; // Skip non-matching records
+          }
+        }
+
+        // Apply field selection (projection) and yield the record
+        yield selectFields(record, selectedFields);
+      }
+    } catch (e) {
+      Logger.error('Error streaming records: $e',
+          label: 'DataStoreImpl.streamRecords');
+    }
+  }
+
+  /// Select specific fields from a record
+  Map<String, dynamic> selectFields(
+      Map<String, dynamic> record, List<String>? fields) {
+    if (fields == null || fields.isEmpty) {
+      return record;
+    }
+
+    final result = <String, dynamic>{};
+    for (final field in fields) {
+      if (record.containsKey(field)) {
+        result[field] = record[field];
+      }
+    }
+    return result;
   }
 }

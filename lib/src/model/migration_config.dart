@@ -13,7 +13,7 @@ class MigrationConfig {
   final bool strictMode;
 
   const MigrationConfig({
-    this.backupBeforeMigrate = true,
+    this.backupBeforeMigrate = false,
     this.validateAfterMigrate = true,
     this.batchSize = 1000,
     this.strictMode = false,

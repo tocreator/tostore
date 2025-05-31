@@ -11,6 +11,8 @@ class CostEstimator {
   static const double _tableScanCost = 10.0;
   static const double _sortCost = 5.0;
   static const double _filterCost = 3.0;
+  static const double _joinCost = 15.0; // JOIN cost weight
+  static const double _cacheScanCost = 0.5; // cache query cost weight, lowest
 
   CostEstimator(this._statistics);
 
@@ -34,6 +36,10 @@ class CostEstimator {
           totalCost += _tableScanCost * estimatedRows;
           break;
 
+        case QueryOperationType.cacheQuery:
+          totalCost += _cacheScanCost * estimatedRows;
+          break;
+
         case QueryOperationType.filter:
           final filterCost = _estimateFilterCost(
             operation.value as Map<String, dynamic>,
@@ -46,10 +52,26 @@ class CostEstimator {
         case QueryOperationType.sort:
           totalCost += _estimateSortCost(estimatedRows);
           break;
+
+        case QueryOperationType.join:
+          final joinCost = _estimateJoinCost(estimatedRows);
+          totalCost += joinCost.cost;
+          estimatedRows = joinCost.rows;
+          break;
       }
     }
 
     return totalCost;
+  }
+
+  /// estimate join cost - estimate the cost of the join operation
+  CostEstimate _estimateJoinCost(int inputRows) {
+    // assume the join operation will produce twice the number of input rows (conservative estimate)
+    final outputRows = inputRows * 2;
+    // the cost of JOIN is proportional to the input rows, and there is an additional merge cost
+    final cost = _joinCost * inputRows;
+
+    return CostEstimate(cost, outputRows);
   }
 
   /// estimate index scan cost

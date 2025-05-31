@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
-import '../model/base_path_changed_event.dart';
+import '../model/space_path_changed_event.dart';
 import 'table_statistics.dart';
 
 /// statistics collector
@@ -27,24 +27,19 @@ class StatisticsCollector {
   /// collect table statistics
   Future<TableStatistics> collectTableStatistics(String tableName) async {
     try {
-      final schema = await _dataStore.getTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final dataPath = await _dataStore.pathManager.getDataMetaPath(tableName);
 
-      if (!await _dataStore.storage.exists(dataPath)) {
+      if (!await _dataStore.storage.existsFile(dataPath)) {
         throw StateError('Table $tableName does not exist');
       }
 
-      final lines = await _dataStore.storage.readLines(dataPath);
       final fieldStats = <String, FieldStatistics>{};
       var totalRows = 0;
 
-      // collect statistics of each line
-      for (var line in lines) {
-        if (line.trim().isEmpty) continue;
+      // collect statistics using stream
+      await for (final record
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
         totalRows++;
-
-        final record = jsonDecode(line) as Map<String, dynamic>;
         for (var entry in record.entries) {
           final stats = fieldStats.putIfAbsent(
             entry.key,
@@ -88,9 +83,7 @@ class StatisticsCollector {
   /// save statistics to file
   Future<void> _saveStatistics(String tableName, TableStatistics stats) async {
     try {
-      final schema = await _dataStore.getTableSchema(tableName);
-      final statsPath =
-          _dataStore.config.getStatsPath(tableName, schema.isGlobal);
+      final statsPath = await _dataStore.pathManager.getStatsPath(tableName);
 
       await _dataStore.storage
           .writeAsString(statsPath, jsonEncode(stats.toJson()));
@@ -148,7 +141,7 @@ class StatisticsCollector {
   }
 
   /// handle base path changed
-  void onBasePathChanged(BasePathChangedEvent event) {
+  void onBasePathChanged(SpacePathChangedEvent event) {
     // clear statistics cache
     _statistics.clear();
     _lastUpdateTime.clear();

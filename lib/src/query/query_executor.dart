@@ -1,26 +1,23 @@
-import 'dart:convert';
-import 'dart:io';
-import 'package:flutter/foundation.dart';
-
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
-import '../model/row_pointer.dart';
+import '../model/store_index.dart';
+import '../model/file_info.dart';
+import '../model/join_clause.dart';
 import 'query_cache.dart';
-import 'query_cache_manager.dart';
 import 'query_condition.dart';
 import 'query_plan.dart';
+import '../handler/value_comparator.dart';
 
 /// query executor
 class QueryExecutor {
   final DataStoreImpl _dataStore;
   final IndexManager _indexManager;
-  final QueryCacheManager queryCacheManager;
 
   QueryExecutor(
     this._dataStore,
     this._indexManager,
-  ) : queryCacheManager = QueryCacheManager(_dataStore);
+  );
 
   /// execute query
   Future<List<Map<String, dynamic>>> execute(
@@ -30,13 +27,25 @@ class QueryExecutor {
     List<String>? orderBy,
     int? limit,
     int? offset,
+    List<JoinClause>? joins,
   }) async {
     try {
+      // Don't use cache when there are join queries
+      if (joins != null && joins.isNotEmpty) {
+        final results =
+            await _executeQueryPlan(plan, tableName, condition, joins);
+        if (orderBy != null) {
+          _applySort(results, orderBy);
+        }
+        return _paginateResults(results, limit, offset);
+      }
+
       // 1. try to use cache
-      final cache = queryCacheManager.getEntireTable(tableName);
+      final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
       if (cache != null) {
         // check cache type and query condition
-        final isFullCache = queryCacheManager.isTableFullyCached(tableName);
+        final isFullCache =
+            await _dataStore.dataCacheManager.isTableFullyCached(tableName);
         final isSpecificQuery =
             condition != null && await _isSpecificQuery(tableName, condition);
 
@@ -53,6 +62,10 @@ class QueryExecutor {
           if (orderBy != null) {
             _applySort(results, orderBy);
           }
+
+          // Update access time
+          _dataStore.dataCacheManager.recordTableAccess(tableName);
+
           return _paginateResults(results, limit, offset);
         }
       }
@@ -66,10 +79,13 @@ class QueryExecutor {
       );
 
       // 2. check query cache
-      final queryResult = queryCacheManager.getQuery(cacheKey);
+      final queryResult = _dataStore.dataCacheManager.getQuery(cacheKey);
       if (queryResult != null) {
         // get table schema to get primary key field
         final schema = await _dataStore.getTableSchema(tableName);
+        if (schema == null) {
+          return [];
+        }
         final primaryKey = schema.primaryKey;
 
         // convert cache result to Map to update
@@ -80,10 +96,12 @@ class QueryExecutor {
         }
 
         // check data in write queue
-        final pendingData = _dataStore.fileManager.writeQueue[tableName] ?? [];
+        final pendingDataMap =
+            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
         final conditions = condition?.build();
 
-        for (var record in pendingData) {
+        for (var entry in pendingDataMap.values) {
+          final record = entry.data;
           final recordId = record[primaryKey].toString();
           if (conditions == null || _matchConditions(record, conditions)) {
             // update or add record
@@ -103,24 +121,27 @@ class QueryExecutor {
       }
 
       // 3. execute actual query
-      final results = await _executeQueryPlan(plan, tableName);
-      // 4. apply query condition
-      var processedResults = results;
-      if (condition != null) {
-        final conditions = condition.build();
-        processedResults = processedResults
-            .where((record) => _matchConditions(record, conditions))
-            .toList();
-      }
+      final results =
+          await _executeQueryPlan(plan, tableName, condition, joins);
+
+      // 4. apply sort
       if (orderBy != null) {
-        _applySort(processedResults, orderBy);
+        _applySort(results, orderBy);
       }
 
-      // 5. paginate and cache results
-      final paginatedResults =
-          _paginateResults(processedResults, limit, offset);
+      // 5. paginate results
+      final paginatedResults = _paginateResults(results, limit, offset);
+
+      // 6. Store query results in cache
       if (paginatedResults.isNotEmpty) {
-        queryCacheManager.cacheQuery(cacheKey, paginatedResults, {tableName});
+        final shouldCache = condition == null ||
+            (await _isSpecificQuery(tableName, condition)) ||
+            (paginatedResults.length < _dataStore.config.maxQueryCacheSize);
+
+        if (shouldCache) {
+          _dataStore.dataCacheManager
+              .cacheQuery(cacheKey, paginatedResults, {tableName});
+        }
       }
 
       return paginatedResults;
@@ -136,113 +157,809 @@ class QueryExecutor {
   Future<List<Map<String, dynamic>>> _executeQueryPlan(
     QueryPlan plan,
     String tableName,
-  ) async {
+    QueryCondition? condition, [
+    List<JoinClause>? joins,
+  ]) async {
     List<Map<String, dynamic>> results = [];
+    // Save original conditions to apply after JOIN
+    final originalConditions = condition?.build() ?? {};
+    Map<String, dynamic> remainingConditions =
+        Map<String, dynamic>.from(originalConditions);
+
     for (var operation in plan.operations) {
       switch (operation.type) {
         case QueryOperationType.tableScan:
-          results = await _performTableScan(tableName);
+          // Scan the main table, only apply main table related conditions
+          var mainTableConditions =
+              _extractTableConditions(remainingConditions, tableName);
+          // Create temporary QueryCondition for main table query
+          if (mainTableConditions.isNotEmpty) {
+            // Convert conditions back to QueryCondition format (simplified handling)
+            final mainTableQueryCondition =
+                _createConditionFromMap(mainTableConditions);
+            results =
+                await _performTableScan(tableName, mainTableQueryCondition);
+            // Remove already applied conditions from remaining conditions
+            for (var field in mainTableConditions.keys) {
+              if (field.startsWith('$tableName.')) {
+                remainingConditions.remove(field);
+              }
+            }
+          } else {
+            results = await _performTableScan(tableName, null);
+          }
           break;
+
         case QueryOperationType.indexScan:
+          // Index scan also only applies main table conditions
           results = await _performIndexScan(
             tableName,
             operation.indexName!,
             operation.value as Map<String, dynamic>,
+            condition, // Use complete conditions, will handle internally
           );
           break;
+
+        case QueryOperationType.cacheQuery:
+          // Read data directly from cache, no need to access files
+          final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
+          if (cache != null) {
+            results = List<Map<String, dynamic>>.from(cache);
+
+            // Record cache access
+            _dataStore.dataCacheManager.recordTableAccess(tableName);
+          } else {
+            results = await _performTableScan(tableName, null);
+          }
+          break;
+
         case QueryOperationType.filter:
-          final conditions = operation.value as Map<String, dynamic>;
+          // Apply filter conditions to query results
+          final filterConditions = operation.value as Map<String, dynamic>;
           results = results
-              .where((record) => _matchConditions(record, conditions))
+              .where((record) => _matchConditions(record, filterConditions))
               .toList();
           break;
+
         case QueryOperationType.sort:
-          _applySort(results, operation.value as List<String>);
+          // Extract sort fields and directions from operation value
+          final sortFieldsInput = operation.value as List<String>;
+          final List<String> sortFields =
+              List.filled(sortFieldsInput.length, '');
+          final List<bool> sortDirections =
+              List.filled(sortFieldsInput.length, true);
+
+          // Process sortFields that may contain sort direction information
+          for (int i = 0; i < sortFieldsInput.length; i++) {
+            String field = sortFieldsInput[i];
+
+            // 1. Field with "-" prefix indicates descending order
+            if (field.startsWith('-')) {
+              sortFields[i] = field.substring(1); // Remove "-" symbol
+              sortDirections[i] = false; // Set to descending order
+            }
+            // 2. Field with DESC/ASC suffix
+            else if (field.toUpperCase().endsWith(' DESC')) {
+              // Remove DESC and set sort direction to descending
+              sortFields[i] = field.substring(0, field.length - 5).trim();
+              sortDirections[i] = false;
+            } else if (field.toUpperCase().endsWith(' ASC')) {
+              // Remove ASC, keep ascending
+              sortFields[i] = field.substring(0, field.length - 4).trim();
+              sortDirections[i] = true;
+            } else {
+              // No special marker, use original field name, default ascending
+              sortFields[i] = field;
+            }
+          }
+
+          // Use ValueComparator for sorting
+          ValueComparator.sortMapList(results, sortFields, sortDirections);
+          break;
+
+        case QueryOperationType.join:
+          final joinInfo = operation.value as Map<String, dynamic>;
+          final joinedResults = await _performJoin(
+            results,
+            joinInfo['table'] as String,
+            joinInfo['firstKey'] as String,
+            joinInfo['operator'] as String,
+            joinInfo['secondKey'] as String,
+            joinInfo['type'] as String,
+          );
+          results = joinedResults;
+
+          // Extract conditions for the current joined table and apply
+          final joinTableName = joinInfo['table'] as String;
+          final joinTableConditions =
+              _extractTableConditions(remainingConditions, joinTableName);
+
+          // Apply joined table conditions
+          if (joinTableConditions.isNotEmpty) {
+            results = results
+                .where(
+                    (record) => _matchConditions(record, joinTableConditions))
+                .toList();
+
+            // Remove applied conditions from remaining conditions
+            for (var field in joinTableConditions.keys) {
+              if (field.startsWith('$joinTableName.')) {
+                remainingConditions.remove(field);
+              }
+            }
+          }
           break;
       }
+    }
+
+    // Apply any remaining conditions (may be cross-table or unhandled conditions)
+    if (remainingConditions.isNotEmpty) {
+      results = results
+          .where((record) => _matchConditions(record, remainingConditions))
+          .toList();
     }
 
     return results;
   }
 
-  /// perform table scan
-  Future<List<Map<String, dynamic>>> _performTableScan(String tableName) async {
-    final schema = await _dataStore.getTableSchema(tableName);
-    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
+  /// Extract conditions for specified table from condition map
+  Map<String, dynamic> _extractTableConditions(
+      Map<String, dynamic> conditions, String tableName) {
+    final result = <String, dynamic>{};
 
-    // get table schema to get primary key field
+    // Process non-cascading conditions
+    for (var entry in conditions.entries) {
+      final field = entry.key;
+
+      // Handle special operators
+      if (field == 'OR' || field == 'AND') {
+        continue; // Skip complex conditions for now
+      }
+
+      // Extract fields with table name prefix
+      if (field.startsWith('$tableName.')) {
+        result[field] = entry.value;
+      }
+    }
+
+    return result;
+  }
+
+  /// Create query condition object from map (simplified implementation)
+  QueryCondition _createConditionFromMap(Map<String, dynamic> conditionMap) {
+    final condition = QueryCondition();
+
+    for (var entry in conditionMap.entries) {
+      final field = entry.key;
+      final value = entry.value;
+
+      if (value is Map) {
+        // Condition with operator
+        final operator = value.keys.first;
+        final compareValue = value[operator];
+        condition.where(field, operator, compareValue);
+      } else {
+        // Simple equality condition
+        condition.where(field, '=', value);
+      }
+    }
+
+    return condition;
+  }
+
+  /// Execute table join operation
+  Future<List<Map<String, dynamic>>> _performJoin(
+    List<Map<String, dynamic>> leftRecords,
+    String rightTableName,
+    String leftKey,
+    String operator,
+    String rightKey,
+    String joinType,
+  ) async {
+    // Get all records from the right table
+    final rightRecords = await _performTableScan(rightTableName, null);
+    final resultRecords = <Map<String, dynamic>>[];
+
+    // Determine left table name (main table name)
+    String leftTableName = '';
+    if (leftKey.contains('.')) {
+      leftTableName = leftKey.split('.')[0];
+    }
+
+    // Handle different JOIN types
+    switch (joinType) {
+      case 'inner':
+        // Inner join: only return records matching in both tables
+        for (var leftRecord in leftRecords) {
+          // Find all matching right table records
+          final matchingRightRecords = rightRecords
+              .where((rightRecord) => _matchJoinCondition(
+                  leftRecord, rightRecord, leftKey, operator, rightKey))
+              .toList();
+
+          // Only add result if matches found
+          for (var rightRecord in matchingRightRecords) {
+            // Create new record for consistency
+            final joinedRecord = <String, dynamic>{};
+
+            // Handle left table fields (main table), keep table prefix if exists, add if not
+            for (var entry in leftRecord.entries) {
+              final key = entry.key;
+              final value = entry.value;
+
+              // If already has table prefix, use as is
+              if (key.contains('.')) {
+                joinedRecord[key] = value;
+              } else if (leftTableName.isNotEmpty) {
+                // Add prefix for main table fields (if main table name exists)
+                joinedRecord['$leftTableName.$key'] = value;
+              } else {
+                // Keep as is when main table name is unclear
+                joinedRecord[key] = value;
+              }
+            }
+
+            // Add prefix for right table fields
+            for (var entry in rightRecord.entries) {
+              final fieldName = entry.key;
+              final fieldValue = entry.value;
+
+              // Only add fields with dot format prefix
+              joinedRecord['$rightTableName.$fieldName'] = fieldValue;
+            }
+
+            resultRecords.add(joinedRecord);
+          }
+        }
+        break;
+
+      case 'left':
+        // Left join: returns all records from left table, even if there are no matches in right table
+        for (var leftRecord in leftRecords) {
+          // Find all matching right table records
+          final matchingRightRecords = rightRecords
+              .where((rightRecord) => _matchJoinCondition(
+                  leftRecord, rightRecord, leftKey, operator, rightKey))
+              .toList();
+
+          if (matchingRightRecords.isNotEmpty) {
+            // Has matches, add all matching records
+            for (var rightRecord in matchingRightRecords) {
+              // Create new record
+              final joinedRecord = <String, dynamic>{};
+
+              // Process left table fields (main table)
+              for (var entry in leftRecord.entries) {
+                final key = entry.key;
+                final value = entry.value;
+
+                // If already has table prefix, use as is
+                if (key.contains('.')) {
+                  joinedRecord[key] = value;
+                } else if (leftTableName.isNotEmpty) {
+                  // Add prefix for main table fields (if main table name exists)
+                  joinedRecord['$leftTableName.$key'] = value;
+                } else {
+                  // Keep as is when main table name is unclear
+                  joinedRecord[key] = value;
+                }
+              }
+
+              // Only add fields with dot format prefix
+              for (var entry in rightRecord.entries) {
+                final fieldName = entry.key;
+                final fieldValue = entry.value;
+
+                joinedRecord['$rightTableName.$fieldName'] = fieldValue;
+              }
+
+              resultRecords.add(joinedRecord);
+            }
+          } else {
+            // No matches, add left record and fill right table fields with null
+            // Create new record
+            final joinedRecord = <String, dynamic>{};
+
+            // Process left table fields (main table)
+            for (var entry in leftRecord.entries) {
+              final key = entry.key;
+              final value = entry.value;
+
+              // If already has table prefix, use as is
+              if (key.contains('.')) {
+                joinedRecord[key] = value;
+              } else if (leftTableName.isNotEmpty) {
+                // Add prefix for main table fields (if main table name exists)
+                joinedRecord['$leftTableName.$key'] = value;
+              } else {
+                // Keep as is when main table name is unclear
+                joinedRecord[key] = value;
+              }
+            }
+
+            // Create an empty right table record (all fields null)
+            if (rightRecords.isNotEmpty) {
+              for (var entry in rightRecords.first.entries) {
+                final fieldName = entry.key;
+
+                // Only add fields with dot format prefix
+                joinedRecord['$rightTableName.$fieldName'] = null;
+              }
+            }
+
+            resultRecords.add(joinedRecord);
+          }
+        }
+        break;
+
+      case 'right':
+        // Right join: returns all records from right table, even if there are no matches in left table
+        for (var rightRecord in rightRecords) {
+          // Find all matching left table records
+          final matchingLeftRecords = leftRecords
+              .where((leftRecord) => _matchJoinCondition(
+                  leftRecord, rightRecord, leftKey, operator, rightKey))
+              .toList();
+
+          if (matchingLeftRecords.isNotEmpty) {
+            // Has matches, add all matching records
+            for (var leftRecord in matchingLeftRecords) {
+              // Create new record
+              final joinedRecord = <String, dynamic>{};
+
+              // Process left table fields (main table)
+              for (var entry in leftRecord.entries) {
+                final key = entry.key;
+                final value = entry.value;
+
+                // If already has table prefix, use as is
+                if (key.contains('.')) {
+                  joinedRecord[key] = value;
+                } else if (leftTableName.isNotEmpty) {
+                  // Add prefix for main table fields (if main table name exists)
+                  joinedRecord['$leftTableName.$key'] = value;
+                } else {
+                  // Keep as is when main table name is unclear
+                  joinedRecord[key] = value;
+                }
+              }
+
+              // Only add fields with dot format prefix
+              for (var entry in rightRecord.entries) {
+                final fieldName = entry.key;
+                final fieldValue = entry.value;
+
+                joinedRecord['$rightTableName.$fieldName'] = fieldValue;
+              }
+
+              resultRecords.add(joinedRecord);
+            }
+          } else {
+            // No matches, create empty left table record
+            final joinedRecord = <String, dynamic>{};
+
+            // Add null values for left table fields
+            if (leftRecords.isNotEmpty) {
+              for (var entry in leftRecords.first.entries) {
+                final key = entry.key;
+
+                // If already has table prefix, use as is
+                if (key.contains('.')) {
+                  joinedRecord[key] = null;
+                } else if (leftTableName.isNotEmpty) {
+                  // Add prefix for main table fields (if main table name exists)
+                  joinedRecord['$leftTableName.$key'] = null;
+                } else {
+                  // Keep as is when main table name is unclear
+                  joinedRecord[key] = null;
+                }
+              }
+            }
+
+            // Only add fields with dot format prefix
+            for (var entry in rightRecord.entries) {
+              final fieldName = entry.key;
+              final fieldValue = entry.value;
+
+              joinedRecord['$rightTableName.$fieldName'] = fieldValue;
+            }
+
+            resultRecords.add(joinedRecord);
+          }
+        }
+        break;
+    }
+
+    return resultRecords;
+  }
+
+  /// Check if two records match the join condition
+  bool _matchJoinCondition(
+    Map<String, dynamic> leftRecord,
+    Map<String, dynamic> rightRecord,
+    String leftKey,
+    String operator,
+    String rightKey,
+  ) {
+    // Handle fields with table names (like 'users.id')
+    String leftFieldName = leftKey;
+    String leftTableName = '';
+    if (leftKey.contains('.')) {
+      final parts = leftKey.split('.');
+      leftTableName = parts[0];
+      leftFieldName = parts[1];
+    }
+
+    String rightFieldName = rightKey;
+    String rightTableName = '';
+    if (rightKey.contains('.')) {
+      final parts = rightKey.split('.');
+      rightTableName = parts[0];
+      rightFieldName = parts[1];
+    }
+
+    // Try to get left value: first check for complete table name prefix field, then check for non-prefixed field
+    dynamic leftValue;
+    final leftPrefixedKey = '$leftTableName.$leftFieldName';
+    if (leftRecord.containsKey(leftPrefixedKey)) {
+      leftValue = leftRecord[leftPrefixedKey];
+    } else {
+      leftValue = leftRecord[leftFieldName];
+    }
+
+    // Try to get right value: first check for complete table name prefix field, then check for non-prefixed field
+    dynamic rightValue;
+    final rightPrefixedKey = '$rightTableName.$rightFieldName';
+    if (rightRecord.containsKey(rightPrefixedKey)) {
+      rightValue = rightRecord[rightPrefixedKey];
+    } else {
+      rightValue = rightRecord[rightFieldName];
+    }
+
+    // Handle different operators
+    switch (operator) {
+      case '=':
+        return leftValue == rightValue;
+      case '<':
+        return leftValue != null &&
+            rightValue != null &&
+            leftValue < rightValue;
+      case '>':
+        return leftValue != null &&
+            rightValue != null &&
+            leftValue > rightValue;
+      case '<=':
+        return leftValue != null &&
+            rightValue != null &&
+            leftValue <= rightValue;
+      case '>=':
+        return leftValue != null &&
+            rightValue != null &&
+            leftValue >= rightValue;
+      case '!=':
+      case '<>':
+        return leftValue != rightValue;
+      default:
+        return false;
+    }
+  }
+
+  /// perform table scan with optimized partition loading
+  Future<List<Map<String, dynamic>>> _performTableScan(
+    String tableName,
+    QueryCondition? condition,
+  ) async {
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      return [];
+    }
     final primaryKey = schema.primaryKey;
+    final isGlobal = schema.isGlobal;
+    bool shouldMarkAsFullTableCache = false;
 
     // 1. check if there is full table cache
-    if (queryCacheManager.isTableFullyCached(tableName)) {
+    if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
       // check if file is modified
-      final cache = queryCacheManager.getEntireTable(tableName);
+      final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
       if (cache != null) {
-        final cacheTime = queryCacheManager.getTableCacheTime(tableName);
+        final cacheTime =
+            _dataStore.dataCacheManager.getTableCacheTime(tableName);
         if (cacheTime != null &&
-            !_dataStore.fileManager.isFileModified(tableName, cacheTime)) {
-          return cache;
+            !_dataStore.tableDataManager.isFileModified(tableName, cacheTime)) {
+          var results = cache;
+          if (condition != null) {
+            final conditions = condition.build();
+            results = results
+                .where((record) => _matchConditions(record, conditions))
+                .toList();
+          }
+          return results;
         }
       }
     }
 
-    // 2. read file content
+    // Result map
     final resultMap = <String, Map<String, dynamic>>{};
-    if (await _dataStore.storage.exists(dataPath)) {
-      // get file size (for web storage, may need fallback if not directly supported)
-      final fileSize = await _getFileSize(tableName, dataPath);
-      await _dataStore.fileManager.updateFileSize(tableName, fileSize);
 
-      // if file size is within limit, read and cache
-      if (_dataStore.fileManager.allowFullTableCache(
-        tableName,
-        _dataStore.config.maxTableCacheSize,
-      )) {
-        final lines = await _dataStore.storage.readLines(dataPath);
-        for (var line in lines) {
-          try {
-            if (line.trim().isEmpty) continue;
-            final data = jsonDecode(line) as Map<String, dynamic>;
-            resultMap[data[primaryKey].toString()] = data;
-          } catch (e) {
-            Logger.error('parse record failed: $e',
-                label: 'QueryExecutor._performTableScan');
-            continue;
+    // 2. Get file meta to check for partitions
+    final fileMeta =
+        await _dataStore.tableDataManager.getTableFileMeta(tableName);
+
+    // If file metadata doesn't exist, empty table or new table, can be marked as full table data
+    if (fileMeta == null ||
+        fileMeta.partitions == null ||
+        fileMeta.partitions!.isEmpty) {
+      // Empty or new table, directly mark as full table cache (if no filter conditions)
+      shouldMarkAsFullTableCache = condition == null;
+    }
+    // 3. If partitioned storage is used
+    else if (fileMeta.partitions!.isNotEmpty) {
+      final conditions = condition?.build();
+      final targetPartitions = await _getTargetPartitions(
+          tableName, isGlobal, conditions, primaryKey, fileMeta);
+
+      // Determine if we need to scan all partitions (equivalent to full table scan)
+      bool scanAllPartitions =
+          targetPartitions.length == fileMeta.partitions!.length;
+
+      if (targetPartitions.isNotEmpty) {
+        // Check for early return in case of exact primary key match
+        final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
+        bool foundExactMatch = false;
+
+        // Process only target partitions
+        for (var partitionIndex in targetPartitions) {
+          final partitionRecords = await _dataStore.tableDataManager
+              .readRecordsFromPartition(
+                  tableName, isGlobal, partitionIndex, primaryKey);
+
+          if (conditions != null) {
+            // Filter records based on condition
+            for (var record in partitionRecords) {
+              if (_matchConditions(record, conditions)) {
+                resultMap[record[primaryKey].toString()] = record;
+
+                // If looking for exact primary key match and found it, we can stop
+                if (exactPkMatch != null &&
+                    record[primaryKey] == exactPkMatch) {
+                  foundExactMatch = true;
+                  break;
+                }
+              }
+            }
+          } else {
+            // No filter, add all records
+            for (var record in partitionRecords) {
+              resultMap[record[primaryKey].toString()] = record;
+            }
+          }
+
+          // Early return if exact match found
+          if (foundExactMatch) {
+            break;
           }
         }
 
-        // cache entire table
-        await queryCacheManager.cacheEntireTable(
+        // Add records from write queue
+        final pendingData =
+            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+        if (conditions != null) {
+          for (var record in pendingData.entries) {
+            if (_matchConditions(record.value.data, conditions)) {
+              resultMap[record.value.data[primaryKey].toString()] =
+                  Map<String, dynamic>.from(record.value.data);
+            }
+          }
+        } else {
+          for (var record in pendingData.entries) {
+            resultMap[record.value.data[primaryKey].toString()] =
+                Map<String, dynamic>.from(record.value.data);
+          }
+        }
+
+        // If full table scan with no filter conditions, and record count within limit, mark as full table data
+        if (scanAllPartitions && condition == null) {
+          shouldMarkAsFullTableCache = true;
+        }
+
+        return resultMap.values.toList();
+      }
+    }
+
+    // 4. Fallback to full table scan via streaming for partitioned data
+    if (fileMeta != null &&
+        fileMeta.partitions != null &&
+        fileMeta.partitions!.isNotEmpty) {
+      // Use streaming to process partitions without loading all at once
+      final conditions = condition?.build();
+
+      final stream = _dataStore.tableDataManager.streamRecords(tableName);
+      await for (var record in stream) {
+        if (conditions == null || _matchConditions(record, conditions)) {
+          resultMap[record[primaryKey].toString()] = record;
+        }
+      }
+
+      // If no filter conditions and record count within limit, mark as full table data
+      if (condition == null) {
+        shouldMarkAsFullTableCache = true;
+      }
+    } else {
+      // Empty or new table also marked as full table data (if no filter conditions and within limit)
+      shouldMarkAsFullTableCache = condition == null;
+    }
+
+    // 6. Add records from write queue
+    final pendingData =
+        _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+    if (condition != null) {
+      final conditions = condition.build();
+      for (var record in pendingData.entries) {
+        if (_matchConditions(record.value.data, conditions)) {
+          resultMap[record.value.data[primaryKey].toString()] =
+              Map<String, dynamic>.from(record.value.data);
+        }
+      }
+    } else {
+      for (var record in pendingData.entries) {
+        resultMap[record.value.data[primaryKey].toString()] =
+            Map<String, dynamic>.from(record.value.data);
+      }
+    }
+
+    // Cache entire table if we should mark as full table cache
+    if (shouldMarkAsFullTableCache) {
+      final recordCount = resultMap.values.length;
+
+      // Determine if full table caching is allowed
+      if (await _dataStore.tableDataManager.allowFullTableCache(tableName)) {
+        await _dataStore.dataCacheManager.cacheEntireTable(
           tableName,
           resultMap.values.toList(),
           primaryKey,
         );
-      } else {
-        Logger.debug('table too large, skip cache: $tableName',
-            label: 'QueryExecutor._performTableScan');
+        Logger.debug(
+          'Full table scan updated table $tableName cache, record count: $recordCount, marked as full table cache',
+          label: 'QueryExecutor._performTableScan',
+        );
       }
-    }
-
-    // 3. merge data in write queue
-    final pendingData = _dataStore.fileManager.writeQueue[tableName] ?? [];
-    for (var record in pendingData) {
-      resultMap[record[primaryKey].toString()] =
-          Map<String, dynamic>.from(record);
     }
 
     return resultMap.values.toList();
   }
 
-  /// get file size helper
-  Future<int> _getFileSize(String tableName, String path) async {
-    try {
-      final content = await _dataStore.storage.readAsString(path);
-      return content?.length ?? 0;
-    } catch (e) {
-      Logger.error('get file size failed: $e',
-          label: 'QueryExecutor._getFileSize');
-      return 0;
+  /// Determine which partitions to load based on query conditions
+  Future<List<int>> _getTargetPartitions(
+    String tableName,
+    bool isGlobal,
+    Map<String, dynamic>? conditions,
+    String primaryKey,
+    FileMeta fileMeta,
+  ) async {
+    // If no conditions or no partitions, return all partition indexes
+    if (conditions == null ||
+        fileMeta.partitions == null ||
+        fileMeta.partitions!.isEmpty) {
+      return fileMeta.partitions?.map((c) => c.index).toList() ?? [];
     }
+
+    // Check if conditions include primary key constraints
+    dynamic pkMin, pkMax;
+    bool hasPkRange = false;
+
+    // Check for direct primary key match or ranges
+    if (conditions.containsKey(primaryKey)) {
+      final pkCondition = conditions[primaryKey];
+
+      if (pkCondition is Map) {
+        // Check for operators like >, >=, <, <=, BETWEEN
+        if (pkCondition.containsKey('>') || pkCondition.containsKey('>=')) {
+          pkMin = pkCondition['>'] ?? pkCondition['>='];
+          hasPkRange = true;
+        }
+
+        if (pkCondition.containsKey('<') || pkCondition.containsKey('<=')) {
+          pkMax = pkCondition['<'] ?? pkCondition['<='];
+          hasPkRange = true;
+        }
+
+        if (pkCondition.containsKey('BETWEEN')) {
+          final between = pkCondition['BETWEEN'] as Map;
+          pkMin = between['start'];
+          pkMax = between['end'];
+          hasPkRange = true;
+        }
+
+        // Check for exact match (=)
+        if (pkCondition.containsKey('=')) {
+          pkMin = pkMax = pkCondition['='];
+          hasPkRange = true;
+        }
+
+        // Check for IN operator
+        if (pkCondition.containsKey('IN')) {
+          // For IN operator, we need to find the partitions containing any of the values
+          final inValues = pkCondition['IN'] as List;
+          if (inValues.isNotEmpty) {
+            final targetPartitions = <int>{};
+
+            for (var value in inValues) {
+              for (var partition in fileMeta.partitions!) {
+                if (_isValueInRange(
+                    value, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+                  targetPartitions.add(partition.index);
+                }
+              }
+            }
+
+            return targetPartitions.toList()..sort();
+          }
+        }
+      } else {
+        // Direct value match
+        pkMin = pkMax = pkCondition;
+        hasPkRange = true;
+      }
+    }
+
+    if (hasPkRange) {
+      // Find partitions within the range
+      final targetPartitions = <int>[];
+
+      for (var partition in fileMeta.partitions!) {
+        // If min/max are not set, consider the partition
+        if (partition.minPrimaryKey == null ||
+            partition.maxPrimaryKey == null) {
+          targetPartitions.add(partition.index);
+          continue;
+        }
+
+        bool include = true;
+
+        // Check if partition's range overlaps with query range
+        if (pkMin != null) {
+          include = _compareValues(partition.maxPrimaryKey, pkMin) >= 0;
+        }
+
+        if (include && pkMax != null) {
+          include = _compareValues(partition.minPrimaryKey, pkMax) <= 0;
+        }
+
+        if (include) {
+          targetPartitions.add(partition.index);
+        }
+      }
+
+      return targetPartitions..sort();
+    }
+
+    // If no primary key constraints, but we have conditions on other fields,
+    // we need to check all partitions
+    return fileMeta.partitions!.map((c) => c.index).toList()..sort();
+  }
+
+  /// Check if a value is within a range (inclusive)
+  bool _isValueInRange(dynamic value, dynamic min, dynamic max) {
+    if (min == null || max == null) return true;
+    return _compareValues(value, min) >= 0 && _compareValues(value, max) <= 0;
+  }
+
+  /// Get exact primary key value if condition has a direct equality match
+  dynamic _getExactPrimaryKeyValue(
+      Map<String, dynamic>? conditions, String primaryKey) {
+    if (conditions == null || !conditions.containsKey(primaryKey)) return null;
+
+    final pkCondition = conditions[primaryKey];
+    if (pkCondition is! Map) {
+      // Direct equality
+      return pkCondition;
+    }
+
+    if (pkCondition.containsKey('=')) {
+      return pkCondition['='];
+    }
+
+    return null;
   }
 
   /// perform index scan
@@ -250,55 +967,89 @@ class QueryExecutor {
     String tableName,
     String indexName,
     Map<String, dynamic> conditions,
+    QueryCondition? queryCondition,
   ) async {
     try {
-      var schema = await _dataStore.getTableSchema(tableName);
-      final index = _indexManager.getIndex(indexName);
-      if (index == null) return _performTableScan(tableName);
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return [];
+      }
+      final index = await _indexManager.getIndex(tableName, indexName);
+      if (index == null) {
+        return _performTableScan(tableName, queryCondition);
+      }
 
-      // 1. get search value
+      // get actual index name
+      final indexSchema = schema.indexes.firstWhere(
+        (idx) => idx.actualIndexName == indexName,
+      );
+      final actualIndexName = indexSchema.actualIndexName;
+
+      // get search value
       dynamic searchValue;
-      if (indexName.startsWith('pk_')) {
+      if (actualIndexName.startsWith('pk_')) {
         searchValue = conditions[schema.primaryKey];
       } else {
-        final indexSchema = schema.indexes.firstWhere(
-          (idx) => idx.actualIndexName == indexName,
-        );
         searchValue = conditions[indexSchema.fields.first];
       }
-      if (searchValue == null) return _performTableScan(tableName);
+      if (searchValue == null) {
+        return _performTableScan(tableName, queryCondition);
+      }
 
-      // 2. use index to search
+      // use index partitions for search
       final indexResults = await index.search(searchValue);
-      if (indexResults.isEmpty) return _performTableScan(tableName);
+      if (indexResults.isEmpty) {
+        return _performTableScan(tableName, queryCondition);
+      }
 
-      // 3. get full record
+      // get full records
       final results = <Map<String, dynamic>>[];
 
-      if (indexName.startsWith('pk_')) {
-        // primary key index directly return row pointer
+      if (actualIndexName.startsWith('pk_')) {
+        // primary key index directly returns row pointer
         for (var pointer in indexResults) {
-          if (pointer is RowPointer) {
-            final record = await _getRecordByPointer(tableName, pointer);
+          if (pointer is StoreIndex) {
+            final record = await _dataStore.tableDataManager
+                .getRecordByPointer(tableName, pointer);
             if (record != null) {
-              results.add(record);
+              // apply additional conditions (if any)
+              if (queryCondition != null) {
+                final conditions = queryCondition.build();
+                if (_matchConditions(record, conditions)) {
+                  results.add(record);
+                }
+              } else {
+                results.add(record);
+              }
             }
           }
         }
       } else {
-        // secondary index return primary key value, need to search primary key index first
-        final pkIndex = _indexManager.getIndex('pk_$tableName');
-        if (pkIndex == null) return _performTableScan(tableName);
-        for (var primaryKeyValue in indexResults) {
-          // get row pointer by primary key index
-          final pointers = await pkIndex.search(primaryKeyValue);
-          if (pointers.isNotEmpty && pointers.first is RowPointer) {
-            final record = await _getRecordByPointer(
+        // secondary index returns primary key value, need to search primary key index first
+        final pkIndex =
+            await _indexManager.getIndex(tableName, 'pk_$tableName');
+        if (pkIndex == null) {
+          return _performTableScan(tableName, queryCondition);
+        }
+
+        for (var pkValue in indexResults) {
+          final pkPointer = await pkIndex.search(pkValue);
+          if (pkPointer.isEmpty) continue;
+
+          if (pkPointer.first is StoreIndex) {
+            final record = await _dataStore.tableDataManager.getRecordByPointer(
               tableName,
-              pointers.first as RowPointer,
+              pkPointer.first as StoreIndex,
             );
             if (record != null) {
-              results.add(record);
+              if (queryCondition != null) {
+                final conditions = queryCondition.build();
+                if (_matchConditions(record, conditions)) {
+                  results.add(record);
+                }
+              } else {
+                results.add(record);
+              }
             }
           }
         }
@@ -306,9 +1057,9 @@ class QueryExecutor {
 
       return results;
     } catch (e) {
-      Logger.error('index scan failed: $e',
-          label: 'QueryExecutor-_performIndexScan');
-      return _performTableScan(tableName);
+      Logger.error('Index scan failed: $e',
+          label: 'QueryExecutor._performIndexScan');
+      return _performTableScan(tableName, queryCondition);
     }
   }
 
@@ -347,16 +1098,73 @@ class QueryExecutor {
       final field = entry.key;
       final value = entry.value;
 
-      if (value is Map) {
-        // handle operator conditions
-        for (var op in value.entries) {
-          if (!_matchOperator(record[field], op.key, op.value)) {
-            return false;
+      // Handle fields with table name prefix (like 'users.id')
+      dynamic fieldValue;
+      if (field.contains('.')) {
+        // First try to match fields with prefix directly
+        if (record.containsKey(field)) {
+          fieldValue = record[field];
+        } else {
+          // Try to get table_field format
+          final parts = field.split('.');
+          final underscoreField = '${parts[0]}_${parts[1]}';
+          if (record.containsKey(underscoreField)) {
+            fieldValue = record[underscoreField];
+          } else {
+            // If not found, try to get field value without prefix
+            final fieldName = parts[1];
+            fieldValue = record[fieldName];
           }
         }
       } else {
+        // Normal field without table name prefix
+        fieldValue = record[field];
+      }
+
+      // If field doesn't exist but has special conditions, may still be valid
+      if (fieldValue == null && !record.containsKey(field)) {
+        // Special case: IS NULL condition
+        if (value is Map &&
+            (value.containsKey('IS') || value.containsKey('IS NOT'))) {
+          if ((value.containsKey('IS') && value['IS'] == null) ||
+              (value.containsKey('IS NOT') && value['IS NOT'] != null)) {
+            continue; // IS NULL condition is satisfied if field doesn't exist
+          }
+        }
+
+        // Check if any variant with table prefix exists
+        bool prefixFound = false;
+        for (String key in record.keys) {
+          if (key.contains('.') && key.endsWith('.$field')) {
+            fieldValue = record[key];
+            prefixFound = true;
+            break;
+          } else if (key.contains('_') && key.endsWith('_$field')) {
+            fieldValue = record[key];
+            prefixFound = true;
+            break;
+          }
+        }
+
+        if (!prefixFound) {
+          return false; // Field doesn't exist at all
+        }
+      }
+
+      if (value is Map) {
+        // handle operator conditions
+        bool matchedAny = false;
+        for (var op in value.entries) {
+          if (_matchOperator(fieldValue, op.key, op.value)) {
+            matchedAny = true;
+            break;
+          }
+        }
+        if (!matchedAny) return false;
+      } else {
         // simple equal condition
-        if (record[field] != value) {
+        // Use ValueComparator for smart type comparison instead of direct comparison
+        if (ValueComparator.compare(fieldValue, value) != 0) {
           return false;
         }
       }
@@ -369,28 +1177,48 @@ class QueryExecutor {
       dynamic fieldValue, String operator, dynamic compareValue) {
     switch (operator.toUpperCase()) {
       case '=':
-        return fieldValue == compareValue;
+        // Use ValueComparator for smart type comparison instead of direct comparison
+        return ValueComparator.compare(fieldValue, compareValue) == 0;
       case '!=':
       case '<>':
-        return fieldValue != compareValue;
+        // Also use ValueComparator for inequality comparison
+        return ValueComparator.compare(fieldValue, compareValue) != 0;
       case '>':
         return fieldValue != null &&
-            _compareValues(fieldValue, compareValue) > 0;
+            ValueComparator.compare(fieldValue, compareValue) > 0;
       case '>=':
         return fieldValue != null &&
-            _compareValues(fieldValue, compareValue) >= 0;
+            ValueComparator.compare(fieldValue, compareValue) >= 0;
       case '<':
         return fieldValue != null &&
-            _compareValues(fieldValue, compareValue) < 0;
+            ValueComparator.compare(fieldValue, compareValue) < 0;
       case '<=':
         return fieldValue != null &&
-            _compareValues(fieldValue, compareValue) <= 0;
+            ValueComparator.compare(fieldValue, compareValue) <= 0;
       case 'IN':
         if (compareValue is! List) return false;
-        return fieldValue != null && compareValue.contains(fieldValue);
+        // Enhanced IN operator using ValueComparator
+        if (fieldValue == null) return false;
+
+        // Check if any value in the list equals the field value
+        for (var item in compareValue) {
+          if (ValueComparator.compare(fieldValue, item) == 0) {
+            return true;
+          }
+        }
+        return false;
       case 'NOT IN':
         if (compareValue is! List) return false;
-        return fieldValue != null && !compareValue.contains(fieldValue);
+        // Enhanced NOT IN operator using ValueComparator
+        if (fieldValue == null) return true; // NULL NOT IN any list is true
+
+        // Check if any value in the list equals the field value
+        for (var item in compareValue) {
+          if (ValueComparator.compare(fieldValue, item) == 0) {
+            return false;
+          }
+        }
+        return true;
       case 'BETWEEN':
         if (compareValue is! Map ||
             !compareValue.containsKey('start') ||
@@ -398,91 +1226,63 @@ class QueryExecutor {
           return false;
         }
         return fieldValue != null &&
-            _compareValues(fieldValue, compareValue['start']) >= 0 &&
-            _compareValues(fieldValue, compareValue['end']) <= 0;
+            ValueComparator.compare(fieldValue, compareValue['start']) >= 0 &&
+            ValueComparator.compare(fieldValue, compareValue['end']) <= 0;
       case 'LIKE':
         if (fieldValue == null || compareValue is! String) return false;
-        final pattern = compareValue
-            .replaceAll('%', '.*')
-            .replaceAll('_', '.')
-            .replaceAll('\\', '\\\\');
-        return RegExp('^$pattern\$', caseSensitive: false)
-            .hasMatch(fieldValue.toString());
+        return ValueComparator.matchesPattern(
+            fieldValue.toString(), compareValue);
       case 'IS':
         return fieldValue == null;
       case 'IS NOT':
         return fieldValue != null;
       default:
-        Logger.warn('未知的操作符: $operator', label: 'QueryExecutor._matchOperator');
+        Logger.error('unknown operator: $operator',
+            label: 'QueryExecutor._matchOperator');
         return false;
     }
   }
 
   /// safe value comparison
   int _compareValues(dynamic a, dynamic b) {
-    if (a == null || b == null) return 0;
-
-    if (a is num && b is num) {
-      return a.compareTo(b);
-    }
-    if (a is String && b is String) {
-      return a.compareTo(b);
-    }
-    if (a is DateTime && b is DateTime) {
-      return a.compareTo(b);
-    }
-    if (a is bool && b is bool) {
-      return a == b ? 0 : (a ? 1 : -1);
-    }
-    if (a is List && b is List) {
-      final len = a.length.compareTo(b.length);
-      if (len != 0) return len;
-
-      for (var i = 0; i < a.length; i++) {
-        final comp = _compareValues(a[i], b[i]);
-        if (comp != 0) return comp;
-      }
-      return 0;
-    }
-
-    return a.toString().compareTo(b.toString());
+    return ValueComparator.compare(a, b);
   }
 
   /// apply sort
   void _applySort(List<Map<String, dynamic>> data, List<String> orderBy) {
     try {
-      data.sort((a, b) {
-        for (var field in orderBy) {
-          final desc = field.startsWith('-');
-          final fieldName = desc ? field.substring(1) : field;
+      // Create sort directions list with same length as orderBy, default all to ascending (true)
+      final List<bool> sortDirections = List.filled(orderBy.length, true);
+      final List<String> sortFields = List.filled(orderBy.length, '');
 
-          // get field value
-          final valueA = a[fieldName];
-          final valueB = b[fieldName];
+      // Process possible sort direction information in orderBy
+      for (int i = 0; i < orderBy.length; i++) {
+        String field = orderBy[i];
 
-          // handle null value
-          if (valueA == null && valueB == null) continue;
-          if (valueA == null) return desc ? -1 : 1;
-          if (valueB == null) return desc ? 1 : -1;
-
-          // compare value
-          int compareResult;
-          if (valueA is num && valueB is num) {
-            compareResult = valueA.compareTo(valueB);
-          } else if (valueA is List && valueB is List) {
-            compareResult = _compareValues(valueA, valueB);
-          } else {
-            compareResult = valueA.toString().compareTo(valueB.toString());
-          }
-
-          if (compareResult != 0) {
-            return desc ? -compareResult : compareResult;
-          }
+        // 1. Field with "-" prefix indicates descending order
+        if (field.startsWith('-')) {
+          sortFields[i] = field.substring(1); // Remove "-" symbol
+          sortDirections[i] = false; // Set to descending
         }
-        return 0;
-      });
+        // 2. Field with DESC/ASC suffix
+        else if (field.toUpperCase().endsWith(' DESC')) {
+          // Remove DESC and set sort direction to descending
+          sortFields[i] = field.substring(0, field.length - 5).trim();
+          sortDirections[i] = false;
+        } else if (field.toUpperCase().endsWith(' ASC')) {
+          // Remove ASC, keep ascending
+          sortFields[i] = field.substring(0, field.length - 4).trim();
+          sortDirections[i] = true;
+        } else {
+          // No special marker, use original field name, default ascending
+          sortFields[i] = field;
+        }
+      }
+
+      // Use correct parameters to call sortMapList
+      ValueComparator.sortMapList(data, sortFields, sortDirections);
     } catch (e) {
-      Logger.error('sort failed: $e', label: "QueryExecutor-_applySort");
+      Logger.error('Sort failed: $e', label: "QueryExecutor-_applySort");
       throw StateError('Error applying sort: ${e.toString()}');
     }
   }
@@ -502,93 +1302,6 @@ class QueryExecutor {
     return results;
   }
 
-  /// invalidate single record related cache
-  Future<void> invalidateRecord(
-      String tableName, dynamic primaryKeyValue) async {
-    queryCacheManager.removeCachedRecord(tableName, primaryKeyValue.toString());
-  }
-
-  /// invalidate multiple records related cache
-  Future<void> invalidateRecords(
-      String tableName, Set<dynamic> primaryKeyValues) async {
-    await queryCacheManager.invalidateRecords(tableName, primaryKeyValues);
-  }
-
-  /// invalidate all cache of a table
-  Future<void> invalidateCache(String tableName) async {
-    await queryCacheManager.invalidateRecords(tableName, {});
-  }
-
-  /// get record by row pointer
-  Future<Map<String, dynamic>?> _getRecordByPointer(
-    String tableName,
-    RowPointer pointer,
-  ) async {
-    // 1. 先检查写入队列
-    final pendingData = _dataStore.fileManager.writeQueue[tableName] ?? [];
-    for (var record in pendingData) {
-      // 检查是否是同一条记录(通过校验和比较)
-      final encoded = jsonEncode(record);
-      if (pointer.verifyContent(encoded)) {
-        return record;
-      }
-    }
-
-    // 2. read from file
-    final schema = await _dataStore.getTableSchema(tableName);
-    final dataPath = _dataStore.config.getDataPath(tableName, schema.isGlobal);
-
-    if (!await _dataStore.storage.exists(dataPath)) return null;
-
-    try {
-      if (kIsWeb) {
-        // For Web platform: read the entire file and extract the needed part
-        final content = await _dataStore.storage.readAsString(dataPath);
-        if (content == null || content.isEmpty) return null;
-
-        if (pointer.offset < content.length) {
-          final endOffset = pointer.offset + pointer.length;
-          final maxOffset = content.length;
-          final safeEndOffset = endOffset < maxOffset ? endOffset : maxOffset;
-
-          final lineSubstring =
-              content.substring(pointer.offset, safeEndOffset);
-          final line = lineSubstring.trim();
-
-          if (line.isNotEmpty) {
-            final record = jsonDecode(line) as Map<String, dynamic>;
-            if (pointer.verifyContent(line)) {
-              return record;
-            }
-          }
-        }
-      } else {
-        final file = File(dataPath);
-        final raf = await file.open(mode: FileMode.read);
-        try {
-          await raf.setPosition(pointer.offset);
-          final bytes = await raf.read(pointer.length);
-
-          final line = utf8.decode(bytes);
-          final record = jsonDecode(line.trim()) as Map<String, dynamic>;
-          // verify record integrity
-          if (pointer.verifyContent(line.trim())) {
-            return record;
-          }
-          return null;
-        } finally {
-          await raf.close();
-        }
-      }
-
-      return null;
-    } catch (e) {
-      Logger.error('read record failed: $e',
-          label: 'QueryExecutor._getRecordByPointer');
-      return null;
-    }
-  }
-
   /// check if it is a specific query (like query by primary key or index field)
   Future<bool> _isSpecificQuery(
     String tableName,
@@ -597,6 +1310,9 @@ class QueryExecutor {
     try {
       // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return false;
+      }
       final conditions = condition.build();
 
       // 1. check if it is primary key query

@@ -59,6 +59,11 @@ class QueryPlan {
         return 'FILTER by ${operation.value}';
       case QueryOperationType.sort:
         return 'SORT by ${operation.value}';
+      case QueryOperationType.join:
+        final joinInfo = operation.value as Map<String, dynamic>;
+        return '${joinInfo['type'].toString().toUpperCase()} JOIN ${joinInfo['table']} ON ${joinInfo['firstKey']} ${joinInfo['operator']} ${joinInfo['secondKey']}';
+      case QueryOperationType.cacheQuery:
+        return 'CACHE QUERY on ${operation.value}';
     }
   }
 }
@@ -94,4 +99,6 @@ enum QueryOperationType {
   indexScan,
   filter,
   sort,
+  join,
+  cacheQuery,
 }

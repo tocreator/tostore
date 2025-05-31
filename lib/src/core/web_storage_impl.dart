@@ -6,9 +6,8 @@ import '../handler/logger.dart';
 import 'dart:convert';
 import '../handler/common.dart';
 
-import '../model/business_error.dart';
-import 'storage_interface.dart';
-import '../model/file_meta.dart';
+import '../Interface/storage_interface.dart';
+import '../model/file_info.dart';
 
 /// Web platform storage adapter implementation
 class WebStorageImpl implements StorageInterface {
@@ -18,9 +17,6 @@ class WebStorageImpl implements StorageInterface {
 
   // store type
   static const String _fileStore = 'files'; // file storage（meta data）
-
-  /// Block size for chunked operations (256KB)
-  static const int _blockSize = 256 * 1024;
 
   factory WebStorageImpl(String dbName) {
     return _instances.putIfAbsent(
@@ -76,33 +72,24 @@ class WebStorageImpl implements StorageInterface {
   }
 
   /// get file type
-  String _getFileType(String path) {
-    if (path.endsWith('.dat')) return 'data';
-    if (path.endsWith('.schema')) return 'schema';
-    if (path.endsWith('.idx')) return 'index';
-    if (path.endsWith('.maxid')) return 'auto_increment';
-    if (path.endsWith('.stats')) return 'stats';
-    if (path.endsWith('.transaction.log')) return 'transaction_log';
-    if (path.endsWith('.checksum')) return 'checksum';
-    if (path.endsWith('.json')) return 'json';
-    if (path.endsWith('.txt')) return 'txt';
-    if (path.endsWith('.csv')) return 'csv';
-    if (path.endsWith('.bak')) return 'backup';
-    if (path.endsWith('.log')) return 'log';
-    if (path.endsWith('.tmp')) return 'temp';
-    if (path.endsWith('.lock')) return 'lock';
-    return 'unknown';
+  FileType _getFileType(String path) {
+    if (path.endsWith('.dat')) return FileType.data;
+    if (path.contains('schema.')) return FileType.schema;
+    if (path.endsWith('.idx')) return FileType.idx;
+    if (path.endsWith('.log')) return FileType.log;
+    return FileType.other;
   }
 
   /// list directory content
   @override
-  Future<List<String>> listDirectory(String path) async {
+  Future<List<String>> listDirectory(String path,
+      {bool recursive = false}) async {
     await _initCompleter.future;
 
     try {
       if (_db == null) throw Exception('Database not initialized');
 
-      final normalizedPath = path.replaceAll('\\', '/');
+      final normalizedPath = _normalizePath(path);
 
       final transaction =
           _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
@@ -118,12 +105,40 @@ class WebStorageImpl implements StorageInterface {
       );
 
       final request = index.getAllKeys(range);
-      final keys = await _wrapRequest<JSArray>(request);
-      return keys.toDart
+      final allKeys = await _wrapRequest<JSArray>(request);
+      final allPaths = allKeys.toDart
           .cast<String>()
-          .toList()
           .where((key) => !key.contains('.block'))
           .toList();
+
+      // if recursive mode, return all paths directly
+      if (recursive) {
+        return allPaths;
+      }
+
+      // non-recursive mode: only return direct children
+      final directChildren = <String>{};
+
+      for (final path in allPaths) {
+        // skip self path
+        if (path == normalizedPath) continue;
+
+        // remove base path prefix
+        String relativePath = path;
+        if (path.startsWith('$normalizedPath/')) {
+          relativePath = path.substring(normalizedPath.length + 1);
+        }
+
+        // split path and take the first segment as direct child
+        final segments = relativePath.split('/');
+        if (segments.isNotEmpty && segments[0].isNotEmpty) {
+          // add full path to result
+          final directChildPath = '$normalizedPath/${segments[0]}';
+          directChildren.add(directChildPath);
+        }
+      }
+
+      return directChildren.toList();
     } catch (e) {
       Logger.error('List directory failed: $e', label: 'WebStorageAdapter');
       return [];
@@ -137,36 +152,59 @@ class WebStorageImpl implements StorageInterface {
 
     try {
       if (_db == null) throw Exception('Database not initialized');
+      final normalizedPath = _normalizePath(path);
       final transaction =
           _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
       final store = transaction.objectStore(_fileStore);
 
-      // 1. delete file metadata
-      final meta = await _wrapRequest<JSAny?>(store.get(path.toJS));
-      if (meta != null) {
-        final metaData = Map<String, dynamic>.from(meta.dartify() as Map);
-
-        // 2. delete all blocks if exists
-        if (metaData.containsKey('totalBlocks')) {
-          final totalBlocks = metaData['totalBlocks'] as int;
-          for (var i = 0; i < totalBlocks; i++) {
-            final blockPath = '$path.block$i';
-            await _wrapRequest(store.delete(blockPath.toJS));
-          }
-        }
-      }
-
       // delete file itself
-      await _wrapRequest(store.delete(path.toJS));
+      await _wrapRequest(store.delete(normalizedPath.toJS));
     } catch (e) {
       Logger.error('Delete file failed: $e', label: 'WebStorageImpl');
       rethrow;
     }
   }
 
+  /// delete directory and all its contents
+  @override
+  Future<void> deleteDirectory(String path) async {
+    await _initCompleter.future;
+
+    try {
+      if (_db == null) throw Exception('Database not initialized');
+
+      final normalizedPath = _normalizePath(path);
+      final transaction =
+          _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
+      final store = transaction.objectStore(_fileStore);
+      final index = store.index('by_path');
+
+      // Use index range query to find all files within this directory
+      final range = IDBKeyRange.bound(
+        '$normalizedPath/'.toJS,
+        '$normalizedPath/\uffff'.toJS,
+        false,
+        false,
+      );
+
+      // Get all keys in this directory
+      final request = index.getAllKeys(range);
+      final keys = await _wrapRequest<JSArray>(request);
+      final filePaths = keys.toDart.cast<String>().toList();
+
+      // Delete all files within this directory
+      for (var filePath in filePaths) {
+        await deleteFile(filePath);
+      }
+    } catch (e) {
+      Logger.error('Delete directory failed: $e', label: 'WebStorageImpl');
+      rethrow;
+    }
+  }
+
   /// check file exists
   @override
-  Future<bool> exists(String path) async {
+  Future<bool> existsFile(String path) async {
     await _initCompleter.future;
 
     try {
@@ -182,6 +220,41 @@ class WebStorageImpl implements StorageInterface {
       return result != null;
     } catch (e) {
       Logger.error('Check file exists failed: $e', label: 'WebStorageAdapter');
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> existsDirectory(String path) async {
+    await _initCompleter.future;
+
+    try {
+      if (_db == null) throw Exception('Database not initialized');
+
+      final normalizedPath = _normalizePath(path);
+
+      final transaction =
+          _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
+      final store = transaction.objectStore(_fileStore);
+      final index = store.index('by_path');
+
+      // use index range query, check if the key exists with this path prefix
+      final range = IDBKeyRange.bound(
+        '$normalizedPath/'.toJS,
+        '$normalizedPath/\uffff'.toJS,
+        false,
+        false,
+      );
+
+      final request =
+          index.getAllKeys(range, 1); // limit to only one key for performance
+      final keys = await _wrapRequest<JSArray>(request);
+      final exists = keys.toDart.isNotEmpty;
+
+      return exists;
+    } catch (e) {
+      Logger.error('Check directory exists failed: $e',
+          label: 'WebStorageAdapter');
       return false;
     }
   }
@@ -254,6 +327,48 @@ class WebStorageImpl implements StorageInterface {
     return completer.future;
   }
 
+  /// Replace _writeSingleFileGeneric with _storeFileInfo
+  Future<void> _storeFileInfo(FileInfo fileInfo) async {
+    final transaction =
+        _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
+    final store = transaction.objectStore(_fileStore);
+    try {
+      await _wrapRequest(store.put(fileInfo.toJson().jsify()));
+    } catch (e) {
+      Logger.error('Write file failed: $e');
+      rethrow;
+    }
+  }
+
+  /// Create _getFileInfo to replace _getFileData
+  Future<FileInfo?> _getFileInfo(String path) async {
+    final normalizedPath = _normalizePath(path);
+    final transaction =
+        _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
+    final store = transaction.objectStore(_fileStore);
+    final result = await _wrapRequest<JSAny?>(store.get(normalizedPath.toJS));
+    if (result == null) return null;
+    final json = _deepConvert(result.dartify());
+    return FileInfo.fromJson(json);
+  }
+
+  /// Update readAsString to decode from stored bytes
+  @override
+  Future<String?> readAsString(String path) async {
+    await _initCompleter.future;
+    try {
+      final normalizedPath = _normalizePath(path);
+      final fileInfo = await _getFileInfo(normalizedPath);
+      if (fileInfo == null || fileInfo.data == null) return null;
+      final bytes = List<int>.from(fileInfo.data!);
+      return utf8.decode(bytes);
+    } catch (e) {
+      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsString');
+      return null;
+    }
+  }
+
+  /// Update writeAsString to store FileInfo
   @override
   Future<void> writeAsString(String path, String content,
       {bool append = false}) async {
@@ -261,186 +376,140 @@ class WebStorageImpl implements StorageInterface {
     try {
       if (_db == null) throw Exception('Database not initialized');
       final normalizedPath = _normalizePath(path);
-      int contentLength = calculateUtf8Length(content);
-      bool isChunked = contentLength > _blockSize;
-
-      // handle append mode
       String newContent = content;
-      if (append && await exists(normalizedPath)) {
+      if (append && await existsFile(normalizedPath)) {
         final existingContent = await readAsString(normalizedPath);
         if (existingContent != null) {
           newContent = existingContent + content;
-          contentLength = calculateUtf8Length(newContent);
-          isChunked = contentLength > _blockSize;
         }
       }
-
-      // clean old data
-      await _cleanOldChunks(normalizedPath);
-
-      // generate meta data
-      final meta = _generateFileMeta(normalizedPath, newContent, isChunked);
-
-      // choose storage method based on file size
-      if (isChunked) {
-        await _writeChunkedFile(normalizedPath, newContent, meta);
-      } else {
-        await _writeSingleFile(normalizedPath, newContent, meta);
-      }
+      final meta = _generateFileMeta(normalizedPath, newContent);
+      // Encode the content to bytes using utf8.encode
+      final encoded = utf8.encode(newContent);
+      final fileInfo =
+          FileInfo(path: normalizedPath, meta: meta, data: encoded);
+      await _storeFileInfo(fileInfo);
     } catch (e) {
-      Logger.error('Write failed: ${e.toString()}',
-          label: 'WebStorageImpl.writeAsString');
+      Logger.error('Write failed: $e', label: 'WebStorageImpl.writeAsString');
       rethrow;
     }
   }
 
-  Future<void> _writeSingleFile(
-      String path, String content, FileMeta meta) async {
-    final transaction =
-        _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
-    final store = transaction.objectStore(_fileStore);
-
-    try {
-      final bytes = utf8.encode(content);
-      // explicitly convert to basic Map and copy
-      final metaJson = Map<String, dynamic>.from(meta.toJson());
-
-      await _wrapRequest(
-          store.put({'path': path, 'data': bytes, 'meta': metaJson}.jsify()));
-    } catch (e) {
-      Logger.error('Write file failed: $e');
-      rethrow;
-    }
-  }
-
-  Future<void> _writeChunkedFile(
-      String path, String content, FileMeta meta) async {
-    final transaction =
-        _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
-    final store = transaction.objectStore(_fileStore);
-
-    // write main meta data
-    await _wrapRequest(store.put({
-      'path': path,
-      'meta': meta.toJson() // use serialized meta data
-    }.jsify()));
-
-    // write chunks
-    final totalChunks = meta.chunks!.total;
-    int contentLength = calculateUtf8Length(content);
-    for (var i = 0; i < totalChunks; i++) {
-      final start = i * _blockSize;
-      final end = (i + 1) * _blockSize;
-      final chunkContent =
-          content.substring(start, end.clamp(0, contentLength));
-
-      // handle encoding
-      final encodedChunkContent = utf8.encode(chunkContent);
-
-      await _wrapRequest(store.put({
-        'path': '$path.block$i',
-        'data': encodedChunkContent,
-        'meta': {
-          'parent': path,
-          'index': i,
-        }
-      }.jsify()));
-    }
-  }
-
+  /// Update writeAsBytes to store FileInfo
   @override
-  Future<void> writeLines(String path, List<String> lines) async {
-    final buffer = StringBuffer();
-    for (final line in lines) {
-      buffer.writeln(line);
-    }
-    await writeAsString(path, buffer.toString());
-  }
-
-  @override
-  Future<String?> readAsString(String path) async {
+  Future<void> writeAsBytes(String path, Uint8List bytes) async {
     await _initCompleter.future;
     try {
+      if (_db == null) throw Exception('Database not initialized');
       final normalizedPath = _normalizePath(path);
-      final mainRecord = await _getFileData(normalizedPath);
-      if (mainRecord == null) return null;
-      final meta =
-          FileMeta.fromJson(mainRecord['meta'] as Map<String, dynamic>);
-
-      // handle chunked file
-      if (meta.chunks != null) {
-        return _readChunkedFile(meta, normalizedPath);
-      }
-
-      // handle normal file
-      final content = utf8.decode(mainRecord['data']);
-      return content;
+      final now = DateTime.now();
+      final meta = FileMeta(
+        version: 1,
+        type: _getFileType(normalizedPath),
+        name: _extractFileName(normalizedPath),
+        fileSizeInBytes: bytes.length,
+        totalRecords: 0,
+        timestamps: Timestamps(
+          created: now,
+          modified: now,
+        ),
+        partitions: null,
+      );
+      final fileInfo = FileInfo(path: normalizedPath, meta: meta, data: bytes);
+      await _storeFileInfo(fileInfo);
     } catch (e) {
-      Logger.error('Read failed: ${e.toString()}',
-          label: 'WebStorageImpl.readAsString');
-      return null;
+      Logger.error('Write bytes failed: $e',
+          label: 'WebStorageImpl.writeAsBytes');
+      rethrow;
     }
-  }
-
-  @override
-  Future<List<String>> readLines(String path) async {
-    final content = await readAsString(path);
-    if (content == null) return [];
-
-    return const LineSplitter().convert(content);
   }
 
   @override
   Future<Uint8List> readAsBytes(String path) async {
-    final content = await readAsString(path);
-    if (content == null) return Uint8List(0);
-    return Uint8List.fromList(utf8.encode(content));
+    await _initCompleter.future;
+    try {
+      final normalizedPath = _normalizePath(path);
+      final fileInfo = await _getFileInfo(normalizedPath);
+      if (fileInfo == null || fileInfo.data == null) return Uint8List(0);
+      final bytes = List<int>.from(fileInfo.data!);
+      return Uint8List.fromList(bytes);
+    } catch (e) {
+      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsString');
+      return Uint8List(0);
+    }
   }
 
-  /// get file metadata
+  /// Update copyFile to use FileInfo
   @override
-  Future<FileMeta?> getFileMeta(String path, {bool validate = false}) async {
+  Future<void> copyFile(String sourcePath, String targetPath) async {
+    await _initCompleter.future;
     try {
-      final data = await _getFileData(path);
-      if (data == null || data['meta'] == null) return null;
+      final normalizedSource = _normalizePath(sourcePath);
+      final normalizedDest = _normalizePath(targetPath);
+      final fileInfo = await _getFileInfo(normalizedSource);
+      if (fileInfo == null) {
+        throw Exception('Source file not found: $sourcePath');
+      }
+      final newName = _extractFileName(normalizedDest);
+      final newMeta = fileInfo.meta.copyWith(name: newName);
+      final newFileInfo =
+          FileInfo(path: normalizedDest, meta: newMeta, data: fileInfo.data);
+      await _storeFileInfo(newFileInfo);
+    } catch (e) {
+      Logger.error('Copy file failed: $e', label: 'WebStorageImpl.copyFile');
+    }
+  }
 
-      // use JSON deep copy to ensure type safety
-      final metaJson =
-          jsonDecode(jsonEncode(data['meta'])) as Map<String, dynamic>;
+  @override
+  Future<void> copyDirectory(String sourcePath, String targetPath) async {
+    await _initCompleter.future;
 
-      final meta = FileMeta.fromJson(metaJson);
+    try {
+      if (_db == null) throw Exception('Database not initialized');
 
-      if (validate) _validateFileMeta(meta);
+      final normalizedSourcePath = _normalizePath(sourcePath);
+      final normalizedTargetPath = _normalizePath(targetPath);
+
+      // get all files and subdirectories in the source directory
+      final items = await listDirectory(sourcePath, recursive: true);
+
+      for (var itemPath in items) {
+        // calculate relative path
+        String relativePath = itemPath;
+        if (itemPath.startsWith('$normalizedSourcePath/')) {
+          relativePath = itemPath.substring(normalizedSourcePath.length + 1);
+        } else if (itemPath == normalizedSourcePath) {
+          continue; // skip source directory itself
+        }
+
+        // calculate target path
+        final targetItemPath = pathJoin(normalizedTargetPath, relativePath);
+
+        // check if it is a file (through existsFile)
+        if (await existsFile(itemPath)) {
+          await copyFile(itemPath, targetItemPath);
+        } else {
+          Logger.debug(
+              'Skipping non-file item during directory copy: $itemPath',
+              label: 'WebStorageImpl.copyDirectory');
+        }
+      }
+    } catch (e) {
+      Logger.error('Copy directory failed: $e',
+          label: 'WebStorageImpl.copyDirectory');
+    }
+  }
+
+  /// Update getFileMeta to use FileInfo structure
+  Future<FileMeta?> _getFileMeta(String path) async {
+    try {
+      final fileInfo = await _getFileInfo(path);
+      if (fileInfo == null) return null;
+      final meta = fileInfo.meta;
       return meta;
     } catch (e) {
-      Logger.warn('Get file meta failed: $e');
+      Logger.warn('Get file meta failed: $e}');
       return null;
-    }
-  }
-
-  void _validateFileMeta(FileMeta meta) {
-    // validate meta data version
-    if (meta.version != 1) {
-      throw BusinessError('Unsupported metadata version: ${meta.version}',
-          type: BusinessErrorType.invalidData);
-    }
-
-    // validate timestamp logic
-    final now = DateTime.now();
-    if (meta.timestamps.created.isAfter(now) ||
-        meta.timestamps.modified.isAfter(now) ||
-        meta.timestamps.accessed.isAfter(now)) {
-      throw const BusinessError('Invalid timestamp in metadata',
-          type: BusinessErrorType.invalidData);
-    }
-
-    // validate chunk info
-    if (meta.chunks != null) {
-      final chunkInfo = meta.chunks!;
-      if (chunkInfo.indexes.length != chunkInfo.total) {
-        throw const BusinessError('Chunk index count mismatch',
-            type: BusinessErrorType.invalidData);
-      }
     }
   }
 
@@ -449,52 +518,16 @@ class WebStorageImpl implements StorageInterface {
     return const LineSplitter().convert(content).length;
   }
 
-  /// validate chunk integrity
-  Future<bool> validateChunks(String path) async {
-    try {
-      final meta = await getFileMeta(path);
-      if (meta == null) return false;
-
-      final chunks = meta.chunks!;
-      final total = chunks.total;
-      final indexes = chunks.indexes;
-
-      // validate index continuity
-      if (indexes.length != total) {
-        Logger.error('Chunk index count mismatch: ${indexes.length} vs $total');
-        return false;
-      }
-
-      // check all chunks exist
-      for (var i = 0; i < total; i++) {
-        if (!await exists('$path.block$i')) {
-          return false;
-        }
-      }
-
-      return true;
-    } catch (e) {
-      Logger.error('Validate chunks failed: $e');
-      return false;
-    }
-  }
-
   @override
   Future<int> getFileSize(String path) async {
-    final meta = await getFileMeta(path);
-    return meta?.size ?? 0;
-  }
-
-  @override
-  Future<int> getFileRecordCount(String path) async {
-    final meta = await getFileMeta(path);
-    return meta?.records ?? 0;
+    final meta = await _getFileMeta(path);
+    return meta?.fileSizeInBytes ?? 0;
   }
 
   @override
   Future<DateTime?> getFileCreationTime(String path) async {
     try {
-      final meta = await getFileMeta(path);
+      final meta = await _getFileMeta(path);
       return meta?.timestamps.created;
     } catch (e) {
       Logger.error('Get creation time failed: $e');
@@ -504,14 +537,8 @@ class WebStorageImpl implements StorageInterface {
 
   @override
   Future<DateTime?> getFileModifiedTime(String path) async {
-    final meta = await getFileMeta(path);
+    final meta = await _getFileMeta(path);
     return meta?.timestamps.modified;
-  }
-
-  @override
-  Future<DateTime?> getFileAccessedTime(String path) async {
-    final meta = await getFileMeta(path);
-    return meta?.timestamps.accessed;
   }
 
   String _normalizePath(String path) {
@@ -521,38 +548,18 @@ class WebStorageImpl implements StorageInterface {
         .replaceAll(RegExp(r'^/+'), '');
   }
 
-  Future<void> _cleanOldChunks(String path) async {
-    try {
-      final meta = await getFileMeta(path);
-      final chunks = meta?.chunks;
-
-      if (chunks != null) {
-        final total = chunks.total;
-        for (var i = 0; i < total; i++) {
-          final chunkPath = '$path.block$i';
-          if (await exists(chunkPath)) {
-            await deleteFile(chunkPath);
-          }
-        }
-      }
-    } catch (e) {
-      Logger.error('Clean old chunks failed: $e');
-    }
-  }
-
-  FileMeta _generateFileMeta(String path, String content, bool isChunked) {
+  FileMeta _generateFileMeta(String path, String content) {
     return FileMeta(
       version: 1,
       type: _getFileType(path),
       name: _extractFileName(path),
-      size: calculateUtf8Length(content),
-      records: _calculateRecordCount(content),
+      fileSizeInBytes: calculateUtf8Length(content),
+      totalRecords: _calculateRecordCount(content),
       timestamps: Timestamps(
         created: DateTime.now(),
         modified: DateTime.now(),
-        accessed: DateTime.now(),
       ),
-      chunks: isChunked ? _generateChunkInfo(content) : null,
+      partitions: null,
     );
   }
 
@@ -561,49 +568,13 @@ class WebStorageImpl implements StorageInterface {
     return path.split('/').last.split('.').first;
   }
 
-  ChunkInfo _generateChunkInfo(String content) {
-    final total = (calculateUtf8Length(content) / _blockSize).ceil();
-    return ChunkInfo(
-      total: total,
-      size: _blockSize,
-      indexes: List.generate(total, (i) => i),
-      index: 0,
-    );
-  }
-
-  Future<String> _readChunkedFile(FileMeta meta, String path) async {
-    final buffer = StringBuffer();
-    final chunkInfo = meta.chunks!;
-
-    for (var i = 0; i < chunkInfo.total; i++) {
-      final chunkPath = '$path.block$i';
-      final chunkData = await _getFileData(chunkPath);
-      if (chunkData == null) continue;
-
-      final content = utf8.decode(chunkData['data']);
-      buffer.write(content);
-    }
-    return buffer.toString();
-  }
-
-  Future<Map<String, dynamic>?> _getFileData(String path) async {
-    final transaction =
-        _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
-    final store = transaction.objectStore(_fileStore);
-
-    final result = await _wrapRequest<JSAny?>(store.get(path.toJS));
-    if (result == null) return null;
-
-    // deep convert nested structure
-    return _deepConvert(result.dartify());
-  }
-
   Future<bool> validateFile(String path) async {
-    final meta = await getFileMeta(path);
+    final meta = await _getFileMeta(path);
     if (meta == null) return false;
 
     final content = await readAsString(path);
-    return content != null && calculateUtf8Length(content) == meta.size;
+    return content != null &&
+        calculateUtf8Length(content) == meta.fileSizeInBytes;
   }
 
   // enhance type conversion method
@@ -619,7 +590,7 @@ class WebStorageImpl implements StorageInterface {
   List<dynamic> _convertJsList(List<dynamic> list) {
     return list.map((e) {
       if (e is JSArray) {
-        return Uint8List.fromList(List<int>.from(e.jsify() as List));
+        return Uint8List.fromList(List<int>.from(e.toDart));
       }
       if (e is Map) return _convertJsMap(e);
       if (e is List) return _convertJsList(e);
@@ -634,8 +605,7 @@ class WebStorageImpl implements StorageInterface {
       if (key == 'data') {
         if (v is JSArray) {
           // Directly convert JSArray to Uint8List for 'data' field and return immediately
-          return MapEntry(key,
-              Uint8List.fromList(List<int>.from((v.jsify() as List<dynamic>))));
+          return MapEntry(key, Uint8List.fromList(List<int>.from(v.toDart)));
         } else {
           return MapEntry(key, v);
         }
@@ -644,21 +614,45 @@ class WebStorageImpl implements StorageInterface {
       dynamic value = v;
       // Process other nested structures
       if (value is JSArray) {
-        value = Uint8List.fromList(
-            List<int>.from((value.jsify() as List<dynamic>)));
+        value = Uint8List.fromList(List<int>.from(value.toDart));
       } else if (value is Map) {
         value = _convertJsMap(value);
       } else if (value is List) {
         value = value.map((e) {
           if (e is Map) return _convertJsMap(e);
           if (e is JSArray) {
-            return Uint8List.fromList(
-                List<int>.from((e.jsify() as List<dynamic>)));
+            return Uint8List.fromList(List<int>.from(e.toDart));
           }
           return e;
         }).toList();
       }
       return MapEntry(key, value);
     });
+  }
+
+  @override
+  Stream<String> readLinesStream(String path, {int offset = 0}) async* {
+    final content = await readAsString(path);
+    if (content == null) return;
+    final lines = const LineSplitter().convert(content);
+    for (var i = offset; i < lines.length; i++) {
+      yield lines[i];
+    }
+  }
+
+  @override
+  Future<void> writeLinesStream(String path, Stream<String> lines,
+      {bool append = false}) async {
+    final buffer = StringBuffer();
+    await for (final line in lines) {
+      buffer.writeln(line);
+    }
+    await writeAsString(path, buffer.toString(), append: append);
+  }
+
+  /// Web storage does not require directory creation
+  @override
+  Future<void> ensureDirectoryExists(String path) async {
+    return;
   }
 }

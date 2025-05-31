@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import '../model/join_clause.dart';
 import 'query_condition.dart';
 
 /// query cache
@@ -75,6 +76,7 @@ class QueryCacheKey {
   final List<String>? orderBy;
   final int? limit;
   final int? offset;
+  final List<JoinClause>? joins;
 
   QueryCacheKey({
     required this.tableName,
@@ -82,6 +84,7 @@ class QueryCacheKey {
     this.orderBy,
     this.limit,
     this.offset,
+    this.joins,
   });
 
   @override
@@ -92,6 +95,15 @@ class QueryCacheKey {
       'orderBy': orderBy,
       'limit': limit,
       'offset': offset,
+      'joins': joins
+          ?.map((j) => {
+                'type': j.type.toString().split('.').last,
+                'table': j.table,
+                'firstKey': j.firstKey,
+                'operator': j.operator,
+                'secondKey': j.secondKey,
+              })
+          .toList(),
     });
   }
 
@@ -103,7 +115,8 @@ class QueryCacheKey {
         _conditionEquals(other.condition, condition) &&
         _listEquals(other.orderBy, orderBy) &&
         other.limit == limit &&
-        other.offset == offset;
+        other.offset == offset &&
+        _joinsEquals(other.joins, joins);
   }
 
   @override
@@ -114,6 +127,7 @@ class QueryCacheKey {
       orderBy?.join(','),
       limit,
       offset,
+      joins?.map((j) => j.toString()).join(';'),
     );
   }
 
@@ -128,6 +142,27 @@ class QueryCacheKey {
     for (var i = 0; i < a.length; i++) {
       if (a[i] != b[i]) return false;
     }
+    return true;
+  }
+
+  bool _joinsEquals(List<JoinClause>? a, List<JoinClause>? b) {
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+
+    for (var i = 0; i < a.length; i++) {
+      final joinA = a[i];
+      final joinB = b[i];
+
+      if (joinA.type != joinB.type ||
+          joinA.table != joinB.table ||
+          joinA.firstKey != joinB.firstKey ||
+          joinA.operator != joinB.operator ||
+          joinA.secondKey != joinB.secondKey) {
+        return false;
+      }
+    }
+
     return true;
   }
 }

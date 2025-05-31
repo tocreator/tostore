@@ -1,18 +1,19 @@
 import 'dart:async';
 
-import 'chain_builder.dart';
-import 'future_builder_mixin.dart';
+import '../Interface/chain_builder.dart';
+import '../Interface/future_builder_mixin.dart';
+import '../model/db_result.dart';
 
 /// update builder
 class UpdateBuilder extends ChainBuilder<UpdateBuilder>
-    with FutureBuilderMixin<bool> {
+    with FutureBuilderMixin<DbResult> {
   final Map<String, dynamic> _data;
-  Future<bool>? _future;
+  Future<DbResult>? _future;
 
   UpdateBuilder(super.db, super.tableName, this._data);
 
   @override
-  Future<bool> get future {
+  Future<DbResult> get future async {
     _future ??= $db.updateInternal(
       $tableName,
       _data,

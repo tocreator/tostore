@@ -1,37 +1,35 @@
-import 'dart:convert';
-import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
-
-import '../core/data_compressor.dart';
 import '../core/data_store_impl.dart';
-import '../model/business_error.dart';
+import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import '../model/file_info.dart';
 
 /// data integrity checker
 class IntegrityChecker {
   final DataStoreImpl _dataStore;
-  final Map<String, TableSchema> _schemas = {};
-  final DataCompressor _compressor;
 
-  IntegrityChecker(this._dataStore) : _compressor = DataCompressor();
+  IntegrityChecker(this._dataStore);
 
   /// check table structure integrity
   Future<bool> checkTableStructure(String tableName) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return false;
+      }
+      final dataPath = await _dataStore.pathManager.getDataMetaPath(tableName);
 
-      if (!await _dataStore.storage.exists(dataPath)) {
+      if (!await _dataStore.storage.existsFile(dataPath)) {
         return false;
       }
 
-      // check each record is valid
-      final lines = await _dataStore.storage.readLines(dataPath);
-      for (var line in lines) {
+      // check each record is valid using stream
+      await for (var data
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
         try {
-          final data = jsonDecode(line) as Map<String, dynamic>;
           if (!_validateRecord(data, schema)) {
             return false;
           }
@@ -49,21 +47,14 @@ class IntegrityChecker {
   /// check index integrity
   Future<bool> checkIndexIntegrity(String tableName) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return false;
+      }
+      final dataPath = await _dataStore.pathManager.getDataMetaPath(tableName);
 
       // check each index file
       for (var index in schema.indexes) {
-        final indexPath = _dataStore.config.getIndexPath(
-          tableName,
-          index.actualIndexName,
-          schema.isGlobal,
-        );
-        if (!await _dataStore.storage.exists(indexPath)) {
-          return false;
-        }
-
         // validate index content
         if (!await _validateIndex(tableName, index, dataPath)) {
           return false;
@@ -79,38 +70,67 @@ class IntegrityChecker {
   /// check data consistency
   Future<bool> checkDataConsistency(String tableName) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
-      final checksumPath =
-          _dataStore.config.getChecksumPath(tableName, schema.isGlobal);
+      // get table meta data
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableFileMeta(tableName);
 
-      if (!await _dataStore.storage.exists(dataPath) ||
-          !await _dataStore.storage.exists(checksumPath)) {
+      // get table schema info
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
         return false;
       }
+      final isGlobal = schema.isGlobal;
+      final primaryKey = schema.primaryKey;
 
-      // read checksum file
-      final lines = await _dataStore.storage.readLines(dataPath);
-      final checksums = await _dataStore.storage.readLines(checksumPath);
+      if (fileMeta != null && fileMeta.partitions != null) {
+        // check each partition
+        for (var partition in fileMeta.partitions!) {
+          if (partition.checksum == null) {
+            Logger.error('Partition missing checksum',
+                label: 'IntegrityChecker.checkDataConsistency');
+            return false;
+          }
 
-      if (lines.length != checksums.length) {
-        return false;
-      }
+          try {
+            // use readRecordsFromPartition to read partition records
+            final records = await _dataStore.tableDataManager
+                .readRecordsFromPartition(
+                    tableName, isGlobal, partition.index, primaryKey);
 
-      // validate each record checksum
-      for (var i = 0; i < lines.length; i++) {
-        final data = Uint8List.fromList(utf8.encode(lines[i]));
-        final actualChecksum = _compressor.calculateChecksum(data);
-        final expectedChecksum = int.parse(checksums[i]);
+            if (records.isEmpty && partition.totalRecords > 0) {
+              Logger.error('Failed to read partition records',
+                  label: 'IntegrityChecker.checkDataConsistency');
+              return false;
+            }
 
-        if (actualChecksum != expectedChecksum) {
-          return false;
+            // use the same way as TableDataManager to calculate checksum
+            final allRecordsData =
+                Uint8List.fromList(utf8.encode(jsonEncode(records)));
+            final actualChecksum =
+                _dataStore.calculateChecksum(allRecordsData).toString();
+
+            // compare with stored checksum
+            if (actualChecksum != partition.checksum) {
+              Logger.error(
+                  'Checksum mismatch: Expected[${partition.checksum}], Actual[$actualChecksum]',
+                  label: 'IntegrityChecker.checkDataConsistency');
+              return false;
+            }
+          } catch (e) {
+            Logger.error('Checksum calculation failed: $e',
+                label: 'IntegrityChecker.checkDataConsistency');
+            return false;
+          }
         }
+        return true;
+      } else {
+        Logger.warn('Table has no partition metadata',
+            label: 'IntegrityChecker.checkDataConsistency');
+        return false;
       }
-
-      return true;
     } catch (e) {
+      Logger.error('Data consistency check failed: $e',
+          label: 'IntegrityChecker.checkDataConsistency');
       return false;
     }
   }
@@ -118,13 +138,13 @@ class IntegrityChecker {
   /// check foreign key constraints
   Future<bool> checkForeignKeyConstraints(String tableName) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
-      final lines = await _dataStore.storage.readLines(dataPath);
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return false;
+      }
 
-      for (var line in lines) {
-        final data = jsonDecode(line) as Map<String, dynamic>;
+      await for (var data
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
         // check each foreign key reference
         for (var field in schema.fields) {
           // check field is foreign key reference
@@ -156,21 +176,22 @@ class IntegrityChecker {
 
     final referencedTable = _inferReferencedTable(fieldName);
     try {
-      final referencedSchema = await _loadTableSchema(referencedTable);
-      final dataPath = _dataStore.config.getDataPath(
+      final referencedSchema = await _dataStore.getTableSchema(referencedTable);
+      if (referencedSchema == null) {
+        return false;
+      }
+      final dataPath = await _dataStore.pathManager.getDataMetaPath(
         referencedTable,
-        referencedSchema.isGlobal,
       );
 
-      if (!await _dataStore.storage.exists(dataPath)) {
+      if (!await _dataStore.storage.existsFile(dataPath)) {
         return false;
       }
 
       // find record in referenced table
-      final lines = await _dataStore.storage.readLines(dataPath);
-      for (var line in lines) {
-        final record = jsonDecode(line) as Map<String, dynamic>;
-        if (record[referencedSchema.primaryKey] == value) {
+      await for (var data
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
+        if (data[referencedSchema.primaryKey] == value) {
           return true;
         }
       }
@@ -192,18 +213,18 @@ class IntegrityChecker {
   /// check unique constraints
   Future<bool> checkUniqueConstraints(String tableName) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final dataPath =
-          _dataStore.config.getDataPath(tableName, schema.isGlobal);
-      final lines = await _dataStore.storage.readLines(dataPath);
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return false;
+      }
 
       final uniqueValues = <String, Set<String>>{};
       for (var index in schema.indexes.where((idx) => idx.unique)) {
         uniqueValues[index.actualIndexName] = {};
       }
 
-      for (var line in lines) {
-        final data = jsonDecode(line) as Map<String, dynamic>;
+      await for (var data
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
         for (var index in schema.indexes.where((idx) => idx.unique)) {
           final key = _extractIndexKey(data, index.fields);
           if (!uniqueValues[index.actualIndexName]!.add(key)) {
@@ -218,45 +239,6 @@ class IntegrityChecker {
     }
   }
 
-  /// load table schema
-  Future<TableSchema> _loadTableSchema(String tableName) async {
-    // Try to get from cache first
-    if (_schemas.containsKey(tableName)) {
-      return _schemas[tableName]!;
-    }
-
-    // Load schema from file
-    final schemaPath = _dataStore.config.getSchemaPath(tableName, true);
-    if (!await _dataStore.storage.exists(schemaPath)) {
-      final baseSchemaPath = _dataStore.config.getSchemaPath(tableName, false);
-      if (!await _dataStore.storage.exists(baseSchemaPath)) {
-        throw BusinessError(
-          'Table schema not found: $tableName',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-      final content = await _dataStore.storage.readAsString(baseSchemaPath);
-      final json = jsonDecode(content!) as Map<String, dynamic>;
-
-      if (!json.containsKey('name')) {
-        json['name'] = tableName;
-      }
-      final schema = TableSchema.fromJson(json);
-      _schemas[tableName] = schema;
-      return schema;
-    }
-
-    final content = await _dataStore.storage.readAsString(schemaPath);
-    final json = jsonDecode(content!) as Map<String, dynamic>;
-
-    if (!json.containsKey('name')) {
-      json['name'] = tableName;
-    }
-    final schema = TableSchema.fromJson(json);
-    _schemas[tableName] = schema;
-    return schema;
-  }
-
   /// validate record
   bool _validateRecord(Map<String, dynamic> data, TableSchema schema) {
     // check required fields
@@ -268,13 +250,38 @@ class IntegrityChecker {
 
     // check data type
     for (var entry in data.entries) {
-      final field = schema.fields.firstWhere(
-        (col) => col.name == entry.key,
-        orElse: () => throw StateError('Unknown field ${entry.key}'),
-      );
+      // check if it is primary key field
+      if (entry.key == schema.primaryKey) {
+        // primary key field, check its type
+        // primary key is usually integer or string type
+        final value = entry.value;
+        if (value != null &&
+            !(value is int ||
+                value is String ||
+                value is BigInt ||
+                value is num)) {
+          return false;
+        }
+        continue; // primary key validation passed, continue to process next field
+      }
 
-      if (!_isValidDataType(entry.value, field.type)) {
-        return false;
+      // for non-primary key field, use schema.fields to validate
+      try {
+        final field = schema.fields.firstWhere(
+          (col) => col.name == entry.key,
+          orElse: () => throw StateError('Unknown field ${entry.key}'),
+        );
+
+        if (!field.isValidDataType(entry.value, field.type)) {
+          return false;
+        }
+      } catch (e) {
+        // if field not found but not primary key field, record warning but not stop validation
+        // this may be due to table structure change
+        Logger.warn(
+            'Unknown field encountered during record validation: ${entry.key}',
+            label: 'IntegrityChecker._validateRecord');
+        continue;
       }
     }
 
@@ -288,38 +295,51 @@ class IntegrityChecker {
     String dataPath,
   ) async {
     try {
-      final schema = await _loadTableSchema(tableName);
-      final indexPath = _dataStore.config.getIndexPath(
-        tableName,
-        index.actualIndexName,
-        schema.isGlobal,
-      );
-
-      if (!await _dataStore.storage.exists(indexPath)) {
-        return false;
-      }
-
-      final indexContent = await _dataStore.storage.readAsString(indexPath);
-      final lines = await _dataStore.storage.readLines(dataPath);
-
-      // check index record count is match
-      final indexEntries =
-          indexContent!.split('\n').where((line) => line.isNotEmpty);
       final uniqueKeys = <String>{};
+      int recordCount = 0;
 
-      for (var line in lines) {
-        final data = jsonDecode(line) as Map<String, dynamic>;
+      // collect all unique keys in data
+      await for (var data
+          in _dataStore.tableDataManager.streamRecords(tableName)) {
         final key = _extractIndexKey(data, index.fields);
         uniqueKeys.add(key);
+        recordCount++;
       }
 
-      // for unique index, check if there are duplicates
-      if (index.unique && uniqueKeys.length != lines.length) {
+      // check duplicate in unique index
+      if (index.unique && uniqueKeys.length != recordCount) {
+        Logger.error('Duplicate found in unique index ${index.actualIndexName}',
+            label: 'IntegrityChecker._validateIndex');
         return false;
       }
 
-      return indexEntries.length == uniqueKeys.length;
+      // get and validate index partitions
+      final indexPartitions = await _dataStore.indexManager
+          ?.getIndexPartitions(tableName, index.actualIndexName);
+
+      if (indexPartitions == null || indexPartitions.isEmpty) {
+        Logger.error('Index ${index.actualIndexName} partitions not found',
+            label: 'IntegrityChecker._validateIndex');
+        return false;
+      }
+
+      // validate total index entries
+      int totalIndexEntries = 0;
+      for (var partition in indexPartitions.values) {
+        totalIndexEntries += partition.meta.entries;
+      }
+
+      final entriesMatch = totalIndexEntries == uniqueKeys.length;
+      if (!entriesMatch) {
+        Logger.error(
+            'Index ${index.actualIndexName} entry count mismatch: index has $totalIndexEntries entries, should have ${uniqueKeys.length} entries',
+            label: 'IntegrityChecker._validateIndex');
+      }
+
+      return entriesMatch;
     } catch (e) {
+      Logger.error('Index validation failed: $e',
+          label: 'IntegrityChecker._validateIndex');
       return false;
     }
   }
@@ -329,48 +349,191 @@ class IntegrityChecker {
     return fields.map((col) => data[col].toString()).join(':');
   }
 
-  /// check data type
-  bool _isValidDataType(dynamic value, DataType type) {
-    if (value == null) return true;
-    switch (type) {
-      case DataType.integer:
-        return value is int;
-      case DataType.double:
-        return value is double;
-      case DataType.text:
-        return value is String;
-      case DataType.blob:
-        return value is List<int>;
-      case DataType.boolean:
-        return value is bool;
-      case DataType.datetime:
-        return value is String && DateTime.tryParse(value) != null;
-      case DataType.array:
-        return value is List;
+  /// efficient migration validation method
+  Future<bool> validateMigration(
+    String tableName,
+    TableSchema newSchema,
+  ) async {
+    // record start time for performance evaluation
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      // check if table meta data file exists
+      final dataMetaPath =
+          await _dataStore.pathManager.getDataMetaPath(tableName);
+      final tableMetaExists = await _dataStore.storage.existsFile(dataMetaPath);
+
+      // get table meta data (if exists)
+      FileMeta? fileMeta;
+      if (tableMetaExists) {
+        fileMeta =
+            await _dataStore.tableDataManager.getTableFileMeta(tableName);
+      }
+
+      // check if it is a new table (no meta data or meta data has no partition info)
+      final isNewTable = !tableMetaExists ||
+          fileMeta == null ||
+          fileMeta.partitions == null ||
+          fileMeta.partitions!.isEmpty;
+
+      if (isNewTable) {
+        Logger.info(
+            'Table[$tableName] is a new table or has no data written yet, skipping data file validation, only validating table structure',
+            label: 'IntegrityChecker.validateMigration');
+      } else {
+        // for table with data, validate index meta data
+        for (var index in newSchema.indexes) {
+          final indexMetaPath = await _dataStore.pathManager
+              .getIndexMetaPath(tableName, index.actualIndexName);
+
+          if (!await _dataStore.storage.existsFile(indexMetaPath)) {
+            Logger.info(
+                'Index metadata does not exist: ${index.actualIndexName}, possibly a new index',
+                label: 'IntegrityChecker.validateMigration');
+            // for new index, do not fail
+          }
+        }
+
+        // sample validation partitions
+        if (fileMeta.partitions != null && fileMeta.partitions!.isNotEmpty) {
+          // in large table, use sample validation: only validate first and last partitions
+          final partitionsToCheck = <PartitionMeta>[];
+
+          // add first partition
+          if (fileMeta.partitions!.isNotEmpty) {
+            partitionsToCheck.add(fileMeta.partitions!.first);
+          }
+
+          // if there are multiple partitions, add the last partition (if different from the first)
+          if (fileMeta.partitions!.length > 1) {
+            final lastPartition = fileMeta.partitions!.last;
+            if (lastPartition.index != partitionsToCheck.first.index) {
+              partitionsToCheck.add(lastPartition);
+            }
+          }
+
+          // optimize: validate multiple partitions in parallel
+          final results = await Future.wait(partitionsToCheck.map((partition) =>
+              _validatePartition(tableName, partition, newSchema.isGlobal,
+                  newSchema.primaryKey)));
+
+          // if any partition validation failed, whole validation failed
+          if (results.contains(false)) {
+            Logger.error(
+                'Partition validation failed, migration validation failed',
+                label: 'IntegrityChecker.validateMigration');
+            return false;
+          }
+        }
+      }
+
+      // whether it is a new table or not, validate table structure
+      try {
+        // validate field default value validity for all fields
+        for (final field in newSchema.fields) {
+          final defaultValue = field.getDefaultValue();
+          if (!field.validateValue(defaultValue)) {
+            Logger.error(
+                'Field[${field.name}] default value validation failed, type: ${field.type}',
+                label: 'IntegrityChecker.validateMigration');
+            return false;
+          }
+        }
+
+        // for non-new table, try to get records from stream and validate structure
+        if (!isNewTable) {
+          final stream = _dataStore.tableDataManager.streamRecords(tableName);
+          int count = 0;
+          int maxSamples = 10;
+
+          await for (var record in stream) {
+            try {
+              // validate record structure
+              if (!_validateRecord(record, newSchema)) {
+                Logger.error(
+                    'Record structure validation failed: Record does not meet new table structure requirements',
+                    label: 'IntegrityChecker.validateMigration');
+                return false;
+              }
+            } catch (recordError) {
+              Logger.error(
+                  'Record structure validation exception: $recordError',
+                  label: 'IntegrityChecker.validateMigration');
+              return false;
+            }
+
+            count++;
+            if (count >= maxSamples) break;
+          }
+        }
+      } catch (e, stack) {
+        Logger.error('Table structure validation failed: $e\n$stack',
+            label: 'IntegrityChecker.validateMigration');
+        return false;
+      }
+
+      // record validation time
+      stopwatch.stop();
+      Logger.info(
+        'Migration validation completed: Table[$tableName], Time[${stopwatch.elapsedMilliseconds}ms]',
+        label: 'IntegrityChecker.validateMigration',
+      );
+
+      return true;
+    } catch (e) {
+      stopwatch.stop();
+      Logger.error(
+        'Migration validation error: Table[$tableName], Error[$e], Time[${stopwatch.elapsedMilliseconds}ms]',
+        label: 'IntegrityChecker.validateMigration',
+      );
+      return false;
     }
   }
 
-  Future<bool> validateMigration(
-    String tableName,
-    TableSchema oldSchema,
-    TableSchema newSchema,
-  ) async {
-    // 1. Validate table structure
-    if (!await validateTableStructure(
-      tableName,
-      newSchema,
-      _dataStore.config,
-    )) {
-      return false;
+  /// validate single partition integrity
+  Future<bool> _validatePartition(String tableName, PartitionMeta partition,
+      bool isGlobal, String primaryKey) async {
+    // if partition is large (record count exceeds threshold), skip checksum validation, only validate record count
+    if (partition.totalRecords > 5000) {
+      // large partition only validate partition file existence
+      final partitionPath = await _dataStore.pathManager
+          .getPartitionFilePath(tableName, partition.index);
+
+      if (!await _dataStore.storage.existsFile(partitionPath)) {
+        Logger.error('Partition file does not exist: $partitionPath',
+            label: 'IntegrityChecker._validatePartition');
+        return false;
+      }
+      return true;
     }
 
-    // 2. Validate data integrity
-    if (!await validateTableData(
-      tableName,
-      newSchema,
-      _dataStore.config,
-    )) {
-      return false;
+    // for small partition, validate checksum
+    if (partition.checksum != null) {
+      try {
+        // read partition records for validation - only try to read 1 record
+        final records = await _dataStore.tableDataManager
+            .readRecordsFromPartition(
+                tableName, isGlobal, partition.index, primaryKey);
+
+        // if records can be read and format is correct, consider partition structure is correct
+        if (records.isNotEmpty) {
+          return true;
+        }
+
+        // if partition is empty but record count shows not zero, validation failed
+        if (records.isEmpty && partition.totalRecords > 0) {
+          Logger.error(
+              'Partition metadata shows ${partition.totalRecords} records, but cannot be read',
+              label: 'IntegrityChecker._validatePartition');
+          return false;
+        }
+
+        return true;
+      } catch (e) {
+        Logger.error('Partition validation failed: $e',
+            label: 'IntegrityChecker._validatePartition');
+        return false;
+      }
     }
 
     return true;

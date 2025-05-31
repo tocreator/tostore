@@ -4,16 +4,21 @@ class BackupInfo {
   final DateTime timestamp;
   final bool isIncremental;
   final int size;
+  final bool isFullBackup;
 
   BackupInfo({
     required this.path,
     required this.timestamp,
     required this.isIncremental,
     required this.size,
+    required this.isFullBackup,
   });
 
   /// get backup type description
-  String get type => isIncremental ? 'incremental backup' : 'full backup';
+  String get type {
+    if (isIncremental) return 'incremental backup';
+    return isFullBackup ? 'full backup' : 'partial backup';
+  }
 
   /// get formatted size
   String get formattedSize {
@@ -32,6 +37,7 @@ class BackupInfo {
       timestamp: DateTime.parse(json['timestamp'] as String),
       isIncremental: json['isIncremental'] as bool,
       size: json['size'] as int,
+      isFullBackup: json['isFullBackup'] as bool? ?? true,
     );
   }
 
@@ -42,6 +48,7 @@ class BackupInfo {
       'timestamp': timestamp.toIso8601String(),
       'isIncremental': isIncremental,
       'size': size,
+      'isFullBackup': isFullBackup,
     };
   }
 }

@@ -5,21 +5,29 @@ export 'src/model/business_error.dart';
 export 'src/model/data_store_config.dart';
 export 'src/model/table_info.dart';
 export 'src/model/log_config.dart';
+export 'src/model/space_info.dart';
+export 'src/model/db_result.dart';
+export 'src/model/migration_task.dart';
+export 'src/model/result_code.dart';
 
 import 'src/chain/delete_builder.dart';
 import 'src/chain/update_builder.dart';
 import 'src/chain/upsert_builder.dart';
-import 'src/core/data_store_interface.dart';
+import 'src/Interface/data_store_interface.dart';
 import 'src/model/data_store_config.dart';
 import 'src/core/data_store_impl.dart';
+import 'src/model/db_result.dart';
+import 'src/model/migration_task.dart';
 import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
-import 'src/query/query_builder.dart';
+import 'src/model/space_info.dart';
+import 'src/chain/query_builder.dart';
 import 'src/chain/schema_builder.dart';
+import 'src/chain/stream_query_builder.dart';
 
 /// High-performance storage engine built specifically for mobile applications.
 /// Features:
-/// - Chain operations, SQL-style and Map-style queries
+/// - Chain operations
 /// - Multi-space architecture with global data tables
 /// - Perfect for user switching scenarios
 /// - Single instance covers most use cases
@@ -28,8 +36,8 @@ import 'src/chain/schema_builder.dart';
 ///
 /// 专为移动应用打造的高性能数据存储引擎
 /// 特性：
-/// - 支持链式操作、SQL风格和Map风格查询
-/// - 多空间架构设计，支持全局数据表
+/// - 支持链式操作
+/// - 多空间架构设计，支持全局共享数据表
 /// - 完美适配用户切换场景
 /// - 单例足以覆盖常见使用场景
 /// - 支持多实例，资源完全隔离
@@ -38,35 +46,24 @@ class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
   /// [dbPath] Database path (optional, excluding filename)
   /// [config] Database configuration
-  /// [version] Database version number,every time the data structure is adjusted, increase the version number to trigger upgrade
-  /// [schemas] Database table schemas, auto upgrade
+  /// [schemas] Database table schemas, Designed for mobile application scenarios, auto upgrade
   /// [onConfigure] Callback when configuring database
   /// [onCreate] Callback when database is first created
-  /// [onUpgrade] Callback when database is upgraded, complex data structure upgrade scenarios use
-  /// [onDowngrade] Callback when database is downgraded
   /// [onOpen] Callback when database is opened
   ///
   /// 以数据库路径的不同创建独立的实例
   /// [dbPath] 数据库路径，可选，不含文件名
   /// [config] 数据库配置
-  /// [version] 数据库版本号，每次调整了数据结构增加版本号则触发升级
-  /// [schemas] 数据库表结构定义，自动化升级
+  /// [schemas] 数据库表结构定义，适用移动应用场景，自动化升级
   /// [onConfigure] 数据库配置时的回调
   /// [onCreate] 数据库首次创建时的回调
-  /// [onUpgrade] 数据库升级时的回调，复杂的数据结构升级场景使用
-  /// [onDowngrade] 数据库降级时的回调
   /// [onOpen] 数据库打开时的回调
   factory ToStore({
     String? dbPath,
     DataStoreConfig? config,
-    int version = 1,
     List<TableSchema> schemas = const [],
     Future<void> Function(ToStore db)? onConfigure,
     Future<void> Function(ToStore db)? onCreate,
-    Future<void> Function(ToStore db, int oldVersion, int newVersion)?
-        onUpgrade,
-    Future<void> Function(ToStore db, int oldVersion, int newVersion)?
-        onDowngrade,
     Future<void> Function(ToStore db)? onOpen,
   }) {
     final key = dbPath ?? 'default';
@@ -74,21 +71,12 @@ class ToStore implements DataStoreInterface {
       final impl = DataStoreImpl(
         dbPath: dbPath,
         config: config,
-        version: version,
         schemas: schemas,
         onConfigure: onConfigure != null
             ? (db) => onConfigure(ToStore._fromImpl(db))
             : null,
         onCreate:
             onCreate != null ? (db) => onCreate(ToStore._fromImpl(db)) : null,
-        onUpgrade: onUpgrade != null
-            ? (db, oldVersion, newVersion) =>
-                onUpgrade(ToStore._fromImpl(db), oldVersion, newVersion)
-            : null,
-        onDowngrade: onDowngrade != null
-            ? (db, oldVersion, newVersion) =>
-                onDowngrade(ToStore._fromImpl(db), oldVersion, newVersion)
-            : null,
         onOpen: onOpen != null ? (db) => onOpen(ToStore._fromImpl(db)) : null,
       );
       _instances[key] = ToStore._internal(impl);
@@ -113,23 +101,21 @@ class ToStore implements DataStoreInterface {
   /// await db.createTable(
   ///  TableSchema(
   ///   name: 'table_name',
-  ///   primaryKey: 'userId',
+  ///   primaryKeyConfig: PrimaryKeyConfig(
+  ///     name: 'userId',
+  ///     type: PrimaryKeyType.timestampBased,
+  ///   ),
   ///   fields: [
-  ///     FieldSchema(
-  ///       name: 'userId',
-  ///       type: DataType.integer,
-  ///       nullable: false,
-  ///     ),
   ///     FieldSchema(
   ///       name: 'userName',
   ///       type: DataType.text,
   ///       nullable: false,
+  ///       unique: true,
   ///     ),
   ///   ],
   ///   indexes: [
   ///     IndexSchema(
   ///       fields: ['userName'],
-  ///       unique: true,
   ///     ),
   ///   ],
   /// ));
@@ -154,12 +140,16 @@ class ToStore implements DataStoreInterface {
   /// await db.createTables([
   ///   TableSchema(
   ///     name: 'table_name',
-  ///     primaryKey: 'userId',
+  ///     primaryKeyConfig: PrimaryKeyConfig(
+  ///       name: 'userId',
+  ///       type: PrimaryKeyType.timestampBased,
+  ///     ),
   ///     fields: [
   ///       FieldSchema(
-  ///         name: 'userId',
-  ///         type: DataType.integer,
+  ///         name: 'userName',
+  ///         type: DataType.text,
   ///         nullable: false,
+  ///         unique: true,
   ///       ),
   ///     ],
   ///   ),
@@ -174,12 +164,14 @@ class ToStore implements DataStoreInterface {
   /// Insert data into table
   /// [tableName] Table name
   /// [data] Data to insert
+  /// Returns the operation result with primary key if successful
   ///
   /// 插入数据
   /// [tableName] 表名
   /// [data] 要插入的数据
+  /// 返回操作结果，包含主键信息
   @override
-  Future<bool> insert(String tableName, Map<String, dynamic> data) async {
+  Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
     return await _impl.insert(tableName, data);
   }
 
@@ -196,6 +188,29 @@ class ToStore implements DataStoreInterface {
   @override
   QueryBuilder query(String tableName) {
     return QueryBuilder(_impl, tableName);
+  }
+
+  /// Stream query data for a table, supports filtering
+  ///
+  /// Example:
+  /// ```dart
+  /// // Use directly as a Stream with listen
+  /// db.streamQuery('users')
+  ///   .where('age', '>', 18)
+  ///   .select(['name', 'email'])
+  ///   .listen((user) {
+  ///     print(user);
+  ///   });
+  ///
+  /// // Or with async for loop
+  /// await for (final user in db.streamQuery('users').where('id', '=', 123).stream) {
+  ///   print(user);
+  /// }
+  /// ```
+  /// 流式查询，支持链式操作条件过滤
+  @override
+  StreamQueryBuilder streamQuery(String tableName) {
+    return StreamQueryBuilder(_impl, tableName);
   }
 
   /// auto upsert data, if exists, update, if not, insert
@@ -223,16 +238,16 @@ class ToStore implements DataStoreInterface {
     return UpsertBuilder(_impl, tableName, data);
   }
 
-  /// Switch base space for scenarios like user switching
+  /// Switch space for scenarios like user switching
   /// Data isolation between spaces, global tables unaffected
   /// [spaceName] Space name, default is 'default'
   ///
-  /// 切换基础空间，用于用户切换等场景
+  /// 切换空间，用于用户切换等场景
   /// 不同空间数据隔离，全局表数据不受影响
   /// [spaceName] 空间名称，默认为'default'
   @override
-  Future<bool> switchBaseSpace({String spaceName = 'default'}) {
-    return _impl.switchBaseSpace(spaceName: spaceName);
+  Future<bool> switchSpace({String spaceName = 'default'}) {
+    return _impl.switchSpace(spaceName: spaceName);
   }
 
   /// Update data in table
@@ -255,12 +270,14 @@ class ToStore implements DataStoreInterface {
   /// Batch insert multiple records
   /// [tableName] Table name
   /// [dataList] List of records to insert
+  /// Returns the operation result with successful and failed keys
   ///
   /// 批量插入数据
   /// [tableName] 表名
   /// [dataList] 要插入的数据列表
+  /// 返回操作结果，包含成功和失败的主键信息
   @override
-  Future<bool> batchInsert(
+  Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList) async {
     return await _impl.batchInsert(tableName, dataList);
   }
@@ -360,7 +377,7 @@ class ToStore implements DataStoreInterface {
   /// 获取表结构
   /// [tableName] 表名
   @override
-  Future<TableSchema> getTableSchema(String tableName) async {
+  Future<TableSchema?> getTableSchema(String tableName) async {
     return await _impl.getTableSchema(tableName);
   }
 
@@ -384,7 +401,7 @@ class ToStore implements DataStoreInterface {
   /// - 创建时间
   /// - 是否全局表
   @override
-  Future<TableInfo> getTableInfo(String tableName) async {
+  Future<TableInfo?> getTableInfo(String tableName) async {
     return await _impl.getTableInfo(tableName);
   }
 
@@ -394,11 +411,11 @@ class ToStore implements DataStoreInterface {
   @override
   DataStoreConfig get config => _impl.config;
 
-  /// Get current base space name
+  /// Get current space name
   ///
-  /// 获取当前基础空间名称
+  /// 获取当前空间名称
   @override
-  String? get currentBaseSpaceName => _impl.currentBaseSpaceName;
+  String? get currentSpaceName => _impl.currentSpaceName;
 
   /// Get current database version number
   ///
@@ -416,63 +433,6 @@ class ToStore implements DataStoreInterface {
   @override
   Future<void> setVersion(int version) async {
     return await _impl.setVersion(version);
-  }
-
-  /// Query using Map style
-  /// [tableName] Table name
-  /// [where] Query conditions in Map format
-  /// [orderBy] Sort fields
-  /// [limit] Maximum number of records
-  /// [offset] Number of records to skip
-  ///
-  /// Map方式查询
-  /// [tableName] 表名
-  /// [where] Map格式的查询条件
-  /// [orderBy] 排序字段
-  /// [limit] 最大记录数
-  /// [offset] 跳过的记录数
-  @override
-  Future<List<Map<String, dynamic>>> queryByMap(String tableName,
-      {Map<String, dynamic>? where,
-      List<String>? orderBy,
-      int? limit,
-      int? offset}) async {
-    return await _impl.queryByMap(tableName,
-        where: where, orderBy: orderBy, limit: limit, offset: offset);
-  }
-
-  /// Query using SQL style
-  /// [tableName] Table name
-  /// [where] SQL WHERE clause
-  /// [whereArgs] Arguments for WHERE clause
-  /// [orderBy] Sort expression
-  /// [limit] Maximum number of records
-  /// [offset] Number of records to skip
-  ///
-  /// SQL方式查询
-  /// [tableName] 表名
-  /// [where] SQL WHERE子句
-  /// [whereArgs] WHERE子句的参数
-  /// [orderBy] 排序表达式
-  /// [limit] 最大记录数
-  /// [offset] 跳过的记录数
-  @override
-  Future<List<Map<String, dynamic>>> queryBySql(
-    String tableName, {
-    String? where,
-    List<dynamic>? whereArgs,
-    String? orderBy,
-    int? limit,
-    int? offset,
-  }) async {
-    return await _impl.queryBySql(
-      tableName,
-      where: where,
-      whereArgs: whereArgs,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-    );
   }
 
   /// Close database and clean up resources
@@ -521,7 +481,7 @@ class ToStore implements DataStoreInterface {
   ///
   /// Example:
   /// ```dart
-  /// await db.updateSchema('users')
+  /// final taskId = await db.updateSchema('users')
   ///   .addField('age', DataType.integer)
   ///   .removeField('old_field')
   ///   .renameField('name', 'full_name')
@@ -533,6 +493,38 @@ class ToStore implements DataStoreInterface {
   @override
   SchemaBuilder updateSchema(String tableName) {
     return SchemaBuilder(_impl, tableName);
+  }
+
+  /// 查询迁移任务状态
+  /// [taskId] 任务ID，可从updateSchema()方法中直接获取
+  /// 返回任务的详细状态，如果任务不存在则返回null
+  ///
+  /// Example:
+  /// ```dart
+  /// // 先执行更新操作获取任务ID
+  /// final taskId = await db.updateSchema('users')
+  ///   .renameField('nickname', 'displayName');
+  ///
+  /// // 查询任务状态
+  /// final status = await db.queryMigrationTaskStatus(taskId);
+  /// print('Migration progress: ${status?.progressPercentage}%');
+  /// ```
+  @override
+  Future<MigrationStatus?> queryMigrationTaskStatus(String taskId) async {
+    if (_impl.migrationManager == null) {
+      return null;
+    }
+    return _impl.migrationManager!.queryTaskStatus(taskId);
+  }
+
+  /// Get information about the current space
+  /// Returns detailed information about the current working space
+  ///
+  /// 获取当前空间的信息
+  /// 返回当前工作空间的详细信息
+  @override
+  Future<SpaceInfo> getSpaceInfo() async {
+    return await _impl.getSpaceInfo();
   }
 
   /// @nodoc

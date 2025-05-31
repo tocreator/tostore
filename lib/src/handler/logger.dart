@@ -41,6 +41,10 @@ class Logger {
 
   /// print info log
   static void info(Object? message, {String? label}) {
+    if (!LogConfig.shouldLogType(LogType.info)) {
+      return;
+    }
+    
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-info"
@@ -50,6 +54,10 @@ class Logger {
 
   /// print debug log
   static void debug(Object? message, {String? label}) {
+    if (!LogConfig.shouldLogType(LogType.debug)) {
+      return;
+    }
+    
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-debug"
@@ -59,6 +67,10 @@ class Logger {
 
   /// print warn log
   static void warn(Object? message, {String? label}) {
+    if (!LogConfig.shouldLogType(LogType.warn)) {
+      return;
+    }
+    
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-warn"
@@ -69,6 +81,10 @@ class Logger {
 
   /// print error log, label can define the method name
   static void error(Object? message, {String? label}) {
+    if (!LogConfig.shouldLogType(LogType.error)) {
+      return;
+    }
+    
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-error"
@@ -91,7 +107,7 @@ class Logger {
 
   /// internal log handler
   static void _log(Object? message, {String label = "log-info"}) {
-    if (kDebugMode) {
+    if (kDebugMode && LogConfig.enableLog) {
       String startDash = "${'-' * 20}    $label    ${'-' * 18}>>";
       String endDash = "${'-' * (startDash.length - 2)}<<";
       if (startDash.length > 130) {
