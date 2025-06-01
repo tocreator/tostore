@@ -1,4 +1,4 @@
-import 'dart:math';
+import 'dart:math' show max, sqrt;
 import 'dart:typed_data';
 import 'dart:convert';
 import '../handler/logger.dart';
@@ -527,6 +527,9 @@ class FieldSchema {
   final String?
       fieldId; // Unique identifier for fields, used for rename detection
 
+  /// Configuration for vector fields (only valid when type is DataType.vector)
+  final VectorFieldConfig? vectorConfig;
+
   const FieldSchema({
     required this.name,
     required this.type,
@@ -539,6 +542,7 @@ class FieldSchema {
     this.maxValue,
     this.comment,
     this.fieldId,
+    this.vectorConfig,
   });
 
   /// Create copy with modifications
@@ -554,6 +558,7 @@ class FieldSchema {
     num? maxValue,
     String? comment,
     String? fieldId,
+    VectorFieldConfig? vectorConfig,
   }) {
     return FieldSchema(
       name: name ?? this.name,
@@ -568,6 +573,7 @@ class FieldSchema {
       maxValue: maxValue ?? this.maxValue,
       comment: comment ?? this.comment,
       fieldId: fieldId ?? this.fieldId,
+      vectorConfig: vectorConfig ?? this.vectorConfig,
     );
   }
 
@@ -584,6 +590,7 @@ class FieldSchema {
       'unique': unique,
       'comment': comment,
       if (fieldId != null) 'fieldId': fieldId,
+      if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
     };
   }
 
@@ -602,9 +609,18 @@ class FieldSchema {
       }
     }
 
+    final type = getType();
+
+    // Parse vector configuration if it's a vector field
+    VectorFieldConfig? vectorConfig;
+    if (type == DataType.vector && json['vectorConfig'] != null) {
+      vectorConfig = VectorFieldConfig.fromJson(
+          json['vectorConfig'] as Map<String, dynamic>);
+    }
+
     return FieldSchema(
       name: json['name'] as String,
-      type: getType(),
+      type: type,
       nullable: json['nullable'] as bool? ?? true,
       defaultValue: json['defaultValue'],
       unique: json['unique'] as bool? ?? false,
@@ -614,6 +630,7 @@ class FieldSchema {
       maxValue: json['maxValue'] as num?,
       comment: json['comment'] as String?,
       fieldId: json['fieldId'] as String?,
+      vectorConfig: vectorConfig,
     );
   }
 
@@ -640,6 +657,8 @@ class FieldSchema {
           return Uint8List(0);
         case DataType.array:
           return [];
+        case DataType.vector:
+          return const VectorData([]); // Empty vector as default
       }
     }
     return null;
@@ -737,6 +756,11 @@ class FieldSchema {
         return false;
       case DataType.array:
         return value is List;
+      case DataType.vector:
+        // Accept VectorData, List of numbers, or byte representation
+        return value is VectorData ||
+            (value is List && value.every((v) => v is num)) ||
+            value is Uint8List;
     }
   }
 
@@ -885,6 +909,36 @@ class FieldSchema {
           }
         }
         return valueTemp == null ? null : [valueTemp];
+      case DataType.vector:
+        if (valueTemp is VectorData) return valueTemp;
+        if (valueTemp is List && valueTemp.every((v) => v is num)) {
+          return VectorData.fromList(valueTemp.cast<num>());
+        }
+        if (valueTemp is Uint8List) {
+          try {
+            return VectorData.fromBytes(valueTemp);
+          } catch (e) {
+            Logger.warn(
+              'Failed to convert binary data to vector: $e',
+              label: 'DataStore._toVector',
+            );
+            return null;
+          }
+        }
+        if (valueTemp is String) {
+          try {
+            final jsonList = jsonDecode(valueTemp);
+            if (jsonList is List && jsonList.every((v) => v is num)) {
+              return VectorData.fromList(jsonList.cast<num>());
+            }
+          } catch (e) {
+            Logger.warn(
+              'Failed to parse vector from string: $valueTemp',
+              label: 'DataStore._toVector',
+            );
+          }
+        }
+        return null;
     }
   }
 }
@@ -896,11 +950,15 @@ class IndexSchema {
   final bool unique;
   final IndexType type;
 
+  /// Vector index configuration (only valid when type is IndexType.vector)
+  final VectorIndexConfig? vectorConfig;
+
   const IndexSchema({
     this.indexName,
     required this.fields,
     this.unique = false,
     this.type = IndexType.btree,
+    this.vectorConfig,
   });
 
   /// get actual index name
@@ -912,14 +970,40 @@ class IndexSchema {
   }
 
   factory IndexSchema.fromJson(Map<String, dynamic> json) {
+    // Parse the index type
+    IndexType getIndexType() {
+      final typeStr = json['type'] as String?;
+      if (typeStr == null) return IndexType.btree;
+
+      // Match using lowercase to be more forgiving
+      switch (typeStr.toLowerCase()) {
+        case 'hash':
+          return IndexType.hash;
+        case 'bitmap':
+          return IndexType.bitmap;
+        case 'vector':
+          return IndexType.vector;
+        default:
+          return IndexType.btree;
+      }
+    }
+
+    // Parse type
+    final indexType = getIndexType();
+
+    // Parse vector configuration if it's a vector index
+    VectorIndexConfig? vectorConfig;
+    if (indexType == IndexType.vector && json['vectorConfig'] != null) {
+      vectorConfig = VectorIndexConfig.fromJson(
+          json['vectorConfig'] as Map<String, dynamic>);
+    }
+
     return IndexSchema(
       indexName: json['indexName'] as String?,
       fields: (json['fields'] as List).cast<String>(),
       unique: json['unique'] as bool? ?? false,
-      type: IndexType.values.firstWhere(
-        (t) => t.toString() == 'IndexType.${json['type']}',
-        orElse: () => IndexType.btree,
-      ),
+      type: indexType,
+      vectorConfig: vectorConfig,
     );
   }
 
@@ -929,6 +1013,7 @@ class IndexSchema {
       'fields': fields,
       'unique': unique,
       'type': type.toString().split('.').last,
+      if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
     };
   }
 
@@ -937,12 +1022,14 @@ class IndexSchema {
     List<String>? fields,
     bool? unique,
     IndexType? type,
+    VectorIndexConfig? vectorConfig,
   }) {
     return IndexSchema(
       indexName: indexName ?? this.indexName,
       fields: fields ?? this.fields,
       unique: unique ?? this.unique,
       type: type ?? this.type,
+      vectorConfig: vectorConfig ?? this.vectorConfig,
     );
   }
 }
@@ -957,6 +1044,7 @@ enum DataType {
   boolean,
   datetime,
   array,
+  vector, // Vector data type for storing numerical vector (embeddings)
 }
 
 /// index type enum
@@ -964,6 +1052,7 @@ enum IndexType {
   btree, // default, btree index
   hash, // hash index
   bitmap, // bitmap index
+  vector, // vector similarity index
 }
 
 /// Primary key generation method
@@ -1113,5 +1202,703 @@ class PrimaryKeyConfig {
               : null),
       isOrdered: json['isOrdered'] as bool?,
     );
+  }
+}
+
+/// Represents vector data for machine learning and similarity search operations
+///
+/// [VectorData] provides a specialized container for managing numerical vectors used in
+/// machine learning applications, similarity searches, and other vector operations.
+///
+/// Key features:
+/// - Supports different precision levels ([VectorPrecision])
+/// - Provides conversions between different formats (List<double>, binary)
+/// - Performs basic vector operations (normalization, dot product)
+/// - Ensures type safety and validation for vector operations
+///
+/// Example usage:
+/// ```dart
+/// // Create a vector from a list of doubles
+/// final vector = VectorData.fromList([0.1, 0.2, 0.3, 0.4]);
+///
+/// // Convert to normalized form (unit vector)
+/// final normalized = vector.normalize();
+///
+/// // Calculate similarity with another vector
+/// final similarity = normalized.dotProduct(anotherVector);
+///
+/// // Convert to binary format for storage
+/// final bytes = vector.toBytes();
+/// ```
+class VectorData {
+  /// Internal storage of vector values
+  final List<double> values;
+
+  /// The number of dimensions in this vector
+  int get dimensions => values.length;
+
+  /// Creates a new vector with the given values
+  ///
+  /// Each element represents one dimension in the vector.
+  const VectorData(this.values);
+
+  /// Creates a vector from a list of double values
+  ///
+  /// This is the standard way to create a vector from application data.
+  ///
+  /// Example:
+  /// ```dart
+  /// final embedding = VectorData.fromList([0.42, -0.087, 0.34, ...]);
+  /// ```
+  factory VectorData.fromList(List<num> list) {
+    return VectorData(list.map((v) => v.toDouble()).toList(growable: false));
+  }
+
+  /// Creates a vector from binary data
+  ///
+  /// The binary data must be in IEEE 754 double-precision format (8 bytes per value).
+  /// The total length of the data must be a multiple of 8 bytes.
+  ///
+  /// Throws [ArgumentError] if the data length is not valid (must be multiple of 8 bytes).
+  ///
+  /// Example:
+  /// ```dart
+  /// // Restore a vector from stored binary data
+  /// final vector = VectorData.fromBytes(storedBinaryData);
+  /// ```
+  factory VectorData.fromBytes(Uint8List bytes) {
+    if (bytes.length % 8 != 0) {
+      throw ArgumentError(
+        'Binary data length (${bytes.length}) must be a multiple of 8 bytes',
+      );
+    }
+
+    final buffer = bytes.buffer;
+    final doubleList = Float64List.view(buffer, 0, bytes.length ~/ 8);
+    return VectorData(doubleList.toList(growable: false));
+  }
+
+  /// Converts this vector to binary format
+  ///
+  /// Returns the vector as a list of bytes in IEEE 754 double-precision format.
+  /// Each double value (8 bytes) is stored in little-endian byte order.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Convert vector to binary for storage
+  /// final bytes = vectorData.toBytes();
+  /// await database.storeVector(fieldName, bytes);
+  /// ```
+  Uint8List toBytes() {
+    final Float64List floatList = Float64List.fromList(values);
+    return Uint8List.view(floatList.buffer);
+  }
+
+  /// Convert vector to a standard JSON representation
+  List<double> toJson() {
+    return List<double>.from(values);
+  }
+
+  /// Create a vector from JSON
+  factory VectorData.fromJson(List<dynamic> json) {
+    return VectorData(
+        json.map<double>((v) => (v as num).toDouble()).toList(growable: false));
+  }
+
+  /// Get string representation of the vector
+  @override
+  String toString() {
+    if (dimensions <= 6) {
+      return 'VectorData${values}';
+    }
+    // For long vectors, show first 3 and last 3 values
+    return 'VectorData[${values[0].toStringAsFixed(4)}, ${values[1].toStringAsFixed(4)}, ${values[2].toStringAsFixed(4)}, ..., ${values[dimensions - 3].toStringAsFixed(4)}, ${values[dimensions - 2].toStringAsFixed(4)}, ${values[dimensions - 1].toStringAsFixed(4)}] (dim: $dimensions)';
+  }
+
+  /// Compare with another vector
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! VectorData) return false;
+    if (other.values.length != values.length) return false;
+
+    for (int i = 0; i < values.length; i++) {
+      // Use epsilon comparison for floating point values
+      if ((values[i] - other.values[i]).abs() > 1e-10) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(values);
+
+  /// Creates a normalized copy of this vector (unit vector)
+  ///
+  /// Normalization scales the vector so its magnitude (length) equals 1,
+  /// which is useful for cosine similarity calculations.
+  ///
+  /// Returns a new [VectorData] instance with normalized values.
+  /// Returns a zero vector if the original vector has zero magnitude.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Normalize a vector for cosine similarity comparison
+  /// final unitVector = embedding.normalize();
+  /// ```
+  VectorData normalize() {
+    final magnitude = _magnitude();
+    if (magnitude == 0) {
+      return VectorData(List<double>.filled(dimensions, 0));
+    }
+
+    final normalized = List<double>.generate(
+      dimensions,
+      (i) => values[i] / magnitude,
+    );
+    return VectorData(normalized);
+  }
+
+  /// Calculates the magnitude (length) of this vector
+  ///
+  /// Returns the Euclidean norm (square root of the sum of squared values).
+  double _magnitude() {
+    double sumOfSquares = 0;
+    for (final value in values) {
+      sumOfSquares += value * value;
+    }
+    return sqrt(sumOfSquares);
+  }
+
+  /// Calculates the dot product between this vector and another
+  ///
+  /// The dot product is the sum of the products of corresponding elements.
+  /// For normalized vectors, the dot product equals the cosine similarity.
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Calculate similarity between two normalized vectors
+  /// final similarity = vector1.normalize().dotProduct(vector2.normalize());
+  /// // Values close to 1 indicate high similarity
+  /// ```
+  double dotProduct(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError(
+        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+      );
+    }
+
+    double result = 0;
+    for (int i = 0; i < dimensions; i++) {
+      result += values[i] * other.values[i];
+    }
+    return result;
+  }
+
+  /// Calculates cosine similarity between this vector and another
+  ///
+  /// Cosine similarity measures the cosine of the angle between two vectors,
+  /// providing a value between -1 and 1 where:
+  /// - 1 means vectors are identical
+  /// - 0 means vectors are orthogonal (unrelated)
+  /// - -1 means vectors are exactly opposite
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// final similarity = queryVector.cosineSimilarity(documentVector);
+  /// if (similarity > 0.8) {
+  ///   print('High similarity match found');
+  /// }
+  /// ```
+  double cosineSimilarity(VectorData other) {
+    return normalize().dotProduct(other.normalize());
+  }
+
+  /// Calculates Euclidean distance between this vector and another
+  ///
+  /// Euclidean distance measures the straight-line distance between two points
+  /// in vector space. Lower values indicate greater similarity.
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// final distance = vector1.euclideanDistance(vector2);
+  /// if (distance < threshold) {
+  ///   print('Vectors are similar');
+  /// }
+  /// ```
+  double euclideanDistance(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError(
+        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+      );
+    }
+
+    double sumSquaredDifferences = 0;
+    for (int i = 0; i < dimensions; i++) {
+      final diff = values[i] - other.values[i];
+      sumSquaredDifferences += diff * diff;
+    }
+    return sqrt(sumSquaredDifferences);
+  }
+
+  /// Adds another vector to this vector
+  ///
+  /// Element-wise addition of corresponding values.
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// final combinedVector = vector1.add(vector2);
+  /// ```
+  VectorData add(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError(
+        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+      );
+    }
+
+    final result = List<double>.generate(
+      dimensions,
+      (i) => values[i] + other.values[i],
+    );
+    return VectorData(result);
+  }
+
+  /// Subtracts another vector from this vector
+  ///
+  /// Element-wise subtraction of corresponding values.
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// final differenceVector = vector1.subtract(vector2);
+  /// ```
+  VectorData subtract(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError(
+        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+      );
+    }
+
+    final result = List<double>.generate(
+      dimensions,
+      (i) => values[i] - other.values[i],
+    );
+    return VectorData(result);
+  }
+
+  /// Scales this vector by a scalar value
+  ///
+  /// Multiplies each element by the given scale factor.
+  ///
+  /// Example:
+  /// ```dart
+  /// final doubledVector = vector.scale(2.0);
+  /// final halvedVector = vector.scale(0.5);
+  /// ```
+  VectorData scale(double factor) {
+    final result = List<double>.generate(
+      dimensions,
+      (i) => values[i] * factor,
+    );
+    return VectorData(result);
+  }
+
+  /// Calculates the L1 (Manhattan) distance between this vector and another
+  ///
+  /// L1 distance is the sum of the absolute differences between corresponding elements.
+  ///
+  /// Throws [ArgumentError] if the vectors have different dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// final distance = vector1.manhattanDistance(vector2);
+  /// ```
+  double manhattanDistance(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError(
+        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+      );
+    }
+
+    double sum = 0;
+    for (int i = 0; i < dimensions; i++) {
+      sum += (values[i] - other.values[i]).abs();
+    }
+    return sum;
+  }
+
+  /// Returns a subset of the vector with specified start and length
+  ///
+  /// Creates a new vector containing elements from [start] to [start + length - 1].
+  ///
+  /// Throws [RangeError] if the range is out of bounds.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Get the first 128 dimensions
+  /// final firstPart = embedding.subvector(0, 128);
+  /// ```
+  VectorData subvector(int start, int length) {
+    if (start < 0 || start >= dimensions) {
+      throw RangeError('Start index out of range: $start');
+    }
+    if (start + length > dimensions) {
+      throw RangeError('End index out of range: ${start + length}');
+    }
+
+    return VectorData(values.sublist(start, start + length));
+  }
+
+  /// Creates a new vector by concatenating this vector with another
+  ///
+  /// The resulting vector will have dimensions equal to the sum of both vectors' dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Combine two embeddings into one longer vector
+  /// final combinedEmbedding = titleEmbedding.concat(bodyEmbedding);
+  /// ```
+  VectorData concat(VectorData other) {
+    final result = List<double>.from(values)..addAll(other.values);
+    return VectorData(result);
+  }
+
+  /// Truncates a vector to the specified number of dimensions
+  ///
+  /// Creates a new vector containing only the first [newDimensions] elements.
+  ///
+  /// Throws [ArgumentError] if newDimensions is greater than the current dimensions.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Reduce a 1536-dim vector to 768 dimensions
+  /// final reducedVector = fullVector.truncate(768);
+  /// ```
+  VectorData truncate(int newDimensions) {
+    if (newDimensions > dimensions) {
+      throw ArgumentError(
+        'New dimensions ($newDimensions) cannot be greater than current dimensions ($dimensions)',
+      );
+    }
+    return subvector(0, newDimensions);
+  }
+}
+
+/// Vector field configuration
+///
+/// Configures the properties of a vector field, such as dimensions and precision.
+/// This is used with [FieldSchema] when the field type is [DataType.vector].
+class VectorFieldConfig {
+  /// Dimension of the vector
+  ///
+  /// Specifies the number of dimensions (length) of the vector.
+  /// Common values are 384, 512, 768, 1024, and 1536 (for OpenAI embeddings).
+  final int dimensions;
+
+  /// Precision of vector data (bits per dimension)
+  ///
+  /// Controls how the vector is stored and the precision of calculations.
+  /// - [VectorPrecision.float64]: 64-bit double precision (default, highest precision)
+  /// - [VectorPrecision.float32]: 32-bit single precision (reduced memory usage)
+  /// - [VectorPrecision.int8]: 8-bit integers (quantized, significant memory savings)
+  final VectorPrecision precision;
+
+  /// Constructor
+  const VectorFieldConfig({
+    required this.dimensions,
+    this.precision = VectorPrecision.float64,
+  });
+
+  /// Convert to JSON
+  Map<String, dynamic> toJson() {
+    return {
+      'dimensions': dimensions,
+      'precision': precision.toString().split('.').last,
+    };
+  }
+
+  /// Create from JSON
+  factory VectorFieldConfig.fromJson(Map<String, dynamic> json) {
+    // Parse precision
+    VectorPrecision getPrecision() {
+      final precisionStr = json['precision'] as String?;
+      if (precisionStr == null) return VectorPrecision.float64;
+
+      switch (precisionStr.toLowerCase()) {
+        case 'float32':
+          return VectorPrecision.float32;
+        case 'int8':
+          return VectorPrecision.int8;
+        default:
+          return VectorPrecision.float64;
+      }
+    }
+
+    return VectorFieldConfig(
+      dimensions: json['dimensions'] as int? ?? 0,
+      precision: getPrecision(),
+    );
+  }
+
+  /// Copy with new values
+  VectorFieldConfig copyWith({
+    int? dimensions,
+    VectorPrecision? precision,
+  }) {
+    return VectorFieldConfig(
+      dimensions: dimensions ?? this.dimensions,
+      precision: precision ?? this.precision,
+    );
+  }
+}
+
+/// Vector precision options
+///
+/// Specifies the numeric precision used for storing vector values.
+/// Higher precision offers better accuracy but uses more storage space.
+enum VectorPrecision {
+  /// 64-bit floating point (IEEE 754)
+  ///
+  /// Default and highest precision, uses 8 bytes per dimension
+  float64,
+
+  /// 32-bit floating point
+  ///
+  /// Standard single precision, uses 4 bytes per dimension
+  /// Offers a good balance between precision and storage efficiency
+  float32,
+
+  /// 8-bit integer (quantized)
+  ///
+  /// Uses quantization to reduce storage to 1 byte per dimension
+  /// Significant memory savings with some loss of precision
+  int8,
+}
+
+/// Vector index type for future use
+///
+/// Specifies the algorithm used for vector indexing and similarity search.
+/// Different types offer various trade-offs between build time, query time,
+/// memory usage, and accuracy.
+enum VectorIndexType {
+  /// Flat index (brute force)
+  ///
+  /// Performs exhaustive search for exact nearest neighbors
+  /// Best accuracy but slowest for large datasets
+  flat,
+
+  /// Inverted file index
+  ///
+  /// Uses quantization and inverted file structure for faster search
+  /// Good balance of speed and accuracy
+  ivf,
+
+  /// Hierarchical navigable small world
+  ///
+  /// Graph-based index structure for efficient approximate nearest neighbor search
+  /// Excellent search speed with high recall
+  hnsw,
+
+  /// Product quantization
+  ///
+  /// Compresses vectors using product quantization for memory-efficient storage
+  /// Allows for memory-efficient similarity search
+  pq,
+}
+
+/// Vector distance metric for similarity calculations
+///
+/// Specifies how the distance/similarity between vectors is calculated.
+/// The appropriate metric depends on your application and how vectors were created.
+enum VectorDistanceMetric {
+  /// Euclidean distance (L2)
+  ///
+  /// Straight-line distance in vector space
+  /// Lower values indicate greater similarity
+  l2,
+
+  /// Inner product
+  ///
+  /// Dot product of vectors
+  /// Higher values indicate greater similarity
+  /// Most efficient but requires normalized vectors for meaningful similarity
+  innerProduct,
+
+  /// Cosine similarity
+  ///
+  /// Measures the cosine of the angle between vectors
+  /// Higher values indicate greater similarity
+  /// Invariant to vector magnitude, focuses on direction
+  cosine,
+}
+
+/// Vector Index Configuration (for future vector search capabilities)
+///
+/// Configures how vector indexes are built and searched.
+/// This is used with [IndexSchema] when the index type is [IndexType.vector].
+class VectorIndexConfig {
+  /// Type of vector index
+  ///
+  /// Specifies the algorithm used for indexing vectors
+  final VectorIndexType indexType;
+
+  /// Distance metric for similarity search
+  ///
+  /// Specifies how similarity between vectors is calculated
+  final VectorDistanceMetric distanceMetric;
+
+  /// Additional index parameters
+  ///
+  /// Algorithm-specific parameters to fine-tune the index behavior
+  /// Common parameters:
+  /// - 'M': (for HNSW) Maximum number of connections per layer
+  /// - 'efConstruction': (for HNSW) Controls index build quality
+  /// - 'efSearch': (for HNSW) Controls search accuracy/speed trade-off
+  /// - 'nlist': (for IVF) Number of clusters/cells
+  /// - 'nprobe': (for IVF) Number of cells to visit during search
+  final Map<String, dynamic> parameters;
+
+  /// Constructor
+  const VectorIndexConfig({
+    this.indexType = VectorIndexType.flat,
+    this.distanceMetric = VectorDistanceMetric.cosine,
+    this.parameters = const {},
+  });
+
+  /// Convert to JSON
+  Map<String, dynamic> toJson() {
+    return {
+      'indexType': indexType.toString().split('.').last,
+      'distanceMetric': distanceMetric.toString().split('.').last,
+      'parameters': parameters,
+    };
+  }
+
+  /// Create from JSON
+  factory VectorIndexConfig.fromJson(Map<String, dynamic> json) {
+    // Parse index type
+    VectorIndexType getIndexType() {
+      final typeStr = json['indexType'] as String?;
+      if (typeStr == null) return VectorIndexType.flat;
+
+      switch (typeStr.toLowerCase()) {
+        case 'ivf':
+          return VectorIndexType.ivf;
+        case 'hnsw':
+          return VectorIndexType.hnsw;
+        case 'pq':
+          return VectorIndexType.pq;
+        default:
+          return VectorIndexType.flat;
+      }
+    }
+
+    // Parse distance metric
+    VectorDistanceMetric getDistanceMetric() {
+      final metricStr = json['distanceMetric'] as String?;
+      if (metricStr == null) return VectorDistanceMetric.cosine;
+
+      switch (metricStr.toLowerCase()) {
+        case 'l2':
+          return VectorDistanceMetric.l2;
+        case 'innerproduct':
+          return VectorDistanceMetric.innerProduct;
+        default:
+          return VectorDistanceMetric.cosine;
+      }
+    }
+
+    return VectorIndexConfig(
+      indexType: getIndexType(),
+      distanceMetric: getDistanceMetric(),
+      parameters: json['parameters'] as Map<String, dynamic>? ?? {},
+    );
+  }
+}
+
+/// Vector utility methods extension
+extension VectorMethods on VectorData {
+  /// Calculate dot product with another vector
+  double dotProduct(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError('Vectors must have same dimensions');
+    }
+
+    double sum = 0;
+    for (int i = 0; i < dimensions; i++) {
+      sum += values[i] * other.values[i];
+    }
+    return sum;
+  }
+
+  /// Calculate Euclidean distance (L2) to another vector
+  double l2Distance(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError('Vectors must have same dimensions');
+    }
+
+    double sum = 0;
+    for (int i = 0; i < dimensions; i++) {
+      final diff = values[i] - other.values[i];
+      sum += diff * diff;
+    }
+    return sqrt(sum);
+  }
+
+  /// Calculate cosine similarity to another vector
+  double cosineSimilarity(VectorData other) {
+    if (dimensions != other.dimensions) {
+      throw ArgumentError('Vectors must have same dimensions');
+    }
+
+    // Calculate dot product
+    double dotProd = dotProduct(other);
+
+    // Calculate magnitudes
+    double mag1 = 0;
+    double mag2 = 0;
+
+    for (int i = 0; i < dimensions; i++) {
+      mag1 += values[i] * values[i];
+      mag2 += other.values[i] * other.values[i];
+    }
+
+    mag1 = sqrt(mag1);
+    mag2 = sqrt(mag2);
+
+    // Avoid division by zero
+    if (mag1 == 0 || mag2 == 0) return 0;
+
+    return dotProd / (mag1 * mag2);
+  }
+
+  /// Normalize the vector (convert to unit vector)
+  VectorData normalize() {
+    // Calculate magnitude
+    double sumSquares = 0;
+    for (final val in values) {
+      sumSquares += val * val;
+    }
+
+    final magnitude = sqrt(sumSquares);
+
+    // Avoid division by zero
+    if (magnitude == 0) return this;
+
+    // Create normalized values
+    final normalizedValues =
+        values.map((v) => v / magnitude).toList(growable: false);
+    return VectorData(normalizedValues);
   }
 }

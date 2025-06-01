@@ -192,6 +192,101 @@ class TostoreExample {
     await db.restore(backupPath);
   }
 
+  /// Example: Working with vector data
+  Future<void> vectorExamples() async {
+    // create table structure
+    await db.createTables([
+      const TableSchema(
+        name: 'embeddings',
+        primaryKeyConfig: PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.timestampBased,
+        ),
+        fields: [
+          FieldSchema(
+            name: 'document_title',
+            type: DataType.text,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: 'embedding',
+            type: DataType.vector,
+            vectorConfig: VectorFieldConfig(
+              dimensions: 1536, // 1536 dimensions
+              precision: VectorPrecision.float64, // 64-bit precision
+            ),
+          ),
+        ],
+        indexes: [
+          IndexSchema(
+            fields: ['embedding'],
+            type: IndexType.vector,
+            vectorConfig: VectorIndexConfig(
+              indexType:
+                  VectorIndexType.hnsw, // HNSW for fast approximate search
+              distanceMetric: VectorDistanceMetric.cosine, // Cosine similarity
+              parameters: {
+                'M': 16, // Max number of connections per layer
+                'efConstruction': 200, // Controls index quality
+                'efSearch': 100, // Controls search accuracy/speed trade-off
+              },
+            ),
+          ),
+        ],
+      ),
+    ]);
+
+    // create vector data
+    final sampleVector1 = VectorData.fromList([0.1, 0.2, 0.3, 0.4]);
+    final sampleVector2 = VectorData.fromList([0.5, 0.6, 0.7, 0.8]);
+
+    // store documents with vector embeddings
+    await db.insert('embeddings', {
+      'document_title': 'Introduction to vector databases',
+      'embedding': sampleVector1,
+    });
+
+    await db.insert('embeddings', {
+      'document_title': 'Machine Learning with embeddings',
+      'embedding': sampleVector2,
+    });
+
+    // query stored vector data
+    final result = await db.query('embeddings');
+    final documents = result.data;
+    List<VectorData> vectors = [];
+
+    for (var doc in documents) {
+      if (doc['embedding'] is List) {
+        VectorData vector =
+            VectorData.fromJson(doc['embedding'] as List<dynamic>);
+        vectors.add(vector);
+        doc['embedding'] = vector;
+
+        log('document title: ${doc['document_title']}, vector dimensions: ${vector.dimensions}');
+      }
+    }
+
+    // at least two vectors can be compared
+    if (vectors.length >= 2) {
+      final vector1 = vectors[0];
+      final vector2 = vectors[1];
+
+      log('vector1: ${vector1.toString()}');
+      log('vector2: ${vector2.toString()}');
+
+      // calculate vector similarity
+      final similarity = vector1.cosineSimilarity(vector2);
+      log('vector similarity: $similarity');
+
+      // calculate euclidean distance
+      final distance = vector1.euclideanDistance(vector2);
+      log('vector distance: $distance');
+    } else {
+      log('not enough vector data for comparison');
+    }
+  }
+
   /// backend server or distributed example
   Future<void> distributedExample() async {
     // create database instance
@@ -213,36 +308,25 @@ class TostoreExample {
     );
 
     // create tables
-    await db.createTables([
-      const TableSchema(
-          name: 'users',
-          primaryKeyConfig: PrimaryKeyConfig(
-            name: 'id',
-            type: PrimaryKeyType.sequential, // sequential key type
-            sequentialConfig: SequentialIdConfig(
-              initialValue: 10000, // initial value
-              increment: 50, // increment
-              useRandomIncrement:
-                  true, // use random increment, avoid exposing business volume
+    await db.createTables(
+      [
+        const TableSchema(
+            name: 'users',
+            primaryKeyConfig: PrimaryKeyConfig(
+              name: 'id',
+              type: PrimaryKeyType.sequential, // sequential key type
+              sequentialConfig: SequentialIdConfig(
+                initialValue: 10000, // initial value
+                increment: 50, // increment
+                useRandomIncrement:
+                    true, // use random increment, avoid exposing business volume
+              ),
             ),
-          ),
-          // field and index definition ...
-          fields: []),
-      const TableSchema(
-          name: 'vector',
-          primaryKeyConfig: PrimaryKeyConfig(
-            name: 'vector_id',
-            type: PrimaryKeyType.timestampBased, // timestamp based key type
-          ),
-          // field and index definition ...
-          fields: [
-            FieldSchema(
-              name: 'vector_data',
-              type: DataType.blob, // vector data
-            ),
-          ]),
+            // field and index definition ...
+            fields: []),
+      ],
       // other tables ...
-    ]);
+    );
 
     // update table structure
     final taskId = await db
@@ -278,6 +362,7 @@ void main() async {
   await example.multiSpaceExamples();
   await example.advancedQueryExamples();
   await example.backupExample();
+  await example.vectorExamples();
 
   runApp(const MaterialApp(
     home: Scaffold(
