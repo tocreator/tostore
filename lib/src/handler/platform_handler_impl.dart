@@ -2,7 +2,9 @@ import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:async';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:archive/archive_io.dart';
 import '../Interface/platform_interface.dart';
+import '../handler/logger.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
@@ -85,6 +87,23 @@ class PlatformHandlerImpl implements PlatformInterface {
       // Fallback to temporary directory
       final tempDir = await Directory.systemTemp.createTemp('tostore_');
       return tempDir.path;
+    }
+  }
+
+  /// create temp directory
+  /// return temp directory path
+  @override
+  Future<String> createTempDirectory(String prefix) async {
+    final tempDir = await Directory.systemTemp.createTemp(prefix);
+    return tempDir.path;
+  }
+
+  /// delete directory
+  @override
+  Future<void> deleteDirectory(String path, {bool recursive = true}) async {
+    final dir = Directory(path);
+    if (await dir.exists()) {
+      await dir.delete(recursive: recursive);
     }
   }
 
@@ -223,6 +242,110 @@ class PlatformHandlerImpl implements PlatformInterface {
       return processorCores <= 4 ? 2048 : 4096;
     } catch (e) {
       return 2048; // 2GB as default value
+    }
+  }
+
+  /// compress directory to ZIP file
+  @override
+  Future<void> compressDirectory(String sourceDir, String targetZip) async {
+    try {
+      // use archive package
+      final encoder = ZipFileEncoder();
+      encoder.create(targetZip);
+
+      // add directory
+      await encoder.addDirectory(Directory(sourceDir), includeDirName: false);
+      await encoder.close();
+    } catch (e) {
+      Logger.error('compress directory failed: $e',
+          label: 'PlatformHandlerImpl.compressDirectory');
+      rethrow;
+    }
+  }
+
+  /// decompress ZIP file to specified directory
+  @override
+  Future<void> extractZip(String zipPath, String targetDir) async {
+    try {
+      final directory = Directory(targetDir);
+      if (!await directory.exists()) {
+        await directory.create(recursive: true);
+      }
+
+      await extractFileToDisk(zipPath, targetDir);
+    } catch (e) {
+      Logger.error('decompress ZIP file failed: $e',
+          label: 'PlatformHandlerImpl.extractZip');
+
+      // try alternative decompression method
+      try {
+        final bytes = await File(zipPath).readAsBytes();
+        final archive = ZipDecoder().decodeBytes(bytes);
+
+        for (final file in archive) {
+          final filename = file.name;
+          if (file.isFile) {
+            final data = file.content as List<int>;
+            final outFile = File('$targetDir/$filename');
+            await outFile.parent.create(recursive: true);
+            await outFile.writeAsBytes(data);
+          } else {
+            await Directory('$targetDir/$filename').create(recursive: true);
+          }
+        }
+      } catch (fallbackError) {
+        Logger.error(
+            'alternative decompression method also failed: $fallbackError',
+            label: 'PlatformHandlerImpl.extractZip');
+        rethrow;
+      }
+    }
+  }
+
+  /// Verify if a ZIP file is valid and optionally check if it contains a specific file
+  @override
+  Future<bool> verifyZipFile(String zipPath, {String? requiredFile}) async {
+    try {
+      // Check if file exists
+      final file = File(zipPath);
+      if (!await file.exists()) {
+        Logger.warn('ZIP file does not exist: $zipPath',
+            label: 'PlatformHandlerImpl.verifyZipFile');
+        return false;
+      }
+
+      // Read file bytes
+      final bytes = await file.readAsBytes();
+      if (bytes.isEmpty) {
+        Logger.warn('ZIP file is empty: $zipPath',
+            label: 'PlatformHandlerImpl.verifyZipFile');
+        return false;
+      }
+
+      // Attempt to decode the ZIP file
+      try {
+        final archive = ZipDecoder().decodeBytes(bytes);
+
+        // If a specific file is required, check for its existence
+        if (requiredFile != null) {
+          final hasRequiredFile = archive.findFile(requiredFile) != null;
+          if (!hasRequiredFile) {
+            Logger.warn('Required file not found in ZIP: $requiredFile',
+                label: 'PlatformHandlerImpl.verifyZipFile');
+            return false;
+          }
+        }
+
+        return true;
+      } catch (decodeError) {
+        Logger.error('Failed to decode ZIP file: $decodeError',
+            label: 'PlatformHandlerImpl.verifyZipFile');
+        return false;
+      }
+    } catch (e) {
+      Logger.error('Error verifying ZIP file: $e',
+          label: 'PlatformHandlerImpl.verifyZipFile');
+      return false;
     }
   }
 }

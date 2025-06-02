@@ -78,10 +78,10 @@ abstract class DataStoreInterface {
   Future<void> close();
 
   /// backup database
-  Future<String> backup();
+  Future<String> backup({bool compress = true});
 
   /// restore database
-  Future<bool> restore(String backupPath);
+  Future<bool> restore(String backupPath, {bool deleteAfterRestore = false});
 
   /// get current config
   DataStoreConfig get config;

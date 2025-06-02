@@ -186,10 +186,11 @@ class TostoreExample {
   /// Example: Backup and restore
   Future<void> backupExample() async {
     // Create backup
-    final backupPath = await db.backup();
+    final backupPath = await db.backup(compress: false);
+    log('Backup created at: $backupPath');
 
     // Restore from backup
-    await db.restore(backupPath);
+    await db.restore(backupPath, deleteAfterRestore: true);
   }
 
   /// Example: Working with vector data

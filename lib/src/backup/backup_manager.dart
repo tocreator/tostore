@@ -1,16 +1,13 @@
 import 'dart:convert';
-// Use dart:io only when not on web platform
-import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
+
 import 'package:path/path.dart' as p;
 
 import 'package:flutter/foundation.dart';
-import 'package:archive/archive_io.dart';
 
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
-
-import 'backup_info.dart';
+import '../handler/platform_handler.dart';
 
 /// backup manager
 class BackupManager {
@@ -55,7 +52,9 @@ class BackupManager {
 
       // Check if directory was created successfully
       if (!await _dataStore.storage.existsDirectory(backupDir)) {
-        throw StateError('Failed to create backup directory: $backupDir');
+        if (!kIsWeb) {
+          throw StateError('Failed to create backup directory: $backupDir');
+        }
       }
 
       // Create metadata file with backup information
@@ -143,24 +142,15 @@ class BackupManager {
   }
 
   /// Compress directory to a zip file
-  /// Using archive package for cross-platform support
+  /// Using PlatformHandler for cross-platform support
   Future<void> _compressDirectory(String sourceDir, String targetZip) async {
-    if (kIsWeb) {
-      throw UnsupportedError(
-          'Directory compression not supported on web platform');
-    }
-
     try {
       Logger.info('Compressing directory: $sourceDir to $targetZip',
           label: 'BackupManager._compressDirectory');
 
-      final encoder = ZipFileEncoder();
-      encoder.create(targetZip);
-      await encoder.addDirectory(Directory(sourceDir),
-          includeDirName: false, level: _dataStore.config.compressionLevel);
-      await encoder.close();
+      await PlatformHandler.compressDirectory(sourceDir, targetZip);
 
-      Logger.info('Directory compressed successfully using archive package',
+      Logger.info('Directory compressed successfully',
           label: 'BackupManager._compressDirectory');
     } catch (e) {
       Logger.error('Failed to compress directory: $e',
@@ -182,91 +172,6 @@ class BackupManager {
     }
 
     return jsonDecode(metaJson) as Map<String, dynamic>;
-  }
-
-  /// List all backups
-  Future<List<BackupInfo>> listBackups() async {
-    final backups = <BackupInfo>[];
-    final backupPath = _dataStore.pathManager.getBackupPath();
-
-    if (!await _dataStore.storage.existsDirectory(backupPath)) {
-      return backups;
-    }
-
-    // Get list of items in backup directory
-    final items = await _dataStore.storage.listDirectory(backupPath);
-
-    for (String path in items) {
-      // Skip non-backup items
-      if (!path.contains('backup_') ||
-          !(await _dataStore.storage.existsDirectory(path) ||
-              path.endsWith('.zip'))) {
-        continue;
-      }
-
-      try {
-        // Get metadata
-        final isDirectory = await _isDirectory(path);
-        final metaData = isDirectory
-            ? await readBackupMetadata(path)
-            : {'timestamp': _extractTimestampFromPath(path)};
-
-        int size = await _calculateBackupSize(path);
-        final isFullBackup = metaData['type'] == 'full';
-
-        backups.add(BackupInfo(
-          path: path,
-          timestamp: DateTime.parse(metaData['timestamp'] as String),
-          isIncremental: false, // Directory backups are always full backups
-          size: size,
-          isFullBackup: isFullBackup,
-        ));
-      } catch (e) {
-        // Skip invalid backup
-        Logger.error('Skip invalid backup: $path, error: $e',
-            label: 'BackupManager.listBackups');
-        continue;
-      }
-    }
-
-    // Sort by timestamp (newest first)
-    backups.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-    return backups;
-  }
-
-  /// Extract timestamp from backup path
-  String _extractTimestampFromPath(String path) {
-    final regex = RegExp(r'backup_([0-9T\-:]+)');
-    final match = regex.firstMatch(path);
-    if (match != null && match.groupCount >= 1) {
-      return match.group(1)!.replaceAll('-', ':');
-    }
-    return DateTime.now().toIso8601String();
-  }
-
-  /// Calculate the size of a backup (directory or zip file)
-  Future<int> _calculateBackupSize(String path) async {
-    // For zip files, just get the file size
-    if (path.endsWith('.zip')) {
-      if (kIsWeb) return 0; // Size calculation might not be available on Web
-      return await _dataStore.storage.getFileSize(path);
-    }
-
-    // For directories, calculate total size of all files
-    int size = 0;
-    try {
-      // On Web, we may need a different approach
-      // This is a simplified calculation that may not work perfectly on Web
-      final files = await _dataStore.storage.listDirectory(path);
-      for (String filePath in files) {
-        if (await _dataStore.storage.existsFile(filePath)) {
-          size += await _dataStore.storage.getFileSize(filePath);
-        }
-      }
-    } catch (e) {
-      Logger.error('Error calculating backup size: $e');
-    }
-    return size;
   }
 
   /// Clean the database root directory but preserve specific directories
@@ -294,21 +199,7 @@ class BackupManager {
       // First ensure the target directory exists
       await _dataStore.storage.ensureDirectoryExists(destPath);
 
-      // List all contents in the source directory
-      final sourceItems = await _dataStore.storage.listDirectory(sourcePath);
-
-      for (final itemPath in sourceItems) {
-        final fileName = _getFileName(itemPath);
-        final targetItemPath = pathJoin(destPath, fileName);
-
-        if (await _isDirectory(itemPath)) {
-          // If it's a directory, copy recursively
-          await _safeCopyDirectory(itemPath, targetItemPath);
-        } else {
-          // If it's a file, use the safe copy method
-          await _safeCopyFile(itemPath, targetItemPath);
-        }
-      }
+      await _dataStore.storage.copyDirectory(sourcePath, destPath);
     } catch (e) {
       Logger.error('Error copying directory: $e',
           label: 'BackupManager._safeCopyDirectory');
@@ -407,18 +298,31 @@ class BackupManager {
   }
 
   /// Restore from backup
-  Future<void> restore(String backupPath) async {
+  /// [ backupPath] is the path to the backup directory or zip file
+  /// [ deleteAfterRestore] is whether to delete the backup file after restore
+  Future<void> restore(String backupPath,
+      {bool deleteAfterRestore = false}) async {
     try {
       // Determine backup type
       final isZip = backupPath.endsWith('.zip');
       final isDirectory = await _isDirectory(backupPath);
 
       if (isZip) {
-        // Extract zip first
-        final extractedDir = await _extractZipBackup(backupPath);
-        await restore(extractedDir);
-        await _dataStore.storage.deleteDirectory(extractedDir); // Clean up
-        return;
+        try {
+          // Extract zip first
+          final extractedDir = await _extractZipBackup(backupPath);
+          await restore(extractedDir, deleteAfterRestore: deleteAfterRestore);
+
+          await _dataStore.storage.deleteDirectory(extractedDir);
+          if (deleteAfterRestore) {
+            await _dataStore.storage.deleteFile(backupPath);
+          }
+          return;
+        } catch (e) {
+          Logger.error('Failed to extract or restore from zip backup: $e',
+              label: 'BackupManager.restore');
+          rethrow;
+        }
       }
 
       if (!isDirectory) {
@@ -438,6 +342,10 @@ class BackupManager {
         await _restorePartialBackup(backupPath);
       }
 
+      if (deleteAfterRestore) {
+        await _dataStore.storage.deleteDirectory(backupPath);
+      }
+
       await _dataStore.close();
       await _dataStore.initialize();
 
@@ -451,41 +359,17 @@ class BackupManager {
   }
 
   /// Extract a zip backup to a temporary directory
-  /// Using archive package for cross-platform support
+  /// Using PlatformHandler for cross-platform support
   Future<String> _extractZipBackup(String zipPath) async {
-    if (kIsWeb) {
-      throw UnsupportedError('Zip extraction not supported on web platform');
-    }
-
-    final tempDir = await Directory.systemTemp.createTemp('tostore_backup_');
-    final tempPath = tempDir.path;
+    final tempPath =
+        await PlatformHandler.createTempDirectory('tostore_backup_');
 
     try {
       Logger.info('Extracting zip backup to: $tempPath',
           label: 'BackupManager._extractZipBackup');
 
-      try {
-        await extractFileToDisk(zipPath, tempPath);
-      } catch (e) {
-        Logger.error('Failed to extract ZIP file: $e',
-            label: 'BackupManager._extractZipBackup');
-
-        // try alternative unzip method
-        final bytes = await File(zipPath).readAsBytes();
-        final archive = ZipDecoder().decodeBytes(bytes);
-
-        for (final file in archive) {
-          final filename = file.name;
-          if (file.isFile) {
-            final data = file.content as List<int>;
-            final outFile = File('$tempPath/$filename');
-            await outFile.parent.create(recursive: true);
-            await outFile.writeAsBytes(data);
-          } else {
-            await Directory('$tempPath/$filename').create(recursive: true);
-          }
-        }
-      }
+      // 使用 PlatformHandler 的 extractZip 方法
+      await PlatformHandler.extractZip(zipPath, tempPath);
 
       Logger.info('Zip backup extracted successfully',
           label: 'BackupManager._extractZipBackup');
@@ -493,7 +377,7 @@ class BackupManager {
       return tempPath;
     } catch (e) {
       // Clean up temp directory on failure
-      await tempDir.delete(recursive: true);
+      await PlatformHandler.deleteDirectory(tempPath);
       Logger.error('Failed to extract zip backup: $e',
           label: 'BackupManager._extractZipBackup');
       rethrow;
@@ -514,17 +398,13 @@ class BackupManager {
       }
 
       if (isZip) {
-        // For zip files, verify archive integrity
+        // For zip files, verify archive integrity using PlatformHandler
         try {
-          final file = File(backupPath);
-          if (!await file.exists()) return false;
+          if (!await _dataStore.storage.existsFile(backupPath)) return false;
 
-          final bytes = await file.readAsBytes();
-          final archive = ZipDecoder().decodeBytes(bytes);
-
-          // verify if essential files are included
-          final hasMeta = archive.findFile('meta.json') != null;
-          return hasMeta;
+          // Use PlatformHandler to verify ZIP file
+          return await PlatformHandler.verifyZipFile(backupPath,
+              requiredFile: 'meta.json');
         } catch (e) {
           Logger.error('Zip file verification failed: $e',
               label: 'BackupManager.verifyBackup');
@@ -547,12 +427,35 @@ class BackupManager {
       if (isFullBackup) {
         // For full backups, verify some essential directories
         // This is a basic check - could be expanded
-        final spacesExists = await _dataStore.storage
-            .existsDirectory(pathJoin(backupPath, 'spaces'));
-        final globalExists = await _dataStore.storage
-            .existsDirectory(pathJoin(backupPath, 'global'));
+        final spacesPath = pathJoin(backupPath, 'spaces');
+        final globalPath = pathJoin(backupPath, 'global');
+
+        final spacesExists =
+            await _dataStore.storage.existsDirectory(spacesPath);
+        final globalExists =
+            await _dataStore.storage.existsDirectory(globalPath);
 
         if (!spacesExists && !globalExists) {
+          // at Web platform, try to verify by listing files if directory check fails
+          if (kIsWeb) {
+            try {
+              // try to list directory content
+              final spacesFiles =
+                  await _dataStore.storage.listDirectory(spacesPath);
+              final globalFiles =
+                  await _dataStore.storage.listDirectory(globalPath);
+
+              if (spacesFiles.isNotEmpty || globalFiles.isNotEmpty) {
+                Logger.warn(
+                    'Web platform: Directory existence check failed but found files in spaces or global directories',
+                    label: 'BackupManager.verifyBackup');
+                return true;
+              }
+            } catch (e) {
+              // ignore listing directory error
+            }
+          }
+
           Logger.error('Missing essential directories in full backup',
               label: 'BackupManager.verifyBackup');
           return false;
@@ -561,6 +464,20 @@ class BackupManager {
         // For partial backups, check base directory
         final spacesPath = pathJoin(backupPath, 'spaces');
         if (!await _dataStore.storage.existsDirectory(spacesPath)) {
+          if (kIsWeb) {
+            try {
+              final files = await _dataStore.storage.listDirectory(spacesPath);
+              if (files.isNotEmpty) {
+                Logger.warn(
+                    'Web platform: Spaces directory existence check failed but found files',
+                    label: 'BackupManager.verifyBackup');
+                return true;
+              }
+            } catch (e) {
+              // ignore listing directory error
+            }
+          }
+
           Logger.error('Missing spaces directory in partial backup',
               label: 'BackupManager.verifyBackup');
           return false;

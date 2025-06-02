@@ -40,6 +40,34 @@ class PlatformHandler {
   /// Get app save directory, for data, config, etc.
   static Future<String> getPathApp() => _instance.getPathApp();
 
+  /// create temp directory
+  /// return temp directory path
+  static Future<String> createTempDirectory(String prefix) =>
+      _instance.createTempDirectory(prefix);
+
+  /// delete directory
+  static Future<void> deleteDirectory(String path, {bool recursive = true}) =>
+      _instance.deleteDirectory(path, recursive: recursive);
+
+  /// compress directory to ZIP file
+  /// sourceDir: source directory path
+  /// targetZip: target ZIP file path
+  static Future<void> compressDirectory(String sourceDir, String targetZip) =>
+      _instance.compressDirectory(sourceDir, targetZip);
+
+  /// decompress ZIP file to specified directory
+  /// zipPath: ZIP file path
+  /// targetDir: target directory path
+  static Future<void> extractZip(String zipPath, String targetDir) =>
+      _instance.extractZip(zipPath, targetDir);
+
+  /// Verify if a ZIP file is valid and optionally check if it contains a specific file
+  /// zipPath: ZIP file path
+  /// requiredFile: Optional file path to check inside the ZIP (e.g., 'meta.json')
+  /// Returns true if ZIP is valid and contains the required file (if specified)
+  static Future<bool> verifyZipFile(String zipPath, {String? requiredFile}) =>
+      _instance.verifyZipFile(zipPath, requiredFile: requiredFile);
+
   /// Recommended IO concurrency (optimized by platform and memory)
   static Future<int> getRecommendedConcurrency() async {
     if (isWeb) return 2;

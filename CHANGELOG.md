@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.3
+
+### Changed
+- Adjusted whether to delete backup files and whether to compress backup files when restoring them
+
+### Fixed
+- Fixed the zip compression issue of backup files on the web platform
+
 ## 2.0.2
 
 ### Changed

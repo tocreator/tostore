@@ -2,8 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:tostore/src/core/lock_manager.dart';
-import '../backup/backup_manager.dart'
-    if (dart.library.html) '../Interface/backup_manager_stub.dart';
+import '../backup/backup_manager.dart';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
@@ -497,7 +496,7 @@ class DataStoreImpl {
       );
       // Restore backup on failure
       if (backupPath.isNotEmpty) {
-        await restore(backupPath);
+        await restore(backupPath, deleteAfterRestore: true);
       }
       rethrow;
     }
@@ -968,7 +967,7 @@ class DataStoreImpl {
   }
 
   /// backup data and return backup path
-  Future<String> backup() async {
+  Future<String> backup({bool compress = true}) async {
     try {
       // 1. flush all pending data
       await tableDataManager.flushWriteBuffer();
@@ -977,7 +976,7 @@ class DataStoreImpl {
       final backupManager = BackupManager(this);
 
       // 3. create backup
-      final backupPath = await backupManager.createBackup(compress: kIsWeb);
+      final backupPath = await backupManager.createBackup(compress: compress);
       return backupPath;
     } catch (e) {
       Logger.error('Create backup failed: $e', label: 'DataStore-backup');
@@ -986,14 +985,16 @@ class DataStoreImpl {
   }
 
   /// Restore database from backup
-  Future<bool> restore(String backupPath) async {
+  Future<bool> restore(String backupPath,
+      {bool deleteAfterRestore = false}) async {
     if (!_baseInitialized) {
       await ensureInitialized();
     }
 
     try {
       final backupManager = BackupManager(this);
-      await backupManager.restore(backupPath);
+      await backupManager.restore(backupPath,
+          deleteAfterRestore: deleteAfterRestore);
       return true;
     } catch (e) {
       Logger.error(

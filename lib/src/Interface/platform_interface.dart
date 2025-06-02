@@ -35,4 +35,27 @@ abstract class PlatformInterface {
 
   /// Get app save directory, for data, config, etc.
   Future<String> getPathApp();
+
+  /// create temp directory
+  /// return temp directory path
+  Future<String> createTempDirectory(String prefix);
+
+  /// delete directory
+  Future<void> deleteDirectory(String path, {bool recursive = true});
+
+  /// compress directory to ZIP file
+  /// sourceDir: source directory path
+  /// targetZip: target ZIP file path
+  Future<void> compressDirectory(String sourceDir, String targetZip);
+
+  /// decompress ZIP file to specified directory
+  /// zipPath: ZIP file path
+  /// targetDir: target directory path
+  Future<void> extractZip(String zipPath, String targetDir);
+
+  /// Verify if a ZIP file is valid and optionally check if it contains a specific file
+  /// zipPath: ZIP file path
+  /// requiredFile: Optional file path to check inside the ZIP (e.g., 'meta.json')
+  /// Returns true if ZIP is valid and contains the required file (if specified)
+  Future<bool> verifyZipFile(String zipPath, {String? requiredFile});
 }

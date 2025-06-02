@@ -1212,7 +1212,6 @@ class PrimaryKeyConfig {
 ///
 /// Key features:
 /// - Supports different precision levels ([VectorPrecision])
-/// - Provides conversions between different formats (List<double>, binary)
 /// - Performs basic vector operations (normalization, dot product)
 /// - Ensures type safety and validation for vector operations
 ///
@@ -1309,7 +1308,7 @@ class VectorData {
   @override
   String toString() {
     if (dimensions <= 6) {
-      return 'VectorData${values}';
+      return 'VectorData$values';
     }
     // For long vectors, show first 3 and last 3 values
     return 'VectorData[${values[0].toStringAsFixed(4)}, ${values[1].toStringAsFixed(4)}, ${values[2].toStringAsFixed(4)}, ..., ${values[dimensions - 3].toStringAsFixed(4)}, ${values[dimensions - 2].toStringAsFixed(4)}, ${values[dimensions - 1].toStringAsFixed(4)}] (dim: $dimensions)';

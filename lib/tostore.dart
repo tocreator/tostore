@@ -322,23 +322,29 @@ class ToStore implements DataStoreInterface {
   }
 
   /// Create database backup
+  /// [compress] Whether to compress the backup into a zip file, default is true
   /// Returns backup file path
   ///
   /// 备份数据库
+  /// [compress] 是否压缩备份为 zip 文件，默认为 true
   /// 返回备份文件路径
   @override
-  Future<String> backup() async {
-    return await _impl.backup();
+  Future<String> backup({bool compress = true}) async {
+    return await _impl.backup(compress: compress);
   }
 
   /// Restore database from backup
   /// [backupPath] Backup file path
+  /// [deleteAfterRestore] Whether to delete the backup file after restore, default is false
   ///
   /// 从备份恢复数据库
   /// [backupPath] 备份文件路径
+  /// [deleteAfterRestore] 是否在恢复后删除备份文件，默认为 false
   @override
-  Future<bool> restore(String backupPath) async {
-    return await _impl.restore(backupPath);
+  Future<bool> restore(String backupPath,
+      {bool deleteAfterRestore = false}) async {
+    return await _impl.restore(backupPath,
+        deleteAfterRestore: deleteAfterRestore);
   }
 
   /// Delete data from table
