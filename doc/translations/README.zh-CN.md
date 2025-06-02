@@ -149,11 +149,11 @@ db.streamQuery('users')
     print('处理用户: ${userData['username']}');
   });
 
-// 全局配置存储
-await db.setValue('isAgreementPrivacy', true, isGlobal: true);
+// 键值对存储数据
+await db.setValue('isAgreementPrivacy', true);
 
-// 获取全局键值对数据
-final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
+// 获取键值对数据
+final isAgreementPrivacy = await db.getValue('isAgreementPrivacy');
 ```
 
 ## 频繁启动场景集成
@@ -163,6 +163,11 @@ final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: tru
 // 精准识别表结构变动，自动升级迁移数据，零代码维护
 final db = ToStore(
   schemas: [
+    const TableSchema(
+            name: 'global_settings',
+            isGlobal: true,  // 设置为全局表，所有空间可访问
+            fields: [],
+    ),
     const TableSchema(
       name: 'users', // 表名
       tableId: "users",  // 表名唯一标识，可选，用于100%识别重命名需求，省略也可达到99.99%以上的精准识别率
@@ -198,18 +203,20 @@ final db = ToStore(
 
 // 多空间架构 - 完美隔离不同用户数据
 await db.switchSpace(spaceName: 'user_123');
+
+// 获取全局表数据 - 因为表名全局唯一，所以表操作不需要isGlobal参数区分
+final globalSettings = await db.query('global_settings');
+// 键值对存储才需要标注isGlobal是否全局，查询时与设置一致
+await db.setValue('global_config', true, isGlobal: true);
+final isAgreementPrivacy = await db.getValue('global_config', isGlobal: true);
+
 ```
 
 ## 服务端集成
 
 ```dart
-// 服务器端动态表结构创建 - 适合持续运行场景
+// 服务端运行时批量创建表结构 - 适合持续运行场景 （单个表创建为 db.createTable）
 await db.createTables([
-  const TableSchema(
-    name: 'global_settings',
-    isGlobal: true,  // 设置为全局表，所有空间可访问
-    fields: []
-  ),
   // 三维空间特征向量存储表结构
   const TableSchema(
     name: 'spatial_embeddings',                // 表名

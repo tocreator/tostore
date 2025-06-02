@@ -164,6 +164,11 @@ final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: tru
 final db = ToStore(
   schemas: [
     const TableSchema(
+            name: 'global_settings',
+            isGlobal: true,  // Set as global table, accessible to all spaces
+            fields: []
+    ),
+    const TableSchema(
       name: 'users', // Table name
       tableId: "users",  // Unique table identifier, optional, used for 100% identification of renaming needs, 
                          // even without it, precision rate is still above 99.99%
@@ -199,6 +204,14 @@ final db = ToStore(
 
 // Multi-space architecture - Perfect isolation of different user data
 await db.switchSpace(spaceName: 'user_123');
+
+
+// Get global table data - Because the table name is globally unique, table operations do not require the isGlobal parameter to distinguish
+final globalSettings = await db.query('global_settings');
+// Only when storing key value pairs, it is necessary to indicate whether isGlobal is global, and the query should be consistent with the settings
+await db.setValue('global_config', true, isGlobal: true);
+final isAgreementPrivacy = await db.getValue('global_config', isGlobal: true);
+
 ```
 
 ## Server-side Integration
@@ -206,11 +219,6 @@ await db.switchSpace(spaceName: 'user_123');
 ```dart
 // Dynamic table structure creation for server-side - Suitable for continuous operation scenarios
 await db.createTables([
-  const TableSchema(
-    name: 'global_settings',
-    isGlobal: true,  // Set as global table, accessible to all spaces
-    fields: []
-  ),
   // Three-dimensional spatial feature vector storage table structure
   const TableSchema(
     name: 'spatial_embeddings',                // Table name
