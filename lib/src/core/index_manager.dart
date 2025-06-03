@@ -1457,6 +1457,22 @@ class IndexManager {
         return;
       }
 
+      // get table structure to check if a redundant primary key index is created
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema != null) {
+        final primaryKeyName = tableSchema.primaryKey;
+        // check if a redundant primary key index is created
+        if (schema.fields.length == 1 &&
+            schema.fields.first == primaryKeyName &&
+            indexName != 'pk_$tableName') {
+          Logger.warn(
+            'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is automatically indexed as pk_$tableName',
+            label: 'IndexManager.createIndex',
+          );
+          return; // skip creation of redundant primary key index
+        }
+      }
+
       // Create index metadata
       final newMeta = IndexMeta(
         version: 1,
@@ -2638,7 +2654,6 @@ class IndexManager {
           if (fieldValue != null) {
             await _removeFromWriteBuffer(
                 tableName, indexName, fieldValue, recordId);
-
             // Remove from memory cache
             final cacheKey = _getIndexCacheKey(tableName, indexName);
             if (_indexCache.containsKey(cacheKey)) {

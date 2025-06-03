@@ -112,6 +112,18 @@ class TableSchema {
   bool validateIndexFields(IndexSchema index) {
     final primaryKeyName = primaryKeyConfig.name;
 
+    // check if the index only contains the primary key field and the name is not the primary key index name
+    // the primary key index should be automatically created by the system, should not be manually defined
+    if (index.fields.length == 1 &&
+        index.fields.first == primaryKeyName &&
+        index.actualIndexName != 'pk_$name') {
+      Logger.warn(
+        'Table $name contains redundant primary key index: ${index.actualIndexName}, primary key is automatically indexed',
+        label: 'TableSchema.validateIndexFields',
+      );
+      // do not return false, because this is just a warning, should not block the table creation
+    }
+
     for (final fieldName in index.fields) {
       // Check if the field is the primary key
       if (fieldName == primaryKeyName) {

@@ -983,18 +983,28 @@ class QueryExecutor {
       if (index == null) {
         return _performTableScan(tableName, queryCondition);
       }
-
       // get actual index name
-      final indexSchema = schema.indexes.firstWhere(
-        (idx) => idx.actualIndexName == indexName,
-      );
-      final actualIndexName = indexSchema.actualIndexName;
+      String? actualIndexName;
+      if (indexName.startsWith('pk_')) {
+        // primary key index directly use indexName
+        actualIndexName = indexName;
+      } else {
+        // normal index need to find from schema.indexes
+        final indexSchema = schema.indexes.firstWhere(
+          (idx) => idx.actualIndexName == indexName,
+        );
+        actualIndexName = indexSchema.actualIndexName;
+      }
 
       // get search value
       dynamic searchValue;
       if (actualIndexName.startsWith('pk_')) {
         searchValue = conditions[schema.primaryKey];
       } else {
+        // for normal index, find index info from schema.indexes
+        final indexSchema = schema.indexes.firstWhere(
+          (idx) => idx.actualIndexName == indexName,
+        );
         searchValue = conditions[indexSchema.fields.first];
       }
       if (searchValue == null) {
@@ -1010,52 +1020,35 @@ class QueryExecutor {
       // get full records
       final results = <Map<String, dynamic>>[];
 
-      if (actualIndexName.startsWith('pk_')) {
-        // primary key index directly returns row pointer
-        for (var pointer in indexResults) {
-          if (pointer is StoreIndex) {
-            final record = await _dataStore.tableDataManager
-                .getRecordByPointer(tableName, pointer);
-            if (record != null) {
-              // apply additional conditions (if any)
-              if (queryCondition != null) {
-                final conditions = queryCondition.build();
-                if (_matchConditions(record, conditions)) {
-                  results.add(record);
-                }
-              } else {
-                results.add(record);
-              }
-            }
-          }
+      // handle primary key index and normal index results
+      for (var pointer in indexResults) {
+        // handle String and StoreIndex types
+        StoreIndex storeIndex;
+        if (pointer is String) {
+          storeIndex = StoreIndex.fromString(pointer);
+        } else if (pointer is StoreIndex) {
+          storeIndex = pointer;
+        } else {
+          // skip unrecognized format
+          Logger.debug(
+              'Skipped unrecognized index result format: ${pointer.runtimeType}',
+              label: 'QueryExecutor._performIndexScan');
+          continue;
         }
-      } else {
-        // secondary index also return StoreIndex value directly, no need to query primary key index
-        for (var pointer in indexResults) {
-          // handle string format StoreIndex
-          StoreIndex storeIndex;
-          if (pointer is String) {
-            storeIndex = StoreIndex.fromString(pointer);
-          } else if (pointer is StoreIndex) {
-            storeIndex = pointer;
-          } else {
-            continue; // skip unrecognized format
-          }
 
-          // directly use StoreIndex to get record
-          final record = await _dataStore.tableDataManager
-              .getRecordByPointer(tableName, storeIndex);
+        // get record by store index
+        final record = await _dataStore.tableDataManager
+            .getRecordByPointer(tableName, storeIndex);
 
-          if (record != null) {
-            // apply additional conditions (if any)
-            if (queryCondition != null) {
-              final conditions = queryCondition.build();
-              if (_matchConditions(record, conditions)) {
-                results.add(record);
-              }
-            } else {
+        if (record != null) {
+          // apply additional conditions (if any)
+          if (queryCondition != null) {
+            final conditions = queryCondition.build();
+            if (_matchConditions(record, conditions)) {
               results.add(record);
             }
+          } else {
+            results.add(record);
           }
         }
       }
