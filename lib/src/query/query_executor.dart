@@ -984,7 +984,7 @@ class QueryExecutor {
         return _performTableScan(tableName, queryCondition);
       }
       // get actual index name
-      String? actualIndexName;
+      String actualIndexName;
       if (indexName.startsWith('pk_')) {
         // primary key index directly use indexName
         actualIndexName = indexName;
@@ -1050,6 +1050,21 @@ class QueryExecutor {
           } else {
             results.add(record);
           }
+        }
+        else {
+          // record not found, index expired, add to delete buffer
+          Logger.debug(
+            'Detected expired index, adding to delete buffer: $tableName.$indexName: $searchValue -> $storeIndex',
+            label: 'QueryExecutor._performIndexScan',
+          );
+          
+          // add to delete buffer for later cleanup
+          await _indexManager.addToDeleteBuffer(
+            tableName, 
+            actualIndexName, 
+            searchValue, 
+            storeIndex.toString()
+          );
         }
       }
 

@@ -793,9 +793,6 @@ class DataCacheManager {
       // 6. Clear query cache
       _queryCache.clear();
 
-      // 7. Notify index manager that base path has changed
-      _dataStore.indexManager?.onSpacePathChanged();
-
       Logger.debug('Base path change completed, non-global table cache cleared',
           label: 'DataCacheManager.onBasePathChanged');
     } catch (e) {

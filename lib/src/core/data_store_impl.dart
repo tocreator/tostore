@@ -20,7 +20,6 @@ import '../model/table_schema.dart';
 import 'data_cache_manager.dart';
 import 'data_compressor.dart';
 import '../model/data_store_config.dart';
-import '../model/space_path_changed_event.dart';
 import 'table_data_manager.dart';
 import 'index_manager.dart';
 import '../model/table_info.dart';
@@ -1276,9 +1275,8 @@ class DataStoreImpl {
         dataCacheManager.removeCachedRecord(tableName, pkValue);
 
         queue?.remove(pkValue);
-
-        await _indexManager!.deleteFromIndexes(tableName, record);
       }
+      await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
 
       // Use streaming to filter out deleted records and rewrite the table without loading all data into memory
       await tableDataManager.writeRecords(
@@ -1859,15 +1857,13 @@ class DataStoreImpl {
 
       // Clear caches
       dataCacheManager.onBasePathChanged();
+      indexManager?.onSpacePathChanged();
       tableDataManager.writeBuffer.clear();
 
       // Reinitialize database
       _isInitialized = false;
       _baseInitialized = false;
       await initialize(dbPath: _config?.dbPath, config: _config);
-
-      // Notify space change
-      _notifyBasePathChanged(SpacePathChangedEvent(oldSpaceName, spaceName));
 
       // Add new space to GlobalConfig
       final globalConfig = await getGlobalConfig();
@@ -1915,12 +1911,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Notify base path change event
-  void _notifyBasePathChanged(SpacePathChangedEvent event) {
-    _indexManager?.onSpacePathChanged();
-    _statisticsCollector?.onBasePathChanged(event);
-  }
-
   /// Delete database
   Future<void> deleteDatabase({String? dbPath}) async {
     try {
@@ -1931,9 +1921,6 @@ class DataStoreImpl {
         await storage.deleteDirectory(dbDirPath);
         Logger.info('Database deleted: $dbDirPath');
       }
-
-      _indexManager?.onSpacePathChanged();
-      dataCacheManager.clear();
 
       _instances.remove(_instanceKey);
     } catch (e) {
