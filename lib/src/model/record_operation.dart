@@ -50,3 +50,30 @@ enum RecordOperationType {
   delete, // delete record
   rewrite, // rewrite whole table or partition
 }
+
+/// delete buffer entry, used to store record information to be deleted
+class RecordDeleteEntry {
+  final Map<String, dynamic> data;
+  final DateTime timestamp;
+
+  RecordDeleteEntry({
+    required this.data,
+    required this.timestamp,
+  });
+  
+  // Add toJson method for serialization
+  Map<String, dynamic> toJson() {
+    return {
+      'data': data,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+  
+  // Add fromJson factory method for deserialization
+  factory RecordDeleteEntry.fromJson(Map<String, dynamic> json) {
+    return RecordDeleteEntry(
+      data: json['data'] as Map<String, dynamic>,
+      timestamp: DateTime.parse(json['timestamp'] as String),
+    );
+  }
+}

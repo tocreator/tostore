@@ -13,7 +13,6 @@ import '../model/file_info.dart';
 import '../model/global_config.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
-import '../model/record_operation.dart';
 import '../model/result_code.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -969,7 +968,7 @@ class DataStoreImpl {
   Future<String> backup({bool compress = true}) async {
     try {
       // 1. flush all pending data
-      await tableDataManager.flushWriteBuffer();
+      await tableDataManager.flushAllBuffers();
 
       // 2. create backup manager
       final backupManager = BackupManager(this);
@@ -1264,7 +1263,7 @@ class DataStoreImpl {
         );
       }
       final primaryKey = schema.primaryKey;
-      final queue = tableDataManager.writeBuffer[tableName];
+      final writeQueue = tableDataManager.writeBuffer[tableName];
 
       for (var record in recordsToDelete) {
         final pkValue = record[primaryKey]?.toString();
@@ -1274,19 +1273,18 @@ class DataStoreImpl {
         // Remove from record cache
         dataCacheManager.removeCachedRecord(tableName, pkValue);
 
-        queue?.remove(pkValue);
+        // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
+        writeQueue?.remove(pkValue);
       }
+
+      // Add records to delete buffer instead of directly writing to file
+      await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
+
+      // Update indexes - still necessary to keep indexes in sync
       await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
 
-      // Use streaming to filter out deleted records and rewrite the table without loading all data into memory
-      await tableDataManager.writeRecords(
-        tableName: tableName,
-        records: recordsToDelete,
-        operationType: RecordOperationType.delete,
-      );
-
-      // Update statistics
-      await _statisticsCollector?.collectTableStatistics(tableName);
+      // Update statistics asynchronously
+      _updateStatisticsAsync(tableName);
 
       await _transactionManager!.commit(transaction);
       return DbResult.success(
@@ -1890,8 +1888,8 @@ class DataStoreImpl {
     try {
       if (!_isInitialized) return false;
 
-      // Process table data write buffer
-      await tableDataManager.flushWriteBuffer();
+      // Process all table data buffers (write and delete)
+      await tableDataManager.flushAllBuffers();
 
       // Process index write buffer
       await _indexManager?.prepareForClose();

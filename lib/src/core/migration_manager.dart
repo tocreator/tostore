@@ -1622,9 +1622,7 @@ class MigrationManager {
       final sortedOperations = _sortOperations(List.from(task.operations));
 
       // save data in write buffer to disk before migration
-      if (_dataStore.tableDataManager.writeBuffer.containsKey(task.tableName)) {
-        await _dataStore.tableDataManager.flushWriteBuffer();
-      }
+      await _dataStore.tableDataManager.flushAllBuffers();
 
       // clear table record cache
       _dataStore.dataCacheManager.invalidateCache(task.tableName);

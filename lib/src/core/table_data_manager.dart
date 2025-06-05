@@ -24,6 +24,10 @@ class TableDataManager {
   final Map<String, Map<String, WriteBufferEntry>> _writeBuffer = {};
   Map<String, Map<String, WriteBufferEntry>> get writeBuffer => _writeBuffer;
 
+  // Delete Buffer: Map<tableName, Map<recordId, RecordDeleteEntry>>
+  final Map<String, Map<String, RecordDeleteEntry>> _deleteBuffer = {};
+  Map<String, Map<String, RecordDeleteEntry>> get deleteBuffer => _deleteBuffer;
+
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
 
@@ -343,31 +347,38 @@ class TableDataManager {
         ExecuteInterval.seconds3, _processWriteBuffer);
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
-    // last flush all write buffer
-    if (_writeBuffer.isNotEmpty) {
-      // then write
-      await flushWriteBuffer();
+    
+    try {
+      // Flush all pending data (both write and delete buffers)
+      await flushAllBuffers();
+      
+      // cleanup file size information
+      clearFileSizes();
+      
+      // cleanup file meta cache
+      _fileMetaCache.clear();
+  
+      _maxIds.clear();
+      _maxIdsDirty.clear();
+  
+      // Save ID range information for all tables
+      for (final tableName in _idGenerators.keys) {
+        await _saveIdRange(tableName);
+      }
+  
+      // Cleanup ID generator resources
+      _idGenerators.clear();
+      _idRanges.clear();
+      _checkedOrderedRange.clear();
+      
+      // Ensure all buffers are cleared
+      _writeBuffer.clear();
+      _deleteBuffer.clear();
+      _processingTables.clear();
+    } catch (e) {
+      Logger.error('Failed to dispose TableDataManager: $e', 
+          label: 'TableDataManager.dispose');
     }
-    await flushMaxIds();
-    // cleanup file size information
-    clearFileSizes();
-    // cleanup write queue
-    _writeBuffer.clear();
-    // cleanup file meta cache
-    _fileMetaCache.clear();
-
-    _maxIds.clear();
-    _maxIdsDirty.clear();
-
-    // Save ID range information for all tables
-    for (final tableName in _idGenerators.keys) {
-      await _saveIdRange(tableName);
-    }
-
-    // Cleanup ID generator resources
-    _idGenerators.clear();
-    _idRanges.clear();
-    _checkedOrderedRange.clear();
   }
 
   /// Process write buffer
@@ -376,7 +387,7 @@ class TableDataManager {
       // Check ID range status
       await _checkIdFetch();
 
-      if (_writeBuffer.isEmpty) {
+      if (_writeBuffer.isEmpty && _deleteBuffer.isEmpty) {
         return;
       }
 
@@ -386,7 +397,7 @@ class TableDataManager {
       // Evaluate write requirements and system status
       bool needsImmediateWrite = false;
 
-      // Condition 1: Check queue size
+      // Condition 1: Check write queue size
       int largestQueueSize = 0;
       String? largestQueueTable;
       int totalRecords = 0;
@@ -406,6 +417,29 @@ class TableDataManager {
           break;
         }
       }
+      
+      // Condition 1b: Check delete queue size
+      int largestDeleteQueueSize = 0;
+      String? largestDeleteQueueTable;
+      int totalDeleteRecords = 0;
+      
+      for (final entry in _deleteBuffer.entries) {
+        final queueSize = entry.value.length;
+        totalDeleteRecords += queueSize;
+        
+        if (queueSize > largestDeleteQueueSize) {
+          largestDeleteQueueSize = queueSize;
+          largestDeleteQueueTable = entry.key;
+        }
+        
+        if (queueSize >= _maxBufferSize) {
+          needsImmediateWrite = true;
+          break;
+        }
+      }
+      
+      // Update total records count to include both write and delete records
+      totalRecords += totalDeleteRecords;
 
       // Condition 2: Check idle time
       final idleWriteDuration = DateTime.now().difference(_lastWriteTime);
@@ -413,8 +447,9 @@ class TableDataManager {
         needsImmediateWrite = true;
       }
 
-      // Condition 3: Number of tables, if exceeds threshold also need to write
-      if (_writeBuffer.length >= _dataStore.config.maxTablesPerFlush * 1.5) {
+      // Condition 3: Number of tables with pending writes or deletes
+      final totalTablesCount = _writeBuffer.length + _deleteBuffer.length;
+      if (totalTablesCount >= _dataStore.config.maxTablesPerFlush * 1.5) {
         needsImmediateWrite = true;
       }
 
@@ -423,10 +458,10 @@ class TableDataManager {
         needsImmediateWrite = true;
       }
 
-      if (needsImmediateWrite && _writeBuffer.isNotEmpty && !_isWriting) {
+      if (needsImmediateWrite && ((_writeBuffer.isNotEmpty || _deleteBuffer.isNotEmpty)) && !_isWriting) {
         _isWriting = true;
         Logger.debug(
-            'Starting batch write, table count: ${_writeBuffer.length}, largest queue table: $largestQueueTable ($largestQueueSize records), total records: $totalRecords',
+            'Starting batch operation, table count: ${_writeBuffer.length} write + ${_deleteBuffer.length} delete, largest write queue: ${largestQueueTable ?? "none"} ($largestQueueSize records), largest delete queue: ${largestDeleteQueueTable ?? "none"} ($largestDeleteQueueSize records), total records: $totalRecords',
             label: 'TableDataManager._processWriteBuffer');
         try {
           // Record start time for performance monitoring
@@ -434,6 +469,9 @@ class TableDataManager {
 
           // Execute write operation
           await flushWriteBuffer();
+          
+          // Execute delete operation
+          await flushDeleteBuffer();
 
           // Handle auto-increment ID save
           await flushMaxIds();
@@ -444,9 +482,10 @@ class TableDataManager {
           // Record write performance data
           final writeDuration =
               _lastWriteTime.difference(startTime).inMilliseconds;
-          if (largestQueueTable != null && largestQueueSize > 100) {
+          if ((largestQueueTable != null && largestQueueSize > 100) ||
+              (largestDeleteQueueTable != null && largestDeleteQueueSize > 100)) {
             Logger.debug(
-                'Batch write completed, duration: ${writeDuration}ms, largest queue table: $largestQueueTable ($largestQueueSize records)',
+                'Batch operation completed, duration: ${writeDuration}ms, largest write queue: ${largestQueueTable ?? "none"} ($largestQueueSize records), largest delete queue: ${largestDeleteQueueTable ?? "none"} ($largestDeleteQueueSize records)',
                 label: 'TableDataManager._processWriteBuffer');
           }
         } finally {
@@ -723,6 +762,51 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
+  /// Add records to delete buffer - for batch deleting
+  Future<void> addToDeleteBuffer(String tableName, List<Map<String, dynamic>> records) async {
+    if (records.isEmpty) return;
+    
+    // Get table schema to extract primary key
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      Logger.error(
+        'Table schema is null, cannot add to delete buffer',
+        label: 'TableDataManager.addToDeleteBuffer'
+      );
+      return;
+    }
+    
+    final primaryKey = schema.primaryKey;
+    final tableQueue = _deleteBuffer.putIfAbsent(tableName, () => {});
+
+    // Process each record
+    for (final record in records) {
+      final recordId = record[primaryKey]?.toString();
+      if (recordId == null) {
+        Logger.warn(
+          'Record in table $tableName does not have a primary key value, skipping',
+          label: 'TableDataManager.addToDeleteBuffer',
+        );
+        continue;
+      }
+
+      // if record is already in write buffer, remove it, because it is not written to file, no need to add to delete buffer
+      if (_writeBuffer.containsKey(tableName) && _writeBuffer[tableName]!.containsKey(recordId)) {
+        _writeBuffer[tableName]!.remove(recordId);
+        continue;
+      }
+
+      // Store in delete buffer
+      tableQueue[recordId] = RecordDeleteEntry(
+        data: record,
+        timestamp: DateTime.now(),
+      );
+    }
+
+    // Record data change, need to update statistics
+    _needSaveStats = true;
+  }
+
   /// Flush single table buffer
   Future<void> _flushTableBuffer(String tableName) async {
     // Use lock manager's exclusive lock to ensure data for the same table isn't processed concurrently
@@ -982,6 +1066,20 @@ class TableDataManager {
       _processingTables.clear();
     }
   }
+  
+  /// Flush all pending write and delete buffers
+  Future<void> flushAllBuffers() async {
+    // First flush write buffer
+    await flushWriteBuffer();
+    
+    // Then flush delete buffer
+    await flushDeleteBuffer();
+    
+    // Finally flush max IDs
+    await flushMaxIds();
+  }
+  
+
 
   /// get total table count
   int getTotalTableCount() {
@@ -3319,8 +3417,9 @@ class TableDataManager {
       // mark table cleanup is in progress
       _tableFlushingFlags[tableName] = true;
 
-      // 1. clean write buffer
+      // 1. clean write and delete buffers
       _writeBuffer.remove(tableName);
+      _deleteBuffer.remove(tableName);
 
       // 2. directly delete the entire partition directory
       try {
@@ -3437,6 +3536,210 @@ class TableDataManager {
       Logger.error('check if primary key is ordered type failed: $e',
           label: 'TableDataManager._isPrimaryKeyOrdered');
       return false;
+    }
+  }
+
+  /// flush all delete buffer
+  Future<void> flushDeleteBuffer() async {
+    if (_deleteBuffer.isEmpty) return;
+
+    final startTime = DateTime.now();
+
+    // Get list of tables to process
+    final tablesToProcess = _deleteBuffer.keys.toList();
+
+    // Keep track of tables with errors to avoid infinite retry
+    final errorTables = <String>[];
+
+    // Decide maximum parallel operations based on configuration
+    final maxConcurrent = _effectiveMaxConcurrent;
+
+    // Use a concurrent queue system
+    final processingQueue = <Future<void>>[];
+    const tableStartIndex = 0;
+    final maxTablesToProcess = min(
+        maxConcurrent, tablesToProcess.length - tableStartIndex);
+
+    if (maxTablesToProcess <= 0) {
+      return;
+    }
+
+    try {
+      // Process maxTablesToProcess tables in parallel
+      for (int i = 0; i < maxTablesToProcess; i++) {
+        final tableIndex = tableStartIndex + i;
+        if (tableIndex >= tablesToProcess.length) break;
+
+        final tableName = tablesToProcess[tableIndex];
+        if (errorTables.contains(tableName)) continue;
+
+        processingQueue.add(_flushTableDeleteBuffer(tableName).catchError((e) {
+          Logger.error('Error flushing delete buffer for table $tableName: $e',
+              label: 'TableDataManager.flushDeleteBuffer');
+          errorTables.add(tableName);
+        }));
+      }
+
+      // Wait for all processing to complete
+      await Future.wait(processingQueue);
+
+      final duration = DateTime.now().difference(startTime).inMilliseconds;
+
+      // check how many tables and records are left to process
+      final remainingTables = _deleteBuffer.length;
+      final remainingRecords =
+          _deleteBuffer.values.fold(0, (sum, table) => sum + table.length);
+
+      if (remainingTables > 0) {
+        Logger.debug(
+            'This delete flush processed ${tablesToProcess.length} tables, time: ${duration}ms, there are $remainingTables tables and $remainingRecords records left to process',
+            label: 'TableDataManager.flushDeleteBuffer');
+      } else {
+        Logger.debug(
+            'All table delete buffers flushed, processed ${tablesToProcess.length} tables, time: ${duration}ms',
+            label: 'TableDataManager.flushDeleteBuffer');
+      }
+    } catch (e, stackTrace) {
+      Logger.error('Failed to flush delete buffer: $e',
+          label: 'TableDataManager.flushDeleteBuffer');
+      Logger.error(stackTrace.toString(),
+          label: 'TableDataManager.flushDeleteBuffer');
+
+      // when error occurs, clear the processing table marks
+      _processingTables.clear();
+    }
+  }
+
+  /// Flush single table delete buffer
+  Future<void> _flushTableDeleteBuffer(String tableName) async {
+    // Use lock manager's exclusive lock to ensure data for the same table isn't processed concurrently
+    final lockKey = 'table_$tableName';
+    bool lockAcquired = false;
+
+    // Try to acquire lock, skip this processing if already occupied
+    if (_dataStore.lockManager != null) {
+      if (!_dataStore.lockManager!.tryAcquireExclusiveLock(lockKey)) {
+        Logger.debug(
+            'Table $tableName is being processed by another operation, skipping this delete flush',
+            label: 'TableDataManager._flushTableDeleteBuffer');
+        return;
+      }
+      lockAcquired = true;
+      _processingTables.add(tableName);
+    } else if (_processingTables.contains(tableName)) {
+      // Without lock manager, use _processingTables as simple reentry prevention
+      Logger.debug('Table $tableName is being processed, skipping this delete flush',
+          label: 'TableDataManager._flushTableDeleteBuffer');
+      return;
+    } else {
+      _processingTables.add(tableName);
+    }
+
+    try {
+      // Check buffer state again (may have been modified while acquiring lock)
+      if (!_deleteBuffer.containsKey(tableName) ||
+          _deleteBuffer[tableName]!.isEmpty) {
+        return;
+      }
+
+      final totalQueueSize = _deleteBuffer[tableName]!.length;
+      final maxBatchSize = _dataStore.config.maxFlushBatchSize;
+
+      Logger.debug(
+          'Starting to process delete buffer for table $tableName, queue size: $totalQueueSize',
+          label: 'TableDataManager._flushTableDeleteBuffer');
+
+      // Record start time
+      final startTime = DateTime.now();
+      // Track processed records
+      int recordsProcessed = 0;
+
+      // Continue processing buffer as long as there's data and table buffer exists
+      while (_deleteBuffer.containsKey(tableName) &&
+          !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
+        // Get current queue size
+        final currentQueueSize = _deleteBuffer[tableName]!.length;
+        
+        // Determine batch size for current iteration
+        final currentBatchSize = min(maxBatchSize, currentQueueSize);
+        if (currentBatchSize <= 0) {
+          break;
+        }
+
+        // Get latest keys directly from current buffer
+        final keysToProcess = _deleteBuffer[tableName]!
+            .keys
+            .take(currentBatchSize.toInt())
+            .toList();
+
+        if (keysToProcess.isEmpty) {
+          break;
+        }
+
+        // Prepare a list of records to delete
+        final recordsToDelete = <Map<String, dynamic>>[];
+        // Store processed entries for error recovery
+        final processedEntries = <String, RecordDeleteEntry>{};
+
+        // Extract data from original buffer and remove immediately
+        for (final key in keysToProcess) {
+          final entry = _deleteBuffer[tableName]?[key];
+          if (entry != null) {
+            processedEntries[key] = entry;
+            _deleteBuffer[tableName]!.remove(key); // Remove from original buffer immediately
+            recordsToDelete.add(entry.data);
+          }
+        }
+
+        // If table buffer is now empty, remove it from delete buffer
+        if (_deleteBuffer[tableName]?.isEmpty ?? true) {
+          _deleteBuffer.remove(tableName);
+        }
+
+        try {
+          // Process delete operations
+          if (recordsToDelete.isNotEmpty) {
+            await writeRecords(
+                tableName: tableName,
+                records: recordsToDelete,
+                operationType: RecordOperationType.delete);
+          }
+
+          recordsProcessed += processedEntries.length;
+
+          // After current batch is processed, yield execution thread for 2ms to avoid blocking UI
+          if (_deleteBuffer.containsKey(tableName) &&
+              !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
+            await Future.delayed(const Duration(milliseconds: 2));
+          }
+        } catch (e) {
+          Logger.error('Failed to process delete data for table $tableName: $e',
+              label: 'TableDataManager._flushTableDeleteBuffer');
+
+          // failed to process data, add data back to buffer
+          final tableBuffer = _deleteBuffer.putIfAbsent(tableName, () => {});
+          tableBuffer.addAll(processedEntries);
+          break; // stop processing when error occurs
+        }
+      }
+
+      final endTime = DateTime.now();
+      final processingDuration = endTime.difference(startTime).inMilliseconds;
+
+      Logger.debug(
+          'Table $tableName delete buffer processing completed, processed $recordsProcessed/$totalQueueSize records, time: ${processingDuration}ms, remaining ${_deleteBuffer[tableName]?.length ?? 0} records',
+          label: 'TableDataManager._flushTableDeleteBuffer');
+    } catch (e, stackTrace) {
+      Logger.error('Failed to flush table $tableName delete buffer: $e',
+          label: 'TableDataManager._flushTableDeleteBuffer');
+      Logger.error(stackTrace.toString(),
+          label: 'TableDataManager._flushTableDeleteBuffer');
+    } finally {
+      // Release lock regardless of outcome
+      if (lockAcquired && _dataStore.lockManager != null) {
+        _dataStore.lockManager!.releaseExclusiveLock(lockKey);
+      }
+      _processingTables.remove(tableName);
     }
   }
 }
