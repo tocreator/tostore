@@ -313,20 +313,22 @@ class IntegrityChecker {
         return false;
       }
 
-      // get and validate index partitions
-      final indexPartitions = await _dataStore.indexManager
-          ?.getIndexPartitions(tableName, index.actualIndexName);
+      // Use processIndexPartitions instead of getIndexPartitions to count entries
+      int totalIndexEntries = 0;
+      final countSuccess = await _dataStore.indexManager?.processIndexPartitions(
+        tableName,
+        index.actualIndexName,
+        processor: (_, meta, __) async {
+          totalIndexEntries += meta.entries;
+          return true; // Continue processing all partitions
+        },
+        updateMetadata: false, // Read-only operation, no need to update metadata
+      );
 
-      if (indexPartitions == null || indexPartitions.isEmpty) {
-        Logger.error('Index ${index.actualIndexName} partitions not found',
+      if (countSuccess != true) {
+        Logger.error('Index ${index.actualIndexName} partitions not found or processing failed',
             label: 'IntegrityChecker._validateIndex');
         return false;
-      }
-
-      // validate total index entries
-      int totalIndexEntries = 0;
-      for (var partition in indexPartitions.values) {
-        totalIndexEntries += partition.meta.entries;
       }
 
       final entriesMatch = totalIndexEntries == uniqueKeys.length;

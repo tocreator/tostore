@@ -2593,7 +2593,10 @@ class IndexManager {
     return 'id'; // Assuming default primary key is id
   }
 
-  /// delete record from all indexes
+  /// Delete single record from all indexes
+  /// Use the batch method internally for efficiency
+  /// @param tableName Table name
+  /// @param record Record to delete
   Future<void> deleteFromIndexes(
     String tableName,
     Map<String, dynamic> record,
@@ -2613,82 +2616,8 @@ class IndexManager {
         return;
       }
 
-      // Get record pointer (for subsequent atomic comparison)
-      final storeIndex =
-          await getStoreIndexByPrimaryKey(tableName, primaryValue);
-      if (storeIndex == null) {
-        // Record does not exist, no need to delete
-        return;
-      }
-
-      final recordId = storeIndex.toString();
-
-      // 1. Delete from primary key index
-      final pkIndexName = 'pk_$tableName';
-      await _removeFromWriteBuffer(
-          tableName, pkIndexName, primaryValue, recordId);
-
-      // Remove from memory cache
-      final pkCacheKey = _getIndexCacheKey(tableName, pkIndexName);
-      if (_indexCache.containsKey(pkCacheKey)) {
-        final btree = _indexCache[pkCacheKey]!;
-        // Search all matching records to ensure accurate deletion
-        final results = await btree.search(primaryValue);
-        for (final result in results) {
-          if (result.toString() == recordId) {
-            await btree.delete(primaryValue, recordId);
-            break;
-          }
-        }
-      }
-
-      // 2. Delete from other indexes
-      for (final index in schema.indexes) {
-        final indexName = index.actualIndexName;
-
-        if (index.fields.length == 1) {
-          // Single field index
-          final fieldName = index.fields[0];
-          final fieldValue = record[fieldName];
-
-          if (fieldValue != null) {
-            await _removeFromWriteBuffer(
-                tableName, indexName, fieldValue, recordId);
-            // Remove from memory cache
-            final cacheKey = _getIndexCacheKey(tableName, indexName);
-            if (_indexCache.containsKey(cacheKey)) {
-              final btree = _indexCache[cacheKey]!;
-              final results = await btree.search(fieldValue);
-              for (final result in results) {
-                if (result.toString() == recordId) {
-                  await btree.delete(fieldValue, recordId);
-                  break;
-                }
-              }
-            }
-          }
-        } else {
-          // Composite index
-          final compositeKey = _createIndexKey(record, index.fields);
-          if (compositeKey != null) {
-            await _removeFromWriteBuffer(
-                tableName, indexName, compositeKey, recordId);
-
-            // Remove from memory cache
-            final cacheKey = _getIndexCacheKey(tableName, indexName);
-            if (_indexCache.containsKey(cacheKey)) {
-              final btree = _indexCache[cacheKey]!;
-              final results = await btree.search(compositeKey);
-              for (final result in results) {
-                if (result.toString() == recordId) {
-                  await btree.delete(compositeKey, recordId);
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
+      // Use the batch method for better efficiency, even with just one record
+      await batchDeleteFromIndexes(tableName, [record]);
     } catch (e) {
       Logger.error('Failed to delete record from indexes: $e',
           label: 'IndexManager.deleteFromIndexes');
@@ -3355,6 +3284,484 @@ class IndexManager {
       Logger.error('Failed to get index partition information: $e',
           label: 'IndexManager.getIndexPartitions');
       return {};
+    }
+  }
+
+  /// Process index partitions one by one with callback
+  /// @param tableName Table name
+  /// @param indexName Index name
+  /// @param processor Function to process each partition, returns true to continue processing, false to stop processing more partitions
+  /// @param updateMetadata Whether to update metadata after processing
+  Future<bool> processIndexPartitions(
+    String tableName,
+    String indexName, {
+    required Future<bool> Function(String partitionPath, IndexPartitionMeta meta, BPlusTree btree) processor,
+    bool updateMetadata = true,
+  }) async {
+    try {
+      // Get index metadata
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) {
+        Logger.error('Index metadata not found: $tableName.$indexName',
+            label: 'IndexManager.processIndexPartitions');
+        return false;
+      }
+
+      // If no partitions, nothing to process
+      if (meta.partitions.isEmpty) {
+        return true;
+      }
+
+      // Track modified partitions for metadata update
+      final modifiedPartitions = <IndexPartitionMeta>[];
+      bool anyPartitionProcessed = false;
+
+      // Process each partition one by one
+      for (final partition in meta.partitions) {
+        final partitionPath = await _dataStore.pathManager
+            .getIndexPartitionPath(tableName, indexName, partition.index);
+
+        if (!await _dataStore.storage.existsFile(partitionPath)) {
+          Logger.warn('Partition file does not exist: $partitionPath',
+              label: 'IndexManager.processIndexPartitions');
+          continue;
+        }
+
+        // Read partition content
+        final content = await _dataStore.storage.readAsString(partitionPath) ?? '';
+        if (content.isEmpty) {
+          continue;
+        }
+
+        // Initialize B+ tree from file content
+        final btree = BPlusTree.fromString(
+          content,
+          order: meta.bTreeOrder,
+          isUnique: meta.isUnique,
+        );
+
+        // Process this partition using the callback
+        final shouldContinue = await processor(partitionPath, partition, btree);
+        anyPartitionProcessed = true;
+
+        // Serialize modified B+ tree back to file if needed
+        final newContent = btree.toStringHandle();
+        if (newContent != content) {
+          // Write back to file
+          await _dataStore.storage.writeAsString(partitionPath, newContent);
+
+          // Calculate new checksum
+          final checksum = _calculateChecksum(newContent);
+
+          // Create updated partition metadata
+          final updatedPartition = partition.copyWith(
+            fileSizeInBytes: newContent.length,
+            bTreeSize: newContent.length,
+            entries: btree.count(),
+            timestamps: Timestamps(
+              created: partition.timestamps.created,
+              modified: DateTime.now(),
+            ),
+            checksum: checksum,
+          );
+
+          // Add to modified partitions list
+          modifiedPartitions.add(updatedPartition);
+        }
+
+        // If callback returns false, stop processing more partitions
+        if (!shouldContinue) {
+          break;
+        }
+      }
+
+      // Update index metadata if needed
+      if (updateMetadata && modifiedPartitions.isNotEmpty) {
+        // Create updated partitions list
+        final updatedPartitions = meta.partitions.map((p) {
+          // Find if this partition was modified
+          final modifiedPartition = modifiedPartitions.firstWhere(
+            (mp) => mp.index == p.index,
+            orElse: () => p,
+          );
+          return modifiedPartition;
+        }).toList();
+
+        // Create updated metadata
+        final updatedMeta = meta.copyWith(
+          partitions: updatedPartitions,
+          timestamps: Timestamps(
+            created: meta.timestamps.created,
+            modified: DateTime.now(),
+          ),
+        );
+
+        // Write updated metadata to file
+        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+        await _dataStore.storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+
+        // Update metadata cache
+        final cacheKey = _getIndexCacheKey(tableName, indexName);
+        _indexMetaCache[cacheKey] = updatedMeta;
+
+        // Clear index from memory cache to ensure it's reloaded with latest data next time
+        if (_indexCache.containsKey(cacheKey)) {
+          _indexCache.remove(cacheKey);
+          _indexFullyCached.remove(cacheKey);
+        }
+      }
+
+      return anyPartitionProcessed;
+    } catch (e, stack) {
+      Logger.error('Failed to process index partitions: $e\n$stack',
+          label: 'IndexManager.processIndexPartitions');
+      return false;
+    }
+  }
+
+  
+
+  /// Internal method to batch delete records from all indexes
+  /// Efficiently handles both file content and memory cache
+  /// @param tableName Table name
+  /// @param records Map of records where key is the primary key value and value is the record data
+  /// @return true if successful, false otherwise
+  Future<bool> _batchDeleteFromAllIndexes(
+    String tableName,
+    Map<dynamic, Map<String, dynamic>> records,
+  ) async {
+    if (records.isEmpty) return true;
+    
+    try {
+      // Get table schema
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table schema not found: $tableName',
+            label: 'IndexManager.batchDeleteRecordsFromAllIndexes');
+        return false;
+      }
+
+      
+      // Get record pointers for all records
+      final recordPointers = <dynamic, String>{};
+      for (final entry in records.entries) {
+        final primaryKeyValue = entry.key;
+        final storeIndex = await getStoreIndexByPrimaryKey(tableName, primaryKeyValue);
+        if (storeIndex != null) {
+          recordPointers[primaryKeyValue] = storeIndex.toString();
+        }
+      }
+      
+      if (recordPointers.isEmpty) {
+        Logger.warn('No valid record pointers found for deletion',
+            label: 'IndexManager.batchDeleteRecordsFromAllIndexes');
+        return false;
+      }
+
+      bool success = true;
+      
+      // first collect all indexes to process (primary key, secondary indexes, unique fields indexes)
+      final allIndexesToProcess = <String, Map<dynamic, List<String>>>{};
+      
+      // 1. collect primary key index data
+      final pkIndexName = 'pk_$tableName';
+      final pkIndexEntries = <dynamic, List<String>>{};
+      for (final entry in recordPointers.entries) {
+        final primaryKeyValue = entry.key;
+        final recordId = entry.value;
+        
+        if (!pkIndexEntries.containsKey(primaryKeyValue)) {
+          pkIndexEntries[primaryKeyValue] = [];
+        }
+        pkIndexEntries[primaryKeyValue]!.add(recordId);
+      }
+      allIndexesToProcess[pkIndexName] = pkIndexEntries;
+      
+      // 2. collect secondary indexes data
+      for (final index in schema.indexes) {
+        final indexName = index.actualIndexName;
+        
+        // skip primary key index (already processed)
+        if (indexName == pkIndexName) continue;
+
+        final indexEntries = <dynamic, List<String>>{};
+        
+        for (final entry in records.entries) {
+          final record = entry.value;
+          final recordId = recordPointers[entry.key];
+          if (recordId == null) continue;
+          
+          // extract index key value
+          dynamic indexKey;
+          if (index.fields.length == 1) {
+            // single field index
+            final fieldName = index.fields[0];
+            indexKey = record[fieldName];
+          } else {
+            // composite index
+            indexKey = _createIndexKey(record, index.fields);
+          }
+          
+          // if key value is invalid, skip
+          if (indexKey == null) continue;
+          
+          if (!indexEntries.containsKey(indexKey)) {
+            indexEntries[indexKey] = [];
+          }
+          indexEntries[indexKey]!.add(recordId);
+        }
+        
+        if (indexEntries.isNotEmpty) {
+          allIndexesToProcess[indexName] = indexEntries;
+        }
+      }
+      
+      // 3. collect unique fields indexes data (may not in schema.indexes)
+      for (final field in schema.fields) {
+        if (field.unique && field.name != schema.primaryKey) {
+          // check if field has explicit index
+          bool hasExplicitIndex = schema.indexes.any((index) =>
+              index.fields.length == 1 && index.fields.first == field.name);
+
+          // if no explicit index, check if there is a unique index generated automatically
+          if (!hasExplicitIndex) {
+            final uniqueIndexName = 'uniq_${field.name}';
+            
+              // create field value to record ID mapping
+            final fieldEntries = <dynamic, List<String>>{};
+            
+            for (final entry in records.entries) {
+              final record = entry.value;
+              final recordId = recordPointers[entry.key];
+              if (recordId == null) continue;
+              
+              final fieldValue = record[field.name];
+              if (fieldValue == null) continue;
+              
+              if (!fieldEntries.containsKey(fieldValue)) {
+                fieldEntries[fieldValue] = [];
+              }
+              fieldEntries[fieldValue]!.add(recordId);
+            }
+            
+            if (fieldEntries.isNotEmpty) {
+              allIndexesToProcess[uniqueIndexName] = fieldEntries;
+            }
+          }
+        }
+      }
+      
+      // 1. process all memory cache and write buffer
+      for (final indexEntry in allIndexesToProcess.entries) {
+        final indexName = indexEntry.key;
+        final entries = indexEntry.value;
+        
+        // 1. clear memory cache
+        final cacheKey = _getIndexCacheKey(tableName, indexName);
+        if (_indexCache.containsKey(cacheKey)) {
+          final btree = _indexCache[cacheKey]!;
+          for (final entry in entries.entries) {
+            final key = entry.key;
+            final recordIds = entry.value;
+            
+            for (final recordId in recordIds) {
+              // try to delete from memory cache
+              try {
+                await btree.delete(key, recordId);
+              } catch (e) {
+                // ignore error, best effort to update cache
+              }
+            }
+          }
+        }
+        
+        // 2. clear write buffer
+        for (final entry in entries.entries) {
+          final key = entry.key;
+          final recordIds = entry.value;
+          
+          for (final recordId in recordIds) {
+            await _removeFromWriteBuffer(tableName, indexName, key, recordId);
+          }
+        }
+      }
+      
+      // 2. process partition files
+      
+      // 1. process primary key index
+      final pkSuccess = await processIndexPartitions(
+        tableName,
+        pkIndexName,
+        processor: (_, __, btree) async {
+          // process all primary keys in current partition
+          final processedKeys = <dynamic>[];
+          for (final entry in pkIndexEntries.entries) {
+            final primaryKeyValue = entry.key;
+            final recordIds = entry.value;
+            
+            // find matching records in current partition
+            final results = await btree.search(primaryKeyValue);
+            bool foundAny = false;
+            
+            // delete found records
+            for (final recordId in recordIds) {
+              for (final result in results) {
+                if (result.toString() == recordId) {
+                  await btree.delete(primaryKeyValue, recordId);
+                  foundAny = true;
+                  break;
+                }
+              }
+            }
+            
+            // If we found and processed this key in this partition, mark it as processed
+            if (foundAny) {
+              processedKeys.add(primaryKeyValue);
+            }
+          }
+          
+          // Remove processed keys from the list for next partitions
+          for (final key in processedKeys) {
+            pkIndexEntries.remove(key);
+          }
+          
+          // If all keys are processed, we can stop searching in other partitions
+          return pkIndexEntries.isNotEmpty;
+        },
+      );
+      
+      success = success && pkSuccess;
+
+      // 2. process other indexes (secondary indexes and unique fields indexes)
+      for (final indexEntry in allIndexesToProcess.entries) {
+        final indexName = indexEntry.key;
+        
+        // skip primary key index (already processed)
+        if (indexName == pkIndexName) continue;
+        
+        final indexEntries = indexEntry.value;
+        if (indexEntries.isEmpty) continue;
+        
+        // Check if this index is a unique index
+        bool isUnique = false;
+        
+        // First check if it's a unique field index
+        if (indexName.startsWith('uniq_')) {
+          isUnique = true;
+        } else {
+          // Check if it's a normal index marked as unique
+          for (final idx in schema.indexes) {
+            if (idx.actualIndexName == indexName) {
+              isUnique = idx.unique;
+              break;
+            }
+          }
+        }
+        
+        // process all partitions of this index
+        final idxSuccess = await processIndexPartitions(
+          tableName,
+          indexName,
+          processor: (_, __, btree) async {
+            // For unique indexes, we can track which keys were processed and stop searching for them
+            final processedKeys = isUnique ? <dynamic>[] : null;
+            
+            // process all index entries in current partition
+            for (final entry in indexEntries.entries) {
+              final indexKey = entry.key;
+              final recordIds = entry.value;
+              
+              // find matching records in current partition
+              final results = await btree.search(indexKey);
+              bool foundAny = false;
+              
+              // delete matching records
+              for (final recordId in recordIds) {
+                for (final result in results) {
+                  if (result.toString() == recordId) {
+                    await btree.delete(indexKey, recordId);
+                    foundAny = true;
+                    break;
+                  }
+                }
+              }
+              
+              // If this is a unique index and we found this key, mark it as processed
+              if (isUnique && foundAny) {
+                processedKeys!.add(indexKey);
+              }
+            }
+            
+            // For unique indexes, remove processed keys from the list for next partitions
+            if (isUnique && processedKeys != null) {
+              for (final key in processedKeys) {
+                indexEntries.remove(key);
+              }
+              
+              // If all keys are processed, we can stop searching in other partitions
+              return indexEntries.isNotEmpty;
+            }
+            
+            // For non-unique indexes, we must always continue to the next partition
+            return true;
+          },
+        );
+        
+        success = success && idxSuccess;
+      }
+
+      return success;
+    } catch (e, stack) {
+      Logger.error('Failed to batch delete records from all indexes: $e\n$stack',
+          label: 'IndexManager.batchDeleteRecordsFromAllIndexes');
+      return false;
+    }
+  }
+
+  /// Batch delete multiple records from all indexes
+  /// @param tableName Table name
+  /// @param records List of records to delete
+  Future<void> batchDeleteFromIndexes(
+    String tableName,
+    List<Map<String, dynamic>> records,
+  ) async {
+    if (records.isEmpty) return;
+    
+    try {
+      // Get table schema
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table schema not found: $tableName',
+            label: 'IndexManager.batchDeleteFromIndexes');
+        return;
+      }
+      
+      final primaryKey = schema.primaryKey;
+      
+      // Create a map of primary key values to records for efficient processing
+      final recordsMap = <dynamic, Map<String, dynamic>>{};
+      for (final record in records) {
+        final primaryValue = record[primaryKey];
+        if (primaryValue != null) {
+          recordsMap[primaryValue] = record;
+        }
+      }
+      
+      if (recordsMap.isEmpty) {
+        Logger.warn('No valid records found for deletion (missing primary key)',
+            label: 'IndexManager.batchDeleteFromIndexes');
+        return;
+      }
+      
+             // Use the internal method for actual deletion
+       final success = await _batchDeleteFromAllIndexes(tableName, recordsMap);
+      if (!success) {
+        Logger.warn('Some records may not have been deleted from indexes',
+            label: 'IndexManager.batchDeleteFromIndexes');
+      }
+    } catch (e, stack) {
+      Logger.error('Failed to batch delete records from indexes: $e\n$stack',
+          label: 'IndexManager.batchDeleteFromIndexes');
     }
   }
 
