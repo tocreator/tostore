@@ -117,9 +117,9 @@ class QueryExecutor {
         if (orderBy != null) {
           _applySort(updatedResults, orderBy);
         }
-        final finalResults = _paginateResults(updatedResults, limit, offset);
 
-        return finalResults;
+        // query cache is already the correct return result, no need to paginate again
+        return updatedResults;
       }
 
       // 3. execute actual query
@@ -131,21 +131,17 @@ class QueryExecutor {
         _applySort(results, orderBy);
       }
 
-      // 5. paginate results
-      final paginatedResults = _paginateResults(results, limit, offset);
+      // 5. first cache the complete result, then paginate
+      final shouldCache = condition == null ||
+          (await _isSpecificQuery(tableName, condition)) ||
+          (results.length < _dataStore.config.maxQueryCacheSize);
 
-      // 6. Store query results in cache
-      if (paginatedResults.isNotEmpty) {
-        final shouldCache = condition == null ||
-            (await _isSpecificQuery(tableName, condition)) ||
-            (paginatedResults.length < _dataStore.config.maxQueryCacheSize);
-
-        if (shouldCache) {
-          _dataStore.dataCacheManager
-              .cacheQuery(cacheKey, paginatedResults, {tableName});
-        }
+      if (shouldCache && results.isNotEmpty) {
+        _dataStore.dataCacheManager.cacheQuery(cacheKey, results, {tableName});
       }
 
+      // 6. apply pagination and return results
+      final paginatedResults = _paginateResults(results, limit, offset);
       return paginatedResults;
     } catch (e, stackTrace) {
       Logger.error('query execution failed: $e',
