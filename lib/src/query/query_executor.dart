@@ -998,7 +998,6 @@ class QueryExecutor {
       if (indexResults.isEmpty) {
         return _performTableScan(tableName, queryCondition);
       }
-
       // get full records
       final results = <Map<String, dynamic>>[];
 
@@ -1046,9 +1045,14 @@ class QueryExecutor {
             label: 'QueryExecutor._performIndexScan',
           );
 
+          dynamic actualValue = searchValue;
+          if (searchValue is Map && searchValue.containsKey('=')) {
+            actualValue = searchValue['='];
+          }
+
           // add to delete buffer for later cleanup
           await _indexManager.addToDeleteBuffer(
-              tableName, actualIndexName, searchValue, storeIndex.toString());
+              tableName, actualIndexName, actualValue, storeIndex.toString());
         }
       }
 

@@ -8,8 +8,20 @@ import '../model/db_result.dart';
 class DeleteBuilder extends ChainBuilder<DeleteBuilder>
     with FutureBuilderMixin<DbResult> {
   Future<DbResult>? _future;
+  // add flag to indicate whether to allow delete without condition
+  bool _allowAll = false;
 
   DeleteBuilder(super.db, super.tableName);
+
+  /// allow delete all records
+  /// 
+  /// this method explicitly indicates that the developer intentionally deletes all records in the table.
+  /// if there is no query condition and this method is not called, the delete operation will be rejected to prevent accidental deletion.
+  DeleteBuilder confirmDeleteAll() {
+    _allowAll = true;
+    return this;
+  }
+
 
   @override
   Future<DbResult> get future async {
@@ -19,6 +31,7 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
       orderBy: $orderBy,
       limit: $limit,
       offset: $offset,
+      allowAll: _allowAll,
     );
     return _future!;
   }

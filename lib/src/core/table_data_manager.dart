@@ -347,36 +347,36 @@ class TableDataManager {
         ExecuteInterval.seconds3, _processWriteBuffer);
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
-    
+
     try {
       // Flush all pending data (both write and delete buffers)
       await flushAllBuffers();
-      
+
       // cleanup file size information
       clearFileSizes();
-      
+
       // cleanup file meta cache
       _fileMetaCache.clear();
-  
+
       _maxIds.clear();
       _maxIdsDirty.clear();
-  
+
       // Save ID range information for all tables
       for (final tableName in _idGenerators.keys) {
         await _saveIdRange(tableName);
       }
-  
+
       // Cleanup ID generator resources
       _idGenerators.clear();
       _idRanges.clear();
       _checkedOrderedRange.clear();
-      
+
       // Ensure all buffers are cleared
       _writeBuffer.clear();
       _deleteBuffer.clear();
       _processingTables.clear();
     } catch (e) {
-      Logger.error('Failed to dispose TableDataManager: $e', 
+      Logger.error('Failed to dispose TableDataManager: $e',
           label: 'TableDataManager.dispose');
     }
   }
@@ -417,27 +417,27 @@ class TableDataManager {
           break;
         }
       }
-      
+
       // Condition 1b: Check delete queue size
       int largestDeleteQueueSize = 0;
       String? largestDeleteQueueTable;
       int totalDeleteRecords = 0;
-      
+
       for (final entry in _deleteBuffer.entries) {
         final queueSize = entry.value.length;
         totalDeleteRecords += queueSize;
-        
+
         if (queueSize > largestDeleteQueueSize) {
           largestDeleteQueueSize = queueSize;
           largestDeleteQueueTable = entry.key;
         }
-        
+
         if (queueSize >= _maxBufferSize) {
           needsImmediateWrite = true;
           break;
         }
       }
-      
+
       // Update total records count to include both write and delete records
       totalRecords += totalDeleteRecords;
 
@@ -458,7 +458,9 @@ class TableDataManager {
         needsImmediateWrite = true;
       }
 
-      if (needsImmediateWrite && ((_writeBuffer.isNotEmpty || _deleteBuffer.isNotEmpty)) && !_isWriting) {
+      if (needsImmediateWrite &&
+          ((_writeBuffer.isNotEmpty || _deleteBuffer.isNotEmpty)) &&
+          !_isWriting) {
         _isWriting = true;
         Logger.debug(
             'Starting batch operation, table count: ${_writeBuffer.length} write + ${_deleteBuffer.length} delete, largest write queue: ${largestQueueTable ?? "none"} ($largestQueueSize records), largest delete queue: ${largestDeleteQueueTable ?? "none"} ($largestDeleteQueueSize records), total records: $totalRecords',
@@ -469,7 +471,7 @@ class TableDataManager {
 
           // Execute write operation
           await flushWriteBuffer();
-          
+
           // Execute delete operation
           await flushDeleteBuffer();
 
@@ -483,7 +485,8 @@ class TableDataManager {
           final writeDuration =
               _lastWriteTime.difference(startTime).inMilliseconds;
           if ((largestQueueTable != null && largestQueueSize > 100) ||
-              (largestDeleteQueueTable != null && largestDeleteQueueSize > 100)) {
+              (largestDeleteQueueTable != null &&
+                  largestDeleteQueueSize > 100)) {
             Logger.debug(
                 'Batch operation completed, duration: ${writeDuration}ms, largest write queue: ${largestQueueTable ?? "none"} ($largestQueueSize records), largest delete queue: ${largestDeleteQueueTable ?? "none"} ($largestDeleteQueueSize records)',
                 label: 'TableDataManager._processWriteBuffer');
@@ -763,19 +766,18 @@ class TableDataManager {
   }
 
   /// Add records to delete buffer - for batch deleting
-  Future<void> addToDeleteBuffer(String tableName, List<Map<String, dynamic>> records) async {
+  Future<void> addToDeleteBuffer(
+      String tableName, List<Map<String, dynamic>> records) async {
     if (records.isEmpty) return;
-    
+
     // Get table schema to extract primary key
     final schema = await _dataStore.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error(
-        'Table schema is null, cannot add to delete buffer',
-        label: 'TableDataManager.addToDeleteBuffer'
-      );
+      Logger.error('Table schema is null, cannot add to delete buffer',
+          label: 'TableDataManager.addToDeleteBuffer');
       return;
     }
-    
+
     final primaryKey = schema.primaryKey;
     final tableQueue = _deleteBuffer.putIfAbsent(tableName, () => {});
 
@@ -791,7 +793,8 @@ class TableDataManager {
       }
 
       // if record is already in write buffer, remove it, because it is not written to file, no need to add to delete buffer
-      if (_writeBuffer.containsKey(tableName) && _writeBuffer[tableName]!.containsKey(recordId)) {
+      if (_writeBuffer.containsKey(tableName) &&
+          _writeBuffer[tableName]!.containsKey(recordId)) {
         _writeBuffer[tableName]!.remove(recordId);
         continue;
       }
@@ -1066,20 +1069,18 @@ class TableDataManager {
       _processingTables.clear();
     }
   }
-  
+
   /// Flush all pending write and delete buffers
   Future<void> flushAllBuffers() async {
     // First flush write buffer
     await flushWriteBuffer();
-    
+
     // Then flush delete buffer
     await flushDeleteBuffer();
-    
+
     // Finally flush max IDs
     await flushMaxIds();
   }
-  
-
 
   /// get total table count
   int getTotalTableCount() {
@@ -1335,8 +1336,9 @@ class TableDataManager {
       bool updateTableMeta = true,
       List<Map<String, dynamic>>? recordsToIndex}) async {
     // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
-    final nonEmptyRecords = records.where((record) => record.isNotEmpty).toList();
-    
+    final nonEmptyRecords =
+        records.where((record) => record.isNotEmpty).toList();
+
     if (nonEmptyRecords.isEmpty) {
       return PartitionMeta(
         version: 1,
@@ -1362,8 +1364,10 @@ class TableDataManager {
     bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
     // Get min/max primary key values
-    dynamic minPk = nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
-    dynamic maxPk = nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
+    dynamic minPk =
+        nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
+    dynamic maxPk =
+        nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
 
     if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
       for (var record in nonEmptyRecords) {
@@ -1447,11 +1451,12 @@ class TableDataManager {
     if (recordsToIndex != null && recordsToIndex.isNotEmpty) {
       // optimize: if it is appending records, can directly start from the old record count
       final int oldRecordsCount = records.length - recordsToIndex.length;
-      
+
       // performance optimization: increase batch size
-      const int indexBatchSize = 500; // increase batch size to improve performance
+      const int indexBatchSize =
+          500; // increase batch size to improve performance
       int offset = oldRecordsCount; // start from the old record count
-      
+
       // only process new record part
       for (int i = oldRecordsCount; i < records.length; i += indexBatchSize) {
         final endIndex = min(i + indexBatchSize, records.length);
@@ -1460,7 +1465,7 @@ class TableDataManager {
         for (int j = 0; j < batch.length; j++) {
           final record = batch[j];
           final currentOffset = offset + j;
-          
+
           // skip empty record
           if (record.isEmpty) continue;
 
@@ -2288,7 +2293,10 @@ class TableDataManager {
           // output all records in partition index order
           for (var records in allPartitionRecords) {
             for (var record in records) {
-              yield record;
+              // filter out empty records (deleted records)
+              if (record.isNotEmpty) {
+                yield record;
+              }
             }
           }
         } else {
@@ -2300,7 +2308,10 @@ class TableDataManager {
                 encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
             for (var record in partitionRecords) {
-              yield record;
+              // filter out empty records (deleted records)
+              if (record.isNotEmpty) {
+                yield record;
+              }
             }
           }
         }
@@ -2643,7 +2654,6 @@ class TableDataManager {
         // process data
         final processedRecords = await processFunction(records, partitionIndex);
 
-
         final partitionMeta = await _savePartitionFile(
           tableName,
           isGlobal,
@@ -2655,7 +2665,7 @@ class TableDataManager {
           encryptionKeyId: encryptionKeyId,
           updateTableMeta: false,
         );
-        
+
         // collect partition meta, for later update table meta
         allPartitionMetas.add(partitionMeta);
       },
@@ -2663,10 +2673,11 @@ class TableDataManager {
       requireLock: true, // need to lock
       description: 'process table partitions: $tableName',
     );
-    
+
     if (allPartitionMetas.isNotEmpty) {
       // update table meta
-      await _updateTableMetadataWithAllPartitions(tableName, allPartitionMetas, fileMeta.partitions);
+      await _updateTableMetadataWithAllPartitions(
+          tableName, allPartitionMetas, fileMeta.partitions);
     }
   }
 
@@ -2790,19 +2801,15 @@ class TableDataManager {
       // If a specific record is requested, find it
       if (recordIndex != null) {
         if (recordIndex >= 0 && recordIndex < partitionInfo.data.length) {
-          final record = partitionInfo.data[recordIndex] as Map<String, dynamic>;
-          // if it is an empty record (deleted), return an empty list
-          if (record.isEmpty) return [];
+          final record =
+              partitionInfo.data[recordIndex] as Map<String, dynamic>;
           return [record];
         }
         return [];
       }
 
-      // filter out empty records (deleted records)
-      return partitionInfo.data
-        .cast<Map<String, dynamic>>()
-        .where((record) => record.isNotEmpty)
-        .toList();
+      // allow empty records (deleted records), avoid deleted records being filtered out during migration
+      return partitionInfo.data.cast<Map<String, dynamic>>().toList();
     } catch (e, stack) {
       Logger.error('''Read records from partition failed:
             error: $e
@@ -2910,7 +2917,8 @@ class TableDataManager {
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
                 updateTableMeta: false, // key: not update table meta
-                recordsToIndex: recordsForPartition, // create index for new inserted records
+                recordsToIndex:
+                    recordsForPartition, // create index for new inserted records
               );
             },
             description: 'parallel insert records to multiple partitions',
@@ -2952,7 +2960,8 @@ class TableDataManager {
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
               updateTableMeta: false, // key: not update table meta
-              recordsToIndex: recordsForPartition, // only create index for new inserted records
+              recordsToIndex:
+                  recordsForPartition, // only create index for new inserted records
             );
 
             // collect partition meta
@@ -3045,7 +3054,7 @@ class TableDataManager {
                   final record = resultRecords[i];
                   // skip already empty records
                   if (record.isEmpty) continue;
-                  
+
                   final pk = record[primaryKey]?.toString() ?? '';
                   if (recordsByPk.containsKey(pk)) {
                     // use empty object {} to replace the record, keep the index unchanged
@@ -3170,15 +3179,16 @@ class TableDataManager {
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
               for (int i = 0; i < resultRecords.length; i++) {
                 final record = resultRecords[i];
-                // skip already empty records
-                if (record.isEmpty) continue;
-                
-                final pk = record[primaryKey]?.toString() ?? '';
-                if (recordsByPk.containsKey(pk)) {
-                  // use empty object {} to replace the record, keep the index unchanged
-                  resultRecords[i] = {};
-                  modified = true;
-                  processedKeys.add(pk);
+
+                // only delete non-empty records
+                if (record.isNotEmpty) {
+                  final pk = record[primaryKey]?.toString() ?? '';
+                  if (recordsByPk.containsKey(pk)) {
+                    // use empty object {} to replace the record, keep the index unchanged
+                    resultRecords[i] = {};
+                    modified = true;
+                    processedKeys.add(pk);
+                  }
                 }
               }
             } else {
@@ -3603,8 +3613,8 @@ class TableDataManager {
     // Use a concurrent queue system
     final processingQueue = <Future<void>>[];
     const tableStartIndex = 0;
-    final maxTablesToProcess = min(
-        maxConcurrent, tablesToProcess.length - tableStartIndex);
+    final maxTablesToProcess =
+        min(maxConcurrent, tablesToProcess.length - tableStartIndex);
 
     if (maxTablesToProcess <= 0) {
       return;
@@ -3674,7 +3684,8 @@ class TableDataManager {
       _processingTables.add(tableName);
     } else if (_processingTables.contains(tableName)) {
       // Without lock manager, use _processingTables as simple reentry prevention
-      Logger.debug('Table $tableName is being processed, skipping this delete flush',
+      Logger.debug(
+          'Table $tableName is being processed, skipping this delete flush',
           label: 'TableDataManager._flushTableDeleteBuffer');
       return;
     } else {
@@ -3705,7 +3716,7 @@ class TableDataManager {
           !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
         // Get current queue size
         final currentQueueSize = _deleteBuffer[tableName]!.length;
-        
+
         // Determine batch size for current iteration
         final currentBatchSize = min(maxBatchSize, currentQueueSize);
         if (currentBatchSize <= 0) {
@@ -3732,7 +3743,8 @@ class TableDataManager {
           final entry = _deleteBuffer[tableName]?[key];
           if (entry != null) {
             processedEntries[key] = entry;
-            _deleteBuffer[tableName]!.remove(key); // Remove from original buffer immediately
+            _deleteBuffer[tableName]!
+                .remove(key); // Remove from original buffer immediately
             recordsToDelete.add(entry.data);
           }
         }

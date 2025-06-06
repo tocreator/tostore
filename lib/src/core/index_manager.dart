@@ -2696,6 +2696,7 @@ class IndexManager {
   /// Delete single record from all indexes
   /// @param tableName Table name
   /// @param record Record to delete
+  /// Note: This method requires fetching the StoreIndex associated with the primaryKey
   Future<void> deleteFromIndexes(
     String tableName,
     Map<String, dynamic> record,
@@ -2707,19 +2708,27 @@ class IndexManager {
         return;
       }
       final primaryKey = schema.primaryKey;
-      final primaryValue = record[primaryKey];
+      final primaryKeyValue = record[primaryKey];
 
-      if (primaryValue == null) {
+      if (primaryKeyValue == null) {
         Logger.error('Record has no primary key value',
             label: 'IndexManager.deleteFromIndexes');
         return;
       }
 
-      final recordId = primaryValue.toString();
+      // Get the StoreIndex by primary key value
+      final storeIndex =
+          await getStoreIndexByPrimaryKey(tableName, primaryKeyValue);
+      if (storeIndex == null) {
+        return;
+      }
+
+      final storeIndexStr = storeIndex.toString();
 
       // 1. Delete from primary key index
       final pkIndexName = 'pk_$tableName';
-      await addToDeleteBuffer(tableName, pkIndexName, primaryValue, recordId);
+      await addToDeleteBuffer(
+          tableName, pkIndexName, primaryKeyValue, storeIndexStr);
 
       // 2. Delete from normal indexes and unique indexes
       for (final index in schema.indexes) {
@@ -2731,14 +2740,15 @@ class IndexManager {
           final fieldValue = record[fieldName];
 
           if (fieldValue != null) {
-            await addToDeleteBuffer(tableName, indexName, fieldValue, recordId);
+            await addToDeleteBuffer(
+                tableName, indexName, fieldValue, storeIndexStr);
           }
         } else {
           // Composite index
           final compositeKey = _createIndexKey(record, index.fields);
           if (compositeKey != null) {
             await addToDeleteBuffer(
-                tableName, indexName, compositeKey, recordId);
+                tableName, indexName, compositeKey, storeIndexStr);
           }
         }
       }
@@ -2758,7 +2768,7 @@ class IndexManager {
               // Build unique index name
               final uniqueIndexName = 'uniq_${field.name}';
               await addToDeleteBuffer(
-                  tableName, uniqueIndexName, fieldValue, recordId);
+                  tableName, uniqueIndexName, fieldValue, storeIndexStr);
             }
           }
         }
@@ -3530,6 +3540,7 @@ class IndexManager {
   /// Batch delete multiple records from all indexes
   /// @param tableName Table name
   /// @param records List of records to delete
+  /// Note: For each record, this method fetches the StoreIndex associated with its primaryKey
   Future<void> batchDeleteFromIndexes(
     String tableName,
     List<Map<String, dynamic>> records,
@@ -3549,14 +3560,20 @@ class IndexManager {
 
       // Process each record and add to delete buffer
       for (final record in records) {
-        final primaryValue = record[primaryKey];
-        if (primaryValue == null) continue;
+        final primaryKeyValue = record[primaryKey];
+        if (primaryKeyValue == null) continue;
 
-        final recordId = primaryValue.toString();
+        // Get StoreIndex by primary key
+        final storeIndex =
+            await getStoreIndexByPrimaryKey(tableName, primaryKeyValue);
+        if (storeIndex == null) continue;
+
+        final storeIndexStr = storeIndex.toString();
 
         // 1. Delete from primary key index
         final pkIndexName = 'pk_$tableName';
-        await addToDeleteBuffer(tableName, pkIndexName, primaryValue, recordId);
+        await addToDeleteBuffer(
+            tableName, pkIndexName, primaryKeyValue, storeIndexStr);
 
         // 2. Delete from normal indexes and unique indexes
         for (final index in schema.indexes) {
@@ -3569,14 +3586,14 @@ class IndexManager {
 
             if (fieldValue != null) {
               await addToDeleteBuffer(
-                  tableName, indexName, fieldValue, recordId);
+                  tableName, indexName, fieldValue, storeIndexStr);
             }
           } else {
             // Composite index
             final compositeKey = _createIndexKey(record, index.fields);
             if (compositeKey != null) {
               await addToDeleteBuffer(
-                  tableName, indexName, compositeKey, recordId);
+                  tableName, indexName, compositeKey, storeIndexStr);
             }
           }
         }
@@ -3594,7 +3611,7 @@ class IndexManager {
                 // Build unique index name
                 final uniqueIndexName = 'uniq_${field.name}';
                 await addToDeleteBuffer(
-                    tableName, uniqueIndexName, fieldValue, recordId);
+                    tableName, uniqueIndexName, fieldValue, storeIndexStr);
               }
             }
           }
@@ -3612,20 +3629,24 @@ class IndexManager {
   }
 
   /// Add index entry during migration
+  /// @param tableName Table name
+  /// @param indexName Index name
+  /// @param value Index key value
+  /// @param storeIndexStr String representation of StoreIndex pointer to the record
   Future<void> addIndexEntry(
     String tableName,
     String indexName,
     dynamic value,
-    String recordId,
+    String storeIndexStr,
   ) async {
     try {
       // Add index entry using write buffer
-      await _addToInsertBuffer(tableName, indexName, value, recordId);
+      await _addToInsertBuffer(tableName, indexName, value, storeIndexStr);
 
       // Update index in memory (if loaded)
       final cacheKey = _getIndexCacheKey(tableName, indexName);
       if (_indexCache.containsKey(cacheKey)) {
-        await _indexCache[cacheKey]!.insert(value, recordId);
+        await _indexCache[cacheKey]!.insert(value, storeIndexStr);
       }
     } catch (e) {
       Logger.error(
@@ -4530,8 +4551,13 @@ class IndexManager {
   }
 
   /// Add index entry to insert buffer
-  Future<void> _addToInsertBuffer(
-      String tableName, String indexName, dynamic key, String recordId) async {
+  /// Add index entry to insert buffer
+  /// @param tableName Table name
+  /// @param indexName Index name
+  /// @param key Index key value
+  /// @param storeIndexStr String representation of StoreIndex pointer to the record
+  Future<void> _addToInsertBuffer(String tableName, String indexName,
+      dynamic key, String storeIndexStr) async {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
@@ -4543,9 +4569,9 @@ class IndexManager {
 
         if (deleteEntries != null && deleteEntries.containsKey(key)) {
           // Found matching key in delete buffer, check for matching record ID
-          if (deleteEntries[key]!.contains(recordId)) {
+          if (deleteEntries[key]!.contains(storeIndexStr)) {
             // Entry is in delete buffer, remove it from there instead of adding to insert buffer
-            deleteEntries[key]!.remove(recordId);
+            deleteEntries[key]!.remove(storeIndexStr);
 
             // If the key set is empty, remove the key
             if (deleteEntries[key]!.isEmpty) {
@@ -4595,8 +4621,8 @@ class IndexManager {
         entries[key] = <dynamic>{};
       }
 
-      if (!entries[key]!.contains(recordId)) {
-        entries[key]!.add(recordId);
+      if (!entries[key]!.contains(storeIndexStr)) {
+        entries[key]!.add(storeIndexStr);
       }
 
       _indexWriteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
@@ -4609,7 +4635,7 @@ class IndexManager {
       // Update index cache (if loaded)
       if (_indexCache.containsKey(cacheKey)) {
         try {
-          await _indexCache[cacheKey]!.insert(key, recordId);
+          await _indexCache[cacheKey]!.insert(key, storeIndexStr);
         } catch (e) {
           // Cache update error does not affect the main process
           Logger.warn('Failed to update memory cache: $e',
@@ -4626,8 +4652,12 @@ class IndexManager {
   }
 
   /// Add index entry to delete buffer
-  Future<void> addToDeleteBuffer(
-      String tableName, String indexName, dynamic key, String recordId) async {
+  /// @param tableName Table name
+  /// @param indexName Index name
+  /// @param key Index key value
+  /// @param storeIndexStr String representation of StoreIndex pointer to the record
+  Future<void> addToDeleteBuffer(String tableName, String indexName,
+      dynamic key, String storeIndexStr) async {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
@@ -4639,9 +4669,9 @@ class IndexManager {
 
         if (insertEntries != null && insertEntries.containsKey(key)) {
           // Found matching key in insert buffer, check for matching record ID
-          if (insertEntries[key]!.contains(recordId)) {
+          if (insertEntries[key]!.contains(storeIndexStr)) {
             // Entry is in insert buffer, remove it from there instead of adding to delete buffer
-            insertEntries[key]!.remove(recordId);
+            insertEntries[key]!.remove(storeIndexStr);
 
             // If the key set is empty, remove the key
             if (insertEntries[key]!.isEmpty) {
@@ -4655,7 +4685,7 @@ class IndexManager {
             // Also remove from memory cache if it exists
             if (_indexCache.containsKey(cacheKey)) {
               try {
-                await _indexCache[cacheKey]!.delete(key, recordId);
+                await _indexCache[cacheKey]!.delete(key, storeIndexStr);
               } catch (e) {
                 // Ignore errors in memory cache update
               }
@@ -4700,8 +4730,8 @@ class IndexManager {
         entries[key] = <dynamic>{};
       }
 
-      if (!entries[key]!.contains(recordId)) {
-        entries[key]!.add(recordId);
+      if (!entries[key]!.contains(storeIndexStr)) {
+        entries[key]!.add(storeIndexStr);
       }
 
       _indexDeleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
@@ -4709,7 +4739,7 @@ class IndexManager {
       // Also remove from memory cache if it exists
       if (_indexCache.containsKey(cacheKey)) {
         try {
-          await _indexCache[cacheKey]!.delete(key, recordId);
+          await _indexCache[cacheKey]!.delete(key, storeIndexStr);
         } catch (e) {
           // Ignore errors in memory cache update
           Logger.warn('Failed to update memory cache for deletion: $e',

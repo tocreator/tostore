@@ -1091,8 +1091,19 @@ class DataStoreImpl {
     List<String>? orderBy,
     int? limit,
     int? offset,
+    bool allowAll = false,
   }) async {
     await ensureInitialized();
+    
+    // check if condition is empty, avoid accidental update of all records
+    if (condition.isEmpty && !allowAll) {
+      Logger.warn('Update operation without condition, this may cause accidental update of all records, please use confirmUpdateAll() method to explicitly confirm.', label: 'DataStore.updateInternal');
+      return DbResult.error(
+        code: ResultCode.validationFailed,
+        message: 'Update operation must specify a filter condition. If you really need to update all records, please use confirmUpdateAll() method to explicitly confirm.',
+      );
+    }
+    
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
@@ -1240,18 +1251,30 @@ class DataStoreImpl {
     List<String>? orderBy,
     int? limit,
     int? offset,
+    bool allowAll = false,
   }) async {
+    await ensureInitialized();
+    
+    // check if condition is empty, avoid accidental deletion of all records
+    if (condition.isEmpty && !allowAll) {
+      Logger.warn('Delete operation without condition, this may cause accidental deletion of all records, please use confirmDeleteAll() method to explicitly confirm.', label: 'DataStore.deleteInternal');
+      return DbResult.error(
+        code: ResultCode.validationFailed,
+        message: 'Delete operation must specify a filter condition. If you really need to delete all records, please use confirmDeleteAll() method to explicitly confirm.',
+      );
+    }
+    
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
-      await ensureInitialized();
-      
+
       // get table record count, for later processing
-      final totalRecords = await tableDataManager.getTableRecordCount(tableName);
-      
+      final totalRecords =
+          await tableDataManager.getTableRecordCount(tableName);
+
       // use config.maxRecordCacheSize as threshold
       final recordThreshold = config.maxRecordCacheSize;
-      
+
       // get table schema
       final schema = await getTableSchema(tableName);
       if (schema == null) {
@@ -1262,25 +1285,25 @@ class DataStoreImpl {
           message: 'Table $tableName does not exist',
         );
       }
-      
+
       final primaryKey = schema.primaryKey;
       final writeQueue = tableDataManager.writeBuffer[tableName];
-      
+
       // Check if condition is an equality on primary key or unique field - this can be optimized
       bool isOptimizableQuery = false;
-      
+
       // Analyze condition to check if it's a primary key or unique field equality operation
       if (!condition.isEmpty) {
         final conditionMap = condition.build();
-        
+
         // Check if condition involves primary key with equality operator
         if (conditionMap.containsKey(primaryKey)) {
           final op = conditionMap[primaryKey];
           if (op is Map<String, dynamic> && op.containsKey('=')) {
             isOptimizableQuery = true;
           }
-        } 
-        
+        }
+
         // If not primary key, check for unique field equality
         if (!isOptimizableQuery) {
           // Get unique fields from schema
@@ -1288,7 +1311,7 @@ class DataStoreImpl {
               .where((field) => field.unique && field.name != primaryKey)
               .map((field) => field.name)
               .toList();
-              
+
           // Add unique indexes fields
           for (final index in schema.indexes.where((idx) => idx.unique)) {
             // Only consider single-field unique indexes for optimization
@@ -1296,7 +1319,7 @@ class DataStoreImpl {
               uniqueFields.add(index.fields[0]);
             }
           }
-          
+
           // Check if condition is on a unique field
           for (final uniqueField in uniqueFields) {
             if (conditionMap.containsKey(uniqueField)) {
@@ -1309,7 +1332,7 @@ class DataStoreImpl {
           }
         }
       }
-      
+
       // when table record count is less than threshold or this is an optimizable query, use regular method
       if (totalRecords <= recordThreshold || isOptimizableQuery) {
         // standard method: get all records
@@ -1339,7 +1362,7 @@ class DataStoreImpl {
 
         // Update indexes - still necessary to keep indexes in sync
         await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
-        
+
         // Update statistics asynchronously
         _updateStatisticsAsync(tableName);
 
@@ -1348,72 +1371,72 @@ class DataStoreImpl {
           message: 'Successfully deleted ${recordsToDelete.length} records',
         );
       } else {
-      
-        
         // create counters
         int totalProcessed = 0;
         int totalDeleted = 0;
-        
+
         // build a process function, to check if each partition's record matches the delete condition
         Future<List<Map<String, dynamic>>> processFunction(
             List<Map<String, dynamic>> records, int partitionIndex) async {
-          
           // record original count
           int originalCount = records.length;
-          
+
           // filter out records that match the delete condition
           final resultRecords = records.where((record) {
             final matches = condition.matches(record);
             if (matches) {
               totalDeleted++;
-              
+
               // remove from cache
               final pkValue = record[primaryKey]?.toString();
               if (pkValue != null) {
                 dataCacheManager.removeCachedRecord(tableName, pkValue);
-                
+
                 // remove from write queue (if exists)
                 writeQueue?.remove(pkValue);
               }
-              
+
               // process limit
               if (limit != null && totalDeleted > limit) {
                 return true; // if exceeds limit, keep this record
               }
-              
+
               return false; // if matches, delete this record
             }
             return true; // if not matches, keep this record
           }).toList();
-          
+
           totalProcessed += originalCount;
-          
+
           // update indexes (if modified)
           if (resultRecords.length < originalCount) {
             // calculate deleted records
-            final deletedRecords = records.where((record) => 
-              !resultRecords.any((r) => r[primaryKey] == record[primaryKey])).toList();
-            
+            final deletedRecords = records
+                .where((record) => !resultRecords
+                    .any((r) => r[primaryKey] == record[primaryKey]))
+                .toList();
+
             // batch update indexes
-            await _indexManager?.batchDeleteFromIndexes(tableName, deletedRecords);
+            await _indexManager?.batchDeleteFromIndexes(
+                tableName, deletedRecords);
           }
-          
+
           return resultRecords;
         }
-        
+
         // use processTablePartitions to process all partition
         await tableDataManager.processTablePartitions(
           tableName: tableName,
           processFunction: processFunction,
         );
-        
-        
+
         // update statistics
         _updateStatisticsAsync(tableName);
-        
+
         await _transactionManager!.commit(transaction);
         return DbResult.success(
-          message: 'Successfully deleted $totalDeleted records (processed $totalProcessed)',
+          message:
+              'Successfully deleted $totalDeleted records (processed $totalProcessed)',
         );
       }
     } catch (e) {
@@ -1669,13 +1692,14 @@ class DataStoreImpl {
       // 6. use WriteRecords to append records directly, not clear table and rewrite
       // Use a batch size that balances performance and memory usage
       final batchSize = config.migrationConfig?.batchSize ?? 1000;
-      
+
       if (allData.length > batchSize) {
         // if data is large, process in batches to avoid memory issues
         for (int i = 0; i < allData.length; i += batchSize) {
-          final end = (i + batchSize < allData.length) ? i + batchSize : allData.length;
+          final end =
+              (i + batchSize < allData.length) ? i + batchSize : allData.length;
           final batch = allData.sublist(i, end);
-          
+
           await tableDataManager.writeRecords(
             tableName: tableName,
             records: batch,
@@ -2346,7 +2370,6 @@ class DataStoreImpl {
 
       // Create index file and build index
       await _indexManager?.createIndex(tableName, index);
-      await _buildIndex(tableName, index);
 
       // Update schema file
       await updateTableSchema(tableName, newSchema);
@@ -2493,46 +2516,6 @@ class DataStoreImpl {
       Logger.error(
         'Failed to update schema: $e',
         label: 'DataStoreImpl.updateTableSchema',
-      );
-      rethrow;
-    }
-  }
-
-  /// Build index for table
-  Future<void> _buildIndex(
-    String tableName,
-    IndexSchema index,
-  ) async {
-    try {
-      final schema = await getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      final queryResult = await executeQuery(tableName, QueryCondition());
-
-      if (!queryResult.isNotEmpty) {
-        return;
-      }
-
-      // Build index entries
-      for (var record in queryResult) {
-        final values = <dynamic>[];
-        for (var field in index.fields) {
-          values.add(record[field]);
-        }
-
-        final value = values.length == 1 ? values.first : values;
-        await _indexManager?.addIndexEntry(
-          tableName,
-          index.actualIndexName,
-          value,
-          record[schema.primaryKey].toString(),
-        );
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to build index: $e',
-        label: 'DataStoreImpl._buildIndex',
       );
       rethrow;
     }
