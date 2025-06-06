@@ -53,9 +53,8 @@ class QueryExecutor {
         if (isFullCache || isSpecificQuery) {
           var results = cache;
           if (condition != null) {
-            results = results
-                .where((record) => condition.matches(record))
-                .toList();
+            results =
+                results.where((record) => condition.matches(record)).toList();
           }
 
           if (orderBy != null) {
@@ -180,7 +179,8 @@ class QueryExecutor {
             // Create QueryCondition and add conditions
             final mainTableQueryCondition = QueryCondition();
             for (var entry in mainTableConditions.entries) {
-              _addConditionToQuery(mainTableQueryCondition, entry.key, entry.value);
+              _addConditionToQuery(
+                  mainTableQueryCondition, entry.key, entry.value);
             }
             results =
                 await _performTableScan(tableName, mainTableQueryCondition);
@@ -281,8 +281,7 @@ class QueryExecutor {
           // Apply joined table conditions
           if (joinTableConditions.isNotEmpty) {
             results = results
-                .where(
-                    (record) => condition?.matches(record) ?? false)
+                .where((record) => condition?.matches(record) ?? false)
                 .toList();
 
             // Remove applied conditions from remaining conditions
@@ -334,9 +333,9 @@ class QueryExecutor {
     return result;
   }
 
-  
   /// Helper to add a condition to QueryCondition
-  void _addConditionToQuery(QueryCondition queryCondition, String field, dynamic value) {
+  void _addConditionToQuery(
+      QueryCondition queryCondition, String field, dynamic value) {
     if (value is Map) {
       // Process operators
       for (var opEntry in value.entries) {
@@ -349,8 +348,6 @@ class QueryExecutor {
       queryCondition.where(field, '=', value);
     }
   }
-
-
 
   /// Execute table join operation
   Future<List<Map<String, dynamic>>> _performJoin(
@@ -673,9 +670,8 @@ class QueryExecutor {
             !_dataStore.tableDataManager.isFileModified(tableName, cacheTime)) {
           var results = cache;
           if (condition != null) {
-            results = results
-                .where((record) => condition.matches(record))
-                .toList();
+            results =
+                results.where((record) => condition.matches(record)).toList();
           }
           return results;
         }
@@ -772,7 +768,8 @@ class QueryExecutor {
     }
 
     // Process records using streaming
-    if (fileMeta != null && fileMeta.totalRecords > 0 &&
+    if (fileMeta != null &&
+        fileMeta.totalRecords > 0 &&
         fileMeta.partitions!.isNotEmpty) {
       // Use streaming to process partitions without loading all at once
       final stream = _dataStore.tableDataManager.streamRecords(tableName);
@@ -1014,7 +1011,15 @@ class QueryExecutor {
         // handle String and StoreIndex types
         StoreIndex storeIndex;
         if (pointer is String) {
-          storeIndex = StoreIndex.fromString(pointer);
+          final storeIndexTemp = StoreIndex.fromString(pointer);
+          if (storeIndexTemp == null) {
+            Logger.debug(
+              'Skipped invalid index result: $pointer',
+              label: 'QueryExecutor._performIndexScan',
+            );
+            continue;
+          }
+          storeIndex = storeIndexTemp;
         } else if (pointer is StoreIndex) {
           storeIndex = pointer;
         } else {
@@ -1038,21 +1043,16 @@ class QueryExecutor {
           } else {
             results.add(record);
           }
-        }
-        else {
+        } else {
           // record not found, index expired, add to delete buffer
           Logger.debug(
             'Detected expired index, adding to delete buffer: $tableName.$indexName: $searchValue -> $storeIndex',
             label: 'QueryExecutor._performIndexScan',
           );
-          
+
           // add to delete buffer for later cleanup
           await _indexManager.addToDeleteBuffer(
-            tableName, 
-            actualIndexName, 
-            searchValue, 
-            storeIndex.toString()
-          );
+              tableName, actualIndexName, searchValue, storeIndex.toString());
         }
       }
 

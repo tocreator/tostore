@@ -1052,7 +1052,7 @@ class IndexManager {
           meta.partitions.isEmpty ? 0 : meta.partitions.last.fileSizeInBytes;
 
       // If the current partition is close to the maximum size, create a new partition
-      if (currentSize > _dataStore.config.maxPartitionFileSize * 0.9) {
+      if (currentSize > _dataStore.config.maxPartitionFileSize) {
         partitionIndex++;
         currentSize = 0;
       }
@@ -1666,6 +1666,13 @@ class IndexManager {
         final fileMeta =
             await _dataStore.tableDataManager.getTableFileMeta(tableName);
 
+        int? clusterId;
+        int? nodeId;
+        if (_dataStore.config.distributedNodeConfig.enableDistributed) {
+          clusterId = _dataStore.config.distributedNodeConfig.clusterId;
+          nodeId = _dataStore.config.distributedNodeConfig.nodeId;
+        }
+
         if (fileMeta != null &&
             fileMeta.partitions != null &&
             fileMeta.partitions!.isNotEmpty) {
@@ -1684,9 +1691,11 @@ class IndexManager {
 
               // Create record pointer
               final recordPointer = await StoreIndex.create(
-                  jsonEncode(record), i, // Use the offset in the partition
-                  partitionId: partition.index // Use the correct partition ID
-                  );
+                offset: i, // Use the offset in the partition
+                partitionId: partition.index, // Use the correct partition ID
+                clusterId: clusterId,
+                nodeId: nodeId,
+              );
 
               final recordId = recordPointer.toString();
 
@@ -1718,9 +1727,11 @@ class IndexManager {
 
             // Create record pointer
             final recordPointer = await StoreIndex.create(
-                jsonEncode(record), recordIndex,
-                partitionId: 0 // Default partition
-                );
+              offset: recordIndex,
+              partitionId: 0, // Default partition
+              clusterId: clusterId,
+              nodeId: nodeId,
+            );
 
             final recordId = recordPointer.toString();
             recordIndex++;
@@ -2103,7 +2114,9 @@ class IndexManager {
       for (final line in lines) {
         if (line.trim().isEmpty) continue;
         try {
-          recordIndices.add(StoreIndex.fromString(line));
+          final storeIndex = StoreIndex.fromString(line);
+          if (storeIndex == null) continue;
+          recordIndices.add(storeIndex);
         } catch (e) {
           // Skip invalid lines
         }
@@ -2660,22 +2673,6 @@ class IndexManager {
         if (storeIndex.offset < recordsList.length) {
           record = recordsList[storeIndex.offset] as Map<String, dynamic>;
         }
-      } else {
-        // Compatible with old format: extract directly by offset and size
-        if (storeIndex.offset + storeIndex.size <= decodedString.length) {
-          final recordContent = decodedString.substring(
-            storeIndex.offset,
-            storeIndex.offset + storeIndex.size,
-          );
-
-          if (recordContent.isNotEmpty) {
-            try {
-              record = jsonDecode(recordContent);
-            } catch (e) {
-              return null;
-            }
-          }
-        }
       }
 
       return record;
@@ -3188,30 +3185,31 @@ class IndexManager {
     // handle write buffer, only keep global table index
     final keysToCheck = <String>[..._indexWriteBuffer.keys];
     final globalKeysToKeep = <String>[];
-    
+
     // check each index key, determine which is global table
     for (final key in keysToCheck) {
       try {
         // extract table name from index key (format: tableName:indexName or tableName_indexName)
         final parts = key.split(':');
         final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
-        
+
         // check if table is global table
         if (await _dataStore.schemaManager?.isTableGlobal(tableName) == true) {
           globalKeysToKeep.add(key);
         }
       } catch (e) {
-        Logger.error('Error checking if index is global: $e', label: 'IndexManager.onSpacePathChanged');
+        Logger.error('Error checking if index is global: $e',
+            label: 'IndexManager.onSpacePathChanged');
       }
     }
 
     // only keep global table write buffer
     _indexWriteBuffer.removeWhere((key, _) => !globalKeysToKeep.contains(key));
-    
+
     // same as above, handle delete buffer
     final deleteKeysToCheck = <String>[..._indexDeleteBuffer.keys];
     final globalDeleteKeysToKeep = <String>[];
-    
+
     for (final key in deleteKeysToCheck) {
       try {
         final parts = key.split(':');
@@ -3220,15 +3218,18 @@ class IndexManager {
           globalDeleteKeysToKeep.add(key);
         }
       } catch (e) {
-        Logger.error('Error checking if delete index is global: $e', label: 'IndexManager.onSpacePathChanged');
+        Logger.error('Error checking if delete index is global: $e',
+            label: 'IndexManager.onSpacePathChanged');
       }
     }
-    
-    _indexDeleteBuffer.removeWhere((key, _) => !globalDeleteKeysToKeep.contains(key));
-    
+
+    _indexDeleteBuffer
+        .removeWhere((key, _) => !globalDeleteKeysToKeep.contains(key));
+
     // clear other related caches
     _indexWriting.removeWhere((key, _) => !globalKeysToKeep.contains(key));
-    _indexLastWriteTime.removeWhere((key, _) => !globalKeysToKeep.contains(key));
+    _indexLastWriteTime
+        .removeWhere((key, _) => !globalKeysToKeep.contains(key));
   }
 
   /// get total size of all indexes
@@ -4317,6 +4318,13 @@ class IndexManager {
       final fileMeta =
           await _dataStore.tableDataManager.getTableFileMeta(tableName);
 
+      int? clusterId;
+      int? nodeId;
+      if (_dataStore.config.distributedNodeConfig.enableDistributed) {
+        clusterId = _dataStore.config.distributedNodeConfig.clusterId;
+        nodeId = _dataStore.config.distributedNodeConfig.nodeId;
+      }
+
       if (fileMeta != null &&
           fileMeta.partitions != null &&
           fileMeta.partitions!.isNotEmpty) {
@@ -4349,8 +4357,10 @@ class IndexManager {
 
               // Create record pointer
               final recordPointer = await StoreIndex.create(
-                  jsonEncode(record), offset + i,
-                  partitionId: partition.index);
+                  offset: offset + i,
+                  partitionId: partition.index,
+                  clusterId: clusterId,
+                  nodeId: nodeId);
 
               final recordId = recordPointer.toString();
 
@@ -4396,8 +4406,10 @@ class IndexManager {
 
           // Create record pointer (approximate as we don't have position info)
           final recordPointer = await StoreIndex.create(
-              jsonEncode(record), totalProcessed,
-              partitionId: 0);
+              offset: totalProcessed,
+              partitionId: 0,
+              clusterId: clusterId,
+              nodeId: nodeId);
 
           final recordId = recordPointer.toString();
 

@@ -1332,8 +1332,12 @@ class TableDataManager {
       List<PartitionMeta>? existingPartitions,
       {List<int>? encryptionKey,
       int? encryptionKeyId,
-      bool updateTableMeta = true}) async {
-    if (records.isEmpty) {
+      bool updateTableMeta = true,
+      List<Map<String, dynamic>>? recordsToIndex}) async {
+    // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
+    final nonEmptyRecords = records.where((record) => record.isNotEmpty).toList();
+    
+    if (nonEmptyRecords.isEmpty) {
       return PartitionMeta(
         version: 1,
         index: partitionIndex,
@@ -1358,11 +1362,11 @@ class TableDataManager {
     bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
     // Get min/max primary key values
-    dynamic minPk = records.isNotEmpty ? records.first[primaryKey] : null;
-    dynamic maxPk = records.isNotEmpty ? records.first[primaryKey] : null;
+    dynamic minPk = nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
+    dynamic maxPk = nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
 
-    if (shouldSaveKeyRange && records.isNotEmpty) {
-      for (var record in records) {
+    if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
+      for (var record in nonEmptyRecords) {
         final pk = record[primaryKey];
         if (minPk == null || _compareValues(pk, minPk) < 0) minPk = pk;
         if (maxPk == null || _compareValues(pk, maxPk) > 0) maxPk = pk;
@@ -1393,7 +1397,7 @@ class TableDataManager {
     final partitionMeta = PartitionMeta(
       version: 1,
       index: partitionIndex,
-      totalRecords: records.length,
+      totalRecords: nonEmptyRecords.length, // only count non-empty records
       fileSizeInBytes: 0, // Will update after encoding
       minPrimaryKey: minPk,
       maxPrimaryKey: maxPk,
@@ -1409,7 +1413,7 @@ class TableDataManager {
     final partitionInfo = PartitionInfo(
       path: partitionPath,
       meta: partitionMeta,
-      data: records,
+      data: records, // keep all records, including empty records
     );
 
     // Encode partition data with the effective key
@@ -1431,8 +1435,7 @@ class TableDataManager {
     // Write partition file
     await _dataStore.storage.writeAsBytes(partitionPath, encodedData);
 
-    // Create or update indexes for each record
-    int offset = 0;
+    // Setup for index creation
     int? clusterId;
     int? nodeId;
     if (_dataStore.config.distributedNodeConfig.enableDistributed) {
@@ -1440,36 +1443,48 @@ class TableDataManager {
       nodeId = _dataStore.config.distributedNodeConfig.nodeId;
     }
 
-    // batch process record index update
-    const int indexBatchSize = 200; // records per batch
-    for (int i = 0; i < records.length; i += indexBatchSize) {
-      final endIndex = min(i + indexBatchSize, records.length);
-      final batch = records.sublist(i, endIndex);
+    // only process records that need to create index
+    if (recordsToIndex != null && recordsToIndex.isNotEmpty) {
+      // optimize: if it is appending records, can directly start from the old record count
+      final int oldRecordsCount = records.length - recordsToIndex.length;
+      
+      // performance optimization: increase batch size
+      const int indexBatchSize = 500; // increase batch size to improve performance
+      int offset = oldRecordsCount; // start from the old record count
+      
+      // only process new record part
+      for (int i = oldRecordsCount; i < records.length; i += indexBatchSize) {
+        final endIndex = min(i + indexBatchSize, records.length);
+        final batch = records.sublist(i, endIndex);
 
-      for (int j = 0; j < batch.length; j++) {
-        final record = batch[j];
-        final currentOffset = offset + j;
+        for (int j = 0; j < batch.length; j++) {
+          final record = batch[j];
+          final currentOffset = offset + j;
+          
+          // skip empty record
+          if (record.isEmpty) continue;
 
-        try {
-          final recordPointer = await StoreIndex.create(
-              jsonEncode(record), currentOffset,
-              partitionId: partitionIndex,
-              clusterId: clusterId,
-              nodeId: nodeId);
-          await _dataStore.indexManager
-              ?.updateIndexes(tableName, record, recordPointer);
-        } catch (e) {
-          Logger.error(
-              'Failed to update record index: $e, record: ${record[primaryKey]}',
-              label: 'TableDataManager._savePartitionFile');
+          try {
+            final recordPointer = await StoreIndex.create(
+                offset: currentOffset,
+                partitionId: partitionIndex,
+                clusterId: clusterId,
+                nodeId: nodeId);
+            await _dataStore.indexManager
+                ?.updateIndexes(tableName, record, recordPointer);
+          } catch (e) {
+            Logger.error(
+                'Failed to update record index: $e, record: ${record[primaryKey]}',
+                label: 'TableDataManager._savePartitionFile');
+          }
         }
-      }
 
-      offset += batch.length;
+        offset += batch.length;
 
-      // add short delay when batch processing
-      if (i + indexBatchSize < records.length) {
-        await Future.delayed(const Duration(milliseconds: 2));
+        // reduce pause time, improve throughput
+        if (i + indexBatchSize < records.length) {
+          await Future.delayed(const Duration(milliseconds: 1));
+        }
       }
     }
 
@@ -1499,7 +1514,7 @@ class TableDataManager {
           type: FileType.data,
           name: tableName,
           fileSizeInBytes: size,
-          totalRecords: records.length,
+          totalRecords: nonEmptyRecords.length, // only count non-empty records
           timestamps: Timestamps(
             created: timeStamp,
             modified: timeStamp,
@@ -1521,7 +1536,7 @@ class TableDataManager {
 
         // calculate exact change in record count and size
         int recordsDelta =
-            records.length - (isExistingPartition ? oldRecordCount : 0);
+            nonEmptyRecords.length - (isExistingPartition ? oldRecordCount : 0);
         int sizeDelta = size - (isExistingPartition ? oldSize : 0);
 
         // update meta
@@ -2294,7 +2309,10 @@ class TableDataManager {
       // Include pending data from write queue
       final pendingData = _writeBuffer[tableName] ?? {};
       for (var record in pendingData.entries) {
-        yield record.value.data;
+        // ensure only return non-empty data
+        if (record.value.data.isNotEmpty) {
+          yield record.value.data;
+        }
       }
     } catch (e) {
       Logger.error('Failed to stream records: $tableName, error: $e',
@@ -2500,9 +2518,9 @@ class TableDataManager {
                 final partitionInfo = PartitionInfo.fromJson(
                     jsonDecode(decodedString) as Map<String, dynamic>);
 
-                // process records
+                // process records, filter out empty records
                 for (final record in partitionInfo.data) {
-                  if (record is Map<String, dynamic>) {
+                  if (record is Map<String, dynamic> && record.isNotEmpty) {
                     yield record;
                   }
                 }
@@ -2772,12 +2790,19 @@ class TableDataManager {
       // If a specific record is requested, find it
       if (recordIndex != null) {
         if (recordIndex >= 0 && recordIndex < partitionInfo.data.length) {
-          return [partitionInfo.data[recordIndex] as Map<String, dynamic>];
+          final record = partitionInfo.data[recordIndex] as Map<String, dynamic>;
+          // if it is an empty record (deleted), return an empty list
+          if (record.isEmpty) return [];
+          return [record];
         }
         return [];
       }
 
-      return partitionInfo.data.cast<Map<String, dynamic>>();
+      // filter out empty records (deleted records)
+      return partitionInfo.data
+        .cast<Map<String, dynamic>>()
+        .where((record) => record.isNotEmpty)
+        .toList();
     } catch (e, stack) {
       Logger.error('''Read records from partition failed:
             error: $e
@@ -2885,6 +2910,7 @@ class TableDataManager {
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
                 updateTableMeta: false, // key: not update table meta
+                recordsToIndex: recordsForPartition, // create index for new inserted records
               );
             },
             description: 'parallel insert records to multiple partitions',
@@ -2926,6 +2952,7 @@ class TableDataManager {
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
               updateTableMeta: false, // key: not update table meta
+              recordsToIndex: recordsForPartition, // only create index for new inserted records
             );
 
             // collect partition meta
@@ -3011,18 +3038,22 @@ class TableDataManager {
               Set<String> processedKeys = {};
 
               if (operationType == RecordOperationType.delete) {
-                // delete operation - remove matching records
+                // use empty object {} to replace the record to be deleted, instead of physical deletion
                 resultRecords =
                     List<Map<String, dynamic>>.from(partitionRecords);
-                resultRecords.removeWhere((record) {
+                for (int i = 0; i < resultRecords.length; i++) {
+                  final record = resultRecords[i];
+                  // skip already empty records
+                  if (record.isEmpty) continue;
+                  
                   final pk = record[primaryKey]?.toString() ?? '';
                   if (recordsByPk.containsKey(pk)) {
+                    // use empty object {} to replace the record, keep the index unchanged
+                    resultRecords[i] = {};
                     modified = true;
                     processedKeys.add(pk);
-                    return true; // delete this record
                   }
-                  return false;
-                });
+                }
               } else {
                 // update operation - update matching records
                 resultRecords =
@@ -3135,17 +3166,21 @@ class TableDataManager {
             List<Map<String, dynamic>> resultRecords;
 
             if (operationType == RecordOperationType.delete) {
-              // delete operation - remove matching records
+              // use empty object {} to replace the record to be deleted, instead of physical deletion
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
-              resultRecords.removeWhere((record) {
+              for (int i = 0; i < resultRecords.length; i++) {
+                final record = resultRecords[i];
+                // skip already empty records
+                if (record.isEmpty) continue;
+                
                 final pk = record[primaryKey]?.toString() ?? '';
                 if (recordsByPk.containsKey(pk)) {
+                  // use empty object {} to replace the record, keep the index unchanged
+                  resultRecords[i] = {};
                   modified = true;
                   processedKeys.add(pk);
-                  return true; // delete this record
                 }
-                return false;
-              });
+              }
             } else {
               // update operation - update matching records
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
