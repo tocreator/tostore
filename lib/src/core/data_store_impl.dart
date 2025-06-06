@@ -116,6 +116,7 @@ class DataStoreImpl {
   /// Create instance with configuration
   factory DataStoreImpl({
     String? dbPath,
+    String? dbName,
     DataStoreConfig? config,
     List<TableSchema> schemas = const [],
     Future<void> Function(DataStoreImpl db)? onConfigure,
@@ -134,7 +135,7 @@ class DataStoreImpl {
         isMigrationInstance,
       );
       _instances[key] = instance;
-      instance._startInitialize(dbPath, config);
+      instance._startInitialize(dbPath, dbName, config);
     }
     // If it's a migration instance, always create a new instance, don't use existing instances
     if (isMigrationInstance) {
@@ -149,7 +150,7 @@ class DataStoreImpl {
       if (config != null) {
         instance._currentSpaceName = config.spaceName;
       }
-      instance._startInitialize(dbPath, config);
+      instance._startInitialize(dbPath, dbName, config);
       return instance;
     }
     return _instances[key]!;
@@ -165,14 +166,14 @@ class DataStoreImpl {
   );
 
   /// Start initialization process
-  void _startInitialize(String? dbPath, DataStoreConfig? config) {
+  void _startInitialize(String? dbPath, String? dbName, DataStoreConfig? config) {
     if (_initializing || _isInitialized) {
       return;
     }
 
     _initCompleter = Completer<void>();
 
-    initialize(dbPath: dbPath, config: config).then((_) {
+    initialize(dbPath: dbPath, dbName: dbName, config: config).then((_) {
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
       }
@@ -252,21 +253,21 @@ class DataStoreImpl {
   }
 
   /// Get database path
-  Future<String> getDatabasePath({String? dbPath}) async {
-    const baseDir = 'db';
-    String? finalPath;
+  Future<String> getDatabasePath({String? dbPath, String? dbName}) async {
+    final baseDir = pathJoin('db', dbName ?? 'default');
+    String? rootPath;
 
     if (dbPath != null) {
-      finalPath = dbPath;
+      rootPath = dbPath;
     } else if (_config != null) {
-      finalPath = _config?.dbPath;
+      rootPath = _config?.dbPath;
     }
 
-    if (finalPath != null) {
-      if (finalPath.startsWith(baseDir) || finalPath.endsWith(baseDir)) {
-        return finalPath;
+    if (rootPath != null) {
+      if (rootPath.startsWith(baseDir) || rootPath.endsWith(baseDir)) {
+        return rootPath;
       }
-      return pathJoin(finalPath, baseDir);
+      return pathJoin(rootPath, baseDir);
     }
 
     if (kIsWeb) {
@@ -279,7 +280,7 @@ class DataStoreImpl {
   }
 
   /// Initialize storage engine
-  Future<bool> initialize({String? dbPath, DataStoreConfig? config}) async {
+  Future<bool> initialize({String? dbPath, String? dbName, DataStoreConfig? config}) async {
     if (_initializing && !_initCompleter.isCompleted) {
       await _initCompleter.future;
       return true;
@@ -296,7 +297,7 @@ class DataStoreImpl {
         await close();
       }
 
-      dbPath = await getDatabasePath(dbPath: dbPath);
+      dbPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
 
       if (config == null) {
         _config = DataStoreConfig(dbPath: dbPath);
@@ -1094,16 +1095,19 @@ class DataStoreImpl {
     bool allowAll = false,
   }) async {
     await ensureInitialized();
-    
+
     // check if condition is empty, avoid accidental update of all records
     if (condition.isEmpty && !allowAll) {
-      Logger.warn('Update operation without condition, this may cause accidental update of all records, please use confirmUpdateAll() method to explicitly confirm.', label: 'DataStore.updateInternal');
+      Logger.warn(
+          'Update operation without condition, this may cause accidental update of all records, please use confirmUpdateAll() method to explicitly confirm.',
+          label: 'DataStore.updateInternal');
       return DbResult.error(
         code: ResultCode.validationFailed,
-        message: 'Update operation must specify a filter condition. If you really need to update all records, please use confirmUpdateAll() method to explicitly confirm.',
+        message:
+            'Update operation must specify a filter condition. If you really need to update all records, please use confirmUpdateAll() method to explicitly confirm.',
       );
     }
-    
+
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
@@ -1254,20 +1258,22 @@ class DataStoreImpl {
     bool allowAll = false,
   }) async {
     await ensureInitialized();
-    
+
     // check if condition is empty, avoid accidental deletion of all records
     if (condition.isEmpty && !allowAll) {
-      Logger.warn('Delete operation without condition, this may cause accidental deletion of all records, please use confirmDeleteAll() method to explicitly confirm.', label: 'DataStore.deleteInternal');
+      Logger.warn(
+          'Delete operation without condition, this may cause accidental deletion of all records, please use confirmDeleteAll() method to explicitly confirm.',
+          label: 'DataStore.deleteInternal');
       return DbResult.error(
         code: ResultCode.validationFailed,
-        message: 'Delete operation must specify a filter condition. If you really need to delete all records, please use confirmDeleteAll() method to explicitly confirm.',
+        message:
+            'Delete operation must specify a filter condition. If you really need to delete all records, please use confirmDeleteAll() method to explicitly confirm.',
       );
     }
-    
+
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
-
       // get table record count, for later processing
       final totalRecords =
           await tableDataManager.getTableRecordCount(tableName);
@@ -2071,9 +2077,9 @@ class DataStoreImpl {
   }
 
   /// Delete database
-  Future<void> deleteDatabase({String? dbPath}) async {
+  Future<void> deleteDatabase({String? dbPath, String? dbName}) async {
     try {
-      final dbDirPath = await getDatabasePath(dbPath: dbPath);
+      final dbDirPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
       await close();
 
       if (await storage.existsDirectory(dbDirPath)) {

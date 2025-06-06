@@ -45,6 +45,7 @@ import 'src/chain/stream_query_builder.dart';
 class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
   /// [dbPath] Database path (optional, excluding filename)
+  /// [dbName] Database name for quickly creating different database instances (will be stored in db/dbName/)
   /// [config] Database configuration
   /// [schemas] Database table schemas, Designed for mobile application scenarios, auto upgrade
   /// [onConfigure] Callback when configuring database
@@ -53,6 +54,7 @@ class ToStore implements DataStoreInterface {
   ///
   /// 以数据库路径的不同创建独立的实例
   /// [dbPath] 数据库路径，可选，不含文件名
+  /// [dbName] 数据库名称，用于快速创建不同的数据库实例（将存储在 db/dbName/ 下）
   /// [config] 数据库配置
   /// [schemas] 数据库表结构定义，适用移动应用场景，自动化升级
   /// [onConfigure] 数据库配置时的回调
@@ -60,16 +62,19 @@ class ToStore implements DataStoreInterface {
   /// [onOpen] 数据库打开时的回调
   factory ToStore({
     String? dbPath,
+    String? dbName,
     DataStoreConfig? config,
     List<TableSchema> schemas = const [],
     Future<void> Function(ToStore db)? onConfigure,
     Future<void> Function(ToStore db)? onCreate,
     Future<void> Function(ToStore db)? onOpen,
   }) {
-    final key = dbPath ?? 'default';
-    if (!_instances.containsKey(key)) {
+    String instanceKey = '$dbPath-${dbName ?? 'default'}';
+
+    if (!_instances.containsKey(instanceKey)) {
       final impl = DataStoreImpl(
         dbPath: dbPath,
+        dbName: dbName,
         config: config,
         schemas: schemas,
         onConfigure: onConfigure != null
@@ -79,9 +84,9 @@ class ToStore implements DataStoreInterface {
             onCreate != null ? (db) => onCreate(ToStore._fromImpl(db)) : null,
         onOpen: onOpen != null ? (db) => onOpen(ToStore._fromImpl(db)) : null,
       );
-      _instances[key] = ToStore._internal(impl);
+      _instances[instanceKey] = ToStore._internal(impl);
     }
-    return _instances[key]!;
+    return _instances[instanceKey]!;
   }
 
   /// Initialize database
@@ -90,8 +95,8 @@ class ToStore implements DataStoreInterface {
   /// 初始化数据库
   /// 确保数据库初始化完成并就绪后再执行其他操作
   @override
-  Future<void> initialize({String? dbPath, DataStoreConfig? config}) async {
-    await _impl.initialize(dbPath: dbPath, config: config);
+  Future<void> initialize({String? dbPath, String? dbName, DataStoreConfig? config}) async {
+    await _impl.initialize(dbPath: dbPath, dbName: dbName, config: config);
   }
 
   /// Create table with schema
@@ -462,14 +467,16 @@ class ToStore implements DataStoreInterface {
 
   /// Delete database
   /// [dbPath] Optional database path to delete
+  /// [dbName] Optional database name to delete
   /// Removes current instance from instance pool
   ///
   /// 删除数据库
   /// [dbPath] 可选的要删除的数据库路径
+  /// [dbName] 可选的要删除的数据库名称
   /// 从实例池中移除当前实例
   @override
-  Future<void> deleteDatabase({String? dbPath}) async {
-    await _impl.deleteDatabase(dbPath: dbPath);
+  Future<void> deleteDatabase({String? dbPath, String? dbName}) async {
+    await _impl.deleteDatabase(dbPath: dbPath, dbName: dbName);
 
     String? instanceKey;
     _instances.forEach((key, value) {

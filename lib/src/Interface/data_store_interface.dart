@@ -16,6 +16,7 @@ abstract class DataStoreInterface {
   /// Initialize data store engine
   Future<void> initialize({
     String? dbPath,
+    String? dbName,
     DataStoreConfig? config,
   });
 
@@ -99,7 +100,7 @@ abstract class DataStoreInterface {
   Future<MigrationStatus?> queryMigrationTaskStatus(String taskId);
 
   /// delete database
-  Future<void> deleteDatabase({String? dbPath});
+  Future<void> deleteDatabase({String? dbPath, String? dbName});
 
   /// Get information about the current space
   Future<SpaceInfo> getSpaceInfo();

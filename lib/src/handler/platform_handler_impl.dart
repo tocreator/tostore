@@ -85,7 +85,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       return cachePath.path;
     } catch (e) {
       // Fallback to temporary directory
-      final tempDir = await Directory.systemTemp.createTemp('tostore_');
+      final tempDir = await Directory.systemTemp.createTemp('common');
       return tempDir.path;
     }
   }
