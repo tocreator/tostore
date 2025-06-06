@@ -172,21 +172,35 @@ class QueryCondition {
         return true;
       }
 
-      // save current group
-      final allGroups = List<_ConditionGroup>.from(_groups);
-      if (_currentGroup.conditions.isNotEmpty) {
-        allGroups.add(_currentGroup);
+      // Build condition structure like QueryExecutor expects
+      final conditionMap = build();
+      
+      // Handle the special OR and AND logic
+      if (conditionMap.containsKey('OR')) {
+        final orConditions = conditionMap['OR'] as List;
+        
+        // First handle non-OR conditions
+        final baseConditions = Map<String, dynamic>.from(conditionMap)
+          ..remove('OR');
+        
+        if (baseConditions.isNotEmpty && !_matchAllConditions(record, baseConditions)) {
+          return false;
+        }
+        
+        // Then handle OR conditions
+        return orConditions.any((condition) => 
+          _matchAllConditions(record, condition as Map<String, dynamic>));
       }
-
-      // if only one AND group, check all conditions
-      if (allGroups.length == 1 && !allGroups[0].isOr) {
-        return _matchAllConditions(record, allGroups[0].conditions);
+      
+      // Handle AND conditions
+      if (conditionMap.containsKey('AND')) {
+        final andConditions = conditionMap['AND'] as List;
+        return andConditions.every((condition) => 
+          _matchAllConditions(record, condition as Map<String, dynamic>));
       }
-
-      // handle multiple groups
-      return allGroups.any((group) => group.isOr
-          ? _matchAllConditions(record, group.conditions)
-          : _matchAllConditions(record, group.conditions));
+      
+      // Simple condition
+      return _matchAllConditions(record, conditionMap);
     } catch (e) {
       Logger.error('condition matching failed: $e',
           label: 'QueryCondition.matches');
@@ -198,7 +212,62 @@ class QueryCondition {
   bool _matchAllConditions(
       Map<String, dynamic> record, Map<String, dynamic> conditions) {
     for (var entry in conditions.entries) {
-      if (!_matchSingleCondition(record[entry.key], entry.value)) {
+      final field = entry.key;
+      final value = entry.value;
+      
+      // Handle fields with table name prefix (like 'users.id')
+      dynamic fieldValue;
+      if (field.contains('.')) {
+        // First try to match fields with prefix directly
+        if (record.containsKey(field)) {
+          fieldValue = record[field];
+        } else {
+          // Try to get table_field format
+          final parts = field.split('.');
+          final underscoreField = '${parts[0]}_${parts[1]}';
+          if (record.containsKey(underscoreField)) {
+            fieldValue = record[underscoreField];
+          } else {
+            // If not found, try to get field value without prefix
+            final fieldName = parts[1];
+            fieldValue = record[fieldName];
+          }
+        }
+      } else {
+        // Normal field without table name prefix
+        fieldValue = record[field];
+      }
+
+      // Handle special case for fields that don't exist
+      if (fieldValue == null && !record.containsKey(field)) {
+        // Special case: IS NULL condition
+        if (value is Map && (value.containsKey('IS') || value.containsKey('IS NOT'))) {
+          if ((value.containsKey('IS') && value['IS'] == null) ||
+              (value.containsKey('IS NOT') && value['IS NOT'] != null)) {
+            continue; // IS NULL condition is satisfied if field doesn't exist
+          }
+        }
+        
+        // Check if any variant with table prefix exists
+        bool prefixFound = false;
+        for (String key in record.keys) {
+          if (key.contains('.') && key.endsWith('.$field')) {
+            fieldValue = record[key];
+            prefixFound = true;
+            break;
+          } else if (key.contains('_') && key.endsWith('_$field')) {
+            fieldValue = record[key];
+            prefixFound = true;
+            break;
+          }
+        }
+        
+        if (!prefixFound) {
+          return false; // Field doesn't exist at all
+        }
+      }
+      
+      if (!_matchSingleCondition(fieldValue, value)) {
         return false;
       }
     }
@@ -210,19 +279,22 @@ class QueryCondition {
     if (condition == null) return value == null;
 
     if (condition is Map) {
-      // check all operator conditions
+      // Handle operator conditions
+      bool matchedAny = false;
       for (var entry in condition.entries) {
         final operator = entry.key;
         final compareValue = entry.value;
-
+        
         bool matches = false;
         switch (operator) {
           case '=':
-            matches = value == compareValue;
+            // Use ValueComparator for smart type comparison
+            matches = ValueComparator.compare(value, compareValue) == 0;
             break;
           case '!=':
           case '<>':
-            matches = value != compareValue;
+            // Use ValueComparator for inequality comparison
+            matches = ValueComparator.compare(value, compareValue) != 0;
             break;
           case '>':
             matches = value != null &&
@@ -242,11 +314,31 @@ class QueryCondition {
             break;
           case 'IN':
             if (compareValue is! List) return false;
-            matches = value != null && compareValue.contains(value);
+            // Enhanced IN operator using ValueComparator
+            if (value == null) return false;
+
+            // Check if any value in the list equals the field value
+            for (var item in compareValue) {
+              if (ValueComparator.compare(value, item) == 0) {
+                matches = true;
+                break;
+              }
+            }
             break;
           case 'NOT IN':
             if (compareValue is! List) return false;
-            matches = value != null && !compareValue.contains(value);
+            // Enhanced NOT IN operator using ValueComparator
+            if (value == null) return true; // NULL NOT IN any list is true
+
+            matches = true; // Assume true until proven false
+            
+            // Check if any value in the list equals the field value
+            for (var item in compareValue) {
+              if (ValueComparator.compare(value, item) == 0) {
+                matches = false;
+                break;
+              }
+            }
             break;
           case 'BETWEEN':
             if (compareValue is! Map ||
@@ -260,7 +352,7 @@ class QueryCondition {
             break;
           case 'LIKE':
             if (value == null || compareValue is! String) return false;
-            matches = ValueComparator.matchesLikePattern(value, compareValue);
+            matches = ValueComparator.matchesPattern(value.toString(), compareValue);
             break;
           case 'IS':
             matches = value == null;
@@ -268,16 +360,22 @@ class QueryCondition {
           case 'IS NOT':
             matches = value != null;
             break;
+          default:
+            Logger.error('Unknown operator: $operator',
+                label: 'QueryCondition._matchSingleCondition');
+            return false;
         }
-
-        // if any condition is not satisfied, return false directly
-        if (!matches) return false;
+        
+        if (matches) {
+          matchedAny = true;
+          break;
+        }
       }
-      return true;
+      return matchedAny;
     }
 
-    // simple equal condition
-    return value == condition;
+    // simple equal condition using ValueComparator
+    return ValueComparator.compare(value, condition) == 0;
   }
 
   // check if there are any conditions

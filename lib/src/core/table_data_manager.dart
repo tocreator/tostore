@@ -2610,6 +2610,9 @@ class TableDataManager {
     final isGlobal = schema.isGlobal;
     final primaryKey = schema.primaryKey;
 
+    // collect all partition meta, for later update table meta
+    final List<PartitionMeta> allPartitionMetas = [];
+
     // process all partitions
     await processPartitionsConcurrently<void>(
       partitionIndexes: fileMeta.partitions!.map((p) => p.index).toList(),
@@ -2622,8 +2625,8 @@ class TableDataManager {
         // process data
         final processedRecords = await processFunction(records, partitionIndex);
 
-        // save processed data
-        await _savePartitionFile(
+
+        final partitionMeta = await _savePartitionFile(
           tableName,
           isGlobal,
           partitionIndex,
@@ -2632,13 +2635,21 @@ class TableDataManager {
           fileMeta.partitions!,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
-          updateTableMeta: true, // keep original behavior, update table meta
+          updateTableMeta: false,
         );
+        
+        // collect partition meta, for later update table meta
+        allPartitionMetas.add(partitionMeta);
       },
       maxConcurrent: maxConcurrent,
       requireLock: true, // need to lock
       description: 'process table partitions: $tableName',
     );
+    
+    if (allPartitionMetas.isNotEmpty) {
+      // update table meta
+      await _updateTableMetadataWithAllPartitions(tableName, allPartitionMetas, fileMeta.partitions);
+    }
   }
 
   // Add new method to recalculate table meta

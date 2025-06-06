@@ -53,9 +53,8 @@ class QueryExecutor {
         if (isFullCache || isSpecificQuery) {
           var results = cache;
           if (condition != null) {
-            final conditions = condition.build();
             results = results
-                .where((record) => _matchConditions(record, conditions))
+                .where((record) => condition.matches(record))
                 .toList();
           }
 
@@ -95,17 +94,21 @@ class QueryExecutor {
               Map<String, dynamic>.from(record);
         }
 
-        // check data in write queue
-        final pendingDataMap =
+        // Process records in write queue that match the condition
+        final pendingData =
             _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-        final conditions = condition?.build();
-
-        for (var entry in pendingDataMap.values) {
-          final record = entry.data;
-          final recordId = record[primaryKey].toString();
-          if (conditions == null || _matchConditions(record, conditions)) {
-            // update or add record
-            resultMap[recordId] = Map<String, dynamic>.from(record);
+        if (condition != null) {
+          for (var record in pendingData.entries) {
+            if (condition.matches(record.value.data)) {
+              resultMap[record.value.data[primaryKey].toString()] =
+                  Map<String, dynamic>.from(record.value.data);
+            }
+          }
+        } else {
+          // Add all pending records
+          for (var record in pendingData.entries) {
+            resultMap[record.value.data[primaryKey].toString()] =
+                Map<String, dynamic>.from(record.value.data);
           }
         }
 
@@ -157,9 +160,9 @@ class QueryExecutor {
   Future<List<Map<String, dynamic>>> _executeQueryPlan(
     QueryPlan plan,
     String tableName,
-    QueryCondition? condition, [
+    QueryCondition? condition,
     List<JoinClause>? joins,
-  ]) async {
+  ) async {
     List<Map<String, dynamic>> results = [];
     // Save original conditions to apply after JOIN
     final Map<String, dynamic> originalConditions = condition?.build() ?? {};
@@ -174,9 +177,11 @@ class QueryExecutor {
               _extractTableConditions(remainingConditions, tableName);
           // Create temporary QueryCondition for main table query
           if (mainTableConditions.isNotEmpty) {
-            // Convert conditions back to QueryCondition format (simplified handling)
-            final mainTableQueryCondition =
-                _createConditionFromMap(mainTableConditions);
+            // Create QueryCondition and add conditions
+            final mainTableQueryCondition = QueryCondition();
+            for (var entry in mainTableConditions.entries) {
+              _addConditionToQuery(mainTableQueryCondition, entry.key, entry.value);
+            }
             results =
                 await _performTableScan(tableName, mainTableQueryCondition);
             // Remove already applied conditions from remaining conditions
@@ -215,9 +220,8 @@ class QueryExecutor {
 
         case QueryOperationType.filter:
           // Apply filter conditions to query results
-          final filterConditions = operation.value as Map<String, dynamic>;
           results = results
-              .where((record) => _matchConditions(record, filterConditions))
+              .where((record) => condition?.matches(record) ?? false)
               .toList();
           break;
 
@@ -278,7 +282,7 @@ class QueryExecutor {
           if (joinTableConditions.isNotEmpty) {
             results = results
                 .where(
-                    (record) => _matchConditions(record, joinTableConditions))
+                    (record) => condition?.matches(record) ?? false)
                 .toList();
 
             // Remove applied conditions from remaining conditions
@@ -295,7 +299,7 @@ class QueryExecutor {
     // Apply any remaining conditions (may be cross-table or unhandled conditions)
     if (remainingConditions.isNotEmpty) {
       results = results
-          .where((record) => _matchConditions(record, remainingConditions))
+          .where((record) => condition?.matches(record) ?? false)
           .toList();
     }
 
@@ -330,27 +334,23 @@ class QueryExecutor {
     return result;
   }
 
-  /// Create query condition object from map (simplified implementation)
-  QueryCondition _createConditionFromMap(Map<String, dynamic> conditionMap) {
-    final condition = QueryCondition();
-
-    for (var entry in conditionMap.entries) {
-      final field = entry.key;
-      final value = entry.value;
-
-      if (value is Map) {
-        // Condition with operator
-        final operator = value.keys.first;
-        final compareValue = value[operator];
-        condition.where(field, operator, compareValue);
-      } else {
-        // Simple equality condition
-        condition.where(field, '=', value);
+  
+  /// Helper to add a condition to QueryCondition
+  void _addConditionToQuery(QueryCondition queryCondition, String field, dynamic value) {
+    if (value is Map) {
+      // Process operators
+      for (var opEntry in value.entries) {
+        final operator = opEntry.key;
+        final compareValue = opEntry.value;
+        queryCondition.where(field, operator, compareValue);
       }
+    } else {
+      // Simple equality
+      queryCondition.where(field, '=', value);
     }
-
-    return condition;
   }
+
+
 
   /// Execute table join operation
   Future<List<Map<String, dynamic>>> _performJoin(
@@ -673,9 +673,8 @@ class QueryExecutor {
             !_dataStore.tableDataManager.isFileModified(tableName, cacheTime)) {
           var results = cache;
           if (condition != null) {
-            final conditions = condition.build();
             results = results
-                .where((record) => _matchConditions(record, conditions))
+                .where((record) => condition.matches(record))
                 .toList();
           }
           return results;
@@ -718,10 +717,10 @@ class QueryExecutor {
               .readRecordsFromPartition(
                   tableName, isGlobal, partitionIndex, primaryKey);
 
-          if (conditions != null) {
+          if (condition != null) {
             // Filter records based on condition
             for (var record in partitionRecords) {
-              if (_matchConditions(record, conditions)) {
+              if (condition.matches(record)) {
                 resultMap[record[primaryKey].toString()] = record;
 
                 // If looking for exact primary key match and found it, we can stop
@@ -745,17 +744,18 @@ class QueryExecutor {
           }
         }
 
-        // Add records from write queue
+        // Process records in write queue that match the condition
         final pendingData =
             _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-        if (conditions != null) {
+        if (condition != null) {
           for (var record in pendingData.entries) {
-            if (_matchConditions(record.value.data, conditions)) {
+            if (condition.matches(record.value.data)) {
               resultMap[record.value.data[primaryKey].toString()] =
                   Map<String, dynamic>.from(record.value.data);
             }
           }
         } else {
+          // Add all pending records
           for (var record in pendingData.entries) {
             resultMap[record.value.data[primaryKey].toString()] =
                 Map<String, dynamic>.from(record.value.data);
@@ -771,41 +771,30 @@ class QueryExecutor {
       }
     }
 
-    // 4. Fallback to full table scan via streaming for partitioned data
-    if (fileMeta != null &&
-        fileMeta.partitions != null &&
+    // Process records using streaming
+    if (fileMeta != null && fileMeta.totalRecords > 0 &&
         fileMeta.partitions!.isNotEmpty) {
       // Use streaming to process partitions without loading all at once
-      final conditions = condition?.build();
-
       final stream = _dataStore.tableDataManager.streamRecords(tableName);
       await for (var record in stream) {
-        if (conditions == null || _matchConditions(record, conditions)) {
+        if (condition == null || condition.matches(record)) {
           resultMap[record[primaryKey].toString()] = record;
         }
       }
-
-      // If no filter conditions and record count within limit, mark as full table data
-      if (condition == null) {
-        shouldMarkAsFullTableCache = true;
-      }
-    } else {
-      // Empty or new table also marked as full table data (if no filter conditions and within limit)
-      shouldMarkAsFullTableCache = condition == null;
     }
 
-    // 6. Add records from write queue
+    // Process records in write queue that match the condition
     final pendingData =
         _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
     if (condition != null) {
-      final conditions = condition.build();
       for (var record in pendingData.entries) {
-        if (_matchConditions(record.value.data, conditions)) {
+        if (condition.matches(record.value.data)) {
           resultMap[record.value.data[primaryKey].toString()] =
               Map<String, dynamic>.from(record.value.data);
         }
       }
     } else {
+      // Add all pending records
       for (var record in pendingData.entries) {
         resultMap[record.value.data[primaryKey].toString()] =
             Map<String, dynamic>.from(record.value.data);
@@ -1043,8 +1032,7 @@ class QueryExecutor {
         if (record != null) {
           // apply additional conditions (if any)
           if (queryCondition != null) {
-            final conditions = queryCondition.build();
-            if (_matchConditions(record, conditions)) {
+            if (queryCondition.matches(record)) {
               results.add(record);
             }
           } else {
@@ -1073,186 +1061,6 @@ class QueryExecutor {
       Logger.error('Index scan failed: $e',
           label: 'QueryExecutor._performIndexScan');
       return _performTableScan(tableName, queryCondition);
-    }
-  }
-
-  /// match record whether satisfies conditions
-  bool _matchConditions(
-      Map<String, dynamic> record, Map<String, dynamic> conditions) {
-    // handle OR condition
-    if (conditions.containsKey('OR')) {
-      final orConditions = conditions['OR'] as List;
-      // first handle non-OR conditions
-      final baseConditions = Map<String, dynamic>.from(conditions)
-        ..remove('OR');
-      if (baseConditions.isNotEmpty &&
-          !_matchBasicConditions(record, baseConditions)) {
-        return false;
-      }
-      // then handle OR conditions
-      return orConditions.any((condition) =>
-          _matchConditions(record, condition as Map<String, dynamic>));
-    }
-
-    // handle AND conditions
-    if (conditions.containsKey('AND')) {
-      final andConditions = conditions['AND'] as List;
-      return andConditions.every((condition) =>
-          _matchConditions(record, condition as Map<String, dynamic>));
-    }
-
-    return _matchBasicConditions(record, conditions);
-  }
-
-  /// match basic conditions (not AND/OR)
-  bool _matchBasicConditions(
-      Map<String, dynamic> record, Map<String, dynamic> conditions) {
-    for (var entry in conditions.entries) {
-      final field = entry.key;
-      final value = entry.value;
-
-      // Handle fields with table name prefix (like 'users.id')
-      dynamic fieldValue;
-      if (field.contains('.')) {
-        // First try to match fields with prefix directly
-        if (record.containsKey(field)) {
-          fieldValue = record[field];
-        } else {
-          // Try to get table_field format
-          final parts = field.split('.');
-          final underscoreField = '${parts[0]}_${parts[1]}';
-          if (record.containsKey(underscoreField)) {
-            fieldValue = record[underscoreField];
-          } else {
-            // If not found, try to get field value without prefix
-            final fieldName = parts[1];
-            fieldValue = record[fieldName];
-          }
-        }
-      } else {
-        // Normal field without table name prefix
-        fieldValue = record[field];
-      }
-
-      // If field doesn't exist but has special conditions, may still be valid
-      if (fieldValue == null && !record.containsKey(field)) {
-        // Special case: IS NULL condition
-        if (value is Map &&
-            (value.containsKey('IS') || value.containsKey('IS NOT'))) {
-          if ((value.containsKey('IS') && value['IS'] == null) ||
-              (value.containsKey('IS NOT') && value['IS NOT'] != null)) {
-            continue; // IS NULL condition is satisfied if field doesn't exist
-          }
-        }
-
-        // Check if any variant with table prefix exists
-        bool prefixFound = false;
-        for (String key in record.keys) {
-          if (key.contains('.') && key.endsWith('.$field')) {
-            fieldValue = record[key];
-            prefixFound = true;
-            break;
-          } else if (key.contains('_') && key.endsWith('_$field')) {
-            fieldValue = record[key];
-            prefixFound = true;
-            break;
-          }
-        }
-
-        if (!prefixFound) {
-          return false; // Field doesn't exist at all
-        }
-      }
-
-      if (value is Map) {
-        // handle operator conditions
-        bool matchedAny = false;
-        for (var op in value.entries) {
-          if (_matchOperator(fieldValue, op.key, op.value)) {
-            matchedAny = true;
-            break;
-          }
-        }
-        if (!matchedAny) return false;
-      } else {
-        // simple equal condition
-        // Use ValueComparator for smart type comparison instead of direct comparison
-        if (ValueComparator.compare(fieldValue, value) != 0) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  /// match single operator condition
-  bool _matchOperator(
-      dynamic fieldValue, String operator, dynamic compareValue) {
-    switch (operator.toUpperCase()) {
-      case '=':
-        // Use ValueComparator for smart type comparison instead of direct comparison
-        return ValueComparator.compare(fieldValue, compareValue) == 0;
-      case '!=':
-      case '<>':
-        // Also use ValueComparator for inequality comparison
-        return ValueComparator.compare(fieldValue, compareValue) != 0;
-      case '>':
-        return fieldValue != null &&
-            ValueComparator.compare(fieldValue, compareValue) > 0;
-      case '>=':
-        return fieldValue != null &&
-            ValueComparator.compare(fieldValue, compareValue) >= 0;
-      case '<':
-        return fieldValue != null &&
-            ValueComparator.compare(fieldValue, compareValue) < 0;
-      case '<=':
-        return fieldValue != null &&
-            ValueComparator.compare(fieldValue, compareValue) <= 0;
-      case 'IN':
-        if (compareValue is! List) return false;
-        // Enhanced IN operator using ValueComparator
-        if (fieldValue == null) return false;
-
-        // Check if any value in the list equals the field value
-        for (var item in compareValue) {
-          if (ValueComparator.compare(fieldValue, item) == 0) {
-            return true;
-          }
-        }
-        return false;
-      case 'NOT IN':
-        if (compareValue is! List) return false;
-        // Enhanced NOT IN operator using ValueComparator
-        if (fieldValue == null) return true; // NULL NOT IN any list is true
-
-        // Check if any value in the list equals the field value
-        for (var item in compareValue) {
-          if (ValueComparator.compare(fieldValue, item) == 0) {
-            return false;
-          }
-        }
-        return true;
-      case 'BETWEEN':
-        if (compareValue is! Map ||
-            !compareValue.containsKey('start') ||
-            !compareValue.containsKey('end')) {
-          return false;
-        }
-        return fieldValue != null &&
-            ValueComparator.compare(fieldValue, compareValue['start']) >= 0 &&
-            ValueComparator.compare(fieldValue, compareValue['end']) <= 0;
-      case 'LIKE':
-        if (fieldValue == null || compareValue is! String) return false;
-        return ValueComparator.matchesPattern(
-            fieldValue.toString(), compareValue);
-      case 'IS':
-        return fieldValue == null;
-      case 'IS NOT':
-        return fieldValue != null;
-      default:
-        Logger.error('unknown operator: $operator',
-            label: 'QueryExecutor._matchOperator');
-        return false;
     }
   }
 

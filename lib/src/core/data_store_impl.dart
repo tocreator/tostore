@@ -13,6 +13,7 @@ import '../model/file_info.dart';
 import '../model/global_config.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
+import '../model/record_operation.dart';
 import '../model/result_code.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -371,12 +372,12 @@ class DataStoreImpl {
       }
 
       return true;
-    } catch (e) {
+    } catch (e, stack) {
       _isInitialized = false;
       if (!_initCompleter.isCompleted) {
         _initCompleter.completeError(e);
       }
-      Logger.error('Database initialization failed: $e',
+      Logger.error('Database initialization failed: $e\n$stack',
           label: 'DataStore.initialize');
       rethrow;
     } finally {
@@ -1244,15 +1245,14 @@ class DataStoreImpl {
 
     try {
       await ensureInitialized();
-      // Find records to delete
-      final recordsToDelete = await executeQuery(tableName, condition,
-          orderBy: orderBy, limit: limit, offset: offset);
-
-      if (recordsToDelete.isEmpty) {
-        return DbResult.success(
-          message: 'No records found to delete',
-        );
-      }
+      
+      // get table record count, for later processing
+      final totalRecords = await tableDataManager.getTableRecordCount(tableName);
+      
+      // use config.maxRecordCacheSize as threshold
+      final recordThreshold = config.maxRecordCacheSize;
+      
+      // get table schema
       final schema = await getTableSchema(tableName);
       if (schema == null) {
         Logger.error('Table $tableName does not exist',
@@ -1262,36 +1262,162 @@ class DataStoreImpl {
           message: 'Table $tableName does not exist',
         );
       }
+      
       final primaryKey = schema.primaryKey;
       final writeQueue = tableDataManager.writeBuffer[tableName];
-
-      for (var record in recordsToDelete) {
-        final pkValue = record[primaryKey]?.toString();
-        if (pkValue == null) {
-          continue;
+      
+      // Check if condition is an equality on primary key or unique field - this can be optimized
+      bool isOptimizableQuery = false;
+      
+      // Analyze condition to check if it's a primary key or unique field equality operation
+      if (!condition.isEmpty) {
+        final conditionMap = condition.build();
+        
+        // Check if condition involves primary key with equality operator
+        if (conditionMap.containsKey(primaryKey)) {
+          final op = conditionMap[primaryKey];
+          if (op is Map<String, dynamic> && op.containsKey('=')) {
+            isOptimizableQuery = true;
+          }
+        } 
+        
+        // If not primary key, check for unique field equality
+        if (!isOptimizableQuery) {
+          // Get unique fields from schema
+          final uniqueFields = schema.fields
+              .where((field) => field.unique && field.name != primaryKey)
+              .map((field) => field.name)
+              .toList();
+              
+          // Add unique indexes fields
+          for (final index in schema.indexes.where((idx) => idx.unique)) {
+            // Only consider single-field unique indexes for optimization
+            if (index.fields.length == 1) {
+              uniqueFields.add(index.fields[0]);
+            }
+          }
+          
+          // Check if condition is on a unique field
+          for (final uniqueField in uniqueFields) {
+            if (conditionMap.containsKey(uniqueField)) {
+              final op = conditionMap[uniqueField];
+              if (op is Map<String, dynamic> && op.containsKey('=')) {
+                isOptimizableQuery = true;
+                break;
+              }
+            }
+          }
         }
-        // Remove from record cache
-        dataCacheManager.removeCachedRecord(tableName, pkValue);
-
-        // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
-        writeQueue?.remove(pkValue);
       }
+      
+      // when table record count is less than threshold or this is an optimizable query, use regular method
+      if (totalRecords <= recordThreshold || isOptimizableQuery) {
+        // standard method: get all records
+        final recordsToDelete = await executeQuery(tableName, condition,
+            orderBy: orderBy, limit: limit, offset: offset);
 
-      // Add records to delete buffer instead of directly writing to file
-      await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
+        if (recordsToDelete.isEmpty) {
+          return DbResult.success(
+            message: 'No records found to delete',
+          );
+        }
 
-      // Update indexes - still necessary to keep indexes in sync
-      await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
+        for (var record in recordsToDelete) {
+          final pkValue = record[primaryKey]?.toString();
+          if (pkValue == null) {
+            continue;
+          }
+          // Remove from record cache
+          dataCacheManager.removeCachedRecord(tableName, pkValue);
 
-      // Update statistics asynchronously
-      _updateStatisticsAsync(tableName);
+          // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
+          writeQueue?.remove(pkValue);
+        }
 
-      await _transactionManager!.commit(transaction);
-      return DbResult.success(
-        message: 'Successfully deleted ${recordsToDelete.length} records',
-      );
+        // Add records to delete buffer instead of directly writing to file
+        await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
+
+        // Update indexes - still necessary to keep indexes in sync
+        await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
+        
+        // Update statistics asynchronously
+        _updateStatisticsAsync(tableName);
+
+        await _transactionManager!.commit(transaction);
+        return DbResult.success(
+          message: 'Successfully deleted ${recordsToDelete.length} records',
+        );
+      } else {
+      
+        
+        // create counters
+        int totalProcessed = 0;
+        int totalDeleted = 0;
+        
+        // build a process function, to check if each partition's record matches the delete condition
+        Future<List<Map<String, dynamic>>> processFunction(
+            List<Map<String, dynamic>> records, int partitionIndex) async {
+          
+          // record original count
+          int originalCount = records.length;
+          
+          // filter out records that match the delete condition
+          final resultRecords = records.where((record) {
+            final matches = condition.matches(record);
+            if (matches) {
+              totalDeleted++;
+              
+              // remove from cache
+              final pkValue = record[primaryKey]?.toString();
+              if (pkValue != null) {
+                dataCacheManager.removeCachedRecord(tableName, pkValue);
+                
+                // remove from write queue (if exists)
+                writeQueue?.remove(pkValue);
+              }
+              
+              // process limit
+              if (limit != null && totalDeleted > limit) {
+                return true; // if exceeds limit, keep this record
+              }
+              
+              return false; // if matches, delete this record
+            }
+            return true; // if not matches, keep this record
+          }).toList();
+          
+          totalProcessed += originalCount;
+          
+          // update indexes (if modified)
+          if (resultRecords.length < originalCount) {
+            // calculate deleted records
+            final deletedRecords = records.where((record) => 
+              !resultRecords.any((r) => r[primaryKey] == record[primaryKey])).toList();
+            
+            // batch update indexes
+            await _indexManager?.batchDeleteFromIndexes(tableName, deletedRecords);
+          }
+          
+          return resultRecords;
+        }
+        
+        // use processTablePartitions to process all partition
+        await tableDataManager.processTablePartitions(
+          tableName: tableName,
+          processFunction: processFunction,
+        );
+        
+        
+        // update statistics
+        _updateStatisticsAsync(tableName);
+        
+        await _transactionManager!.commit(transaction);
+        return DbResult.success(
+          message: 'Successfully deleted $totalDeleted records (processed $totalProcessed)',
+        );
+      }
     } catch (e) {
-      Logger.info('Delete failed: $e', label: 'DataStore-delete');
+      Logger.error('Delete failed: $e', label: 'DataStore-delete');
       await _transactionManager!.rollback(transaction);
       // Clear cache, ensure data consistency
       return DbResult.error(
@@ -1540,19 +1666,30 @@ class DataStoreImpl {
       // 5. Merge all data to write
       final allData = [...pendingRecords, ...uniqueRecords];
 
-      // 6. Use TableDataManager's partition approach to write data
-      // Create a stream from the records list
-      final recordStream = Stream.fromIterable(allData);
-
+      // 6. use WriteRecords to append records directly, not clear table and rewrite
       // Use a batch size that balances performance and memory usage
       final batchSize = config.migrationConfig?.batchSize ?? 1000;
-
-      // Write data in batches using TableDataManager
-      await tableDataManager.rewriteRecordsFromStream(
-        tableName: tableName,
-        recordStream: recordStream,
-        batchSize: batchSize,
-      );
+      
+      if (allData.length > batchSize) {
+        // if data is large, process in batches to avoid memory issues
+        for (int i = 0; i < allData.length; i += batchSize) {
+          final end = (i + batchSize < allData.length) ? i + batchSize : allData.length;
+          final batch = allData.sublist(i, end);
+          
+          await tableDataManager.writeRecords(
+            tableName: tableName,
+            records: batch,
+            operationType: RecordOperationType.insert,
+          );
+        }
+      } else {
+        // if data is small, process once
+        await tableDataManager.writeRecords(
+          tableName: tableName,
+          records: allData,
+          operationType: RecordOperationType.insert,
+        );
+      }
 
       // Update cache
       for (var data in allData) {
@@ -1854,8 +1991,8 @@ class DataStoreImpl {
       }
 
       // Clear caches
-      dataCacheManager.onBasePathChanged();
-      indexManager?.onSpacePathChanged();
+      await dataCacheManager.onBasePathChanged();
+      await indexManager?.onSpacePathChanged();
       tableDataManager.writeBuffer.clear();
 
       // Reinitialize database

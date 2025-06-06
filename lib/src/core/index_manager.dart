@@ -3178,25 +3178,57 @@ class IndexManager {
   }
 
   /// handle Space path changed
-  void onSpacePathChanged() {
+  Future<void> onSpacePathChanged() async {
     // clear index cache
     _indexCache.clear();
     _indexMetaCache.clear();
     _indexFullyCached.clear();
     _indexAccessWeights.clear();
 
-    // Only keep write buffer related to global tables
+    // handle write buffer, only keep global table index
+    final keysToCheck = <String>[..._indexWriteBuffer.keys];
     final globalKeysToKeep = <String>[];
-    _indexWriteBuffer.forEach((key, _) {
-      if (key.startsWith('global_')) {
-        globalKeysToKeep.add(key);
+    
+    // check each index key, determine which is global table
+    for (final key in keysToCheck) {
+      try {
+        // extract table name from index key (format: tableName:indexName or tableName_indexName)
+        final parts = key.split(':');
+        final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
+        
+        // check if table is global table
+        if (await _dataStore.schemaManager?.isTableGlobal(tableName) == true) {
+          globalKeysToKeep.add(key);
+        }
+      } catch (e) {
+        Logger.error('Error checking if index is global: $e', label: 'IndexManager.onSpacePathChanged');
       }
-    });
+    }
 
+    // only keep global table write buffer
     _indexWriteBuffer.removeWhere((key, _) => !globalKeysToKeep.contains(key));
+    
+    // same as above, handle delete buffer
+    final deleteKeysToCheck = <String>[..._indexDeleteBuffer.keys];
+    final globalDeleteKeysToKeep = <String>[];
+    
+    for (final key in deleteKeysToCheck) {
+      try {
+        final parts = key.split(':');
+        final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
+        if (await _dataStore.schemaManager?.isTableGlobal(tableName) == true) {
+          globalDeleteKeysToKeep.add(key);
+        }
+      } catch (e) {
+        Logger.error('Error checking if delete index is global: $e', label: 'IndexManager.onSpacePathChanged');
+      }
+    }
+    
+    _indexDeleteBuffer.removeWhere((key, _) => !globalDeleteKeysToKeep.contains(key));
+    
+    // clear other related caches
     _indexWriting.removeWhere((key, _) => !globalKeysToKeep.contains(key));
-    _indexLastWriteTime
-        .removeWhere((key, _) => !globalKeysToKeep.contains(key));
+    _indexLastWriteTime.removeWhere((key, _) => !globalKeysToKeep.contains(key));
   }
 
   /// get total size of all indexes

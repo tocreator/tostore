@@ -176,7 +176,7 @@ class ValueComparator {
 
   /// Checks if a value matches a pattern using SQL LIKE syntax.
   /// Supports % as wildcard for multiple characters and _ for single character.
-  static bool matchesLikePattern(dynamic value, String pattern) {
+  static bool matchesPattern(dynamic value, String pattern) {
     if (value == null) return false;
 
     String valueStr = value.toString();
@@ -203,7 +203,7 @@ class ValueComparator {
     // Ensure the pattern matches the entire string
     regex = r'^' + regex + r'$';
 
-    return RegExp(regex, caseSensitive: true).hasMatch(valueStr);
+    return RegExp(regex, caseSensitive: false).hasMatch(valueStr);
   }
 
   /// Sort a list, supporting ascending and descending order
@@ -228,19 +228,6 @@ class ValueComparator {
         end == null || (includeEnd ? compareWithEnd <= 0 : compareWithEnd < 0);
 
     return startOk && endOk;
-  }
-
-  /// Check if a string matches a pattern (for LIKE operator)
-  static bool matchesPattern(String? value, String pattern) {
-    if (value == null) return false;
-
-    // Convert SQL LIKE pattern to regular expression
-    final regex = pattern
-        .replaceAll('%', '.*') // % matches zero or more characters
-        .replaceAll('_', '.') // _ matches one character
-        .replaceAll('\\', '\\\\'); // Escape backslashes
-
-    return RegExp('^$regex\$', caseSensitive: false).hasMatch(value);
   }
 
   /// normalize the string - remove the extra quotes
