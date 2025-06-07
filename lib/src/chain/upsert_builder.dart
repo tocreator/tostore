@@ -12,6 +12,8 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
   final Map<String, dynamic> _data;
   // flag to allow update of multiple records if the condition matches multiple records
   bool _allowMultiUpdate = false;
+  // flag to indicate whether to continue on partial errors
+  bool _continueOnPartialErrors = false;
 
   UpsertBuilder(super.db, super.tableName, this._data);
 
@@ -19,8 +21,17 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
   /// 
   /// By default, upsert will only update one record to avoid accidental batch updates.
   /// This method explicitly indicates that the developer intentionally wants to update all matching records.
-  UpsertBuilder confirmUpdateAll() {
+  UpsertBuilder allowUpdateAll() {
     _allowMultiUpdate = true;
+    return this;
+  }
+
+  /// allow partial errors
+  ///
+  /// this method explicitly indicates that the operation should continue when some records fail.
+  /// by default, the operation will stop and return an error if any record fails.
+  UpsertBuilder allowPartialErrors() {
+    _continueOnPartialErrors = true;
     return this;
   }
 
@@ -78,6 +89,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
             orderBy: $orderBy,
             limit: $limit,
             offset: $offset,
+            continueOnPartialErrors: _continueOnPartialErrors,
           );
         } else {
           // Default behavior: only update the first found record by its primary key
@@ -90,6 +102,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
               $tableName,
               _data,
               specificCondition,
+              continueOnPartialErrors: _continueOnPartialErrors,
             );
           } else {
             // Fallback if we can't determine primary key (shouldn't happen)
@@ -98,6 +111,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
               _data,
               condition,
               limit: 1,
+              continueOnPartialErrors: _continueOnPartialErrors,
             );
           }
         }
@@ -106,9 +120,24 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
         return await $db.insert($tableName, _data);
       }
     } catch (e) {
+      // Get primary key value if possible
+      List<String> failedKeys = [];
+      try {
+        final schema = await $db.getTableSchema($tableName);
+        if (schema != null && _data.containsKey(schema.primaryKey)) {
+          final keyValue = _data[schema.primaryKey]?.toString();
+          if (keyValue != null && keyValue.isNotEmpty) {
+            failedKeys = [keyValue];
+          }
+        }
+      } catch (_) {
+        // Ignore errors during error handling
+      }
+      
       return DbResult.error(
         code: ResultCode.dbError,
         message: 'Operation failed: $e',
+        failedKeys: failedKeys,
       );
     }
   }

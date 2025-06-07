@@ -1352,9 +1352,13 @@ class IndexManager {
 
       final recordId = pointer.toString();
 
+      // Record processed field indexes to avoid duplicate creation
+      final Set<String> processedFieldIndexes = {};
+
       // 1. Update primary key index
       final pkIndexName = 'pk_$tableName';
       await _addToInsertBuffer(tableName, pkIndexName, primaryValue, recordId);
+      processedFieldIndexes.add(primaryKey);
 
       // 2. Update normal indexes and unique indexes
       for (final index in schema.indexes) {
@@ -1408,6 +1412,9 @@ class IndexManager {
           if (fieldValue != null) {
             await _addToInsertBuffer(
                 tableName, indexName, fieldValue, recordId);
+            
+            // Record processed field indexes
+            processedFieldIndexes.add(fieldName);
           }
         } else {
           // Composite index
@@ -1415,6 +1422,11 @@ class IndexManager {
           if (compositeKey != null) {
             await _addToInsertBuffer(
                 tableName, indexName, compositeKey, recordId);
+            
+            // Record processed composite index fields
+            for (final field in index.fields) {
+              processedFieldIndexes.add(field);
+            }
           }
         }
       }
@@ -1423,12 +1435,17 @@ class IndexManager {
       for (final field in schema.fields) {
         // Check if the field is set to unique=true
         if (field.unique) {
-          // Check if the field already has a dedicated index
+          // Skip if the field has been processed or is the primary key
+          if (processedFieldIndexes.contains(field.name) || field.name == primaryKey) {
+            continue;
+          }
+          
+          // Check if there is an explicit index (for safety)
           bool hasExplicitIndex = schema.indexes.any((index) =>
               index.fields.length == 1 && index.fields.first == field.name);
 
-          // If there is no explicit index, create a default unique index
-          if (!hasExplicitIndex && field.name != primaryKey) {
+          // If there is no explicit index, create an auto-generated unique index
+          if (!hasExplicitIndex) {
             final fieldValue = record[field.name];
             if (fieldValue != null) {
               // Build unique index name
@@ -1460,6 +1477,11 @@ class IndexManager {
                 // Update cache
                 final cacheKey = _getIndexCacheKey(tableName, uniqueIndexName);
                 _indexMetaCache[cacheKey] = meta;
+                
+                Logger.debug(
+                  'Auto-created unique index for field ${field.name}: $uniqueIndexName',
+                  label: 'IndexManager.updateIndexes',
+                );
               }
 
               // Update unique index
@@ -1573,6 +1595,25 @@ class IndexManager {
             label: 'IndexManager.createIndex',
           );
           return; // skip creation of redundant primary key index
+        }
+        
+        // Check if this index would duplicate an auto-created unique field index
+        if (schema.fields.length == 1 && schema.unique) {
+          final fieldName = schema.fields[0];
+          final autoUniqueIndexName = 'uniq_$fieldName';
+          
+          // Check if the auto-created unique index exists
+          final autoIndexMeta = await _getIndexMeta(tableName, autoUniqueIndexName);
+          
+          if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
+            Logger.warn(
+              'Detected redundant unique index creation: $indexName would duplicate the auto-created unique index "$autoUniqueIndexName". Removing auto-created index and proceeding with explicit index.',
+              label: 'IndexManager.createIndex',
+            );
+            
+            // Remove the auto-created unique index before creating the explicit one
+            await removeIndex(tableName, autoUniqueIndexName);
+          }
         }
       }
 

@@ -1,146 +1,164 @@
 import 'result_code.dart';
 
-/// database operation result model
-/// used to represent the result of database insert, update, delete, etc.
+/// Database operation result model
+/// Used to represent the result of database operations (insert, update, delete, etc.)
 class DbResult {
-  /// whether the operation is successful
-  final bool success;
-
-  /// result status code
+  /// Result status code
   final ResultCode code;
 
-  /// result message
+  /// Result message
   final String message;
 
-  /// list of primary keys of the records operated (primary keys of successful operations)
-  final List<String> primaryKeys;
+  /// List of successfully processed record keys
+  final List<String> successKeys;
 
-  /// list of primary keys of the records operated (primary keys of failed operations)
+  /// List of failed record keys
   final List<String> failedKeys;
 
-  /// create database operation result
+  /// Constructor
   DbResult({
-    required this.success,
-    this.code = ResultCode.success,
-    this.message = '',
-    this.primaryKeys = const [],
+    required this.code,
+    required this.message,
+    this.successKeys = const [],
     this.failedKeys = const [],
   });
 
-  /// get single primary key (suitable for single record operation)
-  String? get primaryKey => primaryKeys.isNotEmpty ? primaryKeys.first : null;
+  /// Whether the operation is successful
+  bool get isSuccess => code == ResultCode.success;
 
-  /// get total number of records processed
-  int get totalCount => primaryKeys.length + failedKeys.length;
-
-  /// get success rate
-  double get successRate =>
-      totalCount > 0 ? primaryKeys.length / totalCount : 0.0;
-
-  /// whether it is a data constraint error
-  bool get isConstraintError => code.isConstraintError;
-
-  /// whether it is a resource not found error
-  bool get isNotFound => code == ResultCode.notFound;
-
-  /// whether it is a unique constraint violation
-  bool get isUniqueViolation => code == ResultCode.uniqueViolation;
-
-  /// whether it is a primary key violation
-  bool get isPrimaryKeyViolation => code == ResultCode.primaryKeyViolation;
-
-  /// get the value of the status code
-  int get codeValue => code.code;
-
-  /// create success result
-  /// [primaryKey] single primary key value (optional)
-  /// [primaryKeys] list of multiple primary key values (optional, mutually exclusive with primaryKey)
-  /// [message] custom message (optional)
-  /// [code] custom status code (default is success)
-  factory DbResult.success({
-    String? primaryKey,
-    List<String>? primaryKeys,
-    String message = '',
-    ResultCode code = ResultCode.success,
+  /// Create a success result
+  static DbResult success({
+    String? successKey,
+    List<String>? successKeys,
+    String message = 'Operation successful',
   }) {
+    final keys = successKey != null ? [successKey] : successKeys ?? [];
     return DbResult(
-      success: true,
-      primaryKeys: primaryKey != null ? [primaryKey] : (primaryKeys ?? []),
-      code: code,
-      message: message.isNotEmpty ? message : code.message,
+      code: ResultCode.success,
+      message: message,
+      successKeys: keys,
+      failedKeys: const [],
     );
   }
 
-  /// create error result
-  /// [code] error status code
-  /// [message] error message
-  /// [primaryKeys] list of related primary keys (optional)
-  /// [failedKeys] list of failed primary keys (optional)
-  factory DbResult.error({
+  /// Create an error result
+  static DbResult error({
     required ResultCode code,
-    String? message,
-    List<String> primaryKeys = const [],
+    required String message,
     List<String> failedKeys = const [],
   }) {
     return DbResult(
-      success: false,
-      primaryKeys: primaryKeys,
-      failedKeys: failedKeys,
       code: code,
-      message: message ?? code.message,
+      message: message,
+      failedKeys: failedKeys,
+      successKeys: const [],
     );
   }
 
-  /// create constraint violation result
-  /// [constraintType] constraint type (unique constraint, primary key constraint, etc.)
-  /// [message] error message (optional)
-  /// [conflictValue] conflict value (optional)
-  factory DbResult.constraintViolation({
-    required ResultCode constraintType,
-    String? message,
-    String? conflictValue,
-  }) {
-    return DbResult(
-      success: false,
-      code: constraintType,
-      message: message ?? constraintType.message,
-      failedKeys: conflictValue != null ? [conflictValue] : [],
-    );
-  }
-
-  /// create batch operation result
-  /// [successKeys] list of successful primary keys
-  /// [failedKeys] list of failed primary keys
-  /// [message] custom message (optional)
-  factory DbResult.batch({
+  /// Create a batch operation result
+  static DbResult batch({
     required List<String> successKeys,
     List<String> failedKeys = const [],
     String? message,
   }) {
-    final bool isAllSuccess = failedKeys.isEmpty && successKeys.isNotEmpty;
-    final bool isAllFailed = successKeys.isEmpty && failedKeys.isNotEmpty;
-
-    ResultCode code;
-    if (isAllSuccess) {
-      code = ResultCode.success;
-    } else if (isAllFailed) {
-      code = ResultCode.dbError;
+    final bool hasSuccess = successKeys.isNotEmpty;
+    final bool hasFailed = failedKeys.isNotEmpty;
+    
+    // Determine the result code based on success and failure counts
+    final ResultCode resultCode;
+    
+    if (!hasFailed && hasSuccess) {
+      resultCode = ResultCode.success;
+    } else if (hasSuccess && hasFailed) {
+      resultCode = ResultCode.partialSuccess;
     } else {
-      // partial success, partial failure
-      code = ResultCode.partialSuccess;
+      //  All failed
+      resultCode = ResultCode.unknown;
     }
-
+                                 
     return DbResult(
-      success: successKeys.isNotEmpty,
-      primaryKeys: successKeys,
+      code: resultCode,
+      message: message ?? _getBatchMessage(successKeys.length, failedKeys.length),
+      successKeys: successKeys,
       failedKeys: failedKeys,
-      code: code,
-      message:
-          message ?? _getBatchMessage(successKeys.length, failedKeys.length),
     );
   }
 
-  /// get the default message of batch operation
+  /// Get total number of records processed
+  int get totalCount => successKeys.length + failedKeys.length;
+
+  /// Get number of successful records
+  int get successCount => successKeys.length;
+
+  /// Get number of failed records
+  int get failedCount => failedKeys.length;
+
+  /// Whether it is a data constraint error
+  bool get isConstraintError => code.isConstraintError;
+
+  /// Whether it is a resource not found error
+  bool get isNotFound => code == ResultCode.notFound;
+
+  /// Whether it is a unique constraint violation
+  bool get isUniqueViolation => code == ResultCode.uniqueViolation;
+
+  /// Whether it is a primary key violation
+  bool get isPrimaryKeyViolation => code == ResultCode.primaryKeyViolation;
+
+  /// Whether the operation succeeded but no records were affected
+  bool get isEmptySuccess => isSuccess && successKeys.isEmpty;
+
+  /// Convert DbResult to a Map (for serialization)
+  Map<String, dynamic> toJson() {
+    return {
+      'code': code.index,
+      'message': message,
+      'successKeys': successKeys,
+      'failedKeys': failedKeys,
+    };
+  }
+  
+  /// Create a DbResult from a Map (for deserialization)
+  static DbResult fromJson(Map<String, dynamic> json) {
+    // Get the code as an index into ResultCode enum
+    final codeIndex = json['code'] as int;
+    final resultCode = ResultCode.values[codeIndex];
+    
+    // Extract message
+    final message = json['message'] as String;
+    
+    // Extract success and failed keys
+    final successKeys = _extractStringList(json['successKeys']);
+    final failedKeys = _extractStringList(json['failedKeys']);
+    
+    return DbResult(
+      code: resultCode,
+      message: message,
+      successKeys: successKeys,
+      failedKeys: failedKeys,
+    );
+  }
+  
+  /// Helper method to extract a List<String> from JSON
+  static List<String> _extractStringList(dynamic value) {
+    if (value == null) {
+      return const [];
+    }
+    
+    if (value is List) {
+      return value.map((item) => item.toString()).toList();
+    }
+    
+    return const [];
+  }
+  
+  /// Override toString for easy debugging
+  @override
+  String toString() {
+    return 'DbResult{code: $code, message: $message, successCount: $successCount, failedCount: $failedCount}';
+  }
+
+  /// Get the default message of batch operation
   static String _getBatchMessage(int successCount, int failedCount) {
     if (failedCount == 0) {
       return 'All operations successful, total $successCount records';
@@ -149,27 +167,5 @@ class DbResult {
     } else {
       return 'Some operations successful, $successCount successful, $failedCount failed';
     }
-  }
-
-  /// method for serialization
-  Map<String, dynamic> toJson() {
-    return {
-      'success': success,
-      'code': code.code,
-      'message': message,
-      'primaryKeys': primaryKeys,
-      'failedKeys': failedKeys,
-    };
-  }
-
-  /// create instance from JSON
-  factory DbResult.fromJson(Map<String, dynamic> json) {
-    return DbResult(
-      success: json['success'] as bool,
-      code: ResultCode.fromCode(json['code'] as int),
-      message: json['message'] as String,
-      primaryKeys: List<String>.from(json['primaryKeys'] ?? []),
-      failedKeys: List<String>.from(json['failedKeys'] ?? []),
-    );
   }
 }
