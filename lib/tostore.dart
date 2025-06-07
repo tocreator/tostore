@@ -7,8 +7,10 @@ export 'src/model/table_info.dart';
 export 'src/model/log_config.dart';
 export 'src/model/space_info.dart';
 export 'src/model/db_result.dart';
+export 'src/model/query_result.dart';
 export 'src/model/migration_task.dart';
 export 'src/model/result_code.dart';
+export 'src/query/query_condition.dart';
 
 import 'src/chain/delete_builder.dart';
 import 'src/chain/update_builder.dart';

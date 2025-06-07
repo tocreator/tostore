@@ -2,24 +2,7 @@ import 'package:flutter/foundation.dart';
 
 import '../core/data_store_impl.dart';
 import '../query/query_condition.dart';
-import '../handler/logger.dart';
 
-// List of valid operators for validation
-const List<String> _validOperators = [
-  '=',
-  '!=',
-  '<>',
-  '>',
-  '>=',
-  '<',
-  '<=',
-  'IN',
-  'NOT IN',
-  'BETWEEN',
-  'LIKE',
-  'IS',
-  'IS NOT'
-];
 
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
@@ -27,8 +10,6 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
 
-  // Track operators that have already been warned about
-  static final Set<String> _warnedInvalidOperators = {};
 
   List<String>? _orderBy;
   int? _limit;
@@ -67,18 +48,6 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// base where condition
   SELF where(String field, String operator, dynamic value) {
-    // Validate the operator before passing to the query condition
-    if (!_validOperators.contains(operator.toUpperCase())) {
-      // Only warn about each invalid operator once
-      if (!_warnedInvalidOperators.contains(operator)) {
-        Logger.error(
-            'Invalid operator: "$operator". Valid operators are: ${_validOperators.join(', ')}',
-            label: 'ChainBuilder.where');
-        _warnedInvalidOperators.add(operator);
-      }
-      // Use equals as a safe fallback
-      operator = '=';
-    }
     _condition.where(field, operator, value);
     return _self;
   }
@@ -112,6 +81,68 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     _condition.or();
     return _self;
   }
+
+  /// Add a predefined condition to this query with AND logic
+  SELF andCondition(QueryCondition condition) {
+    _condition.andCondition(condition);
+    return _self;
+  }
+  
+  /// orCondition condition - adds OR logic
+  SELF orCondition(QueryCondition condition) {
+    _condition.orCondition(condition);
+    return _self;
+  }
+
+  /// orWhere condition - adds OR logic
+  SELF orWhere(String field, String operator, dynamic value) {
+    _condition.or().where(field, operator, value);
+    return _self;
+  }
+
+  /// whereNotIn condition
+  SELF whereNotIn(String field, List values) {
+    _condition.where(field, 'NOT IN', values);
+    return _self;
+  }
+
+  /// whereLike condition
+  SELF whereLike(String field, String pattern) {
+    _condition.where(field, 'LIKE', pattern);
+    return _self;
+  }
+
+  /// whereNotLike condition
+  SELF whereNotLike(String field, String pattern) {
+    _condition.where(field, 'NOT LIKE', pattern);
+    return _self;
+  }
+
+  /// whereEqual condition
+  SELF whereEqual(String field, dynamic value) {
+    _condition.whereEqual(field, value);
+    return _self;
+  }
+
+  /// whereNotEqual condition
+  SELF whereNotEqual(String field, dynamic value) {
+    _condition.whereNotEqual(field, value);
+    return _self;
+  }
+
+  /// whereContains condition
+  SELF whereContains(String field, String value) {
+    _condition.whereContains(field, value);
+    return _self;
+  }
+
+  /// whereNotContains condition  
+  SELF whereNotContains(String field, String value) {
+    _condition.whereNotContains(field, value);
+    return _self;
+  }
+  
+  
 
   /// get condition builder
   QueryCondition get condition => _condition;
