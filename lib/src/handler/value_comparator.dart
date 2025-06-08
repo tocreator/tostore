@@ -27,47 +27,126 @@ class ValueComparator {
       return aBig.compareTo(bBig);
     }
 
-    // special handling: if the value is a string type, add smart string comparison
-    if (a is String && b is String) {
-      // if they are directly equal, return 0
-      if (a == b) return 0;
-
-      // normalize the string - remove the extra quotes
-      String normalizedA = _normalizeString(a);
-      String normalizedB = _normalizeString(b);
-
-      // after normalization, compare again
-      if (normalizedA == normalizedB) return 0;
-    }
-
-    // Convert to strings for string comparison
+    // Convert to strings for further comparisons
     String aStr = a.toString();
     String bStr = b.toString();
 
-    // Check if both are numeric strings
+    // Special case: If both are strings, normalize them first
+    if (a is String && b is String) {
+      // If they are directly equal, return 0
+      if (a == b) return 0;
+
+      // Normalize strings - remove extra quotes
+      aStr = _normalizeString(a);
+      bStr = _normalizeString(b);
+
+      // After normalization, check equality again
+      if (aStr == bStr) return 0;
+    }
+
+    // Check if both are numeric strings (highest priority)
     if (isNumericString(aStr) && isNumericString(bStr)) {
       return compareNumericStrings(aStr, bStr);
     }
 
-    // Check if both are shortcode format
+    // Check if both are shortcode format (second priority)
     if (isShortCodeFormat(aStr) && isShortCodeFormat(bStr)) {
       // 1. First compare length: in Base62 encoding, a longer code always represents a larger value
       if (aStr.length != bStr.length) {
         return aStr.length.compareTo(bStr.length);
       }
 
-      // 2. When length is the same, directly use string comparison:
-      // Because the dictionary order of the Base62 character set (0-9,A-Z,a-z) is consistent with the numerical order,
-      // and the position weight is correct (the higher the position, the greater the weight), so for the same length encoding,
-      // dictionary order comparison is 100% consistent with numerical size comparison.
+      // 2. When length is the same, directly use string comparison
       return aStr.compareTo(bStr);
-
-      // Note: We removed the decode-then-compare logic because direct string comparison is 100% accurate and has better performance
-      // Decode comparison for same-length Base62 encoding is about 20 times slower.
+    }
+    
+    // Natural sorting for strings with embedded numbers (third priority)
+    if (a is String && b is String) {
+      int result = _compareStringsNaturally(aStr, bStr);
+      if (result != 0) return result;
     }
 
-    // For different types or non-numeric strings, compare as strings
+    // Default: standard string comparison
     return aStr.compareTo(bStr);
+  }
+  
+  /// Natural sorting comparison of two strings (handle numbers in strings)
+  static int _compareStringsNaturally(String a, String b) {
+    // Check if digital-aware comparison is needed
+    bool aHasDigit = RegExp(r'\d').hasMatch(a);
+    bool bHasDigit = RegExp(r'\d').hasMatch(b);
+    
+    if (!aHasDigit || !bHasDigit) {
+      return 0; // At least one string does not have a number, use standard comparison
+    }
+    
+    // Split string into list of letter and number parts
+    List<_StringPart> aParts = _splitStringIntoParts(a);
+    List<_StringPart> bParts = _splitStringIntoParts(b);
+    
+    // Compare each part
+    int minLength = aParts.length < bParts.length ? aParts.length : bParts.length;
+    
+    for (int i = 0; i < minLength; i++) {
+      _StringPart aPart = aParts[i];
+      _StringPart bPart = bParts[i];
+      
+      // If two parts are of the same type
+      if (aPart.isNumeric == bPart.isNumeric) {
+        if (aPart.isNumeric) {
+          // If it is a numeric part, compare by value
+          int aNum = int.tryParse(aPart.value) ?? 0;
+          int bNum = int.tryParse(bPart.value) ?? 0;
+          int result = aNum.compareTo(bNum);
+          if (result != 0) return result;
+        } else {
+          // If it is a text part, compare by dictionary order
+          int result = aPart.value.compareTo(bPart.value);
+          if (result != 0) return result;
+        }
+      } else {
+        // If the types are different, the numeric part is less than the text part
+        return aPart.isNumeric ? -1 : 1;
+      }
+    }
+    
+    // If the previous parts are equal, the shorter string is smaller
+    return aParts.length.compareTo(bParts.length);
+  }
+  
+  /// Split string into letter and number parts
+  static List<_StringPart> _splitStringIntoParts(String input) {
+    List<_StringPart> parts = [];
+    StringBuffer currentPart = StringBuffer();
+    bool isNumeric = false;
+    bool hasStarted = false;
+    
+    for (int i = 0; i < input.length; i++) {
+      String char = input[i];
+      bool charIsDigit = RegExp(r'\d').hasMatch(char);
+      
+      if (!hasStarted) {
+        // The first character
+        currentPart.write(char);
+        isNumeric = charIsDigit;
+        hasStarted = true;
+      } else if (charIsDigit == isNumeric) {
+        // The same type, continue adding to the current part
+        currentPart.write(char);
+      } else {
+        // The type changed, save the current part and start a new part
+        parts.add(_StringPart(currentPart.toString(), isNumeric));
+        currentPart = StringBuffer(char);
+        isNumeric = charIsDigit;
+      }
+    }
+    
+    // Add the last part
+    if (currentPart.isNotEmpty) {
+      parts.add(_StringPart(currentPart.toString(), isNumeric));
+    }
+    
+    return parts;
   }
 
   /// Checks if a string represents a numeric value.
@@ -230,21 +309,34 @@ class ValueComparator {
     return startOk && endOk;
   }
 
-  /// normalize the string - remove the extra quotes
+  /// Normalize the string - remove the extra quotes
   static String _normalizeString(String value) {
     String result = value;
 
-    // remove the quotes at the beginning and end of the string
+    // Remove the quotes at the beginning and end of the string
     if ((result.startsWith('"') && result.endsWith('"')) ||
         (result.startsWith("'") && result.endsWith("'"))) {
       result = result.substring(1, result.length - 1);
     }
 
-    // handle the case of escaped quotes: \"value\"
+    // Handle the case of escaped quotes: \"value\"
     if (result.startsWith('\\"') && result.endsWith('\\"')) {
       result = result.substring(2, result.length - 2);
     }
 
     return result;
+  }
+}
+
+/// String part class, used for natural sorting
+class _StringPart {
+  final String value;
+  final bool isNumeric;
+  
+  _StringPart(this.value, this.isNumeric);
+  
+  @override
+  String toString() {
+    return '$value (${isNumeric ? 'num' : 'text'})';
   }
 }
