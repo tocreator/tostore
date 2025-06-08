@@ -506,6 +506,14 @@ class QueryCondition {
     if (node.type == _NodeType.leaf) {
       return _matchAllConditions(record, node.condition);
     }
+    
+    // Handle custom function nodes
+    if (node.type == _NodeType.custom) {
+      if (node.customMatcher != null) {
+        return node.customMatcher!(record);
+      }
+      return false;
+    }
 
     // If the node has no children, match all records
     if (node.children.isEmpty) {
@@ -804,9 +812,55 @@ class QueryCondition {
     return where(field, 'NOT LIKE', '%$value%');
   }
 
-  /// Filter list data
-  List<Map<String, dynamic>> filter(List<Map<String, dynamic>> records) {
-    return records.where((record) => matches(record)).toList();
+
+
+  /// Add a custom condition using a user-provided function
+  /// Example:
+  /// whereCustom((record) => record['is_active'] == true)
+  QueryCondition whereCustom(bool Function(Map<String, dynamic>) record) {
+    final customNode = _ConditionNode(
+      type: _NodeType.custom,
+      customMatcher: record,
+    );
+    
+    // If the current node is an AND node, add the custom node as a child
+    if (_current.type == _NodeType.and) {
+      _current.children.add(customNode);
+    }
+    // If the current node is an OR node
+    else if (_current.type == _NodeType.or) {
+      _current.children.add(customNode);
+    }
+    // If the current node is a leaf or custom node, create a new AND node as a parent
+    else {
+      // Find the parent node of the current node
+      final parent = _findParent(_root, _current);
+      
+      if (parent != null) {
+        // Create a new AND node
+        final andNode = _ConditionNode(type: _NodeType.and);
+        
+        // Replace the current node with the AND node
+        final index = parent.children.indexOf(_current);
+        parent.children[index] = andNode;
+        
+        // Add the current node and the custom node as children of the AND node
+        andNode.children.add(_current);
+        andNode.children.add(customNode);
+        
+        // Update the current node to the AND node
+        _current = andNode;
+      }
+    }
+    
+    return this;
+  }
+
+  /// Add a custom condition using a user-provided function with OR logic
+  /// Example:
+  /// orWhereCustom((record) => record['is_active'] == true)
+  QueryCondition orWhereCustom(bool Function(Map<String, dynamic>) record) {
+    return or().whereCustom(record);
   }
 }
 
@@ -819,7 +873,10 @@ enum _NodeType {
   and,
 
   /// OR operator node
-  or
+  or,
+  
+  /// Custom function node
+  custom
 }
 
 /// Condition node class
@@ -829,6 +886,9 @@ class _ConditionNode {
 
   /// Condition content (only valid for leaf nodes)
   Map<String, dynamic> condition;
+  
+  /// Custom matcher function (only valid for custom nodes)
+  bool Function(Map<String, dynamic>)? customMatcher;
 
   /// Child node list
   List<_ConditionNode> children;
@@ -837,6 +897,7 @@ class _ConditionNode {
   _ConditionNode({
     required this.type,
     this.condition = const {},
+    this.customMatcher,
   }) : children = [];
 
   /// Create a deep copy of the node
@@ -844,6 +905,7 @@ class _ConditionNode {
     final copy = _ConditionNode(
       type: type,
       condition: Map.from(condition),
+      customMatcher: customMatcher,
     );
 
     // Recursively clone all child nodes

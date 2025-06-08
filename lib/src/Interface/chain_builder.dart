@@ -142,6 +142,21 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     return _self;
   }
   
+  /// Add a custom condition using a user-provided function
+  /// Example:
+  /// whereCustom((record) => record['is_active'] == true)
+  SELF whereCustom(bool Function(Map<String, dynamic>) record) {
+    _condition.whereCustom(record);
+    return _self;
+  }
+  
+  /// Add a custom condition using a user-provided function with OR logic
+  /// Example:
+  /// orWhereCustom((record) => record['is_active'] == true)
+  SELF orWhereCustom(bool Function(Map<String, dynamic>) record) {
+    _condition.orWhereCustom(record);
+    return _self;
+  }
   
 
   /// get condition builder
