@@ -9,7 +9,7 @@ export 'src/model/space_info.dart';
 export 'src/model/db_result.dart';
 export 'src/model/query_result.dart';
 export 'src/model/migration_task.dart';
-export 'src/model/result_code.dart';
+export 'src/model/result_type.dart';
 export 'src/query/query_condition.dart';
 
 import 'src/chain/delete_builder.dart';
@@ -272,11 +272,11 @@ class ToStore implements DataStoreInterface {
   /// // Update with condition
   /// await db.update('users', {'name': 'new_name'})
   ///         .where('id', '=', 1);
-  /// 
+  ///
   /// // Update all records, if there is no condition, the update operation will be rejected to prevent accidental update.
   /// await db.update('users', {'status': 'inactive'})
   ///         .allowUpdateAll();
-  /// 
+  ///
   /// // Continue even if some records fail
   /// await db.update('users', {'email': 'unique@example.com'})
   ///         .where('status', '=', 'inactive')
@@ -296,7 +296,7 @@ class ToStore implements DataStoreInterface {
   /// [dataList] List of records to insert
   /// [allowPartialErrors] Whether to continue when some records fail to insert (defaults to true)
   /// Returns the operation result with successful and failed keys
-  /// 
+  ///
   /// Example:
   /// ```dart
   /// // Insert multiple records and continue even if some fail (default behavior)
@@ -304,12 +304,12 @@ class ToStore implements DataStoreInterface {
   ///   {'name': 'John', 'email': 'john@example.com'},
   ///   {'name': 'Jane', 'email': 'jane@example.com'}
   /// ]);
-  /// 
+  ///
   /// // Check results
   /// print('Successful: ${result.successCount}, Failed: ${result.failedCount}');
-  /// 
+  ///
   /// // Stop on first error
-  /// final strictResult = await db.batchInsert('users', records, 
+  /// final strictResult = await db.batchInsert('users', records,
   ///   allowPartialErrors: false);
   /// ```
   ///
@@ -320,8 +320,10 @@ class ToStore implements DataStoreInterface {
   /// 返回操作结果，包含成功和失败的主键信息
   @override
   Future<DbResult> batchInsert(
-      String tableName, List<Map<String, dynamic>> dataList, {bool allowPartialErrors = true}) async {
-    return await _impl.batchInsert(tableName, dataList, allowPartialErrors: allowPartialErrors);
+      String tableName, List<Map<String, dynamic>> dataList,
+      {bool allowPartialErrors = true}) async {
+    return await _impl.batchInsert(tableName, dataList,
+        allowPartialErrors: allowPartialErrors);
   }
 
   /// Set key-value pair
@@ -395,13 +397,13 @@ class ToStore implements DataStoreInterface {
   /// ```dart
   /// await db.delete('users')
   ///         .where('id', '=', 1);
-  /// 
+  ///
   /// // To continue on partial errors:
   /// await db.delete('users')
   ///         .where('id', '>', 100)
   ///         .allowPartialErrors();
   /// ```
-  /// 
+  ///
   /// 删除数据
   /// 链式操作，支持带条件删除
   @override

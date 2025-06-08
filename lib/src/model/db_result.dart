@@ -1,10 +1,10 @@
-import 'result_code.dart';
+import 'result_type.dart';
 
 /// Database operation result model
 /// Used to represent the result of database operations (insert, update, delete, etc.)
 class DbResult {
-  /// Result status code
-  final ResultCode code;
+  /// Result status type
+  final ResultType type;
 
   /// Result message
   final String message;
@@ -17,14 +17,17 @@ class DbResult {
 
   /// Constructor
   DbResult({
-    required this.code,
+    required this.type,
     required this.message,
     this.successKeys = const [],
     this.failedKeys = const [],
   });
 
+  /// Get the status code value
+  int get code => type.code;
+
   /// Whether the operation is successful
-  bool get isSuccess => code == ResultCode.success;
+  bool get isSuccess => type == ResultType.success;
 
   /// Create a success result
   static DbResult success({
@@ -34,7 +37,7 @@ class DbResult {
   }) {
     final keys = successKey != null ? [successKey] : successKeys ?? [];
     return DbResult(
-      code: ResultCode.success,
+      type: ResultType.success,
       message: message,
       successKeys: keys,
       failedKeys: const [],
@@ -43,12 +46,12 @@ class DbResult {
 
   /// Create an error result
   static DbResult error({
-    required ResultCode code,
+    required ResultType type,
     required String message,
     List<String> failedKeys = const [],
   }) {
     return DbResult(
-      code: code,
+      type: type,
       message: message,
       failedKeys: failedKeys,
       successKeys: const [],
@@ -63,22 +66,23 @@ class DbResult {
   }) {
     final bool hasSuccess = successKeys.isNotEmpty;
     final bool hasFailed = failedKeys.isNotEmpty;
-    
-    // Determine the result code based on success and failure counts
-    final ResultCode resultCode;
-    
+
+    // Determine the result type based on success and failure counts
+    final ResultType resultType;
+
     if (!hasFailed && hasSuccess) {
-      resultCode = ResultCode.success;
+      resultType = ResultType.success;
     } else if (hasSuccess && hasFailed) {
-      resultCode = ResultCode.partialSuccess;
+      resultType = ResultType.partialSuccess;
     } else {
       //  All failed
-      resultCode = ResultCode.unknown;
+      resultType = ResultType.unknown;
     }
-                                 
+
     return DbResult(
-      code: resultCode,
-      message: message ?? _getBatchMessage(successKeys.length, failedKeys.length),
+      type: resultType,
+      message:
+          message ?? _getBatchMessage(successKeys.length, failedKeys.length),
       successKeys: successKeys,
       failedKeys: failedKeys,
     );
@@ -93,17 +97,10 @@ class DbResult {
   /// Get number of failed records
   int get failedCount => failedKeys.length;
 
-  /// Whether it is a data constraint error
-  bool get isConstraintError => code.isConstraintError;
 
   /// Whether it is a resource not found error
-  bool get isNotFound => code == ResultCode.notFound;
+  bool get isNotFound => type == ResultType.notFound;
 
-  /// Whether it is a unique constraint violation
-  bool get isUniqueViolation => code == ResultCode.uniqueViolation;
-
-  /// Whether it is a primary key violation
-  bool get isPrimaryKeyViolation => code == ResultCode.primaryKeyViolation;
 
   /// Whether the operation succeeded but no records were affected
   bool get isEmptySuccess => isSuccess && successKeys.isEmpty;
@@ -111,47 +108,47 @@ class DbResult {
   /// Convert DbResult to a Map (for serialization)
   Map<String, dynamic> toJson() {
     return {
-      'code': code.index,
+      'code': type.code,
       'message': message,
       'successKeys': successKeys,
       'failedKeys': failedKeys,
     };
   }
-  
+
   /// Create a DbResult from a Map (for deserialization)
   static DbResult fromJson(Map<String, dynamic> json) {
-    // Get the code as an index into ResultCode enum
-    final codeIndex = json['code'] as int;
-    final resultCode = ResultCode.values[codeIndex];
-    
+    // Get the numeric code and convert to ResultType
+    final int codeValue = json['code'] as int;
+    final resultType = ResultType.fromCode(codeValue);
+
     // Extract message
     final message = json['message'] as String;
-    
+
     // Extract success and failed keys
     final successKeys = _extractStringList(json['successKeys']);
     final failedKeys = _extractStringList(json['failedKeys']);
-    
+
     return DbResult(
-      code: resultCode,
+      type: resultType,
       message: message,
       successKeys: successKeys,
       failedKeys: failedKeys,
     );
   }
-  
+
   /// Helper method to extract a List<String> from JSON
   static List<String> _extractStringList(dynamic value) {
     if (value == null) {
       return const [];
     }
-    
+
     if (value is List) {
       return value.map((item) => item.toString()).toList();
     }
-    
+
     return const [];
   }
-  
+
   /// Override toString for easy debugging
   @override
   String toString() {

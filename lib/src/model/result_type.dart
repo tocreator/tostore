@@ -1,10 +1,10 @@
-/// Database operation result status code
+/// Database operation result status type
 /// 0 represents complete success
 /// Positive numbers represent partial success or special success status
 /// -1 represents unknown error
 /// -2 ~ -30 represent common business errors
 /// -90 ~ -99 represent system errors
-enum ResultCode {
+enum ResultType {
   /// Operation successful
   success(0, 'Operation successful'),
 
@@ -56,25 +56,25 @@ enum ResultCode {
   /// Status code value
   final int code;
 
-  /// Status code description
+  /// Status description
   final String message;
 
   /// Constructor
-  const ResultCode(this.code, this.message);
+  const ResultType(this.code, this.message);
 
   /// Get the corresponding enum from the status code value
-  static ResultCode fromCode(int code) {
-    return ResultCode.values.firstWhere(
+  static ResultType fromCode(int code) {
+    return ResultType.values.firstWhere(
       (e) => e.code == code,
-      orElse: () => ResultCode.unknown,
+      orElse: () => ResultType.unknown,
     );
   }
 
-  /// Determine if it is a successful status code
-  bool get isSuccess => this == ResultCode.success;
+  /// Determine if it is a successful status
+  bool get isSuccess => this == ResultType.success;
 
   /// Determine if it is a partially successful operation
-  bool get isPartialSuccess => this == ResultCode.partialSuccess;
+  bool get isPartialSuccess => this == ResultType.partialSuccess;
 
   /// Determine if it is an error status (negative number)
   bool get isError => code < 0;

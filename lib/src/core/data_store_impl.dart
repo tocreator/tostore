@@ -14,7 +14,7 @@ import '../model/global_config.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
 import '../model/record_operation.dart';
-import '../model/result_code.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import 'data_cache_manager.dart';
@@ -692,14 +692,14 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.insert');
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'Table $tableName does not exist',
         );
       }
       final validData = await _validateAndProcessData(schema, data, tableName);
       if (validData == null) {
         return DbResult.error(
-          code: ResultCode.validationFailed,
+          type: ResultType.validationFailed,
           message: 'Data validation failed',
         );
       }
@@ -720,7 +720,7 @@ class DataStoreImpl {
         }
 
         return DbResult.error(
-          code: ResultCode.uniqueViolation,
+          type: ResultType.uniqueViolation,
           message: 'Unique constraint violation',
           failedKeys: providedId != null ? [providedId.toString()] : [],
         );
@@ -785,7 +785,7 @@ class DataStoreImpl {
       }
 
       return DbResult.error(
-        code: ResultCode.dbError,
+        type: ResultType.dbError,
         message: 'Insert failed: $e',
         failedKeys: failedKeys,
       );
@@ -1120,7 +1120,7 @@ class DataStoreImpl {
           'Update operation without condition, this may cause accidental update of all records, please use allowUpdateAll() method to explicitly confirm.',
           label: 'DataStore.updateInternal');
       return DbResult.error(
-        code: ResultCode.validationFailed,
+        type: ResultType.validationFailed,
         message:
             'Update operation must specify a filter condition. If you really need to update all records, please use allowUpdateAll() method to explicitly confirm.',
       );
@@ -1135,7 +1135,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.updateInternal');
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'Table $tableName does not exist',
         );
       }
@@ -1143,7 +1143,7 @@ class DataStoreImpl {
           await _validateAndProcessUpdateData(schema, data, tableName);
       if (validData == null || validData.isEmpty) {
         return DbResult.error(
-          code: ResultCode.validationFailed,
+          type: ResultType.validationFailed,
           message: 'Data validation failed',
         );
       }
@@ -1153,7 +1153,7 @@ class DataStoreImpl {
           orderBy: orderBy, limit: limit, offset: offset);
       if (records.isEmpty) {
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'No matching records found',
         );
       }
@@ -1168,7 +1168,7 @@ class DataStoreImpl {
         if (recordKey.isEmpty) {
           continue; // Skip records without primary key
         }
-        
+
         // merge update data
         final updatedRecord = Map<String, dynamic>.from(record)
           ..addAll(validData);
@@ -1187,14 +1187,14 @@ class DataStoreImpl {
               Logger.warn(
                   'Warning: value $value of field ${field.name} already exists');
               failedKeys.add(recordKey);
-              
+
               // If continueOnPartialErrors is true, skip this record and continue
               if (continueOnPartialErrors) {
                 continue;
               }
-              
+
               return DbResult.error(
-                code: ResultCode.uniqueViolation,
+                type: ResultType.uniqueViolation,
                 message: 'Field ${field.name} value $value already exists',
                 failedKeys: [recordKey],
               );
@@ -1222,14 +1222,14 @@ class DataStoreImpl {
               Logger.warn(
                   'Warning: value ${record[schema.primaryKey]} of unique index ${index.actualIndexName} already exists');
               failedKeys.add(recordKey);
-              
+
               // If continueOnPartialErrors is true, skip this record and continue
               if (continueOnPartialErrors) {
                 continue;
               }
-              
+
               return DbResult.error(
-                code: ResultCode.uniqueViolation,
+                type: ResultType.uniqueViolation,
                 message: 'Index ${index.actualIndexName} value already exists',
                 failedKeys: [recordKey],
               );
@@ -1238,13 +1238,12 @@ class DataStoreImpl {
         }
 
         // update cache and write queue, index
-        dataCacheManager.removeCachedRecord(
-            tableName, recordKey);
+        dataCacheManager.removeCachedRecord(tableName, recordKey);
         dataCacheManager.addCachedRecord(tableName, updatedRecord);
         // update write queue
         tableDataManager.addToWriteBuffer(tableName, updatedRecord,
             isUpdate: true);
-            
+
         // Add to success keys list
         successKeys.add(recordKey);
       }
@@ -1257,7 +1256,8 @@ class DataStoreImpl {
         return DbResult.batch(
           successKeys: successKeys,
           failedKeys: failedKeys,
-          message: 'Update partially successful, ${successKeys.length} records updated, ${failedKeys.length} records failed',
+          message:
+              'Update partially successful, ${successKeys.length} records updated, ${failedKeys.length} records failed',
         );
       } else {
         return DbResult.success(
@@ -1269,7 +1269,7 @@ class DataStoreImpl {
       Logger.error('Update failed: $e', label: 'DataStore-update');
       await _transactionManager!.rollback(transaction);
       return DbResult.error(
-        code: ResultCode.dbError,
+        type: ResultType.dbError,
         message: 'Update failed: $e',
       );
     }
@@ -1322,25 +1322,26 @@ class DataStoreImpl {
             'Delete operation without condition, this may cause accidental deletion of all records, please use allowDeleteAll() method to explicitly confirm.',
             label: 'DataStore.deleteInternal');
         return DbResult.error(
-          code: ResultCode.validationFailed,
+          type: ResultType.validationFailed,
           message:
               'Delete operation must specify a filter condition. If you really need to delete all records, please use allowDeleteAll() method to explicitly confirm.',
         );
       } else {
         // If allowAll=true and no condition, use clear() for better performance
-        Logger.info('Using clear() for better performance when deleting all records', 
+        Logger.info(
+            'Using clear() for better performance when deleting all records',
             label: 'DataStore.deleteInternal');
-        
+
         try {
           await clear(tableName);
           return DbResult.success(
             message: 'All records in table $tableName have been deleted',
           );
         } catch (e) {
-          Logger.error('Failed to clear table: $e', 
+          Logger.error('Failed to clear table: $e',
               label: 'DataStore.deleteInternal');
           return DbResult.error(
-            code: ResultCode.dbError,
+            type: ResultType.dbError,
             message: 'Failed to delete all records: $e',
           );
         }
@@ -1363,7 +1364,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.deleteInternal');
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'Table $tableName does not exist',
         );
       }
@@ -1438,7 +1439,7 @@ class DataStoreImpl {
           }
           // Add to success keys
           successKeys.add(pkValue);
-          
+
           // Remove from record cache
           dataCacheManager.removeCachedRecord(tableName, pkValue);
 
@@ -1484,7 +1485,7 @@ class DataStoreImpl {
               if (pkValue != null) {
                 // Add to deleted keys list
                 deletedKeys.add(pkValue);
-                
+
                 dataCacheManager.removeCachedRecord(tableName, pkValue);
 
                 // remove from write queue (if exists)
@@ -1540,7 +1541,7 @@ class DataStoreImpl {
       await _transactionManager!.rollback(transaction);
       // Clear cache, ensure data consistency
       return DbResult.error(
-        code: ResultCode.dbError,
+        type: ResultType.dbError,
         message: 'Delete failed: $e',
       );
     }
@@ -1715,7 +1716,8 @@ class DataStoreImpl {
   /// batch insert data
   /// [allowPartialErrors] if true, continue processing remaining records even if some fail
   Future<DbResult> batchInsert(
-      String tableName, List<Map<String, dynamic>> records, {bool allowPartialErrors = true}) async {
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true}) async {
     await ensureInitialized();
 
     TableSchema? schema;
@@ -1726,7 +1728,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.batchInsert');
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'Table $tableName does not exist',
         );
       }
@@ -1734,7 +1736,7 @@ class DataStoreImpl {
       final primaryKey = schema.primaryKey;
       final validRecords = <Map<String, dynamic>>[];
       final invalidRecords = <Map<String, dynamic>>[];
-      
+
       for (var record in records) {
         final validData =
             await _validateAndProcessData(schema, record, tableName);
@@ -1751,14 +1753,14 @@ class DataStoreImpl {
             .map((record) => record[primaryKey]?.toString() ?? '')
             .where((key) => key.isNotEmpty)
             .toList();
-            
+
         return DbResult.error(
-          code: ResultCode.validationFailed,
+          type: ResultType.validationFailed,
           message: 'All data validation failed',
           failedKeys: failedKeys,
         );
       }
-      
+
       // If not allowing partial errors and some records failed validation, return error
       if (!allowPartialErrors && invalidRecords.isNotEmpty) {
         // Collect failed keys
@@ -1766,10 +1768,11 @@ class DataStoreImpl {
             .map((record) => record[primaryKey]?.toString() ?? '')
             .where((key) => key.isNotEmpty)
             .toList();
-            
+
         return DbResult.error(
-          code: ResultCode.validationFailed,
-          message: 'Some records failed validation. Set allowPartialErrors=true to insert valid records.',
+          type: ResultType.validationFailed,
+          message:
+              'Some records failed validation. Set allowPartialErrors=true to insert valid records.',
           failedKeys: failedKeys,
         );
       }
@@ -1797,12 +1800,12 @@ class DataStoreImpl {
             .where((key) => key.isNotEmpty)
             .toList();
         return DbResult.error(
-          code: ResultCode.uniqueViolation,
+          type: ResultType.uniqueViolation,
           message: 'All records have unique constraint conflicts',
           failedKeys: failedKeys,
         );
       }
-      
+
       // If not allowing partial errors and some records failed due to unique constraints
       if (!allowPartialErrors && failedRecords.isNotEmpty) {
         // Collect failed keys
@@ -1810,10 +1813,11 @@ class DataStoreImpl {
             .map((record) => record[primaryKey]?.toString() ?? '')
             .where((key) => key.isNotEmpty)
             .toList();
-            
+
         return DbResult.error(
-          code: ResultCode.uniqueViolation,
-          message: 'Some records have unique constraint conflicts. Set allowPartialErrors=true to insert valid records.',
+          type: ResultType.uniqueViolation,
+          message:
+              'Some records have unique constraint conflicts. Set allowPartialErrors=true to insert valid records.',
           failedKeys: failedKeys,
         );
       }
@@ -1890,7 +1894,7 @@ class DataStoreImpl {
     } catch (e) {
       Logger.error('Batch insertion failed: $e',
           label: 'DataStore-batchInsert');
-           
+
       // try to collect primary keys of original records as failed keys list
       List<String> failedKeys = [];
       try {
@@ -1904,9 +1908,9 @@ class DataStoreImpl {
       } catch (_) {
         // Ignore errors during error handling
       }
-      
+
       return DbResult.error(
-        code: ResultCode.dbError,
+        type: ResultType.dbError,
         message: 'Batch insertion failed: $e',
         failedKeys: failedKeys,
       );

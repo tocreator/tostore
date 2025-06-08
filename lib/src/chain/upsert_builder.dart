@@ -3,7 +3,7 @@ import 'dart:async';
 import '../Interface/chain_builder.dart';
 import '../Interface/future_builder_mixin.dart';
 import '../model/db_result.dart';
-import '../model/result_code.dart';
+import '../model/result_type.dart';
 import '../query/query_condition.dart';
 
 /// upsert builder for chain operations
@@ -18,7 +18,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
   UpsertBuilder(super.db, super.tableName, this._data);
 
   /// Allow updating multiple records if the condition matches multiple records
-  /// 
+  ///
   /// By default, upsert will only update one record to avoid accidental batch updates.
   /// This method explicitly indicates that the developer intentionally wants to update all matching records.
   UpsertBuilder allowUpdateAll() {
@@ -41,7 +41,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
       final schema = await $db.getTableSchema($tableName);
       if (schema == null) {
         return DbResult.error(
-          code: ResultCode.notFound,
+          type: ResultType.notFound,
           message: 'Table does not exist',
         );
       }
@@ -94,10 +94,11 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
         } else {
           // Default behavior: only update the first found record by its primary key
           // This ensures we don't accidentally update multiple records
-          if (existingRecord != null && existingRecord.containsKey(primaryKey)) {
+          if (existingRecord != null &&
+              existingRecord.containsKey(primaryKey)) {
             final specificCondition = QueryCondition()
               ..where(primaryKey, '=', existingRecord[primaryKey]);
-            
+
             return await $db.updateInternal(
               $tableName,
               _data,
@@ -133,9 +134,9 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
       } catch (_) {
         // Ignore errors during error handling
       }
-      
+
       return DbResult.error(
-        code: ResultCode.dbError,
+        type: ResultType.dbError,
         message: 'Operation failed: $e',
         failedKeys: failedKeys,
       );
