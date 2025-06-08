@@ -1176,18 +1176,29 @@ class TableDataManager {
 
   /// check if allow full table cache
   Future<bool> allowFullTableCache(String tableName) async {
-    final cachedTables = _dataStore.dataCacheManager.getAllTableCacheNames();
+    try {
+      final recordCount = await getTableRecordCount(tableName);
+      if (recordCount > 0) {
+        if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
+         return false;
+        }
+      }
+      
+    final cachedTables = _dataStore.dataCacheManager.getAllFullTableCaches();
     int totalSize = 0;
     for (final cachedTable in cachedTables) {
-      if (await _dataStore.dataCacheManager.isTableFullyCached(cachedTable)) {
-        totalSize += await getTableFileSize(cachedTable);
-      }
+      totalSize += await getTableFileSize(cachedTable);
     }
     int tableCount = _dataStore.dataCacheManager.getTableCacheCountAll();
-    tableCount = tableCount + await getTableRecordCount(tableName);
+    tableCount = tableCount + recordCount;
     return _dataStore.config.maxTableCacheFileSize > totalSize ||
         tableCount <
             _dataStore.config.maxRecordCacheSize; // whether exceeds max limit
+    } catch (e) {
+      Logger.error('Failed to check if allow full table cache: $e',
+          label: 'TableDataManager.allowFullTableCache');
+      return false;
+    }
   }
 
   /// check if file is modified

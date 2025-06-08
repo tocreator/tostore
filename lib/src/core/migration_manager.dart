@@ -1627,7 +1627,7 @@ class MigrationManager {
       await _dataStore.tableDataManager.flushAllBuffers();
 
       // clear table record cache
-      _dataStore.dataCacheManager.invalidateCache(task.tableName);
+      await _dataStore.dataCacheManager.invalidateCache(task.tableName);
 
       // update global table structure first
       if (!task.isSchemaUpdated) {
@@ -1684,8 +1684,8 @@ class MigrationManager {
 
         for (var operation in task.operations) {
           if (operation.type == MigrationType.addIndex) {
-            await migrationInstance.addIndex(
-                currentTableName, operation.index!);
+            await migrationInstance.indexManager
+                ?.addIndex(currentTableName, operation.index!);
           } else if (operation.type == MigrationType.removeIndex) {
             // handle removeIndex operation, support delete by field list or index name
             final indexNameToRemove = operation.indexName;
@@ -1693,15 +1693,15 @@ class MigrationManager {
 
             if (indexNameToRemove != null) {
               // if index name exists, delete by name
-              await migrationInstance.removeIndex(currentTableName,
-                  indexName: indexNameToRemove);
+              await migrationInstance.indexManager
+                  ?.removeIndex(currentTableName, indexName: indexNameToRemove);
             } else if (fieldsToRemove != null && fieldsToRemove.isNotEmpty) {
               // delete by field list
-              await migrationInstance.removeIndex(currentTableName,
-                  fields: fieldsToRemove);
+              await migrationInstance.indexManager
+                  ?.removeIndex(currentTableName, fields: fieldsToRemove);
             }
           } else if (operation.type == MigrationType.modifyIndex) {
-            await migrationInstance.modifyIndex(
+            await migrationInstance.indexManager?.modifyIndex(
               currentTableName,
               operation.indexName ?? operation.fields!.join('_'),
               IndexSchema(
@@ -1716,12 +1716,17 @@ class MigrationManager {
           } else if (operation.type == MigrationType.removeField) {
             // delete all indexes containing the field before deleting the field
             final fieldName = operation.fieldName!;
-            await migrationInstance
-                .removeIndex(currentTableName, fields: [fieldName]);
+            await migrationInstance.indexManager
+                ?.removeIndex(currentTableName, fields: [fieldName]);
           }
         }
 
-        // if rename table operation exists, read data from old table first
+        // Check if should cache table (only when current space and table allow full table cache)
+        bool shouldCache = space == _dataStore.currentSpaceName && 
+              await _dataStore.tableDataManager.allowFullTableCache(currentTableName);
+        final List<Map<String, dynamic>> allMigratedRecords = <Map<String, dynamic>>[];
+
+        // Process data migration based on migration type, collect records for cache
         if (renameOp != null && renameOp.newTableName != null) {
           // create a stream transformer, apply migration operations
           final recordStream = migrationInstance.tableDataManager
@@ -1733,7 +1738,14 @@ class MigrationManager {
             final modifiedRecords = _applyMigrationOperations(
                 [record], sortedOperations,
                 oldSchema: oldSchema);
-            return modifiedRecords.isNotEmpty ? modifiedRecords.first : record;
+            final result = modifiedRecords.isNotEmpty ? modifiedRecords.first : record;
+            
+            // if need cache, collect records
+            if (shouldCache) {
+              allMigratedRecords.add(Map<String, dynamic>.from(result));
+            }
+            
+            return result;
           });
 
           // use stream batch processing method to rewrite to new table
@@ -1752,9 +1764,32 @@ class MigrationManager {
           await migrationInstance.tableDataManager.processTablePartitions(
               tableName: currentTableName,
               processFunction: (records, partitionIndex) async {
-                return _applyMigrationOperations(records, sortedOperations,
+                final migratedRecords = _applyMigrationOperations(
+                    records, sortedOperations,
                     oldSchema: oldSchema);
+                    
+                // if need cache, collect records
+                if (shouldCache) {
+                  allMigratedRecords.addAll(
+                    migratedRecords.map((r) => Map<String, dynamic>.from(r)).toList()
+                  );
+                }
+                    
+                return migratedRecords;
               });
+        }
+        
+        // if collect records, add to cache
+        if (allMigratedRecords.isNotEmpty) {
+            final schema = await _dataStore.getTableSchema(currentTableName);
+            if (schema != null) {
+              await _dataStore.dataCacheManager.cacheEntireTable(
+                currentTableName,
+                allMigratedRecords,
+                schema.primaryKey,
+                isFullTableCache: true,
+              );
+            }
         }
 
         // update task status

@@ -1017,7 +1017,14 @@ class IndexManager {
       Map<dynamic, Set<dynamic>> entries) async {
     if (entries.isEmpty) return;
 
-    try {
+          // Create lock resource identifier for index write operation
+      final lockResource = 'index:$tableName:$indexName';
+      final operationId = 'write_index_${DateTime.now().millisecondsSinceEpoch}';
+      
+      try {
+        // Acquire exclusive lock to prevent concurrent writes to the same index file
+        await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
+
       // Get index metadata
       IndexMeta? meta = await _getIndexMeta(tableName, indexName);
       final bool isNew = meta == null;
@@ -1312,6 +1319,9 @@ class IndexManager {
       Logger.error('Failed to write index to file: $e\n$stack',
           label: 'IndexManager._writeIndexToFile');
       rethrow;
+          } finally {
+        // Release lock resource, whether the operation succeeds or fails
+        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
     }
   }
 
@@ -1612,7 +1622,7 @@ class IndexManager {
             );
             
             // Remove the auto-created unique index before creating the explicit one
-            await removeIndex(tableName, autoUniqueIndexName);
+            await removeIndex(tableName, indexName: autoUniqueIndexName);
           }
         }
       }
@@ -3348,75 +3358,6 @@ class IndexManager {
         label: 'IndexManager.invalidateCache');
   }
 
-  /// Remove index for table
-  Future<void> removeIndex(
-    String tableName,
-    String indexName,
-  ) async {
-    try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Cannot delete primary key index
-      if (indexName == 'pk_$tableName') {
-        throw Exception('Cannot delete primary key index');
-      }
-
-      // Delete index files
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta != null) {
-        // Delete index partition files
-        for (final partition in meta.partitions) {
-          try {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
-
-            if (await _dataStore.storage.existsFile(partitionPath)) {
-              await _dataStore.storage.deleteFile(partitionPath);
-            }
-
-            // Try to delete directory containing the partition
-            final dirPath = await _dataStore.pathManager
-                .getIndexPartitionDirPath(
-                    tableName, indexName, partition.index);
-
-            if (await _dataStore.storage.existsDirectory(dirPath)) {
-              final files = await _dataStore.storage.listDirectory(dirPath);
-              if (files.isEmpty) {
-                await _dataStore.storage.deleteDirectory(dirPath);
-              }
-            }
-          } catch (e) {
-            Logger.error('Failed to delete index partition file: $e',
-                label:
-                    'IndexManager.removeIndex($tableName, $indexName, ${partition.index})');
-          }
-        }
-
-        // Delete index metadata file
-        final metaPath =
-            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        if (await _dataStore.storage.existsFile(metaPath)) {
-          await _dataStore.storage.deleteFile(metaPath);
-        }
-      }
-
-      // Clean up cache
-      _indexCache.remove(cacheKey);
-      _indexMetaCache.remove(cacheKey);
-      _indexFullyCached.remove(cacheKey);
-      _indexAccessWeights.remove(cacheKey);
-      _indexWriteBuffer.remove(cacheKey);
-      _indexWriting.remove(cacheKey);
-      _indexLastWriteTime.remove(cacheKey);
-
-      Logger.debug('Index removed successfully: $tableName.$indexName',
-          label: 'IndexManager.removeIndex');
-    } catch (e) {
-      Logger.error('Failed to remove index: $e',
-          label: 'IndexManager.removeIndex');
-      rethrow;
-    }
-  }
 
   /// Get record storage index by primary key
   Future<StoreIndex?> getStoreIndexByPrimaryKey(
@@ -4794,5 +4735,250 @@ class IndexManager {
       Logger.error('Failed to add index entry to delete buffer: $e\n$stack',
           label: 'IndexManager._addToDeleteBuffer');
     }
+  }
+
+  /// Add index to table
+  Future<void> addIndex(
+    String tableName,
+    IndexSchema index,
+  ) async {
+    try {
+      // get table schema
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Failed to add index: table $tableName does not exist', label: 'IndexManager.addIndex');
+        return;
+      }
+
+      // check if index already exists
+      if (schema.indexes.any((i) => i.actualIndexName == index.actualIndexName)) {
+        Logger.warn(
+          'Index ${index.actualIndexName} already exists in table $tableName',
+          label: 'IndexManager.addIndex',
+        );
+        return;
+      }
+
+      // validate index fields
+      if (!schema.validateIndexFields(index)) {
+        throw Exception('Index fields do not exist in table $tableName');
+      }
+
+      // create index file and build index
+      await createIndex(tableName, index);
+
+      // update table schema
+      final newIndexes = [...schema.indexes, index];
+      final newSchema = schema.copyWith(indexes: newIndexes);
+      await _dataStore.updateTableSchema(tableName, newSchema);
+      
+    } catch (e) {
+      Logger.error('Failed to add index: $e', label: 'IndexManager.addIndex');
+      rethrow;
+    }
+  }
+
+  /// modify index
+  Future<void> modifyIndex(
+    String tableName,
+    String oldIndexName,
+    IndexSchema newIndex,
+  ) async {
+    try {
+      // 1. remove old index
+      await removeIndex(tableName, indexName: oldIndexName);
+
+      // 2. create new index
+      await addIndex(tableName, newIndex);
+      
+    } catch (e) {
+      Logger.error('Failed to modify index: $e', label: 'IndexManager.modifyIndex');
+      rethrow;
+    }
+  }
+
+  /// remove index from table
+  /// @param tableName table name
+  /// @param indexName index name
+  /// @param fields field list (when indexName is not provided)
+  Future<void> removeIndex(
+    String tableName,
+    {String? indexName,
+    List<String>? fields,}
+  ) async {
+    try {
+      if (indexName == null && (fields == null || fields.isEmpty)) {
+        throw ArgumentError('index name or field list is required');
+      }
+
+      // cannot remove primary key index
+      if (indexName == 'pk_$tableName') {
+        throw Exception('cannot remove primary key index');
+      }
+
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        Logger.warn('table $tableName does not exist, cannot remove index', label: 'IndexManager.removeIndex');
+        return;
+      }
+
+      // find matching index
+      IndexSchema? targetIndex;
+
+      // 1. if index name is provided, try to match by index name
+      if (indexName != null) {
+        // try to match by index name
+        for (var index in schema.indexes) {
+          if (index.indexName == indexName ||
+              index.actualIndexName == indexName) {
+            targetIndex = index;
+            break;
+          }
+        }
+
+        // if not found, try to match by index name generated by fields
+        if (targetIndex == null) {
+          // check if it is an auto-generated index name
+          final autoGenPattern = RegExp(r'^' + tableName + r'_\w+');
+          if (autoGenPattern.hasMatch(indexName)) {
+            for (var index in schema.indexes) {
+              if (index.actualIndexName == indexName) {
+                targetIndex = index;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // 2. if fields list is provided, try to match by fields list
+      if (targetIndex == null && fields != null && fields.isNotEmpty) {
+        // sort fields list to ensure consistency
+        final sortedFields = List<String>.from(fields)..sort();
+
+        for (var index in schema.indexes) {
+          // sort index fields
+          final indexFields = List<String>.from(index.fields)..sort();
+
+          // check if fields list matches
+          if (_areFieldListsEqual(indexFields, sortedFields)) {
+            targetIndex = index;
+            break;
+          }
+        }
+      }
+
+      String? actualName;
+      
+      // if target index is found
+      if (targetIndex != null) {
+        actualName = targetIndex.actualIndexName;
+      } else if (indexName != null) {
+        // if index name is provided but no matching index is found, try to delete index file
+        Logger.warn(
+          'index $indexName not found, try to delete index file',
+          label: 'IndexManager.removeIndex',
+        );
+        actualName = indexName;
+      } else {
+        // if only fields list is provided but no matching index is found, cannot continue
+        Logger.warn(
+          'no index found for fields [${fields!.join(", ")}]',
+          label: 'IndexManager.removeIndex',
+        );
+        return;
+      }
+
+      // delete index file
+      await _deleteIndexFiles(tableName, actualName);
+      
+      // if target index is found, remove it from table schema
+      if (targetIndex != null) {
+        final newIndexes = schema.indexes.where((i) => i != targetIndex).toList();
+        final newSchema = schema.copyWith(indexes: newIndexes);
+
+        // update table schema
+        await _dataStore.updateTableSchema(tableName, newSchema);
+      }
+    } catch (e) {
+      Logger.error('Failed to remove index: $e', label: 'IndexManager.removeIndex');
+      rethrow;
+    }
+  }
+  
+  /// delete index file
+  /// @param tableName table name
+  /// @param indexName index name
+  Future<void> _deleteIndexFiles(
+    String tableName,
+    String indexName,
+  ) async {
+    // create lock resource for index operation
+    final lockResource = 'index:$tableName:$indexName';
+    final operationId = 'delete_index_${DateTime.now().millisecondsSinceEpoch}';
+    
+    try {
+      // get exclusive lock, ensure no other operation is accessing this index
+      await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
+
+      // clear memory cache
+      invalidateCache(tableName, indexName);
+      
+      // clear write buffer
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
+      _indexWriteBuffer.remove(cacheKey);
+      _indexDeleteBuffer.remove(cacheKey);
+      _indexWriting.remove(cacheKey);
+      _indexLastWriteTime.remove(cacheKey);
+
+      // get index directory path
+      final indexDirPath = await _dataStore.pathManager.getIndexDirPath(tableName);
+      final indexSubDirPath = pathJoin(indexDirPath, indexName);
+      
+      // if index specific subdirectory exists, delete the entire subdirectory
+      if (await _dataStore.storage.existsDirectory(indexSubDirPath)) {
+        await _dataStore.storage.deleteDirectory(indexSubDirPath);
+      } else {
+        // if not using new directory structure, need to find and delete partition files by meta file
+        final meta = await _getIndexMeta(tableName, indexName);
+        if (meta != null) {
+          // delete all partition files
+          for (final partition in meta.partitions) {
+            try {
+              final partitionPath = await _dataStore.pathManager
+                  .getIndexPartitionPath(tableName, indexName, partition.index);
+
+              if (await _dataStore.storage.existsFile(partitionPath)) {
+                await _dataStore.storage.deleteFile(partitionPath);
+              }
+            } catch (e) {
+              Logger.error('Failed to delete index partition file: $e',
+                  label: 'IndexManager._deleteIndexFiles');
+            }
+          }
+        }
+      }
+
+      // delete meta file
+      final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+      if (await _dataStore.storage.existsFile(metaPath)) {
+        await _dataStore.storage.deleteFile(metaPath);
+      }
+
+    } catch (e) {
+      Logger.error('Failed to delete index file: $e', label: 'IndexManager._deleteIndexFiles');
+      rethrow;
+    } finally {
+      // release exclusive lock
+       _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+    }
+  }
+
+  /// compare two field lists (ignore order)
+  bool _areFieldListsEqual(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    final setA = Set<String>.from(a);
+    final setB = Set<String>.from(b);
+    return setA.difference(setB).isEmpty;
   }
 }

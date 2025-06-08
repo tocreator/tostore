@@ -178,7 +178,7 @@ class PathManager {
   /// get index meta file path
   Future<String> getIndexMetaPath(String tableName, String indexName) async {
     final indexPath = await getIndexDirPath(tableName);
-    return pathJoin(indexPath, '$indexName.meta.json');
+    return pathJoin(indexPath, indexName, '$indexName.meta.json');
   }
 
   /// get index partition directory path
@@ -186,7 +186,7 @@ class PathManager {
       String tableName, String indexName, int partitionIndex) async {
     final indexPath = await getIndexDirPath(tableName);
     final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
-    return pathJoin(indexPath, 'partitions', 'dir_$dirIndex');
+    return pathJoin(indexPath, indexName, 'partitions', 'dir_$dirIndex');
   }
 
   /// get index partition file path

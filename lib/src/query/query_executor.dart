@@ -40,34 +40,6 @@ class QueryExecutor {
         return _paginateResults(results, limit, offset);
       }
 
-      // 1. try to use cache
-      final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
-      if (cache != null) {
-        // check cache type and query condition
-        final isFullCache =
-            await _dataStore.dataCacheManager.isTableFullyCached(tableName);
-        final isSpecificQuery =
-            condition != null && await _isSpecificQuery(tableName, condition);
-
-        // decide whether to use cache
-        if (isFullCache || isSpecificQuery) {
-          var results = cache;
-          if (condition != null) {
-            results =
-                results.where((record) => condition.matches(record)).toList();
-          }
-
-          if (orderBy != null) {
-            _applySort(results, orderBy);
-          }
-
-          // Update access time
-          _dataStore.dataCacheManager.recordTableAccess(tableName);
-
-          return _paginateResults(results, limit, offset);
-        }
-      }
-
       final cacheKey = QueryCacheKey(
         tableName: tableName,
         condition: condition ?? QueryCondition(),
@@ -76,7 +48,7 @@ class QueryExecutor {
         offset: offset,
       );
 
-      // 2. check query cache
+      /// 1、 try query cache
       final queryResult = _dataStore.dataCacheManager.getQuery(cacheKey);
       if (queryResult != null) {
         // get table schema to get primary key field
@@ -117,9 +89,72 @@ class QueryExecutor {
         if (orderBy != null) {
           _applySort(updatedResults, orderBy);
         }
-
         // query cache is already the correct return result, no need to paginate again
-        return updatedResults;
+        return _paginateResults(updatedResults, limit, offset);
+      }
+
+      // 2. try to use cache
+      final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
+      if (cache != null) {
+        // check cache type and query condition
+        final isFullCache =
+            await _dataStore.dataCacheManager.isTableFullyCached(tableName);
+        final isSpecificQuery =
+            condition != null && await _isSpecificQuery(tableName, condition);
+
+        // decide whether to use cache
+        if (isFullCache || isSpecificQuery) {
+          var results = cache;
+
+          // Get table schema, used to get primary key field name
+          final schema = await _dataStore.getTableSchema(tableName);
+
+          // Check if it is a primary key query, can use O(1) complexity query optimization
+          if (condition != null && schema != null) {
+            final conditions = condition.build();
+
+            if (conditions.containsKey(schema.primaryKey)) {
+              final pkCondition = conditions[schema.primaryKey];
+
+              // Primary key equal query (=)
+              if (pkCondition is Map && pkCondition.containsKey('=')) {
+                final pkValue = pkCondition['=']?.toString();
+                if (pkValue != null) {
+                  final record = _dataStore.dataCacheManager
+                      .getRecordByPrimaryKey(tableName, pkValue);
+                  if (record != null) {
+                    results = [record];
+                  }
+                }
+              }
+
+              // Primary key IN query, batch get multiple records
+              else if (pkCondition is Map && pkCondition.containsKey('IN')) {
+                final pkValues = (pkCondition['IN'] as List?)
+                    ?.map((e) => e.toString())
+                    .toList();
+                if (pkValues != null && pkValues.isNotEmpty) {
+                  results = _dataStore.dataCacheManager
+                      .getRecordsByPrimaryKeys(tableName, pkValues);
+                }
+              }
+            }
+          }
+
+          if (condition != null) {
+            results =
+                results.where((record) => condition.matches(record)).toList();
+          }
+
+          if (orderBy != null) {
+            _applySort(results, orderBy);
+          }
+
+          // Update access time
+          _dataStore.dataCacheManager.recordTableAccess(tableName);
+
+          return _paginateResults(results, limit, offset);
+        }
       }
 
       // 3. execute actual query

@@ -5,7 +5,6 @@ import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../statistic/table_statistics.dart';
 import '../query/query_cache.dart';
-import '../query/query_condition.dart';
 import '../model/structure_cache.dart';
 import 'crontab_manager.dart';
 
@@ -315,6 +314,10 @@ class DataCacheManager {
   }
 
   /// Cache query results
+  ///
+  /// Cache query results optimization strategy:
+  /// 1. Store complete query results in _queryCache (including all fields and records)
+  /// 2. Store only query metadata and primary key values in _tableDependencies (through _QueryInfo)
   void cacheQuery(
     QueryCacheKey key,
     List<Map<String, dynamic>> results,
@@ -328,6 +331,8 @@ class DataCacheManager {
             label: 'DataCacheManager.cacheQuery');
         return;
       }
+
+      // Query results are stored only once in _queryCache
       _queryCache.put(
         cacheKey,
         results,
@@ -348,6 +353,7 @@ class DataCacheManager {
         // Determine if it is a full table query
         final isFullTableQuery = key.condition.build().isEmpty;
 
+        // Create _QueryInfo object, pass in query results but only extract primary key values
         _tableDependencies.putIfAbsent(table, () => {}).putIfAbsent(
             cacheKey,
             () => _QueryInfo(
@@ -369,49 +375,6 @@ class DataCacheManager {
     return results;
   }
 
-  /// Check if record matches query conditions
-  Future<bool> _recordMatchesConditions(
-    String tableName,
-    dynamic primaryKeyValue,
-    QueryCondition condition,
-    String primaryKeyField,
-  ) async {
-    try {
-      final record = await _getRecordByPrimaryKey(
-        tableName,
-        primaryKeyField,
-        primaryKeyValue,
-      );
-      if (record == null) return false;
-
-      return condition.matches(record);
-    } catch (e) {
-      Logger.error('Check record matches conditions failed: $e',
-          label: 'QueryCacheManager._recordMatchesConditions');
-      return true;
-    }
-  }
-
-  /// Get record full data
-  Future<Map<String, dynamic>?> _getRecordByPrimaryKey(
-    String tableName,
-    String primaryKeyField,
-    dynamic primaryKeyValue,
-  ) async {
-    try {
-      final results = await _dataStore.executeQuery(
-        tableName,
-        QueryCondition()..where(primaryKeyField, '=', primaryKeyValue),
-        limit: 1,
-      );
-      return results.isEmpty ? null : results.first;
-    } catch (e) {
-      Logger.error('Get record by primary key failed: $e',
-          label: 'QueryCacheManager._getRecordByPrimaryKey');
-      return null;
-    }
-  }
-
   /// Invalidate record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
@@ -420,37 +383,88 @@ class DataCacheManager {
       final tableCache = tableCaches[tableName];
       if (tableCache != null) {
         final pkString = primaryKeyValue.toString();
-        // Remove record from cache, but don't affect full table cache status (because cache changes are synchronized with file)
+        // Get the record to be deleted (for later condition matching)
+        final recordToRemove = tableCache.getRecord(pkString)?.record;
+        // Remove record from cache, but don't affect full table cache status
         tableCache.recordsMap.remove(pkString);
-      }
 
-      final tableQueries = _tableDependencies[tableName];
-      if (tableQueries == null) return;
-
-      // Query cache
-      for (var entry in tableQueries.entries) {
-        final queryInfo = entry.value;
-
-        // If it is full table cache or matches query conditions, invalidate cache
-        if (queryInfo.isFullTableCache ||
-            await _recordMatchesConditions(
-              tableName,
-              primaryKeyValue,
-              queryInfo.queryKey.condition,
-              queryInfo.primaryKeyField,
-            )) {
-          _queryCache.invalidate(entry.key);
-          tableQueries.remove(entry.key);
+        // If the record is not in the cache, we cannot perform precise condition matching
+        // In this case, we only clean up those queries that are full table caches
+        if (recordToRemove == null) {
+          _cleanupFullTableQueriesOnly(tableName);
+          return;
         }
-      }
 
-      // If table has no related queries, clean dependency
-      if (tableQueries.isEmpty) {
-        _tableDependencies.remove(tableName);
+        // If there is a record, we can perform more precise condition matching
+        await _cleanupRelatedQueries(
+            tableName, primaryKeyValue, recordToRemove);
+      } else {
+        // If the table cache does not exist, only clean up full table cache queries
+        _cleanupFullTableQueriesOnly(tableName);
       }
     } catch (e) {
       Logger.error('Invalidate record cache failed: $e',
           label: 'QueryCacheManager.invalidateRecord');
+    }
+  }
+
+  /// Only clean up full table cache queries
+  void _cleanupFullTableQueriesOnly(String tableName) {
+    final tableDependency = _tableDependencies[tableName];
+    if (tableDependency == null) return;
+
+    // List of keys to clean up
+    final keysToRemove = <String>[];
+
+    // Check each query, only clean up full table cache queries
+    for (var entry in tableDependency.entries) {
+      final queryInfo = entry.value;
+      if (queryInfo.isFullTableCache) {
+        keysToRemove.add(entry.key);
+      }
+    }
+
+    // Remove related query cache
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+      tableDependency.remove(key);
+    }
+
+    // If there are no related queries, clean up dependencies
+    if (tableDependency.isEmpty) {
+      _tableDependencies.remove(tableName);
+    }
+  }
+
+  /// Clean up queries related to specific records
+  Future<void> _cleanupRelatedQueries(String tableName, dynamic primaryKeyValue,
+      Map<String, dynamic> recordData) async {
+    final tableQueries = _tableDependencies[tableName];
+    if (tableQueries == null) return;
+
+    // List of keys to clean up
+    final keysToRemove = <String>[];
+
+    // Check each query
+    for (var entry in tableQueries.entries) {
+      final queryInfo = entry.value;
+
+      // If it is a full table cache or record matches the condition, invalidate the cache
+      if (queryInfo.isFullTableCache ||
+          queryInfo.queryKey.condition.matches(recordData)) {
+        keysToRemove.add(entry.key);
+      }
+    }
+
+    // Remove related cache
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+      tableQueries.remove(key);
+    }
+
+    // If there are no related queries, clean up dependencies
+    if (tableQueries.isEmpty) {
+      _tableDependencies.remove(tableName);
     }
   }
 
@@ -486,54 +500,41 @@ class DataCacheManager {
         return;
       }
 
+      // Collect the data of the records to be deleted, for subsequent condition matching
+      List<Map<String, dynamic>> recordsToRemove = [];
+
       // Handle specific record invalidation
       if (tableCache != null) {
-        // Remove records with specified primary key values from cache, without affecting full table cache status
+        // Collect the data of the records to be deleted, for subsequent condition matching
+        for (var pkValue in primaryKeyValues) {
+          final pkString = pkValue.toString();
+          final recordCache = tableCache.getRecord(pkString);
+          if (recordCache != null) {
+            recordsToRemove.add(recordCache.record);
+          }
+        }
+
+        // Remove records with specified primary key values from cache
         for (var pkValue in primaryKeyValues) {
           final pkString = pkValue.toString();
           tableCache.recordsMap.remove(pkString);
         }
       }
 
-      // 1. Handle query cache
-      final keysToRemove = <String>[];
+      // Determine whether to use exact matching or conservative cleanup strategy
+      final bool useExactMatching =
+          tableCache != null && recordsToRemove.isNotEmpty;
 
-      // 1.1 Handle table dependency cache
-      final tableDependency = _tableDependencies[tableName];
-      if (tableDependency != null) {
-        for (var entry in tableDependency.entries) {
-          final queryInfo = entry.value;
-          if (queryInfo.isFullTableCache ||
-              queryInfo.results.any((record) {
-                final recordId = record[queryInfo.primaryKeyField]?.toString();
-                return recordId != null && primaryKeyValues.contains(recordId);
-              })) {
-            keysToRemove.add(entry.key);
-          }
-        }
-      }
+      if (useExactMatching) {
+        // If there are record data, we can perform precise condition matching
+        await _cleanupRelatedQueriesForMultipleRecords(
+            tableName, recordsToRemove);
+      } else {
+        // If there is no record data or the table cache does not exist, use conservative strategy to clean up all related queries
+        _cleanupFullTableQueriesOnly(tableName);
 
-      // 1.2 Handle general cache
-      _queryCache.cache.forEach((key, queryCache) {
-        if (queryCache.tableName == tableName) {
-          if (queryCache.results.any((record) {
-            final recordId = record[queryCache.primaryKeyField]?.toString();
-            return recordId != null && primaryKeyValues.contains(recordId);
-          })) {
-            keysToRemove.add(key);
-          }
-        }
-      });
-
-      // 2. Remove cache
-      for (var key in keysToRemove) {
-        _queryCache.invalidate(key);
-        tableDependency?.remove(key);
-      }
-
-      // 3. If table has no related queries, clean dependency
-      if (tableDependency?.isEmpty ?? false) {
-        _tableDependencies.remove(tableName);
+        // For any query containing primary key values, also need to clean up
+        _cleanupQueriesContainingPrimaryKeys(tableName, primaryKeyValues);
       }
     } catch (e) {
       Logger.error(
@@ -542,6 +543,98 @@ class DataCacheManager {
         'primaryKeyValues: $primaryKeyValues',
         label: 'QueryCacheManager.invalidateRecords',
       );
+    }
+  }
+
+  /// Clean up queries containing specified primary key values
+  void _cleanupQueriesContainingPrimaryKeys(
+      String tableName, Set<dynamic> primaryKeyValues) {
+    final tableDependency = _tableDependencies[tableName];
+    if (tableDependency == null) return;
+
+    // List of keys to clean up
+    final keysToRemove = <String>[];
+
+    // Check each query
+    for (var entry in tableDependency.entries) {
+      final queryInfo = entry.value;
+
+      // If any record's primary key is in primaryKeyValues, clean up the query
+      // Now check the intersection of the primary key set directly, instead of traversing the complete record
+      if (queryInfo.resultKeys.any((key) => primaryKeyValues.contains(key))) {
+        keysToRemove.add(entry.key);
+      }
+    }
+
+    // Remove related query cache
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+      tableDependency.remove(key);
+    }
+
+    // If there are no related queries, clean up dependencies
+    if (tableDependency.isEmpty) {
+      _tableDependencies.remove(tableName);
+    }
+  }
+
+  /// Clean up related query cache for multiple records
+  Future<void> _cleanupRelatedQueriesForMultipleRecords(
+      String tableName, List<Map<String, dynamic>> records) async {
+    final tableQueries = _tableDependencies[tableName];
+    if (tableQueries == null) return;
+
+    // List of keys to clean up
+    final keysToRemove = <String>[];
+
+    // Extract all record primary key values
+    final recordPrimaryKeys = <String>{};
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema != null) {
+      final primaryKeyField = schema.primaryKey;
+      for (final record in records) {
+        final pkValue = record[primaryKeyField]?.toString();
+        if (pkValue != null && pkValue.isNotEmpty) {
+          recordPrimaryKeys.add(pkValue);
+        }
+      }
+    }
+
+    // 检查每个查询
+    for (var entry in tableQueries.entries) {
+      final queryInfo = entry.value;
+
+      // 1. If it is a full table cache, clean up directly
+      if (queryInfo.isFullTableCache) {
+        keysToRemove.add(entry.key);
+        continue;
+      }
+
+      // 2. Check primary key intersection first - if the primary keys of these records intersect with the primary keys of the query results, clean up the cache
+      if (recordPrimaryKeys.isNotEmpty &&
+          queryInfo.resultKeys.any((key) => recordPrimaryKeys.contains(key))) {
+        keysToRemove.add(entry.key);
+        continue;
+      }
+
+      // 3. If there is no primary key intersection, check if there is a record that satisfies the query condition
+      for (final recordData in records) {
+        if (queryInfo.queryKey.condition.matches(recordData)) {
+          keysToRemove.add(entry.key);
+          break; // As long as one record matches, clean up the query
+        }
+      }
+    }
+
+    // Remove related query cache
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+      tableQueries.remove(key);
+    }
+
+    // If there are no related queries, clean up dependencies
+    if (tableQueries.isEmpty) {
+      _tableDependencies.remove(tableName);
     }
   }
 
@@ -559,45 +652,56 @@ class DataCacheManager {
   Future<void> cacheEntireTable(String tableName,
       List<Map<String, dynamic>> records, String primaryKeyField,
       {bool isFullTableCache = true}) async {
-    // Check parameter validity
-    if (tableName.isEmpty || primaryKeyField.isEmpty) {
-      return;
-    }
+    try {
+      // Check parameter validity
+      if (tableName.isEmpty || primaryKeyField.isEmpty) {
+        return;
+      }
 
-    // Check if table file size limit allows caching
-    final needCacheFullTableCache =
-        await _dataStore.tableDataManager.allowFullTableCache(tableName);
+      // Check if table file size limit allows caching
+      final needCacheFullTableCache =
+          await _dataStore.tableDataManager.allowFullTableCache(tableName);
 
-    // If full table cache is requested but restricted, log a warning
-    if (isFullTableCache && !needCacheFullTableCache) {
-      Logger.warn(
-        'Table $tableName record count(${records.length}) exceeds full table cache limit(${_dataStore.config.maxRecordCacheSize})',
-        label: 'DataCacheManager.cacheEntireTable',
-      );
-    }
+      // If full table cache is requested but restricted, log a warning
+      if (isFullTableCache && !needCacheFullTableCache) {
+        Logger.warn(
+          'Table $tableName record count(${records.length}) exceeds full table cache limit(${_dataStore.config.maxRecordCacheSize})',
+          label: 'DataCacheManager.cacheEntireTable',
+        );
+      }
 
-    // Check table record cache size, perform cache eviction policy
-    if (getTableCacheCountAll() + records.length >
-        _dataStore.config.maxRecordCacheSize) {
-      // Execute cache eviction policy
-      _evictLowPriorityRecords();
-    }
+      // Check table record cache size, perform cache eviction policy
+      if (getTableCacheCountAll() + records.length >
+          _dataStore.config.maxRecordCacheSize) {
+        // Execute cache eviction policy
+        _evictLowPriorityRecords();
+      }
 
-    // Get current time as cache time
-    final now = DateTime.now();
+      // Get current time as cache time
+      final now = DateTime.now();
 
-    // Check if cache for this table already exists
-    TableCache tableCache;
-    if (tableCaches.containsKey(tableName)) {
-      // Update existing cache
-      tableCache = tableCaches[tableName]!;
-      tableCache.isFullTableCache = needCacheFullTableCache;
-      tableCache.cacheTime = now;
-      tableCache.lastAccessed = now;
+      // Check if cache for this table already exists
+      TableCache tableCache;
+      if (tableCaches.containsKey(tableName)) {
+        // Update existing cache
+        tableCache = tableCaches[tableName]!;
+        tableCache.isFullTableCache = needCacheFullTableCache;
+        tableCache.cacheTime = now;
+        tableCache.lastAccessed = now;
 
-      // Clear existing records (avoid mixed data causing inconsistency)
-      if (needCacheFullTableCache) {
-        tableCaches.remove(tableName);
+        // Clear existing records (avoid mixed data causing inconsistency)
+        if (needCacheFullTableCache) {
+          tableCaches.remove(tableName);
+          tableCache = TableCache(
+            tableName: tableName,
+            primaryKeyField: primaryKeyField,
+            isFullTableCache: needCacheFullTableCache,
+            cacheTime: now,
+            lastAccessed: now,
+          );
+        }
+      } else {
+        // Create new table cache
         tableCache = TableCache(
           tableName: tableName,
           primaryKeyField: primaryKeyField,
@@ -606,28 +710,22 @@ class DataCacheManager {
           lastAccessed: now,
         );
       }
-    } else {
-      // Create new table cache
-      tableCache = TableCache(
-        tableName: tableName,
-        primaryKeyField: primaryKeyField,
-        isFullTableCache: needCacheFullTableCache,
-        cacheTime: now,
-        lastAccessed: now,
-      );
+
+      // Set records
+      if (records.isNotEmpty) {
+        // Determine cache type
+        const cacheType = CacheType.runtime;
+
+        // Add records in batch
+        tableCache.addRecords(records, cacheType: cacheType);
+      }
+
+      // Store table cache
+      tableCaches[tableName] = tableCache;
+    } catch (e) {
+      Logger.error('Cache entire table failed: $e',
+          label: 'DataCacheManager.cacheEntireTable');
     }
-
-    // Set records
-    if (records.isNotEmpty) {
-      // Determine cache type
-      const cacheType = CacheType.runtime;
-
-      // Add records in batch
-      tableCache.addRecords(records, cacheType: cacheType);
-    }
-
-    // Store table cache
-    tableCaches[tableName] = tableCache;
   }
 
   /// Evict low priority records
@@ -689,6 +787,29 @@ class DataCacheManager {
     }
   }
 
+  /// Set full table cache flag
+  Future<void> setFullTableCache(
+      String tableName, bool isFullTableCache) async {
+    final cache = tableCaches[tableName];
+    if (cache == null) {
+      // Create new table cache
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) return;
+      final primaryKeyField = schema.primaryKey;
+      final now = DateTime.now();
+      final tableCache = TableCache(
+        tableName: tableName,
+        primaryKeyField: primaryKeyField,
+        isFullTableCache: isFullTableCache,
+        cacheTime: now,
+        lastAccessed: now,
+      );
+      tableCaches[tableName] = tableCache;
+      return;
+    }
+    cache.isFullTableCache = isFullTableCache;
+  }
+
   /// Check if table is fully cached
   Future<bool> isTableFullyCached(String tableName) async {
     final cache = tableCaches[tableName];
@@ -718,14 +839,6 @@ class DataCacheManager {
     if (cache == null) return;
 
     cache.addOrUpdateRecord(record);
-  }
-
-  /// Remove record from cache
-  void removeCachedRecord(String tableName, String id) {
-    final cache = tableCaches[tableName];
-    if (cache == null) return;
-
-    cache.recordsMap.remove(id);
   }
 
   /// Cache schema
@@ -815,6 +928,22 @@ class DataCacheManager {
     return recordCache?.record;
   }
 
+  /// Get records by multiple primary keys
+  List<Map<String, dynamic>> getRecordsByPrimaryKeys(
+      String tableName, List<String> pkValues) {
+    final cache = tableCaches[tableName];
+    if (cache == null) return [];
+
+    final results = <Map<String, dynamic>>[];
+    for (final pkValue in pkValues) {
+      final record = cache.getRecord(pkValue);
+      if (record != null) {
+        results.add(record.record);
+      }
+    }
+    return results;
+  }
+
   /// Query records by field value
   List<Map<String, dynamic>> queryRecordsByField(
     String tableName,
@@ -842,7 +971,8 @@ class DataCacheManager {
   }
 
   /// Invalidate all cache of a table
-  Future<void> invalidateCache(String tableName) async {
+  Future<void> invalidateCache(String tableName,
+      {bool isFullTableCache = false}) async {
     try {
       // 1. Clear table dependency cache
       _tableDependencies.remove(tableName);
@@ -875,11 +1005,17 @@ class DataCacheManager {
       }
       final primaryKeyField = schema.primaryKey;
 
+      if (!isFullTableCache) {
+        final recordCount =
+            await _dataStore.tableDataManager.getTableRecordCount(tableName);
+        isFullTableCache = recordCount == 0;
+      }
+
       // Create a new empty table cache and mark as full table cache
       final newTableCache = TableCache(
         tableName: tableName,
         primaryKeyField: primaryKeyField,
-        isFullTableCache: true, // Mark as full table cache
+        isFullTableCache: isFullTableCache, // Mark as full table cache
         cacheTime: DateTime.now(),
         lastAccessed: DateTime.now(),
       );
@@ -928,19 +1064,31 @@ class DataCacheManager {
   List<String> getAllTableCacheNames() {
     return tableCaches.keys.toList();
   }
+
+  /// Get list of all full table cache names
+  List<String> getAllFullTableCaches() {
+    return tableCaches.entries
+        .where((entry) => entry.value.isFullTableCache)
+        .map((entry) => entry.key)
+        .toList();
+  }
 }
 
-/// Query info, contains query conditions, primary key field name and result set
+/// Query info, contains query conditions, primary key field name and only primary key values of results
 class _QueryInfo {
   final QueryCacheKey queryKey; // Query conditions
   final String primaryKeyField; // Primary key field name
-  final List<Map<String, dynamic>> results; // Query result set
-  final bool isFullTableCache; // Whether it is full table cache
+  final Set<String>
+      resultKeys; // Only store primary key values of query results, not complete record content
+  final bool isFullTableCache; // Whether it is a full table cache
 
   _QueryInfo({
     required this.queryKey,
     required this.primaryKeyField,
-    required this.results,
+    required List<Map<String, dynamic>> results,
     this.isFullTableCache = false,
-  });
+  }) : resultKeys = results
+            .map((record) => record[primaryKeyField]?.toString() ?? '')
+            .where((key) => key.isNotEmpty)
+            .toSet();
 }

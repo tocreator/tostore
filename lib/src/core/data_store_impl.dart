@@ -752,7 +752,7 @@ class DataStoreImpl {
         final schema = await getTableSchema(tableName);
         final primaryKeyValue = schema != null ? data[schema.primaryKey] : null;
         if (primaryKeyValue != null) {
-          dataCacheManager.removeCachedRecord(
+          dataCacheManager.invalidateRecord(
               tableName, primaryKeyValue.toString());
         }
 
@@ -1238,7 +1238,7 @@ class DataStoreImpl {
         }
 
         // update cache and write queue, index
-        dataCacheManager.removeCachedRecord(tableName, recordKey);
+        dataCacheManager.invalidateRecord(tableName, recordKey);
         dataCacheManager.addCachedRecord(tableName, updatedRecord);
         // update write queue
         tableDataManager.addToWriteBuffer(tableName, updatedRecord,
@@ -1293,7 +1293,7 @@ class DataStoreImpl {
       await _indexManager?.resetIndexes(tableName);
 
       //   clear application layer cache
-      dataCacheManager.invalidateCache(tableName);
+      dataCacheManager.invalidateCache(tableName, isFullTableCache: true);
       _statisticsCollector?.invalidateCache(tableName);
 
       await _transactionManager!.commit(transaction);
@@ -1441,7 +1441,7 @@ class DataStoreImpl {
           successKeys.add(pkValue);
 
           // Remove from record cache
-          dataCacheManager.removeCachedRecord(tableName, pkValue);
+          dataCacheManager.invalidateRecord(tableName, pkValue);
 
           // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
           writeQueue?.remove(pkValue);
@@ -1486,7 +1486,7 @@ class DataStoreImpl {
                 // Add to deleted keys list
                 deletedKeys.add(pkValue);
 
-                dataCacheManager.removeCachedRecord(tableName, pkValue);
+                dataCacheManager.invalidateRecord(tableName, pkValue);
 
                 // remove from write queue (if exists)
                 writeQueue?.remove(pkValue);
@@ -1604,7 +1604,7 @@ class DataStoreImpl {
         }
 
         // Clear table cache and other memory caches
-        _invalidateTableCaches(tableName);
+        _invalidateTableCaches(tableName, isFullTableCache: true);
 
         // Clear path cache
         _pathManager?.clearTableCache(tableName);
@@ -2394,7 +2394,7 @@ class DataStoreImpl {
     }
 
     // Delete all indexes that include this field
-    await removeIndex(tableName, fields: [fieldName]);
+    await indexManager?.removeIndex(tableName, fields: [fieldName]);
 
     // Remove field from schema
     final newFields = schema.fields.where((f) => f.name != fieldName).toList();
@@ -2494,169 +2494,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Add index to table
-  Future<void> addIndex(
-    String tableName,
-    IndexSchema index,
-  ) async {
-    try {
-      final schema = await getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-
-      // Check if index already exists
-      if (schema.indexes
-          .any((i) => i.actualIndexName == index.actualIndexName)) {
-        Logger.warn(
-          'Index ${index.actualIndexName} already exists in table $tableName',
-          label: "DataStore.addIndex",
-        );
-        return;
-      }
-
-      // Validate that the fields referenced by the index exist
-      if (!schema.validateIndexFields(index)) {
-        throw BusinessError(
-          'Index uses fields that do not exist in table $tableName',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      // Add index to schema
-      final newIndexes = [...schema.indexes, index];
-      final newSchema = schema.copyWith(indexes: newIndexes);
-
-      // Create index file and build index
-      await _indexManager?.createIndex(tableName, index);
-
-      // Update schema file
-      await updateTableSchema(tableName, newSchema);
-      // Invalidate caches
-      _invalidateTableCaches(tableName);
-    } catch (e) {
-      Logger.error(
-        'Failed to add index: $e',
-        label: 'DataStoreImpl.addIndex',
-      );
-      rethrow;
-    }
-  }
-
-  /// Drop index from table
-  Future<void> removeIndex(
-    String tableName, {
-    String? indexName,
-    List<String>? fields,
-  }) async {
-    try {
-      if (indexName == null && (fields == null || fields.isEmpty)) {
-        throw ArgumentError(
-            'Must provide either index name or field list parameter');
-      }
-
-      final schema = await getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-
-      // Find matching index
-      IndexSchema? targetIndex;
-
-      // 1. If index name is provided, try to match by index name
-      if (indexName != null) {
-        // Try to match directly by indexName
-        for (var index in schema.indexes) {
-          if (index.indexName == indexName ||
-              index.actualIndexName == indexName) {
-            targetIndex = index;
-            break;
-          }
-        }
-
-        // If not found, try to match by field-generated index name
-        if (targetIndex == null) {
-          // Check if it's an auto-generated index name format
-          final autoGenPattern = RegExp(r'^' + tableName + r'_\w+');
-          if (autoGenPattern.hasMatch(indexName)) {
-            for (var index in schema.indexes) {
-              if (index.actualIndexName == indexName) {
-                targetIndex = index;
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      // 2. If field list is provided, find index based on field list
-      if (targetIndex == null && fields != null && fields.isNotEmpty) {
-        // Sort field list to ensure matching consistency
-        final sortedFields = List<String>.from(fields)..sort();
-
-        for (var index in schema.indexes) {
-          // Sort index fields
-          final indexFields = List<String>.from(index.fields)..sort();
-
-          // Check if field lists match
-          if (_areFieldListsEqual(indexFields, sortedFields)) {
-            targetIndex = index;
-            break;
-          }
-        }
-      }
-
-      // If index still not found
-      if (targetIndex == null) {
-        // If index name is provided, try to delete index file directly
-        if (indexName != null) {
-          Logger.warn(
-            'Cannot find index $indexName, attempting to delete index file directly',
-            label: "DataStore.removeIndex",
-          );
-
-          await _removeIndexFile(tableName, indexName);
-        }
-        // If only field list is provided, cannot proceed
-        else {
-          Logger.warn(
-            'Cannot find index containing fields [${fields!.join(", ")}]',
-            label: "DataStore.removeIndex",
-          );
-        }
-        return;
-      }
-
-      // Use actualIndexName to delete index file
-      final actualName = targetIndex.actualIndexName;
-      await _removeIndexFile(tableName, actualName);
-
-      // Remove index from schema
-      final newIndexes = schema.indexes.where((i) => i != targetIndex).toList();
-      final newSchema = schema.copyWith(indexes: newIndexes);
-
-      // Update table structure
-      await updateTableSchema(tableName, newSchema);
-
-      // Clear cache
-      _invalidateTableCaches(tableName);
-    } catch (e) {
-      Logger.error(
-        'Failed to remove index: $e',
-        label: 'DataStoreImpl.removeIndex',
-      );
-      rethrow;
-    }
-  }
-
-  /// Compare if two field lists are equal (ignoring order)
-  bool _areFieldListsEqual(List<String> a, List<String> b) {
-    if (a.length != b.length) return false;
-    final setA = Set<String>.from(a);
-    final setB = Set<String>.from(b);
-    return setA.difference(setB).isEmpty;
-  }
-
   /// Update table schema
   Future<void> updateTableSchema(
     String tableName,
@@ -2680,95 +2517,53 @@ class DataStoreImpl {
     }
   }
 
-  Future<void> _removeIndexFile(
-    String tableName,
-    String indexName,
-  ) async {
+  /// Invalidate all caches for table
+  Future<void> _invalidateTableCaches(String tableName,
+      {bool isFullTableCache = false}) async {
+    dataCacheManager.invalidateCache(tableName,
+        isFullTableCache: isFullTableCache);
+    _statisticsCollector?.invalidateCache(tableName);
+    tableDataManager.writeBuffer.remove(tableName);
+
+    // Clear index cache
     try {
-      // Get index file name - optimize handling logic
-      String fileName;
+      // Clear primary key index cache
+      indexManager?.invalidateCache(tableName, 'pk_$tableName');
 
-      // 1. If it's a primary key index, keep unchanged
-      if (indexName.startsWith('pk_')) {
-        fileName = indexName;
-      }
-      // 2. If it's already a compound index name with table name prefix, keep unchanged
-      else if (indexName.startsWith('${tableName}_')) {
-        fileName = indexName;
-      }
-      // 3. If it's a regular index name, add table name prefix
-      else {
-        fileName = indexName;
-      }
-
-      Logger.debug(
-        'Preparing to delete index file, index name: $indexName, constructed file name: $fileName',
-        label: 'DataStoreImpl._removeIndexFile',
-      );
-
-      // Get index metadata path
-      final metaPath = await pathManager.getIndexMetaPath(
-        tableName,
-        fileName,
-      );
-
-      // Handle meta and partition file deletion
-      if (await storage.existsFile(metaPath)) {
-        // Read meta to get partition info
-        final content = await storage.readAsString(metaPath);
-
-        if (content != null && content.isNotEmpty) {
-          try {
-            final indexMeta = IndexMeta.fromJson(jsonDecode(content));
-
-            // Delete all partition files
-            for (final partitionMeta in indexMeta.partitions) {
-              final partitionPath = await pathManager.getIndexPartitionPath(
-                  tableName, fileName, partitionMeta.index);
-
-              if (await storage.existsFile(partitionPath)) {
-                await storage.deleteFile(partitionPath);
-              }
-            }
-          } catch (e) {
-            Logger.error(
-              'Failed to parse index meta: $e',
-              label: 'DataStoreImpl._removeIndexFile',
-            );
+      // Get table structure, clear all index caches
+      final schema = await getTableSchema(tableName);
+      if (schema != null) {
+        final List addToClear = [];
+        // clear field unique index cache
+        for (var field in schema.fields) {
+          if (field.unique) {
+            indexManager?.invalidateCache(tableName, 'uniq_${field.name}');
+            addToClear.add(field.name);
           }
         }
 
-        // Delete meta file
-        await storage.deleteFile(metaPath);
-      } else {
-        Logger.warn(
-          'Index metadata file does not exist: $metaPath',
-          label: 'DataStoreImpl._removeIndexFile',
-        );
-      }
-
-      // Check and delete old index file (compatible with old version)
-      if (fileName != indexName) {
-        final oldPath = await pathManager.getIndexMetaPath(
-          tableName,
-          indexName,
-        );
-        if (await storage.existsFile(oldPath)) {
-          await storage.deleteFile(oldPath);
+        // Clear index cache for each index
+        for (var index in schema.indexes) {
+          //  If index has only one field and it's already cleared, skip
+          if (index.fields.length == 1 &&
+              addToClear.contains(index.fields.first)) {
+            continue;
+          }
+          // Use actualIndexName to ensure clearing the correct cache
+          if (index.actualIndexName.isNotEmpty) {
+            indexManager?.invalidateCache(tableName, index.actualIndexName);
+          }
+          // If index has explicit name, also clear cache for that name
+          if (index.indexName != null && index.indexName!.isNotEmpty) {
+            indexManager?.invalidateCache(tableName, index.indexName!);
+          }
         }
-      }
-
-      // Clear index cache using both possible names
-      _indexManager?.invalidateCache(tableName, indexName);
-      if (fileName != indexName) {
-        _indexManager?.invalidateCache(tableName, fileName);
       }
     } catch (e) {
       Logger.error(
-        'Failed to remove index file: $e',
-        label: 'DataStoreImpl._removeIndexFile',
+        'Error clearing cache for table [$tableName]: $e',
+        label: 'DataStoreImpl._invalidateTableCaches',
       );
-      rethrow;
     }
   }
 
@@ -2798,60 +2593,6 @@ class DataStoreImpl {
         label: 'DataStoreImpl._validateMigration',
       );
       return false;
-    }
-  }
-
-  /// Invalidate all caches for table
-  Future<void> _invalidateTableCaches(String tableName) async {
-    dataCacheManager.invalidateCache(tableName);
-    _statisticsCollector?.invalidateCache(tableName);
-    tableDataManager.writeBuffer.remove(tableName);
-
-    // Clear index cache
-    try {
-      // Clear primary key index cache
-      indexManager?.invalidateCache(tableName, 'pk_$tableName');
-
-      // Get table structure, clear all index caches
-      final schema = await getTableSchema(tableName);
-      if (schema != null) {
-        for (var index in schema.indexes) {
-          // Use actualIndexName to ensure clearing the correct cache
-          if (index.actualIndexName.isNotEmpty) {
-            indexManager?.invalidateCache(tableName, index.actualIndexName);
-          }
-          // If index has explicit name, also clear cache for that name
-          if (index.indexName != null && index.indexName!.isNotEmpty) {
-            indexManager?.invalidateCache(tableName, index.indexName!);
-          }
-        }
-      }
-    } catch (e) {
-      Logger.error(
-        'Error clearing cache for table [$tableName]: $e',
-        label: 'DataStoreImpl._invalidateTableCaches',
-      );
-    }
-  }
-
-  /// Modify index
-  Future<void> modifyIndex(
-    String tableName,
-    String oldIndexName,
-    IndexSchema newIndex,
-  ) async {
-    try {
-      // 1. Drop old index
-      await removeIndex(tableName, indexName: oldIndexName);
-
-      // 2. Create new index
-      await addIndex(tableName, newIndex);
-    } catch (e) {
-      Logger.error(
-        'Failed to modify index: $e',
-        label: 'DataStoreImpl.modifyIndex',
-      );
-      rethrow;
     }
   }
 
