@@ -5,7 +5,6 @@ import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../statistic/table_statistics.dart';
 import '../query/query_cache.dart';
-import '../model/structure_cache.dart';
 import 'crontab_manager.dart';
 
 /// Data cache manager
@@ -46,142 +45,7 @@ class DataCacheManager {
     // Register 1-hour periodic task for cleaning expired cache
     CrontabManager.addCallback(ExecuteInterval.hour1, _cleanupExpiredCache);
 
-    // Trigger startup phase cache collection
-    Future.delayed(
-        Duration(
-            milliseconds: _dataStore.config.startupCacheCollectionDurationMs),
-        () async {
-      _dataStore.indexManager?.endStartupCacheCollection();
-    });
-
     _cronJobsRegistered = true;
-  }
-
-  /// Load startup cache (load both global and current space cache simultaneously)
-  Future<void> loadStartupCache() async {
-    try {
-      // Load global and space startup cache in parallel
-      await Future.wait([
-        _tryLoadCacheFile(
-            _dataStore.pathManager.getGlobalStartupCacheFilePath(),
-            isGlobal: true),
-        _tryLoadCacheFile(_dataStore.pathManager.getStartupCacheFilePath(),
-            isGlobal: false),
-      ]);
-    } catch (e) {
-      Logger.error('Failed to load startup cache: $e',
-          label: 'DataCacheManager.loadStartupCache');
-    }
-  }
-
-  /// Try to load cache file
-  Future<void> _tryLoadCacheFile(String filePath,
-      {bool isGlobal = false}) async {
-    try {
-      // Check if file exists
-      if (!await _dataStore.storage.existsFile(filePath)) {
-        return;
-      }
-
-      // Read cache file
-      final jsonData = await _dataStore.storage.readAsString(filePath);
-      if (jsonData == null || jsonData.isEmpty) return;
-
-      // Parse cache data
-      final cache = StructureCache.fromJson(jsonData);
-
-      // Restore index cache
-      if (cache.indices.isNotEmpty) {
-        await _dataStore.indexManager?.loadIndexCache(cache.indices);
-      }
-    } catch (e) {
-      Logger.error('Failed to load cache file: $filePath, $e',
-          label: 'DataCacheManager._tryLoadCacheFile');
-    }
-  }
-
-  /// Provide unified interface for saving cache
-  Future<void> saveStructureCache({
-    required Map<String, Map<String, dynamic>> indexCache,
-    required CacheType cacheType,
-  }) async {
-    try {
-      // Separate global tables and space tables
-      final globalIndexCache = <String, Map<String, dynamic>>{};
-      final spaceIndexCache = <String, Map<String, dynamic>>{};
-
-      // Separate index cache
-      for (final entry in indexCache.entries) {
-        final key = entry.key;
-        final parts = key.split(':');
-        if (parts.length != 2) continue;
-
-        final tableName = parts[0];
-        final schema = await _dataStore.getTableSchema(tableName);
-        if (schema == null) {
-          Logger.error('Table $tableName does not exist',
-              label: 'DataCacheManager.saveStructureCache');
-          continue;
-        }
-        if (schema.isGlobal == true) {
-          globalIndexCache[key] = entry.value;
-        } else {
-          spaceIndexCache[key] = entry.value;
-        }
-      }
-
-      // Save global table cache
-      if (globalIndexCache.isNotEmpty) {
-        await _saveCacheToFile(globalIndexCache, cacheType, isGlobal: true);
-      }
-
-      // Save space table cache
-      if (spaceIndexCache.isNotEmpty) {
-        await _saveCacheToFile(spaceIndexCache, cacheType, isGlobal: false);
-      }
-    } catch (e) {
-      Logger.error('Failed to save cache: $e',
-          label: 'DataCacheManager.saveStructureCache');
-    }
-  }
-
-  /// Save cache to file
-  Future<void> _saveCacheToFile(
-      Map<String, Map<String, dynamic>> indices, CacheType cacheType,
-      {bool isGlobal = false}) async {
-    try {
-      if (cacheType == CacheType.startup) {
-        // Create cache object
-        final cache = StructureCache.startup(
-          indices: indices,
-          createTime: DateTime.now(),
-        );
-
-        // Determine save path
-        String path;
-        if (isGlobal) {
-          // Global cache
-          path = _dataStore.pathManager.getGlobalStartupCacheFilePath();
-
-          // Ensure directory exists
-          await _dataStore.storage.ensureDirectoryExists(
-              _dataStore.pathManager.getGlobalStartupCachePath());
-        } else {
-          // Space cache
-          path = _dataStore.pathManager.getStartupCacheFilePath();
-
-          // Ensure directory exists
-          await _dataStore.storage.ensureDirectoryExists(
-              _dataStore.pathManager.getStartupCachePath());
-        }
-
-        // Write to file
-        await _dataStore.storage.writeAsString(path, cache.toJson());
-      }
-    } catch (e) {
-      Logger.error('Failed to save cache file: $e',
-          label: 'DataCacheManager._saveCacheToFile');
-    }
   }
 
   /// Clean up expired cache
@@ -251,7 +115,6 @@ class DataCacheManager {
   /// Update initialization configuration
   Future<void> _updateSpaceConfig({
     DateTime? lastCacheWeightProcessTime,
-    DateTime? lastStartupCacheTime,
     DateTime? lastCacheCleanupTime,
   }) async {
     try {
@@ -260,7 +123,6 @@ class DataCacheManager {
 
       final newConfig = spaceConfig.copyWith(
         lastCacheWeightProcessTime: lastCacheWeightProcessTime,
-        lastStartupCacheTime: lastStartupCacheTime,
         lastCacheCleanupTime: lastCacheCleanupTime,
       );
 
@@ -276,7 +138,7 @@ class DataCacheManager {
     try {
       bool hasChanges = false;
 
-      // 1. Notify index manager to save cache
+      // Notify index manager to save cache
       final indexManager = _dataStore.indexManager;
       bool indexSaved = false;
       if (indexManager != null) {
@@ -286,23 +148,6 @@ class DataCacheManager {
         if (indexSaved) {
           return true;
         }
-      }
-
-      // 2. Only check and save separately when index manager has no changes
-      // Get index cache data
-      Map<String, Map<String, dynamic>> startupIndexCache = {};
-
-      if (indexManager != null) {
-        startupIndexCache = await indexManager.getStartupIndexCache();
-      }
-
-      // If there is startup index cache, trigger save
-      if (startupIndexCache.isNotEmpty) {
-        await saveStructureCache(
-          indexCache: startupIndexCache,
-          cacheType: CacheType.startup,
-        );
-        hasChanges = true;
       }
 
       return hasChanges;

@@ -22,9 +22,6 @@ class SpaceConfig {
   /// Key format is "spaceName:dirIndex"
   final Map<String, int> directoryUsageMap;
 
-  /// Whether to enable startup cache
-  final bool enableStartupCache;
-
   /// Total number of tables
   final int totalTableCount;
 
@@ -44,7 +41,6 @@ class SpaceConfig {
     this.lastIndexWeightProcessTime,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
-    this.enableStartupCache = false,
     this.totalTableCount = 0,
     this.totalRecordCount = 0,
     this.totalDataSizeBytes = 0,
@@ -77,7 +73,6 @@ class SpaceConfig {
                 (key, value) => MapEntry(key, value as int),
               )
             : {},
-        enableStartupCache: json['enableStartupCache'] as bool? ?? false,
         totalTableCount: json['totalTableCount'] as int? ?? 0,
         totalRecordCount: json['totalRecordCount'] as int? ?? 0,
         totalDataSizeBytes: json['totalDataSizeBytes'] as int? ?? 0,
@@ -96,7 +91,6 @@ class SpaceConfig {
       'tableDirectoryMap':
           tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
       'directoryUsageMap': directoryUsageMap,
-      'enableStartupCache': enableStartupCache,
       'totalTableCount': totalTableCount,
       'totalRecordCount': totalRecordCount,
       'totalDataSizeBytes': totalDataSizeBytes,
@@ -111,11 +105,9 @@ class SpaceConfig {
     int? version,
     DateTime? lastIndexWeightProcessTime,
     DateTime? lastCacheWeightProcessTime,
-    DateTime? lastStartupCacheTime,
     DateTime? lastCacheCleanupTime,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
-    bool? enableStartupCache,
     int? totalTableCount,
     int? totalRecordCount,
     int? totalDataSizeBytes,
@@ -129,7 +121,6 @@ class SpaceConfig {
           lastIndexWeightProcessTime ?? this.lastIndexWeightProcessTime,
       tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
       directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
-      enableStartupCache: enableStartupCache ?? this.enableStartupCache,
       totalTableCount: totalTableCount ?? this.totalTableCount,
       totalRecordCount: totalRecordCount ?? this.totalRecordCount,
       totalDataSizeBytes: totalDataSizeBytes ?? this.totalDataSizeBytes,

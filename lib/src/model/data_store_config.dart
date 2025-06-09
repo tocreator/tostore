@@ -65,13 +65,6 @@ class DataStoreConfig {
   /// Web: 64KB, Mobile: 256KB, Desktop: 4MB
   final int maxPartitionFileSize;
 
-  /// Startup cache collection duration (milliseconds)
-  /// Query results within this time window after application startup are marked as startup cache data
-  final int startupCacheCollectionDurationMs;
-
-  /// Maximum startup index cache size
-  final int maxStartupIndexCacheSize;
-
   /// Table schema cache size limit
   final int maxSchemaCacheSize;
 
@@ -113,8 +106,6 @@ class DataStoreConfig {
     this.migrationConfig = const MigrationConfig(),
     this.maxEntriesPerDir = 500,
     int? maxPartitionFileSize,
-    this.startupCacheCollectionDurationMs = 10000, // 10 seconds
-    int? maxStartupIndexCacheSize,
     int? maxSchemaCacheSize,
     this.enableLog = true,
     this.logLevel = LogLevel.warn,
@@ -130,8 +121,6 @@ class DataStoreConfig {
         maxRecordCacheSize =
             maxRecordCacheSize ?? _getDefaultPlatformCacheSize(),
         maxIndexCacheSize = maxIndexCacheSize ?? _getDefaultPlatformCacheSize(),
-        maxStartupIndexCacheSize =
-            maxStartupIndexCacheSize ?? _getDefaultMaxStartupIndexCacheSize(),
         maxSchemaCacheSize = maxSchemaCacheSize ?? _getDefaultSchemaCacheSize(),
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
         distributedNodeConfig =
@@ -229,17 +218,6 @@ class DataStoreConfig {
     }
   }
 
-  /// Get default max startup index cache size
-  static int _getDefaultMaxStartupIndexCacheSize() {
-    if (PlatformHandler.isWeb) {
-      return 500; // Web platform has more limitations
-    } else if (PlatformHandler.isMobile) {
-      return 1500; // Moderate for mobile devices
-    } else {
-      return 2500; // Maximum for desktop devices
-    }
-  }
-
   /// from json create config
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
     return DataStoreConfig(
@@ -268,9 +246,6 @@ class DataStoreConfig {
           : const MigrationConfig(),
       maxEntriesPerDir: json['maxEntriesPerDir'] as int? ?? 500,
       maxPartitionFileSize: json['maxPartitionFileSize'] as int?,
-      startupCacheCollectionDurationMs:
-          json['startupCacheCollectionDurationMs'] as int? ?? 10000,
-      maxStartupIndexCacheSize: json['maxStartupIndexCacheSize'] as int?,
       maxSchemaCacheSize: json['maxSchemaCacheSize'] as int?,
       enableLog: json['enableLog'] as bool? ?? true,
       logLevel: _parseLogLevel(json['logLevel']),
@@ -306,8 +281,6 @@ class DataStoreConfig {
       'migrationConfig': migrationConfig?.toJson(),
       'maxEntriesPerDir': maxEntriesPerDir,
       'maxPartitionFileSize': maxPartitionFileSize,
-      'startupCacheCollectionDurationMs': startupCacheCollectionDurationMs,
-      'maxStartupIndexCacheSize': maxStartupIndexCacheSize,
       'maxSchemaCacheSize': maxSchemaCacheSize,
       'enableLog': enableLog,
       'logLevel': logLevel.toString().split('.').last,
@@ -339,8 +312,6 @@ class DataStoreConfig {
     MigrationConfig? migrationConfig,
     int? maxEntriesPerDir,
     int? maxPartitionFileSize,
-    int? startupCacheCollectionDurationMs,
-    int? maxStartupIndexCacheSize,
     int? maxSchemaCacheSize,
     bool? enableLog,
     LogLevel? logLevel,
@@ -371,10 +342,6 @@ class DataStoreConfig {
       migrationConfig: migrationConfig ?? this.migrationConfig,
       maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
       maxPartitionFileSize: maxPartitionFileSize ?? this.maxPartitionFileSize,
-      startupCacheCollectionDurationMs: startupCacheCollectionDurationMs ??
-          this.startupCacheCollectionDurationMs,
-      maxStartupIndexCacheSize:
-          maxStartupIndexCacheSize ?? this.maxStartupIndexCacheSize,
       maxSchemaCacheSize: maxSchemaCacheSize ?? this.maxSchemaCacheSize,
       enableLog: enableLog ?? this.enableLog,
       logLevel: logLevel ?? this.logLevel,

@@ -197,23 +197,10 @@ class TableDataManager {
     try {
       final config = await _dataStore.getSpaceConfig();
       if (config != null) {
-        // Check if startup cache should be enabled
-        bool shouldEnableStartupCache = config.enableStartupCache;
-
-        // Automatically enable startup cache if database size exceeds twice the partition limit
-        if (_totalDataSizeBytes > _dataStore.config.maxPartitionFileSize * 2) {
-          shouldEnableStartupCache = true;
-          Logger.info(
-              'Data size (${_totalDataSizeBytes ~/ 1024 / 1024}MB) exceeds threshold, startup cache automatically enabled',
-              label: 'TableDataManager._saveStatisticsToConfig');
-        }
-
         final updatedConfig = config.copyWith(
             totalTableCount: _totalTableCount,
             totalRecordCount: _totalRecordCount,
             totalDataSizeBytes: _totalDataSizeBytes,
-            enableStartupCache:
-                shouldEnableStartupCache, // Use calculated value
             lastStatisticsTime: DateTime.now());
 
         await _dataStore.saveSpaceConfigToFile(updatedConfig);
@@ -1180,20 +1167,20 @@ class TableDataManager {
       final recordCount = await getTableRecordCount(tableName);
       if (recordCount > 0) {
         if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
-         return false;
+          return false;
         }
       }
-      
-    final cachedTables = _dataStore.dataCacheManager.getAllFullTableCaches();
-    int totalSize = 0;
-    for (final cachedTable in cachedTables) {
-      totalSize += await getTableFileSize(cachedTable);
-    }
-    int tableCount = _dataStore.dataCacheManager.getTableCacheCountAll();
-    tableCount = tableCount + recordCount;
-    return _dataStore.config.maxTableCacheFileSize > totalSize ||
-        tableCount <
-            _dataStore.config.maxRecordCacheSize; // whether exceeds max limit
+
+      final cachedTables = _dataStore.dataCacheManager.getAllFullTableCaches();
+      int totalSize = 0;
+      for (final cachedTable in cachedTables) {
+        totalSize += await getTableFileSize(cachedTable);
+      }
+      int tableCount = _dataStore.dataCacheManager.getTableCacheCountAll();
+      tableCount = tableCount + recordCount;
+      return _dataStore.config.maxTableCacheFileSize > totalSize ||
+          tableCount <
+              _dataStore.config.maxRecordCacheSize; // whether exceeds max limit
     } catch (e) {
       Logger.error('Failed to check if allow full table cache: $e',
           label: 'TableDataManager.allowFullTableCache');

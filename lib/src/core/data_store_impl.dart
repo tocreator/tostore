@@ -1944,13 +1944,7 @@ class DataStoreImpl {
   /// load data to cache
   Future<void> _loadDataToCache() async {
     try {
-      // 1. Load startup cache
-      final spaceConfig = await getSpaceConfig();
-      if (spaceConfig?.enableStartupCache == true) {
-        await dataCacheManager.loadStartupCache();
-      }
-
-      // 2. Async load table record to cache
+      // Async load table record to cache
       if (!isMigrationInstance) {
         _loadTableRecordToCache();
       }

@@ -5,7 +5,6 @@ import 'dart:math';
 
 import '../handler/logger.dart';
 import '../handler/common.dart';
-import '../model/cache.dart';
 import '../model/data_store_config.dart';
 import '../model/file_info.dart';
 import '../model/store_index.dart';
@@ -45,12 +44,6 @@ class IndexManager {
 
   // Last index write time - table name + index name -> last write time
   final Map<String, DateTime> _indexLastWriteTime = {};
-
-  // Startup index cache - set of indexes accessed during startup (only record key)
-  final Set<String> _startupIndexCache = {};
-
-  // Startup cache collection activation flag
-  bool _startupCacheCollectionActive = true;
 
   // Whether the cron task has been initialized
   bool _cronInitialized = false;
@@ -290,20 +283,6 @@ class IndexManager {
           _pendingWrites == 0 &&
           !_allWritesCompleted.isCompleted) {
         _allWritesCompleted.complete();
-      }
-
-      // Check if any startup cache related indexes were processed
-      bool hasStartupCacheChanges = false;
-      for (final key in keysWithEntries) {
-        if (_startupIndexCache.contains(key)) {
-          hasStartupCacheChanges = true;
-          break;
-        }
-      }
-
-      // Save startup cache
-      if (hasStartupCacheChanges) {
-        await _saveStartupIndexCache();
       }
     } catch (e) {
       Logger.error('Failed to process index write buffer: $e',
@@ -663,7 +642,7 @@ class IndexManager {
         // Set closing flag, ensure synchronous processing
         _isClosing = true;
 
-        // Force processing all write buffers (this will trigger saving startup cache)
+        // Force processing all write buffers
         await _processIndexWriteBuffer();
         return true;
       } else {
@@ -676,30 +655,6 @@ class IndexManager {
       // Reset closing flag
       _isClosing = false;
     }
-  }
-
-  /// End startup cache collection state
-  void endStartupCacheCollection() {
-    _startupCacheCollectionActive = false;
-
-    if (_startupIndexCache.isNotEmpty) {
-      // Trigger saving startup cache
-      _saveStartupIndexCache();
-    }
-  }
-
-  /// Save startup index cache
-  Future<void> _saveStartupIndexCache() async {
-    if (_startupIndexCache.isEmpty) return;
-
-    final indexCacheData = await getStartupIndexCache();
-    if (indexCacheData.isEmpty) return;
-
-    // Call data cache manager to save
-    await _dataStore.dataCacheManager.saveStructureCache(
-      indexCache: indexCacheData,
-      cacheType: CacheType.startup,
-    );
   }
 
   /// Get index cache key
@@ -760,15 +715,10 @@ class IndexManager {
         ..sort((a, b) =>
             (a.value['weight'] as int).compareTo(b.value['weight'] as int));
 
-      // Delete 30% of lowest weight, but keep indexes in startup cache
+      // Delete 30% of lowest weight
       int removed = 0;
       for (int i = 0; i < weightEntries.length && removed < needToRemove; i++) {
         final key = weightEntries[i].key;
-
-        // If the index is in the startup cache, do not clean
-        if (_startupIndexCache.contains(key)) {
-          continue;
-        }
 
         _indexCache.remove(key);
         _indexFullyCached.remove(key);
@@ -832,15 +782,6 @@ class IndexManager {
       if (_indexCache.containsKey(cacheKey)) {
         // Update access weight
         _updateIndexAccessWeight(cacheKey);
-
-        // If in startup cache collection phase, check quantity limit and record index
-        if (_startupCacheCollectionActive) {
-          // Check startup cache quantity limit
-          if (_startupIndexCache.length <
-              _dataStore.config.maxStartupIndexCacheSize) {
-            _startupIndexCache.add(cacheKey);
-          }
-        }
 
         return _indexCache[cacheKey];
       }
@@ -919,15 +860,6 @@ class IndexManager {
       _indexFullyCached[cacheKey] =
           true; // From file fully loaded, marked as complete
       _updateIndexAccessWeight(cacheKey);
-
-      // If in startup cache collection phase, check quantity limit and record index
-      if (_startupCacheCollectionActive) {
-        // Check startup cache quantity limit
-        if (_startupIndexCache.length <
-            _dataStore.config.maxStartupIndexCacheSize) {
-          _startupIndexCache.add(cacheKey);
-        }
-      }
 
       return btree;
     } catch (e) {
@@ -1017,13 +949,14 @@ class IndexManager {
       Map<dynamic, Set<dynamic>> entries) async {
     if (entries.isEmpty) return;
 
-          // Create lock resource identifier for index write operation
-      final lockResource = 'index:$tableName:$indexName';
-      final operationId = 'write_index_${DateTime.now().millisecondsSinceEpoch}';
-      
-      try {
-        // Acquire exclusive lock to prevent concurrent writes to the same index file
-        await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
+    // Create lock resource identifier for index write operation
+    final lockResource = 'index:$tableName:$indexName';
+    final operationId = 'write_index_${DateTime.now().millisecondsSinceEpoch}';
+
+    try {
+      // Acquire exclusive lock to prevent concurrent writes to the same index file
+      await _dataStore.lockManager
+          ?.acquireExclusiveLock(lockResource, operationId);
 
       // Get index metadata
       IndexMeta? meta = await _getIndexMeta(tableName, indexName);
@@ -1319,9 +1252,9 @@ class IndexManager {
       Logger.error('Failed to write index to file: $e\n$stack',
           label: 'IndexManager._writeIndexToFile');
       rethrow;
-          } finally {
-        // Release lock resource, whether the operation succeeds or fails
-        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+    } finally {
+      // Release lock resource, whether the operation succeeds or fails
+      _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
     }
   }
 
@@ -1422,7 +1355,7 @@ class IndexManager {
           if (fieldValue != null) {
             await _addToInsertBuffer(
                 tableName, indexName, fieldValue, recordId);
-            
+
             // Record processed field indexes
             processedFieldIndexes.add(fieldName);
           }
@@ -1432,7 +1365,7 @@ class IndexManager {
           if (compositeKey != null) {
             await _addToInsertBuffer(
                 tableName, indexName, compositeKey, recordId);
-            
+
             // Record processed composite index fields
             for (final field in index.fields) {
               processedFieldIndexes.add(field);
@@ -1446,10 +1379,11 @@ class IndexManager {
         // Check if the field is set to unique=true
         if (field.unique) {
           // Skip if the field has been processed or is the primary key
-          if (processedFieldIndexes.contains(field.name) || field.name == primaryKey) {
+          if (processedFieldIndexes.contains(field.name) ||
+              field.name == primaryKey) {
             continue;
           }
-          
+
           // Check if there is an explicit index (for safety)
           bool hasExplicitIndex = schema.indexes.any((index) =>
               index.fields.length == 1 && index.fields.first == field.name);
@@ -1487,7 +1421,7 @@ class IndexManager {
                 // Update cache
                 final cacheKey = _getIndexCacheKey(tableName, uniqueIndexName);
                 _indexMetaCache[cacheKey] = meta;
-                
+
                 Logger.debug(
                   'Auto-created unique index for field ${field.name}: $uniqueIndexName',
                   label: 'IndexManager.updateIndexes',
@@ -1606,21 +1540,22 @@ class IndexManager {
           );
           return; // skip creation of redundant primary key index
         }
-        
+
         // Check if this index would duplicate an auto-created unique field index
         if (schema.fields.length == 1 && schema.unique) {
           final fieldName = schema.fields[0];
           final autoUniqueIndexName = 'uniq_$fieldName';
-          
+
           // Check if the auto-created unique index exists
-          final autoIndexMeta = await _getIndexMeta(tableName, autoUniqueIndexName);
-          
+          final autoIndexMeta =
+              await _getIndexMeta(tableName, autoUniqueIndexName);
+
           if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
             Logger.warn(
               'Detected redundant unique index creation: $indexName would duplicate the auto-created unique index "$autoUniqueIndexName". Removing auto-created index and proceeding with explicit index.',
               label: 'IndexManager.createIndex',
             );
-            
+
             // Remove the auto-created unique index before creating the explicit one
             await removeIndex(tableName, indexName: autoUniqueIndexName);
           }
@@ -3358,7 +3293,6 @@ class IndexManager {
         label: 'IndexManager.invalidateCache');
   }
 
-
   /// Get record storage index by primary key
   Future<StoreIndex?> getStoreIndexByPrimaryKey(
     String tableName,
@@ -3807,133 +3741,6 @@ class IndexManager {
     return pathJoin(dataPath, 'index.dat');
   }
 
-  /// Get startup index cache
-  /// Return the current index cache in a format suitable for persistent storage
-  /// If _startupIndexCache is not empty, it will compare and update the existing cache
-  Future<Map<String, Map<String, dynamic>>> getStartupIndexCache() async {
-    try {
-      final result = <String, Map<String, dynamic>>{};
-
-      // Only collect indexes marked for startup
-      for (final cacheKey in _startupIndexCache) {
-        // Skip non-existent indexes
-        if (!_indexCache.containsKey(cacheKey)) {
-          continue;
-        }
-
-        final btree = _indexCache[cacheKey]!;
-
-        final parts = cacheKey.split(':');
-        if (parts.length != 2) continue;
-
-        final tableName = parts[0];
-        final indexName = parts[1];
-
-        // Safe get index metadata
-        final meta = await _getIndexMeta(tableName, indexName);
-        if (meta == null) continue; // Skip invalid metadata
-
-        // Serialize B+ tree data
-        final treeData = btree.toStringHandle();
-
-        // Get current weight
-        final weightInfo = _indexAccessWeights[cacheKey];
-        final weight =
-            weightInfo != null ? weightInfo['weight'] as int? ?? 0 : 0;
-
-        // Build cache data
-        result[cacheKey] = {
-          'tableName': tableName,
-          'indexName': indexName,
-          'meta': meta.toJson(),
-          'treeData': treeData,
-          'weight': weight,
-          'lastAccess': DateTime.now().toIso8601String(),
-        };
-      }
-
-      return result;
-    } catch (e) {
-      Logger.error('Get startup index cache failed: $e',
-          label: 'IndexManager.getStartupIndexCache');
-      return {};
-    }
-  }
-
-  /// Load index cache
-  /// Restore index from cache data
-  /// @param cacheData cache data, format consistent with getStartupIndexCache return format
-  Future<void> loadIndexCache(
-      Map<String, Map<String, dynamic>> cacheData) async {
-    try {
-      if (cacheData.isEmpty) return;
-
-      for (final entry in cacheData.entries) {
-        final cacheKey = entry.key;
-        final data = entry.value;
-
-        final tableName = data['tableName'] as String?;
-        final indexName = data['indexName'] as String?;
-        final treeData = data['treeData'] as String?;
-        final metaJson = data['meta'] as Map<String, dynamic>?;
-        final weight = data['weight'] as int? ?? 1;
-        String? lastAccessStr = data['lastAccess'] as String?;
-
-        if (tableName == null ||
-            indexName == null ||
-            treeData == null ||
-            metaJson == null) {
-          continue;
-        }
-
-        // If the index is already in the cache, skip loading
-        if (_indexCache.containsKey(cacheKey)) continue;
-
-        try {
-          // Restore metadata
-          final meta = IndexMeta.fromJson(metaJson);
-          _indexMetaCache[cacheKey] = meta;
-
-          // Restore B+ tree
-          final order = meta.bTreeOrder;
-          final isUnique = meta.isUnique;
-          final btree = BPlusTree.fromString(
-            treeData,
-            order: order,
-            isUnique: isUnique,
-          );
-
-          // Update index cache
-          _indexCache[cacheKey] = btree;
-          _indexFullyCached[cacheKey] = true;
-
-          // Ensure there is access time, if not use current time
-          final now = DateTime.now();
-          final lastAccess = lastAccessStr != null
-              ? DateTime.tryParse(lastAccessStr) ?? now
-              : now;
-
-          // Add weight record
-          _indexAccessWeights[cacheKey] = {
-            'weight': weight,
-            'lastAccess': lastAccess,
-            'lastWeightUpdate':
-                DateTime(lastAccess.year, lastAccess.month, lastAccess.day),
-          };
-
-          // Add to startup cache
-          _startupIndexCache.add(cacheKey);
-        } catch (e) {
-          Logger.error('Load index cache failed: $tableName.$indexName, $e',
-              label: 'IndexManager.loadIndexCache');
-        }
-      }
-    } catch (e) {
-      Logger.error('Load index cache failed: $e',
-          label: 'IndexManager.loadIndexCache');
-    }
-  }
-
   /// Process weight decay calculation for all indexes
   /// Only executed once per day, using Isolate to avoid blocking the main thread
   Future<void> processIndexWeights() async {
@@ -4146,16 +3953,6 @@ class IndexManager {
       Logger.error('Calculate weight decay in the main thread failed: $e',
           label: 'IndexManager._calculateWeightsDecay');
     }
-  }
-
-  /// Get the number of startup cache indexes
-  int getStartupIndexCount() {
-    return _startupIndexCache.length;
-  }
-
-  /// Get the startup cache index limit
-  int getMaxStartupIndexCacheSize() {
-    return _dataStore.config.maxStartupIndexCacheSize;
   }
 
   /// Calculate the index value range, used for range queries of numeric indexes
@@ -4746,12 +4543,14 @@ class IndexManager {
       // get table schema
       final schema = await _dataStore.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Failed to add index: table $tableName does not exist', label: 'IndexManager.addIndex');
+        Logger.error('Failed to add index: table $tableName does not exist',
+            label: 'IndexManager.addIndex');
         return;
       }
 
       // check if index already exists
-      if (schema.indexes.any((i) => i.actualIndexName == index.actualIndexName)) {
+      if (schema.indexes
+          .any((i) => i.actualIndexName == index.actualIndexName)) {
         Logger.warn(
           'Index ${index.actualIndexName} already exists in table $tableName',
           label: 'IndexManager.addIndex',
@@ -4771,7 +4570,6 @@ class IndexManager {
       final newIndexes = [...schema.indexes, index];
       final newSchema = schema.copyWith(indexes: newIndexes);
       await _dataStore.updateTableSchema(tableName, newSchema);
-      
     } catch (e) {
       Logger.error('Failed to add index: $e', label: 'IndexManager.addIndex');
       rethrow;
@@ -4790,9 +4588,9 @@ class IndexManager {
 
       // 2. create new index
       await addIndex(tableName, newIndex);
-      
     } catch (e) {
-      Logger.error('Failed to modify index: $e', label: 'IndexManager.modifyIndex');
+      Logger.error('Failed to modify index: $e',
+          label: 'IndexManager.modifyIndex');
       rethrow;
     }
   }
@@ -4802,10 +4600,10 @@ class IndexManager {
   /// @param indexName index name
   /// @param fields field list (when indexName is not provided)
   Future<void> removeIndex(
-    String tableName,
-    {String? indexName,
-    List<String>? fields,}
-  ) async {
+    String tableName, {
+    String? indexName,
+    List<String>? fields,
+  }) async {
     try {
       if (indexName == null && (fields == null || fields.isEmpty)) {
         throw ArgumentError('index name or field list is required');
@@ -4818,7 +4616,8 @@ class IndexManager {
 
       final schema = await _dataStore.getTableSchema(tableName);
       if (schema == null) {
-        Logger.warn('table $tableName does not exist, cannot remove index', label: 'IndexManager.removeIndex');
+        Logger.warn('table $tableName does not exist, cannot remove index',
+            label: 'IndexManager.removeIndex');
         return;
       }
 
@@ -4869,7 +4668,7 @@ class IndexManager {
       }
 
       String? actualName;
-      
+
       // if target index is found
       if (targetIndex != null) {
         actualName = targetIndex.actualIndexName;
@@ -4891,21 +4690,23 @@ class IndexManager {
 
       // delete index file
       await _deleteIndexFiles(tableName, actualName);
-      
+
       // if target index is found, remove it from table schema
       if (targetIndex != null) {
-        final newIndexes = schema.indexes.where((i) => i != targetIndex).toList();
+        final newIndexes =
+            schema.indexes.where((i) => i != targetIndex).toList();
         final newSchema = schema.copyWith(indexes: newIndexes);
 
         // update table schema
         await _dataStore.updateTableSchema(tableName, newSchema);
       }
     } catch (e) {
-      Logger.error('Failed to remove index: $e', label: 'IndexManager.removeIndex');
+      Logger.error('Failed to remove index: $e',
+          label: 'IndexManager.removeIndex');
       rethrow;
     }
   }
-  
+
   /// delete index file
   /// @param tableName table name
   /// @param indexName index name
@@ -4916,14 +4717,15 @@ class IndexManager {
     // create lock resource for index operation
     final lockResource = 'index:$tableName:$indexName';
     final operationId = 'delete_index_${DateTime.now().millisecondsSinceEpoch}';
-    
+
     try {
       // get exclusive lock, ensure no other operation is accessing this index
-      await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
+      await _dataStore.lockManager
+          ?.acquireExclusiveLock(lockResource, operationId);
 
       // clear memory cache
       invalidateCache(tableName, indexName);
-      
+
       // clear write buffer
       final cacheKey = _getIndexCacheKey(tableName, indexName);
       _indexWriteBuffer.remove(cacheKey);
@@ -4932,9 +4734,10 @@ class IndexManager {
       _indexLastWriteTime.remove(cacheKey);
 
       // get index directory path
-      final indexDirPath = await _dataStore.pathManager.getIndexDirPath(tableName);
+      final indexDirPath =
+          await _dataStore.pathManager.getIndexDirPath(tableName);
       final indexSubDirPath = pathJoin(indexDirPath, indexName);
-      
+
       // if index specific subdirectory exists, delete the entire subdirectory
       if (await _dataStore.storage.existsDirectory(indexSubDirPath)) {
         await _dataStore.storage.deleteDirectory(indexSubDirPath);
@@ -4960,17 +4763,18 @@ class IndexManager {
       }
 
       // delete meta file
-      final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+      final metaPath =
+          await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
       if (await _dataStore.storage.existsFile(metaPath)) {
         await _dataStore.storage.deleteFile(metaPath);
       }
-
     } catch (e) {
-      Logger.error('Failed to delete index file: $e', label: 'IndexManager._deleteIndexFiles');
+      Logger.error('Failed to delete index file: $e',
+          label: 'IndexManager._deleteIndexFiles');
       rethrow;
     } finally {
       // release exclusive lock
-       _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
     }
   }
 
