@@ -7,8 +7,8 @@ class QueryCondition {
   final _ConditionNode _root = _ConditionNode(type: _NodeType.and);
   // Current active node (for building conditions)
   _ConditionNode _current;
-  
-  // store order by and pagination info
+
+  // Order by, limit, offset related properties
   List<String>? _orderBy;
   int? _limit;
   int? _offset;
@@ -39,48 +39,13 @@ class QueryCondition {
       copy._current =
           _findCorrespondingNode(copy._root, _root, _current) ?? copy._root;
     }
-    
-    // copy order by and pagination info
-    copy._orderBy = _orderBy != null ? List<String>.from(_orderBy!) : null;
+
+    // Copy sorting and pagination parameters
+    copy._orderBy = _orderBy != null ? List.from(_orderBy!) : null;
     copy._limit = _limit;
     copy._offset = _offset;
 
     return copy;
-  }
-  
-  /// get order by fields
-  List<String>? get orderBy => _orderBy;
-  
-  /// get limit value
-  int? get limit => _limit;
-  
-  /// get offset value
-  int? get offset => _offset;
-  
-  /// add ascending order field
-  QueryCondition orderByAsc(String field) {
-    _orderBy = _orderBy ?? [];
-    _orderBy!.add(field);
-    return this;
-  }
-  
-  /// add descending order field
-  QueryCondition orderByDesc(String field) {
-    _orderBy = _orderBy ?? [];
-    _orderBy!.add('-$field');
-    return this;
-  }
-  
-  /// set limit value
-  QueryCondition setLimit(int value) {
-    _limit = value;
-    return this;
-  }
-  
-  /// set offset value
-  QueryCondition setOffset(int value) {
-    _offset = value;
-    return this;
   }
 
   /// Find the corresponding node in two trees
@@ -512,13 +477,6 @@ class QueryCondition {
     };
   }
 
-  /// Reset the query condition
-  QueryCondition clear() {
-    _root.children.clear();
-    _current = _ConditionNode(type: _NodeType.and);
-    _root.children.add(_current);
-    return this;
-  }
 
   /// Check if the condition is empty
   bool get isEmpty {
@@ -904,6 +862,54 @@ class QueryCondition {
   /// orWhereCustom((record) => record['is_active'] == true)
   QueryCondition orWhereCustom(bool Function(Map<String, dynamic>) record) {
     return or().whereCustom(record);
+  }
+
+  /// set order by (asc)
+  QueryCondition orderByAsc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add(field);
+    return this;
+  }
+
+  /// set order by (desc)
+  QueryCondition orderByDesc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add('-$field');
+    return this;
+  }
+
+  /// set limit
+  QueryCondition limit(int value) {
+    _limit = value;
+    return this;
+  }
+
+  /// set offset
+  QueryCondition offset(int value) {
+    _offset = value;
+    return this;
+  }
+
+  /// Internal method: apply order by, limit, offset settings to ChainBuilder
+  void $internalApplySettings(
+      List<String>? Function() getOrderBy,
+      void Function(List<String>) setOrderBy,
+      void Function(int) setLimit,
+      void Function(int) setOffset) {
+    
+    if (_orderBy != null && _orderBy!.isNotEmpty) {
+      final existingOrderBy = getOrderBy() ?? [];
+      existingOrderBy.addAll(_orderBy!);
+      setOrderBy(existingOrderBy);
+    }
+    
+    if (_limit != null) {
+      setLimit(_limit!);
+    }
+    
+    if (_offset != null) {
+      setOffset(_offset!);
+    }
   }
 }
 

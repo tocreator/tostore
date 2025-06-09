@@ -9,6 +9,10 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
 
+  List<String>? _orderBy;
+  int? _limit;
+  int? _offset;
+
   ChainBuilder(this._db, this._tableName);
 
   /// get actual builder instance
@@ -16,25 +20,27 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// set order by (asc)
   SELF orderByAsc(String field) {
-    _condition.orderByAsc(field);
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add(field);
     return _self;
   }
 
   /// set order by (desc)
   SELF orderByDesc(String field) {
-    _condition.orderByDesc(field);
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add('-$field');
     return _self;
   }
 
   /// set limit
   SELF limit(int value) {
-    _condition.setLimit(value);
+    _limit = value;
     return _self;
   }
 
   /// set offset
   SELF offset(int value) {
-    _condition.setOffset(value);
+    _offset = value;
     return _self;
   }
 
@@ -77,12 +83,28 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   /// Add a predefined condition to this query with AND logic
   SELF condition(QueryCondition condition) {
     _condition.condition(condition);
+    
+    condition.$internalApplySettings(
+      () => _orderBy,
+      (orderBy) => _orderBy = orderBy,
+      (limit) => _limit = limit,
+      (offset) => _offset = offset
+    );
+    
     return _self;
   }
 
   /// orCondition condition - adds OR logic
   SELF orCondition(QueryCondition condition) {
     _condition.orCondition(condition);
+    
+    condition.$internalApplySettings(
+      () => _orderBy,
+      (orderBy) => _orderBy = orderBy,
+      (limit) => _limit = limit,
+      (offset) => _offset = offset
+    );
+    
     return _self;
   }
 
@@ -160,11 +182,11 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   String get $tableName => _tableName;
 
   @protected
-  List<String>? get $orderBy => _condition.orderBy;
+  List<String>? get $orderBy => _orderBy;
 
   @protected
-  int? get $limit => _condition.limit;
+  int? get $limit => _limit;
 
   @protected
-  int? get $offset => _condition.offset;
+  int? get $offset => _offset;
 }
