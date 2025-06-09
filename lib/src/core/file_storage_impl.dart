@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:tostore/src/handler/common.dart';
+import '../handler/common.dart';
 
 import '../Interface/storage_interface.dart';
 import '../handler/logger.dart';

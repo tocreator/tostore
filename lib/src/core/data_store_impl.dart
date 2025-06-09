@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
-import 'package:tostore/src/core/lock_manager.dart';
+import 'lock_manager.dart';
 import '../backup/backup_manager.dart';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/common.dart';
