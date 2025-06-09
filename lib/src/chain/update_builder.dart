@@ -17,14 +17,14 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   UpdateBuilder(super.db, super.tableName, this._data);
 
   /// allow update all records
-  /// 
+  ///
   /// this method explicitly indicates that the developer intentionally updates all records in the table.
   /// if there is no query condition and this method is not called, the update operation will be rejected to prevent accidental update.
   UpdateBuilder allowUpdateAll() {
     _allowAll = true;
     return this;
   }
-  
+
   /// allow partial errors
   ///
   /// this method explicitly indicates that the operation should continue when some records fail.
@@ -39,7 +39,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
     _future ??= $db.updateInternal(
       $tableName,
       _data,
-      condition,
+      queryCondition,
       orderBy: $orderBy,
       limit: $limit,
       offset: $offset,

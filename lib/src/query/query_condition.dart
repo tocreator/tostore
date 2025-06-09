@@ -234,7 +234,7 @@ class QueryCondition {
   }
 
   /// Add another condition as an AND condition
-  QueryCondition andCondition(QueryCondition other) {
+  QueryCondition condition(QueryCondition other) {
     if (other.isEmpty) return this;
 
     // Clone the condition tree of other
@@ -506,7 +506,7 @@ class QueryCondition {
     if (node.type == _NodeType.leaf) {
       return _matchAllConditions(record, node.condition);
     }
-    
+
     // Handle custom function nodes
     if (node.type == _NodeType.custom) {
       if (node.customMatcher != null) {
@@ -812,8 +812,6 @@ class QueryCondition {
     return where(field, 'NOT LIKE', '%$value%');
   }
 
-
-
   /// Add a custom condition using a user-provided function
   /// Example:
   /// whereCustom((record) => record['is_active'] == true)
@@ -822,7 +820,7 @@ class QueryCondition {
       type: _NodeType.custom,
       customMatcher: record,
     );
-    
+
     // If the current node is an AND node, add the custom node as a child
     if (_current.type == _NodeType.and) {
       _current.children.add(customNode);
@@ -835,24 +833,24 @@ class QueryCondition {
     else {
       // Find the parent node of the current node
       final parent = _findParent(_root, _current);
-      
+
       if (parent != null) {
         // Create a new AND node
         final andNode = _ConditionNode(type: _NodeType.and);
-        
+
         // Replace the current node with the AND node
         final index = parent.children.indexOf(_current);
         parent.children[index] = andNode;
-        
+
         // Add the current node and the custom node as children of the AND node
         andNode.children.add(_current);
         andNode.children.add(customNode);
-        
+
         // Update the current node to the AND node
         _current = andNode;
       }
     }
-    
+
     return this;
   }
 
@@ -874,7 +872,7 @@ enum _NodeType {
 
   /// OR operator node
   or,
-  
+
   /// Custom function node
   custom
 }
@@ -886,7 +884,7 @@ class _ConditionNode {
 
   /// Condition content (only valid for leaf nodes)
   Map<String, dynamic> condition;
-  
+
   /// Custom matcher function (only valid for custom nodes)
   bool Function(Map<String, dynamic>)? customMatcher;
 

@@ -3,13 +3,11 @@ import 'package:flutter/foundation.dart';
 import '../core/data_store_impl.dart';
 import '../query/query_condition.dart';
 
-
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final DataStoreImpl _db;
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
-
 
   List<String>? _orderBy;
   int? _limit;
@@ -83,11 +81,11 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   }
 
   /// Add a predefined condition to this query with AND logic
-  SELF andCondition(QueryCondition condition) {
-    _condition.andCondition(condition);
+  SELF condition(QueryCondition condition) {
+    _condition.condition(condition);
     return _self;
   }
-  
+
   /// orCondition condition - adds OR logic
   SELF orCondition(QueryCondition condition) {
     _condition.orCondition(condition);
@@ -136,12 +134,12 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     return _self;
   }
 
-  /// whereNotContains condition  
+  /// whereNotContains condition
   SELF whereNotContains(String field, String value) {
     _condition.whereNotContains(field, value);
     return _self;
   }
-  
+
   /// Add a custom condition using a user-provided function
   /// Example:
   /// whereCustom((record) => record['is_active'] == true)
@@ -149,7 +147,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     _condition.whereCustom(record);
     return _self;
   }
-  
+
   /// Add a custom condition using a user-provided function with OR logic
   /// Example:
   /// orWhereCustom((record) => record['is_active'] == true)
@@ -157,10 +155,9 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     _condition.orWhereCustom(record);
     return _self;
   }
-  
 
   /// get condition builder
-  QueryCondition get condition => _condition;
+  QueryCondition get queryCondition => _condition;
 
   @protected
   DataStoreImpl get $db => _db;

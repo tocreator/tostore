@@ -79,7 +79,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// get record count
   Future<int> count() async {
     // if there are no conditions, get total count from metadata
-    if (condition.isEmpty) {
+    if (queryCondition.isEmpty) {
       return await $db.tableDataManager.getTableRecordCount($tableName);
     }
 
@@ -144,7 +144,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// execute query
   Future<List<Map<String, dynamic>>> _executeQuery() async {
     // convert where conditions, add table prefix to fields
-    var whereConditions = condition.build();
+    var whereConditions = queryCondition.build();
     if (_joins.isNotEmpty) {
       whereConditions = _convertWhereClauses(whereConditions, _joins);
     }
@@ -165,7 +165,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     final results = await $db.getQueryExecutor()?.execute(
               queryPlan,
               $tableName,
-              condition: condition,
+              condition: queryCondition,
               orderBy: $orderBy,
               limit: $limit,
               offset: $offset,

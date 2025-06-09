@@ -51,10 +51,10 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
       Map<String, dynamic>? existingRecord;
 
       // 1. If there are conditions, check if a matching record exists first
-      if (condition.build().isNotEmpty) {
+      if (queryCondition.build().isNotEmpty) {
         final existingResult = await $db.executeQuery(
           $tableName,
-          condition,
+          queryCondition,
           limit: 1,
         );
 
@@ -85,7 +85,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
           return await $db.updateInternal(
             $tableName,
             _data,
-            condition,
+            queryCondition,
             orderBy: $orderBy,
             limit: $limit,
             offset: $offset,
@@ -110,7 +110,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
             return await $db.updateInternal(
               $tableName,
               _data,
-              condition,
+              queryCondition,
               limit: 1,
               continueOnPartialErrors: _continueOnPartialErrors,
             );
