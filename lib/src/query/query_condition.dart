@@ -7,6 +7,11 @@ class QueryCondition {
   final _ConditionNode _root = _ConditionNode(type: _NodeType.and);
   // Current active node (for building conditions)
   _ConditionNode _current;
+  
+  // store order by and pagination info
+  List<String>? _orderBy;
+  int? _limit;
+  int? _offset;
 
   /// Create a new query condition builder
   QueryCondition() : _current = _ConditionNode(type: _NodeType.and) {
@@ -34,8 +39,48 @@ class QueryCondition {
       copy._current =
           _findCorrespondingNode(copy._root, _root, _current) ?? copy._root;
     }
+    
+    // copy order by and pagination info
+    copy._orderBy = _orderBy != null ? List<String>.from(_orderBy!) : null;
+    copy._limit = _limit;
+    copy._offset = _offset;
 
     return copy;
+  }
+  
+  /// get order by fields
+  List<String>? get orderBy => _orderBy;
+  
+  /// get limit value
+  int? get limit => _limit;
+  
+  /// get offset value
+  int? get offset => _offset;
+  
+  /// add ascending order field
+  QueryCondition orderByAsc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add(field);
+    return this;
+  }
+  
+  /// add descending order field
+  QueryCondition orderByDesc(String field) {
+    _orderBy = _orderBy ?? [];
+    _orderBy!.add('-$field');
+    return this;
+  }
+  
+  /// set limit value
+  QueryCondition setLimit(int value) {
+    _limit = value;
+    return this;
+  }
+  
+  /// set offset value
+  QueryCondition setOffset(int value) {
+    _offset = value;
+    return this;
   }
 
   /// Find the corresponding node in two trees

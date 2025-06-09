@@ -86,6 +86,17 @@ class DataStoreConfig {
   /// Maximum number of tables to process per flush
   final int maxTablesPerFlush;
 
+  /// Enable query caching
+  /// null: automatic (enabled on web/mobile/desktop, disabled on server)
+  /// true: force enable query cache
+  /// false: force disable query cache
+  final bool? enableQueryCache;
+
+  /// Maximum query cache expiry time
+  /// null: no expiry (cache entries remain until manually cleared or evicted)
+  /// other: duration after which cache entries are considered stale
+  final Duration? queryCacheExpiryTime;
+
   DataStoreConfig({
     this.dbPath,
     this.spaceName = 'default',
@@ -113,6 +124,8 @@ class DataStoreConfig {
     DistributedNodeConfig? distributedNodeConfig,
     int? maxFlushBatchSize,
     int? maxTablesPerFlush,
+    bool? enableQueryCache,
+    this.queryCacheExpiryTime,
   })  : maxPartitionFileSize =
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         maxTableCacheFileSize =
@@ -126,7 +139,8 @@ class DataStoreConfig {
         distributedNodeConfig =
             distributedNodeConfig ?? const DistributedNodeConfig(),
         maxFlushBatchSize = maxFlushBatchSize ?? _getDefaultBatchSize(),
-        maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush() {
+        maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
+        enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled() {
     // Initialize async memory detection and cache optimization
     CacheSettings.startMemoryOptimization();
   }
@@ -141,6 +155,16 @@ class DataStoreConfig {
       return 100000; // Desktop devices
     }
   }
+
+  /// Determine if query cache should be enabled by default
+  static bool _getDefaultQueryCacheEnabled() {
+    // default enabled on web/mobile/desktop, disabled on server environment
+    return !PlatformHandler.isServerEnvironment;
+  }
+
+  /// Determine if query cache should be enabled by default based on platform
+  /// Returns true for client platforms, false for server platforms
+  bool get shouldEnableQueryCache => enableQueryCache ?? _getDefaultQueryCacheEnabled();
 
   /// get default schema cache size
   static int _getDefaultSchemaCacheSize() {
@@ -256,6 +280,10 @@ class DataStoreConfig {
           : const DistributedNodeConfig(),
       maxFlushBatchSize: json['maxFlushBatchSize'] as int?,
       maxTablesPerFlush: json['maxTablesPerFlush'] as int?,
+      enableQueryCache: json['enableQueryCache'] as bool?,
+      queryCacheExpiryTime: json['queryCacheExpiryTime'] != null
+          ? Duration(milliseconds: json['queryCacheExpiryTime'] as int)
+          : null,
     );
   }
 
@@ -288,6 +316,8 @@ class DataStoreConfig {
       'distributedNodeConfig': distributedNodeConfig.toJson(),
       'maxFlushBatchSize': maxFlushBatchSize,
       'maxTablesPerFlush': maxTablesPerFlush,
+      'enableQueryCache': enableQueryCache,
+      'queryCacheExpiryTime': queryCacheExpiryTime?.inMilliseconds,
     };
   }
 
@@ -319,6 +349,8 @@ class DataStoreConfig {
     DistributedNodeConfig? distributedNodeConfig,
     int? maxFlushBatchSize,
     int? maxTablesPerFlush,
+    bool? enableQueryCache,
+    Duration? queryCacheExpiryTime,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
@@ -350,6 +382,8 @@ class DataStoreConfig {
           distributedNodeConfig ?? this.distributedNodeConfig,
       maxFlushBatchSize: maxFlushBatchSize ?? this.maxFlushBatchSize,
       maxTablesPerFlush: maxTablesPerFlush ?? this.maxTablesPerFlush,
+      enableQueryCache: enableQueryCache ?? this.enableQueryCache,
+      queryCacheExpiryTime: queryCacheExpiryTime ?? this.queryCacheExpiryTime,
     );
   }
 }

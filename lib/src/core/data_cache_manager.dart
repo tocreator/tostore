@@ -5,7 +5,9 @@ import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../statistic/table_statistics.dart';
 import '../query/query_cache.dart';
+import '../query/query_condition.dart';
 import 'crontab_manager.dart';
+import 'dart:convert';
 
 /// Data cache manager
 class DataCacheManager {
@@ -86,22 +88,7 @@ class DataCacheManager {
 
       // Clean up query cache
       if (_queryCache.size > _dataStore.config.maxQueryCacheSize) {
-        // Calculate number to delete
-        final removeCount =
-            _queryCache.size - _dataStore.config.maxQueryCacheSize;
-
-        // Sort query cache entries by last access time (oldest first)
-        final queryCacheEntries = _queryCache.cache.entries.toList();
-        queryCacheEntries
-            .sort((a, b) => a.value.timestamp.compareTo(b.value.timestamp));
-
-        // Delete oldest query caches
-        for (int i = 0; i < removeCount && i < queryCacheEntries.length; i++) {
-          _queryCache.invalidate(queryCacheEntries[i].key);
-        }
-
-        Logger.debug('Cleaned up $removeCount expired query caches',
-            label: 'DataCacheManager._cleanupExpiredCache');
+        _queryCache.evictStaleEntries();
       }
 
       // Update initialization configuration
@@ -166,8 +153,9 @@ class DataCacheManager {
   void cacheQuery(
     QueryCacheKey key,
     List<Map<String, dynamic>> results,
-    Set<String> tables,
-  ) async {
+    Set<String> tables, {
+    Duration? expiryDuration,
+  }) async {
     try {
       final cacheKey = key.toString();
       final schema = await _dataStore.getTableSchema(tables.first);
@@ -183,6 +171,7 @@ class DataCacheManager {
         results,
         tables.first,
         schema.primaryKey,
+        expiryDuration: expiryDuration,
       );
 
       // Record the dependency between queries and tables
@@ -218,6 +207,62 @@ class DataCacheManager {
   List<Map<String, dynamic>>? getQuery(QueryCacheKey key) {
     final results = _queryCache.get(key.toString());
     return results;
+  }
+
+  /// Invalidate specific query by cache key
+  /// Returns the number of entries removed (0 or 1)
+  int invalidateQuery(String tableName, String cacheKey) {
+    try {
+      // directly access the dependency cache of the specific table
+      final tableDependency = _tableDependencies[tableName];
+      if (tableDependency == null) return 0;
+
+      // remove specific query cache
+      if (tableDependency.containsKey(cacheKey)) {
+        tableDependency.remove(cacheKey);
+
+        // check if the table dependency is empty
+        if (tableDependency.isEmpty) {
+          _tableDependencies.remove(tableName);
+        }
+
+        // remove the query cache
+        return _queryCache.invalidateQuery(cacheKey);
+      }
+      return 0;
+    } catch (e) {
+      Logger.error('Failed to invalidate query: $e',
+          label: 'DataCacheManager.invalidateQuery');
+      return 0;
+    }
+  }
+
+  /// used to quickly clear the query cache corresponding to a specific primary key
+  Future<void> invalidateRecordByPrimaryKey(
+      String tableName, dynamic primaryKeyValue) async {
+    try {
+      // get the table structure to get the primary key field name
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) return;
+      final primaryKeyField = schema.primaryKey;
+
+      // build the primary key equal query condition
+      final condition =
+          QueryCondition().where(primaryKeyField, '=', primaryKeyValue);
+      final cacheKey = QueryCacheKey(
+        tableName: tableName,
+        condition: condition,
+      ).toString();
+
+      // directly try to clear this specific cache
+      _queryCache.invalidateQuery(cacheKey);
+
+      // remove from table dependency
+      _tableDependencies[tableName]?.remove(cacheKey);
+    } catch (e) {
+      Logger.error('Failed to invalidate record by primary key: $e',
+          label: 'DataCacheManager.invalidateRecordByPrimaryKey');
+    }
   }
 
   /// Invalidate record related cache
@@ -264,6 +309,20 @@ class DataCacheManager {
     // Check each query, only clean up full table cache queries
     for (var entry in tableDependency.entries) {
       final queryInfo = entry.value;
+
+      // skip user-managed caches, these caches need to be manually invalidated by the user
+      try {
+        final cacheKeyStr = entry.key;
+        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
+        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
+
+        if (isUserManaged) {
+          continue; // skip user-managed caches
+        }
+      } catch (e) {
+        // parse error, conservative handling, assume it is system cache
+      }
+
       if (queryInfo.isFullTableCache) {
         keysToRemove.add(entry.key);
       }
@@ -287,12 +346,35 @@ class DataCacheManager {
     final tableQueries = _tableDependencies[tableName];
     if (tableQueries == null) return;
 
+    // first clean up the primary key equal cache (direct fast path)
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema != null) {
+        await invalidateRecordByPrimaryKey(tableName, primaryKeyValue);
+      }
+    } catch (e) {
+      // ignore error, continue with general cleanup process
+    }
+
     // List of keys to clean up
     final keysToRemove = <String>[];
 
     // Check each query
     for (var entry in tableQueries.entries) {
       final queryInfo = entry.value;
+
+      // skip user-managed caches, these caches need to be manually invalidated by the user
+      try {
+        final cacheKeyStr = entry.key;
+        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
+        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
+
+        if (isUserManaged) {
+          continue; // skip user-managed caches
+        }
+      } catch (e) {
+        // parse error, conservative handling, assume it is system cache
+      }
 
       // If it is a full table cache or record matches the condition, invalidate the cache
       if (queryInfo.isFullTableCache ||
@@ -404,6 +486,19 @@ class DataCacheManager {
     for (var entry in tableDependency.entries) {
       final queryInfo = entry.value;
 
+      // skip user-managed caches, these caches need to be manually invalidated by the user
+      try {
+        final cacheKeyStr = entry.key;
+        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
+        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
+
+        if (isUserManaged) {
+          continue; // skip user-managed caches
+        }
+      } catch (e) {
+        // parse error, conservative handling, assume it is system cache
+      }
+
       // If any record's primary key is in primaryKeyValues, clean up the query
       // Now check the intersection of the primary key set directly, instead of traversing the complete record
       if (queryInfo.resultKeys.any((key) => primaryKeyValues.contains(key))) {
@@ -445,9 +540,22 @@ class DataCacheManager {
       }
     }
 
-    // 检查每个查询
+    // check each query
     for (var entry in tableQueries.entries) {
       final queryInfo = entry.value;
+
+      // skip user-managed caches, these caches need to be manually invalidated by the user
+      try {
+        final cacheKeyStr = entry.key;
+        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
+        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
+
+        if (isUserManaged) {
+          continue; // skip user-managed caches
+        }
+      } catch (e) {
+        // parse error, conservative handling, assume it is system cache
+      }
 
       // 1. If it is a full table cache, clean up directly
       if (queryInfo.isFullTableCache) {

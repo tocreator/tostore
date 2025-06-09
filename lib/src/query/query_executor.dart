@@ -28,6 +28,8 @@ class QueryExecutor {
     int? limit,
     int? offset,
     List<JoinClause>? joins,
+    bool? enableQueryCache,
+    Duration? queryCacheExpiry,
   }) async {
     try {
       // Don't use cache when there are join queries
@@ -40,57 +42,64 @@ class QueryExecutor {
         return _paginateResults(results, limit, offset);
       }
 
-      final cacheKey = QueryCacheKey(
-        tableName: tableName,
-        condition: condition ?? QueryCondition(),
-        orderBy: orderBy,
-        limit: limit,
-        offset: offset,
-      );
+      // Determine if query cache should be used
+      final shouldUseQueryCache =
+          enableQueryCache ?? _dataStore.config.shouldEnableQueryCache;
 
-      /// 1、 try query cache
-      final queryResult = _dataStore.dataCacheManager.getQuery(cacheKey);
-      if (queryResult != null) {
-        // get table schema to get primary key field
-        final schema = await _dataStore.getTableSchema(tableName);
-        if (schema == null) {
-          return [];
-        }
-        final primaryKey = schema.primaryKey;
+      if (shouldUseQueryCache) {
+        final cacheKey = QueryCacheKey(
+          tableName: tableName,
+          condition: condition ?? QueryCondition(),
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+          isUserManaged: enableQueryCache == true,
+        );
 
-        // convert cache result to Map to update
-        final resultMap = <String, Map<String, dynamic>>{};
-        for (var record in queryResult) {
-          resultMap[record[primaryKey].toString()] =
-              Map<String, dynamic>.from(record);
-        }
+        /// 1、 try query cache
+        final queryResult = _dataStore.dataCacheManager.getQuery(cacheKey);
+        if (queryResult != null) {
+          // get table schema to get primary key field
+          final schema = await _dataStore.getTableSchema(tableName);
+          if (schema == null) {
+            return [];
+          }
+          final primaryKey = schema.primaryKey;
 
-        // Process records in write queue that match the condition
-        final pendingData =
-            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-        if (condition != null) {
-          for (var record in pendingData.entries) {
-            if (condition.matches(record.value.data)) {
+          // convert cache result to Map to update
+          final resultMap = <String, Map<String, dynamic>>{};
+          for (var record in queryResult) {
+            resultMap[record[primaryKey].toString()] =
+                Map<String, dynamic>.from(record);
+          }
+
+          // Process records in write queue that match the condition
+          final pendingData =
+              _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+          if (condition != null) {
+            for (var record in pendingData.entries) {
+              if (condition.matches(record.value.data)) {
+                resultMap[record.value.data[primaryKey].toString()] =
+                    Map<String, dynamic>.from(record.value.data);
+              }
+            }
+          } else {
+            // Add all pending records
+            for (var record in pendingData.entries) {
               resultMap[record.value.data[primaryKey].toString()] =
                   Map<String, dynamic>.from(record.value.data);
             }
           }
-        } else {
-          // Add all pending records
-          for (var record in pendingData.entries) {
-            resultMap[record.value.data[primaryKey].toString()] =
-                Map<String, dynamic>.from(record.value.data);
-          }
-        }
 
-        // convert back to list
-        final updatedResults = resultMap.values.toList();
-        // apply sort and pagination
-        if (orderBy != null) {
-          _applySort(updatedResults, orderBy);
+          // convert back to list
+          final updatedResults = resultMap.values.toList();
+          // apply sort and pagination
+          if (orderBy != null) {
+            _applySort(updatedResults, orderBy);
+          }
+          // query cache is already the correct return result, no need to paginate again
+          return _paginateResults(updatedResults, limit, offset);
         }
-        // query cache is already the correct return result, no need to paginate again
-        return _paginateResults(updatedResults, limit, offset);
       }
 
       // 2. try to use cache
@@ -109,6 +118,8 @@ class QueryExecutor {
           // Get table schema, used to get primary key field name
           final schema = await _dataStore.getTableSchema(tableName);
 
+          bool isPrimaryKeyQuery = false;
+
           // Check if it is a primary key query, can use O(1) complexity query optimization
           if (condition != null && schema != null) {
             final conditions = condition.build();
@@ -124,6 +135,7 @@ class QueryExecutor {
                       .getRecordByPrimaryKey(tableName, pkValue);
                   if (record != null) {
                     results = [record];
+                    isPrimaryKeyQuery = true;
                   }
                 }
               }
@@ -136,6 +148,7 @@ class QueryExecutor {
                 if (pkValues != null && pkValues.isNotEmpty) {
                   results = _dataStore.dataCacheManager
                       .getRecordsByPrimaryKeys(tableName, pkValues);
+                  isPrimaryKeyQuery = results.isNotEmpty;
                 }
               }
             }
@@ -153,6 +166,30 @@ class QueryExecutor {
           // Update access time
           _dataStore.dataCacheManager.recordTableAccess(tableName);
 
+          // if not primary key query, cache it
+          if (shouldUseQueryCache && !isPrimaryKeyQuery) {
+            final shouldCache = condition == null ||
+                (results.length < _dataStore.config.maxQueryCacheSize);
+
+            if (shouldCache && results.isNotEmpty) {
+              // Create query cache key
+              final cacheKey = QueryCacheKey(
+                tableName: tableName,
+                condition: condition ?? QueryCondition(),
+                orderBy: orderBy,
+                limit: limit,
+                offset: offset,
+                isUserManaged: enableQueryCache == true,
+              );
+
+              _dataStore.dataCacheManager.cacheQuery(
+                cacheKey,
+                results,
+                {tableName},
+                expiryDuration: queryCacheExpiry,
+              );
+            }
+          }
           return _paginateResults(results, limit, offset);
         }
       }
@@ -166,13 +203,30 @@ class QueryExecutor {
         _applySort(results, orderBy);
       }
 
-      // 5. first cache the complete result, then paginate
-      final shouldCache = condition == null ||
-          (await _isSpecificQuery(tableName, condition)) ||
-          (results.length < _dataStore.config.maxQueryCacheSize);
+      // 5. Cache results if query cache is enabled
+      if (shouldUseQueryCache) {
+        final shouldCache = condition == null ||
+            (await _isSpecificQuery(tableName, condition)) ||
+            (results.length < _dataStore.config.maxQueryCacheSize);
 
-      if (shouldCache && results.isNotEmpty) {
-        _dataStore.dataCacheManager.cacheQuery(cacheKey, results, {tableName});
+        if (shouldCache && results.isNotEmpty) {
+          // Create query cache key
+          final cacheKey = QueryCacheKey(
+            tableName: tableName,
+            condition: condition ?? QueryCondition(),
+            orderBy: orderBy,
+            limit: limit,
+            offset: offset,
+            isUserManaged: enableQueryCache == true,
+          );
+
+          _dataStore.dataCacheManager.cacheQuery(
+            cacheKey,
+            results,
+            {tableName},
+            expiryDuration: queryCacheExpiry,
+          );
+        }
       }
 
       // 6. apply pagination and return results

@@ -9,10 +9,6 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final String _tableName;
   final QueryCondition _condition = QueryCondition();
 
-  List<String>? _orderBy;
-  int? _limit;
-  int? _offset;
-
   ChainBuilder(this._db, this._tableName);
 
   /// get actual builder instance
@@ -20,27 +16,25 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// set order by (asc)
   SELF orderByAsc(String field) {
-    _orderBy = _orderBy ?? [];
-    _orderBy!.add(field);
+    _condition.orderByAsc(field);
     return _self;
   }
 
   /// set order by (desc)
   SELF orderByDesc(String field) {
-    _orderBy = _orderBy ?? [];
-    _orderBy!.add('-$field');
+    _condition.orderByDesc(field);
     return _self;
   }
 
   /// set limit
   SELF limit(int value) {
-    _limit = value;
+    _condition.setLimit(value);
     return _self;
   }
 
   /// set offset
   SELF offset(int value) {
-    _offset = value;
+    _condition.setOffset(value);
     return _self;
   }
 
@@ -166,11 +160,11 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   String get $tableName => _tableName;
 
   @protected
-  List<String>? get $orderBy => _orderBy;
+  List<String>? get $orderBy => _condition.orderBy;
 
   @protected
-  int? get $limit => _limit;
+  int? get $limit => _condition.limit;
 
   @protected
-  int? get $offset => _offset;
+  int? get $offset => _condition.offset;
 }

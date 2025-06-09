@@ -3,6 +3,7 @@ import '../Interface/chain_builder.dart';
 import '../Interface/future_builder_mixin.dart';
 import '../model/join_clause.dart';
 import '../model/query_result.dart';
+import '../query/query_cache.dart';
 
 /// query builder
 class QueryBuilder extends ChainBuilder<QueryBuilder>
@@ -12,6 +13,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
   // related query related properties
   final List<JoinClause> _joins = [];
+
+  // query cache control
+  bool? _enableQueryCache;
+  Duration? _queryCacheExpiry;
 
   QueryBuilder(super.db, super.tableName);
 
@@ -66,6 +71,37 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     ));
     _invalidateFuture();
     return this;
+  }
+
+  /// Enable query result caching for this query
+  /// If [expiry] is provided, the cache will be considered stale after this duration
+  /// If no expiry is provided, the cache will not expire based on time
+  QueryBuilder useQueryCache([Duration? expiry]) {
+    _enableQueryCache = true;
+    _queryCacheExpiry = expiry;
+    _invalidateFuture();
+    return this;
+  }
+
+  /// Clear the query cache for the current query condition
+  /// Returns the number of cache entries removed
+  Future<int> clearQueryCache() async {
+    await $db.ensureInitialized();
+    final cacheManager = $db.dataCacheManager;
+
+    // Build cache key from current query parameters
+    final cacheKey = QueryCacheKey(
+      tableName: $tableName,
+      condition: queryCondition,
+      orderBy: $orderBy,
+      limit: $limit,
+      offset: $offset,
+      joins: _joins,
+      isUserManaged: true,
+    );
+
+    // Clear cache for this specific query
+    return cacheManager.invalidateQuery($tableName, cacheKey.toString());
   }
 
   /// get first record
@@ -170,6 +206,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               limit: $limit,
               offset: $offset,
               joins: _joins,
+              enableQueryCache: _enableQueryCache,
+              queryCacheExpiry: _queryCacheExpiry,
             ) ??
         [];
 

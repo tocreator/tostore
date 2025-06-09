@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../model/join_clause.dart';
 import 'query_condition.dart';
+import '../handler/logger.dart';
 
 /// query cache
 class QueryCache {
@@ -22,22 +23,42 @@ class QueryCache {
     final cached = _cache[key];
     if (cached == null) return null;
 
+    // Check if cache is expired
+    if (cached.expiryTime != null &&
+        DateTime.now().isAfter(cached.expiryTime!)) {
+      // Cache is expired, remove it
+      _cache.remove(key);
+      return null;
+    }
+
+    // Record access time for cache eviction policy
+    cached.lastAccessed = DateTime.now();
     return cached.results;
   }
 
   /// cache query results
   void put(String key, List<Map<String, dynamic>> results, String tableName,
-      String primaryKeyField) {
+      String primaryKeyField, {Duration? expiryDuration}) {
     if (_cache.length >= _maxSize) {
-      // remove oldest cache
-      final oldest = _cache.entries.reduce(
-          (a, b) => a.value.timestamp.isBefore(b.value.timestamp) ? a : b);
+      // Find and remove the oldest cache entry by last access time
+      final oldest = _cache.entries.reduce((a, b) =>
+          a.value.lastAccessed.isBefore(b.value.lastAccessed) ? a : b);
       _cache.remove(oldest.key);
+    }
+
+    final now = DateTime.now();
+    
+    // Calculate expiry time if provided
+    DateTime? expiryTime;
+    if (expiryDuration != null) {
+      expiryTime = now.add(expiryDuration);
     }
 
     _cache[key] = CachedQuery(
       results: results,
-      timestamp: DateTime.now(),
+      timestamp: now,
+      lastAccessed: now,
+      expiryTime: expiryTime,
       tableName: tableName,
       primaryKeyField: primaryKeyField,
     );
@@ -47,10 +68,62 @@ class QueryCache {
   void invalidate(String key) {
     _cache.remove(key);
   }
+  
+  /// invalidate a specific query
+  /// returns 1 if removed, 0 if not found
+  int invalidateQuery(String queryKey) {
+    if (_cache.containsKey(queryKey)) {
+      _cache.remove(queryKey);
+      return 1;
+    }
+    return 0;
+  }
 
   /// clear all cache
   void clear() {
     _cache.clear();
+  }
+  
+  /// Evict expired and least recently used entries to make room
+  void evictStaleEntries() {
+    try {
+      final now = DateTime.now();
+      
+      // First remove expired entries
+      final expiredKeys = <String>[];
+      _cache.forEach((key, value) {
+        if (value.expiryTime != null && now.isAfter(value.expiryTime!)) {
+          expiredKeys.add(key);
+        }
+      });
+      
+      for (final key in expiredKeys) {
+        _cache.remove(key);
+      }
+      
+      // If still over capacity, remove oldest entries by last access time
+      if (_cache.length >= _maxSize) {
+        final sortedEntries = _cache.entries.toList()
+          ..sort((a, b) => 
+              a.value.lastAccessed.compareTo(b.value.lastAccessed));
+        
+        // Remove oldest entries until under capacity
+        final removeCount = (_cache.length * 0.2).ceil(); // Remove 20% of entries
+        for (int i = 0; i < removeCount && i < sortedEntries.length; i++) {
+          _cache.remove(sortedEntries[i].key);
+        }
+        
+        Logger.debug(
+          'Evicted $removeCount stale query cache entries, remaining: ${_cache.length}',
+          label: 'QueryCache.evictStaleEntries',
+        );
+      }
+    } catch (e) {
+      Logger.error(
+        'Error evicting stale query cache entries: $e',
+        label: 'QueryCache.evictStaleEntries',
+      );
+    }
   }
 }
 
@@ -58,12 +131,16 @@ class QueryCache {
 class CachedQuery {
   final List<Map<String, dynamic>> results;
   final DateTime timestamp;
+  DateTime lastAccessed;
+  final DateTime? expiryTime;
   final String tableName;
   final String primaryKeyField;
 
   CachedQuery({
     required this.results,
     required this.timestamp,
+    required this.lastAccessed,
+    this.expiryTime,
     required this.tableName,
     required this.primaryKeyField,
   });
@@ -77,6 +154,11 @@ class QueryCacheKey {
   final int? limit;
   final int? offset;
   final List<JoinClause>? joins;
+  
+  /// whether the cache is user-managed
+  /// true: user explicitly created through useQueryCache(), will not expire automatically
+  /// false: system-created cache, will expire automatically when records are modified
+  final bool isUserManaged;
 
   QueryCacheKey({
     required this.tableName,
@@ -85,6 +167,7 @@ class QueryCacheKey {
     this.limit,
     this.offset,
     this.joins,
+    this.isUserManaged = false,
   });
 
   @override
@@ -104,6 +187,7 @@ class QueryCacheKey {
                 'secondKey': j.secondKey,
               })
           .toList(),
+      'isUserManaged': isUserManaged,
     });
   }
 
@@ -116,6 +200,7 @@ class QueryCacheKey {
         _listEquals(other.orderBy, orderBy) &&
         other.limit == limit &&
         other.offset == offset &&
+        other.isUserManaged == isUserManaged &&
         _joinsEquals(other.joins, joins);
   }
 
@@ -127,6 +212,7 @@ class QueryCacheKey {
       orderBy?.join(','),
       limit,
       offset,
+      isUserManaged,
       joins?.map((j) => j.toString()).join(';'),
     );
   }
