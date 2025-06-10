@@ -131,7 +131,7 @@ class ToStore implements DataStoreInterface {
   ///   ],
   ///   indexes: [
   ///     IndexSchema(
-  ///       fields: ['userName'],
+  ///       fields: `['userName']`,
   ///     ),
   ///   ],
   /// ));
@@ -213,7 +213,7 @@ class ToStore implements DataStoreInterface {
   /// // Use directly as a Stream with listen
   /// db.streamQuery('users')
   ///   .where('age', '>', 18)
-  ///   .select(['name', 'email'])
+  ///   .select(`['name', 'email']`)
   ///   .listen((user) {
   ///     print(user);
   ///   });
