@@ -1722,30 +1722,32 @@ class MigrationManager {
         }
 
         // Check if should cache table (only when current space and table allow full table cache)
-        bool shouldCache = space == _dataStore.currentSpaceName && 
-              await _dataStore.tableDataManager.allowFullTableCache(currentTableName);
-        final List<Map<String, dynamic>> allMigratedRecords = <Map<String, dynamic>>[];
+        bool shouldCache = space == _dataStore.currentSpaceName &&
+            await _dataStore.tableDataManager
+                .allowFullTableCache(currentTableName);
+        final List<Map<String, dynamic>> allMigratedRecords =
+            <Map<String, dynamic>>[];
 
         // Process data migration based on migration type, collect records for cache
         if (renameOp != null && renameOp.newTableName != null) {
           // use high performance batch processing method instead of stream processing
-          await migrationInstance.tableDataManager.rewriteRecordsFromSourceTable(
+          await migrationInstance.tableDataManager
+              .rewriteRecordsFromSourceTable(
             sourceTableName: originalTableName,
             targetTableName: currentTableName,
             processFunction: (records, partitionIndex) async {
               // apply migration operations to records
               final modifiedRecords = _applyMigrationOperations(
-                records, sortedOperations,
-                oldSchema: oldSchema
-              );
-              
+                  records, sortedOperations,
+                  oldSchema: oldSchema);
+
               // if need cache, collect records
               if (shouldCache) {
-                allMigratedRecords.addAll(
-                  modifiedRecords.map((r) => Map<String, dynamic>.from(r)).toList()
-                );
+                allMigratedRecords.addAll(modifiedRecords
+                    .map((r) => Map<String, dynamic>.from(r))
+                    .toList());
               }
-              
+
               return modifiedRecords;
             },
           );
@@ -1763,29 +1765,29 @@ class MigrationManager {
                 final migratedRecords = _applyMigrationOperations(
                     records, sortedOperations,
                     oldSchema: oldSchema);
-                    
+
                 // if need cache, collect records
                 if (shouldCache) {
-                  allMigratedRecords.addAll(
-                    migratedRecords.map((r) => Map<String, dynamic>.from(r)).toList()
-                  );
+                  allMigratedRecords.addAll(migratedRecords
+                      .map((r) => Map<String, dynamic>.from(r))
+                      .toList());
                 }
-                    
+
                 return migratedRecords;
               });
         }
-        
+
         // if collect records, add to cache
         if (allMigratedRecords.isNotEmpty) {
-            final schema = await _dataStore.getTableSchema(currentTableName);
-            if (schema != null) {
-              await _dataStore.dataCacheManager.cacheEntireTable(
-                currentTableName,
-                allMigratedRecords,
-                schema.primaryKey,
-                isFullTableCache: true,
-              );
-            }
+          final schema = await _dataStore.getTableSchema(currentTableName);
+          if (schema != null) {
+            await _dataStore.dataCacheManager.cacheEntireTable(
+              currentTableName,
+              allMigratedRecords,
+              schema.primaryKey,
+              isFullTableCache: true,
+            );
+          }
         }
 
         // update task status

@@ -60,7 +60,7 @@ class RecordDeleteEntry {
     required this.data,
     required this.timestamp,
   });
-  
+
   // Add toJson method for serialization
   Map<String, dynamic> toJson() {
     return {
@@ -68,7 +68,7 @@ class RecordDeleteEntry {
       'timestamp': timestamp.toIso8601String(),
     };
   }
-  
+
   // Add fromJson factory method for deserialization
   factory RecordDeleteEntry.fromJson(Map<String, dynamic> json) {
     return RecordDeleteEntry(

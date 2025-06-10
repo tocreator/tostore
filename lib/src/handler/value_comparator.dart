@@ -59,7 +59,7 @@ class ValueComparator {
       // 2. When length is the same, directly use string comparison
       return aStr.compareTo(bStr);
     }
-    
+
     // Natural sorting for strings with embedded numbers (third priority)
     if (a is String && b is String) {
       int result = _compareStringsNaturally(aStr, bStr);
@@ -69,28 +69,29 @@ class ValueComparator {
     // Default: standard string comparison
     return aStr.compareTo(bStr);
   }
-  
+
   /// Natural sorting comparison of two strings (handle numbers in strings)
   static int _compareStringsNaturally(String a, String b) {
     // Check if digital-aware comparison is needed
     bool aHasDigit = RegExp(r'\d').hasMatch(a);
     bool bHasDigit = RegExp(r'\d').hasMatch(b);
-    
+
     if (!aHasDigit || !bHasDigit) {
       return 0; // At least one string does not have a number, use standard comparison
     }
-    
+
     // Split string into list of letter and number parts
     List<_StringPart> aParts = _splitStringIntoParts(a);
     List<_StringPart> bParts = _splitStringIntoParts(b);
-    
+
     // Compare each part
-    int minLength = aParts.length < bParts.length ? aParts.length : bParts.length;
-    
+    int minLength =
+        aParts.length < bParts.length ? aParts.length : bParts.length;
+
     for (int i = 0; i < minLength; i++) {
       _StringPart aPart = aParts[i];
       _StringPart bPart = bParts[i];
-      
+
       // If two parts are of the same type
       if (aPart.isNumeric == bPart.isNumeric) {
         if (aPart.isNumeric) {
@@ -109,22 +110,22 @@ class ValueComparator {
         return aPart.isNumeric ? -1 : 1;
       }
     }
-    
+
     // If the previous parts are equal, the shorter string is smaller
     return aParts.length.compareTo(bParts.length);
   }
-  
+
   /// Split string into letter and number parts
   static List<_StringPart> _splitStringIntoParts(String input) {
     List<_StringPart> parts = [];
     StringBuffer currentPart = StringBuffer();
     bool isNumeric = false;
     bool hasStarted = false;
-    
+
     for (int i = 0; i < input.length; i++) {
       String char = input[i];
       bool charIsDigit = RegExp(r'\d').hasMatch(char);
-      
+
       if (!hasStarted) {
         // The first character
         currentPart.write(char);
@@ -140,12 +141,12 @@ class ValueComparator {
         isNumeric = charIsDigit;
       }
     }
-    
+
     // Add the last part
     if (currentPart.isNotEmpty) {
       parts.add(_StringPart(currentPart.toString(), isNumeric));
     }
-    
+
     return parts;
   }
 
@@ -332,9 +333,9 @@ class ValueComparator {
 class _StringPart {
   final String value;
   final bool isNumeric;
-  
+
   _StringPart(this.value, this.isNumeric);
-  
+
   @override
   String toString() {
     return '$value (${isNumeric ? 'num' : 'text'})';

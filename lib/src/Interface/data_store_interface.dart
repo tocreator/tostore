@@ -34,7 +34,8 @@ abstract class DataStoreInterface {
 
   /// batch insert data, returns the operation result with successful and failed keys
   Future<DbResult> batchInsert(
-      String tableName, List<Map<String, dynamic>> records, {bool allowPartialErrors = true});
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true});
 
   /// update data
   UpdateBuilder update(String tableName, Map<String, dynamic> data);

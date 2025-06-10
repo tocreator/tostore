@@ -433,7 +433,8 @@ class TostoreExample {
     // custom condition function - flexible handling of any complex logic
     final customCondition = QueryCondition().whereCustom((record) {
       // for example: check if the tag contains 'recommend'
-      return record['tags'] != null && record['tags'].toString().contains('recommend');
+      return record['tags'] != null &&
+          record['tags'].toString().contains('recommend');
     });
 
     // query condition nesting example - show infinite nesting ability
@@ -485,8 +486,6 @@ class TostoreExample {
       'created_at': DateTime.now().toIso8601String(),
     });
 
-
-
     // multi-table join query - post, author and comment
     final postsWithComments = await db
         .query('posts')
@@ -505,7 +504,6 @@ class TostoreExample {
     for (var item in postsWithComments.data) {
       log('post: ${item['title']}, author: ${item['author']}, comment: ${item['comment']}');
     }
-
   }
 }
 
@@ -524,4 +522,3 @@ void main() async {
     ),
   ));
 }
-

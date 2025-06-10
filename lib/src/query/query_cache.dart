@@ -38,7 +38,8 @@ class QueryCache {
 
   /// cache query results
   void put(String key, List<Map<String, dynamic>> results, String tableName,
-      String primaryKeyField, {Duration? expiryDuration}) {
+      String primaryKeyField,
+      {Duration? expiryDuration}) {
     if (_cache.length >= _maxSize) {
       // Find and remove the oldest cache entry by last access time
       final oldest = _cache.entries.reduce((a, b) =>
@@ -47,7 +48,7 @@ class QueryCache {
     }
 
     final now = DateTime.now();
-    
+
     // Calculate expiry time if provided
     DateTime? expiryTime;
     if (expiryDuration != null) {
@@ -68,7 +69,7 @@ class QueryCache {
   void invalidate(String key) {
     _cache.remove(key);
   }
-  
+
   /// invalidate a specific query
   /// returns 1 if removed, 0 if not found
   int invalidateQuery(String queryKey) {
@@ -83,12 +84,12 @@ class QueryCache {
   void clear() {
     _cache.clear();
   }
-  
+
   /// Evict expired and least recently used entries to make room
   void evictStaleEntries() {
     try {
       final now = DateTime.now();
-      
+
       // First remove expired entries
       final expiredKeys = <String>[];
       _cache.forEach((key, value) {
@@ -96,23 +97,24 @@ class QueryCache {
           expiredKeys.add(key);
         }
       });
-      
+
       for (final key in expiredKeys) {
         _cache.remove(key);
       }
-      
+
       // If still over capacity, remove oldest entries by last access time
       if (_cache.length >= _maxSize) {
         final sortedEntries = _cache.entries.toList()
-          ..sort((a, b) => 
-              a.value.lastAccessed.compareTo(b.value.lastAccessed));
-        
+          ..sort(
+              (a, b) => a.value.lastAccessed.compareTo(b.value.lastAccessed));
+
         // Remove oldest entries until under capacity
-        final removeCount = (_cache.length * 0.2).ceil(); // Remove 20% of entries
+        final removeCount =
+            (_cache.length * 0.2).ceil(); // Remove 20% of entries
         for (int i = 0; i < removeCount && i < sortedEntries.length; i++) {
           _cache.remove(sortedEntries[i].key);
         }
-        
+
         Logger.debug(
           'Evicted $removeCount stale query cache entries, remaining: ${_cache.length}',
           label: 'QueryCache.evictStaleEntries',
@@ -154,7 +156,7 @@ class QueryCacheKey {
   final int? limit;
   final int? offset;
   final List<JoinClause>? joins;
-  
+
   /// whether the cache is user-managed
   /// true: user explicitly created through useQueryCache(), will not expire automatically
   /// false: system-created cache, will expire automatically when records are modified

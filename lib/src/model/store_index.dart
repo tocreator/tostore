@@ -31,7 +31,7 @@ class StoreIndex {
           clusterId: parts.length > 3 ? int.parse(parts[3]) : null,
           nodeId: parts.length > 4 ? int.parse(parts[4]) : null,
         );
-      } 
+      }
       // new format (offset:partitionId) or (offset:partitionId:clusterId:nodeId)
       else {
         return StoreIndex(

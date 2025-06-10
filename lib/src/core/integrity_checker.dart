@@ -315,18 +315,21 @@ class IntegrityChecker {
 
       // Use processIndexPartitions instead of getIndexPartitions to count entries
       int totalIndexEntries = 0;
-      final countSuccess = await _dataStore.indexManager?.processIndexPartitions(
+      final countSuccess =
+          await _dataStore.indexManager?.processIndexPartitions(
         tableName,
         index.actualIndexName,
         processor: (_, meta, __) async {
           totalIndexEntries += meta.entries;
           return true; // Continue processing all partitions
         },
-        updateMetadata: false, // Read-only operation, no need to update metadata
+        updateMetadata:
+            false, // Read-only operation, no need to update metadata
       );
 
       if (countSuccess != true) {
-        Logger.error('Index ${index.actualIndexName} partitions not found or processing failed',
+        Logger.error(
+            'Index ${index.actualIndexName} partitions not found or processing failed',
             label: 'IntegrityChecker._validateIndex');
         return false;
       }

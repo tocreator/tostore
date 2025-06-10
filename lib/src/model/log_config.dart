@@ -26,7 +26,7 @@ class LogConfig {
   static LogLevel get logLevel => _logLevel;
 
   /// Log callback method, for custom log processing
-  /// 
+  ///
   /// Parameters:
   /// - `message`: The log content message
   /// - `type`: The log type (debug, info, warn, error)
@@ -51,7 +51,7 @@ class LogConfig {
   }
 
   /// Configure log settings
-  /// 
+  ///
   /// Parameters:
   /// - `enableLog`: Whether to enable logging
   /// - `logLevel`: The minimum log level to display

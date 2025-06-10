@@ -164,7 +164,8 @@ class DataStoreConfig {
 
   /// Determine if query cache should be enabled by default based on platform
   /// Returns true for client platforms, false for server platforms
-  bool get shouldEnableQueryCache => enableQueryCache ?? _getDefaultQueryCacheEnabled();
+  bool get shouldEnableQueryCache =>
+      enableQueryCache ?? _getDefaultQueryCacheEnabled();
 
   /// get default schema cache size
   static int _getDefaultSchemaCacheSize() {

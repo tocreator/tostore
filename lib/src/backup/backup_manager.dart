@@ -199,18 +199,17 @@ class BackupManager {
       // First ensure the target directory exists
       await _dataStore.storage.ensureDirectoryExists(destPath);
 
-      
-        final items = await _dataStore.storage.listDirectory(sourcePath);
-        for (final itemPath in items) {
-          final fileName = _getFileName(itemPath);
-          final targetItemPath = pathJoin(destPath, fileName);
-          
-          if (await _isDirectory(itemPath)) {
-            await _safeCopyDirectory(itemPath, targetItemPath);
-          } else {
-            await _safeCopyFile(itemPath, targetItemPath);
-          }
+      final items = await _dataStore.storage.listDirectory(sourcePath);
+      for (final itemPath in items) {
+        final fileName = _getFileName(itemPath);
+        final targetItemPath = pathJoin(destPath, fileName);
+
+        if (await _isDirectory(itemPath)) {
+          await _safeCopyDirectory(itemPath, targetItemPath);
+        } else {
+          await _safeCopyFile(itemPath, targetItemPath);
         }
+      }
     } catch (e) {
       Logger.error('Error copying directory: $e',
           label: 'BackupManager._safeCopyDirectory');
