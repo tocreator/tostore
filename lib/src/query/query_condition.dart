@@ -477,7 +477,6 @@ class QueryCondition {
     };
   }
 
-
   /// Check if the condition is empty
   bool get isEmpty {
     return _root.children.isEmpty ||
@@ -816,8 +815,6 @@ class QueryCondition {
   }
 
   /// Add a custom condition using a user-provided function
-  /// Example:
-  /// whereCustom((record) => record['is_active'] == true)
   QueryCondition whereCustom(bool Function(Map<String, dynamic>) record) {
     final customNode = _ConditionNode(
       type: _NodeType.custom,
@@ -858,8 +855,6 @@ class QueryCondition {
   }
 
   /// Add a custom condition using a user-provided function with OR logic
-  /// Example:
-  /// orWhereCustom((record) => record['is_active'] == true)
   QueryCondition orWhereCustom(bool Function(Map<String, dynamic>) record) {
     return or().whereCustom(record);
   }
@@ -896,17 +891,16 @@ class QueryCondition {
       void Function(List<String>) setOrderBy,
       void Function(int) setLimit,
       void Function(int) setOffset) {
-    
     if (_orderBy != null && _orderBy!.isNotEmpty) {
       final existingOrderBy = getOrderBy() ?? [];
       existingOrderBy.addAll(_orderBy!);
       setOrderBy(existingOrderBy);
     }
-    
+
     if (_limit != null) {
       setLimit(_limit!);
     }
-    
+
     if (_offset != null) {
       setOffset(_offset!);
     }

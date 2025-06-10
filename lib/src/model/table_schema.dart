@@ -1226,21 +1226,7 @@ class PrimaryKeyConfig {
 /// - Supports different precision levels ([VectorPrecision])
 /// - Performs basic vector operations (normalization, dot product)
 /// - Ensures type safety and validation for vector operations
-///
-/// Example usage:
-/// ```dart
-/// // Create a vector from a list of doubles
-/// final vector = VectorData.fromList([0.1, 0.2, 0.3, 0.4]);
-///
-/// // Convert to normalized form (unit vector)
-/// final normalized = vector.normalize();
-///
-/// // Calculate similarity with another vector
-/// final similarity = normalized.dotProduct(anotherVector);
-///
-/// // Convert to binary format for storage
-/// final bytes = vector.toBytes();
-/// ```
+
 class VectorData {
   /// Internal storage of vector values
   final List<double> values;
@@ -1256,11 +1242,7 @@ class VectorData {
   /// Creates a vector from a list of double values
   ///
   /// This is the standard way to create a vector from application data.
-  ///
-  /// Example:
-  /// ```dart
-  /// final embedding = VectorData.fromList([0.42, -0.087, 0.34, ...]);
-  /// ```
+
   factory VectorData.fromList(List<num> list) {
     return VectorData(list.map((v) => v.toDouble()).toList(growable: false));
   }
@@ -1269,14 +1251,7 @@ class VectorData {
   ///
   /// The binary data must be in IEEE 754 double-precision format (8 bytes per value).
   /// The total length of the data must be a multiple of 8 bytes.
-  ///
-  /// Throws [ArgumentError] if the data length is not valid (must be multiple of 8 bytes).
-  ///
-  /// Example:
-  /// ```dart
-  /// // Restore a vector from stored binary data
-  /// final vector = VectorData.fromBytes(storedBinaryData);
-  /// ```
+
   factory VectorData.fromBytes(Uint8List bytes) {
     if (bytes.length % 8 != 0) {
       throw ArgumentError(
@@ -1350,15 +1325,7 @@ class VectorData {
   ///
   /// Normalization scales the vector so its magnitude (length) equals 1,
   /// which is useful for cosine similarity calculations.
-  ///
-  /// Returns a new [VectorData] instance with normalized values.
-  /// Returns a zero vector if the original vector has zero magnitude.
-  ///
-  /// Example:
-  /// ```dart
-  /// // Normalize a vector for cosine similarity comparison
-  /// final unitVector = embedding.normalize();
-  /// ```
+
   VectorData normalize() {
     final magnitude = _magnitude();
     if (magnitude == 0) {
@@ -1387,15 +1354,7 @@ class VectorData {
   ///
   /// The dot product is the sum of the products of corresponding elements.
   /// For normalized vectors, the dot product equals the cosine similarity.
-  ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// // Calculate similarity between two normalized vectors
-  /// final similarity = vector1.normalize().dotProduct(vector2.normalize());
-  /// // Values close to 1 indicate high similarity
-  /// ```
+
   double dotProduct(VectorData other) {
     if (dimensions != other.dimensions) {
       throw ArgumentError(
@@ -1418,15 +1377,7 @@ class VectorData {
   /// - 0 means vectors are orthogonal (unrelated)
   /// - -1 means vectors are exactly opposite
   ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// final similarity = queryVector.cosineSimilarity(documentVector);
-  /// if (similarity > 0.8) {
-  ///   print('High similarity match found');
-  /// }
-  /// ```
+
   double cosineSimilarity(VectorData other) {
     return normalize().dotProduct(other.normalize());
   }
@@ -1435,16 +1386,7 @@ class VectorData {
   ///
   /// Euclidean distance measures the straight-line distance between two points
   /// in vector space. Lower values indicate greater similarity.
-  ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// final distance = vector1.euclideanDistance(vector2);
-  /// if (distance < threshold) {
-  ///   print('Vectors are similar');
-  /// }
-  /// ```
+
   double euclideanDistance(VectorData other) {
     if (dimensions != other.dimensions) {
       throw ArgumentError(
@@ -1464,12 +1406,7 @@ class VectorData {
   ///
   /// Element-wise addition of corresponding values.
   ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// final combinedVector = vector1.add(vector2);
-  /// ```
+
   VectorData add(VectorData other) {
     if (dimensions != other.dimensions) {
       throw ArgumentError(
@@ -1487,13 +1424,7 @@ class VectorData {
   /// Subtracts another vector from this vector
   ///
   /// Element-wise subtraction of corresponding values.
-  ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// final differenceVector = vector1.subtract(vector2);
-  /// ```
+
   VectorData subtract(VectorData other) {
     if (dimensions != other.dimensions) {
       throw ArgumentError(
@@ -1511,12 +1442,7 @@ class VectorData {
   /// Scales this vector by a scalar value
   ///
   /// Multiplies each element by the given scale factor.
-  ///
-  /// Example:
-  /// ```dart
-  /// final doubledVector = vector.scale(2.0);
-  /// final halvedVector = vector.scale(0.5);
-  /// ```
+
   VectorData scale(double factor) {
     final result = List<double>.generate(
       dimensions,
@@ -1528,13 +1454,7 @@ class VectorData {
   /// Calculates the L1 (Manhattan) distance between this vector and another
   ///
   /// L1 distance is the sum of the absolute differences between corresponding elements.
-  ///
-  /// Throws [ArgumentError] if the vectors have different dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// final distance = vector1.manhattanDistance(vector2);
-  /// ```
+
   double manhattanDistance(VectorData other) {
     if (dimensions != other.dimensions) {
       throw ArgumentError(
@@ -1551,9 +1471,9 @@ class VectorData {
 
   /// Returns a subset of the vector with specified start and length
   ///
-  /// Creates a new vector containing elements from [start] to [start + length - 1].
+  /// Creates a new vector containing elements from `start` index to the index `start + length - 1`.
   ///
-  /// Throws [RangeError] if the range is out of bounds.
+  /// Throws RangeError if the range is out of bounds.
   ///
   /// Example:
   /// ```dart
@@ -1574,12 +1494,7 @@ class VectorData {
   /// Creates a new vector by concatenating this vector with another
   ///
   /// The resulting vector will have dimensions equal to the sum of both vectors' dimensions.
-  ///
-  /// Example:
-  /// ```dart
-  /// // Combine two embeddings into one longer vector
-  /// final combinedEmbedding = titleEmbedding.concat(bodyEmbedding);
-  /// ```
+
   VectorData concat(VectorData other) {
     final result = List<double>.from(values)..addAll(other.values);
     return VectorData(result);
@@ -1587,9 +1502,9 @@ class VectorData {
 
   /// Truncates a vector to the specified number of dimensions
   ///
-  /// Creates a new vector containing only the first [newDimensions] elements.
+  /// Creates a new vector containing only the first `newDimensions` elements.
   ///
-  /// Throws [ArgumentError] if newDimensions is greater than the current dimensions.
+  /// Throws ArgumentError if newDimensions is greater than the current dimensions.
   ///
   /// Example:
   /// ```dart
@@ -1609,7 +1524,6 @@ class VectorData {
 /// Vector field configuration
 ///
 /// Configures the properties of a vector field, such as dimensions and precision.
-/// This is used with [FieldSchema] when the field type is [DataType.vector].
 class VectorFieldConfig {
   /// Dimension of the vector
   ///
@@ -1620,9 +1534,6 @@ class VectorFieldConfig {
   /// Precision of vector data (bits per dimension)
   ///
   /// Controls how the vector is stored and the precision of calculations.
-  /// - [VectorPrecision.float64]: 64-bit double precision (default, highest precision)
-  /// - [VectorPrecision.float32]: 32-bit single precision (reduced memory usage)
-  /// - [VectorPrecision.int8]: 8-bit integers (quantized, significant memory savings)
   final VectorPrecision precision;
 
   /// Constructor

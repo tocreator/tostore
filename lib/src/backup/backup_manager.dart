@@ -309,8 +309,8 @@ class BackupManager {
   }
 
   /// Restore from backup
-  /// [ backupPath] is the path to the backup directory or zip file
-  /// [ deleteAfterRestore] is whether to delete the backup file after restore
+  /// `backupPath` is the path to the backup directory or zip file
+  /// `deleteAfterRestore` is whether to delete the backup file after restore
   Future<void> restore(String backupPath,
       {bool deleteAfterRestore = false}) async {
     try {
@@ -379,7 +379,7 @@ class BackupManager {
       Logger.info('Extracting zip backup to: $tempPath',
           label: 'BackupManager._extractZipBackup');
 
-      // 使用 PlatformHandler 的 extractZip 方法
+      // use PlatformHandler's extractZip method
       await PlatformHandler.extractZip(zipPath, tempPath);
 
       Logger.info('Zip backup extracted successfully',

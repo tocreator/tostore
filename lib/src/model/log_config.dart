@@ -25,10 +25,12 @@ class LogConfig {
   static LogLevel _logLevel = LogLevel.warn;
   static LogLevel get logLevel => _logLevel;
 
-  /// log callback method, for custom log processing
-  /// [message] log content
-  /// [type] log callback type (warn/error)
-  /// [label] log label
+  /// Log callback method, for custom log processing
+  /// 
+  /// Parameters:
+  /// - `message`: The log content message
+  /// - `type`: The log type (debug, info, warn, error)
+  /// - `label`: The log category label
   static void Function(String message, LogType type, String label)?
       onLogHandler;
 
@@ -48,7 +50,13 @@ class LogConfig {
     }
   }
 
-  /// configure log
+  /// Configure log settings
+  /// 
+  /// Parameters:
+  /// - `enableLog`: Whether to enable logging
+  /// - `logLevel`: The minimum log level to display
+  /// - `onLogHandler`: Custom log handler function
+  /// - `publicLabel`: Default label for logs
   static void setConfig({
     bool? enableLog,
     LogLevel? logLevel,

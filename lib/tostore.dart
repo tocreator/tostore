@@ -1,3 +1,15 @@
+/// Tostore is a high-performance distributed data storage engine that builds intelligent data networks
+/// using multi-partition parallel mechanisms and interconnected topologies.
+///
+/// Key features:
+/// - Precise table structure change detection and automatic migration
+/// - Encryption protection and multi-space architecture
+/// - Isolate parallel processing to fully utilize multi-core performance
+/// - Cross-platform support from mobile edge devices to cloud servers
+/// - Multiple distributed primary key algorithms and horizontal node expansion
+///
+/// Tostore provides a distributed data foundation for immersive virtual-real fusion,
+/// multimodal interaction, 3D spatial features, generative AI, and semantic vector space modeling.
 library tostore;
 
 export 'src/model/table_schema.dart';
