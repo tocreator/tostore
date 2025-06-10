@@ -26,11 +26,58 @@ class TostoreExample {
             FieldSchema(name: 'username', type: DataType.text, nullable: false),
             FieldSchema(name: 'email', type: DataType.text, nullable: false),
             FieldSchema(name: 'last_login', type: DataType.datetime),
+            FieldSchema(
+                name: 'is_active', type: DataType.boolean, defaultValue: true),
+            FieldSchema(name: 'age', type: DataType.integer),
+            FieldSchema(name: 'tags', type: DataType.text),
+            FieldSchema(name: 'type', type: DataType.text),
+            FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 0),
           ],
           indexes: [
             IndexSchema(fields: ['username'], unique: true),
             IndexSchema(fields: ['email'], unique: true),
             IndexSchema(fields: ['last_login'], unique: false),
+            IndexSchema(fields: ['is_active']),
+            IndexSchema(fields: ['type']),
+          ],
+        ),
+        const TableSchema(
+          name: 'posts',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'id',
+          ),
+          fields: [
+            FieldSchema(name: 'title', type: DataType.text, nullable: false),
+            FieldSchema(name: 'content', type: DataType.text),
+            FieldSchema(
+                name: 'user_id', type: DataType.integer, nullable: false),
+            FieldSchema(name: 'created_at', type: DataType.datetime),
+            FieldSchema(
+                name: 'is_published',
+                type: DataType.boolean,
+                defaultValue: true),
+          ],
+          indexes: [
+            IndexSchema(fields: ['user_id']),
+            IndexSchema(fields: ['created_at']),
+          ],
+        ),
+        const TableSchema(
+          name: 'comments',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'id',
+          ),
+          fields: [
+            FieldSchema(
+                name: 'post_id', type: DataType.integer, nullable: false),
+            FieldSchema(
+                name: 'user_id', type: DataType.integer, nullable: false),
+            FieldSchema(name: 'content', type: DataType.text, nullable: false),
+            FieldSchema(name: 'created_at', type: DataType.datetime),
+          ],
+          indexes: [
+            IndexSchema(fields: ['post_id']),
+            IndexSchema(fields: ['user_id']),
           ],
         ),
         const TableSchema(
@@ -348,6 +395,118 @@ class TostoreExample {
     final status = await db.queryMigrationTaskStatus(taskId);
     log('migration progress: ${status?.progressPercentage}%');
   }
+
+  /// Example: Complex nested queries with predefined conditions
+  Future<void> complexQueryExamples() async {
+    // prepare some test data
+    await db.insert('users', {
+      'username': 'active_user',
+      'email': 'active@example.com',
+      'is_active': true,
+      'age': 25,
+      'type': 'app',
+      'fans': 300,
+      'tags': 'recommend,hot,featured',
+      'last_login': DateTime.now().toIso8601String(),
+    });
+
+    await db.insert('users', {
+      'username': 'inactive_user',
+      'email': 'inactive@example.com',
+      'is_active': false,
+      'age': 30,
+      'type': 'web',
+      'fans': 150,
+      'tags': 'normal,newbie',
+      'last_login':
+          DateTime.now().subtract(const Duration(days: 30)).toIso8601String(),
+    });
+
+    // complex query condition nesting - pre-defined query condition module
+    final recentLoginCondition = QueryCondition().where('fans', '>=', 200);
+
+    final idCondition = QueryCondition()
+        .where('id', '>=', 1)
+        .orCondition(// orCondition is equivalent to OR condition combination
+            recentLoginCondition);
+
+    // custom condition function - flexible handling of any complex logic
+    final customCondition = QueryCondition().whereCustom((record) {
+      // for example: check if the tag contains 'recommend'
+      return record['tags'] != null && record['tags'].toString().contains('recommend');
+    });
+
+    // query condition nesting example - show infinite nesting ability
+    final result = await db
+        .query('users')
+        .where('is_active', '=', true)
+        .condition(QueryCondition() // query condition construction
+                .whereEqual('type', 'app')
+                .condition(idCondition) // nest again the defined conditions
+            )
+        .orCondition(customCondition) // or satisfy custom complex conditions
+        .limit(20);
+
+    for (var user in result.data) {
+      log('user: ${user['username']}, type: ${user['type']}, fans: ${user['fans']}, tags: ${user['tags']}');
+    }
+
+    // equivalent SQL:
+    // SELECT * FROM users
+    // WHERE is_active = true
+    //   AND (type = 'app' OR id >= 1 OR fans >= 200)
+    //   OR ([custom condition: tag contains 'recommend'])
+    // LIMIT 20
+  }
+
+  /// Example: Join queries with table relationships
+  Future<void> joinQueryExamples() async {
+    // prepare test data
+    // insert user
+    await db.insert('users', {
+      'username': 'blogger',
+      'email': 'blogger@example.com',
+      'is_active': true,
+    });
+
+    // insert post
+    await db.insert('posts', {
+      'title': 'how to use join to query',
+      'content': 'this is a post about join...',
+      'user_id': 1,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+
+    // insert comment
+    await db.insert('comments', {
+      'post_id': 1,
+      'user_id': 1,
+      'content': 'this is my own post comment',
+      'created_at': DateTime.now().toIso8601String(),
+    });
+
+
+
+    // multi-table join query - post, author and comment
+    final postsWithComments = await db
+        .query('posts')
+        .select([
+          'posts.id as post_id',
+          'posts.title',
+          'users.username as author',
+          'comments.content as comment',
+          'comments.created_at as comment_time'
+        ])
+        .join('users', 'posts.user_id', '=', 'users.id')
+        .join('comments', 'posts.user_id', '=', 'comments.user_id')
+        .where('posts.is_published', '=', true)
+        .orderByDesc('comments.created_at');
+
+    for (var item in postsWithComments.data) {
+      log('post: ${item['title']}, author: ${item['author']}, comment: ${item['comment']}');
+    }
+
+  }
 }
 
 /// Simple UI to run examples
@@ -357,14 +516,6 @@ void main() async {
   final example = TostoreExample();
   await example.initialize();
 
-  // Run examples
-  await example.userExamples();
-  await example.settingsExamples();
-  await example.multiSpaceExamples();
-  await example.advancedQueryExamples();
-  await example.backupExample();
-  await example.vectorExamples();
-
   runApp(const MaterialApp(
     home: Scaffold(
       body: Center(
@@ -373,3 +524,4 @@ void main() async {
     ),
   ));
 }
+

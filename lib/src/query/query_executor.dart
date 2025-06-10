@@ -706,26 +706,26 @@ class QueryExecutor {
     // Handle different operators
     switch (operator) {
       case '=':
-        return leftValue == rightValue;
+        return ValueComparator.compare(leftValue, rightValue) == 0;
       case '<':
         return leftValue != null &&
             rightValue != null &&
-            leftValue < rightValue;
+            ValueComparator.compare(leftValue, rightValue) < 0;
       case '>':
         return leftValue != null &&
             rightValue != null &&
-            leftValue > rightValue;
+            ValueComparator.compare(leftValue, rightValue) > 0;
       case '<=':
         return leftValue != null &&
             rightValue != null &&
-            leftValue <= rightValue;
+            ValueComparator.compare(leftValue, rightValue) <= 0;
       case '>=':
         return leftValue != null &&
             rightValue != null &&
-            leftValue >= rightValue;
+            ValueComparator.compare(leftValue, rightValue) >= 0;
       case '!=':
       case '<>':
-        return leftValue != rightValue;
+        return ValueComparator.compare(leftValue, rightValue) != 0;
       default:
         return false;
     }

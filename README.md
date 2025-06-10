@@ -118,6 +118,7 @@ await db.update('users', {'age': 31}).where('id', '=', 1);
 await db.delete('users').where('id', '!=', 1);
 
 // Chain queries - concise and powerful
+// Supported operators: =, !=, <>, >, <, >=, <=, LIKE, NOT LIKE, IN, NOT IN, BETWEEN, IS, IS NOT
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('name', 'like', '%John%')
@@ -125,6 +126,40 @@ final users = await db.query('users')
     .whereIn('id', [1, 2, 3])
     .orderByDesc('age')
     .limit(10);
+
+// Complex query condition nesting - Modular predefined query conditions
+final recentLoginCondition = QueryCondition()
+    .where('fans', '>=', 200);
+
+final idCondition = QueryCondition()
+    .where('id', '>=', 123)
+    .orCondition(  // orCondition is equivalent to OR condition combination
+        recentLoginCondition
+    );
+
+// Custom condition function - Flexible handling of any complex logic
+final customCondition = QueryCondition()
+    .whereCustom((record) {
+      // For example: check if tags contain 'recommended'
+      return record['tags'] != null && record['tags'].contains('recommended');
+    });
+
+// Query condition nesting example - Demonstrates unlimited nesting capability
+final result = await db.query('users')
+    .condition(      
+        QueryCondition()    // Query condition construction
+            .whereEqual('type', 'app')
+            .or()
+            .condition(idCondition)  // Nest previously defined conditions
+    )
+    .orCondition(customCondition)    // Or satisfy custom complex condition
+    .limit(20);
+// SQL equivalent: 
+// SELECT * FROM users 
+// WHERE (status = 'active' AND is_vip >= 1)
+//   AND (type = 'app' OR id >= 123 OR fans >= 200)
+//   OR ([custom condition: tags contain 'recommended'])
+// LIMIT 20
 
 // Smart storage - update if exists, insert if not
 await db.upsert('users', {
@@ -154,6 +189,23 @@ await db.setValue('isAgreementPrivacy', true, isGlobal: true);
 
 // Get global key-value data
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
+
+// Select specific fields query - Improve performance
+final userProfiles = await db.query('users')
+    .select(['id', 'username', 'email']) // Only return specified fields
+    .where('is_active', '=', true)
+    .limit(100);
+
+// Table join query - Multi-table data association
+final ordersWithUsers = await db.query('orders')
+    .select([
+      'orders.id', 
+      'orders.amount', 
+      'users.username as customer_name', // Using alias
+    ])
+    .join('users', 'orders.user_id', '=', 'users.id') // Inner join
+    .where('orders.amount', '>', 1000)
+    .limit(50);
 ```
 
 ## Integration for Frequent Startup Scenarios

@@ -87,7 +87,6 @@ Tostore 是一款高性能分布式数据存储引擎，采用多分区并行机
 
 - 🚀 **智能缓存与检索性能**
   - 多层级智能缓存机制，极速数据检索
-  - 启动预热缓存，显著提升应用启动速度
   - 与存储引擎深度融合的缓存策略
   - 自适应扩展，数据规模增长下保持稳定性能
 
@@ -118,6 +117,7 @@ await db.update('users', {'age': 31}).where('id', '=', 1);
 await db.delete('users').where('id', '!=', 1);
 
 // 链式查询 - 简洁而强大
+// 支持的操作符：=, !=, <>, >, <, >=, <=, LIKE, NOT LIKE, IN, NOT IN, BETWEEN, IS, IS NOT
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('name', 'like', '%John%')
@@ -125,6 +125,41 @@ final users = await db.query('users')
     .whereIn('id', [1, 2, 3])
     .orderByDesc('age')
     .limit(10);
+
+// 复杂查询条件嵌套 - 预定义构造查询条件模块化
+final recentLoginCondition = QueryCondition()
+    .where('fans', '>=', 200);
+
+final idCondition = QueryCondition()
+    .where('id', '>=', 123)
+    .orCondition(  // orCondition 相当于 OR 条件组合
+        recentLoginCondition
+    );
+
+// 自定义条件函数 - 灵活处理任何复杂逻辑
+final customCondition = QueryCondition()
+    .whereCustom((record) {
+      // 例如：判断标签包含'推荐'
+      return record['tags'] != null && record['tags'].contains('推荐');
+    });
+
+// 查询条件嵌套示例 - 展示无限嵌套能力
+final result = await db.query('users')
+    .condition(      
+        QueryCondition()    // 查询条件构造
+            .whereEqual('type', 'app')
+            .or()
+            .condition(idCondition)  // 再次嵌套已定义的条件
+    )
+    .orCondition(customCondition)    // 或满足自定义复杂条件
+    .limit(20);
+// SQL等价: 
+// SELECT * FROM users 
+// WHERE (status = 'active' AND is_vip >= 1)
+//   AND (type = 'app' OR id >= 123 OR fans >= 200)
+//   OR ([自定义条件：标签包含'推荐'])
+// LIMIT 20
+
 
 // 智能存储 - 存在则更新，不存在则插入
 await db.upsert('users', {
@@ -154,6 +189,24 @@ await db.setValue('isAgreementPrivacy', true);
 
 // 获取键值对数据
 final isAgreementPrivacy = await db.getValue('isAgreementPrivacy');
+
+// 选择特定字段查询 - 提高性能
+final userProfiles = await db.query('users')
+    .select(['id', 'username', 'email']) // 只返回指定字段
+    .where('is_active', '=', true)
+    .limit(100);
+
+// 表连接查询 - 多表数据关联
+final ordersWithUsers = await db.query('orders')
+    .select([
+      'orders.id', 
+      'orders.amount', 
+      'users.username as customer_name', // 使用别名
+    ])
+    .join('users', 'orders.user_id', '=', 'users.id') // 内连接
+    .where('orders.amount', '>', 1000)
+    .limit(50);
+
 ```
 
 ## 频繁启动场景集成

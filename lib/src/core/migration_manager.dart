@@ -1728,35 +1728,31 @@ class MigrationManager {
 
         // Process data migration based on migration type, collect records for cache
         if (renameOp != null && renameOp.newTableName != null) {
-          // create a stream transformer, apply migration operations
-          final recordStream = migrationInstance.tableDataManager
-              .streamRecords(originalTableName);
-
-          // create a modified record stream, apply migration operations
-          final modifiedRecordStream = recordStream.map((record) {
-            // apply migration operations to each record, directly use sorted operations
-            final modifiedRecords = _applyMigrationOperations(
-                [record], sortedOperations,
-                oldSchema: oldSchema);
-            final result = modifiedRecords.isNotEmpty ? modifiedRecords.first : record;
-            
-            // if need cache, collect records
-            if (shouldCache) {
-              allMigratedRecords.add(Map<String, dynamic>.from(result));
-            }
-            
-            return result;
-          });
-
-          // use stream batch processing method to rewrite to new table
-          await migrationInstance.tableDataManager.rewriteRecordsFromStream(
-            tableName: currentTableName,
-            recordStream: modifiedRecordStream,
-            batchSize: 500, // set appropriate batch size
+          // use high performance batch processing method instead of stream processing
+          await migrationInstance.tableDataManager.rewriteRecordsFromSourceTable(
+            sourceTableName: originalTableName,
+            targetTableName: currentTableName,
+            processFunction: (records, partitionIndex) async {
+              // apply migration operations to records
+              final modifiedRecords = _applyMigrationOperations(
+                records, sortedOperations,
+                oldSchema: oldSchema
+              );
+              
+              // if need cache, collect records
+              if (shouldCache) {
+                allMigratedRecords.addAll(
+                  modifiedRecords.map((r) => Map<String, dynamic>.from(r)).toList()
+                );
+              }
+              
+              return modifiedRecords;
+            },
           );
-
+          // record partition migration performance data
+          final migrationDuration = spaceStopwatch.elapsedMilliseconds;
           Logger.info(
-            'Table rename migration: $originalTableName -> $currentTableName completed',
+            'Table rename batch processing performance: $migrationDuration ms for table $originalTableName -> $currentTableName',
             label: 'MigrationManager._executeMigrationTask',
           );
         } else {

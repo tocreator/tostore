@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.5
+
+### Added
+- Added `useQueryCache` and `clearQueryCache` APIs for fine-grained developer control over query caching
+- Enhanced query capabilities with new `condition`, `whereCustom` methods and `QueryCondition` builder
+- Implemented support for infinitely nestable complex query conditions with fully customizable data retrieval logic
+
+### Changed
+- Optimized indexing algorithms for improved data retrieval performance
+- Enhanced parallel processing mechanism for data migrations, increasing migration efficiency
+- Improved documentation examples with additional complex query scenarios
+
+### Fixed
+- Fixed issue where primary keys were not properly included in regular field indexes
+- Resolved JOIN operation failures when primary and foreign keys had different types
+- Implemented automatic repair for corrupted index structures, improving system stability
+
 ## 2.0.3
 
 ### Changed

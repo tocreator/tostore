@@ -3578,6 +3578,85 @@ class TableDataManager {
     }
   }
 
+  /// Rewrite records from source table to target table using batch processing
+  /// This is optimized for table renaming operations, much faster than using stream approach
+  Future<void> rewriteRecordsFromSourceTable({
+    required String sourceTableName,
+    required String targetTableName,
+    required Future<List<Map<String, dynamic>>> Function(
+      List<Map<String, dynamic>> records,
+      int partitionIndex,
+    ) processFunction,
+    List<int>? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    try {
+      // Get source table meta
+      final sourceFileMeta = await getTableFileMeta(sourceTableName);
+      if (sourceFileMeta == null || sourceFileMeta.partitions == null) {
+        return;
+      }
+
+      // Get source table schema
+      final sourceSchema = await _dataStore.getTableSchema(sourceTableName);
+      if (sourceSchema == null) {
+        return;
+      }
+      final isGlobal = sourceSchema.isGlobal;
+      final primaryKey = sourceSchema.primaryKey;
+
+      // Collect all partition meta for later update table meta
+      final List<PartitionMeta> allPartitionMetas = [];
+
+      // Process all partitions from source table
+      await processPartitionsConcurrently<void>(
+        partitionIndexes:
+            sourceFileMeta.partitions!.map((p) => p.index).toList(),
+        processFunction: (partitionIndex) async {
+          // Read source partition data
+          final records = await readRecordsFromPartition(
+              sourceTableName, isGlobal, partitionIndex, primaryKey,
+              encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+
+          // Process data with transformation function
+          final processedRecords =
+              await processFunction(records, partitionIndex);
+
+          // Write to target table with same partition index
+          final partitionMeta = await _savePartitionFile(
+            targetTableName,
+            isGlobal,
+            partitionIndex,
+            processedRecords,
+            primaryKey,
+            [], // No existing partitions for target table
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            updateTableMeta: false, // Don't update table meta yet
+            recordsToIndex: processedRecords, // Create indexes for all records
+          );
+
+          // Collect partition meta, for later update table meta
+          allPartitionMetas.add(partitionMeta);
+        },
+        requireLock: true,
+        description:
+            'rewrite from source to target: $sourceTableName -> $targetTableName',
+      );
+
+      // Update target table meta with all collected partitions
+      if (allPartitionMetas.isNotEmpty) {
+        await _updateTableMetadataWithAllPartitions(
+            targetTableName, allPartitionMetas, []);
+      }
+    } catch (e, stack) {
+      Logger.error(
+        'Failed to rewrite records from source table: $e\n$stack',
+        label: 'TableDataManager.rewriteRecordsFromSourceTable',
+      );
+    }
+  }
+
   /// check if primary key is ordered type
   Future<bool> _isPrimaryKeyOrdered(String tableName) async {
     try {
