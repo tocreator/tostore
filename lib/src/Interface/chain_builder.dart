@@ -83,28 +83,26 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   /// Add a predefined condition to this query with AND logic
   SELF condition(QueryCondition condition) {
     _condition.condition(condition);
-    
+
     condition.$internalApplySettings(
-      () => _orderBy,
-      (orderBy) => _orderBy = orderBy,
-      (limit) => _limit = limit,
-      (offset) => _offset = offset
-    );
-    
+        () => _orderBy,
+        (orderBy) => _orderBy = orderBy,
+        (limit) => _limit = limit,
+        (offset) => _offset = offset);
+
     return _self;
   }
 
   /// orCondition condition - adds OR logic
   SELF orCondition(QueryCondition condition) {
     _condition.orCondition(condition);
-    
+
     condition.$internalApplySettings(
-      () => _orderBy,
-      (orderBy) => _orderBy = orderBy,
-      (limit) => _limit = limit,
-      (offset) => _offset = offset
-    );
-    
+        () => _orderBy,
+        (orderBy) => _orderBy = orderBy,
+        (limit) => _limit = limit,
+        (offset) => _offset = offset);
+
     return _self;
   }
 
@@ -157,16 +155,12 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   }
 
   /// Add a custom condition using a user-provided function
-  /// Example:
-  /// whereCustom((record) => record['is_active'] == true)
   SELF whereCustom(bool Function(Map<String, dynamic>) record) {
     _condition.whereCustom(record);
     return _self;
   }
 
   /// Add a custom condition using a user-provided function with OR logic
-  /// Example:
-  /// orWhereCustom((record) => record['is_active'] == true)
   SELF orWhereCustom(bool Function(Map<String, dynamic>) record) {
     _condition.orWhereCustom(record);
     return _self;

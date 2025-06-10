@@ -97,10 +97,8 @@ class DbResult {
   /// Get number of failed records
   int get failedCount => failedKeys.length;
 
-
   /// Whether it is a resource not found error
   bool get isNotFound => type == ResultType.notFound;
-
 
   /// Whether the operation succeeded but no records were affected
   bool get isEmptySuccess => isSuccess && successKeys.isEmpty;
@@ -136,7 +134,7 @@ class DbResult {
     );
   }
 
-  /// Helper method to extract a List<String> from JSON
+  /// Helper method to extract a List from JSON
   static List<String> _extractStringList(dynamic value) {
     if (value == null) {
       return const [];

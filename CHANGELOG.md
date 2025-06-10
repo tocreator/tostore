@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.0.5
+## 2.0.6
 
 ### Added
 - Added `useQueryCache` and `clearQueryCache` APIs for fine-grained developer control over query caching
