@@ -2586,7 +2586,10 @@ class TableDataManager {
 
   Future<Map<String, dynamic>?> getRecordByPointer(
       String tableName, StoreIndex pointer,
-      {List<int>? encryptionKey, int? encryptionKeyId}) async {
+      {List<int>? encryptionKey,
+      int? encryptionKeyId,
+      String? fieldName,
+      dynamic expectedValue}) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
       if (schema == null) {
@@ -2600,6 +2603,8 @@ class TableDataManager {
         recordIndex: pointer.offset,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        fieldName: fieldName,
+        expectedValue: expectedValue,
       );
 
       return records.isNotEmpty ? records.first : null;
@@ -2729,6 +2734,8 @@ class TableDataManager {
     int? recordIndex,
     List<int>? encryptionKey,
     int? encryptionKeyId,
+    String? fieldName,
+    dynamic expectedValue,
   }) async {
     final partitionPath = await _dataStore.pathManager
         .getPartitionFilePath(tableName, partitionIndex);
@@ -2796,12 +2803,87 @@ class TableDataManager {
         await updateTableFileMeta(tableName, updatedMeta);
       }
 
-      // If a specific record is requested, find it
+      // if request specific record (by index position)
       if (recordIndex != null) {
+        // check if index is in valid range
         if (recordIndex >= 0 && recordIndex < partitionInfo.data.length) {
           final record =
               partitionInfo.data[recordIndex] as Map<String, dynamic>;
-          return [record];
+
+          // if no expected value and field is provided, return the record directly
+          if (fieldName == null || expectedValue == null) {
+            return [record];
+          }
+
+          // if expected value and field are provided, verify if the record matches
+          if (record.containsKey(fieldName) &&
+              ValueComparator.compare(record[fieldName], expectedValue) == 0) {
+            // record matches, return directly
+            return [record];
+          } else if (record.isNotEmpty) {
+            // record does not match, but there is a valid record, indicating that the index position may be inaccurate
+            Logger.warn(
+              'Index position record does not match, find correct record in partition $partitionIndex: expected $fieldName=$expectedValue, actual: ${record[fieldName]}',
+              label: 'TableDataManager.readRecordsFromPartition',
+            );
+          }
+
+          // index is inaccurate, scan the entire partition to find the matching record
+          for (int i = 0; i < partitionInfo.data.length; i++) {
+            final currentRecord = partitionInfo.data[i] as Map<String, dynamic>;
+            if (currentRecord.isNotEmpty &&
+                currentRecord.containsKey(fieldName) &&
+                ValueComparator.compare(
+                        currentRecord[fieldName], expectedValue) ==
+                    0) {
+              // found matching record, update index
+              if (i != recordIndex) {
+                // try to update index (here only add log, actual index update needs to call index manager)
+                try {
+                  // find table schema to get more information
+                  final schema = await _dataStore.getTableSchema(tableName);
+                  if (schema != null) {
+                    // create new index pointer
+                    final newPointer = await StoreIndex.create(
+                        offset: i,
+                        partitionId: partitionIndex,
+                        clusterId: _dataStore
+                                .config.distributedNodeConfig.enableDistributed
+                            ? _dataStore.config.distributedNodeConfig.clusterId
+                            : null,
+                        nodeId: _dataStore
+                                .config.distributedNodeConfig.enableDistributed
+                            ? _dataStore.config.distributedNodeConfig.nodeId
+                            : null);
+
+                    // update index (may need additional processing in actual business)
+                    // here only add log, actual index update needs to call index manager
+                    Logger.debug(
+                      'Index pointer needs to be updated: value=$fieldName=$expectedValue, new pointer=$newPointer',
+                      label: 'TableDataManager.readRecordsFromPartition',
+                    );
+
+                    // if there is index manager, try to update index
+                    if (_dataStore.indexManager != null &&
+                        fieldName == schema.primaryKey) {
+                      // use updateIndexes method to update index, it will update all necessary indexes
+                      await _dataStore.indexManager
+                          ?.updateIndexes(tableName, currentRecord, newPointer);
+                    }
+                  }
+                } catch (updateError) {
+                  Logger.error(
+                    'Failed to update index: $updateError',
+                    label: 'TableDataManager.readRecordsFromPartition',
+                  );
+                }
+              }
+
+              // return found matching record
+              return [currentRecord];
+            }
+          }
+          return [];
         }
         return [];
       }
@@ -3633,7 +3715,6 @@ class TableDataManager {
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             updateTableMeta: false, // Don't update table meta yet
-            recordsToIndex: processedRecords, // Create indexes for all records
           );
 
           // Collect partition meta, for later update table meta

@@ -1069,14 +1069,18 @@ class QueryExecutor {
 
       // get search value
       dynamic searchValue;
+      // get field name for comparison
+      String fieldName;
       if (actualIndexName.startsWith('pk_')) {
         searchValue = conditions[schema.primaryKey];
+        fieldName = schema.primaryKey;
       } else {
         // for normal index, find index info from schema.indexes
         final indexSchema = schema.indexes.firstWhere(
           (idx) => idx.actualIndexName == indexName,
         );
         searchValue = conditions[indexSchema.fields.first];
+        fieldName = indexSchema.fields.first;
       }
       if (searchValue == null) {
         return _performTableScan(tableName, queryCondition);
@@ -1114,9 +1118,16 @@ class QueryExecutor {
           continue;
         }
 
-        // get record by store index
-        final record = await _dataStore.tableDataManager
-            .getRecordByPointer(tableName, storeIndex);
+        // get actual value for comparison
+        dynamic actualValue = searchValue;
+        if (searchValue is Map && searchValue.containsKey('=')) {
+          actualValue = searchValue['='];
+        }
+
+        // get record, pass field name and expected value for verification
+        final record = await _dataStore.tableDataManager.getRecordByPointer(
+            tableName, storeIndex,
+            fieldName: fieldName, expectedValue: actualValue);
 
         if (record != null) {
           // apply additional conditions (if any)
@@ -1130,14 +1141,9 @@ class QueryExecutor {
         } else {
           // record not found, index expired, add to delete buffer
           Logger.debug(
-            'Detected expired index, adding to delete buffer: $tableName.$indexName: $searchValue -> $storeIndex',
+            'Detected expired index, adding to delete buffer: $tableName.$indexName: $actualValue -> $storeIndex',
             label: 'QueryExecutor._performIndexScan',
           );
-
-          dynamic actualValue = searchValue;
-          if (searchValue is Map && searchValue.containsKey('=')) {
-            actualValue = searchValue['='];
-          }
 
           // add to delete buffer for later cleanup
           await _indexManager.addToDeleteBuffer(
