@@ -10,6 +10,7 @@ import '../model/file_info.dart';
 import '../model/store_index.dart';
 import '../model/table_schema.dart';
 import '../handler/value_comparator.dart';
+import '../model/index_entry.dart';
 import 'crontab_manager.dart';
 import 'b_plus_tree.dart';
 import 'data_store_impl.dart';
@@ -33,11 +34,13 @@ class IndexManager {
   // Index access weight - table name + index name -> {weight: weight value, lastAccess: last access time}
   final Map<String, Map<String, dynamic>> _indexAccessWeights = {};
 
-  // Index write buffer - table name + index name -> {entries: Map<key value, Set<record ID>>, lastUpdate: last update time}
-  final Map<String, Map<String, dynamic>> _writeBuffer = {};
+  // Index write buffer - table name + index name -> Map<String, IndexBufferEntry>
+  // "tableName:indexName"，"indexKey|recordPointer"
+  final Map<String, Map<String, IndexBufferEntry>> _writeBuffer = {};
 
-  // Index delete buffer - table name + index name -> {entries: Map<key value, Set<record ID>>, lastUpdate: last update time}
-  final Map<String, Map<String, dynamic>> _deleteBuffer = {};
+  // Index delete buffer - table name + index name -> Map<String, IndexBufferEntry>
+  // "tableName:indexName"，"indexKey|recordPointer"
+  final Map<String, Map<String, IndexBufferEntry>> _deleteBuffer = {};
 
   // Index writing status - table name + index name -> whether writing
   final Map<String, bool> _indexWriting = {};
@@ -131,8 +134,8 @@ class IndexManager {
 
     // Check insert buffer
     for (final key in _writeBuffer.keys) {
-      final entries = _writeBuffer[key]?['entries'] as Map?;
-      if (entries != null && entries.length >= _fastProcessThreshold) {
+      if (_writeBuffer[key] != null &&
+          _writeBuffer[key]!.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
       }
@@ -140,8 +143,8 @@ class IndexManager {
 
     // Check delete buffer
     for (final key in _deleteBuffer.keys) {
-      final entries = _deleteBuffer[key]?['entries'] as Map?;
-      if (entries != null && entries.length >= _fastProcessThreshold) {
+      if (_deleteBuffer[key] != null &&
+          _deleteBuffer[key]!.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
       }
@@ -220,19 +223,14 @@ class IndexManager {
           int entries = 0;
 
           // Check insert buffer
-          if (_writeBuffer.containsKey(key)) {
-            final insertEntries = _writeBuffer[key]?['entries'] as Map?;
-            if (insertEntries != null && insertEntries.isNotEmpty) {
-              entries += insertEntries.length;
-            }
+          if (_writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty) {
+            entries += _writeBuffer[key]!.length;
           }
 
           // Check delete buffer
-          if (_deleteBuffer.containsKey(key)) {
-            final deleteEntries = _deleteBuffer[key]?['entries'] as Map?;
-            if (deleteEntries != null && deleteEntries.isNotEmpty) {
-              entries += deleteEntries.length;
-            }
+          if (_deleteBuffer.containsKey(key) &&
+              _deleteBuffer[key]!.isNotEmpty) {
+            entries += _deleteBuffer[key]!.length;
           }
 
           if (entries > 0) {
@@ -310,16 +308,14 @@ class IndexManager {
 
     // Add keys from insert buffer
     for (final key in _writeBuffer.keys) {
-      if (_writeBuffer[key]?['entries'] != null &&
-          (_writeBuffer[key]?['entries'] as Map).isNotEmpty) {
+      if (_writeBuffer[key] != null && _writeBuffer[key]!.isNotEmpty) {
         result.add(key);
       }
     }
 
     // Add keys from delete buffer
     for (final key in _deleteBuffer.keys) {
-      if (_deleteBuffer[key]?['entries'] != null &&
-          (_deleteBuffer[key]?['entries'] as Map).isNotEmpty) {
+      if (_deleteBuffer[key] != null && _deleteBuffer[key]!.isNotEmpty) {
         result.add(key);
       }
     }
@@ -335,16 +331,11 @@ class IndexManager {
       try {
         _indexWriting[key] = true;
 
-        // Extract data from insert buffer
-        final insertData = _writeBuffer[key];
-        // Extract data from delete buffer
-        final deleteData = _deleteBuffer[key];
-
         // Check if there's any data to process
-        bool hasInserts = insertData != null &&
-            (insertData['entries'] as Map?)?.isNotEmpty == true;
-        bool hasDeletes = deleteData != null &&
-            (deleteData['entries'] as Map?)?.isNotEmpty == true;
+        bool hasInserts =
+            _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
+        bool hasDeletes =
+            _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
 
         if (!hasInserts && !hasDeletes) {
           _indexWriting[key] = false;
@@ -367,27 +358,109 @@ class IndexManager {
           continue;
         }
 
-        // Process inserts and deletes
+        // Process inserts - new optimized approach
         if (hasInserts) {
-          final insertEntries =
-              insertData['entries'] as Map<dynamic, Set<dynamic>>;
+          final writeBuffer = _writeBuffer[key]!;
+          final maxBatchSize = _dataStore.config.maxBatchSize;
+          final maxPartitionFileSize = _dataStore.config.maxPartitionFileSize;
 
-          // Process inserts
-          await _writeIndexToFile(tableName, indexName, insertEntries);
+          // Get initial snapshot of buffer size to process in this run
+          final initialBufferSize = writeBuffer.length;
+          int processedCount = 0;
 
-          // Clear insert buffer
-          _writeBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
+          // Get last partition index and remaining size
+          int currentPartitionSize = indexMeta.partitions.isEmpty
+              ? 0
+              : indexMeta.partitions.last.fileSizeInBytes;
+          int remainingSpaceInPartition =
+              maxPartitionFileSize - currentPartitionSize;
+
+          // Process until we've completed the initial buffer size or no more data
+          while (processedCount < initialBufferSize && writeBuffer.isNotEmpty) {
+            // Determine optimal batch size based on remaining space and max batch size
+            final estimatedEntrySize =
+                100; // Approximate average size per entry
+            int optimalBatchSize = min(
+                min(
+                    maxBatchSize,
+                    writeBuffer
+                        .length), // Don't exceed buffer size or max batch
+                remainingSpaceInPartition ~/
+                    estimatedEntrySize // Don't exceed partition capacity
+                );
+
+            // Ensure we process at least some entries even if space is tight
+            optimalBatchSize = max(optimalBatchSize, 1);
+
+            // Take a batch of keys
+            final processingKeys =
+                writeBuffer.keys.take(optimalBatchSize).toList();
+            final currentBatchMap = <dynamic, Set<dynamic>>{};
+
+            // Convert to old format for this batch
+            for (final k in processingKeys) {
+              final entry = writeBuffer[k]!;
+              final indexKey = entry.indexEntry.indexKey;
+              final recordId = entry.indexEntry.recordPointer.toString();
+
+              if (!currentBatchMap.containsKey(indexKey)) {
+                currentBatchMap[indexKey] = <dynamic>{};
+              }
+              currentBatchMap[indexKey]!.add(recordId);
+            }
+
+            // Process this batch
+            await _writeIndexToFile(tableName, indexName, currentBatchMap);
+
+            // Remove processed entries immediately
+            for (final k in processingKeys) {
+              writeBuffer.remove(k);
+            }
+
+            // Update counters
+            processedCount += processingKeys.length;
+
+            // Get updated partition info
+            final updatedMeta = await _getIndexMeta(tableName, indexName);
+            if (updatedMeta != null) {
+              currentPartitionSize = updatedMeta.partitions.isEmpty
+                  ? 0
+                  : updatedMeta.partitions.last.fileSizeInBytes;
+              remainingSpaceInPartition =
+                  maxPartitionFileSize - currentPartitionSize;
+            } else {
+              // Reset if metadata not available
+              currentPartitionSize = 0;
+              remainingSpaceInPartition = maxPartitionFileSize;
+            }
+
+            // Small delay between batches
+            await Future.delayed(const Duration(milliseconds: 5));
+          }
         }
 
+        // Process deletes
         if (hasDeletes) {
-          final deleteEntries =
-              deleteData['entries'] as Map<dynamic, Set<dynamic>>;
+          // Get all entries at once
+          final deleteBuffer = _deleteBuffer[key]!;
+          final allDeleteEntries = <dynamic, Set<dynamic>>{};
 
-          // Process deletes
-          await _processDeleteEntries(tableName, indexName, deleteEntries);
+          // Convert all entries to old format
+          for (final entry in deleteBuffer.values) {
+            final indexKey = entry.indexEntry.indexKey;
+            final recordId = entry.indexEntry.recordPointer.toString();
 
-          // Clear delete buffer
-          _deleteBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
+            if (!allDeleteEntries.containsKey(indexKey)) {
+              allDeleteEntries[indexKey] = <dynamic>{};
+            }
+            allDeleteEntries[indexKey]!.add(recordId);
+          }
+
+          // Clear the buffer immediately to avoid duplicate processing
+          deleteBuffer.clear();
+
+          // Process all deletes
+          await _processDeleteEntries(tableName, indexName, allDeleteEntries);
         }
 
         // Update last write time
@@ -417,7 +490,10 @@ class IndexManager {
       // Process each delete entry by finding it in each partition
       await processIndexPartitions(tableName, indexName,
           processor: (_, __, btree) async {
-        for (final entry in entriesToDelete.entries) {
+        int processedCount = 0;
+        final entryList = entriesToDelete.entries.toList();
+
+        for (final entry in entryList) {
           final key = entry.key;
           final recordIds = entry.value;
 
@@ -429,8 +505,14 @@ class IndexManager {
             for (final existingValue in existingValues) {
               if (existingValue.toString() == recordId) {
                 await btree.delete(key, recordId);
+                processedCount++;
 
-                // because these indexes only have one record per key, no need to continue processing
+                // Give the main thread a break every 50 deletions
+                if (processedCount % 50 == 0) {
+                  await Future.delayed(const Duration(milliseconds: 1));
+                }
+
+                // For unique indexes, stop after first match since they only have one record per key
                 if (isUniqueIndex) {
                   return false; // stop processing more partitions
                 }
@@ -441,7 +523,7 @@ class IndexManager {
           }
         }
 
-        // for regular indexes, need to continue checking other partitions, because entries may be spread across multiple partitions
+        // For regular indexes, continue checking other partitions as entries may be spread across multiple partitions
         return true;
       });
 
@@ -467,16 +549,13 @@ class IndexManager {
       try {
         _indexWriting[key] = true;
 
-        // Extract data from insert buffer
-        final insertData = _writeBuffer[key];
-        // Extract data from delete buffer
-        final deleteData = _deleteBuffer[key];
+        // No need to extract data anymore, we'll use the collections directly
 
         // Check if there's any data to process
-        bool hasInserts = insertData != null &&
-            (insertData['entries'] as Map?)?.isNotEmpty == true;
-        bool hasDeletes = deleteData != null &&
-            (deleteData['entries'] as Map?)?.isNotEmpty == true;
+        bool hasInserts =
+            _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
+        bool hasDeletes =
+            _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
 
         if (!hasInserts && !hasDeletes) {
           _indexWriting[key] = false;
@@ -502,17 +581,22 @@ class IndexManager {
 
         // Process inserts (using batch mode)
         if (hasInserts) {
-          final entryList = (insertData['entries'] as Map).entries.toList();
+          final entryList = _writeBuffer[key]!.values.toList();
 
           for (int i = 0; i < entryList.length; i += batchSize) {
             final end = min(i + batchSize, entryList.length);
 
-            // Create current batch entries map
+            // Create current batch entries map for backward compatibility
             final batchEntries = <dynamic, Set<dynamic>>{};
             for (int j = i; j < end; j++) {
               final entry = entryList[j];
-              batchEntries[entry.key] =
-                  Set<dynamic>.from(entry.value as Set<dynamic>);
+              final indexKey = entry.indexEntry.indexKey;
+              final recordId = entry.indexEntry.recordPointer.toString();
+
+              if (!batchEntries.containsKey(indexKey)) {
+                batchEntries[indexKey] = <dynamic>{};
+              }
+              batchEntries[indexKey]!.add(recordId);
             }
 
             // Write current batch
@@ -525,37 +609,41 @@ class IndexManager {
           }
 
           // Clear insert buffer
-          _writeBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
+          _writeBuffer[key]!.clear();
         }
 
         // Process deletes (also in batch mode)
         if (hasDeletes) {
-          final deleteEntries =
-              deleteData['entries'] as Map<dynamic, Set<dynamic>>;
+          final entryList = _deleteBuffer[key]!.values.toList();
 
           // Process deletes in batches to avoid loading too many partitions at once
-          final deleteKeysList = deleteEntries.keys.toList();
-          for (int i = 0; i < deleteKeysList.length; i += batchSize) {
-            final end = min(i + batchSize, deleteKeysList.length);
+          for (int i = 0; i < entryList.length; i += batchSize) {
+            final end = min(i + batchSize, entryList.length);
 
-            // Create current batch delete map
+            // Create current batch delete map for backward compatibility
             final batchDeletes = <dynamic, Set<dynamic>>{};
             for (int j = i; j < end; j++) {
-              final key = deleteKeysList[j];
-              batchDeletes[key] = Set<dynamic>.from(deleteEntries[key]!);
+              final entry = entryList[j];
+              final indexKey = entry.indexEntry.indexKey;
+              final recordId = entry.indexEntry.recordPointer.toString();
+
+              if (!batchDeletes.containsKey(indexKey)) {
+                batchDeletes[indexKey] = <dynamic>{};
+              }
+              batchDeletes[indexKey]!.add(recordId);
             }
 
             // Process this batch of deletes
             await _processDeleteEntries(tableName, indexName, batchDeletes);
 
             // Small delay between batches
-            if (i + batchSize < deleteKeysList.length) {
+            if (i + batchSize < entryList.length) {
               await Future.delayed(const Duration(milliseconds: 5));
             }
           }
 
           // Clear delete buffer
-          _deleteBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
+          _deleteBuffer[key]!.clear();
         }
 
         // Update last write time
@@ -608,8 +696,7 @@ class IndexManager {
 
       // Check insert buffer
       for (final key in _writeBuffer.keys) {
-        final entries = _writeBuffer[key]?['entries'] as Map?;
-        if (entries != null && entries.isNotEmpty) {
+        if (_writeBuffer[key] != null && _writeBuffer[key]!.isNotEmpty) {
           hasChanges = true;
           break;
         }
@@ -618,8 +705,7 @@ class IndexManager {
       // Check delete buffer if insert buffer has no changes
       if (!hasChanges) {
         for (final key in _deleteBuffer.keys) {
-          final entries = _deleteBuffer[key]?['entries'] as Map?;
-          if (entries != null && entries.isNotEmpty) {
+          if (_deleteBuffer[key] != null && _deleteBuffer[key]!.isNotEmpty) {
             hasChanges = true;
             break;
           }
@@ -979,8 +1065,12 @@ class IndexManager {
       int currentSize =
           meta.partitions.isEmpty ? 0 : meta.partitions.last.fileSizeInBytes;
 
-      // If the current partition is close to the maximum size, create a new partition
-      if (currentSize > _dataStore.config.maxPartitionFileSize) {
+      // Calculate estimated size based on number of entries
+      // Use average size estimate: 100 bytes per key-value pair (conservative estimate)
+      int estimatedNewSize = currentSize + (entries.length * 100);
+
+      // If the estimated size exceeds the maximum file size, create a new partition
+      if (estimatedNewSize > _dataStore.config.maxPartitionFileSize) {
         partitionIndex++;
         currentSize = 0;
       }
@@ -1043,7 +1133,7 @@ class IndexManager {
 
           // Slight delay between batches to avoid blocking
           if (i + insertBatchSize < entryList.length) {
-            await Future.delayed(const Duration(milliseconds: 2));
+            await Future.delayed(const Duration(milliseconds: 1));
           }
         }
 
@@ -1096,7 +1186,7 @@ class IndexManager {
             }
           }
         } catch (e) {
-          // Calculation exception,不影响主流程
+          // Calculation exception, not affect main process
           Logger.debug('Failed to calculate index range: $e',
               label: 'IndexManager._writeIndexToFile');
         }
@@ -1692,39 +1782,7 @@ class IndexManager {
             }
           }
         } else {
-          // When there is no partition data, read directly from the stream
-          int recordIndex = 0;
-          await for (final record
-              in _dataStore.tableDataManager.streamRecords(tableName)) {
-            final primaryValue = record[primaryKey];
-            if (primaryValue == null) continue;
-
-            // Create record pointer
-            final recordPointer = await StoreIndex.create(
-              offset: recordIndex,
-              partitionId: 0, // Default partition
-              clusterId: clusterId,
-              nodeId: nodeId,
-            );
-
-            final recordId = recordPointer.toString();
-            recordIndex++;
-
-            // Process index logic, same as above
-            if (fields.length == 1) {
-              final fieldName = fields[0];
-              final fieldValue = record[fieldName];
-
-              if (fieldValue != null) {
-                await btree.insert(fieldValue, recordId);
-              }
-            } else {
-              final compositeKey = _createIndexKey(record, fields);
-              if (compositeKey != null) {
-                await btree.insert(compositeKey, recordId);
-              }
-            }
-          }
+          return;
         }
 
         // Serialize the B+ tree to a file
@@ -2921,28 +2979,37 @@ class IndexManager {
 
         // Initialize write buffer
         if (!_writeBuffer.containsKey(cacheKey)) {
-          _writeBuffer[cacheKey] = {
-            'entries': <dynamic, Set<dynamic>>{},
-            'lastUpdate': DateTime.now()
-          };
+          _writeBuffer[cacheKey] = <String, IndexBufferEntry>{};
         }
 
         // Merge updates
-        final queueData = _writeBuffer[cacheKey]!;
-        final entries = queueData['entries'] as Map<dynamic, Set<dynamic>>;
-
         for (final keyEntry in updates.entries) {
-          final key = keyEntry.key;
-          final values = keyEntry.value;
+          final indexKey = keyEntry.key;
+          final recordIds = keyEntry.value;
 
-          if (!entries.containsKey(key)) {
-            entries[key] = {};
+          for (final recordId in recordIds) {
+            final storeIndex = StoreIndex.fromString(recordId);
+            if (storeIndex == null) {
+              Logger.error('Invalid StoreIndex format: $recordId',
+                  label: 'IndexManager.batchUpdateIndexes');
+              continue;
+            }
+
+            // Generate unique key for buffer entry
+            final entryUniqueKey =
+                IndexBufferEntry.createUniqueKey(indexKey, recordId);
+
+            // Create IndexBufferEntry for insertion
+            final bufferEntry = IndexBufferEntry.forInsert(
+              indexKey: indexKey,
+              recordPointer: storeIndex,
+              timestamp: DateTime.now(),
+            );
+
+            // Add to buffer
+            _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
           }
-
-          entries[key]!.addAll(values);
         }
-
-        _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
         _indexLastWriteTime[cacheKey] = DateTime.now();
 
         // Update memory cache
@@ -4186,49 +4253,7 @@ class IndexManager {
           }
         }
       } else {
-        // When there is no partition data, read directly using stream
-        await for (final record
-            in _dataStore.tableDataManager.streamRecords(tableName)) {
-          final primaryValue = record[primaryKey];
-          if (primaryValue == null) continue;
-
-          // Create record pointer (approximate as we don't have position info)
-          final recordPointer = await StoreIndex.create(
-              offset: totalProcessed,
-              partitionId: 0,
-              clusterId: clusterId,
-              nodeId: nodeId);
-
-          final recordId = recordPointer.toString();
-
-          // Process fields
-          if (fields.length == 1) {
-            // Single field index
-            final fieldName = fields[0];
-            final fieldValue = record[fieldName];
-
-            if (fieldValue != null) {
-              await btree.insert(fieldValue, recordId);
-            }
-          } else {
-            // Composite index
-            final compositeKey = _createIndexKey(record, fields);
-            if (compositeKey != null) {
-              await btree.insert(compositeKey, recordId);
-            }
-          }
-
-          totalProcessed++;
-
-          // Report progress periodically
-          if (totalProcessed % 1000 == 0) {
-            Logger.info('Processed $totalProcessed records',
-                label: 'IndexManager._buildIndexOnMainThread');
-
-            // Add small delays to avoid blocking UI
-            await Future.delayed(const Duration(milliseconds: 5));
-          }
-        }
+        return;
       }
 
       // Calculate index value range (for primary key indexes)
@@ -4328,74 +4353,48 @@ class IndexManager {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
-      // Check if the entry is in delete buffer - if so, cancel out the operations
-      if (_deleteBuffer.containsKey(cacheKey)) {
-        final deleteData = _deleteBuffer[cacheKey]!;
-        final deleteEntries =
-            deleteData['entries'] as Map<dynamic, Set<dynamic>>?;
-
-        if (deleteEntries != null && deleteEntries.containsKey(key)) {
-          // Found matching key in delete buffer, check for matching record ID
-          if (deleteEntries[key]!.contains(storeIndexStr)) {
-            // Entry is in delete buffer, remove it from there instead of adding to insert buffer
-            deleteEntries[key]!.remove(storeIndexStr);
-
-            // If the key set is empty, remove the key
-            if (deleteEntries[key]!.isEmpty) {
-              deleteEntries.remove(key);
-            }
-
-            // Update last write time
-            _deleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
-            _indexLastWriteTime[cacheKey] = DateTime.now();
-
-            return; // Operations cancel out, no need to add to insert buffer
-          }
-        }
-      }
-
-      // Initialize insert buffer
-      if (!_writeBuffer.containsKey(cacheKey)) {
-        _writeBuffer[cacheKey] = {
-          'entries': <dynamic, Set<dynamic>>{},
-          'lastUpdate': DateTime.now()
-        };
-      }
-
-      final queueData = _writeBuffer[cacheKey]!;
-
-      Map<dynamic, Set<dynamic>> entries;
-      try {
-        if (queueData['entries'] == null ||
-            (queueData['entries'] as Map).isEmpty) {
-          queueData['entries'] = <dynamic, Set<dynamic>>{};
-        }
-        entries = queueData['entries'] as Map<dynamic, Set<dynamic>>;
-      } catch (e) {
-        Logger.error('Insert buffer data format error: $e',
+      // Parse StoreIndex from string
+      final storeIndex = StoreIndex.fromString(storeIndexStr);
+      if (storeIndex == null) {
+        Logger.error('Invalid StoreIndex format: $storeIndexStr',
             label: 'IndexManager._addToInsertBuffer');
-        // Reset buffer
-        _writeBuffer[cacheKey] = {
-          'entries': <dynamic, Set<dynamic>>{},
-          'lastUpdate': DateTime.now()
-        };
-        entries =
-            _writeBuffer[cacheKey]!['entries'] as Map<dynamic, Set<dynamic>>;
+        return;
       }
 
-      // Add entry
-      if (!entries.containsKey(key)) {
-        entries[key] = <dynamic>{};
+      // Generate unique key for buffer entry
+      final entryUniqueKey =
+          IndexBufferEntry.createUniqueKey(key, storeIndexStr);
+
+      // Check if the entry is in delete buffer - if so, cancel out the operations
+      if (_deleteBuffer.containsKey(cacheKey) &&
+          _deleteBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
+        // Entry is in delete buffer, remove it from there instead of adding to insert buffer
+        _deleteBuffer[cacheKey]!.remove(entryUniqueKey);
+
+        // Update last write time
+        _indexLastWriteTime[cacheKey] = DateTime.now();
+
+        return; // Operations cancel out, no need to add to insert buffer
       }
 
-      if (!entries[key]!.contains(storeIndexStr)) {
-        entries[key]!.add(storeIndexStr);
+      // Initialize insert buffer for this table/index if not exists
+      if (!_writeBuffer.containsKey(cacheKey)) {
+        _writeBuffer[cacheKey] = <String, IndexBufferEntry>{};
       }
 
-      _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+      // Create IndexBufferEntry for insertion
+      final bufferEntry = IndexBufferEntry.forInsert(
+        indexKey: key,
+        recordPointer: storeIndex,
+        timestamp: DateTime.now(),
+      );
 
-      // Check buffer size, enable fast processing mode when any buffer reaches the threshold
-      if (!_fastProcessEnabled && entries.length >= _fastProcessThreshold) {
+      // Add to buffer
+      _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
+
+      // Check buffer size, enable fast processing mode when buffer reaches threshold
+      if (!_fastProcessEnabled &&
+          _writeBuffer[cacheKey]!.length >= _fastProcessThreshold) {
         _enableFastProcessMode();
       }
 
@@ -4428,80 +4427,53 @@ class IndexManager {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
+      // Parse StoreIndex from string
+      final storeIndex = StoreIndex.fromString(storeIndexStr);
+      if (storeIndex == null) {
+        Logger.error('Invalid StoreIndex format: $storeIndexStr',
+            label: 'IndexManager.addToDeleteBuffer');
+        return;
+      }
+
+      // Generate unique key for buffer entry
+      final entryUniqueKey =
+          IndexBufferEntry.createUniqueKey(key, storeIndexStr);
+
       // Check if the entry is in insert buffer - if so, cancel out the operations
-      if (_writeBuffer.containsKey(cacheKey)) {
-        final insertData = _writeBuffer[cacheKey]!;
-        final insertEntries =
-            insertData['entries'] as Map<dynamic, Set<dynamic>>?;
+      if (_writeBuffer.containsKey(cacheKey) &&
+          _writeBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
+        // Entry is in insert buffer, remove it from there instead of adding to delete buffer
+        _writeBuffer[cacheKey]!.remove(entryUniqueKey);
 
-        if (insertEntries != null && insertEntries.containsKey(key)) {
-          // Found matching key in insert buffer, check for matching record ID
-          if (insertEntries[key]!.contains(storeIndexStr)) {
-            // Entry is in insert buffer, remove it from there instead of adding to delete buffer
-            insertEntries[key]!.remove(storeIndexStr);
+        // Update last write time
+        _indexLastWriteTime[cacheKey] = DateTime.now();
 
-            // If the key set is empty, remove the key
-            if (insertEntries[key]!.isEmpty) {
-              insertEntries.remove(key);
-            }
-
-            // Update last write time
-            _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
-            _indexLastWriteTime[cacheKey] = DateTime.now();
-
-            // Also remove from memory cache if it exists
-            if (_indexCache.containsKey(cacheKey)) {
-              try {
-                await _indexCache[cacheKey]!.delete(key, storeIndexStr);
-              } catch (e) {
-                // Ignore errors in memory cache update
-              }
-            }
-
-            return; // Operations cancel out, no need to add to delete buffer
+        // Also remove from memory cache if it exists
+        if (_indexCache.containsKey(cacheKey)) {
+          try {
+            await _indexCache[cacheKey]!.delete(key, storeIndexStr);
+          } catch (e) {
+            // Ignore errors in memory cache update
           }
         }
+
+        return; // Operations cancel out, no need to add to delete buffer
       }
 
-      // Initialize delete buffer
+      // Initialize delete buffer for this table/index if not exists
       if (!_deleteBuffer.containsKey(cacheKey)) {
-        _deleteBuffer[cacheKey] = {
-          'entries': <dynamic, Set<dynamic>>{},
-          'lastUpdate': DateTime.now()
-        };
+        _deleteBuffer[cacheKey] = <String, IndexBufferEntry>{};
       }
 
-      final queueData = _deleteBuffer[cacheKey]!;
+      // Create IndexBufferEntry for deletion
+      final bufferEntry = IndexBufferEntry.forDelete(
+        indexKey: key,
+        recordPointer: storeIndex,
+        timestamp: DateTime.now(),
+      );
 
-      Map<dynamic, Set<dynamic>> entries;
-      try {
-        if (queueData['entries'] == null ||
-            (queueData['entries'] as Map).isEmpty) {
-          queueData['entries'] = <dynamic, Set<dynamic>>{};
-        }
-        entries = queueData['entries'] as Map<dynamic, Set<dynamic>>;
-      } catch (e) {
-        Logger.error('Delete buffer data format error: $e',
-            label: 'IndexManager._addToDeleteBuffer');
-        // Reset buffer
-        _deleteBuffer[cacheKey] = {
-          'entries': <dynamic, Set<dynamic>>{},
-          'lastUpdate': DateTime.now()
-        };
-        entries =
-            _deleteBuffer[cacheKey]!['entries'] as Map<dynamic, Set<dynamic>>;
-      }
-
-      // Add entry
-      if (!entries.containsKey(key)) {
-        entries[key] = <dynamic>{};
-      }
-
-      if (!entries[key]!.contains(storeIndexStr)) {
-        entries[key]!.add(storeIndexStr);
-      }
-
-      _deleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+      // Add to buffer
+      _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
       // Also remove from memory cache if it exists
       if (_indexCache.containsKey(cacheKey)) {
@@ -4510,7 +4482,7 @@ class IndexManager {
         } catch (e) {
           // Ignore errors in memory cache update
           Logger.warn('Failed to update memory cache for deletion: $e',
-              label: 'IndexManager._addToDeleteBuffer');
+              label: 'IndexManager.addToDeleteBuffer');
         }
       }
 
@@ -4518,7 +4490,7 @@ class IndexManager {
       _indexLastWriteTime[cacheKey] = DateTime.now();
     } catch (e, stack) {
       Logger.error('Failed to add index entry to delete buffer: $e\n$stack',
-          label: 'IndexManager._addToDeleteBuffer');
+          label: 'IndexManager.addToDeleteBuffer');
     }
   }
 

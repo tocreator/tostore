@@ -388,7 +388,7 @@ class TableDataManager {
       int largestQueueSize = 0;
       String? largestQueueTable;
       int totalRecords = 0;
-      final maxBatchSize = _dataStore.config.maxFlushBatchSize;
+      final maxBatchSize = _dataStore.config.maxBatchSize;
 
       for (final entry in _writeBuffer.entries) {
         final queueSize = entry.value.length;
@@ -831,7 +831,7 @@ class TableDataManager {
       }
 
       final totalQueueSize = _writeBuffer[tableName]!.length;
-      final maxBatchSize = _dataStore.config.maxFlushBatchSize;
+      final maxBatchSize = _dataStore.config.maxBatchSize;
 
       Logger.debug(
           'Starting to process write buffer for table $tableName, queue size: $totalQueueSize',
@@ -976,7 +976,7 @@ class TableDataManager {
     try {
       // get configured batch processing parameters
       final maxTablesPerFlush = _dataStore.config.maxTablesPerFlush;
-      final maxBatchSize = _dataStore.config.maxFlushBatchSize;
+      final maxBatchSize = _dataStore.config.maxBatchSize;
 
       // remove tables being processed to avoid duplicate processing
       final availableTables = _writeBuffer.keys
@@ -3859,7 +3859,7 @@ class TableDataManager {
       }
 
       final totalQueueSize = _deleteBuffer[tableName]!.length;
-      final maxBatchSize = _dataStore.config.maxFlushBatchSize;
+      final maxBatchSize = _dataStore.config.maxBatchSize;
 
       Logger.debug(
           'Starting to process delete buffer for table $tableName, queue size: $totalQueueSize',

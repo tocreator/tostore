@@ -80,8 +80,8 @@ class DataStoreConfig {
   /// Distributed node configuration
   final DistributedNodeConfig distributedNodeConfig;
 
-  /// Maximum records per batch processing
-  final int maxFlushBatchSize;
+  /// Maximum per batch processing
+  final int maxBatchSize;
 
   /// Maximum number of tables to process per flush
   final int maxTablesPerFlush;
@@ -122,7 +122,7 @@ class DataStoreConfig {
     this.logLevel = LogLevel.warn,
     int? maxConcurrent,
     DistributedNodeConfig? distributedNodeConfig,
-    int? maxFlushBatchSize,
+    int? maxBatchSize,
     int? maxTablesPerFlush,
     bool? enableQueryCache,
     this.queryCacheExpiryTime,
@@ -138,7 +138,7 @@ class DataStoreConfig {
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
         distributedNodeConfig =
             distributedNodeConfig ?? const DistributedNodeConfig(),
-        maxFlushBatchSize = maxFlushBatchSize ?? _getDefaultBatchSize(),
+        maxBatchSize = maxBatchSize ?? _getDefaultBatchSize(),
         maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
         enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled() {
     // Initialize async memory detection and cache optimization
@@ -228,7 +228,7 @@ class DataStoreConfig {
     } else if (PlatformHandler.isMobile) {
       return 1000; // Mobile devices, balance performance and memory usage
     } else {
-      return 1000; // Desktop devices, leverage more powerful hardware
+      return 1500; // Desktop devices, leverage more powerful hardware
     }
   }
 
@@ -279,7 +279,7 @@ class DataStoreConfig {
           ? DistributedNodeConfig.fromJson(
               json['distributedNodeConfig'] as Map<String, dynamic>)
           : const DistributedNodeConfig(),
-      maxFlushBatchSize: json['maxFlushBatchSize'] as int?,
+      maxBatchSize: json['maxBatchSize'] as int?,
       maxTablesPerFlush: json['maxTablesPerFlush'] as int?,
       enableQueryCache: json['enableQueryCache'] as bool?,
       queryCacheExpiryTime: json['queryCacheExpiryTime'] != null
@@ -315,7 +315,7 @@ class DataStoreConfig {
       'logLevel': logLevel.toString().split('.').last,
       'maxConcurrent': maxConcurrent,
       'distributedNodeConfig': distributedNodeConfig.toJson(),
-      'maxFlushBatchSize': maxFlushBatchSize,
+      'maxBatchSize': maxBatchSize,
       'maxTablesPerFlush': maxTablesPerFlush,
       'enableQueryCache': enableQueryCache,
       'queryCacheExpiryTime': queryCacheExpiryTime?.inMilliseconds,
@@ -348,7 +348,7 @@ class DataStoreConfig {
     LogLevel? logLevel,
     int? maxConcurrent,
     DistributedNodeConfig? distributedNodeConfig,
-    int? maxFlushBatchSize,
+    int? maxBatchSize,
     int? maxTablesPerFlush,
     bool? enableQueryCache,
     Duration? queryCacheExpiryTime,
@@ -381,7 +381,7 @@ class DataStoreConfig {
       maxConcurrent: maxConcurrent ?? this.maxConcurrent,
       distributedNodeConfig:
           distributedNodeConfig ?? this.distributedNodeConfig,
-      maxFlushBatchSize: maxFlushBatchSize ?? this.maxFlushBatchSize,
+      maxBatchSize: maxBatchSize ?? this.maxBatchSize,
       maxTablesPerFlush: maxTablesPerFlush ?? this.maxTablesPerFlush,
       enableQueryCache: enableQueryCache ?? this.enableQueryCache,
       queryCacheExpiryTime: queryCacheExpiryTime ?? this.queryCacheExpiryTime,
