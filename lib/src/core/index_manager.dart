@@ -34,10 +34,10 @@ class IndexManager {
   final Map<String, Map<String, dynamic>> _indexAccessWeights = {};
 
   // Index write buffer - table name + index name -> {entries: Map<key value, Set<record ID>>, lastUpdate: last update time}
-  final Map<String, Map<String, dynamic>> _indexWriteBuffer = {};
+  final Map<String, Map<String, dynamic>> _writeBuffer = {};
 
   // Index delete buffer - table name + index name -> {entries: Map<key value, Set<record ID>>, lastUpdate: last update time}
-  final Map<String, Map<String, dynamic>> _indexDeleteBuffer = {};
+  final Map<String, Map<String, dynamic>> _deleteBuffer = {};
 
   // Index writing status - table name + index name -> whether writing
   final Map<String, bool> _indexWriting = {};
@@ -130,8 +130,8 @@ class IndexManager {
     List<String> keysToProcess = [];
 
     // Check insert buffer
-    for (final key in _indexWriteBuffer.keys) {
-      final entries = _indexWriteBuffer[key]?['entries'] as Map?;
+    for (final key in _writeBuffer.keys) {
+      final entries = _writeBuffer[key]?['entries'] as Map?;
       if (entries != null && entries.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
@@ -139,8 +139,8 @@ class IndexManager {
     }
 
     // Check delete buffer
-    for (final key in _indexDeleteBuffer.keys) {
-      final entries = _indexDeleteBuffer[key]?['entries'] as Map?;
+    for (final key in _deleteBuffer.keys) {
+      final entries = _deleteBuffer[key]?['entries'] as Map?;
       if (entries != null && entries.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
@@ -220,16 +220,16 @@ class IndexManager {
           int entries = 0;
 
           // Check insert buffer
-          if (_indexWriteBuffer.containsKey(key)) {
-            final insertEntries = _indexWriteBuffer[key]?['entries'] as Map?;
+          if (_writeBuffer.containsKey(key)) {
+            final insertEntries = _writeBuffer[key]?['entries'] as Map?;
             if (insertEntries != null && insertEntries.isNotEmpty) {
               entries += insertEntries.length;
             }
           }
 
           // Check delete buffer
-          if (_indexDeleteBuffer.containsKey(key)) {
-            final deleteEntries = _indexDeleteBuffer[key]?['entries'] as Map?;
+          if (_deleteBuffer.containsKey(key)) {
+            final deleteEntries = _deleteBuffer[key]?['entries'] as Map?;
             if (deleteEntries != null && deleteEntries.isNotEmpty) {
               entries += deleteEntries.length;
             }
@@ -309,17 +309,17 @@ class IndexManager {
     final result = <String>{};
 
     // Add keys from insert buffer
-    for (final key in _indexWriteBuffer.keys) {
-      if (_indexWriteBuffer[key]?['entries'] != null &&
-          (_indexWriteBuffer[key]?['entries'] as Map).isNotEmpty) {
+    for (final key in _writeBuffer.keys) {
+      if (_writeBuffer[key]?['entries'] != null &&
+          (_writeBuffer[key]?['entries'] as Map).isNotEmpty) {
         result.add(key);
       }
     }
 
     // Add keys from delete buffer
-    for (final key in _indexDeleteBuffer.keys) {
-      if (_indexDeleteBuffer[key]?['entries'] != null &&
-          (_indexDeleteBuffer[key]?['entries'] as Map).isNotEmpty) {
+    for (final key in _deleteBuffer.keys) {
+      if (_deleteBuffer[key]?['entries'] != null &&
+          (_deleteBuffer[key]?['entries'] as Map).isNotEmpty) {
         result.add(key);
       }
     }
@@ -336,9 +336,9 @@ class IndexManager {
         _indexWriting[key] = true;
 
         // Extract data from insert buffer
-        final insertData = _indexWriteBuffer[key];
+        final insertData = _writeBuffer[key];
         // Extract data from delete buffer
-        final deleteData = _indexDeleteBuffer[key];
+        final deleteData = _deleteBuffer[key];
 
         // Check if there's any data to process
         bool hasInserts = insertData != null &&
@@ -376,10 +376,7 @@ class IndexManager {
           await _writeIndexToFile(tableName, indexName, insertEntries);
 
           // Clear insert buffer
-          _indexWriteBuffer[key] = {
-            'entries': {},
-            'lastUpdate': DateTime.now()
-          };
+          _writeBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
         }
 
         if (hasDeletes) {
@@ -390,10 +387,7 @@ class IndexManager {
           await _processDeleteEntries(tableName, indexName, deleteEntries);
 
           // Clear delete buffer
-          _indexDeleteBuffer[key] = {
-            'entries': {},
-            'lastUpdate': DateTime.now()
-          };
+          _deleteBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
         }
 
         // Update last write time
@@ -474,9 +468,9 @@ class IndexManager {
         _indexWriting[key] = true;
 
         // Extract data from insert buffer
-        final insertData = _indexWriteBuffer[key];
+        final insertData = _writeBuffer[key];
         // Extract data from delete buffer
-        final deleteData = _indexDeleteBuffer[key];
+        final deleteData = _deleteBuffer[key];
 
         // Check if there's any data to process
         bool hasInserts = insertData != null &&
@@ -531,10 +525,7 @@ class IndexManager {
           }
 
           // Clear insert buffer
-          _indexWriteBuffer[key] = {
-            'entries': {},
-            'lastUpdate': DateTime.now()
-          };
+          _writeBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
         }
 
         // Process deletes (also in batch mode)
@@ -564,10 +555,7 @@ class IndexManager {
           }
 
           // Clear delete buffer
-          _indexDeleteBuffer[key] = {
-            'entries': {},
-            'lastUpdate': DateTime.now()
-          };
+          _deleteBuffer[key] = {'entries': {}, 'lastUpdate': DateTime.now()};
         }
 
         // Update last write time
@@ -598,10 +586,10 @@ class IndexManager {
     _indexMetaCache.clear();
     _indexFullyCached.clear();
     _indexAccessWeights.clear();
-    _indexWriteBuffer.clear();
+    _writeBuffer.clear();
     _indexWriting.clear();
     _indexLastWriteTime.clear();
-    _indexDeleteBuffer.clear();
+    _deleteBuffer.clear();
     _pendingWrites = 0;
     _pendingEntriesCount = 0;
     _isClosing = false;
@@ -619,8 +607,8 @@ class IndexManager {
       bool hasChanges = false;
 
       // Check insert buffer
-      for (final key in _indexWriteBuffer.keys) {
-        final entries = _indexWriteBuffer[key]?['entries'] as Map?;
+      for (final key in _writeBuffer.keys) {
+        final entries = _writeBuffer[key]?['entries'] as Map?;
         if (entries != null && entries.isNotEmpty) {
           hasChanges = true;
           break;
@@ -629,8 +617,8 @@ class IndexManager {
 
       // Check delete buffer if insert buffer has no changes
       if (!hasChanges) {
-        for (final key in _indexDeleteBuffer.keys) {
-          final entries = _indexDeleteBuffer[key]?['entries'] as Map?;
+        for (final key in _deleteBuffer.keys) {
+          final entries = _deleteBuffer[key]?['entries'] as Map?;
           if (entries != null && entries.isNotEmpty) {
             hasChanges = true;
             break;
@@ -2799,10 +2787,10 @@ class IndexManager {
       for (final indexName in indexesToReset) {
         // Clear write buffer
         final cacheKey = _getIndexCacheKey(tableName, indexName);
-        _indexWriteBuffer.remove(cacheKey);
+        _writeBuffer.remove(cacheKey);
         _indexCache.remove(cacheKey);
         _indexFullyCached.remove(cacheKey);
-        _indexDeleteBuffer.remove(cacheKey);
+        _deleteBuffer.remove(cacheKey);
 
         // Delete index file
         final meta = await _getIndexMeta(tableName, indexName);
@@ -2932,15 +2920,15 @@ class IndexManager {
         final cacheKey = _getIndexCacheKey(tableName, indexName);
 
         // Initialize write buffer
-        if (!_indexWriteBuffer.containsKey(cacheKey)) {
-          _indexWriteBuffer[cacheKey] = {
+        if (!_writeBuffer.containsKey(cacheKey)) {
+          _writeBuffer[cacheKey] = {
             'entries': <dynamic, Set<dynamic>>{},
             'lastUpdate': DateTime.now()
           };
         }
 
         // Merge updates
-        final queueData = _indexWriteBuffer[cacheKey]!;
+        final queueData = _writeBuffer[cacheKey]!;
         final entries = queueData['entries'] as Map<dynamic, Set<dynamic>>;
 
         for (final keyEntry in updates.entries) {
@@ -2954,7 +2942,7 @@ class IndexManager {
           entries[key]!.addAll(values);
         }
 
-        _indexWriteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+        _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
         _indexLastWriteTime[cacheKey] = DateTime.now();
 
         // Update memory cache
@@ -3179,7 +3167,7 @@ class IndexManager {
     _indexAccessWeights.clear();
 
     // handle write buffer, only keep global table index
-    final keysToCheck = <String>[..._indexWriteBuffer.keys];
+    final keysToCheck = <String>[..._writeBuffer.keys];
     final globalKeysToKeep = <String>[];
 
     // check each index key, determine which is global table
@@ -3200,10 +3188,10 @@ class IndexManager {
     }
 
     // only keep global table write buffer
-    _indexWriteBuffer.removeWhere((key, _) => !globalKeysToKeep.contains(key));
+    _writeBuffer.removeWhere((key, _) => !globalKeysToKeep.contains(key));
 
     // same as above, handle delete buffer
-    final deleteKeysToCheck = <String>[..._indexDeleteBuffer.keys];
+    final deleteKeysToCheck = <String>[..._deleteBuffer.keys];
     final globalDeleteKeysToKeep = <String>[];
 
     for (final key in deleteKeysToCheck) {
@@ -3219,7 +3207,7 @@ class IndexManager {
       }
     }
 
-    _indexDeleteBuffer
+    _deleteBuffer
         .removeWhere((key, _) => !globalDeleteKeysToKeep.contains(key));
 
     // clear other related caches
@@ -4341,8 +4329,8 @@ class IndexManager {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Check if the entry is in delete buffer - if so, cancel out the operations
-      if (_indexDeleteBuffer.containsKey(cacheKey)) {
-        final deleteData = _indexDeleteBuffer[cacheKey]!;
+      if (_deleteBuffer.containsKey(cacheKey)) {
+        final deleteData = _deleteBuffer[cacheKey]!;
         final deleteEntries =
             deleteData['entries'] as Map<dynamic, Set<dynamic>>?;
 
@@ -4358,7 +4346,7 @@ class IndexManager {
             }
 
             // Update last write time
-            _indexDeleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+            _deleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
             _indexLastWriteTime[cacheKey] = DateTime.now();
 
             return; // Operations cancel out, no need to add to insert buffer
@@ -4367,14 +4355,14 @@ class IndexManager {
       }
 
       // Initialize insert buffer
-      if (!_indexWriteBuffer.containsKey(cacheKey)) {
-        _indexWriteBuffer[cacheKey] = {
+      if (!_writeBuffer.containsKey(cacheKey)) {
+        _writeBuffer[cacheKey] = {
           'entries': <dynamic, Set<dynamic>>{},
           'lastUpdate': DateTime.now()
         };
       }
 
-      final queueData = _indexWriteBuffer[cacheKey]!;
+      final queueData = _writeBuffer[cacheKey]!;
 
       Map<dynamic, Set<dynamic>> entries;
       try {
@@ -4387,12 +4375,12 @@ class IndexManager {
         Logger.error('Insert buffer data format error: $e',
             label: 'IndexManager._addToInsertBuffer');
         // Reset buffer
-        _indexWriteBuffer[cacheKey] = {
+        _writeBuffer[cacheKey] = {
           'entries': <dynamic, Set<dynamic>>{},
           'lastUpdate': DateTime.now()
         };
-        entries = _indexWriteBuffer[cacheKey]!['entries']
-            as Map<dynamic, Set<dynamic>>;
+        entries =
+            _writeBuffer[cacheKey]!['entries'] as Map<dynamic, Set<dynamic>>;
       }
 
       // Add entry
@@ -4404,7 +4392,7 @@ class IndexManager {
         entries[key]!.add(storeIndexStr);
       }
 
-      _indexWriteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+      _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
 
       // Check buffer size, enable fast processing mode when any buffer reaches the threshold
       if (!_fastProcessEnabled && entries.length >= _fastProcessThreshold) {
@@ -4441,8 +4429,8 @@ class IndexManager {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Check if the entry is in insert buffer - if so, cancel out the operations
-      if (_indexWriteBuffer.containsKey(cacheKey)) {
-        final insertData = _indexWriteBuffer[cacheKey]!;
+      if (_writeBuffer.containsKey(cacheKey)) {
+        final insertData = _writeBuffer[cacheKey]!;
         final insertEntries =
             insertData['entries'] as Map<dynamic, Set<dynamic>>?;
 
@@ -4458,7 +4446,7 @@ class IndexManager {
             }
 
             // Update last write time
-            _indexWriteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+            _writeBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
             _indexLastWriteTime[cacheKey] = DateTime.now();
 
             // Also remove from memory cache if it exists
@@ -4476,14 +4464,14 @@ class IndexManager {
       }
 
       // Initialize delete buffer
-      if (!_indexDeleteBuffer.containsKey(cacheKey)) {
-        _indexDeleteBuffer[cacheKey] = {
+      if (!_deleteBuffer.containsKey(cacheKey)) {
+        _deleteBuffer[cacheKey] = {
           'entries': <dynamic, Set<dynamic>>{},
           'lastUpdate': DateTime.now()
         };
       }
 
-      final queueData = _indexDeleteBuffer[cacheKey]!;
+      final queueData = _deleteBuffer[cacheKey]!;
 
       Map<dynamic, Set<dynamic>> entries;
       try {
@@ -4496,12 +4484,12 @@ class IndexManager {
         Logger.error('Delete buffer data format error: $e',
             label: 'IndexManager._addToDeleteBuffer');
         // Reset buffer
-        _indexDeleteBuffer[cacheKey] = {
+        _deleteBuffer[cacheKey] = {
           'entries': <dynamic, Set<dynamic>>{},
           'lastUpdate': DateTime.now()
         };
-        entries = _indexDeleteBuffer[cacheKey]!['entries']
-            as Map<dynamic, Set<dynamic>>;
+        entries =
+            _deleteBuffer[cacheKey]!['entries'] as Map<dynamic, Set<dynamic>>;
       }
 
       // Add entry
@@ -4513,7 +4501,7 @@ class IndexManager {
         entries[key]!.add(storeIndexStr);
       }
 
-      _indexDeleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
+      _deleteBuffer[cacheKey]!['lastUpdate'] = DateTime.now();
 
       // Also remove from memory cache if it exists
       if (_indexCache.containsKey(cacheKey)) {
@@ -4728,8 +4716,8 @@ class IndexManager {
 
       // clear write buffer
       final cacheKey = _getIndexCacheKey(tableName, indexName);
-      _indexWriteBuffer.remove(cacheKey);
-      _indexDeleteBuffer.remove(cacheKey);
+      _writeBuffer.remove(cacheKey);
+      _deleteBuffer.remove(cacheKey);
       _indexWriting.remove(cacheKey);
       _indexLastWriteTime.remove(cacheKey);
 

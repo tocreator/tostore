@@ -7,7 +7,7 @@ import '../../tostore.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../handler/encoder.dart';
-import '../model/record_operation.dart';
+import '../model/buffer_entry.dart';
 import 'data_store_impl.dart';
 import '../model/store_index.dart';
 import '../model/file_info.dart';
@@ -20,13 +20,13 @@ import '../handler/value_comparator.dart';
 class TableDataManager {
   final DataStoreImpl _dataStore;
 
-  // Write Buffer: Map<tableName, Map<recordId, WriteBufferEntry>>
-  final Map<String, Map<String, WriteBufferEntry>> _writeBuffer = {};
-  Map<String, Map<String, WriteBufferEntry>> get writeBuffer => _writeBuffer;
+  // Write Buffer: Map<tableName, Map<recordId, BufferEntry>>
+  final Map<String, Map<String, BufferEntry>> _writeBuffer = {};
+  Map<String, Map<String, BufferEntry>> get writeBuffer => _writeBuffer;
 
-  // Delete Buffer: Map<tableName, Map<recordId, RecordDeleteEntry>>
-  final Map<String, Map<String, RecordDeleteEntry>> _deleteBuffer = {};
-  Map<String, Map<String, RecordDeleteEntry>> get deleteBuffer => _deleteBuffer;
+  // Delete Buffer: Map<tableName, Map<recordId, BufferEntry>>
+  final Map<String, Map<String, BufferEntry>> _deleteBuffer = {};
+  Map<String, Map<String, BufferEntry>> get deleteBuffer => _deleteBuffer;
 
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
@@ -741,10 +741,10 @@ class TableDataManager {
       );
       return;
     }
-    tableQueue[recordId] = WriteBufferEntry(
+    tableQueue[recordId] = BufferEntry(
       data: data,
       operation:
-          isUpdate ? RecordOperationType.update : RecordOperationType.insert,
+          isUpdate ? BufferOperationType.update : BufferOperationType.insert,
       timestamp: DateTime.now(),
     );
 
@@ -787,7 +787,8 @@ class TableDataManager {
       }
 
       // Store in delete buffer
-      tableQueue[recordId] = RecordDeleteEntry(
+      tableQueue[recordId] = BufferEntry(
+        operation: BufferOperationType.delete,
         data: record,
         timestamp: DateTime.now(),
       );
@@ -875,7 +876,7 @@ class TableDataManager {
         final insertRecords = <Map<String, dynamic>>[];
         final updateRecords = <Map<String, dynamic>>[];
         // Store processed entries for error recovery
-        final processedEntries = <String, WriteBufferEntry>{};
+        final processedEntries = <String, BufferEntry>{};
 
         // Extract data from original buffer and remove immediately
         for (final key in keysToProcess) {
@@ -888,7 +889,7 @@ class TableDataManager {
             final data = entry.data;
             final operation = entry.operation;
 
-            if (operation == RecordOperationType.update) {
+            if (operation == BufferOperationType.update) {
               updateRecords.add(data);
             } else {
               insertRecords.add(data);
@@ -907,14 +908,14 @@ class TableDataManager {
             await writeRecords(
                 tableName: tableName,
                 records: insertRecords,
-                operationType: RecordOperationType.insert);
+                operationType: BufferOperationType.insert);
           }
 
           if (updateRecords.isNotEmpty) {
             await writeRecords(
                 tableName: tableName,
                 records: updateRecords,
-                operationType: RecordOperationType.update);
+                operationType: BufferOperationType.update);
           }
 
           recordsProcessed += processedEntries.length;
@@ -1138,7 +1139,7 @@ class TableDataManager {
     // calculate pending insert records count (only count insert operation, not update operation)
     int pendingInsertCount = 0;
     for (final entry in pendingRecords.entries) {
-      if (entry.value.operation == RecordOperationType.insert) {
+      if (entry.value.operation == BufferOperationType.insert) {
         pendingInsertCount++;
       }
     }
@@ -2389,7 +2390,7 @@ class TableDataManager {
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         operationType:
-            RecordOperationType.rewrite // Explicitly use rewrite operation type
+            BufferOperationType.rewrite // Explicitly use rewrite operation type
         );
 
     List<Map<String, dynamic>> batch = [];
@@ -2401,7 +2402,7 @@ class TableDataManager {
             records: batch,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
-            operationType: RecordOperationType
+            operationType: BufferOperationType
                 .insert // Explicitly use insert operation type
             );
         batch.clear();
@@ -2416,7 +2417,7 @@ class TableDataManager {
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           operationType:
-              RecordOperationType.insert // Explicitly use insert operation type
+              BufferOperationType.insert // Explicitly use insert operation type
           );
     }
   }
@@ -2908,14 +2909,14 @@ class TableDataManager {
     required List<Map<String, dynamic>> records,
     List<int>? encryptionKey,
     int? encryptionKeyId,
-    RecordOperationType operationType = RecordOperationType.insert,
+    BufferOperationType operationType = BufferOperationType.insert,
   }) async {
     if (tableName.isEmpty) {
       throw ArgumentError('Table name cannot be empty');
     }
 
     // if records are empty and operation is not rewrite, return directly
-    if (records.isEmpty && operationType != RecordOperationType.rewrite) {
+    if (records.isEmpty && operationType != BufferOperationType.rewrite) {
       return;
     }
 
@@ -2936,7 +2937,7 @@ class TableDataManager {
 
     try {
       // handle based on operation type
-      if (operationType == RecordOperationType.insert) {
+      if (operationType == BufferOperationType.insert) {
         // pre-allocate records to partitions
         final partitionRecords = await _assignRecordsToPartitions(
             tableName, records, primaryKey,
@@ -3052,8 +3053,8 @@ class TableDataManager {
         // all partitions processed, update table meta once
         await _updateTableMetadataWithAllPartitions(
             tableName, allPartitionMetas, existingPartitions);
-      } else if (operationType == RecordOperationType.delete ||
-          operationType == RecordOperationType.update) {
+      } else if (operationType == BufferOperationType.delete ||
+          operationType == BufferOperationType.update) {
         // Create a mapping from primary key to record, for easy lookup
         final recordsByPk = <String, Map<String, dynamic>>{};
         for (final record in records) {
@@ -3104,7 +3105,7 @@ class TableDataManager {
         // use concurrent processing
         if (_shouldUseConcurrent(
             partitionsToProcess.map((p) => p.index).toList(),
-            operationType == RecordOperationType.delete
+            operationType == BufferOperationType.delete
                 ? 'delete'
                 : 'update')) {
           // store all processed partition meta
@@ -3126,7 +3127,7 @@ class TableDataManager {
               List<Map<String, dynamic>> resultRecords;
               Set<String> processedKeys = {};
 
-              if (operationType == RecordOperationType.delete) {
+              if (operationType == BufferOperationType.delete) {
                 // use empty object {} to replace the record to be deleted, instead of physical deletion
                 resultRecords =
                     List<Map<String, dynamic>>.from(partitionRecords);
@@ -3205,7 +3206,7 @@ class TableDataManager {
               };
             },
             description:
-                '${operationType == RecordOperationType.delete ? "delete" : "update"} records',
+                '${operationType == BufferOperationType.delete ? "delete" : "update"} records',
           );
 
           // all partitions processed, update table meta once
@@ -3215,7 +3216,7 @@ class TableDataManager {
           }
 
           // if update operation, need to handle records not found (as insert operation)
-          if (operationType == RecordOperationType.update) {
+          if (operationType == BufferOperationType.update) {
             // collect all processed keys
             final processedKeys = <String>{};
             for (var result in partitionResults) {
@@ -3236,7 +3237,7 @@ class TableDataManager {
                 records: recordsToInsert,
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
-                operationType: RecordOperationType.insert,
+                operationType: BufferOperationType.insert,
               );
             }
           }
@@ -3254,7 +3255,7 @@ class TableDataManager {
             bool modified = false;
             List<Map<String, dynamic>> resultRecords;
 
-            if (operationType == RecordOperationType.delete) {
+            if (operationType == BufferOperationType.delete) {
               // use empty object {} to replace the record to be deleted, instead of physical deletion
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
               for (int i = 0; i < resultRecords.length; i++) {
@@ -3321,7 +3322,7 @@ class TableDataManager {
           }
 
           // if update operation, need to handle records not found (as insert operation)
-          if (operationType == RecordOperationType.update) {
+          if (operationType == BufferOperationType.update) {
             // find records not processed
             final recordsToInsert = records.where((record) {
               final pk = record[primaryKey]?.toString() ?? '';
@@ -3335,12 +3336,12 @@ class TableDataManager {
                 records: recordsToInsert,
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
-                operationType: RecordOperationType.insert,
+                operationType: BufferOperationType.insert,
               );
             }
           }
         }
-      } else if (operationType == RecordOperationType.rewrite) {
+      } else if (operationType == BufferOperationType.rewrite) {
         // pre-allocate records to new partitions
         final partitionRecords = await _assignRecordsToPartitions(
             tableName, records, primaryKey,
@@ -3894,7 +3895,7 @@ class TableDataManager {
         // Prepare a list of records to delete
         final recordsToDelete = <Map<String, dynamic>>[];
         // Store processed entries for error recovery
-        final processedEntries = <String, RecordDeleteEntry>{};
+        final processedEntries = <String, BufferEntry>{};
 
         // Extract data from original buffer and remove immediately
         for (final key in keysToProcess) {
@@ -3918,7 +3919,7 @@ class TableDataManager {
             await writeRecords(
                 tableName: tableName,
                 records: recordsToDelete,
-                operationType: RecordOperationType.delete);
+                operationType: BufferOperationType.delete);
           }
 
           recordsProcessed += processedEntries.length;

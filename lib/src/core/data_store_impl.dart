@@ -13,7 +13,7 @@ import '../model/file_info.dart';
 import '../model/global_config.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
-import '../model/record_operation.dart';
+import '../model/buffer_entry.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -1846,7 +1846,7 @@ class DataStoreImpl {
           await tableDataManager.writeRecords(
             tableName: tableName,
             records: batch,
-            operationType: RecordOperationType.insert,
+            operationType: BufferOperationType.insert,
           );
         }
       } else {
@@ -1854,7 +1854,7 @@ class DataStoreImpl {
         await tableDataManager.writeRecords(
           tableName: tableName,
           records: allData,
-          operationType: RecordOperationType.insert,
+          operationType: BufferOperationType.insert,
         );
       }
 
