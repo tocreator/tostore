@@ -503,6 +503,12 @@ class IndexManager {
                 await btree.delete(key, recordId);
                 processedCount++;
 
+                // Remove processed entries from entriesToDelete
+                entriesToDelete[key]!.remove(recordId);
+                if (entriesToDelete[key]!.isEmpty) {
+                  entriesToDelete.remove(key);
+                }
+
                 // Give the main thread a break every 50 deletions
                 if (processedCount % 50 == 0) {
                   await Future.delayed(const Duration(milliseconds: 1));
@@ -1579,7 +1585,7 @@ class IndexManager {
       _indexMetaCache[cacheKey] = newMeta;
 
       // Scan table data to create index
-      await _buildIndexFromTableData(tableName, indexName, [primaryKey]);
+      // TODO
     } catch (e) {
       Logger.error('Failed to create primary key index: $e',
           label: 'IndexManager.createPrimaryIndex');
@@ -1662,7 +1668,7 @@ class IndexManager {
       _indexMetaCache[cacheKey] = newMeta;
 
       // Scan table data to create index data to create index
-      await _buildIndexFromTableData(tableName, indexName, schema.fields);
+      //  TODO
     } catch (e) {
       Logger.error('Failed to create index: $e',
           label: 'IndexManager.createIndex');
