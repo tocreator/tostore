@@ -2301,7 +2301,7 @@ class IndexManager {
         // These types of primary keys are ordered
         return true;
       case PrimaryKeyType.none:
-        // User-defined primary key, default认为无序
+        // User-defined primary key
         return false;
     }
   }
