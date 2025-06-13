@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import '../compute/compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../model/file_info.dart';
@@ -12,6 +13,7 @@ import '../model/index_entry.dart';
 import 'crontab_manager.dart';
 import 'b_plus_tree.dart';
 import 'data_store_impl.dart';
+import '../compute/compute_tasks.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -257,12 +259,7 @@ class IndexManager {
         return;
       }
 
-      if (totalEntries > 1000) {
-        await _processBatchIndexWrites(keysWithEntries, totalEntries);
-      } else {
-        // Use existing processing logic for small number of entries
-        await _processRegularIndexWrites(keysWithEntries);
-      }
+      await _processBatchIndexWrites(keysWithEntries, totalEntries);
 
       // After processing, reduce count
       _pendingEntriesCount = max(0, _pendingEntriesCount - totalEntries);
@@ -319,213 +316,44 @@ class IndexManager {
     return result.toList();
   }
 
-  /// Process regular index writes
-  Future<void> _processRegularIndexWrites(List<String> keysToProcess) async {
-    for (final key in keysToProcess) {
-      if (_indexWriting[key] == true) continue;
-
-      try {
-        _indexWriting[key] = true;
-
-        // Check if there's any data to process
-        bool hasInserts =
-            _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
-        bool hasDeletes =
-            _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
-
-        if (!hasInserts && !hasDeletes) {
-          _indexWriting[key] = false;
-          continue;
-        }
-
-        final parts = key.split(':');
-        if (parts.length != 2) {
-          _indexWriting[key] = false;
-          continue;
-        }
-
-        final tableName = parts[0];
-        final indexName = parts[1];
-
-        // Get index metadata
-        final indexMeta = await _getIndexMeta(tableName, indexName);
-        if (indexMeta == null) {
-          _indexWriting[key] = false;
-          continue;
-        }
-
-        // Process inserts - new optimized approach
-        if (hasInserts) {
-          final writeBuffer = _writeBuffer[key]!;
-          final maxBatchSize = _dataStore.config.maxBatchSize;
-          final maxPartitionFileSize = _dataStore.config.maxPartitionFileSize;
-
-          // Get initial snapshot of buffer size to process in this run
-          final initialBufferSize = writeBuffer.length;
-          int processedCount = 0;
-
-          // Get last partition index and remaining size
-          int currentPartitionSize = indexMeta.partitions.isEmpty
-              ? 0
-              : indexMeta.partitions.last.fileSizeInBytes;
-          int remainingSpaceInPartition =
-              maxPartitionFileSize - currentPartitionSize;
-
-          // Process until we've completed the initial buffer size or no more data
-          while (processedCount < initialBufferSize && writeBuffer.isNotEmpty) {
-            // Determine optimal batch size based on remaining space and max batch size
-            const estimatedEntrySize =
-                100; // Approximate average size per entry
-            int optimalBatchSize = min(
-                min(
-                    maxBatchSize,
-                    writeBuffer
-                        .length), // Don't exceed buffer size or max batch
-                remainingSpaceInPartition ~/
-                    estimatedEntrySize // Don't exceed partition capacity
-                );
-
-            // Ensure we process at least some entries even if space is tight
-            optimalBatchSize = max(optimalBatchSize, 1);
-
-            // Take a batch of keys
-            final processingKeys =
-                writeBuffer.keys.take(optimalBatchSize).toList();
-            final currentBatchMap = <dynamic, Set<dynamic>>{};
-
-            // Convert to old format for this batch
-            for (final k in processingKeys) {
-              final entry = writeBuffer[k]!;
-              final indexKey = entry.indexEntry.indexKey;
-              final recordId = entry.indexEntry.recordPointer.toString();
-
-              if (!currentBatchMap.containsKey(indexKey)) {
-                currentBatchMap[indexKey] = <dynamic>{};
-              }
-              currentBatchMap[indexKey]!.add(recordId);
-            }
-
-            // Process this batch
-            await _writeIndexToFile(tableName, indexName, currentBatchMap);
-
-            // Remove processed entries immediately
-            for (final k in processingKeys) {
-              writeBuffer.remove(k);
-            }
-
-            // Update counters
-            processedCount += processingKeys.length;
-
-            // Get updated partition info
-            final updatedMeta = await _getIndexMeta(tableName, indexName);
-            if (updatedMeta != null) {
-              currentPartitionSize = updatedMeta.partitions.isEmpty
-                  ? 0
-                  : updatedMeta.partitions.last.fileSizeInBytes;
-              remainingSpaceInPartition =
-                  maxPartitionFileSize - currentPartitionSize;
-            } else {
-              // Reset if metadata not available
-              currentPartitionSize = 0;
-              remainingSpaceInPartition = maxPartitionFileSize;
-            }
-
-            // Small delay between batches
-            await Future.delayed(const Duration(milliseconds: 5));
-          }
-        }
-
-        // Process deletes
-        if (hasDeletes) {
-          // Get all entries at once
-          final deleteBuffer = _deleteBuffer[key]!;
-          final allDeleteEntries = <dynamic, Set<dynamic>>{};
-
-          // Convert all entries to old format
-          for (final entry in deleteBuffer.values) {
-            final indexKey = entry.indexEntry.indexKey;
-            final recordId = entry.indexEntry.recordPointer.toString();
-
-            if (!allDeleteEntries.containsKey(indexKey)) {
-              allDeleteEntries[indexKey] = <dynamic>{};
-            }
-            allDeleteEntries[indexKey]!.add(recordId);
-          }
-
-          // Clear the buffer immediately to avoid duplicate processing
-          deleteBuffer.clear();
-
-          // Process all deletes
-          await _processDeleteEntries(tableName, indexName, allDeleteEntries);
-        }
-
-        // Update last write time
-        _indexLastWriteTime[key] = DateTime.now();
-      } catch (e) {
-        Logger.error('Failed to process index write buffer: $e',
-            label: 'IndexManager._processIndexWriteBuffer');
-      } finally {
-        _indexWriting[key] = false;
-      }
-    }
-  }
-
   /// Process delete entries - remove entries from the B+ tree in the file
   Future<void> _processDeleteEntries(String tableName, String indexName,
-      Map<dynamic, Set<dynamic>> entriesToDelete) async {
+      Map<String, IndexBufferEntry> entriesToDelete) async {
     try {
-      // Need to get all partitions for this index
+      if (entriesToDelete.isEmpty) return;
+
       final indexMeta = await _getIndexMeta(tableName, indexName);
       if (indexMeta == null) return;
 
-      // Check if this is a primary key or unique index
       final isUniqueIndex = indexName == 'pk_$tableName' ||
           indexMeta.isUnique ||
           indexName.startsWith('uniq_');
 
-      // Process each delete entry by finding it in each partition
+      // Now, apply these grouped deletes by iterating through the partitions.
       await processIndexPartitions(tableName, indexName,
           processor: (_, __, btree) async {
-        int processedCount = 0;
-        final entryList = entriesToDelete.entries.toList();
+        // Stop processing partitions if no deletes are left.
+        if (entriesToDelete.isEmpty) return false;
 
-        for (final entry in entryList) {
-          final key = entry.key;
-          final recordIds = entry.value;
+        final keysToCheck = entriesToDelete.keys.toList();
 
-          // Search for this key in the current partition
+        for (final key in keysToCheck) {
+          final indexEntry = entriesToDelete[key];
+          if (indexEntry == null) continue;
+
           final existingValues = await btree.search(key);
-
-          // Remove matching record IDs
-          for (final recordId in recordIds) {
-            for (final existingValue in existingValues) {
-              if (existingValue.toString() == recordId) {
-                await btree.delete(key, recordId);
-                processedCount++;
-
-                // Remove processed entries from entriesToDelete
-                entriesToDelete[key]!.remove(recordId);
-                if (entriesToDelete[key]!.isEmpty) {
-                  entriesToDelete.remove(key);
-                }
-
-                // Give the main thread a break every 50 deletions
-                if (processedCount % 50 == 0) {
-                  await Future.delayed(const Duration(milliseconds: 1));
-                }
-
-                // For unique indexes, stop after first match since they only have one record per key
-                if (isUniqueIndex) {
-                  return false; // stop processing more partitions
-                }
-
-                break;
-              }
+          if (existingValues.isEmpty) continue;
+          if (existingValues
+              .contains(indexEntry.indexEntry.recordPointer.toString())) {
+            await btree.delete(
+                key, indexEntry.indexEntry.recordPointer.toString());
+            if (isUniqueIndex) {
+              // For unique keys, finding it once is enough. Remove from future searches.
+              entriesToDelete.remove(key);
+              if (entriesToDelete.isEmpty) return false;
             }
           }
         }
-
-        // For regular indexes, continue checking other partitions as entries may be spread across multiple partitions
         return true;
       });
 
@@ -541,30 +369,14 @@ class IndexManager {
   /// Batch process index writes
   Future<void> _processBatchIndexWrites(
       List<String> keys, int totalEntries) async {
-    // Calculate optimal batch size - reduce batch size to improve stability
-    final int batchSize = _calculateOptimalBatchSize(totalEntries);
+    final maxConcurrent = _dataStore.config.maxConcurrent;
 
-    // Process each index
     for (final key in keys) {
       if (_indexWriting[key] == true) continue;
 
       try {
         _indexWriting[key] = true;
 
-        // No need to extract data anymore, we'll use the collections directly
-
-        // Check if there's any data to process
-        bool hasInserts =
-            _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
-        bool hasDeletes =
-            _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
-
-        if (!hasInserts && !hasDeletes) {
-          _indexWriting[key] = false;
-          continue;
-        }
-
-        // Get index information
         final parts = key.split(':');
         if (parts.length != 2) {
           _indexWriting[key] = false;
@@ -574,82 +386,246 @@ class IndexManager {
         final tableName = parts[0];
         final indexName = parts[1];
 
-        // Get index metadata
-        final indexMeta = await _getIndexMeta(tableName, indexName);
-        if (indexMeta == null) {
-          _indexWriting[key] = false;
-          continue;
-        }
+        // Create lock resource identifier for index write operation
+        final lockResource = 'index:$tableName:$indexName';
+        final operationId =
+            'batch_write_index_${DateTime.now().millisecondsSinceEpoch}';
 
-        // Process inserts (using batch mode)
-        if (hasInserts) {
-          final entryList = _writeBuffer[key]!.values.toList();
+        try {
+          // Acquire exclusive lock to prevent concurrent writes to the same index file
+          await _dataStore.lockManager
+              ?.acquireExclusiveLock(lockResource, operationId);
 
-          for (int i = 0; i < entryList.length; i += batchSize) {
-            final end = min(i + batchSize, entryList.length);
+          // Get index metadata
+          final indexMeta = await _getIndexMeta(tableName, indexName);
+          if (indexMeta == null) {
+            _indexWriting[key] = false;
+            continue;
+          }
 
-            // Create current batch entries map for backward compatibility
-            final batchEntries = <dynamic, Set<dynamic>>{};
-            for (int j = i; j < end; j++) {
-              final entry = entryList[j];
-              final indexKey = entry.indexEntry.indexKey;
-              final recordId = entry.indexEntry.recordPointer.toString();
+          // Check if there's any data to process
+          bool hasInserts =
+              _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
+          bool hasDeletes =
+              _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
 
-              if (!batchEntries.containsKey(indexKey)) {
-                batchEntries[indexKey] = <dynamic>{};
+          if (!hasInserts && !hasDeletes) {
+            _indexWriting[key] = false;
+            continue;
+          }
+
+          // --- 1. Process Inserts Concurrently ---
+          if (hasInserts) {
+            final writeBuffer = _writeBuffer[key]!;
+            final List<IndexBufferEntry> allEntries =
+                writeBuffer.values.toList();
+            writeBuffer.clear(); // Clear buffer immediately
+
+            // --- Pre-allocation Step ---
+            final List<PartitionWriteJob> jobs = [];
+            if (allEntries.isNotEmpty) {
+              final maxPartitionFileSize =
+                  _dataStore.config.maxPartitionFileSize;
+              int partitionIndex = indexMeta.partitions.isEmpty
+                  ? 0
+                  : indexMeta.partitions.last.index;
+              int currentSize = indexMeta.partitions.isEmpty
+                  ? 0
+                  : indexMeta.partitions.last.fileSizeInBytes;
+
+              List<IndexBufferEntry> currentJobEntries = [];
+              for (final entry in allEntries) {
+                try {
+                  final estimatedEntrySize =
+                      (entry.indexEntry.indexKey.toString().length +
+                              entry.indexEntry.recordPointer.toString().length +
+                              2)
+                          .toInt();
+                  if (currentSize + estimatedEntrySize > maxPartitionFileSize &&
+                      currentJobEntries.isNotEmpty) {
+                    // Finalize current job and start a new one
+                    jobs.add(PartitionWriteJob(
+                        partitionIndex: partitionIndex,
+                        entries: currentJobEntries));
+                    partitionIndex++;
+                    currentSize = 0;
+                    currentJobEntries = [];
+                  }
+                  currentJobEntries.add(entry);
+                  currentSize += estimatedEntrySize;
+                } catch (e) {
+                  Logger.warn('Failed to estimate entry size: $e',
+                      label: 'IndexManager._processBatchIndexWrites');
+                }
               }
-              batchEntries[indexKey]!.add(recordId);
+              // Add the last job
+              if (currentJobEntries.isNotEmpty) {
+                jobs.add(PartitionWriteJob(
+                    partitionIndex: partitionIndex,
+                    entries: currentJobEntries));
+              }
             }
 
-            // Write current batch
-            await _writeIndexToFile(tableName, indexName, batchEntries);
+            // --- Parallel Execution Step (Optimized) ---
+            if (jobs.isNotEmpty) {
+              final allNewOrUpdatedPartitions = <IndexPartitionMeta>[];
 
-            // Small delay between batches to avoid blocking the main thread
-            if (i + batchSize < entryList.length) {
-              await Future.delayed(const Duration(milliseconds: 5));
+              for (int i = 0; i < jobs.length; i += maxConcurrent) {
+                final batchJobs =
+                    jobs.sublist(i, min(i + maxConcurrent, jobs.length));
+
+                // Step 1 (for batch): Concurrently load content and start compute.
+                // Use a standard for-loop for clearer type inference.
+                final computeFutures = <Future<IndexProcessingResult>>[];
+                for (final job in batchJobs) {
+                  final future = () async {
+                    try {
+                      final results = indexMeta.partitions
+                          .where((p) => p.index == job.partitionIndex);
+                      final existingPartition =
+                          results.isEmpty ? null : results.first;
+
+                      if (existingPartition != null) {
+                        final path = await _dataStore.pathManager
+                            .getIndexPartitionPath(
+                                tableName, indexName, job.partitionIndex);
+                        if (await _dataStore.storage.existsFile(path)) {
+                          job.existingContent =
+                              await _dataStore.storage.readAsString(path);
+                        }
+                      }
+                      final request = IndexProcessingRequest(
+                        entries: job.entries,
+                        existingPartitionContent: job.existingContent,
+                        bTreeOrder: indexMeta.bTreeOrder,
+                        isUnique: indexMeta.isUnique,
+                      );
+                      return await ComputeManager.run(
+                          processIndexPartition, request,
+                          useIsolate: job.entries.length > 1);
+                    } catch (e, stack) {
+                      Logger.error(
+                          'Error preparing or running compute job for partition ${job.partitionIndex}: $e\n$stack',
+                          label: 'IndexManager._processBatchIndexWrites');
+                      return IndexProcessingResult.failed();
+                    }
+                  }(); // Immediately invoke the async closure
+                  computeFutures.add(future);
+                }
+
+                // Step 2 (for batch): Await all compute tasks to finish.
+                final computeResults = await Future.wait(computeFutures);
+
+                // Step 3 (for batch): Assign results and concurrently write files.
+                final writeFutures = <Future>[];
+                for (int j = 0; j < batchJobs.length; j++) {
+                  try {
+                    final job = batchJobs[j];
+                    final result = computeResults[j];
+                    if (result.isFailed) continue; // Skip failed jobs
+
+                    job.result = result; // Needed for metadata creation below
+
+                    final partitionPath = await _dataStore.pathManager
+                        .getIndexPartitionPath(
+                            tableName, indexName, job.partitionIndex);
+                    writeFutures.add(_dataStore.storage
+                        .writeAsString(partitionPath, result.serializedBTree));
+                  } catch (e, stack) {
+                    Logger.error('Error writing partition file: $e\n$stack',
+                        label: 'IndexManager._processBatchIndexWrites');
+                  }
+                }
+                await Future.wait(writeFutures);
+
+                // Step 4 (for batch): Create metadata for the completed jobs.
+                for (final job in batchJobs) {
+                  if (job.result == null || job.result!.isFailed) continue;
+                  try {
+                    final checksum =
+                        _calculateChecksum(job.result!.serializedBTree);
+                    final results = indexMeta.partitions
+                        .where((p) => p.index == job.partitionIndex);
+                    final existingPartition =
+                        results.isEmpty ? null : results.first;
+
+                    if (existingPartition != null) {
+                      allNewOrUpdatedPartitions.add(existingPartition.copyWith(
+                        fileSizeInBytes: job.result!.newSize,
+                        bTreeSize: job.result!.newSize,
+                        entries: job.result!.entryCount,
+                        timestamps: Timestamps(
+                            created: existingPartition.timestamps.created,
+                            modified: DateTime.now()),
+                        checksum: checksum,
+                      ));
+                    } else {
+                      allNewOrUpdatedPartitions.add(IndexPartitionMeta(
+                        version: 1,
+                        index: job.partitionIndex,
+                        fileSizeInBytes: job.result!.newSize,
+                        minKey: null,
+                        maxKey: null,
+                        bTreeSize: job.result!.newSize,
+                        entries: job.result!.entryCount,
+                        timestamps: Timestamps(
+                            created: DateTime.now(), modified: DateTime.now()),
+                        checksum: checksum,
+                      ));
+                    }
+                  } catch (e, stack) {
+                    Logger.error(
+                        'Error creating partition metadata: $e\n$stack',
+                        label: 'IndexManager._processBatchIndexWrites');
+                  }
+                }
+              }
+
+              // --- Final Step: Update metadata once with all changes ---
+              final partitionMap = {
+                for (var p in indexMeta.partitions) p.index: p
+              };
+              for (var p in allNewOrUpdatedPartitions) {
+                partitionMap[p.index] = p;
+              }
+              final finalPartitions = partitionMap.values.toList()
+                ..sort((a, b) => a.index.compareTo(b.index));
+
+              final updatedMeta = indexMeta.copyWith(
+                partitions: finalPartitions,
+                timestamps: Timestamps(
+                    created: indexMeta.timestamps.created,
+                    modified: DateTime.now()),
+              );
+
+              final metaPath = await _dataStore.pathManager
+                  .getIndexMetaPath(tableName, indexName);
+              await _dataStore.storage
+                  .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+              _indexMetaCache[key] = updatedMeta;
             }
           }
 
-          // Clear insert buffer
-          _writeBuffer[key]!.clear();
-        }
+          // --- 2. Process Deletes Sequentially ---
+          if (hasDeletes) {
+            final deleteBuffer = _deleteBuffer[key]!;
+            _deleteBuffer.remove(key); // Clear buffer immediately
 
-        // Process deletes (also in batch mode)
-        if (hasDeletes) {
-          final entryList = _deleteBuffer[key]!.values.toList();
-
-          // Process deletes in batches to avoid loading too many partitions at once
-          for (int i = 0; i < entryList.length; i += batchSize) {
-            final end = min(i + batchSize, entryList.length);
-
-            // Create current batch delete map for backward compatibility
-            final batchDeletes = <dynamic, Set<dynamic>>{};
-            for (int j = i; j < end; j++) {
-              final entry = entryList[j];
-              final indexKey = entry.indexEntry.indexKey;
-              final recordId = entry.indexEntry.recordPointer.toString();
-
-              if (!batchDeletes.containsKey(indexKey)) {
-                batchDeletes[indexKey] = <dynamic>{};
-              }
-              batchDeletes[indexKey]!.add(recordId);
-            }
-
-            // Process this batch of deletes
-            await _processDeleteEntries(tableName, indexName, batchDeletes);
-
-            // Small delay between batches
-            if (i + batchSize < entryList.length) {
-              await Future.delayed(const Duration(milliseconds: 5));
+            if (deleteBuffer.isNotEmpty) {
+              await _processDeleteEntries(tableName, indexName, deleteBuffer);
             }
           }
 
-          // Clear delete buffer
-          _deleteBuffer[key]!.clear();
+          // Update last write time
+          _indexLastWriteTime[key] = DateTime.now();
+        } catch (e, stack) {
+          Logger.error('Failed to batch write index: $e\n$stack',
+              label: 'IndexManager._processBatchIndexWrites');
+        } finally {
+          // Release lock resource, whether the operation succeeds or fails
+          _dataStore.lockManager
+              ?.releaseExclusiveLock(lockResource, operationId);
         }
-
-        // Update last write time
-        _indexLastWriteTime[key] = DateTime.now();
       } catch (e, stack) {
         Logger.error('Failed to batch write index: $e\n$stack',
             label: 'IndexManager._processBatchIndexWrites');
@@ -657,15 +633,6 @@ class IndexManager {
         _indexWriting[key] = false;
       }
     }
-  }
-
-  /// Calculate optimal batch size
-  int _calculateOptimalBatchSize(int totalEntries) {
-    // Dynamically adjust batch size based on total entries, use smaller batches for large data
-    if (totalEntries > 100000) return 2000;
-    if (totalEntries > 10000) return 1000;
-    if (totalEntries > 5000) return 500;
-    return 200;
   }
 
   void dispose() {
@@ -1018,324 +985,6 @@ class IndexManager {
     }
 
     return result;
-  }
-
-  /// Write index to file
-  Future<void> _writeIndexToFile(String tableName, String indexName,
-      Map<dynamic, Set<dynamic>> entries) async {
-    if (entries.isEmpty) return;
-
-    // Create lock resource identifier for index write operation
-    final lockResource = 'index:$tableName:$indexName';
-    final operationId = 'write_index_${DateTime.now().millisecondsSinceEpoch}';
-
-    try {
-      // Acquire exclusive lock to prevent concurrent writes to the same index file
-      await _dataStore.lockManager
-          ?.acquireExclusiveLock(lockResource, operationId);
-
-      // Get index metadata
-      IndexMeta? meta = await _getIndexMeta(tableName, indexName);
-      final bool isNew = meta == null;
-
-      if (isNew) {
-        // Create index metadata
-        final isUnique =
-            indexName.startsWith('uniq_') || indexName.startsWith('pk_');
-        final fields = [indexName.split('_').last]; // Simple processing
-
-        meta = IndexMeta(
-          version: 1,
-          name: indexName,
-          tableName: tableName,
-          fields: fields,
-          isUnique: isUnique,
-          bTreeOrder: _dataStore.config.bTreeOrder,
-          partitions: [],
-          timestamps: Timestamps(
-            created: DateTime.now(),
-            modified: DateTime.now(),
-          ),
-        );
-      }
-
-      // Get current available partition
-      int partitionIndex =
-          meta.partitions.isEmpty ? 0 : meta.partitions.last.index;
-
-      // Get current partition size
-      int currentSize =
-          meta.partitions.isEmpty ? 0 : meta.partitions.last.fileSizeInBytes;
-
-      // Calculate estimated size based on number of entries
-      // Use average size estimate: 100 bytes per key-value pair (conservative estimate)
-      int estimatedNewSize = currentSize + (entries.length * 100);
-
-      // If the estimated size exceeds the maximum file size, create a new partition
-      if (estimatedNewSize > _dataStore.config.maxPartitionFileSize) {
-        partitionIndex++;
-        currentSize = 0;
-      }
-
-      // Ensure partition directory exists
-      final dirPath = await _dataStore.pathManager
-          .getIndexPartitionDirPath(tableName, indexName, partitionIndex);
-      await _dataStore.storage.ensureDirectoryExists(dirPath);
-
-      // Get partition file path
-      final partitionPath = await _dataStore.pathManager
-          .getIndexPartitionPath(tableName, indexName, partitionIndex);
-
-      // Create or get B+ tree
-      BPlusTree btree;
-      try {
-        if (await _dataStore.storage.existsFile(partitionPath)) {
-          final content =
-              await _dataStore.storage.readAsString(partitionPath) ?? '';
-          btree = BPlusTree.fromString(
-            content,
-            order: meta.bTreeOrder,
-            isUnique: meta.isUnique,
-          );
-        } else {
-          btree = BPlusTree(
-            order: meta.bTreeOrder,
-            isUnique: meta.isUnique,
-          );
-        }
-
-        // Batch process key-value pairs to avoid processing too many at once
-        // Reduce insert batch size to avoid overflow of B+ tree nodes
-        const int insertBatchSize =
-            50; // Reduce batch size to improve stability
-        final entryList = entries.entries.toList();
-
-        for (int i = 0; i < entryList.length; i += insertBatchSize) {
-          final endIndex = min(i + insertBatchSize, entryList.length);
-          final batchEntries = entryList.sublist(i, endIndex);
-
-          for (final entry in batchEntries) {
-            // Process each key separately to reduce the problem of inserting too many values at once
-            for (final value in entry.value) {
-              try {
-                await btree.insert(entry.key, value);
-              } catch (e, stack) {
-                Logger.error(
-                    'Failed to insert B+ tree: key=${entry.key}, value=$value, error=$e\n$stack',
-                    label: 'IndexManager._writeIndexToFile');
-                // If it is an index overflow error, reduce the processing batch and continue to try
-                if (e.toString().contains('RangeError') ||
-                    e.toString().contains('out of range')) {
-                  // It may be a B+ tree structure problem, skip this value and continue to process other values
-                  continue;
-                }
-              }
-            }
-          }
-
-          // Slight delay between batches to avoid blocking
-          if (i + insertBatchSize < entryList.length) {
-            await Future.delayed(const Duration(milliseconds: 1));
-          }
-        }
-
-        // Serialize B+ tree
-        final serialized = btree.toStringHandle();
-
-        // Calculate partition size
-        final newSize = serialized.length;
-
-        // Write to partition file
-        await _dataStore.storage.writeAsString(partitionPath, serialized);
-
-        // Calculate checksum
-        final checksum = _calculateChecksum(serialized);
-
-        // Update index metadata
-        final hasExistingPartition =
-            meta.partitions.any((p) => p.index == partitionIndex);
-
-        // Calculate index value range information
-        dynamic minKey, maxKey;
-
-        try {
-          if (entries.isNotEmpty) {
-            final keys = entries.keys.toList();
-
-            // Check if this index is a primary key index
-            bool isPrimaryKeyIndex = false;
-            if (indexName == 'pk_$tableName') {
-              isPrimaryKeyIndex = true;
-            }
-
-            // Get table structure, for checking if the index is ordered
-            final schema = await _dataStore.getTableSchema(tableName);
-            if (schema == null) {
-              return;
-            }
-
-            // Only primary key index or field explicitly set to ordered, calculate partition key range
-            bool shouldCalculateRange = false;
-
-            if (isPrimaryKeyIndex) {
-              // For primary key index, check if the primary key is ordered
-              shouldCalculateRange = _isPrimaryKeyOrdered(schema);
-            }
-
-            if (shouldCalculateRange) {
-              minKey = _calculateMinKey(keys);
-              maxKey = _calculateMaxKey(keys);
-            }
-          }
-        } catch (e) {
-          // Calculation exception, not affect main process
-          Logger.debug('Failed to calculate index range: $e',
-              label: 'IndexManager._writeIndexToFile');
-        }
-
-        if (hasExistingPartition) {
-          // Update existing partition
-          meta = meta.copyWith(
-            partitions: meta.partitions.map((p) {
-              if (p.index == partitionIndex) {
-                return p.copyWith(
-                  fileSizeInBytes: newSize,
-                  bTreeSize: serialized.length,
-                  entries: btree.count(),
-                  minKey: minKey != null ? (p.minKey ?? minKey) : p.minKey,
-                  maxKey: maxKey != null
-                      ? (ValueComparator.compare(maxKey, (p.maxKey ?? maxKey)) >
-                              0
-                          ? maxKey
-                          : p.maxKey)
-                      : p.maxKey,
-                  timestamps: Timestamps(
-                    created: p.timestamps.created,
-                    modified: DateTime.now(),
-                  ),
-                  checksum: checksum,
-                );
-              }
-              return p;
-            }).toList(),
-            timestamps: Timestamps(
-              created: meta.timestamps.created,
-              modified: DateTime.now(),
-            ),
-          );
-        } else {
-          // Add new partition
-          final newPartition = IndexPartitionMeta(
-            version: 1,
-            index: partitionIndex,
-            fileSizeInBytes: newSize,
-            minKey: minKey,
-            maxKey: maxKey,
-            bTreeSize: serialized.length,
-            entries: btree.count(),
-            timestamps: Timestamps(
-              created: DateTime.now(),
-              modified: DateTime.now(),
-            ),
-            checksum: checksum,
-          );
-
-          meta = meta.copyWith(
-            partitions: [...meta.partitions, newPartition],
-            timestamps: Timestamps(
-              created: meta.timestamps.created,
-              modified: DateTime.now(),
-            ),
-          );
-        }
-
-        // Write index metadata
-        final metaPath =
-            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage
-            .writeAsString(metaPath, jsonEncode(meta.toJson()));
-
-        // Update cache
-        final cacheKey = _getIndexCacheKey(tableName, indexName);
-        _indexMetaCache[cacheKey] = meta;
-
-        // If the index is cached, update the cache
-        if (_indexCache.containsKey(cacheKey)) {
-          try {
-            // Batch update memory cache to avoid processing too many at once
-            final entryList = entries.entries.toList();
-            // Further reduce memory cache batch size
-            const int memCacheBatchSize = 30;
-            for (int i = 0; i < entryList.length; i += memCacheBatchSize) {
-              final endIndex = min(i + memCacheBatchSize, entryList.length);
-              final batchEntries = entryList.sublist(i, endIndex);
-
-              bool batchHadErrors = false;
-
-              for (final entry in batchEntries) {
-                // Each key-value pair is processed independently, a failure does not affect other key-value pairs
-                for (final value in entry.value) {
-                  try {
-                    // Check if the B+ tree is approaching capacity limit
-                    final btree = _indexCache[cacheKey]!;
-                    // Use smaller batch size to process each key's value collection
-                    await btree.insert(entry.key, value);
-                  } catch (e) {
-                    batchHadErrors = true;
-                    // Capture error and record, but do not interrupt the process
-                    Logger.warn(
-                        'Failed to update memory index cache: ${e.toString().substring(0, min(100, e.toString().length))}... key=${entry.key}, value=$value',
-                        label: 'IndexManager._writeIndexToFile');
-
-                    // If it is an index overflow error, consider rebuilding the memory cache
-                    if (e.toString().contains('out of range') ||
-                        e.toString().contains('RangeError')) {
-                      // Remove the index from the cache, it will be reloaded from the file next time
-                      _indexCache.remove(cacheKey);
-                      _indexFullyCached.remove(cacheKey);
-                      Logger.info(
-                          'Detected index overflow, removed from cache: $tableName.$indexName',
-                          label: 'IndexManager._writeIndexToFile');
-                      break; // Do not process remaining values
-                    }
-                  }
-                }
-
-                // If the batch has errors and the index cache has been removed, do not continue processing
-                if (batchHadErrors && !_indexCache.containsKey(cacheKey)) {
-                  break;
-                }
-              }
-
-              // If there are errors and the index cache has been removed, do not continue processing
-              if (batchHadErrors && !_indexCache.containsKey(cacheKey)) {
-                break;
-              }
-
-              // Slight delay between batches to avoid blocking, especially when processing large data
-              if (i + memCacheBatchSize < entryList.length) {
-                await Future.delayed(const Duration(milliseconds: 1));
-              }
-            }
-          } catch (e) {
-            // Capture errors in the overall processing, ensure that even if an error occurs, the process will not be interrupted
-            Logger.error('Error during index cache update process: $e',
-                label: 'IndexManager._writeIndexToFile');
-          }
-        }
-      } catch (e, stack) {
-        Logger.error('Failed to process B+ tree: $e\n$stack',
-            label: 'IndexManager._writeIndexToFile');
-        rethrow;
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to write index to file: $e\n$stack',
-          label: 'IndexManager._writeIndexToFile');
-      rethrow;
-    } finally {
-      // Release lock resource, whether the operation succeeds or fails
-      _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
-    }
   }
 
   /// Verify content checksum
@@ -2558,35 +2207,6 @@ class IndexManager {
     } catch (e, stack) {
       Logger.error('Failed to batch delete records from indexes: $e\n$stack',
           label: 'IndexManager.batchDeleteFromIndexes');
-    }
-  }
-
-  /// Add index entry during migration
-  /// @param tableName Table name
-  /// @param indexName Index name
-  /// @param value Index key value
-  /// @param storeIndexStr String representation of StoreIndex pointer to the record
-  Future<void> addIndexEntry(
-    String tableName,
-    String indexName,
-    dynamic value,
-    String storeIndexStr,
-  ) async {
-    try {
-      // Add index entry using write buffer
-      await _addToInsertBuffer(tableName, indexName, value, storeIndexStr);
-
-      // Update index in memory (if loaded)
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      if (_indexCache.containsKey(cacheKey)) {
-        await _indexCache[cacheKey]!.insert(value, storeIndexStr);
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to add index entry: $e',
-        label: 'IndexManager.addIndexEntry',
-      );
-      rethrow;
     }
   }
 
