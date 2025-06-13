@@ -2625,6 +2625,7 @@ class TableDataManager {
       List<Map<String, dynamic>> records,
       int partitionIndex,
     ) processFunction,
+    bool onlyRead = false,  // if true, only read records from partitions, do not write records
     int? maxConcurrent,
     List<int>? encryptionKey,
     int? encryptionKeyId,
@@ -2658,6 +2659,11 @@ class TableDataManager {
         // process data
         final processedRecords = await processFunction(records, partitionIndex);
 
+        // if only read, return directly
+        if (onlyRead) {
+          return;
+        }
+
         final partitionMeta = await _savePartitionFile(
           tableName,
           isGlobal,
@@ -2677,6 +2683,11 @@ class TableDataManager {
       requireLock: true, // need to lock
       description: 'process table partitions: $tableName',
     );
+
+    // if only read, return directly
+    if (onlyRead) {
+      return;
+    }
 
     if (allPartitionMetas.isNotEmpty) {
       // update table meta

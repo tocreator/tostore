@@ -841,7 +841,7 @@ class IndexManager {
           // Table exists, check if the index is defined in the table
           if (indexName == 'pk_$tableName') {
             // Primary key index, automatically create
-            Logger.info('找不到主键索引 $indexName，自动创建',
+            Logger.info('Primary key index not found: $indexName, auto create',
                 label: 'IndexManager.getIndex');
             await createPrimaryIndex(tableName, tableSchema.primaryKey);
             return getIndex(tableName,
@@ -1233,10 +1233,37 @@ class IndexManager {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
       _indexMetaCache[cacheKey] = newMeta;
 
-      // Scan table data to create index
-      // TODO
-    } catch (e) {
-      Logger.error('Failed to create primary key index: $e',
+      // scan table data to build index
+      int recordCount = 0;
+        
+      await _dataStore.tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true,
+        processFunction: (records, partitionIndex) async {
+          for (final record in records) {
+            final primaryValue = record[primaryKey];
+            if (primaryValue == null) {
+              Logger.warn('Record missing primary key value, skip index creation',
+                  label: 'IndexManager.createPrimaryIndex');
+              continue;
+            }
+              
+            final pointer = await StoreIndex.create(
+                        offset: recordCount,
+                        partitionId: partitionIndex,
+                        clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+                        nodeId: _dataStore.config.distributedNodeConfig.nodeId);
+            
+            await _addToInsertBuffer(tableName, indexName, primaryValue, pointer.toString());
+
+            recordCount++;
+          }
+          return records; // return original records, do not modify
+        }
+      );
+      
+    } catch (e, stack) {
+      Logger.error('Failed to create primary index: $e\n$stack',
           label: 'IndexManager.createPrimaryIndex');
       rethrow;
     }
@@ -1316,10 +1343,37 @@ class IndexManager {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
       _indexMetaCache[cacheKey] = newMeta;
 
-      // Scan table data to create index data to create index
-      //  TODO
-    } catch (e) {
-      Logger.error('Failed to create index: $e',
+      // scan table data to build index
+      int recordCount = 0;
+          
+      await _dataStore.tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true,
+        processFunction: (records, partitionIndex) async {
+          for (final record in records) {
+            // build index key
+            final indexKey = _createIndexKey(record, schema.fields);
+            if (indexKey == null) {
+              // if cannot build index key (e.g. some fields are null), skip this record
+              continue;
+            }
+            // create store index
+            final pointer = await StoreIndex.create(
+                        offset: recordCount,
+                        partitionId: partitionIndex,
+                        clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+                        nodeId: _dataStore.config.distributedNodeConfig.nodeId);
+            
+            // add record to index
+            await _addToInsertBuffer(tableName, indexName, indexKey, pointer.toString());
+            recordCount++;
+          }
+          return records; // return original records, do not modify
+        }
+      );
+    
+    } catch (e, stack) {
+      Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
       rethrow;
     }
