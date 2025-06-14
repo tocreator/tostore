@@ -8,6 +8,15 @@ import '../handler/logger.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
+  // Cache for memory values
+  int? _cachedSystemMemoryMB;
+  DateTime? _lastSystemMemoryFetch;
+
+  int? _cachedAvailableSystemMemoryMB;
+  DateTime? _lastAvailableSystemMemoryFetch;
+
+  final _memoryFetchTimeout = const Duration(seconds: 5);
+
   @override
   bool get isMobile => Platform.isAndroid || Platform.isIOS;
 
@@ -54,23 +63,69 @@ class PlatformHandlerImpl implements PlatformInterface {
   /// Get system memory size (MB)
   @override
   Future<int> getSystemMemoryMB() async {
+    final now = DateTime.now();
+    if (_cachedSystemMemoryMB != null &&
+        _lastSystemMemoryFetch != null &&
+        now.difference(_lastSystemMemoryFetch!) < _memoryFetchTimeout) {
+      return _cachedSystemMemoryMB!;
+    }
+
+    int memoryMB;
     try {
       if (isWindows) {
-        return await _getWindowsMemory();
+        memoryMB = await _getWindowsMemory();
       } else if (isLinux) {
-        return await _getLinuxMemory();
+        memoryMB = await _getLinuxMemory();
       } else if (isMacOS) {
-        return await _getMacOSMemory();
+        memoryMB = await _getMacOSMemory();
       } else if (isAndroid) {
-        return await _getAndroidMemory();
+        memoryMB = await _getAndroidMemory();
+      } else {
+        // Unknown platform or retrieval failed, estimate based on core count
+        memoryMB = processorCores * 1024;
       }
-
-      // Unknown platform or retrieval failed, estimate based on core count
-      return processorCores * 1024;
     } catch (e) {
       // Return a safe default value based on platform
-      return isMobile ? 2048 : 4096;
+      memoryMB = isMobile ? 2048 : 4096;
     }
+
+    _cachedSystemMemoryMB = memoryMB;
+    _lastSystemMemoryFetch = now;
+    return memoryMB;
+  }
+
+  /// Get available system memory size (MB)
+  @override
+  Future<int> getAvailableSystemMemoryMB() async {
+    final now = DateTime.now();
+    if (_cachedAvailableSystemMemoryMB != null &&
+        _lastAvailableSystemMemoryFetch != null &&
+        now.difference(_lastAvailableSystemMemoryFetch!) < _memoryFetchTimeout) {
+      return _cachedAvailableSystemMemoryMB!;
+    }
+
+    int memoryMB;
+    try {
+      if (isWindows) {
+        memoryMB = await _getWindowsAvailableMemory();
+      } else if (isLinux) {
+        memoryMB = await _getLinuxAvailableMemory();
+      } else if (isMacOS) {
+        memoryMB = await _getMacOSAvailableMemory();
+      } else if (isAndroid) {
+        memoryMB = await _getAndroidAvailableMemory();
+      } else {
+        // Unknown platform or retrieval failed, estimate 25% of total
+        memoryMB = (await getSystemMemoryMB()) ~/ 4;
+      }
+    } catch (e) {
+      // Return a safe default value based on platform
+      memoryMB = isMobile ? 512 : 1024;
+    }
+
+    _cachedAvailableSystemMemoryMB = memoryMB;
+    _lastAvailableSystemMemoryFetch = now;
+    return memoryMB;
   }
 
   /// Get app save directory, for data, config, etc.
@@ -141,6 +196,44 @@ class PlatformHandlerImpl implements PlatformInterface {
     }
   }
 
+  /// Get Windows available memory
+  Future<int> _getWindowsAvailableMemory() async {
+    try {
+      // Use PowerShell to get available memory information
+      final result = await Process.run('powershell', [
+        '-Command',
+        '(Get-Counter "\\Memory\\Available MBytes").CounterSamples[0].CookedValue'
+      ]);
+
+      if (result.exitCode == 0 && result.stdout != null) {
+        final memoryMB = double.tryParse((result.stdout as String).trim());
+        if (memoryMB != null && memoryMB > 0) {
+          return memoryMB.round();
+        }
+      }
+
+      // Backup method: calculate available memory from system information
+      final fallbackResult = await Process.run('powershell', [
+        '-Command',
+        '(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1KB'
+      ]);
+      
+      if (fallbackResult.exitCode == 0 && fallbackResult.stdout != null) {
+        final memoryKB = double.tryParse((fallbackResult.stdout as String).trim());
+        if (memoryKB != null && memoryKB > 0) {
+          return (memoryKB / 1024).round(); // Convert to MB
+        }
+      }
+
+      // If all fail, return 25% of total memory as an estimate
+      final totalMemory = await _getWindowsMemory();
+      return totalMemory ~/ 4;
+    } catch (e) {
+      final totalMemory = await _getWindowsMemory();
+      return totalMemory ~/ 4; // Return 1/4 of total memory as default value
+    }
+  }
+
   /// Get Linux system memory
   Future<int> _getLinuxMemory() async {
     try {
@@ -177,6 +270,59 @@ class PlatformHandlerImpl implements PlatformInterface {
     }
   }
 
+  /// Get Linux available memory
+  Future<int> _getLinuxAvailableMemory() async {
+    try {
+      // use /proc/meminfo to get available memory
+      final file = File('/proc/meminfo');
+      if (await file.exists()) {
+        final contents = await file.readAsString();
+        
+        // first try to get MemAvailable (more accurate metric)
+        final memAvailableMatch =
+            RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
+            
+        if (memAvailableMatch != null) {
+          final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
+          return (memKB / 1024).round(); // convert to MB
+        }
+        
+        // if MemAvailable does not exist (older kernel), calculate: MemFree + Buffers + Cached
+        final memFreeMatch = RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
+        final buffersMatch = RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
+        final cachedMatch = RegExp(r'Cached:\s+(\d+) kB').firstMatch(contents);
+        
+        if (memFreeMatch != null && buffersMatch != null && cachedMatch != null) {
+          final memFreeKB = int.tryParse(memFreeMatch.group(1) ?? '0') ?? 0;
+          final buffersKB = int.tryParse(buffersMatch.group(1) ?? '0') ?? 0;
+          final cachedKB = int.tryParse(cachedMatch.group(1) ?? '0') ?? 0;
+          
+          return ((memFreeKB + buffersKB + cachedKB) / 1024).round(); // convert to MB
+        }
+      }
+
+      // backup command: use free command
+      final result = await Process.run('free', ['-m']);
+      if (result.exitCode == 0 && result.stdout != null) {
+        final lines = (result.stdout as String).split('\n');
+        if (lines.length > 1) {
+          final memParts = lines[1].split(RegExp(r'\s+'));
+          if (memParts.length > 3) {
+            // free -m output format: Mem: total used free shared buffers cached
+            // available memory = free + buffers + cached (usually the 4th, 6th, and 7th columns)
+            return int.tryParse(memParts[3]) ?? (processorCores * 256);
+          }
+        }
+      }
+
+      // estimate 1/4 of total memory
+      final totalMemory = await _getLinuxMemory();
+      return totalMemory ~/ 4;
+    } catch (e) {
+      return 1024; // 1GB as default value
+    }
+  }
+
   /// Get macOS system memory
   Future<int> _getMacOSMemory() async {
     try {
@@ -206,6 +352,64 @@ class PlatformHandlerImpl implements PlatformInterface {
       return processorCores * 1024;
     } catch (e) {
       return 8192; // 8GB as default value
+    }
+  }
+
+  /// Get macOS available memory
+  Future<int> _getMacOSAvailableMemory() async {
+    try {
+      // Use vm_stat command to get memory statistics
+      final result = await Process.run('vm_stat', []);
+      
+      if (result.exitCode == 0 && result.stdout != null) {
+        final output = result.stdout as String;
+        
+        // Parse page size
+        final pageSizeMatch = RegExp(r'page size of (\d+) bytes').firstMatch(output);
+        final pageSize = pageSizeMatch != null 
+            ? int.tryParse(pageSizeMatch.group(1) ?? '4096') ?? 4096 
+            : 4096;
+            
+        // Parse free pages
+        final freeMatch = RegExp(r'Pages free:\s+(\d+)').firstMatch(output);
+        final inactiveMatch = RegExp(r'Pages inactive:\s+(\d+)').firstMatch(output);
+        final purgableMatch = RegExp(r'Pages purgeable:\s+(\d+)').firstMatch(output);
+        
+        if (freeMatch != null && inactiveMatch != null && purgableMatch != null) {
+          final freePages = int.tryParse(freeMatch.group(1) ?? '0') ?? 0;
+          final inactivePages = int.tryParse(inactiveMatch.group(1) ?? '0') ?? 0;
+          final purgablePages = int.tryParse(purgableMatch.group(1) ?? '0') ?? 0;
+          
+          // Calculate available memory: free pages + inactive pages + purgeable pages
+          final totalAvailableBytes = (freePages + inactivePages + purgablePages) * pageSize;
+          return (totalAvailableBytes / (1024 * 1024)).round(); // Convert to MB
+        }
+      }
+
+      // Backup command: use top command
+      final topResult = await Process.run('top', ['-l', '1', '-n', '0']);
+      if (topResult.exitCode == 0 && topResult.stdout != null) {
+        final output = topResult.stdout as String;
+        // Find memory usage from top output
+        final memMatch = RegExp(r'PhysMem: .*?(\d+)([MG]) unused').firstMatch(output);
+        if (memMatch != null) {
+          final value = int.tryParse(memMatch.group(1) ?? '0') ?? 0;
+          final unit = memMatch.group(2);
+          if (unit == 'G') {
+            return value * 1024; // Convert GB to MB
+          } else {
+            return value; // Already in MB
+          }
+        }
+      }
+      
+      // If all fail, estimate 1/4 of total memory
+      final totalMemory = await _getMacOSMemory();
+      return totalMemory ~/ 4;
+    } catch (e) {
+      // Return 1/4 of total memory as default value
+      final totalMemory = await _getMacOSMemory();
+      return totalMemory ~/ 4;
     }
   }
 
@@ -242,6 +446,59 @@ class PlatformHandlerImpl implements PlatformInterface {
       return processorCores <= 4 ? 2048 : 4096;
     } catch (e) {
       return 2048; // 2GB as default value
+    }
+  }
+
+  /// Get Android available memory
+  Future<int> _getAndroidAvailableMemory() async {
+    try {
+      // Similar to Linux, use /proc/meminfo to get available memory
+      final file = File('/proc/meminfo');
+      if (await file.exists()) {
+        final contents = await file.readAsString();
+        
+        // First try to get MemAvailable (more modern Android system)
+        final memAvailableMatch =
+            RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
+            
+        if (memAvailableMatch != null) {
+          final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
+          return (memKB / 1024).round(); // Convert to MB
+        }
+        
+        // Backup method: calculate MemFree + Cached + Buffers
+        final memFreeMatch = RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
+        final buffersMatch = RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
+        final cachedMatch = RegExp(r'Cached:\s+(\d+) kB').firstMatch(contents);
+        
+        if (memFreeMatch != null && buffersMatch != null && cachedMatch != null) {
+          final memFreeKB = int.tryParse(memFreeMatch.group(1) ?? '0') ?? 0;
+          final buffersKB = int.tryParse(buffersMatch.group(1) ?? '0') ?? 0;
+          final cachedKB = int.tryParse(cachedMatch.group(1) ?? '0') ?? 0;
+          
+          return ((memFreeKB + buffersKB + cachedKB) / 1024).round(); // Convert to MB
+        }
+      }
+
+      // If file reading fails, try using command line tool
+      final result = await Process.run('cat', ['/proc/meminfo']);
+      if (result.exitCode == 0 && result.stdout != null) {
+        final contents = result.stdout as String;
+        
+        final memAvailableMatch =
+            RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
+            
+        if (memAvailableMatch != null) {
+          final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
+          return (memKB / 1024).round(); // Convert to MB
+        }
+      }
+
+      // Estimate 25% of total memory
+      final totalMemory = await _getAndroidMemory();
+      return totalMemory ~/ 4;
+    } catch (e) {
+      return 512; // Default 512MB available
     }
   }
 

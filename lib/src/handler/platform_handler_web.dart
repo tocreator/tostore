@@ -49,6 +49,12 @@ class PlatformHandlerImpl implements PlatformInterface {
   }
 
   @override
+  Future<int> getAvailableSystemMemoryMB() async {
+    // Web platform cannot accurately get available memory, return an estimated value (40% of total memory)
+    return 204; // 512 * 0.4 约等于 204
+  }
+
+  @override
   Future<String> getPathApp() async {
     return '';
   }

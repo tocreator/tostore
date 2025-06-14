@@ -5,6 +5,7 @@ import 'dart:math';
 import '../compute/compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
+import '../handler/platform_handler.dart';
 import '../model/file_info.dart';
 import '../model/store_index.dart';
 import '../model/table_schema.dart';
@@ -836,54 +837,14 @@ class IndexManager {
         if (tableSchema == null) {
           return null;
         }
+        
+        // Table exists but index not found, check if we need to rebuild
         if (tableSchema.fields.isNotEmpty) {
-          // Table exists, check if the index is defined in the table
-          if (indexName == 'pk_$tableName') {
-            // Primary key index, automatically create
-            Logger.info('Primary key index not found: $indexName, auto create',
-                label: 'IndexManager.getIndex');
-            await createPrimaryIndex(tableName, tableSchema.primaryKey);
-            return getIndex(tableName,
-                indexName); // Recursively call to get the created index
-          } else {
-            // Try to find if it is a normal index
-            final indexSchema = tableSchema.indexes.firstWhere(
-              (idx) => idx.actualIndexName == indexName,
-              orElse: () => const IndexSchema(fields: []),
-            );
-
-            if (indexSchema.fields.isNotEmpty) {
-              // The table defines this index, but the index file does not exist, create it
-              Logger.info(
-                  'not found index $indexName, but defined in table schema, auto create',
-                  label: 'IndexManager.getIndex');
-              await createIndex(tableName, indexSchema);
-              return getIndex(tableName,
-                  indexName); // Recursively call to get the created index
-            }
-            // Check if it is a unique field index automatically created
-            else if (indexName.startsWith('uniq_')) {
-              // Extract possible field names - remove prefix 'uniq_'
-              final fieldName = indexName.substring(5);
-
-              // Find if the field is set to unique constraint
-              final uniqueField = tableSchema.fields.firstWhere(
-                (field) => field.name == fieldName && field.unique,
-                orElse: () => const FieldSchema(name: '', type: DataType.text),
-              );
-
-              if (uniqueField.name.isNotEmpty) {
-                final autoIndexSchema = IndexSchema(
-                  fields: [fieldName],
-                  unique: true,
-                );
-
-                await createIndex(tableName, autoIndexSchema);
-                return getIndex(tableName,
-                    indexName); // Recursively call to get the created index
-              }
-            }
-          }
+          // Check table index status and rebuild indexes if needed
+          await _checkAndRebuildTableIndexes(tableName, tableSchema);
+          
+          // Try to get the index again after rebuilding
+          return getIndex(tableName, indexName);
         }
 
         Logger.debug('not found index: $tableName.$indexName, skip index check',
@@ -923,15 +884,15 @@ class IndexManager {
       // Load index data from each partition
       for (final partition in meta.partitions) {
         try {
-          final partitionPath = await _dataStore.pathManager
-              .getIndexPartitionPath(tableName, indexName, partition.index);
+        final partitionPath = await _dataStore.pathManager
+            .getIndexPartitionPath(tableName, indexName, partition.index);
 
-          if (!await _dataStore.storage.existsFile(partitionPath)) {
+        if (!await _dataStore.storage.existsFile(partitionPath)) {
             continue;
-          }
+        }
 
-          final content = await _dataStore.storage.readAsString(partitionPath);
-          if (content == null || content.isEmpty) {
+        final content = await _dataStore.storage.readAsString(partitionPath);
+        if (content == null || content.isEmpty) {
             continue;
           }
 
@@ -940,7 +901,7 @@ class IndexManager {
               !_verifyChecksum(content, partition.checksum!)) {
             Logger.error(
                 'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
-                label: 'IndexManager._loadIndexFromFile');
+          label: 'IndexManager._loadIndexFromFile');
             continue; // Skip damaged partition
           }
 
@@ -1060,7 +1021,7 @@ class IndexManager {
                 .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
 
             // Update cache
-            final cacheKey = _getIndexCacheKey(tableName, indexName);
+    final cacheKey = _getIndexCacheKey(tableName, indexName);
             _indexMetaCache[cacheKey] = updatedMeta;
 
             // If the index is in the cache, ensure the unique flag is correct
@@ -1098,9 +1059,9 @@ class IndexManager {
             for (final field in index.fields) {
               processedFieldIndexes.add(field);
             }
-          }
-        }
-      }
+    }
+  }
+}
 
       // 3. Handle the case where a normal field is set to unique=true but no index is created
       for (final field in schema.fields) {
@@ -1207,60 +1168,14 @@ class IndexManager {
         return;
       }
 
-      // Create index metadata
-      final newMeta = IndexMeta(
-        version: 1,
-        name: indexName,
-        tableName: tableName,
-        fields: [primaryKey],
-        isUnique: true,
-        bTreeOrder: _dataStore.config.bTreeOrder,
-        partitions: [],
-        timestamps: Timestamps(
-          created: DateTime.now(),
-          modified: DateTime.now(),
-        ),
-      );
-
-      // Write index metadata
-      final metaPath =
-          await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-      await _dataStore.storage
-          .writeAsString(metaPath, jsonEncode(newMeta.toJson()));
-
-      // Update cache
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      _indexMetaCache[cacheKey] = newMeta;
-
-      // scan table data to build index
-      int recordCount = 0;
-
-      await _dataStore.tableDataManager.processTablePartitions(
-        tableName: tableName,
-        onlyRead: true,
-        processFunction: (records, partitionIndex) async {
-          for (final record in records) {
-            final primaryValue = record[primaryKey];
-            if (primaryValue == null) {
-              Logger.warn(
-                'Record missing primary key value, skip index creation',
-                    label: 'IndexManager.createPrimaryIndex');
-              continue;
-            }
-
-            final pointer = await StoreIndex.create(
-              offset: recordCount,
-              partitionId: partitionIndex,
-              clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
-
-              await _addToInsertBuffer(
-                  tableName, indexName, primaryValue, pointer.toString());
-
-              recordCount++;
-            }
-            return records; // return original records, do not modify
-          });
+      // Get table schema
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema == null) {
+        return;
+      } else {
+        // Use existing schema to rebuild
+        await _rebuildTableIndexes(tableName, tableSchema, true, []);
+      }
     } catch (e, stack) {
       Logger.error('Failed to create primary index: $e\n$stack',
           label: 'IndexManager.createPrimaryIndex');
@@ -1281,95 +1196,48 @@ class IndexManager {
         return;
       }
 
-      // get table structure to check if a redundant primary key index is created
+      // Get table structure
       final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema != null) {
-        final primaryKeyName = tableSchema.primaryKey;
-        // check if a redundant primary key index is created
-        if (schema.fields.length == 1 &&
-            schema.fields.first == primaryKeyName &&
-            indexName != 'pk_$tableName') {
+      if (tableSchema == null) {
+        return;
+      }
+
+      final primaryKeyName = tableSchema.primaryKey;
+      // Check if a redundant primary key index is created
+      if (schema.fields.length == 1 &&
+          schema.fields.first == primaryKeyName &&
+          indexName != 'pk_$tableName') {
+        Logger.warn(
+          'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is automatically indexed as pk_$tableName',
+          label: 'IndexManager.createIndex',
+        );
+        return; // Skip creation of redundant primary key index
+      }
+
+      // Check if this index would duplicate an auto-created unique field index
+      if (schema.fields.length == 1 && schema.unique) {
+        final fieldName = schema.fields[0];
+        final autoUniqueIndexName = 'uniq_$fieldName';
+
+        // Check if the auto-created unique index exists
+        final autoIndexMeta = await _getIndexMeta(tableName, autoUniqueIndexName);
+
+        if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
           Logger.warn(
-            'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is automatically indexed as pk_$tableName',
+            'Detected redundant unique index creation: $indexName would duplicate the auto-created unique index "$autoUniqueIndexName". Removing auto-created index and proceeding with explicit index.',
             label: 'IndexManager.createIndex',
           );
-          return; // skip creation of redundant primary key index
-        }
 
-        // Check if this index would duplicate an auto-created unique field index
-        if (schema.fields.length == 1 && schema.unique) {
-          final fieldName = schema.fields[0];
-          final autoUniqueIndexName = 'uniq_$fieldName';
-
-          // Check if the auto-created unique index exists
-          final autoIndexMeta =
-              await _getIndexMeta(tableName, autoUniqueIndexName);
-
-          if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
-            Logger.warn(
-              'Detected redundant unique index creation: $indexName would duplicate the auto-created unique index "$autoUniqueIndexName". Removing auto-created index and proceeding with explicit index.',
-              label: 'IndexManager.createIndex',
-            );
-
-            // Remove the auto-created unique index before creating the explicit one
-            await removeIndex(tableName, indexName: autoUniqueIndexName);
-          }
+          // Remove the auto-created unique index before creating the explicit one
+          await removeIndex(tableName, indexName: autoUniqueIndexName);
         }
       }
 
-      // Create index metadata
-      final newMeta = IndexMeta(
-        version: 1,
-        name: indexName,
-        tableName: tableName,
-        fields: schema.fields,
-        isUnique: schema.unique,
-        bTreeOrder: _dataStore.config.bTreeOrder,
-        partitions: [],
-        timestamps: Timestamps(
-          created: DateTime.now(),
-          modified: DateTime.now(),
-        ),
-      );
-
-      // Write index metadata
-      final metaPath =
-          await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-      await _dataStore.storage
-          .writeAsString(metaPath, jsonEncode(newMeta.toJson()));
-
-      // Update cache
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      _indexMetaCache[cacheKey] = newMeta;
-
-      // scan table data to build index
-      int recordCount = 0;
-
-      await _dataStore.tableDataManager.processTablePartitions(
-          tableName: tableName,
-          onlyRead: true,
-          processFunction: (records, partitionIndex) async {
-            for (final record in records) {
-              // build index key
-              final indexKey = _createIndexKey(record, schema.fields);
-              if (indexKey == null) {
-                // if cannot build index key (e.g. some fields are null), skip this record
-                continue;
-              }
-              // create store index
-              final pointer = await StoreIndex.create(
-                  offset: recordCount,
-                  partitionId: partitionIndex,
-                  clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
-
-              // add record to index
-              await _addToInsertBuffer(
-                  tableName, indexName, indexKey, pointer.toString());
-              recordCount++;
-            }
-            return records; // return original records, do not modify
-          });
+      // Use optimized index building
+      await _rebuildTableIndexes(tableName, tableSchema, false, [schema]);
+      
+      Logger.info('Created index for $tableName: $indexName',
+          label: 'IndexManager.createIndex');
     } catch (e, stack) {
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
@@ -1495,16 +1363,16 @@ class IndexManager {
       }
 
       for (final field in schema.fields) {
-        // Check if the field is set to unique=true
+        // Check unique field auto-created indexes
         if (field.unique) {
-          // If there is no explicit index, we need to remove from the auto-created unique index
-          if (!indexesToReset.contains('uniq_${field.name}')) {
-            indexesToReset.add('uniq_${field.name}');
+          final uniqueIndexName = 'uniq_${field.name}';
+          if (!indexesToReset.contains(uniqueIndexName)) {
+            indexesToReset.add(uniqueIndexName);
           }
         }
       }
 
-      // Clear index data
+      // Clear index data from memory and files
       for (final indexName in indexesToReset) {
         // Clear write buffer
         final cacheKey = _getIndexCacheKey(tableName, indexName);
@@ -1542,14 +1410,29 @@ class IndexManager {
         }
       }
 
-      // Rebuild indexes
-      // 1. Rebuild primary key index
-      await createPrimaryIndex(tableName, schema.primaryKey);
-
-      // 2. Rebuild other indexes
-      for (final indexSchema in schema.indexes) {
-        await createIndex(tableName, indexSchema);
+      // Collect all indexes to rebuild
+      final indexesToBuild = <IndexSchema>[];
+      
+      // Add all normal indexes
+      indexesToBuild.addAll(schema.indexes);
+      
+      // Add unique field indexes if they don't have an explicit index
+      for (final field in schema.fields) {
+        if (field.unique && field.name != schema.primaryKey) {
+          bool hasExplicitIndex = schema.indexes.any((idx) => 
+              idx.fields.length == 1 && idx.fields.first == field.name);
+          
+          if (!hasExplicitIndex) {
+            indexesToBuild.add(IndexSchema(
+              fields: [field.name],
+              unique: true,
+            ));
+          }
+        }
       }
+
+      // Use optimized batch index building mechanism
+      await _rebuildTableIndexes(tableName, schema, true, indexesToBuild);
 
       Logger.debug('Reset table indexes completed: $tableName',
           label: 'IndexManager.resetIndexes');
@@ -1627,9 +1510,9 @@ class IndexManager {
               }
               indexUpdates[indexName]![compositeKey]!.add(recordId);
             }
-          }
-        }
-      }
+    }
+  }
+}
 
       // Batch update write buffer
       for (final entry in indexUpdates.entries) {
@@ -2168,8 +2051,8 @@ class IndexManager {
       Logger.error('Failed to process index partitions: $e\n$stack',
           label: 'IndexManager.processIndexPartitions');
       return false;
-    }
   }
+}
 
   /// Batch delete multiple records from all indexes
   /// @param tableName Table name
@@ -2327,7 +2210,7 @@ class IndexManager {
   Future<void> _addToInsertBuffer(String tableName, String indexName,
       dynamic key, String storeIndexStr) async {
     try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
+    final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Parse StoreIndex from string
       final storeIndex = StoreIndex.fromString(storeIndexStr);
@@ -2365,7 +2248,7 @@ class IndexManager {
         timestamp: DateTime.now(),
       );
 
-      // Add to buffer
+    // Add to buffer
       _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
       // Check buffer size, enable fast processing mode when buffer reaches threshold
@@ -2401,7 +2284,7 @@ class IndexManager {
   Future<void> addToDeleteBuffer(String tableName, String indexName,
       dynamic key, String storeIndexStr) async {
     try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
+    final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Parse StoreIndex from string
       final storeIndex = StoreIndex.fromString(storeIndexStr);
@@ -2448,7 +2331,7 @@ class IndexManager {
         timestamp: DateTime.now(),
       );
 
-      // Add to buffer
+    // Add to buffer
       _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
       // Also remove from memory cache if it exists
@@ -2679,22 +2562,22 @@ class IndexManager {
         await _dataStore.storage.deleteDirectory(indexSubDirPath);
       } else {
         // if not using new directory structure, need to find and delete partition files by meta file
-        final meta = await _getIndexMeta(tableName, indexName);
-        if (meta != null) {
-          // delete all partition files
-          for (final partition in meta.partitions) {
-            try {
-              final partitionPath = await _dataStore.pathManager
-                  .getIndexPartitionPath(tableName, indexName, partition.index);
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta != null) {
+        // delete all partition files
+        for (final partition in meta.partitions) {
+          try {
+            final partitionPath = await _dataStore.pathManager
+                .getIndexPartitionPath(tableName, indexName, partition.index);
 
-              if (await _dataStore.storage.existsFile(partitionPath)) {
-                await _dataStore.storage.deleteFile(partitionPath);
-              }
-            } catch (e) {
-              Logger.error('Failed to delete index partition file: $e',
-                  label: 'IndexManager._deleteIndexFiles');
+            if (await _dataStore.storage.existsFile(partitionPath)) {
+              await _dataStore.storage.deleteFile(partitionPath);
             }
+          } catch (e) {
+            Logger.error('Failed to delete index partition file: $e',
+                label: 'IndexManager._deleteIndexFiles');
           }
+        }
         }
       }
 
@@ -2720,5 +2603,373 @@ class IndexManager {
     final setA = Set<String>.from(a);
     final setB = Set<String>.from(b);
     return setA.difference(setB).isEmpty;
+  }
+
+  /// Check and rebuild needed indexes for a table
+  /// @param tableName Table name
+  /// @param tableSchema Table schema
+  Future<void> _checkAndRebuildTableIndexes(String tableName, TableSchema tableSchema) async {
+    try {
+      // Create lock resource identifier
+      final lockResource = 'rebuild_indexes:$tableName';
+      final operationId = 'rebuild_indexes_${DateTime.now().millisecondsSinceEpoch}';
+      
+      try {
+        // Try to acquire lock
+        final lockAcquired = _dataStore.lockManager
+            ?.tryAcquireExclusiveLock(lockResource, operationId);
+        
+        if (lockAcquired == false) {
+          // If lock cannot be acquired, another thread is rebuilding
+          Logger.info('Another thread is rebuilding indexes for $tableName, skipping',
+              label: 'IndexManager._checkAndRebuildTableIndexes');
+          return;
+        }
+        
+        // Check primary key index
+        final pkIndexName = 'pk_$tableName';
+        final pkIndexMeta = await _getIndexMeta(tableName, pkIndexName);
+        final primaryKey = tableSchema.primaryKey;
+        
+        // Collect indexes to build
+        final indexesToBuild = <IndexSchema>[];
+        bool needRebuildPrimary = pkIndexMeta == null;
+        
+        // Check normal indexes
+        for (final indexSchema in tableSchema.indexes) {
+          final indexName = indexSchema.actualIndexName;
+          final indexMeta = await _getIndexMeta(tableName, indexName);
+          
+          if (indexMeta == null) {
+            indexesToBuild.add(indexSchema);
+          }
+        }
+        
+        // Check unique field auto-created indexes
+        for (final field in tableSchema.fields) {
+          if (field.unique && field.name != primaryKey) {
+            // Check if an explicit index exists for this field
+            bool hasExplicitIndex = tableSchema.indexes.any((idx) => 
+                idx.fields.length == 1 && idx.fields.first == field.name);
+            
+            if (!hasExplicitIndex) {
+              final uniqueIndexName = 'uniq_${field.name}';
+              final indexMeta = await _getIndexMeta(tableName, uniqueIndexName);
+              
+              if (indexMeta == null) {
+                // Add to indexes to build
+                indexesToBuild.add(IndexSchema(
+                  fields: [field.name],
+                  unique: true,
+                ));
+              }
+            }
+          }
+        }
+        
+        // If all indexes exist, no need to rebuild
+        if (!needRebuildPrimary && indexesToBuild.isEmpty) {
+          return;
+        }
+        
+        Logger.info(
+          'Rebuilding indexes for $tableName: primaryKey=$needRebuildPrimary, otherIndexes=${indexesToBuild.length}',
+          label: 'IndexManager._checkAndRebuildTableIndexes'
+        );
+        
+        // Rebuild all needed indexes at once
+        await _rebuildTableIndexes(tableName, tableSchema, needRebuildPrimary, indexesToBuild);
+        
+      } finally {
+        // Release lock
+        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      }
+    } catch (e, stack) {
+      Logger.error(
+        'Failed to check and rebuild indexes: $e\n$stack',
+        label: 'IndexManager._checkAndRebuildTableIndexes'
+      );
+    }
+  }
+
+  /// Rebuild table indexes efficiently
+  /// @param tableName Table name
+  /// @param tableSchema Table schema
+  /// @param rebuildPrimary Whether to rebuild primary key index
+  /// @param indexesToBuild List of indexes to build
+  Future<void> _rebuildTableIndexes(
+    String tableName, 
+    TableSchema tableSchema, 
+    bool rebuildPrimary,
+    List<IndexSchema> indexesToBuild
+  ) async {
+    try {
+      final primaryKey = tableSchema.primaryKey;
+      
+      // Create index metadata (if needed)
+      if (rebuildPrimary) {
+        final pkIndexName = 'pk_$tableName';
+        final pkMeta = IndexMeta(
+          version: 1,
+          name: pkIndexName,
+          tableName: tableName,
+          fields: [primaryKey],
+          isUnique: true,
+          bTreeOrder: _dataStore.config.bTreeOrder,
+          partitions: [],
+          timestamps: Timestamps(
+            created: DateTime.now(),
+            modified: DateTime.now(),
+          ),
+        );
+        
+        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, pkIndexName);
+        await _dataStore.storage.writeAsString(metaPath, jsonEncode(pkMeta.toJson()));
+        _indexMetaCache[_getIndexCacheKey(tableName, pkIndexName)] = pkMeta;
+      }
+      
+      // Create metadata for other indexes
+      for (final indexSchema in indexesToBuild) {
+        final indexName = indexSchema.actualIndexName;
+        final indexMeta = IndexMeta(
+          version: 1,
+          name: indexName,
+          tableName: tableName,
+          fields: indexSchema.fields,
+          isUnique: indexSchema.unique,
+          bTreeOrder: _dataStore.config.bTreeOrder,
+          partitions: [],
+          timestamps: Timestamps(
+            created: DateTime.now(),
+            modified: DateTime.now(),
+          ),
+        );
+        
+        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+        await _dataStore.storage.writeAsString(metaPath, jsonEncode(indexMeta.toJson()));
+        _indexMetaCache[_getIndexCacheKey(tableName, indexName)] = indexMeta;
+      }
+      
+      // Store index entries by partition
+      // Map<partitionId, Map<indexName, Map<indexKey, List<recordPointer>>>>
+      final partitionIndexData = <int, Map<String, Map<dynamic, List<String>>>>{};
+      
+      // Maximum concurrent operations
+      final maxConcurrent = _dataStore.config.maxConcurrent;
+      
+      // Record count for generating pointers
+      int recordCount = 0;
+      
+      // Track which partitions have been processed
+      final processedPartitions = <int>{};
+      
+      // Count total entries in write buffer for this table
+      int getTableWriteBufferSize() {
+        int size = 0;
+        for (final key in _writeBuffer.keys) {
+          if (key.startsWith('$tableName:') && _writeBuffer[key] != null) {
+            size += _writeBuffer[key]!.length;
+          }
+        }
+        return size;
+      }
+      
+      // Calculate dynamic threshold based on available memory
+      // Each index entry is estimated to consume about 100 bytes
+      Future<int> getDynamicThreshold() async {
+        try {
+          // Get available memory in MB
+          final availableMemoryMB = await PlatformHandler.getAvailableSystemMemoryMB();
+          
+          // Reserve 25% of available memory for index building
+          // 1MB = 1024*1024 bytes, divide by 100 bytes per entry
+          final maxEntriesInMemory = (availableMemoryMB * 1024 * 1024 * 0.25 / 100).toInt();
+          
+          // Minimum threshold to ensure reasonable batch size
+          const minThreshold = _fastProcessThreshold;
+          
+          // Calculate a safe threshold, with upper and lower limits
+          return maxEntriesInMemory.clamp(minThreshold, minThreshold * 20);
+        } catch (e) {
+          // Fallback to fixed threshold if memory query fails
+          Logger.warn('Failed to get available memory, using default threshold',
+              label: 'IndexManager._rebuildTableIndexes');
+          return _fastProcessThreshold * 4;
+        }
+      }
+      
+      // Get initial threshold
+      int dynamicThreshold = await getDynamicThreshold();
+      
+      Logger.debug('Initial dynamic threshold for index building: $dynamicThreshold entries',
+          label: 'IndexManager._rebuildTableIndexes');
+      
+      // Process function for submitting a batch of partition index data
+      Future<void> processPartitionBatch() async {
+        if (processedPartitions.isEmpty) return;
+        
+        Logger.debug(
+          'Processing index batch for table $tableName, partitions: $processedPartitions',
+          label: 'IndexManager._rebuildTableIndexes'
+        );
+        
+        // Sort partitions for ordered processing
+        final sortedPartitions = processedPartitions.toList()..sort();
+        
+        for (final partitionId in sortedPartitions) {
+          final partitionData = partitionIndexData[partitionId];
+          if (partitionData == null) continue;
+          
+          // Process each index in this partition
+          for (final indexName in partitionData.keys) {
+            final indexEntries = partitionData[indexName]!;
+            
+            // Add entries to index buffer
+            for (final entry in indexEntries.entries) {
+              final indexKey = entry.key;
+              final pointers = entry.value;
+              
+              for (final pointer in pointers) {
+                await _addToInsertBuffer(tableName, indexName, indexKey, pointer);
+              }
+            }
+          }
+          
+          // Remove processed partition data from memory
+          partitionIndexData.remove(partitionId);
+        }
+        
+        // Get current buffer size
+        final currentBufferSize = getTableWriteBufferSize();
+        
+        // Check if buffer size exceeds threshold
+        if (currentBufferSize > dynamicThreshold) {
+          Logger.debug(
+            'Index buffer size ($currentBufferSize) exceeds threshold ($dynamicThreshold), flushing for table $tableName',
+            label: 'IndexManager._rebuildTableIndexes'
+          );
+          
+          // Flush write buffer
+          await _processIndexWriteBuffer();
+          
+          // Sleep for a duration proportional to the buffer size
+          // The larger the buffer, the longer the sleep to allow more time for processing
+          final sleepDuration = Duration(
+              milliseconds: (currentBufferSize / dynamicThreshold * 100).clamp(50, 500).toInt());
+          await Future.delayed(sleepDuration);
+          
+          // Update dynamic threshold after flush
+          dynamicThreshold = await getDynamicThreshold();
+        }
+        
+        // Clear processed partitions set
+        processedPartitions.clear();
+      }
+      
+      // Scan table data and build all indexes
+      await _dataStore.tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true,
+        maxConcurrent: maxConcurrent,
+        processFunction: (records, partitionIndex) async {
+          // Create index data container for this partition
+          if (!partitionIndexData.containsKey(partitionIndex)) {
+            partitionIndexData[partitionIndex] = {};
+            
+            // Primary key index
+            if (rebuildPrimary) {
+              partitionIndexData[partitionIndex]!['pk_$tableName'] = {};
+            }
+            
+            // Other indexes
+            for (final indexSchema in indexesToBuild) {
+              partitionIndexData[partitionIndex]![indexSchema.actualIndexName] = {};
+            }
+          }
+          
+          // Process each record
+          for (final record in records) {
+            final primaryKeyValue = record[primaryKey];
+            if (primaryKeyValue == null) {
+              continue;
+            }
+            
+            // Create record pointer
+            final pointer = StoreIndex(
+              offset: recordCount,
+              partitionId: partitionIndex,
+              clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+              nodeId: _dataStore.config.distributedNodeConfig.nodeId
+            );
+            
+            final pointerStr = pointer.toString();
+            
+            // Add primary key index data
+            if (rebuildPrimary) {
+              final pkData = partitionIndexData[partitionIndex]!['pk_$tableName']!;
+              if (!pkData.containsKey(primaryKeyValue)) {
+                pkData[primaryKeyValue] = [];
+              }
+              pkData[primaryKeyValue]!.add(pointerStr);
+            }
+            
+            // Add other index data
+            for (final indexSchema in indexesToBuild) {
+              final indexName = indexSchema.actualIndexName;
+              final indexKey = _createIndexKey(record, indexSchema.fields);
+              
+              if (indexKey != null) {
+                final indexData = partitionIndexData[partitionIndex]![indexName]!;
+                if (!indexData.containsKey(indexKey)) {
+                  indexData[indexKey] = [];
+                }
+                indexData[indexKey]!.add(pointerStr);
+              }
+            }
+            
+            recordCount++;
+          }
+          
+          // Mark this partition as processed
+          processedPartitions.add(partitionIndex);
+          
+          // Check current buffer size before deciding whether to process or continue
+          final currentPartitionCount = processedPartitions.length;
+          final recordCountThreshold = recordCount % 10000 == 0 && recordCount > 0;
+          
+          if (currentPartitionCount >= maxConcurrent || recordCountThreshold) {
+            // Check if write buffer is getting too large
+            final currentBufferSize = getTableWriteBufferSize();
+            
+            // If buffer is already approaching threshold, process now
+            if (currentBufferSize > dynamicThreshold * 0.7) {
+              await processPartitionBatch();
+            } else {
+              // Otherwise just call without awaiting to avoid blocking
+              processPartitionBatch();
+            }
+          }
+          
+          return records; // Return original records, no modification
+        }
+      );
+      
+      // Process any remaining partition data - make sure to await this call
+      await processPartitionBatch();
+      
+      // Final flush of all buffers
+      await _processIndexWriteBuffer();
+      
+      Logger.info(
+        'Rebuilt indexes for table $tableName, processed $recordCount records',
+        label: 'IndexManager._rebuildTableIndexes'
+      );
+    } catch (e, stack) {
+      Logger.error(
+        'Failed to rebuild table indexes: $e\n$stack',
+        label: 'IndexManager._rebuildTableIndexes'
+      );
+      rethrow;
+    }
   }
 }
