@@ -372,85 +372,61 @@ class IndexManager {
               return;
             }
             
-            // Verify checksum
-            if (partition.checksum != null && 
-                !_verifyChecksum(content, partition.checksum!)) {
-              Logger.error(
-                  'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
-                  label: 'IndexManager._processDeleteEntries');
-              return;
-            }
+            // Take a snapshot of current keys to process
+            final localKeysToProcess = List<String>.from(keysToDelete);
             
-            // Initialize B+ tree and load data
-            final btree = BPlusTree.fromString(
-              content,
-              order: indexMeta.bTreeOrder,
-              isUnique: indexMeta.isUnique,
+            // Skip processing if no keys to process
+            if (localKeysToProcess.isEmpty) return;
+            
+            // Prepare request for compute task
+            final request = IndexDeleteRequest(
+              content: content,
+              checksum: partition.checksum,
+              bTreeOrder: indexMeta.bTreeOrder,
+              isUnique: isUniqueIndex,
+              keysToProcess: localKeysToProcess,
+              entriesToDelete: Map.fromEntries(
+                entriesToDelete.entries.where((e) => localKeysToProcess.contains(e.key))
+              )
             );
             
-            // Record whether the B+ tree has been modified, if modified, write back to file
-            bool isModified = false;
+            // Run CPU-intensive operations in isolate
+            // Only use isolate if the content is large enough to justify the overhead
+            final useIsolate = content.length > 500 || localKeysToProcess.length > 20;
+            final result = await ComputeManager.run(
+              processIndexDelete, 
+              request,
+              useIsolate: useIsolate
+            );
             
-            // Create a copy of the list of keys to process in the current task, to avoid being modified by other tasks during processing
-
-            List<String>  localKeysToProcess = List<String>.from(keysToDelete);
+            // Process result back in main thread
+            if (result.isModified) {
+              // IO operation: Write file (keep in main thread)
+              await _dataStore.storage.writeAsString(partitionPath, result.newContent);
+              
+              // Update partition metadata
+              final updatedPartition = partition.copyWith(
+                fileSizeInBytes: result.newContent.length,
+                bTreeSize: result.newContent.length,
+                entries: result.entryCount,
+                timestamps: Timestamps(
+                  created: partition.timestamps.created,
+                  modified: DateTime.now(),
+                ),
+                checksum: result.checksum,
+              );
+              
+              // Update index metadata
+              await _updatePartitionMetadata(tableName, indexName, updatedPartition);
+            }
             
-            // Process each key to delete
-            for (final key in localKeysToProcess) {
-              // Check if the key has been processed by other tasks
-              
-              if (!keysToDelete.contains(key)) {
-                continue;
-              }
-              
-              final indexEntry = entriesToDelete[key];
-              if (indexEntry == null) continue;
-              
-              final existingValues = await btree.search(key);
-              if (existingValues.isEmpty) continue;
-              
-              final recordPointer = indexEntry.indexEntry.recordPointer.toString();
-              if (existingValues.contains(recordPointer)) {
-                await btree.delete(key, recordPointer);
-                isModified = true;
-                
-                // For unique indexes, remove the processed keys from the list of keys to process
-                if (isUniqueIndex) {
-                    keysToDelete.remove(key);
-                  
-                  // Check if all keys have been processed, if so, exit early
-                  if (keysToDelete.isEmpty) {
-                    break;
-                  }
-                }
+            // Remove processed keys from the shared list
+            if (result.processedKeys.isNotEmpty) {
+              for (final key in result.processedKeys) {
+                keysToDelete.remove(key);
               }
             }
             
-            // If the B+ tree has been modified, write it back to the file
-            if (isModified) {
-              final newContent = btree.toStringHandle();
-                
-                // Write the updated content
-                await _dataStore.storage.writeAsString(partitionPath, newContent);
-                
-                // Calculate the new checksum
-                final checksum = _calculateChecksum(newContent);
-                
-                // Update partition metadata
-                final updatedPartition = partition.copyWith(
-                  fileSizeInBytes: newContent.length,
-                  bTreeSize: newContent.length,
-                  entries: btree.count(),
-                  timestamps: Timestamps(
-                    created: partition.timestamps.created,
-                    modified: DateTime.now(),
-                  ),
-                  checksum: checksum,
-                );
-                
-                // Update index metadata
-                _updatePartitionMetadata(tableName, indexName, updatedPartition);
-            }
           } catch (e, stack) {
             Logger.error('Failed to process partition for delete entries: $e\n$stack',
                 label: 'IndexManager._processDeleteEntries');

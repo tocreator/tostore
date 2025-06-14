@@ -2965,8 +2965,8 @@ class TableDataManager {
                 allRecords,
                 primaryKey,
                 existingPartitions,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
                 updateTableMeta: false, // key: not update table meta
               );
             },
