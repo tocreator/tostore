@@ -328,34 +328,157 @@ class IndexManager {
       final isUniqueIndex = indexName == 'pk_$tableName' ||
           indexMeta.isUnique ||
           indexName.startsWith('uniq_');
-
-      // Now, apply these grouped deletes by iterating through the partitions.
-      await processIndexPartitions(tableName, indexName,
-          processor: (_, __, btree) async {
-        // Stop processing partitions if no deletes are left.
-        if (entriesToDelete.isEmpty) return false;
-
-        final keysToCheck = entriesToDelete.keys.toList();
-
-        for (final key in keysToCheck) {
-          final indexEntry = entriesToDelete[key];
-          if (indexEntry == null) continue;
-
-          final existingValues = await btree.search(key);
-          if (existingValues.isEmpty) continue;
-          if (existingValues
-              .contains(indexEntry.indexEntry.recordPointer.toString())) {
-            await btree.delete(
-                key, indexEntry.indexEntry.recordPointer.toString());
-            if (isUniqueIndex) {
-              // For unique keys, finding it once is enough. Remove from future searches.
-              entriesToDelete.remove(key);
-              if (entriesToDelete.isEmpty) return false;
+      
+      // Get maximum concurrency
+      final maxConcurrent = _dataStore.config.maxConcurrent;
+      
+      // If the number of partitions is 0, there are no index files present
+      if (indexMeta.partitions.isEmpty) return;
+      
+      // Create a mutable copy of the key list for concurrency security
+      final keysToDelete = List<String>.from(entriesToDelete.keys);
+      
+      // Create a partition processing task list
+      final List<Future<void>> partitionTasks = [];
+    
+      
+      // Process each partition concurrently
+      for (int i = 0; i < indexMeta.partitions.length; i++) {
+        // If all keys have been processed, exit early
+        if (keysToDelete.isEmpty) {
+          Logger.debug(
+            'All keys processed for unique index $tableName.$indexName, skipping remaining partitions',
+            label: 'IndexManager._processDeleteEntries'
+          );
+          break;
+        }
+        
+        final partition = indexMeta.partitions[i];
+        
+        final partitionTask = () async {
+          try {
+            // Check if there are any keys to process again
+            if (keysToDelete.isEmpty) return;
+            
+            final partitionPath = await _dataStore.pathManager
+                .getIndexPartitionPath(tableName, indexName, partition.index);
+            
+            if (!await _dataStore.storage.existsFile(partitionPath)) {
+              return;
             }
+            
+            final content = await _dataStore.storage.readAsString(partitionPath);
+            if (content == null || content.isEmpty) {
+              return;
+            }
+            
+            // Verify checksum
+            if (partition.checksum != null && 
+                !_verifyChecksum(content, partition.checksum!)) {
+              Logger.error(
+                  'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
+                  label: 'IndexManager._processDeleteEntries');
+              return;
+            }
+            
+            // Initialize B+ tree and load data
+            final btree = BPlusTree.fromString(
+              content,
+              order: indexMeta.bTreeOrder,
+              isUnique: indexMeta.isUnique,
+            );
+            
+            // Record whether the B+ tree has been modified, if modified, write back to file
+            bool isModified = false;
+            
+            // Create a copy of the list of keys to process in the current task, to avoid being modified by other tasks during processing
+
+            List<String>  localKeysToProcess = List<String>.from(keysToDelete);
+            
+            // Process each key to delete
+            for (final key in localKeysToProcess) {
+              // Check if the key has been processed by other tasks
+              
+              if (!keysToDelete.contains(key)) {
+                continue;
+              }
+              
+              final indexEntry = entriesToDelete[key];
+              if (indexEntry == null) continue;
+              
+              final existingValues = await btree.search(key);
+              if (existingValues.isEmpty) continue;
+              
+              final recordPointer = indexEntry.indexEntry.recordPointer.toString();
+              if (existingValues.contains(recordPointer)) {
+                await btree.delete(key, recordPointer);
+                isModified = true;
+                
+                // For unique indexes, remove the processed keys from the list of keys to process
+                if (isUniqueIndex) {
+                    keysToDelete.remove(key);
+                  
+                  // Check if all keys have been processed, if so, exit early
+                  if (keysToDelete.isEmpty) {
+                    break;
+                  }
+                }
+              }
+            }
+            
+            // If the B+ tree has been modified, write it back to the file
+            if (isModified) {
+              final newContent = btree.toStringHandle();
+                
+                // Write the updated content
+                await _dataStore.storage.writeAsString(partitionPath, newContent);
+                
+                // Calculate the new checksum
+                final checksum = _calculateChecksum(newContent);
+                
+                // Update partition metadata
+                final updatedPartition = partition.copyWith(
+                  fileSizeInBytes: newContent.length,
+                  bTreeSize: newContent.length,
+                  entries: btree.count(),
+                  timestamps: Timestamps(
+                    created: partition.timestamps.created,
+                    modified: DateTime.now(),
+                  ),
+                  checksum: checksum,
+                );
+                
+                // Update index metadata
+                _updatePartitionMetadata(tableName, indexName, updatedPartition);
+            }
+          } catch (e, stack) {
+            Logger.error('Failed to process partition for delete entries: $e\n$stack',
+                label: 'IndexManager._processDeleteEntries');
+          }
+        }();
+        
+        partitionTasks.add(partitionTask);
+        
+        // Control the number of concurrent operations
+        if (partitionTasks.length >= maxConcurrent) {
+          await Future.wait(partitionTasks);
+          partitionTasks.clear();
+          
+          // If all keys have been processed, exit early
+          if (keysToDelete.isEmpty && isUniqueIndex) {
+            Logger.debug(
+              'All keys processed for unique index $tableName.$indexName after processing ${i+1} partitions (total: ${indexMeta.partitions.length})',
+              label: 'IndexManager._processDeleteEntries'
+            );
+            break;
           }
         }
-        return true;
-      });
+      }
+      
+      // Wait for remaining tasks to complete
+      if (partitionTasks.isNotEmpty) {
+        await Future.wait(partitionTasks);
+      }
 
       Logger.debug(
           'Processed ${entriesToDelete.length} delete entries for $tableName.$indexName',
@@ -363,6 +486,49 @@ class IndexManager {
     } catch (e, stack) {
       Logger.error('Failed to process delete entries: $e\n$stack',
           label: 'IndexManager._processDeleteEntries');
+    }
+  }
+
+
+  /// Update partition metadata
+  Future<void> _updatePartitionMetadata(
+      String tableName, String indexName, IndexPartitionMeta updatedPartition) async {
+    final cacheKey = _getIndexCacheKey(tableName, indexName);
+    final meta = _indexMetaCache[cacheKey];
+    
+    if (meta != null) {
+      // Create lock resource identifier
+      final lockResource = 'index_meta:$tableName:$indexName';
+      final operationId = 'update_meta_${DateTime.now().millisecondsSinceEpoch}';
+      
+      try {
+        // Acquire exclusive lock to ensure concurrency safety
+        await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
+        
+        // Create updated partition list
+        final partitions = meta.partitions.map((p) {
+          return p.index == updatedPartition.index ? updatedPartition : p;
+        }).toList();
+        
+        // Create updated metadata
+        final updatedMeta = meta.copyWith(
+          partitions: partitions,
+          timestamps: Timestamps(
+            created: meta.timestamps.created,
+            modified: DateTime.now(),
+          ),
+        );
+        
+        // Update cache
+        _indexMetaCache[cacheKey] = updatedMeta;
+        
+        // Write to file
+        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+        await _dataStore.storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+      } finally {
+        // Release lock
+        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      }
     }
   }
 
