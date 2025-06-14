@@ -1332,8 +1332,7 @@ class TableDataManager {
       List<PartitionMeta>? existingPartitions,
       {List<int>? encryptionKey,
       int? encryptionKeyId,
-      bool updateTableMeta = true,
-      List<Map<String, dynamic>>? recordsToIndex}) async {
+      bool updateTableMeta = true,}) async {
     // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
     final nonEmptyRecords =
         records.where((record) => record.isNotEmpty).toList();
@@ -1438,59 +1437,8 @@ class TableDataManager {
     // Write partition file
     await _dataStore.storage.writeAsBytes(partitionPath, encodedData);
 
-    // Setup for index creation
-    int? clusterId;
-    int? nodeId;
-    if (_dataStore.config.distributedNodeConfig.enableDistributed) {
-      clusterId = _dataStore.config.distributedNodeConfig.clusterId;
-      nodeId = _dataStore.config.distributedNodeConfig.nodeId;
-    }
 
-    // only process records that need to create index
-    if (recordsToIndex != null && recordsToIndex.isNotEmpty) {
-      // optimize: if it is appending records, can directly start from the old record count
-      final int oldRecordsCount = records.length - recordsToIndex.length;
 
-      // performance optimization: increase batch size
-      const int indexBatchSize =
-          500; // increase batch size to improve performance
-      int offset = oldRecordsCount; // start from the old record count
-
-      // only process new record part
-      for (int i = oldRecordsCount; i < records.length; i += indexBatchSize) {
-        final endIndex = min(i + indexBatchSize, records.length);
-        final batch = records.sublist(i, endIndex);
-
-        for (int j = 0; j < batch.length; j++) {
-          final record = batch[j];
-          final currentOffset = offset + j;
-
-          // skip empty record
-          if (record.isEmpty) continue;
-
-          try {
-            final recordPointer = await StoreIndex.create(
-                offset: currentOffset,
-                partitionId: partitionIndex,
-                clusterId: clusterId,
-                nodeId: nodeId);
-            await _dataStore.indexManager
-                ?.updateIndexes(tableName, record, recordPointer);
-          } catch (e) {
-            Logger.error(
-                'Failed to update record index: $e, record: ${record[primaryKey]}',
-                label: 'TableDataManager._savePartitionFile');
-          }
-        }
-
-        offset += batch.length;
-
-        // reduce pause time, improve throughput
-        if (i + indexBatchSize < records.length) {
-          await Future.delayed(const Duration(milliseconds: 1));
-        }
-      }
-    }
 
     // only update table meta when needed
     if (updateTableMeta) {
@@ -2953,6 +2901,11 @@ class TableDataManager {
         final partitionRecords = await _assignRecordsToPartitions(
             tableName, records, primaryKey,
             useExistingPartitions: true);
+            
+        // create a map to store partition index and records to create index
+        final Map<int, List<Map<String, dynamic>>> recordsToCreateIndex = {};
+        // store the starting offset of each partition
+        final Map<int, int> partitionOffsets = {};
 
         // store all processed partition meta
         List<PartitionMeta> allPartitionMetas = [];
@@ -2995,23 +2948,27 @@ class TableDataManager {
                     encryptionKeyId: encryptionKeyId);
               }
 
-              // merge records
-              allRecords.addAll(recordsForPartition);
+                // collect records to create index
+                if (recordsForPartition.isNotEmpty) {
+                  recordsToCreateIndex[partitionIndex] = recordsForPartition;
+                  partitionOffsets[partitionIndex] = allRecords.length;
+                }
 
-              // save partition, but not update table meta
-              return await _savePartitionFile(
-                tableName,
-                isGlobal,
-                partitionIndex,
-                allRecords,
-                primaryKey,
-                existingPartitions,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-                updateTableMeta: false, // key: not update table meta
-                recordsToIndex:
-                    recordsForPartition, // create index for new inserted records
-              );
+                // merge records
+                allRecords.addAll(recordsForPartition);
+
+                // save partition, but not update table meta
+                return await _savePartitionFile(
+                  tableName,
+                  isGlobal,
+                  partitionIndex,
+                  allRecords,
+                  primaryKey,
+                  existingPartitions,
+                  encryptionKey: encryptionKey,
+                  encryptionKeyId: encryptionKeyId,
+                  updateTableMeta: false, // key: not update table meta
+                );
             },
             description: 'parallel insert records to multiple partitions',
           );
@@ -3038,23 +2995,30 @@ class TableDataManager {
                   encryptionKeyId: encryptionKeyId);
             }
 
-            // merge records
-            allRecords.addAll(recordsForPartition);
+              // record original record count for index creation
+              final oldRecordsCount = allRecords.length;
 
-            // save partition, but not update table meta
-            final partitionMeta = await _savePartitionFile(
-              tableName,
-              isGlobal,
-              partitionIndex,
-              allRecords,
-              primaryKey,
-              existingPartitions,
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
-              updateTableMeta: false, // key: not update table meta
-              recordsToIndex:
-                  recordsForPartition, // only create index for new inserted records
-            );
+              // collect records to create index
+              if (recordsForPartition.isNotEmpty) {
+                recordsToCreateIndex[partitionIndex] = recordsForPartition;
+                partitionOffsets[partitionIndex] = oldRecordsCount;
+              }
+
+              // merge records
+              allRecords.addAll(recordsForPartition);
+
+              // save partition, but not update table meta
+              final partitionMeta = await _savePartitionFile(
+                tableName,
+                isGlobal,
+                partitionIndex,
+                allRecords,
+                primaryKey,
+                existingPartitions,
+                encryptionKey: encryptionKey,
+                encryptionKeyId: encryptionKeyId,
+                updateTableMeta: false, // key: not update table meta
+              );
 
             // collect partition meta
             allPartitionMetas.add(partitionMeta);
@@ -3064,6 +3028,17 @@ class TableDataManager {
         // all partitions processed, update table meta once
         await _updateTableMetadataWithAllPartitions(
             tableName, allPartitionMetas, existingPartitions);
+            
+        // create index for all records asynchronously
+        if (recordsToCreateIndex.isNotEmpty) {
+          _asyncCreateIndexes(
+            tableName: tableName, 
+            primaryKey: primaryKey,
+            recordsToCreateIndex: recordsToCreateIndex, 
+            partitionOffsets: partitionOffsets
+          );
+        
+        }
       } else if (operationType == BufferOperationType.delete ||
           operationType == BufferOperationType.update) {
         // Create a mapping from primary key to record, for easy lookup
@@ -3968,6 +3943,79 @@ class TableDataManager {
         _dataStore.lockManager!.releaseExclusiveLock(lockKey);
       }
       _processingTables.remove(tableName);
+    }
+  }
+
+  /// Create indexes asynchronously to avoid blocking the main thread
+  Future<void> _asyncCreateIndexes({
+    required String tableName,
+    required String primaryKey,
+    required Map<int, List<Map<String, dynamic>>> recordsToCreateIndex,
+    required Map<int, int> partitionOffsets,
+  }) async {
+    try {
+      // get distributed node information
+      int? clusterId;
+      int? nodeId;
+      if (_dataStore.config.distributedNodeConfig.enableDistributed) {
+        clusterId = _dataStore.config.distributedNodeConfig.clusterId;
+        nodeId = _dataStore.config.distributedNodeConfig.nodeId;
+      }
+      
+      // process by partition index order
+      final sortedPartitionIndexes = recordsToCreateIndex.keys.toList()..sort();
+      
+      // performance optimization: batch process index creation
+      const int indexBatchSize = 500;
+  
+      
+      for (final partitionIndex in sortedPartitionIndexes) {
+        final recordsForIndex = recordsToCreateIndex[partitionIndex]!;
+        final oldRecordsCount = partitionOffsets[partitionIndex] ?? 0;
+        int offset = oldRecordsCount; // calculate offset from old record count
+        
+        // batch process index creation
+        for (int i = 0; i < recordsForIndex.length; i += indexBatchSize) {
+          final endIndex = min(i + indexBatchSize, recordsForIndex.length);
+          final batch = recordsForIndex.sublist(i, endIndex);
+          
+          for (int j = 0; j < batch.length; j++) {
+            final record = batch[j];
+            final currentOffset = offset + j;
+            
+            // skip empty record
+            if (record.isEmpty) continue;
+            
+            try {
+              final recordPointer = await StoreIndex.create(
+                offset: currentOffset,
+                partitionId: partitionIndex,
+                clusterId: clusterId,
+                nodeId: nodeId
+              );
+              await _dataStore.indexManager?.updateIndexes(tableName, record, recordPointer);
+            } catch (e) {
+              Logger.error(
+                'Failed to update record index: $e, record: ${record[primaryKey]}',
+                label: 'TableDataManager._asyncCreateIndexes'
+              );
+            }
+          }
+          
+          offset += batch.length;
+          
+          // reduce pause time, improve throughput
+          if (i + indexBatchSize < recordsForIndex.length) {
+            await Future.delayed(const Duration(milliseconds: 1));
+          }
+        }
+      }
+    } catch (e) {
+      // Handle any exceptions to prevent them from affecting other operations
+      Logger.error(
+        'Error during async index creation for table $tableName: $e',
+        label: 'TableDataManager._asyncCreateIndexes'
+      );
     }
   }
 }

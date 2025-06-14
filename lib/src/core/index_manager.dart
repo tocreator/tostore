@@ -8,7 +8,6 @@ import '../handler/common.dart';
 import '../model/file_info.dart';
 import '../model/store_index.dart';
 import '../model/table_schema.dart';
-import '../handler/value_comparator.dart';
 import '../model/index_entry.dart';
 import 'crontab_manager.dart';
 import 'b_plus_tree.dart';
@@ -1235,7 +1234,7 @@ class IndexManager {
 
       // scan table data to build index
       int recordCount = 0;
-        
+
       await _dataStore.tableDataManager.processTablePartitions(
         tableName: tableName,
         onlyRead: true,
@@ -1243,25 +1242,25 @@ class IndexManager {
           for (final record in records) {
             final primaryValue = record[primaryKey];
             if (primaryValue == null) {
-              Logger.warn('Record missing primary key value, skip index creation',
-                  label: 'IndexManager.createPrimaryIndex');
+              Logger.warn(
+                'Record missing primary key value, skip index creation',
+                    label: 'IndexManager.createPrimaryIndex');
               continue;
             }
-              
-            final pointer = await StoreIndex.create(
-                        offset: recordCount,
-                        partitionId: partitionIndex,
-                        clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-                        nodeId: _dataStore.config.distributedNodeConfig.nodeId);
-            
-            await _addToInsertBuffer(tableName, indexName, primaryValue, pointer.toString());
 
-            recordCount++;
-          }
-          return records; // return original records, do not modify
-        }
-      );
-      
+            final pointer = await StoreIndex.create(
+              offset: recordCount,
+              partitionId: partitionIndex,
+              clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
+
+              await _addToInsertBuffer(
+                  tableName, indexName, primaryValue, pointer.toString());
+
+              recordCount++;
+            }
+            return records; // return original records, do not modify
+          });
     } catch (e, stack) {
       Logger.error('Failed to create primary index: $e\n$stack',
           label: 'IndexManager.createPrimaryIndex');
@@ -1345,33 +1344,32 @@ class IndexManager {
 
       // scan table data to build index
       int recordCount = 0;
-          
+
       await _dataStore.tableDataManager.processTablePartitions(
-        tableName: tableName,
-        onlyRead: true,
-        processFunction: (records, partitionIndex) async {
-          for (final record in records) {
-            // build index key
-            final indexKey = _createIndexKey(record, schema.fields);
-            if (indexKey == null) {
-              // if cannot build index key (e.g. some fields are null), skip this record
-              continue;
+          tableName: tableName,
+          onlyRead: true,
+          processFunction: (records, partitionIndex) async {
+            for (final record in records) {
+              // build index key
+              final indexKey = _createIndexKey(record, schema.fields);
+              if (indexKey == null) {
+                // if cannot build index key (e.g. some fields are null), skip this record
+                continue;
+              }
+              // create store index
+              final pointer = await StoreIndex.create(
+                  offset: recordCount,
+                  partitionId: partitionIndex,
+                  clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
+
+              // add record to index
+              await _addToInsertBuffer(
+                  tableName, indexName, indexKey, pointer.toString());
+              recordCount++;
             }
-            // create store index
-            final pointer = await StoreIndex.create(
-                        offset: recordCount,
-                        partitionId: partitionIndex,
-                        clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-                        nodeId: _dataStore.config.distributedNodeConfig.nodeId);
-            
-            // add record to index
-            await _addToInsertBuffer(tableName, indexName, indexKey, pointer.toString());
-            recordCount++;
-          }
-          return records; // return original records, do not modify
-        }
-      );
-    
+            return records; // return original records, do not modify
+          });
     } catch (e, stack) {
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
@@ -1692,7 +1690,7 @@ class IndexManager {
         }
       }
 
-      Logger.debug(
+              Logger.debug(
           'Batch update indexes completed: $tableName, ${records.length} records',
           label: 'IndexManager.batchUpdateIndexes');
     } catch (e) {
@@ -2264,48 +2262,6 @@ class IndexManager {
     }
   }
 
-  /// Calculate the index value range, used for range queries of numeric indexes
-  /// Supports different types of primary key values (int, bigInt, String, etc.)
-  dynamic _calculateMinKey(List<dynamic> keys) {
-    if (keys.isEmpty) return null;
-
-    return keys.fold(keys.first, (min, key) {
-      return ValueComparator.compare(key, min) < 0 ? key : min;
-    });
-  }
-
-  /// Calculate the maximum key value
-  dynamic _calculateMaxKey(List<dynamic> keys) {
-    if (keys.isEmpty) return null;
-
-    return keys.fold(keys.first, (max, key) {
-      return ValueComparator.compare(key, max) > 0 ? key : max;
-    });
-  }
-
-  /// Check if the primary key is an ordered type
-  bool _isPrimaryKeyOrdered(TableSchema schema) {
-    final pkConfig = schema.primaryKeyConfig;
-
-    // If the isOrdered flag is explicitly set, return directly
-    if (pkConfig.isOrdered != null) {
-      return pkConfig.isOrdered!;
-    }
-
-    // Determine based on the primary key type
-    switch (pkConfig.type) {
-      case PrimaryKeyType.timestampBased:
-      case PrimaryKeyType.datePrefixed:
-      case PrimaryKeyType.shortCode:
-      case PrimaryKeyType.sequential:
-        // These types of primary keys are ordered
-        return true;
-      case PrimaryKeyType.none:
-        // User-defined primary key
-        return false;
-    }
-  }
-
   /// Set the closing state and wait for all write operations to complete
   Future<void> prepareForClose() async {
     if (_isClosing) return; // Avoid repeated calls
@@ -2341,7 +2297,7 @@ class IndexManager {
         await _allWritesCompleted.future.timeout(
           Duration(seconds: timeoutSeconds),
           onTimeout: () {
-            Logger.warn(
+                    Logger.warn(
                 'Waiting for index write operation timeout ($timeoutSeconds seconds), force close, remaining pending writes: $_pendingWrites',
                 label: 'IndexManager.prepareForClose');
             if (!_allWritesCompleted.isCompleted) {
@@ -2422,7 +2378,7 @@ class IndexManager {
       if (_indexCache.containsKey(cacheKey)) {
         try {
           await _indexCache[cacheKey]!.insert(key, storeIndexStr);
-        } catch (e) {
+              } catch (e) {
           // Cache update error does not affect the main process
           Logger.warn('Failed to update memory cache: $e',
               label: 'IndexManager._addToInsertBuffer');
