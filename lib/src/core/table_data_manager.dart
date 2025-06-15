@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'package:flutter/foundation.dart';
-
 import '../../tostore.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
@@ -15,6 +13,8 @@ import '../handler/platform_handler.dart';
 import 'crontab_manager.dart';
 import '../model/id_generator.dart';
 import '../handler/value_comparator.dart';
+import '../compute/compute_manager.dart';
+import '../compute/compute_tasks.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -1359,28 +1359,36 @@ class TableDataManager {
     final timeStamp = DateTime.now();
     final partitionPath = await _dataStore.pathManager
         .getPartitionFilePath(tableName, partitionIndex);
+    final parentPath = await _dataStore.pathManager.getTablePath(tableName);
 
-    // check if should save primary key range
+    // parallel use isolate to calculate primary key range
+    dynamic minPk, maxPk;
+    
+    // check if should use range query optimization
     bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
-    // Get min/max primary key values
-    dynamic minPk =
-        nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
-    dynamic maxPk =
-        nonEmptyRecords.isNotEmpty ? nonEmptyRecords.first[primaryKey] : null;
-
     if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
-      for (var record in nonEmptyRecords) {
-        final pk = record[primaryKey];
-        if (minPk == null || _compareValues(pk, minPk) < 0) minPk = pk;
-        if (maxPk == null || _compareValues(pk, maxPk) > 0) maxPk = pk;
+    
+        final rangeResult = await ComputeManager.run(
+          analyzePartitionKeyRange,
+          PartitionRangeAnalysisRequest(
+            records: nonEmptyRecords,
+            primaryKey: primaryKey,
+            partitionIndex: partitionIndex,
+            existingPartitions: existingPartitions,
+          ),
+          useIsolate: nonEmptyRecords.length > 100 || (existingPartitions?.length ?? 0) > 1000
+        );
+          
+        minPk = rangeResult.minPk;
+        maxPk = rangeResult.maxPk;
+      
+      // If not ordered based on analysis result, mark table as non-ordered
+      if (!rangeResult.isOrdered) {
+        await _markTableAsUnordered(tableName);
       }
-
-      // check if should mark as non-ordered
-      await _checkOrderForNewPartition(
-          tableName, partitionIndex, minPk, maxPk, existingPartitions);
-
-      // check again, because _checkOrderForNewPartition may change the table's ordered state
+      
+      // check again, because partition analysis may change the table's ordered state
       shouldSaveKeyRange = _checkedOrderedRange.containsKey(tableName)
           ? _checkedOrderedRange[tableName]!
           : await _isPrimaryKeyOrdered(tableName);
@@ -1392,44 +1400,31 @@ class TableDataManager {
       maxPk = null;
     }
 
-    // calculate partition checksum
-    final allRecordsData = Uint8List.fromList(utf8.encode(jsonEncode(records)));
-    final partitionChecksum =
-        _dataStore.calculateChecksum(allRecordsData).toString();
 
-    // Create partition meta
-    final partitionMeta = PartitionMeta(
-      version: 1,
-      index: partitionIndex,
-      totalRecords: nonEmptyRecords.length, // only count non-empty records
-      fileSizeInBytes: 0, // Will update after encoding
-      minPrimaryKey: minPk,
-      maxPrimaryKey: maxPk,
-      checksum: partitionChecksum,
-      timestamps: Timestamps(
-        created: timeStamp,
-        modified: timeStamp,
-      ),
-      parentPath: await _dataStore.pathManager.getTablePath(tableName),
-    );
-
-    // Create partition data
-    final partitionInfo = PartitionInfo(
-      path: partitionPath,
-      meta: partitionMeta,
-      data: records, // keep all records, including empty records
-    );
-
-    // Encode partition data with the effective key
-    final encodedData = EncoderHandler.encode(
-      jsonEncode(partitionInfo.toJson()),
-      customKey: encryptionKey,
-      keyId: encryptionKeyId,
-    );
-    final size = encodedData.length;
-
-    // Update size in meta
-    final updatedPartitionMeta = partitionMeta.copyWith(fileSizeInBytes: size);
+    
+    // use ComputeManager.run, fallback to main thread if failed
+      final encodeResult = await ComputeManager.run(
+        encodePartitionData,
+        EncodePartitionRequest(
+          records: records,
+          partitionIndex: partitionIndex,
+          primaryKey: primaryKey,
+          minPk: minPk,
+          maxPk: maxPk,
+          partitionPath: partitionPath,
+          parentPath: parentPath,
+          timestamps: Timestamps(
+            created: timeStamp,
+            modified: timeStamp,
+          ),
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        ),
+        useIsolate: records.length > 100
+      );
+      
+      final encodedData = encodeResult.encodedData;
+      final updatedPartitionMeta = encodeResult.partitionMeta;
 
     // Ensure partition directory exists
     final dirPath = await _dataStore.pathManager
@@ -1464,7 +1459,7 @@ class TableDataManager {
           version: 1,
           type: FileType.data,
           name: tableName,
-          fileSizeInBytes: size,
+          fileSizeInBytes: updatedPartitionMeta.fileSizeInBytes,
           totalRecords: nonEmptyRecords.length, // only count non-empty records
           timestamps: Timestamps(
             created: timeStamp,
@@ -1488,7 +1483,7 @@ class TableDataManager {
         // calculate exact change in record count and size
         int recordsDelta =
             nonEmptyRecords.length - (isExistingPartition ? oldRecordCount : 0);
-        int sizeDelta = size - (isExistingPartition ? oldSize : 0);
+        int sizeDelta = updatedPartitionMeta.fileSizeInBytes - (isExistingPartition ? oldSize : 0);
 
         // update meta
         fileMeta = fileMeta.copyWith(
@@ -1524,110 +1519,6 @@ class TableDataManager {
     return updatedPartitionMeta;
   }
 
-  /// check if new partition meets ordered requirements - simplified version, improve performance
-  Future<void> _checkOrderForNewPartition(
-      String tableName,
-      int partitionIndex,
-      dynamic minPk,
-      dynamic maxPk,
-      List<PartitionMeta>? existingPartitions) async {
-    try {
-      // quick check: if already determined as non-ordered table, no need to check
-      if (_checkedOrderedRange.containsKey(tableName) &&
-          !_checkedOrderedRange[tableName]!) {
-        return;
-      }
-
-      // basic check: if no data or no existing partitions, return directly
-      if (minPk == null ||
-          maxPk == null ||
-          existingPartitions == null ||
-          existingPartitions.isEmpty) {
-        return;
-      }
-
-      // get table schema and check if primary key type should be considered ordered
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table schema is null, cannot check ordered range',
-            label: 'TableDataManager._checkOrderForNewPartition');
-        await _markTableAsUnordered(tableName);
-        return;
-      }
-      bool shouldBeOrdered = schema.isPrimaryKeyOrdered();
-
-      if (!shouldBeOrdered) {
-        // primary key type is not ordered, mark as non-ordered table directly
-        await _markTableAsUnordered(tableName);
-        return;
-      }
-
-      // primary key is not number or string, mark as non-ordered
-      if (minPk is! num && minPk is! String) {
-        await _markTableAsUnordered(tableName);
-        return;
-      }
-
-      // high performance check: only check relation between current writing partition and existing partitions
-      // 1. find the existing partition with max index (for comparing new inserted data to maintain ordered)
-      PartitionMeta? maxIdxPartition;
-      // 2. if it's an existing partition, find the partition itself for comparing internal ordered
-      PartitionMeta? existingPartition;
-
-      // single traversal to find required partitions, avoid multiple traversals
-      for (var partition in existingPartitions) {
-        // skip empty partition
-        if (partition.totalRecords <= 0 ||
-            partition.minPrimaryKey == null ||
-            partition.maxPrimaryKey == null) {
-          continue;
-        }
-
-        // find current partition
-        if (partition.index == partitionIndex) {
-          existingPartition = partition;
-        }
-        // find the partition with max index
-        else if (maxIdxPartition == null ||
-            partition.index > maxIdxPartition.index) {
-          maxIdxPartition = partition;
-        }
-      }
-
-      // check 1: existing partition internal ordered check - only check existing partitions
-      if (existingPartition != null && existingPartition.totalRecords > 0) {
-        // if new data range is completely separated from existing range, mark as non-ordered
-        // for example: existing range [10-20], new data [1-5] or [25-30]
-        if (_compareValues(minPk, existingPartition.maxPrimaryKey) > 0 ||
-            _compareValues(maxPk, existingPartition.minPrimaryKey) < 0) {
-          await _markTableAsUnordered(tableName);
-          return;
-        }
-      }
-
-      // check 2: relation with max index partition - only check one key partition
-      if (maxIdxPartition != null && maxIdxPartition.index != partitionIndex) {
-        // if current partition index is greater than max index partition, new data's min primary key should be greater than max index partition's max primary key
-        if (partitionIndex > maxIdxPartition.index) {
-          if (_compareValues(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
-            await _markTableAsUnordered(tableName);
-            return;
-          }
-        }
-        // if current partition index is less than max index partition, new data's max primary key should be less than max index partition's min primary key
-        else if (partitionIndex < maxIdxPartition.index) {
-          if (_compareValues(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
-            await _markTableAsUnordered(tableName);
-            return;
-          }
-        }
-      }
-    } catch (e) {
-      // record error log but not affect write operation
-      Logger.error('Failed to check partition ordered: $e',
-          label: 'TableDataManager._checkOrderForNewPartition');
-    }
-  }
 
   /// mark table as non-ordered range
   Future<void> _markTableAsUnordered(String tableName) async {
@@ -1657,17 +1548,15 @@ class TableDataManager {
   Future<Map<int, List<Map<String, dynamic>>>> _assignRecordsToPartitions(
       String tableName, List<Map<String, dynamic>> records, String primaryKey,
       {bool useExistingPartitions = true}) async {
-    final result = <int, List<Map<String, dynamic>>>{};
-
+    if (records.isEmpty) {
+      return <int, List<Map<String, dynamic>>>{};
+    }
+    
     try {
       final fileMeta = await getTableFileMeta(tableName);
       final partitionSizeLimit = _getPartitionSizeLimit(tableName);
       int currentPartitionIndex = 0;
       int currentPartitionSize = 0;
-
-      Logger.debug(
-          'Start to assign records to partitions, record count: ${records.length}, partition size limit: $partitionSizeLimit',
-          label: 'TableDataManager._assignRecordsToPartitions');
 
       // initialize partition info
       if (fileMeta != null &&
@@ -1703,56 +1592,27 @@ class TableDataManager {
         }
       }
 
-      // estimate the average size of records, for pre-allocation
-      int totalDataSize = 0;
-      if (records.isNotEmpty) {
-        // sample at most 10 records to calculate average size
-        final sampleSize = records.length > 10 ? 10 : records.length;
-        for (int i = 0; i < sampleSize; i++) {
-          totalDataSize += jsonEncode(records[i]).length;
-        }
-        final averageRecordSize = totalDataSize / sampleSize;
-
-        // estimate total data size
-        totalDataSize = (averageRecordSize * records.length).toInt();
-
+          
+        final assignmentResult = await ComputeManager.run(
+          assignRecordsToPartitions,
+          PartitionAssignmentRequest(
+            records: records,
+            partitionSizeLimit: partitionSizeLimit,
+            currentPartitionIndex: currentPartitionIndex,
+            currentPartitionSize: currentPartitionSize,
+          ),
+          useIsolate: records.length > 1000
+        );
         Logger.debug(
-            'Estimated data size: $totalDataSize bytes, average record size: $averageRecordSize bytes',
+            'Partition assignment completed, ${assignmentResult.partitionRecords.length} partitions, ${records.length} records',
             label: 'TableDataManager._assignRecordsToPartitions');
-      }
-
-      // assign partitions to all records, process in order
-      for (var record in records) {
-        // calculate record size
-        final recordSize = jsonEncode(record).length;
-
-        // if current partition is full, create new partition
-        if (currentPartitionSize + recordSize > partitionSizeLimit) {
-          currentPartitionIndex++; // create new partition
-          currentPartitionSize = 0; // reset partition size
-        }
-
-        // update partition size
-        currentPartitionSize += recordSize;
-
-        // add record to corresponding partition
-        if (!result.containsKey(currentPartitionIndex)) {
-          result[currentPartitionIndex] = [];
-        }
-        result[currentPartitionIndex]!.add(record);
-      }
-
-      // log the result
-      Logger.debug(
-          'Partition assignment completed, ${result.length} partitions, ${records.length} records',
-          label: 'TableDataManager._assignRecordsToPartitions');
-
-      return result;
+        return assignmentResult.partitionRecords;
     } catch (e) {
       Logger.error('Failed to assign records to partitions: $e',
           label: 'TableDataManager._assignRecordsToPartitions');
 
-      // when error, put all records into single partition
+      // if error, put all records into single partition
+      final result = <int, List<Map<String, dynamic>>>{};
       result[0] = List.from(records);
       return result;
     }
@@ -2712,28 +2572,16 @@ class TableDataManager {
             label: 'TableDataManager.readRecordsFromPartition');
         return [];
       }
-
-      // Decode partition data with provided key
-      final decodedString = await EncoderHandler.decode(bytes,
-          customKey: encryptionKey, keyId: encryptionKeyId);
-
-      if (decodedString.isEmpty) {
-        Logger.error('Failed to decode partition data: $partitionPath',
-            label: 'TableDataManager.readRecordsFromPartition');
-        return [];
-      }
-
-      // parse JSON
-      Map<String, dynamic> jsonData;
-      try {
-        jsonData = jsonDecode(decodedString) as Map<String, dynamic>;
-      } catch (e) {
-        Logger.error('Failed to parse partition JSON data: $e',
-            label: 'TableDataManager.readRecordsFromPartition');
-        return [];
-      }
-
-      final partitionInfo = PartitionInfo.fromJson(jsonData);
+      
+      final decodedData = await ComputeManager.run(
+          decodePartitionData, 
+          DecodePartitionRequest(
+            bytes: bytes,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          ),
+          useIsolate: bytes.length > 10 * 1024  // only use isolate if data size is larger than 10KB
+        );
 
       // Update access time in meta
       FileMeta? fileMeta = await getTableFileMeta(tableName);
@@ -2766,9 +2614,8 @@ class TableDataManager {
       // if request specific record (by index position)
       if (recordIndex != null) {
         // check if index is in valid range
-        if (recordIndex >= 0 && recordIndex < partitionInfo.data.length) {
-          final record =
-              partitionInfo.data[recordIndex] as Map<String, dynamic>;
+        if (recordIndex >= 0 && recordIndex < decodedData.length) {
+          final record = decodedData[recordIndex];
 
           // if no expected value and field is provided, return the record directly
           if (fieldName == null || expectedValue == null) {
@@ -2789,8 +2636,8 @@ class TableDataManager {
           }
 
           // index is inaccurate, scan the entire partition to find the matching record
-          for (int i = 0; i < partitionInfo.data.length; i++) {
-            final currentRecord = partitionInfo.data[i] as Map<String, dynamic>;
+          for (int i = 0; i < decodedData.length; i++) {
+            final currentRecord = decodedData[i];
             if (currentRecord.isNotEmpty &&
                 currentRecord.containsKey(fieldName) &&
                 ValueComparator.compare(
@@ -2849,7 +2696,7 @@ class TableDataManager {
       }
 
       // allow empty records (deleted records), avoid deleted records being filtered out during migration
-      return partitionInfo.data.cast<Map<String, dynamic>>().toList();
+      return decodedData;
     } catch (e, stack) {
       Logger.error('''Read records from partition failed:
             error: $e

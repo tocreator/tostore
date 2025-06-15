@@ -328,82 +328,78 @@ class IndexManager {
       final isUniqueIndex = indexName == 'pk_$tableName' ||
           indexMeta.isUnique ||
           indexName.startsWith('uniq_');
-      
+
       // Get maximum concurrency
       final maxConcurrent = _dataStore.config.maxConcurrent;
-      
+
       // If the number of partitions is 0, there are no index files present
       if (indexMeta.partitions.isEmpty) return;
-      
+
       // Create a mutable copy of the key list for concurrency security
       final keysToDelete = List<String>.from(entriesToDelete.keys);
-      
+
       // Create a partition processing task list
       final List<Future<void>> partitionTasks = [];
-    
-      
+
       // Process each partition concurrently
       for (int i = 0; i < indexMeta.partitions.length; i++) {
         // If all keys have been processed, exit early
         if (keysToDelete.isEmpty) {
           Logger.debug(
-            'All keys processed for unique index $tableName.$indexName, skipping remaining partitions',
-            label: 'IndexManager._processDeleteEntries'
-          );
+              'All keys processed for unique index $tableName.$indexName, skipping remaining partitions',
+              label: 'IndexManager._processDeleteEntries');
           break;
         }
-        
+
         final partition = indexMeta.partitions[i];
-        
+
         final partitionTask = () async {
           try {
             // Check if there are any keys to process again
             if (keysToDelete.isEmpty) return;
-            
+
             final partitionPath = await _dataStore.pathManager
                 .getIndexPartitionPath(tableName, indexName, partition.index);
-            
+
             if (!await _dataStore.storage.existsFile(partitionPath)) {
               return;
             }
-            
-            final content = await _dataStore.storage.readAsString(partitionPath);
+
+            final content =
+                await _dataStore.storage.readAsString(partitionPath);
             if (content == null || content.isEmpty) {
               return;
             }
-            
+
             // Take a snapshot of current keys to process
             final localKeysToProcess = List<String>.from(keysToDelete);
-            
+
             // Skip processing if no keys to process
             if (localKeysToProcess.isEmpty) return;
-            
+
             // Prepare request for compute task
             final request = IndexDeleteRequest(
-              content: content,
-              checksum: partition.checksum,
-              bTreeOrder: indexMeta.bTreeOrder,
-              isUnique: isUniqueIndex,
-              keysToProcess: localKeysToProcess,
-              entriesToDelete: Map.fromEntries(
-                entriesToDelete.entries.where((e) => localKeysToProcess.contains(e.key))
-              )
-            );
-            
+                content: content,
+                checksum: partition.checksum,
+                bTreeOrder: indexMeta.bTreeOrder,
+                isUnique: isUniqueIndex,
+                keysToProcess: localKeysToProcess,
+                entriesToDelete: Map.fromEntries(entriesToDelete.entries
+                    .where((e) => localKeysToProcess.contains(e.key))));
+
             // Run CPU-intensive operations in isolate
             // Only use isolate if the content is large enough to justify the overhead
-            final useIsolate = content.length > 500 || localKeysToProcess.length > 20;
-            final result = await ComputeManager.run(
-              processIndexDelete, 
-              request,
-              useIsolate: useIsolate
-            );
-            
+            final useIsolate =
+                content.length > 500 || localKeysToProcess.length > 20;
+            final result = await ComputeManager.run(processIndexDelete, request,
+                useIsolate: useIsolate);
+
             // Process result back in main thread
             if (result.isModified) {
               // IO operation: Write file (keep in main thread)
-              await _dataStore.storage.writeAsString(partitionPath, result.newContent);
-              
+              await _dataStore.storage
+                  .writeAsString(partitionPath, result.newContent);
+
               // Update partition metadata
               final updatedPartition = partition.copyWith(
                 fileSizeInBytes: result.newContent.length,
@@ -415,42 +411,42 @@ class IndexManager {
                 ),
                 checksum: result.checksum,
               );
-              
+
               // Update index metadata
-              await _updatePartitionMetadata(tableName, indexName, updatedPartition);
+              await _updatePartitionMetadata(
+                  tableName, indexName, updatedPartition);
             }
-            
+
             // Remove processed keys from the shared list
             if (result.processedKeys.isNotEmpty) {
               for (final key in result.processedKeys) {
                 keysToDelete.remove(key);
               }
             }
-            
           } catch (e, stack) {
-            Logger.error('Failed to process partition for delete entries: $e\n$stack',
+            Logger.error(
+                'Failed to process partition for delete entries: $e\n$stack',
                 label: 'IndexManager._processDeleteEntries');
           }
         }();
-        
+
         partitionTasks.add(partitionTask);
-        
+
         // Control the number of concurrent operations
         if (partitionTasks.length >= maxConcurrent) {
           await Future.wait(partitionTasks);
           partitionTasks.clear();
-          
+
           // If all keys have been processed, exit early
           if (keysToDelete.isEmpty && isUniqueIndex) {
             Logger.debug(
-              'All keys processed for unique index $tableName.$indexName after processing ${i+1} partitions (total: ${indexMeta.partitions.length})',
-              label: 'IndexManager._processDeleteEntries'
-            );
+                'All keys processed for unique index $tableName.$indexName after processing ${i + 1} partitions (total: ${indexMeta.partitions.length})',
+                label: 'IndexManager._processDeleteEntries');
             break;
           }
         }
       }
-      
+
       // Wait for remaining tasks to complete
       if (partitionTasks.isNotEmpty) {
         await Future.wait(partitionTasks);
@@ -465,27 +461,28 @@ class IndexManager {
     }
   }
 
-
   /// Update partition metadata
-  Future<void> _updatePartitionMetadata(
-      String tableName, String indexName, IndexPartitionMeta updatedPartition) async {
+  Future<void> _updatePartitionMetadata(String tableName, String indexName,
+      IndexPartitionMeta updatedPartition) async {
     final cacheKey = _getIndexCacheKey(tableName, indexName);
     final meta = _indexMetaCache[cacheKey];
-    
+
     if (meta != null) {
       // Create lock resource identifier
       final lockResource = 'index_meta:$tableName:$indexName';
-      final operationId = 'update_meta_${DateTime.now().millisecondsSinceEpoch}';
-      
+      final operationId =
+          'update_meta_${DateTime.now().millisecondsSinceEpoch}';
+
       try {
         // Acquire exclusive lock to ensure concurrency safety
-        await _dataStore.lockManager?.acquireExclusiveLock(lockResource, operationId);
-        
+        await _dataStore.lockManager
+            ?.acquireExclusiveLock(lockResource, operationId);
+
         // Create updated partition list
         final partitions = meta.partitions.map((p) {
           return p.index == updatedPartition.index ? updatedPartition : p;
         }).toList();
-        
+
         // Create updated metadata
         final updatedMeta = meta.copyWith(
           partitions: partitions,
@@ -494,13 +491,15 @@ class IndexManager {
             modified: DateTime.now(),
           ),
         );
-        
+
         // Update cache
         _indexMetaCache[cacheKey] = updatedMeta;
-        
+
         // Write to file
-        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+        final metaPath =
+            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+        await _dataStore.storage
+            .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
       } finally {
         // Release lock
         _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
@@ -979,12 +978,12 @@ class IndexManager {
         if (tableSchema == null) {
           return null;
         }
-        
+
         // Table exists but index not found, check if we need to rebuild
         if (tableSchema.fields.isNotEmpty) {
           // Check table index status and rebuild indexes if needed
           await _checkAndRebuildTableIndexes(tableName, tableSchema);
-          
+
           // Try to get the index again after rebuilding
           return getIndex(tableName, indexName);
         }
@@ -1026,15 +1025,15 @@ class IndexManager {
       // Load index data from each partition
       for (final partition in meta.partitions) {
         try {
-        final partitionPath = await _dataStore.pathManager
-            .getIndexPartitionPath(tableName, indexName, partition.index);
+          final partitionPath = await _dataStore.pathManager
+              .getIndexPartitionPath(tableName, indexName, partition.index);
 
-        if (!await _dataStore.storage.existsFile(partitionPath)) {
+          if (!await _dataStore.storage.existsFile(partitionPath)) {
             continue;
-        }
+          }
 
-        final content = await _dataStore.storage.readAsString(partitionPath);
-        if (content == null || content.isEmpty) {
+          final content = await _dataStore.storage.readAsString(partitionPath);
+          if (content == null || content.isEmpty) {
             continue;
           }
 
@@ -1043,7 +1042,7 @@ class IndexManager {
               !_verifyChecksum(content, partition.checksum!)) {
             Logger.error(
                 'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
-          label: 'IndexManager._loadIndexFromFile');
+                label: 'IndexManager._loadIndexFromFile');
             continue; // Skip damaged partition
           }
 
@@ -1163,7 +1162,7 @@ class IndexManager {
                 .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
 
             // Update cache
-    final cacheKey = _getIndexCacheKey(tableName, indexName);
+            final cacheKey = _getIndexCacheKey(tableName, indexName);
             _indexMetaCache[cacheKey] = updatedMeta;
 
             // If the index is in the cache, ensure the unique flag is correct
@@ -1201,9 +1200,9 @@ class IndexManager {
             for (final field in index.fields) {
               processedFieldIndexes.add(field);
             }
-    }
-  }
-}
+          }
+        }
+      }
 
       // 3. Handle the case where a normal field is set to unique=true but no index is created
       for (final field in schema.fields) {
@@ -1362,7 +1361,8 @@ class IndexManager {
         final autoUniqueIndexName = 'uniq_$fieldName';
 
         // Check if the auto-created unique index exists
-        final autoIndexMeta = await _getIndexMeta(tableName, autoUniqueIndexName);
+        final autoIndexMeta =
+            await _getIndexMeta(tableName, autoUniqueIndexName);
 
         if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
           Logger.warn(
@@ -1377,7 +1377,7 @@ class IndexManager {
 
       // Use optimized index building
       await _rebuildTableIndexes(tableName, tableSchema, false, [schema]);
-      
+
       Logger.info('Created index for $tableName: $indexName',
           label: 'IndexManager.createIndex');
     } catch (e, stack) {
@@ -1554,16 +1554,16 @@ class IndexManager {
 
       // Collect all indexes to rebuild
       final indexesToBuild = <IndexSchema>[];
-      
+
       // Add all normal indexes
       indexesToBuild.addAll(schema.indexes);
-      
+
       // Add unique field indexes if they don't have an explicit index
       for (final field in schema.fields) {
         if (field.unique && field.name != schema.primaryKey) {
-          bool hasExplicitIndex = schema.indexes.any((idx) => 
+          bool hasExplicitIndex = schema.indexes.any((idx) =>
               idx.fields.length == 1 && idx.fields.first == field.name);
-          
+
           if (!hasExplicitIndex) {
             indexesToBuild.add(IndexSchema(
               fields: [field.name],
@@ -1652,9 +1652,9 @@ class IndexManager {
               }
               indexUpdates[indexName]![compositeKey]!.add(recordId);
             }
-    }
-  }
-}
+          }
+        }
+      }
 
       // Batch update write buffer
       for (final entry in indexUpdates.entries) {
@@ -1715,7 +1715,7 @@ class IndexManager {
         }
       }
 
-              Logger.debug(
+      Logger.debug(
           'Batch update indexes completed: $tableName, ${records.length} records',
           label: 'IndexManager.batchUpdateIndexes');
     } catch (e) {
@@ -2193,8 +2193,8 @@ class IndexManager {
       Logger.error('Failed to process index partitions: $e\n$stack',
           label: 'IndexManager.processIndexPartitions');
       return false;
+    }
   }
-}
 
   /// Batch delete multiple records from all indexes
   /// @param tableName Table name
@@ -2322,7 +2322,7 @@ class IndexManager {
         await _allWritesCompleted.future.timeout(
           Duration(seconds: timeoutSeconds),
           onTimeout: () {
-                    Logger.warn(
+            Logger.warn(
                 'Waiting for index write operation timeout ($timeoutSeconds seconds), force close, remaining pending writes: $_pendingWrites',
                 label: 'IndexManager.prepareForClose');
             if (!_allWritesCompleted.isCompleted) {
@@ -2352,7 +2352,7 @@ class IndexManager {
   Future<void> _addToInsertBuffer(String tableName, String indexName,
       dynamic key, String storeIndexStr) async {
     try {
-    final cacheKey = _getIndexCacheKey(tableName, indexName);
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Parse StoreIndex from string
       final storeIndex = StoreIndex.fromString(storeIndexStr);
@@ -2390,7 +2390,7 @@ class IndexManager {
         timestamp: DateTime.now(),
       );
 
-    // Add to buffer
+      // Add to buffer
       _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
       // Check buffer size, enable fast processing mode when buffer reaches threshold
@@ -2403,7 +2403,7 @@ class IndexManager {
       if (_indexCache.containsKey(cacheKey)) {
         try {
           await _indexCache[cacheKey]!.insert(key, storeIndexStr);
-              } catch (e) {
+        } catch (e) {
           // Cache update error does not affect the main process
           Logger.warn('Failed to update memory cache: $e',
               label: 'IndexManager._addToInsertBuffer');
@@ -2426,7 +2426,7 @@ class IndexManager {
   Future<void> addToDeleteBuffer(String tableName, String indexName,
       dynamic key, String storeIndexStr) async {
     try {
-    final cacheKey = _getIndexCacheKey(tableName, indexName);
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
 
       // Parse StoreIndex from string
       final storeIndex = StoreIndex.fromString(storeIndexStr);
@@ -2473,7 +2473,7 @@ class IndexManager {
         timestamp: DateTime.now(),
       );
 
-    // Add to buffer
+      // Add to buffer
       _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
       // Also remove from memory cache if it exists
@@ -2704,22 +2704,22 @@ class IndexManager {
         await _dataStore.storage.deleteDirectory(indexSubDirPath);
       } else {
         // if not using new directory structure, need to find and delete partition files by meta file
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta != null) {
-        // delete all partition files
-        for (final partition in meta.partitions) {
-          try {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
+        final meta = await _getIndexMeta(tableName, indexName);
+        if (meta != null) {
+          // delete all partition files
+          for (final partition in meta.partitions) {
+            try {
+              final partitionPath = await _dataStore.pathManager
+                  .getIndexPartitionPath(tableName, indexName, partition.index);
 
-            if (await _dataStore.storage.existsFile(partitionPath)) {
-              await _dataStore.storage.deleteFile(partitionPath);
+              if (await _dataStore.storage.existsFile(partitionPath)) {
+                await _dataStore.storage.deleteFile(partitionPath);
+              }
+            } catch (e) {
+              Logger.error('Failed to delete index partition file: $e',
+                  label: 'IndexManager._deleteIndexFiles');
             }
-          } catch (e) {
-            Logger.error('Failed to delete index partition file: $e',
-                label: 'IndexManager._deleteIndexFiles');
           }
-        }
         }
       }
 
@@ -2750,54 +2750,57 @@ class IndexManager {
   /// Check and rebuild needed indexes for a table
   /// @param tableName Table name
   /// @param tableSchema Table schema
-  Future<void> _checkAndRebuildTableIndexes(String tableName, TableSchema tableSchema) async {
+  Future<void> _checkAndRebuildTableIndexes(
+      String tableName, TableSchema tableSchema) async {
     try {
       // Create lock resource identifier
       final lockResource = 'rebuild_indexes:$tableName';
-      final operationId = 'rebuild_indexes_${DateTime.now().millisecondsSinceEpoch}';
-      
+      final operationId =
+          'rebuild_indexes_${DateTime.now().millisecondsSinceEpoch}';
+
       try {
         // Try to acquire lock
         final lockAcquired = _dataStore.lockManager
             ?.tryAcquireExclusiveLock(lockResource, operationId);
-        
+
         if (lockAcquired == false) {
           // If lock cannot be acquired, another thread is rebuilding
-          Logger.info('Another thread is rebuilding indexes for $tableName, skipping',
+          Logger.info(
+              'Another thread is rebuilding indexes for $tableName, skipping',
               label: 'IndexManager._checkAndRebuildTableIndexes');
           return;
         }
-        
+
         // Check primary key index
         final pkIndexName = 'pk_$tableName';
         final pkIndexMeta = await _getIndexMeta(tableName, pkIndexName);
         final primaryKey = tableSchema.primaryKey;
-        
+
         // Collect indexes to build
         final indexesToBuild = <IndexSchema>[];
         bool needRebuildPrimary = pkIndexMeta == null;
-        
+
         // Check normal indexes
         for (final indexSchema in tableSchema.indexes) {
           final indexName = indexSchema.actualIndexName;
           final indexMeta = await _getIndexMeta(tableName, indexName);
-          
+
           if (indexMeta == null) {
             indexesToBuild.add(indexSchema);
           }
         }
-        
+
         // Check unique field auto-created indexes
         for (final field in tableSchema.fields) {
           if (field.unique && field.name != primaryKey) {
             // Check if an explicit index exists for this field
-            bool hasExplicitIndex = tableSchema.indexes.any((idx) => 
+            bool hasExplicitIndex = tableSchema.indexes.any((idx) =>
                 idx.fields.length == 1 && idx.fields.first == field.name);
-            
+
             if (!hasExplicitIndex) {
               final uniqueIndexName = 'uniq_${field.name}';
               final indexMeta = await _getIndexMeta(tableName, uniqueIndexName);
-              
+
               if (indexMeta == null) {
                 // Add to indexes to build
                 indexesToBuild.add(IndexSchema(
@@ -2808,29 +2811,26 @@ class IndexManager {
             }
           }
         }
-        
+
         // If all indexes exist, no need to rebuild
         if (!needRebuildPrimary && indexesToBuild.isEmpty) {
           return;
         }
-        
+
         Logger.info(
-          'Rebuilding indexes for $tableName: primaryKey=$needRebuildPrimary, otherIndexes=${indexesToBuild.length}',
-          label: 'IndexManager._checkAndRebuildTableIndexes'
-        );
-        
+            'Rebuilding indexes for $tableName: primaryKey=$needRebuildPrimary, otherIndexes=${indexesToBuild.length}',
+            label: 'IndexManager._checkAndRebuildTableIndexes');
+
         // Rebuild all needed indexes at once
-        await _rebuildTableIndexes(tableName, tableSchema, needRebuildPrimary, indexesToBuild);
-        
+        await _rebuildTableIndexes(
+            tableName, tableSchema, needRebuildPrimary, indexesToBuild);
       } finally {
         // Release lock
         _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
       }
     } catch (e, stack) {
-      Logger.error(
-        'Failed to check and rebuild indexes: $e\n$stack',
-        label: 'IndexManager._checkAndRebuildTableIndexes'
-      );
+      Logger.error('Failed to check and rebuild indexes: $e\n$stack',
+          label: 'IndexManager._checkAndRebuildTableIndexes');
     }
   }
 
@@ -2839,15 +2839,11 @@ class IndexManager {
   /// @param tableSchema Table schema
   /// @param rebuildPrimary Whether to rebuild primary key index
   /// @param indexesToBuild List of indexes to build
-  Future<void> _rebuildTableIndexes(
-    String tableName, 
-    TableSchema tableSchema, 
-    bool rebuildPrimary,
-    List<IndexSchema> indexesToBuild
-  ) async {
+  Future<void> _rebuildTableIndexes(String tableName, TableSchema tableSchema,
+      bool rebuildPrimary, List<IndexSchema> indexesToBuild) async {
     try {
       final primaryKey = tableSchema.primaryKey;
-      
+
       // Create index metadata (if needed)
       if (rebuildPrimary) {
         final pkIndexName = 'pk_$tableName';
@@ -2864,12 +2860,14 @@ class IndexManager {
             modified: DateTime.now(),
           ),
         );
-        
-        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, pkIndexName);
-        await _dataStore.storage.writeAsString(metaPath, jsonEncode(pkMeta.toJson()));
+
+        final metaPath = await _dataStore.pathManager
+            .getIndexMetaPath(tableName, pkIndexName);
+        await _dataStore.storage
+            .writeAsString(metaPath, jsonEncode(pkMeta.toJson()));
         _indexMetaCache[_getIndexCacheKey(tableName, pkIndexName)] = pkMeta;
       }
-      
+
       // Create metadata for other indexes
       for (final indexSchema in indexesToBuild) {
         final indexName = indexSchema.actualIndexName;
@@ -2886,25 +2884,28 @@ class IndexManager {
             modified: DateTime.now(),
           ),
         );
-        
-        final metaPath = await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage.writeAsString(metaPath, jsonEncode(indexMeta.toJson()));
+
+        final metaPath =
+            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+        await _dataStore.storage
+            .writeAsString(metaPath, jsonEncode(indexMeta.toJson()));
         _indexMetaCache[_getIndexCacheKey(tableName, indexName)] = indexMeta;
       }
-      
+
       // Store index entries by partition
       // Map<partitionId, Map<indexName, Map<indexKey, List<recordPointer>>>>
-      final partitionIndexData = <int, Map<String, Map<dynamic, List<String>>>>{};
-      
+      final partitionIndexData =
+          <int, Map<String, Map<dynamic, List<String>>>>{};
+
       // Maximum concurrent operations
       final maxConcurrent = _dataStore.config.maxConcurrent;
-      
+
       // Record count for generating pointers
       int recordCount = 0;
-      
+
       // Track which partitions have been processed
       final processedPartitions = <int>{};
-      
+
       // Count total entries in write buffer for this table
       int getTableWriteBufferSize() {
         int size = 0;
@@ -2915,21 +2916,23 @@ class IndexManager {
         }
         return size;
       }
-      
+
       // Calculate dynamic threshold based on available memory
       // Each index entry is estimated to consume about 100 bytes
       Future<int> getDynamicThreshold() async {
         try {
           // Get available memory in MB
-          final availableMemoryMB = await PlatformHandler.getAvailableSystemMemoryMB();
-          
+          final availableMemoryMB =
+              await PlatformHandler.getAvailableSystemMemoryMB();
+
           // Reserve 25% of available memory for index building
           // 1MB = 1024*1024 bytes, divide by 100 bytes per entry
-          final maxEntriesInMemory = (availableMemoryMB * 1024 * 1024 * 0.25 / 100).toInt();
-          
+          final maxEntriesInMemory =
+              (availableMemoryMB * 1024 * 1024 * 0.25 / 100).toInt();
+
           // Minimum threshold to ensure reasonable batch size
           const minThreshold = _fastProcessThreshold;
-          
+
           // Calculate a safe threshold, with upper and lower limits
           return maxEntriesInMemory.clamp(minThreshold, minThreshold * 20);
         } catch (e) {
@@ -2939,178 +2942,172 @@ class IndexManager {
           return _fastProcessThreshold * 4;
         }
       }
-      
+
       // Get initial threshold
       int dynamicThreshold = await getDynamicThreshold();
-      
-      Logger.debug('Initial dynamic threshold for index building: $dynamicThreshold entries',
-          label: 'IndexManager._rebuildTableIndexes');
-      
+
       // Process function for submitting a batch of partition index data
       Future<void> processPartitionBatch() async {
         if (processedPartitions.isEmpty) return;
-        
+
         Logger.debug(
-          'Processing index batch for table $tableName, partitions: $processedPartitions',
-          label: 'IndexManager._rebuildTableIndexes'
-        );
-        
+            'Processing index batch for table $tableName, partitions: $processedPartitions',
+            label: 'IndexManager._rebuildTableIndexes');
+
         // Sort partitions for ordered processing
         final sortedPartitions = processedPartitions.toList()..sort();
-        
+
         for (final partitionId in sortedPartitions) {
           final partitionData = partitionIndexData[partitionId];
           if (partitionData == null) continue;
-          
+
           // Process each index in this partition
           for (final indexName in partitionData.keys) {
             final indexEntries = partitionData[indexName]!;
-            
+
             // Add entries to index buffer
             for (final entry in indexEntries.entries) {
               final indexKey = entry.key;
               final pointers = entry.value;
-              
+
               for (final pointer in pointers) {
-                await _addToInsertBuffer(tableName, indexName, indexKey, pointer);
+                await _addToInsertBuffer(
+                    tableName, indexName, indexKey, pointer);
               }
             }
           }
-          
+
           // Remove processed partition data from memory
           partitionIndexData.remove(partitionId);
         }
-        
+
         // Get current buffer size
         final currentBufferSize = getTableWriteBufferSize();
-        
+
         // Check if buffer size exceeds threshold
         if (currentBufferSize > dynamicThreshold) {
           Logger.debug(
-            'Index buffer size ($currentBufferSize) exceeds threshold ($dynamicThreshold), flushing for table $tableName',
-            label: 'IndexManager._rebuildTableIndexes'
-          );
-          
+              'Index buffer size ($currentBufferSize) exceeds threshold ($dynamicThreshold), flushing for table $tableName',
+              label: 'IndexManager._rebuildTableIndexes');
+
           // Flush write buffer
           await _processIndexWriteBuffer();
-          
+
           // Sleep for a duration proportional to the buffer size
           // The larger the buffer, the longer the sleep to allow more time for processing
           final sleepDuration = Duration(
-              milliseconds: (currentBufferSize / dynamicThreshold * 100).clamp(50, 500).toInt());
+              milliseconds: (currentBufferSize / dynamicThreshold * 100)
+                  .clamp(50, 500)
+                  .toInt());
           await Future.delayed(sleepDuration);
-          
+
           // Update dynamic threshold after flush
           dynamicThreshold = await getDynamicThreshold();
         }
-        
+
         // Clear processed partitions set
         processedPartitions.clear();
       }
-      
+
       // Scan table data and build all indexes
       await _dataStore.tableDataManager.processTablePartitions(
-        tableName: tableName,
-        onlyRead: true,
-        maxConcurrent: maxConcurrent,
-        processFunction: (records, partitionIndex) async {
-          // Create index data container for this partition
-          if (!partitionIndexData.containsKey(partitionIndex)) {
-            partitionIndexData[partitionIndex] = {};
-            
-            // Primary key index
-            if (rebuildPrimary) {
-              partitionIndexData[partitionIndex]!['pk_$tableName'] = {};
-            }
-            
-            // Other indexes
-            for (final indexSchema in indexesToBuild) {
-              partitionIndexData[partitionIndex]![indexSchema.actualIndexName] = {};
-            }
-          }
-          
-          // Process each record
-          for (final record in records) {
-            final primaryKeyValue = record[primaryKey];
-            if (primaryKeyValue == null) {
-              continue;
-            }
-            
-            // Create record pointer
-            final pointer = StoreIndex(
-              offset: recordCount,
-              partitionId: partitionIndex,
-              clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-              nodeId: _dataStore.config.distributedNodeConfig.nodeId
-            );
-            
-            final pointerStr = pointer.toString();
-            
-            // Add primary key index data
-            if (rebuildPrimary) {
-              final pkData = partitionIndexData[partitionIndex]!['pk_$tableName']!;
-              if (!pkData.containsKey(primaryKeyValue)) {
-                pkData[primaryKeyValue] = [];
+          tableName: tableName,
+          onlyRead: true,
+          maxConcurrent: maxConcurrent,
+          processFunction: (records, partitionIndex) async {
+            // Create index data container for this partition
+            if (!partitionIndexData.containsKey(partitionIndex)) {
+              partitionIndexData[partitionIndex] = {};
+
+              // Primary key index
+              if (rebuildPrimary) {
+                partitionIndexData[partitionIndex]!['pk_$tableName'] = {};
               }
-              pkData[primaryKeyValue]!.add(pointerStr);
+
+              // Other indexes
+              for (final indexSchema in indexesToBuild) {
+                partitionIndexData[partitionIndex]![
+                    indexSchema.actualIndexName] = {};
+              }
             }
-            
-            // Add other index data
-            for (final indexSchema in indexesToBuild) {
-              final indexName = indexSchema.actualIndexName;
-              final indexKey = _createIndexKey(record, indexSchema.fields);
-              
-              if (indexKey != null) {
-                final indexData = partitionIndexData[partitionIndex]![indexName]!;
-                if (!indexData.containsKey(indexKey)) {
-                  indexData[indexKey] = [];
+
+            // Process each record
+            for (final record in records) {
+              final primaryKeyValue = record[primaryKey];
+              if (primaryKeyValue == null) {
+                continue;
+              }
+
+              // Create record pointer
+              final pointer = StoreIndex(
+                  offset: recordCount,
+                  partitionId: partitionIndex,
+                  clusterId: _dataStore.config.distributedNodeConfig.clusterId,
+                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
+
+              final pointerStr = pointer.toString();
+
+              // Add primary key index data
+              if (rebuildPrimary) {
+                final pkData =
+                    partitionIndexData[partitionIndex]!['pk_$tableName']!;
+                if (!pkData.containsKey(primaryKeyValue)) {
+                  pkData[primaryKeyValue] = [];
                 }
-                indexData[indexKey]!.add(pointerStr);
+                pkData[primaryKeyValue]!.add(pointerStr);
+              }
+
+              // Add other index data
+              for (final indexSchema in indexesToBuild) {
+                final indexName = indexSchema.actualIndexName;
+                final indexKey = _createIndexKey(record, indexSchema.fields);
+
+                if (indexKey != null) {
+                  final indexData =
+                      partitionIndexData[partitionIndex]![indexName]!;
+                  if (!indexData.containsKey(indexKey)) {
+                    indexData[indexKey] = [];
+                  }
+                  indexData[indexKey]!.add(pointerStr);
+                }
+              }
+
+              recordCount++;
+            }
+
+            // Mark this partition as processed
+            processedPartitions.add(partitionIndex);
+
+            // Check current buffer size before deciding whether to process or continue
+            final currentPartitionCount = processedPartitions.length;
+            final recordCountThreshold =
+                recordCount % 10000 == 0 && recordCount > 0;
+
+            if (currentPartitionCount >= maxConcurrent ||
+                recordCountThreshold) {
+              // Check if write buffer is getting too large
+              final currentBufferSize = getTableWriteBufferSize();
+
+              // If buffer is already approaching threshold, process now
+              if (currentBufferSize > dynamicThreshold * 0.7) {
+                await processPartitionBatch();
+              } else {
+                // Otherwise just call without awaiting to avoid blocking
+                processPartitionBatch();
               }
             }
-            
-            recordCount++;
-          }
-          
-          // Mark this partition as processed
-          processedPartitions.add(partitionIndex);
-          
-          // Check current buffer size before deciding whether to process or continue
-          final currentPartitionCount = processedPartitions.length;
-          final recordCountThreshold = recordCount % 10000 == 0 && recordCount > 0;
-          
-          if (currentPartitionCount >= maxConcurrent || recordCountThreshold) {
-            // Check if write buffer is getting too large
-            final currentBufferSize = getTableWriteBufferSize();
-            
-            // If buffer is already approaching threshold, process now
-            if (currentBufferSize > dynamicThreshold * 0.7) {
-              await processPartitionBatch();
-            } else {
-              // Otherwise just call without awaiting to avoid blocking
-              processPartitionBatch();
-            }
-          }
-          
-          return records; // Return original records, no modification
-        }
-      );
-      
+
+            return records; // Return original records, no modification
+          });
+
       // Process any remaining partition data - make sure to await this call
       await processPartitionBatch();
-      
+
       // Final flush of all buffers
       await _processIndexWriteBuffer();
-      
-      Logger.info(
-        'Rebuilt indexes for table $tableName, processed $recordCount records',
-        label: 'IndexManager._rebuildTableIndexes'
-      );
     } catch (e, stack) {
-      Logger.error(
-        'Failed to rebuild table indexes: $e\n$stack',
-        label: 'IndexManager._rebuildTableIndexes'
-      );
+      Logger.error('Failed to rebuild table indexes: $e\n$stack',
+          label: 'IndexManager._rebuildTableIndexes');
       rethrow;
     }
   }

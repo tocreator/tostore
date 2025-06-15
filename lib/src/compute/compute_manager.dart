@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../Interface/compute_provider.dart' as compute_impl;
+import '../handler/logger.dart';
 
 /// A compute manager to control whether to use isolate.
 ///
@@ -13,14 +14,32 @@ class ComputeManager {
   /// - [function]: The function to execute. It must be a top-level function or a static method
   ///   to be executed in an isolate.
   /// - [message]: The argument to pass to the [function].
-  static Future<R> run<Q, R>(FutureOr<R> Function(Q) function, Q message, {bool useIsolate = true}) {
-    if (useIsolate) {
-      // Delegates to the platform-specific implementation.
-      // On native, this will use an Isolate. On web, it will run inline.
-      return compute_impl.compute(function, message);
-    } else {
-      // Forces the function to run on the current isolate and returns the result as a Future.
-      return Future(() => function(message));
+  /// - [useIsolate]: Whether to use an isolate or run in the current isolate. Defaults to true.
+  /// - [fallbackToMainThread]: Whether to fallback to main thread if isolate execution fails. Defaults to true.
+  static Future<R> run<Q, R>(
+    FutureOr<R> Function(Q) function, 
+    Q message, {
+    bool useIsolate = true,
+    bool fallbackToMainThread = true,
+  }) async {
+    if (!useIsolate) {
+      //  run directly in main thread
+      return function(message);
+    }
+    
+    try {
+      // try to run in isolate
+      return await compute_impl.compute(function, message);
+    } catch (isolateError) {
+      if (fallbackToMainThread) {
+        // record error and fallback to main thread
+        Logger.error('Isolate execution failed, fallback to main thread: $isolateError',
+            label: 'ComputeManager.run');
+        return function(message);
+      } else {
+        // rethrow exception
+        rethrow;
+      }
     }
   }
 } 
