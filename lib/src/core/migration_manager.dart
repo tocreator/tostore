@@ -2,9 +2,12 @@ import '../handler/logger.dart';
 import '../model/migration_meta.dart';
 import '../model/migration_task.dart';
 import '../model/table_schema.dart';
+import '../compute/compute_manager.dart';
+import '../compute/compute_tasks.dart';
 import 'data_store_impl.dart';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:math';
 
 /// Migration manager for handling database version upgrades
 ///
@@ -352,208 +355,116 @@ class MigrationManager {
       List<String> existingTables,
       List<TableSchema> newSchemas,
       Map<String, TableSchema> renamedTables) async {
-    // Similarity threshold, above which tables are considered the same
-    const similarityThreshold = 0.75;
-
-    // Similarity matrix
-    final similarityMatrix = <String, Map<TableSchema, double>>{};
-
-    // Calculate similarity for all tables
-    for (final existingTableName in existingTables) {
-      final existingSchema = await _dataStore.getTableSchema(existingTableName);
-      if (existingSchema == null) continue;
-
-      similarityMatrix[existingTableName] = {};
-
-      for (final newSchema in newSchemas) {
-        // Skip tables with the same name, these should not be identified as renamed tables
-        if (existingTableName == newSchema.name) {
-          continue;
-        }
-
-        // Calculate similarity
-        final similarity = _calculateTableSimilarity(
-            existingSchema,
-            newSchema,
-            existingTables.indexOf(existingTableName),
-            newSchemas.indexOf(newSchema),
-            existingTables.length,
-            newSchemas.length);
-
-        similarityMatrix[existingTableName]![newSchema] = similarity;
+    try {
+      // Similarity threshold, above which tables are considered the same
+      const similarityThreshold = 0.75;
+      
+      
+      // prepare parallel calculation requests
+      final similarityRequests = <TableSimilarityRequest>[];
+      final existingSchemasMap = <String, TableSchema>{};
+      
+      // get all old table schemas
+      for (final existingTableName in existingTables) {
+        final existingSchema = await _dataStore.getTableSchema(existingTableName);
+        if (existingSchema == null) continue;
+        existingSchemasMap[existingTableName] = existingSchema;
       }
-    }
-
-    // Greedy matching algorithm
-    while (similarityMatrix.isNotEmpty) {
-      // Find highest similarity
-      String? bestExistingTable;
-      TableSchema? bestNewSchema;
-      double bestSimilarity = 0;
-
-      for (final existingTable in similarityMatrix.keys) {
-        for (final newSchema in similarityMatrix[existingTable]!.keys) {
-          final similarity = similarityMatrix[existingTable]![newSchema]!;
-
-          if (similarity > bestSimilarity) {
-            bestSimilarity = similarity;
-            bestExistingTable = existingTable;
-            bestNewSchema = newSchema;
+      
+      // build all similarity requests
+      for (final existingTableName in existingSchemasMap.keys) {
+        final existingSchema = existingSchemasMap[existingTableName]!;
+        
+        for (final newSchema in newSchemas) {
+          // skip tables with the same name, these should not be identified as renamed tables
+          if (existingTableName == newSchema.name) {
+            continue;
           }
+          
+          similarityRequests.add(TableSimilarityRequest(
+            oldSchema: existingSchema,
+            newSchema: newSchema,
+            oldTableIndex: existingTables.indexOf(existingTableName),
+            newTableIndex: newSchemas.indexOf(newSchema),
+            oldTablesCount: existingTables.length,
+            newTablesCount: newSchemas.length,
+          ));
         }
       }
-
-      // If the best match exceeds the threshold, consider it a renamed table
-      if (bestSimilarity >= similarityThreshold &&
-          bestExistingTable != null &&
-          bestNewSchema != null) {
-        // Additional check: Even with high similarity, tables with the same name should not be considered renamed
-        if (bestExistingTable == bestNewSchema.name) {
-          // Remove same-name table match from similarity matrix
-          similarityMatrix.remove(bestExistingTable);
+      
+      // if no requests to process, return
+      if (similarityRequests.isEmpty) {
+        return;
+      }
+      
+      // max concurrent
+      final maxConcurrent = _dataStore.config.maxConcurrent;
+      
+      // batch processing requests
+      final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
+      final batches = <List<TableSimilarityRequest>>[];
+      
+      for (int i = 0; i < similarityRequests.length; i += batchSize) {
+        final end = min(i + batchSize, similarityRequests.length);
+        batches.add(similarityRequests.sublist(i, end));
+      }
+      
+      // parallel processing all batches
+      final batchResults = await Future.wait(batches.map((batch) => 
+        ComputeManager.run(calculateBatchTableSimilarity, 
+            BatchTableSimilarityRequest(requests: batch),useIsolate: similarityRequests.length > 2)
+      ));
+      
+      // merge all results
+      final allResults = <TableSimilarityResult>[];
+      for (final batchResult in batchResults) {
+        allResults.addAll(batchResult.results);
+      }
+      
+      // sort results by similarity
+      allResults.sort((a, b) => b.similarity.compareTo(a.similarity));
+      
+      // greedy matching algorithm
+      final processedOldTables = <String>{};
+      final processedNewSchemas = <TableSchema>{};
+      
+      for (final result in allResults) {
+        // if table is already processed, skip
+        if (processedOldTables.contains(result.oldTableName) || 
+            processedNewSchemas.contains(result.newSchema)) {
           continue;
         }
-
-        // Add to renamed results
-        renamedTables[bestExistingTable] = bestNewSchema;
-
-        // Remove matched items from matrix
-        similarityMatrix.remove(bestExistingTable);
-        for (final existingTable in similarityMatrix.keys) {
-          similarityMatrix[existingTable]!.remove(bestNewSchema);
+        
+        // if best match is above threshold, consider as renamed table
+        if (result.similarity >= similarityThreshold) {
+          // additional check: even with high similarity, tables with the same name should not be considered renamed
+          if (result.oldTableName == result.newSchema.name) {
+            continue;
+          }
+          
+          // add to renamed results
+          renamedTables[result.oldTableName] = result.newSchema;
+          
+          // record processed tables
+          processedOldTables.add(result.oldTableName);
+          processedNewSchemas.add(result.newSchema);
+          
+          // remove from remaining lists
+          existingTables.remove(result.oldTableName);
+          newSchemas.remove(result.newSchema);
+        } else {
+          // if similarity is not high enough, break
+          break;
         }
-
-        // Delete from remaining lists
-        existingTables.remove(bestExistingTable);
-        newSchemas.remove(bestNewSchema);
-      } else {
-        // No tables similar enough, terminate matching
-        break;
       }
+    } catch (e, stack) {
+      Logger.error(
+        'Error during parallel table similarity detection: $e\n$stack',
+        label: 'MigrationManager._detectRenamedTablesBySimilarity',
+      );
     }
   }
 
-  /// Calculate table similarity
-  double _calculateTableSimilarity(
-      TableSchema oldSchema,
-      TableSchema newSchema,
-      int oldTableIndex,
-      int newTableIndex,
-      int oldTablesCount,
-      int newTablesCount) {
-    double score = 0.0;
-    double totalWeight = 0.0;
-
-    // 1. First check table name similarity (medium weight)
-    const nameWeight = 10.0;
-    totalWeight += nameWeight;
-    double nameScore = _calculateNameSimilarity(oldSchema.name, newSchema.name);
-    score += nameWeight * nameScore;
-
-    // 2. Check primary key (high weight)
-    const primaryKeyWeight = 20.0;
-    totalWeight += primaryKeyWeight;
-    if (oldSchema.primaryKey == newSchema.primaryKey) {
-      score += primaryKeyWeight;
-    } else {
-      // Primary key mismatch is a strong negative signal
-      score -= primaryKeyWeight * 0.5;
-    }
-
-    // 3. Check isGlobal property (medium weight)
-    const globalWeight = 10.0;
-    totalWeight += globalWeight;
-    if (oldSchema.isGlobal == newSchema.isGlobal) {
-      score += globalWeight;
-    } else {
-      // isGlobal mismatch is an important signal
-      score -= globalWeight * 0.3;
-    }
-
-    // 4. Check field matching (highest weight)
-    const fieldsWeight = 50.0;
-    totalWeight += fieldsWeight;
-
-    // 4.1 Field count comparison
-    double fieldsScore = 0.0;
-    if (oldSchema.fields.isEmpty || newSchema.fields.isEmpty) {
-      fieldsScore = 0.0;
-    } else {
-      // Check common field count
-      int matchingFields = 0;
-      Set<String> oldFieldNames = oldSchema.fields.map((f) => f.name).toSet();
-      Set<String> newFieldNames = newSchema.fields.map((f) => f.name).toSet();
-
-      // Calculate number of common fields
-      for (final name in oldFieldNames) {
-        if (newFieldNames.contains(name)) {
-          matchingFields++;
-        }
-      }
-
-      // Calculate field match rate
-      final matchingFieldsRatio =
-          oldSchema.fields.isEmpty || newSchema.fields.isEmpty
-              ? 0.0
-              : (2 * matchingFields) /
-                  (oldFieldNames.length + newFieldNames.length);
-
-      fieldsScore = matchingFieldsRatio;
-    }
-
-    score += fieldsWeight * fieldsScore;
-
-    // 5. Index match rate (medium weight)
-    const indexWeight = 15.0;
-    totalWeight += indexWeight;
-
-    double indexScore = 0.0;
-    if (oldSchema.indexes.isEmpty && newSchema.indexes.isEmpty) {
-      // Both have no indexes, perfect match
-      indexScore = 1.0;
-    } else if (oldSchema.indexes.isEmpty || newSchema.indexes.isEmpty) {
-      // One has indexes, one doesn't, not a good match
-      indexScore = 0.1;
-    } else {
-      // Check index field matching
-      int matchingIndexes = 0;
-
-      for (final oldIndex in oldSchema.indexes) {
-        for (final newIndex in newSchema.indexes) {
-          if (_areFieldListsEqual(oldIndex.fields, newIndex.fields)) {
-            matchingIndexes++;
-            break;
-          }
-        }
-      }
-
-      // Calculate index match rate
-      final totalIndexes = oldSchema.indexes.length + newSchema.indexes.length;
-      indexScore =
-          totalIndexes > 0 ? (2 * matchingIndexes) / totalIndexes : 0.0;
-    }
-
-    score += indexWeight * indexScore;
-
-    // 6. Table position matching (low weight)
-    const positionWeight = 5.0;
-    totalWeight += positionWeight;
-
-    // Calculate relative position difference
-    double positionDiff;
-    if (oldTablesCount <= 1 || newTablesCount <= 1) {
-      positionDiff = 0;
-    } else {
-      positionDiff = (oldTableIndex / (oldTablesCount - 1) -
-              newTableIndex / (newTablesCount - 1))
-          .abs();
-    }
-
-    score += positionWeight * (1 - positionDiff);
-
-    // Calculate final score
-    return totalWeight > 0 ? score / totalWeight : 0.0;
-  }
 
   /// Migrate existing table schema
   Future<MigrationTask?> _migrateExistingTable(TableSchema newSchema,
@@ -1018,7 +929,7 @@ class MigrationManager {
 
     // if there are still fields to match, match by similarity
     if (removedFields.isNotEmpty && addedFields.isNotEmpty) {
-      _detectRenamedFieldsBySimilarity(
+      _detectRenamedFieldsBySimilarityParallel(
           oldSchema, newSchema, operations, removedFields, addedFields);
     }
   }
@@ -1081,21 +992,22 @@ class MigrationManager {
     addedFields.removeWhere((field) => matchedAddedFields.contains(field));
   }
 
-  /// match renamed fields by similarity
-  void _detectRenamedFieldsBySimilarity(
+
+  /// parallel way to detect renamed fields
+  Future<void> _detectRenamedFieldsBySimilarityParallel(
     TableSchema oldSchema,
     TableSchema newSchema,
     List<MigrationOperation> operations,
     List<String> removedFields,
     List<FieldSchema> addedFields,
-  ) {
+  ) async {
     // field similarity threshold, only fields with score above this value will be considered as renamed
     const similarityThreshold = 0.6;
-
-    // calculate similarity matrix for all removed and added fields
-    final similarityMatrix = <String, Map<FieldSchema, double>>{};
-
-    // iterate all removed fields
+    
+    // prepare parallel calculation requests
+    final similarityRequests = <FieldSimilarityRequest>[];
+    
+    // iterate all fields to compare
     for (var oldFieldName in removedFields) {
       // if old field is primary key, skip
       if (oldSchema.primaryKey == oldFieldName) continue;
@@ -1103,336 +1015,97 @@ class MigrationManager {
       final oldField = oldSchema.fields.firstWhere(
         (f) => f.name == oldFieldName,
       );
-
-      similarityMatrix[oldFieldName] = {};
-
-      // calculate similarity with each added field
+      
       for (var newField in addedFields) {
         // if new field is primary key, skip
         if (newSchema.primaryKey == newField.name) continue;
-
-        final similarity = _calculateFieldSimilarityWithWeights(
-            oldField,
-            newField,
-            oldSchema.fields.indexOf(oldField),
-            newSchema.fields.indexOf(newField),
-            oldSchema.fields.length,
-            newSchema.fields.length,
-            oldSchema: oldSchema,
-            newSchema: newSchema);
-
-        similarityMatrix[oldFieldName]![newField] = similarity;
+        
+        similarityRequests.add(FieldSimilarityRequest(
+          oldField: oldField,
+          newField: newField,
+          oldFieldIndex: oldSchema.fields.indexOf(oldField),
+          newFieldIndex: newSchema.fields.indexOf(newField),
+          oldFieldsCount: oldSchema.fields.length,
+          newFieldsCount: newSchema.fields.length,
+          oldSchema: oldSchema,
+          newSchema: newSchema,
+        ));
       }
     }
-
-    // greedy matching algorithm: find the highest similarity field pair
-    while (similarityMatrix.isNotEmpty) {
-      // find the highest similarity field pair
-      String? bestOldField;
-      FieldSchema? bestNewField;
-      double bestSimilarity = 0;
-
-      for (var oldField in similarityMatrix.keys) {
-        for (var newField in similarityMatrix[oldField]!.keys) {
-          final similarity = similarityMatrix[oldField]![newField]!;
-
-          if (similarity > bestSimilarity) {
-            bestSimilarity = similarity;
-            bestOldField = oldField;
-            bestNewField = newField;
-          }
-        }
+    
+    // if no requests to process, return
+    if (similarityRequests.isEmpty) {
+      return;
+    }
+    
+    // max concurrent
+    final maxConcurrent = _dataStore.config.maxConcurrent;
+    
+    // batch processing requests
+    final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
+    final batches = <List<FieldSimilarityRequest>>[];
+    
+    for (int i = 0; i < similarityRequests.length; i += batchSize) {
+      final end = min(i + batchSize, similarityRequests.length);
+      batches.add(similarityRequests.sublist(i, end));
+    }
+    
+    // parallel processing all batches
+    final batchResults = await Future.wait(batches.map((batch) => 
+      ComputeManager.run(calculateBatchFieldSimilarity, 
+          BatchFieldSimilarityRequest(requests: batch),useIsolate: similarityRequests.length > 5)
+    ));
+    
+    // merge all results
+    final allResults = <FieldSimilarityResult>[];
+    for (final batchResult in batchResults) {
+      allResults.addAll(batchResult.results);
+    }
+    
+    // sort results by similarity
+    allResults.sort((a, b) => b.similarity.compareTo(a.similarity));
+    
+    // greedy matching algorithm
+    final processedOldFields = <String>{};
+    final processedNewFields = <FieldSchema>{};
+    
+    for (final result in allResults) {
+      // if field is already processed, skip
+      if (processedOldFields.contains(result.oldFieldName) || 
+          processedNewFields.contains(result.newField)) {
+        continue;
       }
-
-      // if similarity is above threshold, consider as renamed
-      if (bestSimilarity >= similarityThreshold &&
-          bestOldField != null &&
-          bestNewField != null) {
+      
+      // if best match is above threshold, consider as renamed field
+      if (result.similarity >= similarityThreshold) {
         // remove existing add and remove operations
         operations.removeWhere((op) =>
             (op.type == MigrationType.removeField &&
-                op.fieldName == bestOldField) ||
-            (op.type == MigrationType.addField && op.field == bestNewField));
-
+                op.fieldName == result.oldFieldName) ||
+            (op.type == MigrationType.addField && op.field == result.newField));
+        
         // add rename operation
         operations.add(MigrationOperation(
           type: MigrationType.renameField,
-          fieldName: bestOldField,
-          newName: bestNewField.name,
+          fieldName: result.oldFieldName,
+          newName: result.newField.name,
         ));
-
-        // record detailed log
-        Logger.info(
-          'Automatic field renaming detected: $bestOldField -> ${bestNewField.name}, similarity: ${bestSimilarity.toStringAsFixed(2)}',
-          label: 'MigrationManager._detectRenamedFieldsBySimilarity',
-        );
-
-        // remove matched fields from similarity matrix
-        similarityMatrix.remove(bestOldField);
-        for (var oldField in similarityMatrix.keys) {
-          similarityMatrix[oldField]!.remove(bestNewField);
-        }
+        
+        
+        // record processed fields
+        processedOldFields.add(result.oldFieldName);
+        processedNewFields.add(result.newField);
+        
+        // remove from processing list
+        removedFields.remove(result.oldFieldName);
+        addedFields.remove(result.newField);
       } else {
-        // if best match still not above threshold, break
+        // if similarity is not high enough, break
         break;
       }
     }
   }
 
-  /// calculate field similarity with weights
-  double _calculateFieldSimilarityWithWeights(
-      FieldSchema oldField,
-      FieldSchema newField,
-      int oldFieldIndex,
-      int newFieldIndex,
-      int oldFieldsCount,
-      int newFieldsCount,
-      {TableSchema? oldSchema,
-      TableSchema? newSchema}) {
-    // if no table schema provided, create default empty schema
-    oldSchema ??= const TableSchema(
-        name: '',
-        primaryKeyConfig: PrimaryKeyConfig(),
-        fields: [],
-        indexes: []);
-
-    newSchema ??= const TableSchema(
-        name: '',
-        primaryKeyConfig: PrimaryKeyConfig(),
-        fields: [],
-        indexes: []);
-
-    double score = 0.0;
-    double totalWeight = 0.0;
-
-    // 1. basic type matching (high weight)
-    const typeWeight = 20.0;
-    totalWeight += typeWeight;
-    if (oldField.type == newField.type) {
-      score += typeWeight;
-    } else {
-      // when type not matched, subtract some weight
-      score -= typeWeight * 0.7;
-    }
-
-    // 2. default value matching (if not basic null value)
-    const defaultValueWeight = 15.0;
-    totalWeight += defaultValueWeight;
-    if (oldField.defaultValue != null && newField.defaultValue != null) {
-      if (oldField.defaultValue == newField.defaultValue) {
-        score += defaultValueWeight;
-      } else {
-        // default value different is strong negative signal
-        score -= defaultValueWeight * 0.5;
-      }
-    } else if (oldField.defaultValue == null && newField.defaultValue == null) {
-      // both are null, also consider as partial match
-      score += defaultValueWeight * 0.5;
-    }
-
-    // 3. comment matching (give high weight to non-empty and meaningful comments)
-    const commentWeight = 20.0;
-    if (oldField.comment != null &&
-        newField.comment != null &&
-        oldField.comment!.length > 1 &&
-        newField.comment!.length > 1) {
-      totalWeight += commentWeight;
-      if (oldField.comment == newField.comment) {
-        score += commentWeight;
-      } else {
-        // different meaningful comments are strong negative signal
-        score -= commentWeight * 0.5;
-      }
-    }
-
-    // 4. nullable and unique property matching
-    const nullableWeight = 10.0;
-    totalWeight += nullableWeight;
-    if (oldField.nullable == newField.nullable) {
-      score += nullableWeight;
-    } else {
-      // nullable different is negative signal
-      score -= nullableWeight * 0.3;
-    }
-
-    const uniqueWeight = 10.0;
-    totalWeight += uniqueWeight;
-    if (oldField.unique == newField.unique) {
-      score += uniqueWeight;
-    } else {
-      // unique different is negative signal
-      score -= uniqueWeight * 0.3;
-    }
-
-    // 5. length and value range constraint matching
-    const constraintWeight = 5.0;
-    double constraintsChecked = 0;
-    double constraintsMatched = 0;
-
-    // maxLength check
-    if (oldField.maxLength != null || newField.maxLength != null) {
-      constraintsChecked++;
-      if (oldField.maxLength == newField.maxLength) {
-        constraintsMatched++;
-      }
-    }
-
-    // minLength check
-    if (oldField.minLength != null || newField.minLength != null) {
-      constraintsChecked++;
-      if (oldField.minLength == newField.minLength) {
-        constraintsMatched++;
-      }
-    }
-
-    // minValue check
-    if (oldField.minValue != null || newField.minValue != null) {
-      constraintsChecked++;
-      if (oldField.minValue == newField.minValue) {
-        constraintsMatched++;
-      }
-    }
-
-    // maxValue check
-    if (oldField.maxValue != null || newField.maxValue != null) {
-      constraintsChecked++;
-      if (oldField.maxValue == newField.maxValue) {
-        constraintsMatched++;
-      }
-    }
-
-    if (constraintsChecked > 0) {
-      totalWeight += constraintWeight;
-      score += (constraintsMatched / constraintsChecked) * constraintWeight;
-    }
-
-    // 6. field position matching (very high weight)
-    const positionWeight = 25.0;
-    totalWeight += positionWeight;
-
-    // calculate relative position difference (0-1 value, 0 means fully matched)
-    double positionDiff;
-    if (oldFieldsCount == 1 || newFieldsCount == 1) {
-      // if only one field, position is not important
-      positionDiff = 0;
-    } else {
-      // normalize position difference to 0-1
-      positionDiff = (oldFieldIndex / (oldFieldsCount - 1) -
-              newFieldIndex / (newFieldsCount - 1))
-          .abs();
-    }
-
-    // the closer the position, the higher the score
-    score += positionWeight * (1 - positionDiff);
-
-    // 7. field name similarity check
-    const nameWeight = 15.0;
-    totalWeight += nameWeight;
-
-    // field name string similarity
-    double nameScore = _calculateNameSimilarity(oldField.name, newField.name);
-    score += nameWeight * nameScore;
-
-    // 8. index position check
-    const indexWeight = 5.0;
-    bool oldFieldInIndex = _isFieldInIndex(oldField.name, oldSchema.indexes);
-    bool newFieldInIndex = _isFieldInIndex(newField.name, newSchema.indexes);
-
-    if (oldFieldInIndex && newFieldInIndex) {
-      totalWeight += indexWeight;
-      score += indexWeight;
-    } else if (!oldFieldInIndex && !newFieldInIndex) {
-      // both not in index also consider as matched
-      totalWeight += indexWeight;
-      score += indexWeight * 0.5;
-    }
-
-    // 9. field number similarity (extra factor)
-    if (oldFieldsCount == newFieldsCount) {
-      // field total number is consistent, add a small extra score
-      score += 5.0;
-      totalWeight += 5.0;
-    }
-
-    // calculate final percentage score (0-1)
-    return totalWeight > 0 ? score / totalWeight : 0.0;
-  }
-
-  /// 检查字段是否在任何索引中
-  bool _isFieldInIndex(String fieldName, List<IndexSchema> indexes) {
-    for (var index in indexes) {
-      if (index.fields.contains(fieldName)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /// calculate field name similarity
-  double _calculateNameSimilarity(String oldName, String newName) {
-    // 1. normalize processing: convert to lowercase
-    final oldNameLower = oldName.toLowerCase();
-    final newNameLower = newName.toLowerCase();
-
-    if (oldNameLower == newNameLower) {
-      return 1.0; // fully matched
-    }
-
-    // 2. camel and underline conversion comparison
-    String oldNameNormalized = _normalizeFieldName(oldNameLower);
-    String newNameNormalized = _normalizeFieldName(newNameLower);
-
-    if (oldNameNormalized == newNameNormalized) {
-      return 0.9; // very close
-    }
-
-    // 3. calculate longest common subsequence
-    int lcsLength = _getLongestCommonSubsequenceLength(
-        oldNameNormalized, newNameNormalized);
-    int maxLength = oldNameNormalized.length > newNameNormalized.length
-        ? oldNameNormalized.length
-        : newNameNormalized.length;
-
-    // return similarity score between 0-1
-    return maxLength > 0 ? lcsLength / maxLength : 0.0;
-  }
-
-  /// normalize field name: process camel and underline
-  String _normalizeFieldName(String name) {
-    // camel to underline
-    String result = name.replaceAllMapped(
-        RegExp(r'[A-Z]'), (match) => '_${match.group(0)!.toLowerCase()}');
-
-    // process continuous underline
-    result = result.replaceAll(RegExp(r'_+'), '_');
-
-    // remove leading underline
-    if (result.startsWith('_')) {
-      result = result.substring(1);
-    }
-
-    return result;
-  }
-
-  /// get longest common subsequence length
-  int _getLongestCommonSubsequenceLength(String a, String b) {
-    if (a.isEmpty || b.isEmpty) return 0;
-
-    List<List<int>> dp =
-        List.generate(a.length + 1, (_) => List.filled(b.length + 1, 0));
-
-    for (int i = 1; i <= a.length; i++) {
-      for (int j = 1; j <= b.length; j++) {
-        if (a[i - 1] == b[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1] + 1;
-        } else {
-          dp[i][j] = dp[i - 1][j] > dp[i][j - 1] ? dp[i - 1][j] : dp[i][j - 1];
-        }
-      }
-    }
-
-    return dp[a.length][b.length];
-  }
 
   /// Check if field is modified
   bool _isFieldModified(FieldSchema oldField, FieldSchema newField) {
@@ -1729,7 +1402,7 @@ class MigrationManager {
             targetTableName: currentTableName,
             processFunction: (records, partitionIndex) async {
               // apply migration operations to records
-              final modifiedRecords = _applyMigrationOperations(
+              final modifiedRecords = await _applyMigrationOperations(
                   records, sortedOperations,
                   oldSchema: oldSchema);
 
@@ -1754,7 +1427,7 @@ class MigrationManager {
           await migrationInstance.tableDataManager.processTablePartitions(
               tableName: currentTableName,
               processFunction: (records, partitionIndex) async {
-                final migratedRecords = _applyMigrationOperations(
+                final migratedRecords = await _applyMigrationOperations(
                     records, sortedOperations,
                     oldSchema: oldSchema);
 
@@ -1827,227 +1500,52 @@ class MigrationManager {
   }
 
   /// Apply migration operations to records
-  List<Map<String, dynamic>> _applyMigrationOperations(
+  Future<List<Map<String, dynamic>>> _applyMigrationOperations(
       List<Map<String, dynamic>> records, List<MigrationOperation> operations,
-      {TableSchema? oldSchema}) {
-    var modifiedRecords = List<Map<String, dynamic>>.from(records);
-
-    // use the incoming sorted operations, no need to sort again
-    for (var operation in operations) {
-      switch (operation.type) {
-        case MigrationType.addField:
-          final field = operation.field!;
-          modifiedRecords = modifiedRecords.map((record) {
-            if (!record.containsKey(field.name)) {
-              record[field.name] = field.getDefaultValue();
-            }
-            return record;
-          }).toList();
-          break;
-
-        case MigrationType.removeField:
-          final fieldName = operation.fieldName!;
-          modifiedRecords = modifiedRecords.map((record) {
-            record.remove(fieldName);
-            return record;
-          }).toList();
-          break;
-
-        case MigrationType.renameField:
-          final oldName = operation.fieldName!;
-          final newName = operation.newName!;
-          modifiedRecords = modifiedRecords.map((record) {
-            if (record.containsKey(oldName)) {
-              record[newName] = record[oldName];
-              record.remove(oldName);
-            }
-            return record;
-          }).toList();
-          break;
-
-        case MigrationType.modifyField:
-          final fieldUpdate = operation.fieldUpdate!;
-          // get old field information
-          FieldSchema? oldFieldSchema;
-          if (oldSchema != null) {
-            try {
-              oldFieldSchema = oldSchema.fields
-                  .firstWhere((f) => f.name == fieldUpdate.name);
-            } catch (e) {
-              oldFieldSchema = null;
-            }
-          }
-          modifiedRecords = modifiedRecords.map((record) {
-            if (record.containsKey(fieldUpdate.name)) {
-              // call the extracted method to handle field modification, pass old field information
-              record = _applyFieldModification(record, fieldUpdate,
-                  oldFieldSchema: oldFieldSchema);
-            }
-            return record;
-          }).toList();
-          break;
-
-        case MigrationType.addIndex:
-          // index operation does not affect record data
-          break;
-
-        case MigrationType.removeIndex:
-          break;
-
-        case MigrationType.modifyIndex:
-          break;
-
-        case MigrationType.renameTable:
-          // table rename operation does not affect current record data, but needs to be handled at a higher level
-          break;
-
-        case MigrationType.dropTable:
-          // drop table operation does not affect record data
-          break;
-
-        case MigrationType.setPrimaryKeyConfig:
-          // handle primary key configuration changes, especially handle primary key name changes and data type changes
-          if (operation.oldPrimaryKeyConfig != null &&
-              operation.primaryKeyConfig != null) {
-            final oldConfig = operation.oldPrimaryKeyConfig!;
-            final newConfig = operation.primaryKeyConfig!;
-
-            // handle primary key name changes
-            if (oldConfig.name != newConfig.name) {
-              modifiedRecords = modifiedRecords.map((record) {
-                if (record.containsKey(oldConfig.name)) {
-                  // copy old primary key field value to new primary key field
-                  record[newConfig.name] = record[oldConfig.name];
-                  // delete old primary key field
-                  record.remove(oldConfig.name);
-                }
-                return record;
-              }).toList();
-            }
-          }
-          break;
-      }
+      {TableSchema? oldSchema}) async {
+    if (records.isEmpty || operations.isEmpty) {
+      return records;
     }
-
-    return modifiedRecords;
+      // Get max concurrent
+      final maxConcurrent = _dataStore.config.maxConcurrent;
+      
+      // Batch size
+      final int batchSize = (records.length / maxConcurrent).ceil();
+      
+      // Create batches
+      final batches = <List<Map<String, dynamic>>>[];
+      for (int i = 0; i < records.length; i += batchSize) {
+        final end = min(i + batchSize, records.length);
+        batches.add(records.sublist(i, end));
+      }
+      
+      // Parallel processing all batches
+      final batchResults = await Future.wait(batches.map((batch) =>
+        ComputeManager.run(processMigrationRecords,
+            MigrationRecordProcessRequest(
+              records: batch,
+              operations: operations,
+              oldSchema: oldSchema,
+            ),useIsolate: records.length > 100)
+      ));
+      
+      // Merge results
+      final allProcessedRecords = <Map<String, dynamic>>[];
+      for (final batchResult in batchResults) {
+        if (batchResult.success) {
+          allProcessedRecords.addAll(batchResult.migratedRecords);
+        } else {
+          Logger.warn(
+            'Batch migration failed: ${batchResult.errorMessage}',
+            label: 'MigrationManager._applyMigrationOperations',
+          );
+          allProcessedRecords.addAll(batchResult.migratedRecords);
+        }
+      }
+      
+      return allProcessedRecords;
   }
-
-  /// Apply field modification to a single record with old field schema information
-  Map<String, dynamic> _applyFieldModification(
-      Map<String, dynamic> record, FieldSchemaUpdate fieldUpdate,
-      {FieldSchema? oldFieldSchema}) {
-    // create field schema for validation and get default value
-    final fieldSchema = FieldSchema(
-      name: fieldUpdate.name,
-      type: fieldUpdate.type ?? (oldFieldSchema?.type ?? DataType.text),
-      nullable: fieldUpdate.nullable ?? (oldFieldSchema?.nullable ?? true),
-      defaultValue: fieldUpdate.defaultValue ?? oldFieldSchema?.defaultValue,
-      unique: fieldUpdate.unique ?? (oldFieldSchema?.unique ?? false),
-      maxLength: fieldUpdate.maxLength ?? oldFieldSchema?.maxLength,
-      minLength: fieldUpdate.minLength ?? oldFieldSchema?.minLength,
-      minValue: fieldUpdate.minValue ?? oldFieldSchema?.minValue,
-      maxValue: fieldUpdate.maxValue ?? oldFieldSchema?.maxValue,
-      comment: fieldUpdate.comment ?? oldFieldSchema?.comment,
-    );
-
-    // 1. handle type changes
-    if (fieldUpdate.type != null) {
-      try {
-        record[fieldUpdate.name] = fieldSchema.convertValue(
-          value: record[fieldUpdate.name],
-        );
-      } catch (e) {
-        record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-        Logger.warn(
-          'Failed to convert field ${fieldUpdate.name} to type ${fieldUpdate.type}, using default value: $e',
-          label: 'MigrationManager._applyFieldModification',
-        );
-      }
-    }
-
-    // 2. handle null value constraint changes
-    if (fieldUpdate.nullable != null &&
-        !fieldUpdate.nullable! &&
-        record[fieldUpdate.name] == null) {
-      record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-      Logger.debug(
-        'Field ${fieldUpdate.name} is now non-nullable, applied default value',
-        label: 'MigrationManager._applyFieldModification',
-      );
-    }
-
-    // 3. handle default value changes
-    if (fieldUpdate.defaultValue != null && record[fieldUpdate.name] == null) {
-      record[fieldUpdate.name] = fieldUpdate.defaultValue;
-      Logger.debug(
-        'Field ${fieldUpdate.name} has new default value, applied to null value',
-        label: 'MigrationManager._applyFieldModification',
-      );
-    }
-
-    // 4. handle unique constraint changes (only log, data itself is not directly processed)
-    if (fieldUpdate.unique != null && fieldUpdate.unique!) {
-      Logger.debug(
-        'Field ${fieldUpdate.name} now has unique constraint, further validation may be needed',
-        label: 'MigrationManager._applyFieldModification',
-      );
-    }
-
-    // 5. handle length constraint changes (only log, data itself is not directly processed)
-    if ((fieldUpdate.maxLength != null || fieldUpdate.minLength != null) &&
-        record[fieldUpdate.name] is String) {
-      String value = record[fieldUpdate.name];
-      if (fieldUpdate.maxLength != null &&
-          value.length > fieldUpdate.maxLength!) {
-        record[fieldUpdate.name] = value.substring(0, fieldUpdate.maxLength!);
-        Logger.warn(
-          'Field ${fieldUpdate.name} exceeds max length of ${fieldUpdate.maxLength}, truncated',
-          label: 'MigrationManager._applyFieldModification',
-        );
-      }
-      if (fieldUpdate.minLength != null &&
-          value.length < fieldUpdate.minLength!) {
-        record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-        Logger.warn(
-          'Field ${fieldUpdate.name} is shorter than min length of ${fieldUpdate.minLength}, using default value',
-          label: 'MigrationManager._applyFieldModification',
-        );
-      }
-    }
-
-    // 6. handle numeric range constraint changes (only log, data itself is not directly processed)
-    if ((fieldUpdate.minValue != null || fieldUpdate.maxValue != null) &&
-        record[fieldUpdate.name] is num) {
-      num value = record[fieldUpdate.name];
-
-      if (fieldUpdate.minValue != null && value < fieldUpdate.minValue!) {
-        record[fieldUpdate.name] = fieldUpdate.minValue;
-        Logger.warn(
-          'Field ${fieldUpdate.name} below min value of ${fieldUpdate.minValue}, set to min',
-          label: 'MigrationManager._applyFieldModification',
-        );
-      }
-
-      if (fieldUpdate.maxValue != null && value > fieldUpdate.maxValue!) {
-        record[fieldUpdate.name] = fieldUpdate.maxValue;
-        Logger.warn(
-          'Field ${fieldUpdate.name} exceeds max value of ${fieldUpdate.maxValue}, set to max',
-          label: 'MigrationManager._applyFieldModification',
-        );
-      }
-    }
-
-    // 7. final validation
-    if (!fieldSchema.validateValue(record[fieldUpdate.name])) {
-      record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-      Logger.warn(
-        'Field ${fieldUpdate.name} value does not meet constraints after updates, using default value',
-        label: 'MigrationManager._applyFieldModification',
-      );
-    }
-
-    return record;
-  }
+  
 
   /// Cleanup task files after completion
   Future<void> _cleanupTask(MigrationTask task) async {
