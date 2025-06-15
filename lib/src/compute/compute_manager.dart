@@ -12,7 +12,7 @@ class ComputeManager {
   /// - [R]: The type of the result.
   /// - [function]: The function to execute. It must be a top-level function or a static method
   ///   to be executed in an isolate.
-  /// - [message]: The argument to pass to the [function].
+  /// - [message]: The argument to pass to the function.
   /// - [useIsolate]: Whether to use an isolate or run in the current isolate. Defaults to true.
   /// - [fallbackToMainThread]: Whether to fallback to main thread if isolate execution fails. Defaults to true.
   static Future<R> run<Q, R>(
