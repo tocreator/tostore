@@ -5,6 +5,8 @@ import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../handler/logger.dart';
 import '../core/lock_manager.dart';
+import '../compute/compute_manager.dart';
+import '../compute/compute_tasks.dart';
 
 /// ID generator interface
 abstract class IdGenerator {
@@ -270,23 +272,40 @@ class TimeBasedIdGenerator implements IdGenerator {
   static final Map<String, DateTime> _lastInstanceAccessTime =
       {}; // record last access time of instance
 
+  // Parallel generation control related properties
+  bool _enableParallel = true; // Whether to enable parallel generation
+  int _maxConcurrent = 4; // Maximum parallel count, default is 4
+  static const int _minCountPerIsolate = 100; // Minimum number of IDs to generate for each isolate
+
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
 
   /// Get generator from instance map, create new instance if not exists
   static TimeBasedIdGenerator getInstance(PrimaryKeyType keyType,
-      DistributedNodeConfig nodeConfig, String tableName) {
+      DistributedNodeConfig nodeConfig, String tableName, {int? maxConcurrent}) {
     final key = '${keyType}_$tableName';
 
     // If instance already exists, return directly
     if (_instances.containsKey(key)) {
       // Update last access time
       _lastInstanceAccessTime[key] = DateTime.now();
+      
+      // If parallel count is specified, update parallel settings of existing instance
+      if (maxConcurrent != null && maxConcurrent > 0) {
+        _instances[key]!.setParallelGeneration(true, maxConcurrent: maxConcurrent);
+      }
+      
       return _instances[key]!;
     }
 
     // Create new instance
     final generator = TimeBasedIdGenerator._(keyType, nodeConfig, tableName);
+    
+    // Set parallel count
+    if (maxConcurrent != null && maxConcurrent > 0) {
+      generator.setParallelGeneration(true, maxConcurrent: maxConcurrent);
+    }
+    
     _instances[key] = generator;
     _lastInstanceAccessTime[key] = DateTime.now();
     return generator;
@@ -305,6 +324,14 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Calculate and cache the number of digits for node ID
     _nodeIdDigits = _calculateNodeIdDigits(nodeConfig.nodeId);
     _initializeGenerator();
+  }
+
+  /// Set parallel generation parameters
+  void setParallelGeneration(bool enable, {int? maxConcurrent}) {
+    _enableParallel = enable;
+    if (maxConcurrent != null && maxConcurrent > 0) {
+      _maxConcurrent = maxConcurrent;
+    }
   }
 
   /// Calculate the number of digits for node ID
@@ -419,85 +446,111 @@ class TimeBasedIdGenerator implements IdGenerator {
         final startTime = DateTime.now();
         int totalGenerated = 0;
 
-        // Generate in batches to avoid long lock time
-        int remainingCount = neededCount;
-        // Increase batch size to reduce iteration count
-        const int batchSize = 1000; // Generate 1000 IDs per batch
-
-        // Add log
-        Logger.debug(
-            'Start filling ID pool: $tableName, need count: $neededCount, current pool size: $currentPoolSize',
-            label: 'TimeBasedIdGenerator._refillIdPool');
-
-        // Last check demand time
-        var lastCheckTime = DateTime.now();
-
-        // Generate in small batches continuously until demand is met
-        while (remainingCount > 0) {
-          final currentBatchSize = min(remainingCount, batchSize);
-
-          // Generate a batch of IDs - use latest obtained request stats
-          final numericIds =
-              await _generateIds(currentBatchSize, latestRecentTotal);
-          final formattedIds = _formatIds(numericIds);
-
-          // Add to ID pool
-          _idPools[tableName]!.addAll(formattedIds);
-          _idPoolLastUpdateTime[tableName] = DateTime.now();
-
-          // Update instance last access time
-          _lastInstanceAccessTime['${keyType}_$tableName'] = DateTime.now();
-
-          totalGenerated += formattedIds.length;
-          remainingCount -= formattedIds.length;
-
-          // When remaining count is less or has passed a certain time, check if there's new demand
-          final now = DateTime.now();
-          bool needsCheck = remainingCount < _minGenerateBatchSize ||
-              now.difference(lastCheckTime).inMilliseconds > 800;
-
-          if (needsCheck && remainingCount < 300) {
-            lastCheckTime = now;
-
-            // Get latest request stats
-            final newRecentTotal = _getRecentRequestCount();
-
-            // Calculate new expected pool size
-            final newExpectedSize = _calculateExpectedPoolSize(newRecentTotal);
-
-            // Get current pool size (already generated minus already consumed)
-            final currentSize = _idPools[tableName]!.length;
-
-            // Calculate the number of IDs needed to generate
-            final newNeededCount = max(0, newExpectedSize - currentSize);
-
-            // If new demand is greater than minimum batch size, continue generating
-            if (newNeededCount > _minGenerateBatchSize) {
-              // Update remaining count
-              remainingCount += newNeededCount;
-
+        // Check if parallel generation conditions are met
+        final canUseParallel = _enableParallel &&
+                              neededCount >= _minCountPerIsolate * 2;
+        
+        if (canUseParallel) {
+            // Parallel generate IDs
+            final generatedIds = await _generateIdsInParallel(neededCount, latestRecentTotal);
+            
+            // Add generated IDs to ID pool
+            if (generatedIds.isNotEmpty) {
+              _idPools[tableName]!.addAll(generatedIds);
+              _idPoolLastUpdateTime[tableName] = DateTime.now();
+              
+              totalGenerated = generatedIds.length;
+              
+              // Record performance data
+              final duration = DateTime.now().difference(startTime).inMilliseconds;
+              final genRate = duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
               Logger.debug(
-                  'Dynamic adjust ID pool size: $tableName, new demand: $newNeededCount, '
-                  'Already generated: $totalGenerated, current pool size: $currentSize',
+                  'ID parallel generated: $tableName, count: $totalGenerated, current pool size: ${_idPools[tableName]!.length}, '
+                  'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
                   label: 'TimeBasedIdGenerator._refillIdPool');
+            }
+        } else {
+          // Old serial generation method remains unchanged
+          // Generate in batches to avoid long lock time
+          int remainingCount = neededCount;
+          // Increase batch size to reduce iteration count
+          const int batchSize = 1000; // Generate 1000 IDs per batch
+
+          // Add log
+          Logger.debug(
+              'Start filling ID pool: $tableName, need count: $neededCount, current pool size: $currentPoolSize',
+              label: 'TimeBasedIdGenerator._refillIdPool');
+
+          // Last check demand time
+          var lastCheckTime = DateTime.now();
+
+          // Generate in small batches continuously until demand is met
+          while (remainingCount > 0) {
+            final currentBatchSize = min(remainingCount, batchSize);
+
+            // Generate a batch of IDs - use latest obtained request stats
+            final numericIds =
+                await _generateIds(currentBatchSize, latestRecentTotal);
+            final formattedIds = _formatIds(numericIds);
+
+            // Add to ID pool
+            _idPools[tableName]!.addAll(formattedIds);
+            _idPoolLastUpdateTime[tableName] = DateTime.now();
+
+            // Update instance last access time
+            _lastInstanceAccessTime['${keyType}_$tableName'] = DateTime.now();
+
+            totalGenerated += formattedIds.length;
+            remainingCount -= formattedIds.length;
+
+            // When remaining count is less or has passed a certain time, check if there's new demand
+            final now = DateTime.now();
+            bool needsCheck = remainingCount < _minGenerateBatchSize ||
+                now.difference(lastCheckTime).inMilliseconds > 800;
+
+            if (needsCheck && remainingCount < 300) {
+              lastCheckTime = now;
+
+              // Get latest request stats
+              final newRecentTotal = _getRecentRequestCount();
+
+              // Calculate new expected pool size
+              final newExpectedSize = _calculateExpectedPoolSize(newRecentTotal);
+
+              // Get current pool size (already generated minus already consumed)
+              final currentSize = _idPools[tableName]!.length;
+
+              // Calculate the number of IDs needed to generate
+              final newNeededCount = max(0, newExpectedSize - currentSize);
+
+              // If new demand is greater than minimum batch size, continue generating
+              if (newNeededCount > _minGenerateBatchSize) {
+                // Update remaining count
+                remainingCount += newNeededCount;
+
+                Logger.debug(
+                    'Dynamic adjust ID pool size: $tableName, new demand: $newNeededCount, '
+                    'Already generated: $totalGenerated, current pool size: $currentSize',
+                    label: 'TimeBasedIdGenerator._refillIdPool');
+              }
+            }
+
+            // Generate each batch, yield execution thread
+            if (remainingCount > 0) {
+              await Future.delayed(const Duration(milliseconds: 5));
             }
           }
 
-          // Generate each batch, yield execution thread
-          if (remainingCount > 0) {
-            await Future.delayed(const Duration(milliseconds: 5));
-          }
+          // Record performance data
+          final duration = DateTime.now().difference(startTime).inMilliseconds;
+          final genRate =
+              duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
+          final purpose = totalGenerated > 1000 ? "refill" : "preheat";
+          Logger.debug(
+              'ID ${purpose}ed: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
+              'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
+              label: 'TimeBasedIdGenerator._refillIdPool');
         }
-
-        // Record performance data
-        final duration = DateTime.now().difference(startTime).inMilliseconds;
-        final genRate =
-            duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
-        final purpose = totalGenerated > 1000 ? "refill" : "preheat";
-        Logger.debug(
-            'ID ${purpose}ed: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
-            'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
-            label: 'TimeBasedIdGenerator._refillIdPool');
       } finally {
         // Ensure mark is cleared
         _idGenerationInProgress[tableName] = false;
@@ -511,6 +564,159 @@ class TimeBasedIdGenerator implements IdGenerator {
     } finally {
       // Release lock
       _lockManager.releaseExclusiveLock(operationId, 'id_generator');
+    }
+  }
+  
+  /// Parallel generate IDs
+  Future<List<String>> _generateIdsInParallel(int neededCount, int recentTotal) async {
+    
+    try {
+      // Record start time
+      final startTime = DateTime.now();
+      
+      // Parallel generation control parameters
+      final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
+      
+      // Calculate the number of IDs to generate for each parallel task based on maximum concurrency and total demand
+      int parallelCount = min(_maxConcurrent, 8); // Maximum 8 parallel tasks
+      // Ensure each isolate at least processes a certain number of IDs
+      parallelCount = min(parallelCount, neededCount ~/ _minCountPerIsolate);
+      if (parallelCount < 1) parallelCount = 1;
+      
+      // Calculate the number of IDs to generate for each isolate
+      final idsPerIsolate = neededCount ~/ parallelCount;
+      final remainingIds = neededCount % parallelCount;
+      
+      // Prepare parallel task list, use Map to store results for sequential merging
+      final tasks = <int, Future<TimeBasedIdGenerateResult>>{};
+      int currentSequence = _sequenceMap[tableName] ?? 0;
+      dynamic currentValue;
+      
+      // Get current base value
+      if (keyType == PrimaryKeyType.timestampBased || keyType == PrimaryKeyType.shortCode) {
+        currentValue = _getCurrentLogicalTimestamp();
+      } else {
+        currentValue = _getCurrentDateString();
+      }
+      
+      // Create multiple generation tasks
+      for (int i = 0; i < parallelCount; i++) {
+        // Calculate the number of IDs to generate for this task
+        final countForThisIsolate = i == parallelCount - 1 
+            ? idsPerIsolate + remainingIds 
+            : idsPerIsolate;
+            
+        // Create request
+        final request = TimeBasedIdGenerateRequest(
+          keyType: keyType,
+          nodeConfig: nodeConfig,
+          tableName: tableName,
+          count: countForThisIsolate,
+          startValue: currentValue,
+          startSequence: currentSequence,
+          useNewTimestamp: i > 0, // The first one uses current timestamp, others use new timestamp
+          useRandomStep: !isHighGeneration,
+          isHighGeneration: isHighGeneration,
+        );
+        
+        // Add task, record task index for order preservation
+        final task = ComputeManager.run(
+          generateTimeBasedIds,
+          request,
+          useIsolate: true,
+          fallbackToMainThread: true,
+        );
+        
+        tasks[i] = task;
+        
+        // Reserve sequence number space for next task
+        if (isHighGeneration) {
+          // High generation mode uses continuous sequence numbers
+          currentSequence += countForThisIsolate;
+          if (currentSequence > _maxSequence) {
+            // If sequence number is insufficient, use new timestamp value
+            if (keyType == PrimaryKeyType.timestampBased || keyType == PrimaryKeyType.shortCode) {
+              currentValue = _getCurrentLogicalTimestamp() + 1; // +1 ensure it's a new timestamp
+            } else {
+              // Get next second string
+              final now = DateTime.now().add(const Duration(seconds: 1));
+              currentValue = '${now.year}'
+                '${now.month.toString().padLeft(2, '0')}'
+                '${now.day.toString().padLeft(2, '0')}'
+                '${now.hour.toString().padLeft(2, '0')}'
+                '${now.minute.toString().padLeft(2, '0')}'
+                '${now.second.toString().padLeft(2, '0')}';
+            }
+            currentSequence = 0;
+          }
+        } else {
+          // Non-high generation mode uses different sequence number ranges
+          // Each task uses a different sequence number starting point to avoid conflicts
+          final step = _maxSequence ~/ (parallelCount + 1);
+          currentSequence += step;
+          if (currentSequence > _maxSequence) currentSequence = 1;
+        }
+      }
+      
+      // Wait for all tasks to complete and collect results
+      final results = <TimeBasedIdGenerateResult>[];
+      // Process results in order, ensure ID order
+      for (int i = 0; i < parallelCount; i++) {
+        results.add(await tasks[i]!);
+      }
+      
+      final allGeneratedIds = <String>[];
+      dynamic lastValue = currentValue;
+      int lastSequence = currentSequence;
+      
+      // Process and merge results in original order
+      for (final result in results) {
+        if (result.success && result.ids.isNotEmpty) {
+          // Add generated IDs in order of task index, ensure correct order
+          allGeneratedIds.addAll(result.ids);
+          
+          // Update latest value and sequence number
+          if (keyType == PrimaryKeyType.timestampBased || keyType == PrimaryKeyType.shortCode) {
+            // For timestamp, use larger value
+            if (result.lastValue is int && lastValue is int && result.lastValue > lastValue) {
+              lastValue = result.lastValue;
+            }
+          } else if (keyType == PrimaryKeyType.datePrefixed) {
+            // For date prefixed, compare string size
+            if (result.lastValue is String && lastValue is String && 
+                result.lastValue.compareTo(lastValue) > 0) {
+              lastValue = result.lastValue;
+            }
+          }
+          
+          // Use the largest sequence number
+          if (result.lastSequence > lastSequence) {
+            lastSequence = result.lastSequence;
+          }
+        }
+      }
+      
+      // Update state
+      _sequenceMap[tableName] = lastSequence;
+      _lastValueMap[tableName] = lastValue;
+      _lastValue = lastValue;
+      
+      // Record performance metrics
+      final duration = DateTime.now().difference(startTime).inMilliseconds;
+      final genRate = duration > 0 ? ((allGeneratedIds.length * 1000) ~/ duration) : 0;
+      
+      Logger.debug(
+          'Parallel generate IDs completed: $tableName, generated count: ${allGeneratedIds.length}, '
+          'used task count: $parallelCount, duration: ${duration}ms, generation rate: $genRate IDs/s',
+          label: 'TimeBasedIdGenerator._generateIdsInParallel');
+      
+      return allGeneratedIds;
+    } catch (e) {
+      Logger.error('Parallel generate IDs failed: $e', label: 'TimeBasedIdGenerator._generateIdsInParallel');
+      
+      // If error occurs, fall back to traditional generation method
+      final numericIds = await _generateIds(neededCount, recentTotal);
+      return _formatIds(numericIds);
     }
   }
 
@@ -1130,6 +1336,7 @@ class IdGeneratorFactory {
           pkConfig.type,
           config.distributedNodeConfig,
           schema.name,
+          maxConcurrent: config.maxConcurrent,
         );
 
       case PrimaryKeyType.none:

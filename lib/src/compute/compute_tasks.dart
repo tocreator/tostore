@@ -1,16 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:math';
 
 import '../core/b_plus_tree.dart';
 import '../model/index_entry.dart';
 import '../model/file_info.dart';
 import '../model/table_schema.dart';
+import '../model/data_store_config.dart';
 import '../model/migration_task.dart';
 import '../handler/encoder.dart';
 import '../handler/value_comparator.dart';
 import '../handler/logger.dart';
-
 
 /// Helper class for organizing parallel write jobs.
 class PartitionWriteJob {
@@ -49,22 +50,22 @@ class IndexProcessingRequest {
 class IndexDeleteRequest {
   /// The content of the partition file to process
   final String content;
-  
+
   /// The checksum of the partition file (optional)
   final String? checksum;
-  
+
   /// The B+ tree order
   final int bTreeOrder;
-  
+
   /// Whether the index is unique
   final bool isUnique;
-  
+
   /// The keys to process for deletion
   final List<String> keysToProcess;
-  
+
   /// The entries to delete mapped by key
   final Map<String, IndexBufferEntry> entriesToDelete;
-  
+
   IndexDeleteRequest({
     required this.content,
     this.checksum,
@@ -79,19 +80,19 @@ class IndexDeleteRequest {
 class IndexDeleteResult {
   /// Whether the B+ tree was modified
   final bool isModified;
-  
+
   /// The new content of the B+ tree
   final String newContent;
-  
+
   /// The number of entries in the B+ tree after processing
   final int entryCount;
-  
+
   /// The keys that were successfully processed
   final List<String> processedKeys;
-  
+
   /// The checksum of the new content
   final String checksum;
-  
+
   IndexDeleteResult({
     required this.isModified,
     required this.newContent,
@@ -153,10 +154,8 @@ Future<IndexProcessingResult> processIndexPartition(
         );
       }
     } catch (treeInitError) {
-      Logger.error(
-        'Failed to initialize B+ tree: $treeInitError', 
-        label: 'processIndexPartition'
-      );
+      Logger.error('Failed to initialize B+ tree: $treeInitError',
+          label: 'processIndexPartition');
       return IndexProcessingResult.failed();
     }
 
@@ -169,20 +168,17 @@ Future<IndexProcessingResult> processIndexPartition(
         await btree.insert(entry.indexKey, entry.recordPointer.toString());
       } catch (insertError) {
         failedCount++;
-        Logger.warn(
-          'Failed to insert entry: $insertError', 
-          label: 'processIndexPartition'
-        );
+        Logger.warn('Failed to insert entry: $insertError',
+            label: 'processIndexPartition');
         // Continue with next entry
         continue;
       }
     }
-    
+
     if (failedCount > 0) {
       Logger.warn(
-        'Failed to insert $failedCount entries out of ${request.entries.length}', 
-        label: 'processIndexPartition'
-      );
+          'Failed to insert $failedCount entries out of ${request.entries.length}',
+          label: 'processIndexPartition');
     }
 
     // Serialize the final tree to a string.
@@ -190,10 +186,8 @@ Future<IndexProcessingResult> processIndexPartition(
     try {
       serialized = btree.toStringHandle();
     } catch (serializeError) {
-      Logger.error(
-        'Failed to serialize B+ tree: $serializeError', 
-        label: 'processIndexPartition'
-      );
+      Logger.error('Failed to serialize B+ tree: $serializeError',
+          label: 'processIndexPartition');
       return IndexProcessingResult.failed();
     }
 
@@ -204,13 +198,11 @@ Future<IndexProcessingResult> processIndexPartition(
       entryCount: btree.count(),
     );
   } catch (e) {
-    Logger.error(
-      'Failed to process index partition: $e', 
-      label: 'processIndexPartition'
-    );
+    Logger.error('Failed to process index partition: $e',
+        label: 'processIndexPartition');
     return IndexProcessingResult.failed();
   }
-} 
+}
 
 /// Process index deletion in an isolate
 ///
@@ -219,12 +211,10 @@ Future<IndexProcessingResult> processIndexPartition(
 Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
   try {
     // Verify checksum if provided
-    if (request.checksum != null && 
+    if (request.checksum != null &&
         !_verifyChecksum(request.content, request.checksum!)) {
-      Logger.warn(
-        'Checksum verification failed for index delete operation', 
-        label: 'processIndexDelete'
-      );
+      Logger.warn('Checksum verification failed for index delete operation',
+          label: 'processIndexDelete');
       // Return empty result if checksum verification fails
       return IndexDeleteResult(
         isModified: false,
@@ -234,7 +224,7 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         checksum: request.checksum ?? '',
       );
     }
-    
+
     // Initialize B+ tree from content
     BPlusTree btree;
     try {
@@ -244,7 +234,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         isUnique: request.isUnique,
       );
     } catch (treeError) {
-      Logger.error('Failed to initialize B+ tree: $treeError', label: 'processIndexDelete');
+      Logger.error('Failed to initialize B+ tree: $treeError',
+          label: 'processIndexDelete');
       // Return unmodified content as fallback
       return IndexDeleteResult(
         isModified: false,
@@ -254,58 +245,54 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         checksum: request.checksum ?? _calculateChecksum(request.content),
       );
     }
-    
+
     // Track whether the B+ tree was modified
     bool isModified = false;
-    
+
     // Track which keys were processed
     final processedKeys = <String>[];
-    
+
     // Process each key to delete
     for (final key in request.keysToProcess) {
       try {
         final indexEntry = request.entriesToDelete[key];
         if (indexEntry == null) continue;
-        
+
         final existingValues = await btree.search(key);
         if (existingValues.isEmpty) continue;
-        
+
         final recordPointer = indexEntry.indexEntry.recordPointer.toString();
         if (existingValues.contains(recordPointer)) {
           await btree.delete(key, recordPointer);
           isModified = true;
           processedKeys.add(key);
-          
+
           // For unique indexes, we can stop after finding the first match
           if (request.isUnique) break;
         }
       } catch (keyError) {
-        Logger.warn(
-          'Failed to process delete for key $key: $keyError', 
-          label: 'processIndexDelete'
-        );
+        Logger.warn('Failed to process delete for key $key: $keyError',
+            label: 'processIndexDelete');
         // Continue with next key
         continue;
       }
     }
-    
+
     String newContent;
     try {
       // Serialize the B+ tree if modified
       newContent = isModified ? btree.toStringHandle() : request.content;
     } catch (serializeError) {
-      Logger.error(
-        'Failed to serialize B+ tree: $serializeError', 
-        label: 'processIndexDelete'
-      );
+      Logger.error('Failed to serialize B+ tree: $serializeError',
+          label: 'processIndexDelete');
       // Use original content as fallback
       newContent = request.content;
       isModified = false;
     }
-    
+
     // Calculate checksum for the new content
     final checksum = _calculateChecksum(newContent);
-    
+
     // Return the results
     return IndexDeleteResult(
       isModified: isModified,
@@ -315,7 +302,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       checksum: checksum,
     );
   } catch (e) {
-    Logger.error('Failed to process index delete operation: $e', label: 'processIndexDelete');
+    Logger.error('Failed to process index delete operation: $e',
+        label: 'processIndexDelete');
     // Return unmodified content as fallback
     return IndexDeleteResult(
       isModified: false,
@@ -339,19 +327,19 @@ String _calculateChecksum(String content) {
   // Use simple hash value as checksum
   final hash = content.hashCode;
   return hash.toRadixString(16).padLeft(8, '0');
-} 
+}
 
 /// Request data for decoding partition data in an isolate.
 class DecodePartitionRequest {
   /// The bytes to decode
   final Uint8List bytes;
-  
+
   /// Optional custom encryption key
   final List<int>? encryptionKey;
-  
+
   /// Optional encryption key ID
   final int? encryptionKeyId;
-  
+
   DecodePartitionRequest({
     required this.bytes,
     this.encryptionKey,
@@ -363,34 +351,34 @@ class DecodePartitionRequest {
 class EncodePartitionRequest {
   /// The records to encode
   final List<Map<String, dynamic>> records;
-  
+
   /// The partition index
   final int partitionIndex;
-  
+
   /// The primary key field name
   final String primaryKey;
-  
+
   /// Optional minimum primary key value
   final dynamic minPk;
-  
+
   /// Optional maximum primary key value
   final dynamic maxPk;
-  
+
   /// The partition path
   final String partitionPath;
-  
+
   /// The parent path
   final String parentPath;
-  
+
   /// The timestamps
   final Timestamps timestamps;
-  
+
   /// Optional custom encryption key
   final List<int>? encryptionKey;
-  
+
   /// Optional encryption key ID
   final int? encryptionKeyId;
-  
+
   EncodePartitionRequest({
     required this.records,
     required this.partitionIndex,
@@ -409,13 +397,13 @@ class EncodePartitionRequest {
 class EncodedPartitionResult {
   /// The encoded data
   final Uint8List encodedData;
-  
+
   /// The updated partition meta
   final PartitionMeta partitionMeta;
-  
+
   /// The number of non-empty records
   final int nonEmptyRecordCount;
-  
+
   EncodedPartitionResult({
     required this.encodedData,
     required this.partitionMeta,
@@ -427,16 +415,16 @@ class EncodedPartitionResult {
 class PartitionRangeAnalysisRequest {
   /// The records to analyze
   final List<Map<String, dynamic>> records;
-  
+
   /// The primary key field name
   final String primaryKey;
-  
+
   /// The partition index (optional)
   final int partitionIndex;
-  
+
   /// The existing partitions (optional)
   final List<PartitionMeta>? existingPartitions;
-  
+
   PartitionRangeAnalysisRequest({
     required this.records,
     required this.primaryKey,
@@ -449,16 +437,16 @@ class PartitionRangeAnalysisRequest {
 class PartitionRangeAnalysisResult {
   /// The minimum primary key value
   final dynamic minPk;
-  
+
   /// The maximum primary key value
   final dynamic maxPk;
-  
+
   /// The total number of records
   final int recordCount;
-  
+
   /// Whether the partition order is maintained
   final bool isOrdered;
-  
+
   PartitionRangeAnalysisResult({
     this.minPk,
     this.maxPk,
@@ -472,7 +460,7 @@ class PartitionRangeAnalysisResult {
 /// This function takes a [DecodePartitionRequest], decodes the partition data,
 /// and returns a list of records.
 Future<List<Map<String, dynamic>>> decodePartitionData(
-  DecodePartitionRequest request) async {
+    DecodePartitionRequest request) async {
   try {
     // decode data
     final decodedString = await EncoderHandler.decode(
@@ -480,25 +468,27 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
       customKey: request.encryptionKey,
       keyId: request.encryptionKeyId,
     );
-    
+
     if (decodedString.isEmpty) {
       Logger.warn('Decoded string is empty', label: 'decodePartitionData');
       return [];
     }
-    
+
     // parse JSON
     try {
       final jsonData = jsonDecode(decodedString) as Map<String, dynamic>;
       final partitionInfo = PartitionInfo.fromJson(jsonData);
-      
+
       return partitionInfo.data.cast<Map<String, dynamic>>().toList();
     } catch (jsonError) {
-      Logger.error('Failed to parse JSON data: $jsonError', label: 'decodePartitionData');
+      Logger.error('Failed to parse JSON data: $jsonError',
+          label: 'decodePartitionData');
       // Return empty list as fallback instead of throwing exception
       return [];
     }
   } catch (e) {
-    Logger.error('Failed to decode partition data: $e', label: 'decodePartitionData');
+    Logger.error('Failed to decode partition data: $e',
+        label: 'decodePartitionData');
     // Return empty list as fallback instead of throwing exception
     return [];
   }
@@ -509,23 +499,25 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
 /// This function takes an [EncodePartitionRequest], encodes the partition data,
 /// and returns an [EncodedPartitionResult].
 Future<EncodedPartitionResult> encodePartitionData(
-  EncodePartitionRequest request) async {
+    EncodePartitionRequest request) async {
   try {
     // count non-empty records
     final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
-    
+
     // calculate partition checksum
     Uint8List allRecordsData;
     String partitionChecksum;
     try {
-      allRecordsData = Uint8List.fromList(utf8.encode(jsonEncode(request.records)));
+      allRecordsData =
+          Uint8List.fromList(utf8.encode(jsonEncode(request.records)));
       partitionChecksum = allRecordsData.hashCode.toString();
     } catch (jsonError) {
-      Logger.error('Failed to encode records to JSON: $jsonError', label: 'encodePartitionData');
+      Logger.error('Failed to encode records to JSON: $jsonError',
+          label: 'encodePartitionData');
       // Create a fallback checksum
       partitionChecksum = DateTime.now().microsecondsSinceEpoch.toString();
     }
-    
+
     // create partition meta
     final partitionMeta = PartitionMeta(
       version: 1,
@@ -538,14 +530,14 @@ Future<EncodedPartitionResult> encodePartitionData(
       timestamps: request.timestamps,
       parentPath: request.parentPath,
     );
-    
+
     // create partition info
     final partitionInfo = PartitionInfo(
       path: request.partitionPath,
       meta: partitionMeta,
       data: request.records,
     );
-    
+
     // encode data
     Uint8List encodedData;
     try {
@@ -555,19 +547,22 @@ Future<EncodedPartitionResult> encodePartitionData(
         keyId: request.encryptionKeyId,
       );
     } catch (encodeError) {
-      Logger.error('Failed to encode partition info: $encodeError', label: 'encodePartitionData');
+      Logger.error('Failed to encode partition info: $encodeError',
+          label: 'encodePartitionData');
       // Create empty data as fallback
       encodedData = Uint8List(0);
     }
-    
+
     // update size and return result
     return EncodedPartitionResult(
       encodedData: encodedData,
-      partitionMeta: partitionMeta.copyWith(fileSizeInBytes: encodedData.length),
+      partitionMeta:
+          partitionMeta.copyWith(fileSizeInBytes: encodedData.length),
       nonEmptyRecordCount: nonEmptyRecords.length,
     );
   } catch (e) {
-    Logger.error('Failed to encode partition data: $e', label: 'encodePartitionData');
+    Logger.error('Failed to encode partition data: $e',
+        label: 'encodePartitionData');
     // Return a minimal valid result instead of throwing exception
     final emptyMeta = PartitionMeta(
       version: 1,
@@ -593,30 +588,28 @@ Future<EncodedPartitionResult> encodePartitionData(
 /// This function takes a [PartitionRangeAnalysisRequest], analyzes the partition key range,
 /// and returns a [PartitionRangeAnalysisResult].
 Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
-  PartitionRangeAnalysisRequest request) async {
+    PartitionRangeAnalysisRequest request) async {
   try {
     if (request.records.isEmpty) {
       return PartitionRangeAnalysisResult(recordCount: 0);
     }
-    
+
     final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
     if (nonEmptyRecords.isEmpty) {
       return PartitionRangeAnalysisResult(recordCount: 0);
     }
-    
+
     // Check if primary key exists in first record
     if (!nonEmptyRecords.first.containsKey(request.primaryKey)) {
-      Logger.warn(
-        'Primary key "${request.primaryKey}" not found in records', 
-        label: 'analyzePartitionKeyRange'
-      );
+      Logger.warn('Primary key "${request.primaryKey}" not found in records',
+          label: 'analyzePartitionKeyRange');
       return PartitionRangeAnalysisResult(recordCount: nonEmptyRecords.length);
     }
-    
+
     // initialize with the primary key value of the first record
     dynamic minPk = nonEmptyRecords.first[request.primaryKey];
     dynamic maxPk = minPk;
-    
+
     // iterate through all records to find the minimum and maximum values
     for (final record in nonEmptyRecords) {
       final pk = record[request.primaryKey];
@@ -626,26 +619,23 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
           if (_compareKeyValues(pk, maxPk) > 0) maxPk = pk;
         } catch (compareError) {
           // If comparison fails for a specific record, log and continue
-          Logger.warn(
-            'Failed to compare key values: $compareError, key=$pk', 
-            label: 'analyzePartitionKeyRange'
-          );
+          Logger.warn('Failed to compare key values: $compareError, key=$pk',
+              label: 'analyzePartitionKeyRange');
         }
       }
     }
-    
+
     // Check partition order when existingPartitions is provided
     bool isOrdered = true;
-    if (request.existingPartitions != null && 
-        request.existingPartitions!.isNotEmpty && 
-        minPk != null && 
+    if (request.existingPartitions != null &&
+        request.existingPartitions!.isNotEmpty &&
+        minPk != null &&
         maxPk != null) {
-      
       // 1. Find the existing partition with max index
       PartitionMeta? maxIdxPartition;
       // 2. Find the partition itself for comparing internal ordered
       PartitionMeta? existingPartition;
-      
+
       // Single traversal to find required partitions
       for (var partition in request.existingPartitions!) {
         // Skip empty partition
@@ -654,7 +644,7 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
             partition.maxPrimaryKey == null) {
           continue;
         }
-        
+
         // Find current partition
         if (partition.index == request.partitionIndex) {
           existingPartition = partition;
@@ -665,7 +655,7 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
           maxIdxPartition = partition;
         }
       }
-      
+
       // Check 1: Existing partition internal ordered check
       if (existingPartition != null && existingPartition.totalRecords > 0) {
         // If new data range is completely separated from existing range, mark as non-ordered
@@ -674,9 +664,10 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
           isOrdered = false;
         }
       }
-      
+
       // Check 2: Relation with max index partition
-      if (maxIdxPartition != null && maxIdxPartition.index != request.partitionIndex) {
+      if (maxIdxPartition != null &&
+          maxIdxPartition.index != request.partitionIndex) {
         // If current partition index is greater than max index partition
         if (request.partitionIndex > maxIdxPartition.index) {
           if (_compareKeyValues(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
@@ -691,7 +682,7 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
         }
       }
     }
-    
+
     return PartitionRangeAnalysisResult(
       minPk: minPk,
       maxPk: maxPk,
@@ -699,7 +690,8 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       isOrdered: isOrdered,
     );
   } catch (e) {
-    Logger.error('Failed to analyze partition key range: $e', label: 'analyzePartitionKeyRange');
+    Logger.error('Failed to analyze partition key range: $e',
+        label: 'analyzePartitionKeyRange');
     // Return a valid result with just the record count
     return PartitionRangeAnalysisResult(
       recordCount: request.records.where((r) => r.isNotEmpty).length,
@@ -717,16 +709,16 @@ int _compareKeyValues(dynamic a, dynamic b) {
 class PartitionAssignmentRequest {
   /// The records to assign
   final List<Map<String, dynamic>> records;
-  
+
   /// The partition size limit (bytes)
   final int partitionSizeLimit;
-  
+
   /// The current partition index
   final int currentPartitionIndex;
-  
+
   /// The current partition used size
   final int currentPartitionSize;
-  
+
   PartitionAssignmentRequest({
     required this.records,
     required this.partitionSizeLimit,
@@ -739,13 +731,13 @@ class PartitionAssignmentRequest {
 class PartitionAssignmentResult {
   /// The records assigned to partitions, Map<partition index, record list>
   final Map<int, List<Map<String, dynamic>>> partitionRecords;
-  
+
   /// The estimated total data size
   final int estimatedTotalSize;
-  
+
   /// The average record size
   final double averageRecordSize;
-  
+
   PartitionAssignmentResult({
     required this.partitionRecords,
     required this.estimatedTotalSize,
@@ -765,11 +757,11 @@ Future<PartitionAssignmentResult> assignRecordsToPartitions(
     int currentPartitionSize = request.currentPartitionSize;
     final partitionSizeLimit = request.partitionSizeLimit;
     final records = request.records;
-    
+
     // estimate average record size
     int totalDataSize = 0;
     double averageRecordSize = 0;
-    
+
     if (records.isNotEmpty) {
       try {
         // sample at most 10 records to calculate average size
@@ -779,28 +771,25 @@ Future<PartitionAssignmentResult> assignRecordsToPartitions(
             totalDataSize += jsonEncode(records[i]).length;
           } catch (jsonError) {
             Logger.warn(
-              'Failed to encode record for size estimation: $jsonError', 
-              label: 'assignRecordsToPartitions'
-            );
+                'Failed to encode record for size estimation: $jsonError',
+                label: 'assignRecordsToPartitions');
             // Use a reasonable default size estimate
             totalDataSize += 100;
           }
         }
         averageRecordSize = totalDataSize / sampleSize;
-        
+
         // estimate total data size
         totalDataSize = (averageRecordSize * records.length).toInt();
       } catch (estimationError) {
-        Logger.warn(
-          'Failed to estimate record sizes: $estimationError', 
-          label: 'assignRecordsToPartitions'
-        );
+        Logger.warn('Failed to estimate record sizes: $estimationError',
+            label: 'assignRecordsToPartitions');
         // Use reasonable defaults
         averageRecordSize = 100.0;
         totalDataSize = 100 * records.length;
       }
     }
-    
+
     // process records in order, assign all records to partitions
     for (var record in records) {
       int recordSize;
@@ -808,66 +797,70 @@ Future<PartitionAssignmentResult> assignRecordsToPartitions(
         // calculate record size
         recordSize = jsonEncode(record).length;
       } catch (sizeError) {
-        Logger.warn(
-          'Failed to calculate record size: $sizeError', 
-          label: 'assignRecordsToPartitions'
-        );
+        Logger.warn('Failed to calculate record size: $sizeError',
+            label: 'assignRecordsToPartitions');
         // Use average size as fallback
         recordSize = averageRecordSize.toInt();
       }
-      
+
       // if current partition is full, create new partition
       if (currentPartitionSize + recordSize > partitionSizeLimit) {
         currentPartitionIndex++; // create new partition
         currentPartitionSize = 0; // reset partition size
       }
-      
+
       // update partition size
       currentPartitionSize += recordSize;
-      
+
       // add record to corresponding partition
       if (!result.containsKey(currentPartitionIndex)) {
         result[currentPartitionIndex] = [];
       }
       result[currentPartitionIndex]!.add(record);
     }
-    
+
     return PartitionAssignmentResult(
       partitionRecords: result,
       estimatedTotalSize: totalDataSize,
       averageRecordSize: averageRecordSize,
     );
   } catch (e) {
-    Logger.error('Failed to assign records to partitions: $e', label: 'assignRecordsToPartitions');
-    
+    Logger.error('Failed to assign records to partitions: $e',
+        label: 'assignRecordsToPartitions');
+
     // Return fallback result instead of throwing exception
     // Put all records in a single partition
     final fallbackResult = <int, List<Map<String, dynamic>>>{};
     fallbackResult[request.currentPartitionIndex] = List.from(request.records);
-    
+
     return PartitionAssignmentResult(
       partitionRecords: fallbackResult,
       estimatedTotalSize: 0,
       averageRecordSize: 0.0,
     );
   }
-} 
+}
 
 /// Table similarity calculation request
 class TableSimilarityRequest {
   /// Old table schema
   final TableSchema oldSchema;
+
   /// New table schema
   final TableSchema newSchema;
+
   /// Old table index
   final int oldTableIndex;
+
   /// New table index
   final int newTableIndex;
+
   /// Old table count
   final int oldTablesCount;
+
   /// New table count
   final int newTablesCount;
-  
+
   TableSimilarityRequest({
     required this.oldSchema,
     required this.newSchema,
@@ -882,11 +875,13 @@ class TableSimilarityRequest {
 class TableSimilarityResult {
   /// Old table name
   final String oldTableName;
+
   /// New table schema
   final TableSchema newSchema;
+
   /// Similarity (0-1)
   final double similarity;
-  
+
   TableSimilarityResult({
     required this.oldTableName,
     required this.newSchema,
@@ -898,7 +893,7 @@ class TableSimilarityResult {
 class BatchTableSimilarityRequest {
   /// List of similarity requests to process
   final List<TableSimilarityRequest> requests;
-  
+
   BatchTableSimilarityRequest({
     required this.requests,
   });
@@ -908,7 +903,7 @@ class BatchTableSimilarityRequest {
 class BatchTableSimilarityResult {
   /// List of similarity results
   final List<TableSimilarityResult> results;
-  
+
   BatchTableSimilarityResult({
     required this.results,
   });
@@ -918,21 +913,28 @@ class BatchTableSimilarityResult {
 class FieldSimilarityRequest {
   /// Old field
   final FieldSchema oldField;
+
   /// New field
   final FieldSchema newField;
+
   /// Old field index
   final int oldFieldIndex;
+
   /// New field index
   final int newFieldIndex;
+
   /// Old table field count
   final int oldFieldsCount;
+
   /// New table field count
   final int newFieldsCount;
+
   /// Old table schema
   final TableSchema oldSchema;
+
   /// New table schema
   final TableSchema newSchema;
-  
+
   FieldSimilarityRequest({
     required this.oldField,
     required this.newField,
@@ -949,11 +951,13 @@ class FieldSimilarityRequest {
 class FieldSimilarityResult {
   /// Old field name
   final String oldFieldName;
+
   /// New field
   final FieldSchema newField;
+
   /// Similarity (0-1)
   final double similarity;
-  
+
   FieldSimilarityResult({
     required this.oldFieldName,
     required this.newField,
@@ -965,7 +969,7 @@ class FieldSimilarityResult {
 class BatchFieldSimilarityRequest {
   /// List of similarity requests to process
   final List<FieldSimilarityRequest> requests;
-  
+
   BatchFieldSimilarityRequest({
     required this.requests,
   });
@@ -975,21 +979,23 @@ class BatchFieldSimilarityRequest {
 class BatchFieldSimilarityResult {
   /// List of similarity results
   final List<FieldSimilarityResult> results;
-  
+
   BatchFieldSimilarityResult({
     required this.results,
   });
 }
 
 /// Calculate similarity between two tables
-Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest request) async {
+Future<TableSimilarityResult> calculateTableSimilarity(
+    TableSimilarityRequest request) async {
   double score = 0.0;
   double totalWeight = 0.0;
 
   // 1. First check table name similarity (medium weight)
   const nameWeight = 10.0;
   totalWeight += nameWeight;
-  double nameScore = _calculateNameSimilarity(request.oldSchema.name, request.newSchema.name);
+  double nameScore =
+      _calculateNameSimilarity(request.oldSchema.name, request.newSchema.name);
   score += nameWeight * nameScore;
 
   // 2. Check primary key (high weight)
@@ -1023,8 +1029,10 @@ Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest re
   } else {
     // Check common field count
     int matchingFields = 0;
-    Set<String> oldFieldNames = request.oldSchema.fields.map((f) => f.name).toSet();
-    Set<String> newFieldNames = request.newSchema.fields.map((f) => f.name).toSet();
+    Set<String> oldFieldNames =
+        request.oldSchema.fields.map((f) => f.name).toSet();
+    Set<String> newFieldNames =
+        request.newSchema.fields.map((f) => f.name).toSet();
 
     // Calculate common field count
     for (final name in oldFieldNames) {
@@ -1034,11 +1042,10 @@ Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest re
     }
 
     // Calculate field match rate
-    final matchingFieldsRatio =
-        request.oldSchema.fields.isEmpty || request.newSchema.fields.isEmpty
-            ? 0.0
-            : (2 * matchingFields) /
-                (oldFieldNames.length + newFieldNames.length);
+    final matchingFieldsRatio = request.oldSchema.fields.isEmpty ||
+            request.newSchema.fields.isEmpty
+        ? 0.0
+        : (2 * matchingFields) / (oldFieldNames.length + newFieldNames.length);
 
     fieldsScore = matchingFieldsRatio;
   }
@@ -1053,7 +1060,8 @@ Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest re
   if (request.oldSchema.indexes.isEmpty && request.newSchema.indexes.isEmpty) {
     // Both have no indexes, perfect match
     indexScore = 1.0;
-  } else if (request.oldSchema.indexes.isEmpty || request.newSchema.indexes.isEmpty) {
+  } else if (request.oldSchema.indexes.isEmpty ||
+      request.newSchema.indexes.isEmpty) {
     // One has index, one doesn't, not a good match
     indexScore = 0.1;
   } else {
@@ -1070,9 +1078,9 @@ Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest re
     }
 
     // Calculate index match rate
-    final totalIndexes = request.oldSchema.indexes.length + request.newSchema.indexes.length;
-    indexScore =
-        totalIndexes > 0 ? (2 * matchingIndexes) / totalIndexes : 0.0;
+    final totalIndexes =
+        request.oldSchema.indexes.length + request.newSchema.indexes.length;
+    indexScore = totalIndexes > 0 ? (2 * matchingIndexes) / totalIndexes : 0.0;
   }
 
   score += indexWeight * indexScore;
@@ -1107,17 +1115,18 @@ Future<TableSimilarityResult> calculateTableSimilarity(TableSimilarityRequest re
 Future<BatchTableSimilarityResult> calculateBatchTableSimilarity(
     BatchTableSimilarityRequest request) async {
   final results = <TableSimilarityResult>[];
-  
+
   for (final req in request.requests) {
     final result = await calculateTableSimilarity(req);
     results.add(result);
   }
-  
+
   return BatchTableSimilarityResult(results: results);
 }
 
 /// Calculate similarity between two fields
-Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest request) async {
+Future<FieldSimilarityResult> calculateFieldSimilarity(
+    FieldSimilarityRequest request) async {
   double score = 0.0;
   double totalWeight = 0.0;
 
@@ -1134,14 +1143,16 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
   // 2. Default value matching (if not basic empty value)
   const defaultValueWeight = 15.0;
   totalWeight += defaultValueWeight;
-  if (request.oldField.defaultValue != null && request.newField.defaultValue != null) {
+  if (request.oldField.defaultValue != null &&
+      request.newField.defaultValue != null) {
     if (request.oldField.defaultValue == request.newField.defaultValue) {
       score += defaultValueWeight;
     } else {
       // Default value mismatch is a strong negative signal
       score -= defaultValueWeight * 0.5;
     }
-  } else if (request.oldField.defaultValue == null && request.newField.defaultValue == null) {
+  } else if (request.oldField.defaultValue == null &&
+      request.newField.defaultValue == null) {
     // Both are empty, also considered partial match
     score += defaultValueWeight * 0.5;
   }
@@ -1176,7 +1187,7 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
   if (request.oldField.unique == request.newField.unique) {
     score += uniqueWeight;
   } else {
-      // Unique mismatch is a negative signal
+    // Unique mismatch is a negative signal
     score -= uniqueWeight * 0.3;
   }
 
@@ -1186,7 +1197,8 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
   double constraintsMatched = 0;
 
   // maxLength check
-  if (request.oldField.maxLength != null || request.newField.maxLength != null) {
+  if (request.oldField.maxLength != null ||
+      request.newField.maxLength != null) {
     constraintsChecked++;
     if (request.oldField.maxLength == request.newField.maxLength) {
       constraintsMatched++;
@@ -1194,7 +1206,8 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
   }
 
   // minLength check
-  if (request.oldField.minLength != null || request.newField.minLength != null) {
+  if (request.oldField.minLength != null ||
+      request.newField.minLength != null) {
     constraintsChecked++;
     if (request.oldField.minLength == request.newField.minLength) {
       constraintsMatched++;
@@ -1246,13 +1259,16 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
   totalWeight += nameWeight;
 
   // Field name string similarity
-  double nameScore = _calculateNameSimilarity(request.oldField.name, request.newField.name);
+  double nameScore =
+      _calculateNameSimilarity(request.oldField.name, request.newField.name);
   score += nameWeight * nameScore;
 
-    // 8. Index position check
+  // 8. Index position check
   const indexWeight = 5.0;
-  bool oldFieldInIndex = _isFieldInIndex(request.oldField.name, request.oldSchema.indexes);
-  bool newFieldInIndex = _isFieldInIndex(request.newField.name, request.newSchema.indexes);
+  bool oldFieldInIndex =
+      _isFieldInIndex(request.oldField.name, request.oldSchema.indexes);
+  bool newFieldInIndex =
+      _isFieldInIndex(request.newField.name, request.newSchema.indexes);
 
   if (oldFieldInIndex && newFieldInIndex) {
     totalWeight += indexWeight;
@@ -1272,7 +1288,7 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
 
   // Calculate final percentage score (0-1)
   double finalScore = totalWeight > 0 ? score / totalWeight : 0.0;
-  
+
   return FieldSimilarityResult(
     oldFieldName: request.oldField.name,
     newField: request.newField,
@@ -1284,12 +1300,12 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(FieldSimilarityRequest re
 Future<BatchFieldSimilarityResult> calculateBatchFieldSimilarity(
     BatchFieldSimilarityRequest request) async {
   final results = <FieldSimilarityResult>[];
-  
+
   for (final req in request.requests) {
     final result = await calculateFieldSimilarity(req);
     results.add(result);
   }
-  
+
   return BatchFieldSimilarityResult(results: results);
 }
 
@@ -1330,8 +1346,8 @@ double _calculateNameSimilarity(String oldName, String newName) {
   }
 
   // 3. Calculate longest common subsequence
-  int lcsLength = _getLongestCommonSubsequenceLength(
-      oldNameNormalized, newNameNormalized);
+  int lcsLength =
+      _getLongestCommonSubsequenceLength(oldNameNormalized, newNameNormalized);
   int maxLength = oldNameNormalized.length > newNameNormalized.length
       ? oldNameNormalized.length
       : newNameNormalized.length;
@@ -1381,11 +1397,13 @@ int _getLongestCommonSubsequenceLength(String a, String b) {
 class MigrationRecordProcessRequest {
   /// Records to migrate
   final List<Map<String, dynamic>> records;
+
   /// Table operations
   final List<MigrationOperation> operations;
+
   /// Old table schema (optional)
   final TableSchema? oldSchema;
-  
+
   MigrationRecordProcessRequest({
     required this.records,
     required this.operations,
@@ -1397,11 +1415,13 @@ class MigrationRecordProcessRequest {
 class MigrationRecordProcessResult {
   /// Processed records
   final List<Map<String, dynamic>> migratedRecords;
+
   /// Processing result status
   final bool success;
+
   /// Error message (if any)
   final String? errorMessage;
-  
+
   MigrationRecordProcessResult({
     required this.migratedRecords,
     this.success = true,
@@ -1419,10 +1439,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
         success: true,
       );
     }
-    
+
     var modifiedRecords = List<Map<String, dynamic>>.from(request.records);
-    
-      // Use sorted operations, no need to reorder
+
+    // Use sorted operations, no need to reorder
     for (var operation in request.operations) {
       switch (operation.type) {
         case MigrationType.addField:
@@ -1518,13 +1538,14 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
           break;
       }
     }
-    
+
     return MigrationRecordProcessResult(
       migratedRecords: modifiedRecords,
       success: true,
     );
   } catch (e) {
-    Logger.error('Failed to process migration records: $e', label: 'processMigrationRecords');
+    Logger.error('Failed to process migration records: $e',
+        label: 'processMigrationRecords');
     return MigrationRecordProcessResult(
       migratedRecords: request.records,
       success: false,
@@ -1648,4 +1669,345 @@ Map<String, dynamic> _applyFieldModification(
   }
 
   return record;
-} 
+}
+
+/// Time-based ID generation request (for isolate)
+class TimeBasedIdGenerateRequest {
+  /// ID type
+  final PrimaryKeyType keyType;
+
+  /// Node configuration
+  final DistributedNodeConfig nodeConfig;
+
+  /// Table name
+  final String tableName;
+
+  /// Generation count
+  final int count;
+
+  /// Start time or date value
+  final dynamic startValue;
+
+  /// Start sequence number
+  final int startSequence;
+
+  /// Whether to use new timestamp
+  final bool useNewTimestamp;
+
+  /// Whether to use random step
+  final bool useRandomStep;
+
+  /// 高生成模式
+  final bool isHighGeneration;
+
+  TimeBasedIdGenerateRequest({
+    required this.keyType,
+    required this.nodeConfig,
+    required this.tableName,
+    required this.count,
+    required this.startValue,
+    required this.startSequence,
+    this.useNewTimestamp = false,
+    this.useRandomStep = false,
+    this.isHighGeneration = false,
+  });
+}
+
+/// Time-based ID generation result (isolate return)
+class TimeBasedIdGenerateResult {
+  /// List of generated IDs
+  final List<String> ids;
+
+  /// Latest time value
+  final dynamic lastValue;
+
+  /// Latest sequence number
+  final int lastSequence;
+
+  /// Whether generation is successful
+  final bool success;
+
+  /// Error message
+  final String? errorMessage;
+
+  TimeBasedIdGenerateResult({
+    required this.ids,
+    required this.lastValue,
+    required this.lastSequence,
+    this.success = true,
+    this.errorMessage,
+  });
+}
+
+/// Base62 encoder copied to avoid class reference issues in isolate
+class _IsolateBase62Encoder {
+  static const String _charset =
+      '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+  /// Encode BigInt to Base62 string
+  static String encode(BigInt value) {
+    if (value < BigInt.zero) {
+      throw ArgumentError('Base62 encoding does not support negative numbers');
+    }
+    if (value == BigInt.zero) {
+      return '0';
+    }
+
+    String result = '';
+    BigInt base = BigInt.from(62);
+    BigInt remainder;
+
+    while (value > BigInt.zero) {
+      remainder = value % base;
+      value = value ~/ base;
+      result = _charset[remainder.toInt()] + result;
+    }
+
+    return result;
+  }
+}
+
+/// Generate timestamp or date prefixed ID in isolate
+Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
+    TimeBasedIdGenerateRequest request) async {
+  try {
+    // Create new random number seed for Random
+    final random = Random(DateTime.now().millisecondsSinceEpoch);
+
+    // Initialize basic parameters
+    final List<String> result = [];
+    final List<BigInt> numericIds = [];
+
+    // Set current state
+    dynamic currentValue = request.startValue;
+    int sequence = request.startSequence;
+    dynamic workingValue = currentValue;
+
+    // Create necessary constants and caches
+    const int maxSequence = 99999; // Sequence number limit
+    const int epochStartSeconds = 441763200; // Timestamp start point
+
+    // Calculate nodeId digits
+    int nodeIdDigits = 1;
+    if (request.nodeConfig.nodeId > 0) {
+      int temp = request.nodeConfig.nodeId;
+      nodeIdDigits = 0;
+      while (temp > 0) {
+        temp ~/= 10;
+        nodeIdDigits++;
+      }
+    }
+
+    // Precompute commonly used BigInt values
+    final sequenceFactor = BigInt.from(100000); // 10^5
+    BigInt powerFactor;
+    BigInt? nodeIdBig;
+
+    if (request.nodeConfig.enableDistributed) {
+      powerFactor = BigInt.from(10).pow(nodeIdDigits + 5);
+      final nodeId =
+          request.nodeConfig.nodeId > 0 ? request.nodeConfig.nodeId : 1;
+      nodeIdBig = BigInt.from(nodeId);
+    } else {
+      powerFactor = sequenceFactor; // Use 10^5 in non-distributed mode
+      nodeIdBig = BigInt.from(1);
+    }
+
+    // Select different generation logic based on ID type
+    if (request.keyType == PrimaryKeyType.timestampBased ||
+        request.keyType == PrimaryKeyType.shortCode) {
+      // Timestamp ID generation or short code ID generation
+
+      // Efficient generation strategy: generate all IDs in order when sequence number space is sufficient
+      if (request.isHighGeneration && sequence + request.count <= maxSequence) {
+        // Efficient batch generation method
+        for (int i = 0; i < request.count; i++) {
+          sequence += 1;
+
+          // Calculate timestamp ID
+          final BigInt timestampBig = BigInt.from(workingValue);
+          final BigInt sequenceBig = BigInt.from(sequence);
+
+          BigInt idValue;
+          if (request.nodeConfig.enableDistributed) {
+            // Algorithm with node ID: timestamp * 10^(nodeIdDigits+5) + nodeId * 10^5 + sequence
+            idValue = timestampBig * powerFactor +
+                nodeIdBig * sequenceFactor +
+                sequenceBig;
+          } else {
+            // Simplified algorithm: timestamp * 10^5 + sequence
+            idValue = timestampBig * sequenceFactor + sequenceBig;
+          }
+
+          numericIds.add(idValue);
+        }
+      } else {
+        // Regular generation method: consider step and sequence number limit
+        int step = 1;
+        if (!request.isHighGeneration) {
+          // Calculate average step
+          step = maxSequence ~/ max(request.count, 100);
+        } else if (request.useNewTimestamp) {
+          // If new timestamp is used, reset sequence number
+          sequence = random.nextInt(1000) + 1;
+        }
+
+        // Generate ID
+        for (int i = 0; i < request.count; i++) {
+          // Increase sequence number
+          sequence +=
+              request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
+
+          // Check if sequence number exceeds limit
+          if (sequence > maxSequence) {
+            // Sequence number insufficient, wait for next timestamp
+            workingValue = (DateTime.now().millisecondsSinceEpoch ~/ 1000) -
+                epochStartSeconds;
+            sequence = random.nextInt(1000) + 1;
+          }
+
+          // Calculate ID
+          final BigInt timestampBig = BigInt.from(workingValue);
+          final BigInt sequenceBig = BigInt.from(sequence);
+
+          BigInt idValue;
+          if (request.nodeConfig.enableDistributed) {
+            // Algorithm with node ID
+            idValue = timestampBig * powerFactor +
+                nodeIdBig * sequenceFactor +
+                sequenceBig;
+          } else {
+            // Simplified algorithm
+            idValue = timestampBig * sequenceFactor + sequenceBig;
+          }
+
+          numericIds.add(idValue);
+        }
+      }
+    } else if (request.keyType == PrimaryKeyType.datePrefixed) {
+      // Date prefixed ID generation logic
+      String dateString = workingValue as String;
+
+      // Efficient generation strategy
+      if (request.isHighGeneration && sequence + request.count <= maxSequence) {
+        // Efficient batch generation method
+        for (int i = 0; i < request.count; i++) {
+          sequence += 1;
+
+          // Calculate date prefixed ID
+          BigInt dateValue;
+          try {
+            dateValue = BigInt.parse(dateString);
+          } catch (e) {
+            // Use timestamp as fallback
+            dateValue = BigInt.from(
+                (DateTime.now().millisecondsSinceEpoch ~/ 1000) % 10000000000);
+          }
+
+          final BigInt sequenceBig = BigInt.from(sequence);
+          BigInt idValue;
+
+          if (request.nodeConfig.enableDistributed) {
+            // Algorithm with node ID
+            idValue = dateValue * powerFactor +
+                nodeIdBig * sequenceFactor +
+                sequenceBig;
+          } else {
+            // Simplified algorithm
+            idValue = dateValue * sequenceFactor + sequenceBig;
+          }
+
+          numericIds.add(idValue);
+        }
+      } else {
+        // Regular generation method
+        int step = 1;
+        if (!request.isHighGeneration) {
+          // Calculate average step
+          step = maxSequence ~/ max(request.count, 100);
+        } else if (request.useNewTimestamp) {
+          // If new date is used, reset sequence number
+          sequence = random.nextInt(1000) + 1;
+        }
+
+        // Generate ID
+        for (int i = 0; i < request.count; i++) {
+          // Increase sequence number
+          sequence +=
+              request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
+
+          // Check if sequence number exceeds limit
+          if (sequence > maxSequence) {
+            // Sequence number insufficient, use current date
+            final now = DateTime.now();
+            dateString = '${now.year}'
+                '${now.month.toString().padLeft(2, '0')}'
+                '${now.day.toString().padLeft(2, '0')}'
+                '${now.hour.toString().padLeft(2, '0')}'
+                '${now.minute.toString().padLeft(2, '0')}'
+                '${now.second.toString().padLeft(2, '0')}';
+            sequence = random.nextInt(1000) + 1;
+          }
+
+          // Calculate ID
+          BigInt dateValue;
+          try {
+            dateValue = BigInt.parse(dateString);
+          } catch (e) {
+            // Use timestamp as fallback
+            dateValue = BigInt.from(
+                (DateTime.now().millisecondsSinceEpoch ~/ 1000) % 10000000000);
+          }
+
+          final BigInt sequenceBig = BigInt.from(sequence);
+          BigInt idValue;
+
+          if (request.nodeConfig.enableDistributed) {
+            // Algorithm with node ID
+            idValue = dateValue * powerFactor +
+                nodeIdBig * sequenceFactor +
+                sequenceBig;
+          } else {
+            // Simplified algorithm
+            idValue = dateValue * sequenceFactor + sequenceBig;
+          }
+
+          numericIds.add(idValue);
+        }
+      }
+
+      // Update current value
+      currentValue = dateString;
+    }
+
+    // Format ID (based on ID type)
+    if (request.keyType == PrimaryKeyType.shortCode) {
+      // Short code ID needs Base62 encoding
+      for (final numericId in numericIds) {
+        result.add(_IsolateBase62Encoder.encode(numericId));
+      }
+    } else {
+      // Timestamp ID and date prefixed ID directly converted to string
+      for (final numericId in numericIds) {
+        result.add(numericId.toString());
+      }
+    }
+
+    // Return generation result
+    return TimeBasedIdGenerateResult(
+      ids: result,
+      lastValue: currentValue,
+      lastSequence: sequence,
+      success: true,
+    );
+  } catch (e) {
+    // Record error and return empty result
+    return TimeBasedIdGenerateResult(
+      ids: [],
+      lastValue: request.startValue,
+      lastSequence: request.startSequence,
+      success: false,
+      errorMessage: 'ID generation failed: $e',
+    );
+  }
+}

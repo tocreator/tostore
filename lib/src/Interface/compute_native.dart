@@ -50,4 +50,4 @@ Future<R> compute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
   });
 
   return completer.future;
-} 
+}
