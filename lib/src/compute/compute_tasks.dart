@@ -339,11 +339,15 @@ class DecodePartitionRequest {
 
   /// Optional encryption key ID
   final int? encryptionKeyId;
+  
+  /// Optional encoder state for isolate execution
+  final Map<String, dynamic>? encoderState;
 
   DecodePartitionRequest({
     required this.bytes,
     this.encryptionKey,
     this.encryptionKeyId,
+    this.encoderState,
   });
 }
 
@@ -378,6 +382,9 @@ class EncodePartitionRequest {
 
   /// Optional encryption key ID
   final int? encryptionKeyId;
+  
+  /// Optional encoder state for isolate execution
+  final Map<String, dynamic>? encoderState;
 
   EncodePartitionRequest({
     required this.records,
@@ -390,6 +397,7 @@ class EncodePartitionRequest {
     required this.timestamps,
     this.encryptionKey,
     this.encryptionKeyId,
+    this.encoderState,
   });
 }
 
@@ -462,6 +470,14 @@ class PartitionRangeAnalysisResult {
 Future<List<Map<String, dynamic>>> decodePartitionData(
     DecodePartitionRequest request) async {
   try {
+    // if encoder state is provided, apply it
+    // ONLY apply encoder state if no specific encryption key/keyId is provided
+    if (request.encoderState != null && 
+        request.encryptionKey == null && 
+        request.encryptionKeyId == null) {
+      EncoderHandler.setEncodingState(request.encoderState!);
+    }
+    
     // decode data
     final decodedString = await EncoderHandler.decode(
       request.bytes,
@@ -501,6 +517,14 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
 Future<EncodedPartitionResult> encodePartitionData(
     EncodePartitionRequest request) async {
   try {
+    // if encoder state is provided, apply it
+    // ONLY apply encoder state if no specific encryption key/keyId is provided
+    if (request.encoderState != null && 
+        request.encryptionKey == null && 
+        request.encryptionKeyId == null) {
+      EncoderHandler.setEncodingState(request.encoderState!);
+    }
+    
     // count non-empty records
     final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
 

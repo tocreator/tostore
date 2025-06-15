@@ -389,4 +389,33 @@ class EncoderHandler {
     // if no match found, return the original string
     return encoded;
   }
+
+  /// Get key ID
+  static int getCurrentKeyId() {
+    return _currentKeyId;
+  }
+
+  /// Get current complete encoding state, for isolate thread passing
+  static Map<String, dynamic> getCurrentEncodingState() {
+    return {
+      'enableEncoding': _enableEncoding,
+      'enableObfuscation': _enableObfuscation,
+      'activeKey': List<int>.from(_activeKey),
+      'keyId': _currentKeyId,
+    };
+  }
+
+  /// set complete encoding state, for isolate thread passing
+  static void setEncodingState(Map<String, dynamic> state) {
+    if (state['enableEncoding'] != null) _enableEncoding = state['enableEncoding'];
+    if (state['enableObfuscation'] != null) _enableObfuscation = state['enableObfuscation'];
+    if (state['activeKey'] != null) _activeKey = List<int>.from(state['activeKey']);
+    if (state['keyId'] != null) _currentKeyId = state['keyId'];
+  }
+
+  /// Check if encoding is enabled
+  static bool get isEncodingEnabled => _enableEncoding;
+
+  /// Check if obfuscation is enabled
+  static bool get isObfuscationEnabled => _enableObfuscation;
 }

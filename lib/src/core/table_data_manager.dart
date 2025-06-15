@@ -1419,6 +1419,9 @@ class TableDataManager {
           ),
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
+          // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
+          encoderState: (encryptionKey == null && encryptionKeyId == null) ? 
+              EncoderHandler.getCurrentEncodingState() : null,
         ),
         useIsolate: records.length > 100
       );
@@ -2579,6 +2582,9 @@ class TableDataManager {
             bytes: bytes,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
+            // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
+            encoderState: (encryptionKey == null && encryptionKeyId == null) ? 
+                EncoderHandler.getCurrentEncodingState() : null,
           ),
           useIsolate: bytes.length > 10 * 1024  // only use isolate if data size is larger than 10KB
         );
