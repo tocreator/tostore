@@ -390,7 +390,7 @@ class IndexManager {
             // Run CPU-intensive operations in isolate
             // Only use isolate if the content is large enough to justify the overhead
             final useIsolate =
-                content.length > 10 * 1024 || localKeysToProcess.length > 1000;
+                content.length > 500 * 1024 || localKeysToProcess.length > 1000;
             final result = await ComputeManager.run(processIndexDelete, request,
                 useIsolate: useIsolate);
 
@@ -643,7 +643,8 @@ class IndexManager {
                       );
                       return await ComputeManager.run(
                           processIndexPartition, request,
-                          useIsolate: job.entries.length > 2);
+                          useIsolate:
+                              (job.existingContent?.length ?? 0) > 500 * 1024);
                     } catch (e, stack) {
                       Logger.error(
                           'Error preparing or running compute job for partition ${job.partitionIndex}: $e\n$stack',
@@ -2641,11 +2642,6 @@ class IndexManager {
         );
         actualName = indexName;
       } else {
-        // if only fields list is provided but no matching index is found, cannot continue
-        Logger.warn(
-          'no index found for fields [${fields!.join(", ")}]',
-          label: 'IndexManager.removeIndex',
-        );
         return;
       }
 

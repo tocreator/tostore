@@ -358,29 +358,29 @@ class MigrationManager {
     try {
       // Similarity threshold, above which tables are considered the same
       const similarityThreshold = 0.75;
-      
-      
+
       // prepare parallel calculation requests
       final similarityRequests = <TableSimilarityRequest>[];
       final existingSchemasMap = <String, TableSchema>{};
-      
+
       // get all old table schemas
       for (final existingTableName in existingTables) {
-        final existingSchema = await _dataStore.getTableSchema(existingTableName);
+        final existingSchema =
+            await _dataStore.getTableSchema(existingTableName);
         if (existingSchema == null) continue;
         existingSchemasMap[existingTableName] = existingSchema;
       }
-      
+
       // build all similarity requests
       for (final existingTableName in existingSchemasMap.keys) {
         final existingSchema = existingSchemasMap[existingTableName]!;
-        
+
         for (final newSchema in newSchemas) {
           // skip tables with the same name, these should not be identified as renamed tables
           if (existingTableName == newSchema.name) {
             continue;
           }
-          
+
           similarityRequests.add(TableSimilarityRequest(
             oldSchema: existingSchema,
             newSchema: newSchema,
@@ -391,64 +391,64 @@ class MigrationManager {
           ));
         }
       }
-      
+
       // if no requests to process, return
       if (similarityRequests.isEmpty) {
         return;
       }
-      
+
       // max concurrent
       final maxConcurrent = _dataStore.config.maxConcurrent;
-      
+
       // batch processing requests
       final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
       final batches = <List<TableSimilarityRequest>>[];
-      
+
       for (int i = 0; i < similarityRequests.length; i += batchSize) {
         final end = min(i + batchSize, similarityRequests.length);
         batches.add(similarityRequests.sublist(i, end));
       }
-      
+
       // parallel processing all batches
-      final batchResults = await Future.wait(batches.map((batch) => 
-        ComputeManager.run(calculateBatchTableSimilarity, 
-            BatchTableSimilarityRequest(requests: batch),useIsolate: similarityRequests.length > 2)
-      ));
-      
+      final batchResults = await Future.wait(batches.map((batch) =>
+          ComputeManager.run(calculateBatchTableSimilarity,
+              BatchTableSimilarityRequest(requests: batch),
+              useIsolate: similarityRequests.length > 20)));
+
       // merge all results
       final allResults = <TableSimilarityResult>[];
       for (final batchResult in batchResults) {
         allResults.addAll(batchResult.results);
       }
-      
+
       // sort results by similarity
       allResults.sort((a, b) => b.similarity.compareTo(a.similarity));
-      
+
       // greedy matching algorithm
       final processedOldTables = <String>{};
       final processedNewSchemas = <TableSchema>{};
-      
+
       for (final result in allResults) {
         // if table is already processed, skip
-        if (processedOldTables.contains(result.oldTableName) || 
+        if (processedOldTables.contains(result.oldTableName) ||
             processedNewSchemas.contains(result.newSchema)) {
           continue;
         }
-        
+
         // if best match is above threshold, consider as renamed table
         if (result.similarity >= similarityThreshold) {
           // additional check: even with high similarity, tables with the same name should not be considered renamed
           if (result.oldTableName == result.newSchema.name) {
             continue;
           }
-          
+
           // add to renamed results
           renamedTables[result.oldTableName] = result.newSchema;
-          
+
           // record processed tables
           processedOldTables.add(result.oldTableName);
           processedNewSchemas.add(result.newSchema);
-          
+
           // remove from remaining lists
           existingTables.remove(result.oldTableName);
           newSchemas.remove(result.newSchema);
@@ -464,7 +464,6 @@ class MigrationManager {
       );
     }
   }
-
 
   /// Migrate existing table schema
   Future<MigrationTask?> _migrateExistingTable(TableSchema newSchema,
@@ -992,7 +991,6 @@ class MigrationManager {
     addedFields.removeWhere((field) => matchedAddedFields.contains(field));
   }
 
-
   /// parallel way to detect renamed fields
   Future<void> _detectRenamedFieldsBySimilarityParallel(
     TableSchema oldSchema,
@@ -1003,10 +1001,10 @@ class MigrationManager {
   ) async {
     // field similarity threshold, only fields with score above this value will be considered as renamed
     const similarityThreshold = 0.6;
-    
+
     // prepare parallel calculation requests
     final similarityRequests = <FieldSimilarityRequest>[];
-    
+
     // iterate all fields to compare
     for (var oldFieldName in removedFields) {
       // if old field is primary key, skip
@@ -1015,11 +1013,11 @@ class MigrationManager {
       final oldField = oldSchema.fields.firstWhere(
         (f) => f.name == oldFieldName,
       );
-      
+
       for (var newField in addedFields) {
         // if new field is primary key, skip
         if (newSchema.primaryKey == newField.name) continue;
-        
+
         similarityRequests.add(FieldSimilarityRequest(
           oldField: oldField,
           newField: newField,
@@ -1032,50 +1030,50 @@ class MigrationManager {
         ));
       }
     }
-    
+
     // if no requests to process, return
     if (similarityRequests.isEmpty) {
       return;
     }
-    
+
     // max concurrent
     final maxConcurrent = _dataStore.config.maxConcurrent;
-    
+
     // batch processing requests
     final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
     final batches = <List<FieldSimilarityRequest>>[];
-    
+
     for (int i = 0; i < similarityRequests.length; i += batchSize) {
       final end = min(i + batchSize, similarityRequests.length);
       batches.add(similarityRequests.sublist(i, end));
     }
-    
+
     // parallel processing all batches
-    final batchResults = await Future.wait(batches.map((batch) => 
-      ComputeManager.run(calculateBatchFieldSimilarity, 
-          BatchFieldSimilarityRequest(requests: batch),useIsolate: similarityRequests.length > 5)
-    ));
-    
+    final batchResults = await Future.wait(batches.map((batch) =>
+        ComputeManager.run(calculateBatchFieldSimilarity,
+            BatchFieldSimilarityRequest(requests: batch),
+            useIsolate: similarityRequests.length > 100)));
+
     // merge all results
     final allResults = <FieldSimilarityResult>[];
     for (final batchResult in batchResults) {
       allResults.addAll(batchResult.results);
     }
-    
+
     // sort results by similarity
     allResults.sort((a, b) => b.similarity.compareTo(a.similarity));
-    
+
     // greedy matching algorithm
     final processedOldFields = <String>{};
     final processedNewFields = <FieldSchema>{};
-    
+
     for (final result in allResults) {
       // if field is already processed, skip
-      if (processedOldFields.contains(result.oldFieldName) || 
+      if (processedOldFields.contains(result.oldFieldName) ||
           processedNewFields.contains(result.newField)) {
         continue;
       }
-      
+
       // if best match is above threshold, consider as renamed field
       if (result.similarity >= similarityThreshold) {
         // remove existing add and remove operations
@@ -1083,19 +1081,18 @@ class MigrationManager {
             (op.type == MigrationType.removeField &&
                 op.fieldName == result.oldFieldName) ||
             (op.type == MigrationType.addField && op.field == result.newField));
-        
+
         // add rename operation
         operations.add(MigrationOperation(
           type: MigrationType.renameField,
           fieldName: result.oldFieldName,
           newName: result.newField.name,
         ));
-        
-        
+
         // record processed fields
         processedOldFields.add(result.oldFieldName);
         processedNewFields.add(result.newField);
-        
+
         // remove from processing list
         removedFields.remove(result.oldFieldName);
         addedFields.remove(result.newField);
@@ -1105,7 +1102,6 @@ class MigrationManager {
       }
     }
   }
-
 
   /// Check if field is modified
   bool _isFieldModified(FieldSchema oldField, FieldSchema newField) {
@@ -1347,7 +1343,16 @@ class MigrationManager {
             isMigrationInstance: true);
         await migrationInstance.initialize();
 
+        // check if need data migration
+        bool needDataMigration = false;
+
         for (var operation in task.operations) {
+          if (operation.type == MigrationType.addField ||
+              operation.type == MigrationType.modifyField ||
+              operation.type == MigrationType.renameField ||
+              operation.type == MigrationType.removeField) {
+            needDataMigration = true;
+          }
           if (operation.type == MigrationType.addIndex) {
             await migrationInstance.indexManager
                 ?.addIndex(currentTableName, operation.index!);
@@ -1423,23 +1428,25 @@ class MigrationManager {
             label: 'MigrationManager._executeMigrationTask',
           );
         } else {
-          // no rename table operation, directly process data migration
-          await migrationInstance.tableDataManager.processTablePartitions(
-              tableName: currentTableName,
-              processFunction: (records, partitionIndex) async {
-                final migratedRecords = await _applyMigrationOperations(
-                    records, sortedOperations,
-                    oldSchema: oldSchema);
+          if (needDataMigration) {
+            // no rename table operation, directly process data migration
+            await migrationInstance.tableDataManager.processTablePartitions(
+                tableName: currentTableName,
+                processFunction: (records, partitionIndex) async {
+                  final migratedRecords = await _applyMigrationOperations(
+                      records, sortedOperations,
+                      oldSchema: oldSchema);
 
-                // if need cache, collect records
-                if (shouldCache) {
-                  allMigratedRecords.addAll(migratedRecords
-                      .map((r) => Map<String, dynamic>.from(r))
-                      .toList());
-                }
+                  // if need cache, collect records
+                  if (shouldCache) {
+                    allMigratedRecords.addAll(migratedRecords
+                        .map((r) => Map<String, dynamic>.from(r))
+                        .toList());
+                  }
 
-                return migratedRecords;
-              });
+                  return migratedRecords;
+                });
+          }
         }
 
         // if collect records, add to cache
@@ -1506,46 +1513,46 @@ class MigrationManager {
     if (records.isEmpty || operations.isEmpty) {
       return records;
     }
-      // Get max concurrent
-      final maxConcurrent = _dataStore.config.maxConcurrent;
-      
-      // Batch size
-      final int batchSize = (records.length / maxConcurrent).ceil();
-      
-      // Create batches
-      final batches = <List<Map<String, dynamic>>>[];
-      for (int i = 0; i < records.length; i += batchSize) {
-        final end = min(i + batchSize, records.length);
-        batches.add(records.sublist(i, end));
-      }
-      
-      // Parallel processing all batches
-      final batchResults = await Future.wait(batches.map((batch) =>
-        ComputeManager.run(processMigrationRecords,
+    // Get max concurrent
+    final maxConcurrent = _dataStore.config.maxConcurrent;
+
+    // Batch size
+    final int batchSize = (records.length / maxConcurrent).ceil();
+
+    // Create batches
+    final batches = <List<Map<String, dynamic>>>[];
+    for (int i = 0; i < records.length; i += batchSize) {
+      final end = min(i + batchSize, records.length);
+      batches.add(records.sublist(i, end));
+    }
+
+    // Parallel processing all batches
+    final batchResults =
+        await Future.wait(batches.map((batch) => ComputeManager.run(
+            processMigrationRecords,
             MigrationRecordProcessRequest(
               records: batch,
               operations: operations,
               oldSchema: oldSchema,
-            ),useIsolate: records.length > 100)
-      ));
-      
-      // Merge results
-      final allProcessedRecords = <Map<String, dynamic>>[];
-      for (final batchResult in batchResults) {
-        if (batchResult.success) {
-          allProcessedRecords.addAll(batchResult.migratedRecords);
-        } else {
-          Logger.warn(
-            'Batch migration failed: ${batchResult.errorMessage}',
-            label: 'MigrationManager._applyMigrationOperations',
-          );
-          allProcessedRecords.addAll(batchResult.migratedRecords);
-        }
+            ),
+            useIsolate: records.length > 2000)));
+
+    // Merge results
+    final allProcessedRecords = <Map<String, dynamic>>[];
+    for (final batchResult in batchResults) {
+      if (batchResult.success) {
+        allProcessedRecords.addAll(batchResult.migratedRecords);
+      } else {
+        Logger.warn(
+          'Batch migration failed: ${batchResult.errorMessage}',
+          label: 'MigrationManager._applyMigrationOperations',
+        );
+        allProcessedRecords.addAll(batchResult.migratedRecords);
       }
-      
-      return allProcessedRecords;
+    }
+
+    return allProcessedRecords;
   }
-  
 
   /// Cleanup task files after completion
   Future<void> _cleanupTask(MigrationTask task) async {

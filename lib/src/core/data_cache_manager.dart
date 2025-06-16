@@ -952,8 +952,6 @@ class DataCacheManager {
       // Get table's primary key field name
       final schema = await _dataStore.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataCacheManager.invalidateCache');
         return;
       }
       final primaryKeyField = schema.primaryKey;

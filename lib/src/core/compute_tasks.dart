@@ -339,7 +339,7 @@ class DecodePartitionRequest {
 
   /// Optional encryption key ID
   final int? encryptionKeyId;
-  
+
   /// Optional encoder state for isolate execution
   final Map<String, dynamic>? encoderState;
 
@@ -382,7 +382,7 @@ class EncodePartitionRequest {
 
   /// Optional encryption key ID
   final int? encryptionKeyId;
-  
+
   /// Optional encoder state for isolate execution
   final Map<String, dynamic>? encoderState;
 
@@ -472,12 +472,12 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
   try {
     // if encoder state is provided, apply it
     // ONLY apply encoder state if no specific encryption key/keyId is provided
-    if (request.encoderState != null && 
-        request.encryptionKey == null && 
+    if (request.encoderState != null &&
+        request.encryptionKey == null &&
         request.encryptionKeyId == null) {
       EncoderHandler.setEncodingState(request.encoderState!);
     }
-    
+
     // decode data
     final decodedString = await EncoderHandler.decode(
       request.bytes,
@@ -519,12 +519,12 @@ Future<EncodedPartitionResult> encodePartitionData(
   try {
     // if encoder state is provided, apply it
     // ONLY apply encoder state if no specific encryption key/keyId is provided
-    if (request.encoderState != null && 
-        request.encryptionKey == null && 
+    if (request.encoderState != null &&
+        request.encryptionKey == null &&
         request.encryptionKeyId == null) {
       EncoderHandler.setEncodingState(request.encoderState!);
     }
-    
+
     // count non-empty records
     final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
 

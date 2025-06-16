@@ -32,7 +32,8 @@ class PlatformHandler {
   static Future<int> getSystemMemoryMB() => _instance.getSystemMemoryMB();
 
   /// Get available system memory (MB)
-  static Future<int> getAvailableSystemMemoryMB() => _instance.getAvailableSystemMemoryMB();
+  static Future<int> getAvailableSystemMemoryMB() =>
+      _instance.getAvailableSystemMemoryMB();
 
   /// Get system memory (GB)
   static Future<double> getSystemMemoryGB() async {

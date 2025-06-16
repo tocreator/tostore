@@ -321,9 +321,6 @@ class LockManager {
       if (operationId != null &&
           state.exclusiveHolder != null &&
           state.exclusiveHolder != opId) {
-        Logger.warn(
-            'Attempted to release an exclusive lock not held by this operation: $resource, holder: ${state.exclusiveHolder}, requester: $opId',
-            label: 'LockManager');
         return;
       }
 

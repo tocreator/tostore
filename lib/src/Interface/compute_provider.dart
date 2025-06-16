@@ -1,1 +1,1 @@
-export 'compute_stub.dart' if (dart.library.isolate) 'compute_native.dart'; 
+export 'compute_stub.dart' if (dart.library.isolate) 'compute_native.dart';

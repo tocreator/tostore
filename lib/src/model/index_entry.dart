@@ -6,7 +6,7 @@ import 'store_index.dart';
 class IndexEntry {
   /// Index key (can be single value or composite value)
   final dynamic indexKey;
-  
+
   /// Record pointer, pointing to the actual record in storage
   final StoreIndex recordPointer;
 
@@ -22,41 +22,41 @@ class IndexEntry {
     if (value.contains('|')) {
       final parts = value.split('|');
       if (parts.length != 2) return null;
-      
+
       final key = _parseKey(parts[0]);
       final storeIndex = StoreIndex.fromString(parts[1]);
-      
+
       if (storeIndex == null) return null;
-      
+
       return IndexEntry(
         indexKey: key,
         recordPointer: storeIndex,
       );
-    } 
+    }
     // Old format: the part after the last : is StoreIndex
     else {
       // Try parsing from the end, find the StoreIndex part
       final parts = value.split(':');
       if (parts.length < 2) return null;
-      
+
       // Try different combinations to parse StoreIndex
       StoreIndex? storeIndex;
       String keyPart = '';
-      
+
       // Try parsing StoreIndex from the least 2 parts
       for (int i = parts.length - 2; i >= 0; i--) {
         final storeIndexStr = parts.sublist(i).join(':');
         storeIndex = StoreIndex.fromString(storeIndexStr);
-        
+
         if (storeIndex != null) {
           // Successfully parsed to StoreIndex, the previous part is the index key
           keyPart = parts.sublist(0, i).join(':');
           break;
         }
       }
-      
+
       if (storeIndex == null) return null;
-      
+
       final key = _parseKey(keyPart);
       return IndexEntry(
         indexKey: key,
@@ -69,21 +69,21 @@ class IndexEntry {
   static dynamic _parseKey(String keyStr) {
     // Try parsing as number
     if (keyStr == 'null') return null;
-    
+
     // Try parsing as integer
     try {
       return int.parse(keyStr);
     } catch (_) {}
-    
+
     // Try parsing as double
     try {
       return double.parse(keyStr);
     } catch (_) {}
-    
+
     // Try parsing as boolean
     if (keyStr.toLowerCase() == 'true') return true;
     if (keyStr.toLowerCase() == 'false') return false;
-    
+
     // Default as string
     return keyStr;
   }
@@ -93,22 +93,22 @@ class IndexEntry {
   String toString() {
     return '${indexKey.toString()}|${recordPointer.toString()}';
   }
-  
+
   /// Convert to string (using old format) for compatibility with old versions
   String toStringOldFormat() {
     return '${indexKey.toString()}:${recordPointer.toString()}';
   }
-  
+
   /// Get the string representation of the index key
   String getKeyString() {
     return indexKey.toString();
   }
-  
+
   /// Get the string representation of the record pointer
   String getRecordPointerString() {
     return recordPointer.toString();
   }
-  
+
   /// Create index entry from composite fields
   static IndexEntry fromCompositeFields(
     List<dynamic> fieldValues,
@@ -116,13 +116,13 @@ class IndexEntry {
   ) {
     // Convert field values to string and join with :
     final compositeKey = fieldValues.map((v) => v.toString()).join(':');
-    
+
     return IndexEntry(
       indexKey: compositeKey,
       recordPointer: recordPointer,
     );
   }
-  
+
   /// Extract composite field values from index entry
   List<String> extractCompositeFields() {
     if (indexKey is String) {
@@ -131,35 +131,33 @@ class IndexEntry {
     // If not a composite key, return a list with a single element
     return [indexKey.toString()];
   }
-  
+
   /// Used to compare two index entries for equality
   @override
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
     if (other is! IndexEntry) return false;
-    
+
     return indexKey.toString() == other.indexKey.toString() &&
-           recordPointer.toString() == other.recordPointer.toString();
+        recordPointer.toString() == other.recordPointer.toString();
   }
-  
+
   @override
   int get hashCode => Object.hash(
-    indexKey.toString(),
-    recordPointer.toString(),
-  );
-} 
-
-
+        indexKey.toString(),
+        recordPointer.toString(),
+      );
+}
 
 /// Index buffer entry model
 /// Used to store index entries in the buffer, including operation type and timestamp
 class IndexBufferEntry {
   /// Index entry
   final IndexEntry indexEntry;
-  
+
   /// Operation type (insert, delete, etc.)
   final BufferOperationType operation;
-  
+
   /// Entry creation timestamp
   final DateTime timestamp;
 
@@ -220,21 +218,21 @@ class IndexBufferEntry {
   String getUniqueKey() {
     return createUniqueKey(indexEntry.indexKey, indexEntry.recordPointer);
   }
-  
+
   /// Create a unique key from index key and record pointer
   /// This is a static utility method to standardize key generation
   static String createUniqueKey(dynamic indexKey, dynamic recordPointer) {
     return '$indexKey|$recordPointer';
   }
-  
+
   /// Convert to JSON
   Map<String, dynamic> toJson() {
     return {
-      'indexKey': indexEntry.indexKey is String || 
-                  indexEntry.indexKey is num || 
-                  indexEntry.indexKey is bool ? 
-                  indexEntry.indexKey : 
-                  indexEntry.indexKey.toString(),
+      'indexKey': indexEntry.indexKey is String ||
+              indexEntry.indexKey is num ||
+              indexEntry.indexKey is bool
+          ? indexEntry.indexKey
+          : indexEntry.indexKey.toString(),
       'recordPointer': indexEntry.recordPointer.toString(),
       'operation': operation.toString().split('.').last,
       'timestamp': timestamp.toIso8601String(),
@@ -243,7 +241,8 @@ class IndexBufferEntry {
 
   /// Create from JSON
   factory IndexBufferEntry.fromJson(Map<String, dynamic> json) {
-    final recordPointer = StoreIndex.fromString(json['recordPointer'] as String);
+    final recordPointer =
+        StoreIndex.fromString(json['recordPointer'] as String);
     if (recordPointer == null) {
       throw const FormatException('Invalid record pointer format');
     }
@@ -272,4 +271,4 @@ class IndexBufferEntry {
 
     return BufferOperationType.insert;
   }
-} 
+}
