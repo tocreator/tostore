@@ -6,7 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../core/data_store_impl.dart';
+import 'data_store_impl.dart';
 import '../handler/platform_handler.dart';
 
 /// backup manager

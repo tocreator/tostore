@@ -13,8 +13,8 @@ import '../handler/platform_handler.dart';
 import 'crontab_manager.dart';
 import '../model/id_generator.dart';
 import '../handler/value_comparator.dart';
-import '../compute/compute_manager.dart';
-import '../compute/compute_tasks.dart';
+import 'compute_manager.dart';
+import 'compute_tasks.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {

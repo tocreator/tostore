@@ -100,7 +100,8 @@ class PlatformHandlerImpl implements PlatformInterface {
     final now = DateTime.now();
     if (_cachedAvailableSystemMemoryMB != null &&
         _lastAvailableSystemMemoryFetch != null &&
-        now.difference(_lastAvailableSystemMemoryFetch!) < _memoryFetchTimeout) {
+        now.difference(_lastAvailableSystemMemoryFetch!) <
+            _memoryFetchTimeout) {
       return _cachedAvailableSystemMemoryMB!;
     }
 
@@ -217,9 +218,10 @@ class PlatformHandlerImpl implements PlatformInterface {
         '-Command',
         '(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1KB'
       ]);
-      
+
       if (fallbackResult.exitCode == 0 && fallbackResult.stdout != null) {
-        final memoryKB = double.tryParse((fallbackResult.stdout as String).trim());
+        final memoryKB =
+            double.tryParse((fallbackResult.stdout as String).trim());
         if (memoryKB != null && memoryKB > 0) {
           return (memoryKB / 1024).round(); // Convert to MB
         }
@@ -277,27 +279,32 @@ class PlatformHandlerImpl implements PlatformInterface {
       final file = File('/proc/meminfo');
       if (await file.exists()) {
         final contents = await file.readAsString();
-        
+
         // first try to get MemAvailable (more accurate metric)
         final memAvailableMatch =
             RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
-            
+
         if (memAvailableMatch != null) {
           final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
           return (memKB / 1024).round(); // convert to MB
         }
-        
+
         // if MemAvailable does not exist (older kernel), calculate: MemFree + Buffers + Cached
-        final memFreeMatch = RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
-        final buffersMatch = RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
+        final memFreeMatch =
+            RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
+        final buffersMatch =
+            RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
         final cachedMatch = RegExp(r'Cached:\s+(\d+) kB').firstMatch(contents);
-        
-        if (memFreeMatch != null && buffersMatch != null && cachedMatch != null) {
+
+        if (memFreeMatch != null &&
+            buffersMatch != null &&
+            cachedMatch != null) {
           final memFreeKB = int.tryParse(memFreeMatch.group(1) ?? '0') ?? 0;
           final buffersKB = int.tryParse(buffersMatch.group(1) ?? '0') ?? 0;
           final cachedKB = int.tryParse(cachedMatch.group(1) ?? '0') ?? 0;
-          
-          return ((memFreeKB + buffersKB + cachedKB) / 1024).round(); // convert to MB
+
+          return ((memFreeKB + buffersKB + cachedKB) / 1024)
+              .round(); // convert to MB
         }
       }
 
@@ -360,28 +367,36 @@ class PlatformHandlerImpl implements PlatformInterface {
     try {
       // Use vm_stat command to get memory statistics
       final result = await Process.run('vm_stat', []);
-      
+
       if (result.exitCode == 0 && result.stdout != null) {
         final output = result.stdout as String;
-        
+
         // Parse page size
-        final pageSizeMatch = RegExp(r'page size of (\d+) bytes').firstMatch(output);
-        final pageSize = pageSizeMatch != null 
-            ? int.tryParse(pageSizeMatch.group(1) ?? '4096') ?? 4096 
+        final pageSizeMatch =
+            RegExp(r'page size of (\d+) bytes').firstMatch(output);
+        final pageSize = pageSizeMatch != null
+            ? int.tryParse(pageSizeMatch.group(1) ?? '4096') ?? 4096
             : 4096;
-            
+
         // Parse free pages
         final freeMatch = RegExp(r'Pages free:\s+(\d+)').firstMatch(output);
-        final inactiveMatch = RegExp(r'Pages inactive:\s+(\d+)').firstMatch(output);
-        final purgableMatch = RegExp(r'Pages purgeable:\s+(\d+)').firstMatch(output);
-        
-        if (freeMatch != null && inactiveMatch != null && purgableMatch != null) {
+        final inactiveMatch =
+            RegExp(r'Pages inactive:\s+(\d+)').firstMatch(output);
+        final purgableMatch =
+            RegExp(r'Pages purgeable:\s+(\d+)').firstMatch(output);
+
+        if (freeMatch != null &&
+            inactiveMatch != null &&
+            purgableMatch != null) {
           final freePages = int.tryParse(freeMatch.group(1) ?? '0') ?? 0;
-          final inactivePages = int.tryParse(inactiveMatch.group(1) ?? '0') ?? 0;
-          final purgablePages = int.tryParse(purgableMatch.group(1) ?? '0') ?? 0;
-          
+          final inactivePages =
+              int.tryParse(inactiveMatch.group(1) ?? '0') ?? 0;
+          final purgablePages =
+              int.tryParse(purgableMatch.group(1) ?? '0') ?? 0;
+
           // Calculate available memory: free pages + inactive pages + purgeable pages
-          final totalAvailableBytes = (freePages + inactivePages + purgablePages) * pageSize;
+          final totalAvailableBytes =
+              (freePages + inactivePages + purgablePages) * pageSize;
           return (totalAvailableBytes / (1024 * 1024)).round(); // Convert to MB
         }
       }
@@ -391,7 +406,8 @@ class PlatformHandlerImpl implements PlatformInterface {
       if (topResult.exitCode == 0 && topResult.stdout != null) {
         final output = topResult.stdout as String;
         // Find memory usage from top output
-        final memMatch = RegExp(r'PhysMem: .*?(\d+)([MG]) unused').firstMatch(output);
+        final memMatch =
+            RegExp(r'PhysMem: .*?(\d+)([MG]) unused').firstMatch(output);
         if (memMatch != null) {
           final value = int.tryParse(memMatch.group(1) ?? '0') ?? 0;
           final unit = memMatch.group(2);
@@ -402,7 +418,7 @@ class PlatformHandlerImpl implements PlatformInterface {
           }
         }
       }
-      
+
       // If all fail, estimate 1/4 of total memory
       final totalMemory = await _getMacOSMemory();
       return totalMemory ~/ 4;
@@ -456,27 +472,32 @@ class PlatformHandlerImpl implements PlatformInterface {
       final file = File('/proc/meminfo');
       if (await file.exists()) {
         final contents = await file.readAsString();
-        
+
         // First try to get MemAvailable (more modern Android system)
         final memAvailableMatch =
             RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
-            
+
         if (memAvailableMatch != null) {
           final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
           return (memKB / 1024).round(); // Convert to MB
         }
-        
+
         // Backup method: calculate MemFree + Cached + Buffers
-        final memFreeMatch = RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
-        final buffersMatch = RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
+        final memFreeMatch =
+            RegExp(r'MemFree:\s+(\d+) kB').firstMatch(contents);
+        final buffersMatch =
+            RegExp(r'Buffers:\s+(\d+) kB').firstMatch(contents);
         final cachedMatch = RegExp(r'Cached:\s+(\d+) kB').firstMatch(contents);
-        
-        if (memFreeMatch != null && buffersMatch != null && cachedMatch != null) {
+
+        if (memFreeMatch != null &&
+            buffersMatch != null &&
+            cachedMatch != null) {
           final memFreeKB = int.tryParse(memFreeMatch.group(1) ?? '0') ?? 0;
           final buffersKB = int.tryParse(buffersMatch.group(1) ?? '0') ?? 0;
           final cachedKB = int.tryParse(cachedMatch.group(1) ?? '0') ?? 0;
-          
-          return ((memFreeKB + buffersKB + cachedKB) / 1024).round(); // Convert to MB
+
+          return ((memFreeKB + buffersKB + cachedKB) / 1024)
+              .round(); // Convert to MB
         }
       }
 
@@ -484,10 +505,10 @@ class PlatformHandlerImpl implements PlatformInterface {
       final result = await Process.run('cat', ['/proc/meminfo']);
       if (result.exitCode == 0 && result.stdout != null) {
         final contents = result.stdout as String;
-        
+
         final memAvailableMatch =
             RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
-            
+
         if (memAvailableMatch != null) {
           final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
           return (memKB / 1024).round(); // Convert to MB

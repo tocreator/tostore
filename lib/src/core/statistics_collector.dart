@@ -1,9 +1,9 @@
 import 'dart:convert';
 
 import '../handler/logger.dart';
-import '../core/data_store_impl.dart';
+import 'data_store_impl.dart';
 import '../model/space_path_changed_event.dart';
-import 'table_statistics.dart';
+import '../model/table_statistics.dart';
 
 /// statistics collector
 class StatisticsCollector {

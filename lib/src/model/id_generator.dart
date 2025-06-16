@@ -5,8 +5,8 @@ import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../handler/logger.dart';
 import '../core/lock_manager.dart';
-import '../compute/compute_manager.dart';
-import '../compute/compute_tasks.dart';
+import '../core/compute_manager.dart';
+import '../core/compute_tasks.dart';
 
 /// ID generator interface
 abstract class IdGenerator {
@@ -464,10 +464,11 @@ class TimeBasedIdGenerator implements IdGenerator {
               // Record performance data
               final duration = DateTime.now().difference(startTime).inMilliseconds;
               final genRate = duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
+
               Logger.debug(
-                  'ID parallel generated: $tableName, count: $totalGenerated, current pool size: ${_idPools[tableName]!.length}, '
-                  'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
-                  label: 'TimeBasedIdGenerator._refillIdPool');
+              'ID parallel generated: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
+              'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
+              label: 'TimeBasedIdGenerator._refillIdPool');
             }
         } else {
           // Old serial generation method remains unchanged
@@ -475,11 +476,6 @@ class TimeBasedIdGenerator implements IdGenerator {
           int remainingCount = neededCount;
           // Increase batch size to reduce iteration count
           const int batchSize = 1000; // Generate 1000 IDs per batch
-
-          // Add log
-          Logger.debug(
-              'Start filling ID pool: $tableName, need count: $neededCount, current pool size: $currentPoolSize',
-              label: 'TimeBasedIdGenerator._refillIdPool');
 
           // Last check demand time
           var lastCheckTime = DateTime.now();
@@ -527,11 +523,6 @@ class TimeBasedIdGenerator implements IdGenerator {
               if (newNeededCount > _minGenerateBatchSize) {
                 // Update remaining count
                 remainingCount += newNeededCount;
-
-                Logger.debug(
-                    'Dynamic adjust ID pool size: $tableName, new demand: $newNeededCount, '
-                    'Already generated: $totalGenerated, current pool size: $currentSize',
-                    label: 'TimeBasedIdGenerator._refillIdPool');
               }
             }
 
@@ -571,8 +562,6 @@ class TimeBasedIdGenerator implements IdGenerator {
   Future<List<String>> _generateIdsInParallel(int neededCount, int recentTotal) async {
     
     try {
-      // Record start time
-      final startTime = DateTime.now();
       
       // Parallel generation control parameters
       final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
@@ -701,14 +690,7 @@ class TimeBasedIdGenerator implements IdGenerator {
       _lastValueMap[tableName] = lastValue;
       _lastValue = lastValue;
       
-      // Record performance metrics
-      final duration = DateTime.now().difference(startTime).inMilliseconds;
-      final genRate = duration > 0 ? ((allGeneratedIds.length * 1000) ~/ duration) : 0;
-      
-      Logger.debug(
-          'Parallel generate IDs completed: $tableName, generated count: ${allGeneratedIds.length}, '
-          'used task count: $parallelCount, duration: ${duration}ms, generation rate: $genRate IDs/s',
-          label: 'TimeBasedIdGenerator._generateIdsInParallel');
+  
       
       return allGeneratedIds;
     } catch (e) {

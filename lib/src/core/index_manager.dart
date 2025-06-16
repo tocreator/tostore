@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
-import '../compute/compute_manager.dart';
+import 'compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../handler/platform_handler.dart';
@@ -13,7 +13,7 @@ import '../model/index_entry.dart';
 import 'crontab_manager.dart';
 import 'b_plus_tree.dart';
 import 'data_store_impl.dart';
-import '../compute/compute_tasks.dart';
+import 'compute_tasks.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations

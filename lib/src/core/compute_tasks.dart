@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:math';
 
-import '../core/b_plus_tree.dart';
+import 'b_plus_tree.dart';
 import '../model/index_entry.dart';
 import '../model/file_info.dart';
 import '../model/table_schema.dart';

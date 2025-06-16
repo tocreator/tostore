@@ -1,4 +1,4 @@
-import '../statistic/table_statistics.dart';
+import '../model/table_statistics.dart';
 import 'query_plan.dart';
 
 /// query cost estimator
