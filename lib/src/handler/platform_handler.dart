@@ -102,7 +102,7 @@ class PlatformHandler {
     if (isWeb) return 2;
     if (isMobile) return 3;
     return processorCores.clamp(
-        2, 6); // Maximum 6 concurrent operations for desktop
+        2, 8); // Maximum 8 concurrent operations for desktop
   }
 
   /// Detect if it's a server environment

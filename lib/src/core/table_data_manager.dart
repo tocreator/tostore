@@ -441,7 +441,7 @@ class TableDataManager {
       }
 
       // Condition 4: Total records exceed threshold should also write
-      if (totalRecords >= maxBatchSize * 1.5) {
+      if (totalRecords >= maxBatchSize * 2) {
         needsImmediateWrite = true;
       }
 
@@ -1363,13 +1363,12 @@ class TableDataManager {
 
     // parallel use isolate to calculate primary key range
     dynamic minPk, maxPk;
-    
+
     // check if should use range query optimization
     bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
     if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
-    
-        final rangeResult = await ComputeManager.run(
+      final rangeResult = await ComputeManager.run(
           analyzePartitionKeyRange,
           PartitionRangeAnalysisRequest(
             records: nonEmptyRecords,
@@ -1377,17 +1376,17 @@ class TableDataManager {
             partitionIndex: partitionIndex,
             existingPartitions: existingPartitions,
           ),
-          useIsolate: nonEmptyRecords.length > 100 || (existingPartitions?.length ?? 0) > 1000
-        );
-          
-        minPk = rangeResult.minPk;
-        maxPk = rangeResult.maxPk;
-      
+          useIsolate: nonEmptyRecords.length > 500 ||
+              (existingPartitions?.length ?? 0) > 1000);
+
+      minPk = rangeResult.minPk;
+      maxPk = rangeResult.maxPk;
+
       // If not ordered based on analysis result, mark table as non-ordered
       if (!rangeResult.isOrdered) {
         await _markTableAsUnordered(tableName);
       }
-      
+
       // check again, because partition analysis may change the table's ordered state
       shouldSaveKeyRange = _checkedOrderedRange.containsKey(tableName)
           ? _checkedOrderedRange[tableName]!
@@ -1400,10 +1399,8 @@ class TableDataManager {
       maxPk = null;
     }
 
-
-    
     // use ComputeManager.run, fallback to main thread if failed
-      final encodeResult = await ComputeManager.run(
+    final encodeResult = await ComputeManager.run(
         encodePartitionData,
         EncodePartitionRequest(
           records: records,
@@ -1420,14 +1417,14 @@ class TableDataManager {
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
-          encoderState: (encryptionKey == null && encryptionKeyId == null) ? 
-              EncoderHandler.getCurrentEncodingState() : null,
+          encoderState: (encryptionKey == null && encryptionKeyId == null)
+              ? EncoderHandler.getCurrentEncodingState()
+              : null,
         ),
-        useIsolate: records.length > 100
-      );
-      
-      final encodedData = encodeResult.encodedData;
-      final updatedPartitionMeta = encodeResult.partitionMeta;
+        useIsolate: records.length > 500);
+
+    final encodedData = encodeResult.encodedData;
+    final updatedPartitionMeta = encodeResult.partitionMeta;
 
     // Ensure partition directory exists
     final dirPath = await _dataStore.pathManager
@@ -1486,7 +1483,8 @@ class TableDataManager {
         // calculate exact change in record count and size
         int recordsDelta =
             nonEmptyRecords.length - (isExistingPartition ? oldRecordCount : 0);
-        int sizeDelta = updatedPartitionMeta.fileSizeInBytes - (isExistingPartition ? oldSize : 0);
+        int sizeDelta = updatedPartitionMeta.fileSizeInBytes -
+            (isExistingPartition ? oldSize : 0);
 
         // update meta
         fileMeta = fileMeta.copyWith(
@@ -1522,7 +1520,6 @@ class TableDataManager {
     return updatedPartitionMeta;
   }
 
-
   /// mark table as non-ordered range
   Future<void> _markTableAsUnordered(String tableName) async {
     try {
@@ -1554,7 +1551,7 @@ class TableDataManager {
     if (records.isEmpty) {
       return <int, List<Map<String, dynamic>>>{};
     }
-    
+
     try {
       final fileMeta = await getTableFileMeta(tableName);
       final partitionSizeLimit = _getPartitionSizeLimit(tableName);
@@ -1595,8 +1592,7 @@ class TableDataManager {
         }
       }
 
-          
-        final assignmentResult = await ComputeManager.run(
+      final assignmentResult = await ComputeManager.run(
           assignRecordsToPartitions,
           PartitionAssignmentRequest(
             records: records,
@@ -1604,12 +1600,11 @@ class TableDataManager {
             currentPartitionIndex: currentPartitionIndex,
             currentPartitionSize: currentPartitionSize,
           ),
-          useIsolate: records.length > 1000
-        );
-        Logger.debug(
-            'Partition assignment completed, ${assignmentResult.partitionRecords.length} partitions, ${records.length} records',
-            label: 'TableDataManager._assignRecordsToPartitions');
-        return assignmentResult.partitionRecords;
+          useIsolate: records.length > 1000);
+      Logger.debug(
+          'Partition assignment completed, ${assignmentResult.partitionRecords.length} partitions, ${records.length} records',
+          label: 'TableDataManager._assignRecordsToPartitions');
+      return assignmentResult.partitionRecords;
     } catch (e) {
       Logger.error('Failed to assign records to partitions: $e',
           label: 'TableDataManager._assignRecordsToPartitions');
@@ -2575,19 +2570,21 @@ class TableDataManager {
             label: 'TableDataManager.readRecordsFromPartition');
         return [];
       }
-      
+
       final decodedData = await ComputeManager.run(
-          decodePartitionData, 
+          decodePartitionData,
           DecodePartitionRequest(
             bytes: bytes,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
-            encoderState: (encryptionKey == null && encryptionKeyId == null) ? 
-                EncoderHandler.getCurrentEncodingState() : null,
+            encoderState: (encryptionKey == null && encryptionKeyId == null)
+                ? EncoderHandler.getCurrentEncodingState()
+                : null,
           ),
-          useIsolate: bytes.length > 10 * 1024  // only use isolate if data size is larger than 10KB
-        );
+          useIsolate: bytes.length >
+              500 * 1024 // only use isolate if data size is larger than 500KB
+          );
 
       // Update access time in meta
       FileMeta? fileMeta = await getTableFileMeta(tableName);
@@ -2818,8 +2815,8 @@ class TableDataManager {
                 allRecords,
                 primaryKey,
                 existingPartitions,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
+                encryptionKey: encryptionKey,
+                encryptionKeyId: encryptionKeyId,
                 updateTableMeta: false, // key: not update table meta
               );
             },

@@ -228,7 +228,7 @@ class DataStoreConfig {
     } else if (PlatformHandler.isMobile) {
       return 1000; // Mobile devices, balance performance and memory usage
     } else {
-      return 1500; // Desktop devices, leverage more powerful hardware
+      return 2000; // Desktop devices, leverage more powerful hardware
     }
   }
 
