@@ -407,12 +407,15 @@ class EncoderHandler {
 
   /// set complete encoding state, for isolate thread passing
   static void setEncodingState(Map<String, dynamic> state) {
-    if (state['enableEncoding'] != null)
+    if (state['enableEncoding'] != null) {
       _enableEncoding = state['enableEncoding'];
-    if (state['enableObfuscation'] != null)
+    }
+    if (state['enableObfuscation'] != null) {
       _enableObfuscation = state['enableObfuscation'];
-    if (state['activeKey'] != null)
+    }
+    if (state['activeKey'] != null) {
       _activeKey = List<int>.from(state['activeKey']);
+    }
     if (state['keyId'] != null) _currentKeyId = state['keyId'];
   }
 

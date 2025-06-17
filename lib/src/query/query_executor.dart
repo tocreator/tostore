@@ -746,7 +746,6 @@ class QueryExecutor {
 
     // 1. check if there is full table cache
     if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
-      // check if file is modified
       final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
       if (cache != null) {
         final cacheTime =
@@ -790,45 +789,65 @@ class QueryExecutor {
       if (targetPartitions.isNotEmpty) {
         // Check for early return in case of exact primary key match
         final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
-        bool foundExactMatch = false;
 
-        // Process only target partitions
-        for (var partitionIndex in targetPartitions) {
-          final partitionRecords = await _dataStore.tableDataManager
-              .readRecordsFromPartition(
-                  tableName, isGlobal, partitionIndex, primaryKey);
+        try {
+          // Efficiently process target partitions
+          await _dataStore.tableDataManager.processTablePartitions(
+            tableName: tableName,
+            onlyRead: true,
+            targetPartitions: targetPartitions, // Use target partitions list
+            processFunction: (records, partitionIndex) async {
+              if (condition != null) {
+                // Apply filter conditions
+                for (var record in records) {
+                  if (condition.matches(record)) {
+                    resultMap[record[primaryKey].toString()] = record;
 
-          if (condition != null) {
-            // Filter records based on condition
-            for (var record in partitionRecords) {
-              if (condition.matches(record)) {
-                resultMap[record[primaryKey].toString()] = record;
-
-                // If looking for exact primary key match and found it, we can stop
-                if (exactPkMatch != null &&
-                    record[primaryKey] == exactPkMatch) {
-                  foundExactMatch = true;
-                  break;
+                    // If exact primary key match is found, throw exception to immediately terminate all partition processing
+                    if (exactPkMatch != null &&
+                        record[primaryKey] == exactPkMatch) {
+                      // Create a deep copy of the record
+                      final matchRecord = Map<String, dynamic>.from(record);
+                      throw 'exact_match_found:$partitionIndex:${matchRecord[primaryKey]}';
+                    }
+                  }
+                }
+              } else {
+                // No filter conditions, add all records
+                for (var record in records) {
+                  resultMap[record[primaryKey].toString()] = record;
                 }
               }
-            }
-          } else {
-            // No filter, add all records
-            for (var record in partitionRecords) {
-              resultMap[record[primaryKey].toString()] = record;
-            }
-          }
 
-          // Early return if exact match found
-          if (foundExactMatch) {
-            break;
+              return records;
+            },
+          );
+        } catch (e) {
+          // Catch exact match exception, this is a normal early termination process
+          if (e is String && e.startsWith('exact_match_found:')) {
+            // No need to clear result set here, because the exact match record has been added to resultMap
+          } else {
+            // Other exceptions log
+            Logger.error('Error during table scan: $e',
+                label: 'QueryExecutor._performTableScan');
           }
         }
 
         // Process records in write queue that match the condition
         final pendingData =
             _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-        if (condition != null) {
+
+        // If exact primary key match, check if there is an updated record in the write buffer
+        if (exactPkMatch != null &&
+            pendingData.containsKey(exactPkMatch.toString())) {
+          final pendingRecord = pendingData[exactPkMatch.toString()];
+          if (pendingRecord != null &&
+              (condition == null || condition.matches(pendingRecord.data))) {
+            // Replace or add the record in the write buffer to the result
+            resultMap[exactPkMatch.toString()] =
+                Map<String, dynamic>.from(pendingRecord.data);
+          }
+        } else if (condition != null) {
           for (var record in pendingData.entries) {
             if (condition.matches(record.value.data)) {
               resultMap[record.value.data[primaryKey].toString()] =
@@ -852,16 +871,27 @@ class QueryExecutor {
       }
     }
 
-    // Process records using streaming
+    // If the above optimization path is not available, use parallel processing instead of stream processing
     if (fileMeta != null &&
         fileMeta.totalRecords > 0 &&
         fileMeta.partitions!.isNotEmpty) {
-      // Use streaming to process partitions without loading all at once
-      final stream = _dataStore.tableDataManager.streamRecords(tableName);
-      await for (var record in stream) {
-        if (condition == null || condition.matches(record)) {
-          resultMap[record[primaryKey].toString()] = record;
-        }
+      try {
+        // Use parallel processing
+        await _dataStore.tableDataManager.processTablePartitions(
+          tableName: tableName,
+          onlyRead: true,
+          processFunction: (records, partitionIndex) async {
+            for (var record in records) {
+              if (condition == null || condition.matches(record)) {
+                resultMap[record[primaryKey].toString()] = record;
+              }
+            }
+            return records;
+          },
+        );
+      } catch (e) {
+        Logger.error('Error during parallel table scan: $e',
+            label: 'QueryExecutor._performTableScan');
       }
     }
 

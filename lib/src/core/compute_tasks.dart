@@ -461,6 +461,51 @@ class PartitionRangeAnalysisResult {
     required this.recordCount,
     this.isOrdered = true,
   });
+
+  /// Create a copy with some fields replaced
+  PartitionRangeAnalysisResult copyWith({
+    dynamic minPk,
+    dynamic maxPk,
+    int? recordCount,
+    bool? isOrdered,
+  }) {
+    return PartitionRangeAnalysisResult(
+      minPk: minPk ?? this.minPk,
+      maxPk: maxPk ?? this.maxPk,
+      recordCount: recordCount ?? this.recordCount,
+      isOrdered: isOrdered ?? this.isOrdered,
+    );
+  }
+  
+  /// Convert to a map for serialization
+  Map<String, dynamic> toJson() {
+    return {
+      'minPk': minPk,
+      'maxPk': maxPk,
+      'recordCount': recordCount,
+      'isOrdered': isOrdered,
+    };
+  }
+  
+  /// Create from a map after deserialization
+  factory PartitionRangeAnalysisResult.fromJson(Map<String, dynamic> json) {
+    try {
+      return PartitionRangeAnalysisResult(
+        minPk: json['minPk'],
+        maxPk: json['maxPk'],
+        recordCount: json['recordCount'] is int 
+            ? json['recordCount'] 
+            : int.tryParse(json['recordCount'].toString()) ?? 0,
+        isOrdered: json['isOrdered'] is bool 
+            ? json['isOrdered'] 
+            : json['isOrdered'].toString().toLowerCase() == 'true',
+      );
+    } catch (e) {
+      Logger.error('Failed to parse PartitionRangeAnalysisResult: $e', 
+          label: 'PartitionRangeAnalysisResult.fromJson');
+      return PartitionRangeAnalysisResult(recordCount: 0, isOrdered: false);
+    }
+  }
 }
 
 /// A top-level function designed to be run in a separate isolate.
@@ -682,51 +727,80 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
 
       // Check 1: Existing partition internal ordered check
       if (existingPartition != null && existingPartition.totalRecords > 0) {
-        // If new data range is completely separated from existing range, mark as non-ordered
-        if (_compareKeyValues(minPk, existingPartition.maxPrimaryKey) > 0 ||
-            _compareKeyValues(maxPk, existingPartition.minPrimaryKey) < 0) {
-          isOrdered = false;
+        try {
+          // If new data range is completely separated from existing range, mark as non-ordered
+          if (_compareKeyValues(minPk, existingPartition.maxPrimaryKey) > 0 ||
+              _compareKeyValues(maxPk, existingPartition.minPrimaryKey) < 0) {
+            isOrdered = false;
+          }
+        } catch (compareError) {
+          Logger.warn('Failed to compare key values for existing partition: $compareError',
+              label: 'analyzePartitionKeyRange');
+          isOrdered = false; // Conservative approach on comparison error
         }
       }
 
       // Check 2: Relation with max index partition
       if (maxIdxPartition != null &&
           maxIdxPartition.index != request.partitionIndex) {
-        // If current partition index is greater than max index partition
-        if (request.partitionIndex > maxIdxPartition.index) {
-          if (_compareKeyValues(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
-            isOrdered = false;
+        try {
+          // If current partition index is greater than max index partition
+          if (request.partitionIndex > maxIdxPartition.index) {
+            if (_compareKeyValues(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
+              isOrdered = false;
+            }
           }
-        }
-        // If current partition index is less than max index partition
-        else if (request.partitionIndex < maxIdxPartition.index) {
-          if (_compareKeyValues(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
-            isOrdered = false;
+          // If current partition index is less than max index partition
+          else if (request.partitionIndex < maxIdxPartition.index) {
+            if (_compareKeyValues(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
+              isOrdered = false;
+            }
           }
+        } catch (compareError) {
+          Logger.warn('Failed to compare key values with max index partition: $compareError',
+              label: 'analyzePartitionKeyRange');
+          isOrdered = false; // Conservative approach on comparison error
         }
       }
     }
 
-    return PartitionRangeAnalysisResult(
+    // Ensure the return value is always of type PartitionRangeAnalysisResult
+    final result = PartitionRangeAnalysisResult(
       minPk: minPk,
       maxPk: maxPk,
       recordCount: nonEmptyRecords.length,
       isOrdered: isOrdered,
     );
+    
+    return result;
   } catch (e) {
     Logger.error('Failed to analyze partition key range: $e',
         label: 'analyzePartitionKeyRange');
-    // Return a valid result with just the record count
-    return PartitionRangeAnalysisResult(
-      recordCount: request.records.where((r) => r.isNotEmpty).length,
-      isOrdered: false, // Conservative approach on error
-    );
+        
+    // Even in case of error, ensure the return type is correct
+    try {
+      return PartitionRangeAnalysisResult(
+        recordCount: request.records.where((r) => r.isNotEmpty).length,
+        isOrdered: false, // Conservative approach on error
+      );
+    } catch (innerError) {
+      // Last defense mechanism: return a basic valid object
+      Logger.error('Critical error in partition analysis: $innerError',
+          label: 'analyzePartitionKeyRange');
+      return PartitionRangeAnalysisResult(recordCount: 0, isOrdered: false);
+    }
   }
 }
 
 /// Primary key value comparison function
 int _compareKeyValues(dynamic a, dynamic b) {
-  return ValueComparator.compare(a, b);
+  try {
+    return ValueComparator.compare(a, b);
+  } catch (e) {
+    Logger.warn('Value comparison error: $e', label: '_compareKeyValues');
+    // Default comparison fallback
+    return a.toString().compareTo(b.toString());
+  }
 }
 
 /// Request data for assigning records to partitions in an isolate.

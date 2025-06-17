@@ -2008,11 +2008,35 @@ class DataStoreImpl {
   /// load all records
   Future<List<Map<String, dynamic>>> _loadAllRecords(String tableName) async {
     final results = <Map<String, dynamic>>[];
+    final resultMap = <String, Map<String, dynamic>>{}; // Use Map to avoid duplicates
 
     try {
-      await for (final record in tableDataManager.streamRecords(tableName)) {
-        results.add(Map<String, dynamic>.from(record));
+      // Get table schema to get primary key
+      final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        return results;
       }
+      
+      final primaryKey = schema.primaryKey;
+      
+      // Use parallel processing instead of stream processing
+      await tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true, // Only read, do not modify data
+        processFunction: (records, partitionIndex) async {
+          // Process records in current partition
+          for (var record in records) {
+            if (record[primaryKey] != null) {
+              // Use primary key as Map key to avoid duplicate records
+              resultMap[record[primaryKey].toString()] = Map<String, dynamic>.from(record);
+            }
+          }
+          return records; // Return original records, do not modify
+        },
+      );
+      
+      // Return result list
+      results.addAll(resultMap.values);
     } catch (e) {
       Logger.error('Failed to load records from $tableName: $e',
           label: 'DataStore._loadAllRecords');

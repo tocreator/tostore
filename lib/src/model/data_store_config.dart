@@ -150,7 +150,7 @@ class DataStoreConfig {
     if (PlatformHandler.isWeb) {
       return 5000; // Web platform
     } else if (PlatformHandler.isMobile) {
-      return 10000; // Mobile devices
+      return 15000; // Mobile devices
     } else {
       return 100000; // Desktop devices
     }

@@ -1213,19 +1213,15 @@ class TableDataManager {
     if (_fileMetaCache.containsKey(tableName)) {
       return _fileMetaCache[tableName];
     }
-
     try {
       final mainFilePath =
           await _dataStore.pathManager.getDataMetaPath(tableName);
-
       if (!await _dataStore.storage.existsFile(mainFilePath)) {
         return null;
       }
-
       try {
         final decodedString =
             await _dataStore.storage.readAsString(mainFilePath);
-
         if (decodedString == null) {
           Logger.error("Failed to decode file meta: $mainFilePath",
               label: 'TableDataManager.getTableFileMeta');
@@ -1335,189 +1331,219 @@ class TableDataManager {
     int? encryptionKeyId,
     bool updateTableMeta = true,
   }) async {
-    // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
-    final nonEmptyRecords =
-        records.where((record) => record.isNotEmpty).toList();
+    try {
+      // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
+      final nonEmptyRecords =
+          records.where((record) => record.isNotEmpty).toList();
 
-    if (nonEmptyRecords.isEmpty) {
-      return PartitionMeta(
-        version: 1,
-        index: partitionIndex,
-        totalRecords: 0,
-        fileSizeInBytes: 0,
-        minPrimaryKey: null,
-        maxPrimaryKey: null,
-        checksum: "",
-        timestamps: Timestamps(
-          created: DateTime.now(),
-          modified: DateTime.now(),
-        ),
-        parentPath: await _dataStore.pathManager.getTablePath(tableName),
-      );
-    }
+      if (nonEmptyRecords.isEmpty) {
+        return PartitionMeta(
+          version: 1,
+          index: partitionIndex,
+          totalRecords: 0,
+          fileSizeInBytes: 0,
+          minPrimaryKey: null,
+          maxPrimaryKey: null,
+          checksum: "",
+          timestamps: Timestamps(
+            created: DateTime.now(),
+            modified: DateTime.now(),
+          ),
+          parentPath: await _dataStore.pathManager.getTablePath(tableName),
+        );
+      }
 
-    final timeStamp = DateTime.now();
-    final partitionPath = await _dataStore.pathManager
-        .getPartitionFilePath(tableName, partitionIndex);
-    final parentPath = await _dataStore.pathManager.getTablePath(tableName);
+      final timeStamp = DateTime.now();
+      final partitionPath = await _dataStore.pathManager
+          .getPartitionFilePath(tableName, partitionIndex);
+      final parentPath = await _dataStore.pathManager.getTablePath(tableName);
 
-    // parallel use isolate to calculate primary key range
-    dynamic minPk, maxPk;
+      // parallel use isolate to calculate primary key range
+      dynamic minPk, maxPk;
 
-    // check if should use range query optimization
-    bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
+      // check if should use range query optimization
+      bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
-    if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
-      final rangeResult = await ComputeManager.run(
-          analyzePartitionKeyRange,
-          PartitionRangeAnalysisRequest(
+      if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
+        try {
+          final request = PartitionRangeAnalysisRequest(
             records: nonEmptyRecords,
             primaryKey: primaryKey,
             partitionIndex: partitionIndex,
             existingPartitions: existingPartitions,
-          ),
-          useIsolate: nonEmptyRecords.length > 500 ||
-              (existingPartitions?.length ?? 0) > 1000);
+          );
 
-      minPk = rangeResult.minPk;
-      maxPk = rangeResult.maxPk;
+          // use try-catch to ensure correct handling of compute results
+          PartitionRangeAnalysisResult rangeResult;
+          try {
+            rangeResult = await ComputeManager.run(
+                analyzePartitionKeyRange, request,
+                useIsolate: nonEmptyRecords.length > 500 ||
+                    (existingPartitions?.length ?? 0) > 1000);
+          } catch (computeError) {
+            Logger.error(
+                'Error running analyzePartitionKeyRange in ComputeManager: $computeError',
+                label: 'TableDataManager._savePartitionFile');
 
-      // If not ordered based on analysis result, mark table as non-ordered
-      if (!rangeResult.isOrdered) {
-        await _markTableAsUnordered(tableName);
+            // fallback to direct function call if error
+            rangeResult = await analyzePartitionKeyRange(request);
+          }
+
+          // ensure valid result before using
+          minPk = rangeResult.minPk;
+          maxPk = rangeResult.maxPk;
+
+          // If not ordered based on analysis result, mark table as non-ordered
+          if (!rangeResult.isOrdered) {
+            await _markTableAsUnordered(tableName);
+          }
+
+          // check again, because partition analysis may change the table's ordered state
+          shouldSaveKeyRange = _checkedOrderedRange.containsKey(tableName)
+              ? _checkedOrderedRange[tableName]!
+              : await _isPrimaryKeyOrdered(tableName);
+        } catch (e) {
+          // handle exception
+          Logger.error('Error analyzing partition key range: $e',
+              label: 'TableDataManager._savePartitionFile');
+          minPk = null;
+          maxPk = null;
+          shouldSaveKeyRange = false;
+        }
       }
 
-      // check again, because partition analysis may change the table's ordered state
-      shouldSaveKeyRange = _checkedOrderedRange.containsKey(tableName)
-          ? _checkedOrderedRange[tableName]!
-          : await _isPrimaryKeyOrdered(tableName);
-    }
+      // if should not save primary key range, set value to null
+      if (!shouldSaveKeyRange) {
+        minPk = null;
+        maxPk = null;
+      }
 
-    // if should not save primary key range, set value to null
-    if (!shouldSaveKeyRange) {
-      minPk = null;
-      maxPk = null;
-    }
-
-    // use ComputeManager.run, fallback to main thread if failed
-    final encodeResult = await ComputeManager.run(
-        encodePartitionData,
-        EncodePartitionRequest(
-          records: records,
-          partitionIndex: partitionIndex,
-          primaryKey: primaryKey,
-          minPk: minPk,
-          maxPk: maxPk,
-          partitionPath: partitionPath,
-          parentPath: parentPath,
-          timestamps: Timestamps(
-            created: timeStamp,
-            modified: timeStamp,
+      // use ComputeManager.run, fallback to main thread if failed
+      final encodeResult = await ComputeManager.run(
+          encodePartitionData,
+          EncodePartitionRequest(
+            records: records,
+            partitionIndex: partitionIndex,
+            primaryKey: primaryKey,
+            minPk: minPk,
+            maxPk: maxPk,
+            partitionPath: partitionPath,
+            parentPath: parentPath,
+            timestamps: Timestamps(
+              created: timeStamp,
+              modified: timeStamp,
+            ),
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
+            encoderState: (encryptionKey == null && encryptionKeyId == null)
+                ? EncoderHandler.getCurrentEncodingState()
+                : null,
           ),
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
-          encoderState: (encryptionKey == null && encryptionKeyId == null)
-              ? EncoderHandler.getCurrentEncodingState()
-              : null,
-        ),
-        useIsolate: records.length > 500);
+          useIsolate: records.length > 500);
 
-    final encodedData = encodeResult.encodedData;
-    final updatedPartitionMeta = encodeResult.partitionMeta;
+      final encodedData = encodeResult.encodedData;
+      final updatedPartitionMeta = encodeResult.partitionMeta;
 
-    // Ensure partition directory exists
-    final dirPath = await _dataStore.pathManager
-        .getPartitionDirPath(tableName, partitionIndex);
-    await _ensureDirectoryExists(dirPath);
+      // Ensure partition directory exists
+      final dirPath = await _dataStore.pathManager
+          .getPartitionDirPath(tableName, partitionIndex);
+      await _ensureDirectoryExists(dirPath);
 
-    // Write partition file
-    await _dataStore.storage.writeAsBytes(partitionPath, encodedData);
+      // Write partition file
+      await _dataStore.storage.writeAsBytes(partitionPath, encodedData);
 
-    // only update table meta when needed
-    if (updateTableMeta) {
-      // get current partition status and calculate exact change
-      FileMeta? fileMeta = await getTableFileMeta(tableName);
-      int oldRecordCount = 0;
-      int oldSize = 0;
-      bool isExistingPartition = false;
+      // only update table meta when needed
+      if (updateTableMeta) {
+        // get current partition status and calculate exact change
+        FileMeta? fileMeta = await getTableFileMeta(tableName);
+        int oldRecordCount = 0;
+        int oldSize = 0;
+        bool isExistingPartition = false;
 
-      if (fileMeta != null && fileMeta.partitions != null) {
-        for (var partition in fileMeta.partitions!) {
-          if (partition.index == partitionIndex) {
-            oldRecordCount = partition.totalRecords;
-            oldSize = partition.fileSizeInBytes;
-            isExistingPartition = true;
-            break;
+        if (fileMeta != null && fileMeta.partitions != null) {
+          for (var partition in fileMeta.partitions!) {
+            if (partition.index == partitionIndex) {
+              oldRecordCount = partition.totalRecords;
+              oldSize = partition.fileSizeInBytes;
+              isExistingPartition = true;
+              break;
+            }
           }
         }
-      }
 
-      // Update main file meta
-      if (fileMeta == null) {
-        fileMeta = FileMeta(
-          version: 1,
-          type: FileType.data,
-          name: tableName,
-          fileSizeInBytes: updatedPartitionMeta.fileSizeInBytes,
-          totalRecords: nonEmptyRecords.length, // only count non-empty records
-          timestamps: Timestamps(
-            created: timeStamp,
-            modified: timeStamp,
-          ),
-          partitions: [updatedPartitionMeta],
-        );
-      } else {
-        List<PartitionMeta> partitions =
-            List<PartitionMeta>.from(fileMeta.partitions ?? []);
-
-        int existingIndex =
-            partitions.indexWhere((c) => c.index == partitionIndex);
-
-        if (existingIndex >= 0) {
-          partitions[existingIndex] = updatedPartitionMeta;
+        // Update main file meta
+        if (fileMeta == null) {
+          fileMeta = FileMeta(
+            version: 1,
+            type: FileType.data,
+            name: tableName,
+            fileSizeInBytes: updatedPartitionMeta.fileSizeInBytes,
+            totalRecords:
+                nonEmptyRecords.length, // only count non-empty records
+            timestamps: Timestamps(
+              created: timeStamp,
+              modified: timeStamp,
+            ),
+            partitions: [updatedPartitionMeta],
+          );
         } else {
-          partitions.add(updatedPartitionMeta);
+          List<PartitionMeta> partitions =
+              List<PartitionMeta>.from(fileMeta.partitions ?? []);
+
+          int existingIndex =
+              partitions.indexWhere((c) => c.index == partitionIndex);
+
+          if (existingIndex >= 0) {
+            partitions[existingIndex] = updatedPartitionMeta;
+          } else {
+            partitions.add(updatedPartitionMeta);
+          }
+
+          // calculate exact change in record count and size
+          int recordsDelta = nonEmptyRecords.length -
+              (isExistingPartition ? oldRecordCount : 0);
+          int sizeDelta = updatedPartitionMeta.fileSizeInBytes -
+              (isExistingPartition ? oldSize : 0);
+
+          // update meta
+          fileMeta = fileMeta.copyWith(
+            totalRecords: fileMeta.totalRecords + recordsDelta,
+            fileSizeInBytes: fileMeta.fileSizeInBytes + sizeDelta,
+            timestamps: Timestamps(
+              created: fileMeta.timestamps.created,
+              modified: timeStamp,
+            ),
+            partitions: partitions,
+          );
+
+          // update stats in memory directly
+          _totalRecordCount += recordsDelta;
+          _totalDataSizeBytes += sizeDelta;
+
+          // mark need to save stats
+          _needSaveStats = true;
         }
 
-        // calculate exact change in record count and size
-        int recordsDelta =
-            nonEmptyRecords.length - (isExistingPartition ? oldRecordCount : 0);
-        int sizeDelta = updatedPartitionMeta.fileSizeInBytes -
-            (isExistingPartition ? oldSize : 0);
-
-        // update meta
-        fileMeta = fileMeta.copyWith(
-          totalRecords: fileMeta.totalRecords + recordsDelta,
-          fileSizeInBytes: fileMeta.fileSizeInBytes + sizeDelta,
-          timestamps: Timestamps(
-            created: fileMeta.timestamps.created,
-            modified: timeStamp,
-          ),
-          partitions: partitions,
-        );
-
-        // update stats in memory directly
-        _totalRecordCount += recordsDelta;
-        _totalDataSizeBytes += sizeDelta;
-
-        // mark need to save stats
-        _needSaveStats = true;
+        // write updated file meta
+        await updateTableFileMeta(tableName, fileMeta,
+            recalculateTotals: false);
       }
 
-      // write updated file meta
-      await updateTableFileMeta(tableName, fileMeta, recalculateTotals: false);
+      // Record operation duration
+      final endTime = DateTime.now();
+      final duration = endTime.difference(timeStamp);
+      Logger.debug(
+          'Partition $partitionIndex write completed, time: ${duration.inMilliseconds}ms',
+          label: 'TableDataManager._savePartitionFile');
+
+      // return updated partition meta
+      return updatedPartitionMeta;
+    } catch (e, stack) {
+      Logger.error('Failed to save partition file: $e\n$stack',
+          label: 'TableDataManager._savePartitionFile');
+      rethrow;
     }
-
-    // Record operation duration
-    final endTime = DateTime.now();
-    final duration = endTime.difference(timeStamp);
-    Logger.debug(
-        'Partition $partitionIndex write completed, time: ${duration.inMilliseconds}ms',
-        label: 'TableDataManager._savePartitionFile');
-
-    // return updated partition meta
-    return updatedPartitionMeta;
   }
 
   /// mark table as non-ordered range
@@ -2435,6 +2461,8 @@ class TableDataManager {
     int? maxConcurrent,
     List<int>? encryptionKey,
     int? encryptionKeyId,
+    List<int>?
+        targetPartitions, // Specify the list of partitions to process, if null, process all partitions
   }) async {
     // get table meta
     final fileMeta = await getTableFileMeta(tableName);
@@ -2453,9 +2481,35 @@ class TableDataManager {
     // collect all partition meta, for later update table meta
     final List<PartitionMeta> allPartitionMetas = [];
 
+    // Determine the list of partitions to process
+    List<int> partitionIndexesToProcess;
+    if (targetPartitions != null && targetPartitions.isNotEmpty) {
+      // If target partitions are provided, only process these partitions
+      partitionIndexesToProcess = targetPartitions;
+
+      // Verify if target partitions exist
+      final availablePartitions =
+          fileMeta.partitions!.map((p) => p.index).toSet();
+      partitionIndexesToProcess = partitionIndexesToProcess
+          .where((index) => availablePartitions.contains(index))
+          .toList();
+
+      if (partitionIndexesToProcess.isEmpty) {
+        Logger.warn(
+          'No valid partitions to process for table $tableName from targetPartitions',
+          label: 'TableDataManager.processTablePartitions',
+        );
+        return;
+      }
+    } else {
+      // Otherwise, process all partitions
+      partitionIndexesToProcess =
+          fileMeta.partitions!.map((p) => p.index).toList();
+    }
+
     // process all partitions
     await processPartitionsConcurrently<void>(
-      partitionIndexes: fileMeta.partitions!.map((p) => p.index).toList(),
+      partitionIndexes: partitionIndexesToProcess,
       processFunction: (partitionIndex) async {
         // read partition data
         final records = await readRecordsFromPartition(
@@ -2586,33 +2640,6 @@ class TableDataManager {
               500 * 1024 // only use isolate if data size is larger than 500KB
           );
 
-      // Update access time in meta
-      FileMeta? fileMeta = await getTableFileMeta(tableName);
-      if (fileMeta != null && fileMeta.partitions != null) {
-        var partitions = List<PartitionMeta>.from(fileMeta.partitions!);
-
-        for (var i = 0; i < partitions.length; i++) {
-          if (partitions[i].index == partitionIndex) {
-            partitions[i] = partitions[i].copyWith(
-              timestamps: Timestamps(
-                created: partitions[i].timestamps.created,
-                modified: partitions[i].timestamps.modified,
-              ),
-            );
-            break;
-          }
-        }
-
-        final updatedMeta = fileMeta.copyWith(
-          timestamps: Timestamps(
-            created: fileMeta.timestamps.created,
-            modified: fileMeta.timestamps.modified,
-          ),
-          partitions: partitions,
-        );
-
-        await updateTableFileMeta(tableName, updatedMeta);
-      }
 
       // if request specific record (by index position)
       if (recordIndex != null) {
@@ -3348,19 +3375,18 @@ class TableDataManager {
 
     // try to acquire lock, if locked, show message and return
     if (_dataStore.lockManager != null) {
-      // use non-blocking way to try to acquire lock
-      lockAcquired = _dataStore.lockManager!.tryAcquireExclusiveLock(lockKey);
-      if (!lockAcquired) {
-        Logger.warn('table $tableName is being processed, cannot cleanup',
-            label: 'TableDataManager.clearTable');
-        return;
-      }
+      await _dataStore.lockManager!.acquireExclusiveLock(lockKey);
+      lockAcquired = true;
     } else {
       // when no lock manager, check if table is being processed
       if (_processingTables.contains(tableName)) {
-        Logger.warn('table $tableName is being processed, cannot cleanup',
+        Logger.warn('table $tableName is being processed, waiting to cleanup',
             label: 'TableDataManager.clearTable');
-        return;
+        // wait for a while and try again
+        await Future.delayed(const Duration(milliseconds: 100));
+        while (_processingTables.contains(tableName)) {
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
       }
       _processingTables.add(tableName);
       lockAcquired = true;
