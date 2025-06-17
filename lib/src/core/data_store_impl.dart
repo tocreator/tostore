@@ -1586,7 +1586,9 @@ class DataStoreImpl {
         String? tablePath;
         try {
           tablePath = await _pathManager!.getTablePath(tableName);
-        } catch (e) {}
+        } catch (e) {
+          // Ignore errors where the table does not exist
+        }
 
         // Delete table structure
         if (schemaManager != null) {

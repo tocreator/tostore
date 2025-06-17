@@ -829,7 +829,7 @@ class PartitionAssignmentRequest {
 
 /// Result data from assigning records to partitions in an isolate.
 class PartitionAssignmentResult {
-  /// The records assigned to partitions, Map<partition index, record list>
+  /// The records assigned to partitions
   final Map<int, List<Map<String, dynamic>>> partitionRecords;
 
   /// The estimated total data size
