@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.0.7
+## 2.0.8
 
 ### Added
 - Implemented comprehensive intelligent parallel processing mechanism for database operations, boosting performance by several times
