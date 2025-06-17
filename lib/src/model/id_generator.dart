@@ -583,7 +583,7 @@ class TimeBasedIdGenerator implements IdGenerator {
       final remainingIds = neededCount % parallelCount;
 
       // Prepare parallel task list, use Map to store results for sequential merging
-      final tasks = <int, Future<TimeBasedIdGenerateResult>>{};
+      final tasks = <int, TimeBasedIdGenerateResult>{};
       int currentSequence = _sequenceMap[tableName] ?? 0;
       dynamic currentValue;
 
@@ -617,7 +617,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         );
 
         // Add task, record task index for order preservation
-        final task = ComputeManager.run(
+        final task = await ComputeManager.run(
           generateTimeBasedIds,
           request,
           useIsolate: true,
@@ -660,7 +660,7 @@ class TimeBasedIdGenerator implements IdGenerator {
       final results = <TimeBasedIdGenerateResult>[];
       // Process results in order, ensure ID order
       for (int i = 0; i < parallelCount; i++) {
-        results.add(await tasks[i]!);
+        results.add(tasks[i]!);
       }
 
       final allGeneratedIds = <String>[];

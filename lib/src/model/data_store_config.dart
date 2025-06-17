@@ -5,6 +5,19 @@ import 'dart:math';
 
 /// data store config
 class DataStoreConfig {
+  /// Static cache for system memory size in MB
+  static int _cachedSystemMemoryMB = 0;
+
+  /// Static initializer to fetch and cache system memory
+  static void _initMemoryCache() {
+    PlatformHandler.getSystemMemoryMB().then((memoryMB) {
+      _cachedSystemMemoryMB = memoryMB > 0 ? memoryMB : 2048;
+    }).catchError((_) {
+      // Default value on error
+      _cachedSystemMemoryMB = 2048;
+    });
+  }
+
   /// database path
   final String? dbPath;
 
@@ -143,6 +156,10 @@ class DataStoreConfig {
         enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled() {
     // Initialize async memory detection and cache optimization
     CacheSettings.startMemoryOptimization();
+    // Initialize our system memory cache
+    if (_cachedSystemMemoryMB <= 0) {
+      _initMemoryCache();
+    }
   }
 
   /// get default platform cache size
@@ -227,6 +244,15 @@ class DataStoreConfig {
       return 500; // Web environment, avoid browser freezing
     } else if (PlatformHandler.isMobile) {
       return 1000; // Mobile devices, balance performance and memory usage
+    } else if (PlatformHandler.isServerEnvironment) {
+      // Simple formula based primarily on CPU count
+      int cpuCount = PlatformHandler.recommendedConcurrency;
+
+      // Base size 2000 + 500 per CPU core
+      int batchSize = 2000 + (cpuCount * 500);
+
+      // Cap at reasonable maximum
+      return min(batchSize, 10000);
     } else {
       return 2000; // Desktop devices, leverage more powerful hardware
     }
@@ -238,6 +264,13 @@ class DataStoreConfig {
       return 2; // Web environment, limit concurrency
     } else if (PlatformHandler.isMobile) {
       return 5; // Mobile devices, moderate concurrency
+    } else if (PlatformHandler.isServerEnvironment) {
+      // Simple server formula: 8 base + 1 table per 2 CPU cores
+      int cpuCount = PlatformHandler.recommendedConcurrency;
+      int tablesPerFlush = 8 + (cpuCount ~/ 2);
+
+      // Cap at reasonable maximum
+      return min(tablesPerFlush, 24);
     } else {
       return 8; // Desktop devices, fully utilize multi-core processors
     }
@@ -538,23 +571,33 @@ class CacheSettings {
         // Server environment - use larger proportion of available memory for cache
         final memoryGB = memoryMB / 1024.0;
 
-        // Server memory tiering strategy (50-70% of total memory)
+        // Dynamic memory percentage calculation - the higher the memory, the lower the percentage used
+        // Use a smooth percentage decrease curve
+        // From 8GB's 40% to 1024GB's 10%
+        double percentageToUse;
+
         if (memoryGB < 8) {
-          // Small server (<8GB): 50% memory for cache, max 1GB
-          newCacheSize = min((memoryMB * 0.5).toInt(), 1024) * 1024 * 1024;
-        } else if (memoryGB < 16) {
-          // Medium server (8-16GB): max 2GB cache
-          newCacheSize = min((memoryMB * 0.55).toInt(), 2048) * 1024 * 1024;
-        } else if (memoryGB < 32) {
-          // Large server (16-32GB): max 5GB cache
-          newCacheSize = min((memoryMB * 0.6).toInt(), 5120) * 1024 * 1024;
-        } else if (memoryGB < 64) {
-          // Extra large server (32-64GB): max 10GB cache
-          newCacheSize = min((memoryMB * 0.65).toInt(), 10240) * 1024 * 1024;
+          // Small server (<8GB) - fixed 40%
+          percentageToUse = 0.40;
         } else {
-          // Enterprise server (>64GB): max 20GB cache
-          newCacheSize = min((memoryMB * 0.7).toInt(), 20480) * 1024 * 1024;
+          // Use smooth transition: as memory increases, percentage decreases
+          // Basic formula: 40% - linear reduction rate * (memoryGB - 8) / 100
+          // Each increase of 100GB memory, the percentage decreases by 3%
+          double reductionRate = (memoryGB - 8) / 100.0 * 0.03;
+          percentageToUse = 0.40 - reductionRate;
+
+          // Ensure at least 10%
+          percentageToUse = max(percentageToUse, 0.10);
         }
+
+        // Calculate cache size (MB)
+        int cacheSizeMB = (memoryMB * percentageToUse).toInt();
+
+        // Set minimum and maximum limits to avoid extreme values
+        cacheSizeMB = max(cacheSizeMB, 512); // At least 512MB
+
+        // Convert to bytes
+        newCacheSize = cacheSizeMB * 1024 * 1024;
       } else {
         // Adjust based on available memory for desktop devices
         if (memoryMB < 2048) {

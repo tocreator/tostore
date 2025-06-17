@@ -7,42 +7,15 @@ English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/tra
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
-Tostore is a high-performance distributed data storage engine that builds intelligent data networks using multi-partition parallel mechanisms and interconnected topology. It provides precise table structure change detection, encryption protection, and multi-space architecture. The Isolate parallel processing mechanism fully unleashes multi-core performance, while Dart's cross-platform nature naturally supports collaboration from mobile edge devices to the cloud. With various distributed primary key algorithms and node horizontal scaling capabilities, Tostore provides a distributed data foundation for immersive virtual-real integration, multimodal interaction, three-dimensional spatial features, generative AI, and semantic vector space modeling.
+
 
 ## Why Choose Tostore?
 
-### 1. Partition Parallel Mechanism vs Single File Storage
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Intelligent partitioning mechanism, data distributed across multiple appropriately sized files | ❌ Single data file becomes bloated as data grows, performance drops dramatically |
-| ✅ Only reads relevant partition data, query performance decoupled from total data volume | ❌ Even querying a single record requires loading the entire data file |
-| ✅ Maintains millisecond-level response with TB-scale data | ❌ Performance noticeably decreases on mobile devices after data exceeds 5MB |
-| ✅ True multi-core parallel processing via Isolates, multiplying performance | ❌ Single file cannot be processed concurrently, wasting CPU resources |
 
-### 2. Embedded Deep Integration vs Independent Data Storage
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Pure Dart language, seamless integration with Flutter/Dart projects | ❌ Requires learning SQL or specific query languages, increasing learning costs |
-| ✅ Unified technology stack for front and back end, same code throughout the stack | ❌ Multiple programming languages and tech stacks for front and back end, high switching costs |
-| ✅ Chain API consistent with modern programming styles, superior development experience | ❌ String concatenation for SQL prone to attacks and errors, lacks type safety |
-| ✅ Direct use of Dart objects, no need for complex ORM mapping | ❌ Complex object-relational mapping, high development and maintenance costs |
+Tostore is the only distributed vector database storage engine in the Dart/Flutter ecosystem with exceptional performance. It uses multi-partition parallel mechanisms and interconnected topology to build intelligent data networks, providing precise table structure change detection, encryption protection, and multi-space architecture. The Isolate parallel processing mechanism fully unleashes multi-core performance, while Dart's cross-platform nature naturally supports collaboration from mobile edge devices to the cloud. With various distributed primary key algorithms and node horizontal scaling capabilities, Tostore provides a distributed data foundation for immersive interactions, multimodal applications, spatial computing, generative AI, and semantic vector space modeling.
 
-### 3. Precise Table Structure Change Detection vs Manual Migration Management
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Automatically detects table structure changes, no manual version management needed | ❌ Relies on manual version control and explicit migration code |
-| ✅ Millisecond-level detection and automatic data migration | ❌ Requires writing upgrade migration logic for each version |
-| ✅ Precisely identifies table field renaming with zero data loss | ❌ Renaming table fields is complex and prone to data loss |
-| ✅ Fully automated structure upgrades, imperceptible during business operations | ❌ Complex upgrade logic as versions increase, difficult maintenance |
 
-### 4. Multi-space Architecture vs Single Storage Space
-| Tostore | Traditional Databases |
-|:---------|:-----------|
-| ✅ Multi-space architecture, perfect isolation of different user data | ❌ Single storage space, mixed storage of multi-user data |
-| ✅ One line of code to switch spaces, simple and efficient | ❌ Requires creating multiple database instances or complex isolation logic |
-| ✅ Flexible space isolation and global data sharing mechanism | ❌ Difficult to balance user data isolation and sharing |
-| ✅ Simple API for cross-space data copying and migration | ❌ Tenant migration or data copying operations are cumbersome and complex |
-| ✅ Queries automatically limited to current space, no additional filtering needed | ❌ Queries for different users require complex filtering conditions |
+.......  From fingertips to cloud applications, Tostore helps you unleash data computing power, empowering the future.
 
 
 

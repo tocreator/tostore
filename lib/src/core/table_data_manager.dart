@@ -1251,8 +1251,6 @@ class TableDataManager {
         return null;
       }
     } catch (e) {
-      Logger.error('Failed to get table path: $e',
-          label: 'TableDataManager.getTableFileMeta');
       return null;
     }
   }
@@ -2639,7 +2637,6 @@ class TableDataManager {
           useIsolate: bytes.length >
               500 * 1024 // only use isolate if data size is larger than 500KB
           );
-
 
       // if request specific record (by index position)
       if (recordIndex != null) {

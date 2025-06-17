@@ -476,7 +476,7 @@ class PartitionRangeAnalysisResult {
       isOrdered: isOrdered ?? this.isOrdered,
     );
   }
-  
+
   /// Convert to a map for serialization
   Map<String, dynamic> toJson() {
     return {
@@ -486,22 +486,22 @@ class PartitionRangeAnalysisResult {
       'isOrdered': isOrdered,
     };
   }
-  
+
   /// Create from a map after deserialization
   factory PartitionRangeAnalysisResult.fromJson(Map<String, dynamic> json) {
     try {
       return PartitionRangeAnalysisResult(
         minPk: json['minPk'],
         maxPk: json['maxPk'],
-        recordCount: json['recordCount'] is int 
-            ? json['recordCount'] 
+        recordCount: json['recordCount'] is int
+            ? json['recordCount']
             : int.tryParse(json['recordCount'].toString()) ?? 0,
-        isOrdered: json['isOrdered'] is bool 
-            ? json['isOrdered'] 
+        isOrdered: json['isOrdered'] is bool
+            ? json['isOrdered']
             : json['isOrdered'].toString().toLowerCase() == 'true',
       );
     } catch (e) {
-      Logger.error('Failed to parse PartitionRangeAnalysisResult: $e', 
+      Logger.error('Failed to parse PartitionRangeAnalysisResult: $e',
           label: 'PartitionRangeAnalysisResult.fromJson');
       return PartitionRangeAnalysisResult(recordCount: 0, isOrdered: false);
     }
@@ -734,7 +734,8 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
             isOrdered = false;
           }
         } catch (compareError) {
-          Logger.warn('Failed to compare key values for existing partition: $compareError',
+          Logger.warn(
+              'Failed to compare key values for existing partition: $compareError',
               label: 'analyzePartitionKeyRange');
           isOrdered = false; // Conservative approach on comparison error
         }
@@ -757,7 +758,8 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
             }
           }
         } catch (compareError) {
-          Logger.warn('Failed to compare key values with max index partition: $compareError',
+          Logger.warn(
+              'Failed to compare key values with max index partition: $compareError',
               label: 'analyzePartitionKeyRange');
           isOrdered = false; // Conservative approach on comparison error
         }
@@ -771,12 +773,12 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       recordCount: nonEmptyRecords.length,
       isOrdered: isOrdered,
     );
-    
+
     return result;
   } catch (e) {
     Logger.error('Failed to analyze partition key range: $e',
         label: 'analyzePartitionKeyRange');
-        
+
     // Even in case of error, ensure the return type is correct
     try {
       return PartitionRangeAnalysisResult(

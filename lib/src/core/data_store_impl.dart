@@ -1586,10 +1586,7 @@ class DataStoreImpl {
         String? tablePath;
         try {
           tablePath = await _pathManager!.getTablePath(tableName);
-        } catch (e) {
-          Logger.warn('Failed to get table path: $e',
-              label: 'DataStore.dropTable');
-        }
+        } catch (e) {}
 
         // Delete table structure
         if (schemaManager != null) {
@@ -2008,7 +2005,8 @@ class DataStoreImpl {
   /// load all records
   Future<List<Map<String, dynamic>>> _loadAllRecords(String tableName) async {
     final results = <Map<String, dynamic>>[];
-    final resultMap = <String, Map<String, dynamic>>{}; // Use Map to avoid duplicates
+    final resultMap =
+        <String, Map<String, dynamic>>{}; // Use Map to avoid duplicates
 
     try {
       // Get table schema to get primary key
@@ -2016,9 +2014,9 @@ class DataStoreImpl {
       if (schema == null) {
         return results;
       }
-      
+
       final primaryKey = schema.primaryKey;
-      
+
       // Use parallel processing instead of stream processing
       await tableDataManager.processTablePartitions(
         tableName: tableName,
@@ -2028,13 +2026,14 @@ class DataStoreImpl {
           for (var record in records) {
             if (record[primaryKey] != null) {
               // Use primary key as Map key to avoid duplicate records
-              resultMap[record[primaryKey].toString()] = Map<String, dynamic>.from(record);
+              resultMap[record[primaryKey].toString()] =
+                  Map<String, dynamic>.from(record);
             }
           }
           return records; // Return original records, do not modify
         },
       );
-      
+
       // Return result list
       results.addAll(resultMap.values);
     } catch (e) {
