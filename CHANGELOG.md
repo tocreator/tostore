@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.9
+
+### Added
+- Added `DefaultValueType` to support default values that automatically fill current timestamp
+
+### Changed
+- Enhanced B+Tree index structure for optimized retrieval efficiency and data access speed
+- Improved data repair mechanisms for better consistency and reliability
+- Optimized hash calculation algorithm for table structure comparison
+- Improved overall system stability and reliability with comprehensive testing under high-load conditions
+
+### Fixed
+- Fixed issues during index deletion process
+
 ## 2.0.8
 
 ### Added
@@ -15,7 +29,7 @@ All notable changes to this project will be documented in this file.
 - Optimized buffer management with improved write/delete handling
 - Enhanced memory usage through dynamic allocation based on workload patterns
 - Refined error handling and recovery processes for increased reliability
-- Improved overall system stability and reliability with comprehensive testing under high-load conditions
+
 
 ### Fixed
 - Resolved concurrency issues in high-load environments

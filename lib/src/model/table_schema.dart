@@ -425,8 +425,14 @@ class TableSchema {
       buffer.addByte(0); // isOrdered not set
     }
 
-    // Add sequential increment configuration
-    if (config.sequentialConfig != null) {
+    // Check if it's the default configuration
+    final isDefaultConfig = config.sequentialConfig != null &&
+        config.sequentialConfig!.initialValue == 1 &&
+        config.sequentialConfig!.increment == 1 &&
+        !config.sequentialConfig!.useRandomIncrement;
+
+    // If it's the default configuration or null, it's considered to have no configuration
+    if (config.sequentialConfig != null && !isDefaultConfig) {
       buffer.addByte(1); // Has configuration
       final cfg = config.sequentialConfig!;
       _addInt32ToBuffer(buffer, cfg.initialValue);
@@ -443,6 +449,14 @@ class TableSchema {
     buffer.addByte(field.type.index);
     buffer.addByte(field.nullable ? 1 : 0);
     buffer.addByte(field.unique ? 1 : 0);
+
+    // Add defaultValueType
+    buffer.addByte(field.defaultValueType.index);
+
+    // Only check if defaultValue exists but DO NOT include its content
+    buffer.addByte(field.defaultValue != null ? 1 : 0);
+
+    // to ensure consistent hash values regardless of dynamic content
 
     // Special handling for BigInt type to ensure it can be recognized in table structure comparison
     if (field.type == DataType.bigInt) {
@@ -472,6 +486,14 @@ class TableSchema {
     if (field.fieldId != null) {
       buffer.addByte(1);
       _addStringToBuffer(buffer, field.fieldId!);
+    } else {
+      buffer.addByte(0);
+    }
+
+    // Add comment information
+    if (field.comment != null) {
+      buffer.addByte(1);
+      _addStringToBuffer(buffer, field.comment!);
     } else {
       buffer.addByte(0);
     }
@@ -539,6 +561,9 @@ class FieldSchema {
   final String?
       fieldId; // Unique identifier for fields, used for rename detection
 
+  /// Default value type, used for special default value processing (e.g. timestamp)
+  final DefaultValueType defaultValueType;
+
   /// Configuration for vector fields (only valid when type is DataType.vector)
   final VectorFieldConfig? vectorConfig;
 
@@ -555,6 +580,7 @@ class FieldSchema {
     this.comment,
     this.fieldId,
     this.vectorConfig,
+    this.defaultValueType = DefaultValueType.none,
   });
 
   /// Create copy with modifications
@@ -571,6 +597,7 @@ class FieldSchema {
     String? comment,
     String? fieldId,
     VectorFieldConfig? vectorConfig,
+    DefaultValueType? defaultValueType,
   }) {
     return FieldSchema(
       name: name ?? this.name,
@@ -586,6 +613,7 @@ class FieldSchema {
       comment: comment ?? this.comment,
       fieldId: fieldId ?? this.fieldId,
       vectorConfig: vectorConfig ?? this.vectorConfig,
+      defaultValueType: defaultValueType ?? this.defaultValueType,
     );
   }
 
@@ -603,6 +631,9 @@ class FieldSchema {
       'comment': comment,
       if (fieldId != null) 'fieldId': fieldId,
       if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
+      // Only serialize if not none
+      if (defaultValueType != DefaultValueType.none)
+        'defaultValueType': defaultValueType.toString().split('.').last,
     };
   }
 
@@ -618,6 +649,19 @@ class FieldSchema {
         );
       } catch (_) {
         return DataType.text;
+      }
+    }
+
+    // Parse default value type
+    DefaultValueType getDefaultValueType() {
+      final typeStr = json['defaultValueType'] as String?;
+      if (typeStr == null) return DefaultValueType.none;
+
+      switch (typeStr.toLowerCase()) {
+        case 'currenttimestamp':
+          return DefaultValueType.currentTimestamp;
+        default:
+          return DefaultValueType.none;
       }
     }
 
@@ -643,14 +687,32 @@ class FieldSchema {
       comment: json['comment'] as String?,
       fieldId: json['fieldId'] as String?,
       vectorConfig: vectorConfig,
+      defaultValueType: getDefaultValueType(),
     );
   }
 
   /// Get default value for this field
   dynamic getDefaultValue() {
-    if (defaultValue != null) {
-      return defaultValue;
+    // handle special default value type
+    if (defaultValueType == DefaultValueType.currentTimestamp) {
+      if (type == DataType.datetime) {
+        return DateTime.now().toIso8601String();
+      }
+      if (type == DataType.integer) {
+        return DateTime.now().millisecondsSinceEpoch;
+      }
+      if (type == DataType.bigInt) {
+        return BigInt.from(DateTime.now().millisecondsSinceEpoch);
+      }
+      return DateTime.now().toIso8601String();
     }
+
+    // use static default value
+    if (defaultValue != null) {
+      return _convertValueInternal(defaultValue);
+    }
+
+    // handle not nullable constraint
     if (!nullable) {
       switch (type) {
         case DataType.integer:
@@ -673,7 +735,195 @@ class FieldSchema {
           return const VectorData([]); // Empty vector as default
       }
     }
+
+    // allow null and no default value, return null
     return null;
+  }
+
+  /// Get field value: handle null value and execute type conversion
+  dynamic convertValue(dynamic value) {
+    // handle null value
+    if (value == null) {
+      return getDefaultValue();
+    }
+
+    // execute type conversion for non-null value
+    return _convertValueInternal(value);
+  }
+
+  /// Type conversion (internal method)
+  dynamic _convertValueInternal(dynamic value) {
+    if (value == null) return null;
+
+    switch (type) {
+      case DataType.integer:
+        if (value is int) return value;
+        if (value is double) return value.round();
+        if (value is String) return int.tryParse(value);
+        if (value is bool) return value ? 1 : 0;
+        if (value is DateTime) {
+          return value.millisecondsSinceEpoch;
+        }
+        if (value is BigInt) {
+          // Try to convert BigInt to int, return null or max value if out of range
+          if (value <= BigInt.from(9007199254740991) &&
+              value >= BigInt.from(-9007199254740991)) {
+            return value.toInt();
+          }
+          return null; // Out of range
+        }
+        return null;
+      case DataType.bigInt:
+        if (value is BigInt) return value;
+        if (value is int) return BigInt.from(value);
+        if (value is String) {
+          try {
+            return BigInt.parse(value);
+          } catch (_) {
+            return null;
+          }
+        }
+        if (value is bool) {
+          return value ? BigInt.from(1) : BigInt.from(0);
+        }
+        if (value is DateTime) {
+          return BigInt.from(value.millisecondsSinceEpoch);
+        }
+        return null;
+      case DataType.double:
+        if (value is double) return value;
+        if (value is int) return value.toDouble();
+        if (value is String) return double.tryParse(value);
+        if (value is bool) return value ? 1.0 : 0.0;
+        if (value is DateTime) {
+          return value.millisecondsSinceEpoch.toDouble();
+        }
+        if (value is BigInt) {
+          // Try to convert BigInt to double, may lose precision
+          try {
+            return value.toDouble();
+          } catch (e) {
+            return null;
+          }
+        }
+        return null;
+      case DataType.text:
+        if (value is String) return value;
+        if (value is DateTime) {
+          try {
+            return value.toIso8601String();
+          } catch (e) {
+            Logger.warn(
+              'Failed to convert DateTime to string: $value',
+              label: 'DataStore._toString',
+            );
+            return null;
+          }
+        }
+        if (value is BigInt) {
+          return value.toString();
+        }
+        return value?.toString();
+      case DataType.blob:
+        if (value is Uint8List) return value;
+        if (value is String) {
+          return Uint8List.fromList(utf8.encode(value));
+        }
+        if (value is List<int>) return Uint8List.fromList(value);
+        return null;
+      case DataType.boolean:
+        if (value is bool) return value;
+        if (value is int) return value != 0;
+        if (value is double) return value != 0.0;
+        if (value is String) {
+          final lower = value.toLowerCase();
+          return lower == 'true' || lower == '1' || lower == 'yes';
+        }
+        if (value is BigInt) return value != BigInt.zero;
+        return null;
+      case DataType.datetime:
+        if (value == null) return null;
+        if (value is DateTime) return value.toIso8601String();
+        if (value is String) {
+          try {
+            return DateTime.parse(value).toIso8601String();
+          } catch (e) {
+            Logger.warn(
+              'Failed to parse DateTime from string: $value',
+              label: 'DataStore._toDateTimeString',
+            );
+            return null;
+          }
+        }
+        if (value is int) {
+          try {
+            return DateTime.fromMillisecondsSinceEpoch(value).toIso8601String();
+          } catch (e) {
+            Logger.warn(
+              'Failed to convert timestamp to DateTime: $value',
+              label: 'DataStore._toDateTimeString',
+            );
+            return null;
+          }
+        }
+        if (value is BigInt) {
+          try {
+            if (value <= BigInt.from(8640000000000000) &&
+                value >= BigInt.from(-8640000000000000)) {
+              return DateTime.fromMillisecondsSinceEpoch(value.toInt())
+                  .toIso8601String();
+            }
+            return null; // Out of range
+          } catch (e) {
+            Logger.warn(
+              'Failed to convert BigInt to DateTime: $value',
+              label: 'DataStore._toDateTimeString',
+            );
+            return null;
+          }
+        }
+        return null;
+      case DataType.array:
+        if (value is List) return value;
+        if (value is String) {
+          try {
+            return jsonDecode(value) as List?;
+          } catch (_) {
+            return [value];
+          }
+        }
+        return value == null ? null : [value];
+      case DataType.vector:
+        if (value is VectorData) return value;
+        if (value is List && value.every((v) => v is num)) {
+          return VectorData.fromList(value.cast<num>());
+        }
+        if (value is Uint8List) {
+          try {
+            return VectorData.fromBytes(value);
+          } catch (e) {
+            Logger.warn(
+              'Failed to convert binary data to vector: $e',
+              label: 'DataStore._toVector',
+            );
+            return null;
+          }
+        }
+        if (value is String) {
+          try {
+            final jsonList = jsonDecode(value);
+            if (jsonList is List && jsonList.every((v) => v is num)) {
+              return VectorData.fromList(jsonList.cast<num>());
+            }
+          } catch (e) {
+            Logger.warn(
+              'Failed to parse vector from string: $value',
+              label: 'DataStore._toVector',
+            );
+          }
+        }
+        return null;
+    }
   }
 
   /// Validate value against field constraints
@@ -773,184 +1023,6 @@ class FieldSchema {
         return value is VectorData ||
             (value is List && value.every((v) => v is num)) ||
             value is Uint8List;
-    }
-  }
-
-  /// Convert value between data types
-  dynamic convertValue({dynamic value, DataType? targetType}) {
-    if (defaultValue == null && value == null) return null;
-    final valueTemp = value ?? defaultValue;
-    targetType ??= type;
-
-    switch (targetType) {
-      case DataType.integer:
-        if (valueTemp is int) return valueTemp;
-        if (valueTemp is double) return valueTemp.round();
-        if (valueTemp is String) return int.tryParse(valueTemp);
-        if (valueTemp is bool) return valueTemp ? 1 : 0;
-        if (valueTemp is DateTime) {
-          return valueTemp.millisecondsSinceEpoch;
-        }
-        if (valueTemp is BigInt) {
-          // Try to convert BigInt to int, return null or max value if out of range
-          if (valueTemp <= BigInt.from(9007199254740991) &&
-              valueTemp >= BigInt.from(-9007199254740991)) {
-            return valueTemp.toInt();
-          }
-          return null; // Out of range
-        }
-        return null;
-      case DataType.bigInt:
-        if (valueTemp is BigInt) return valueTemp;
-        if (valueTemp is int) return BigInt.from(valueTemp);
-        if (valueTemp is String) {
-          try {
-            return BigInt.parse(valueTemp);
-          } catch (_) {
-            return null;
-          }
-        }
-        if (valueTemp is bool) {
-          return valueTemp ? BigInt.from(1) : BigInt.from(0);
-        }
-        if (valueTemp is DateTime) {
-          return BigInt.from(valueTemp.millisecondsSinceEpoch);
-        }
-        return null;
-      case DataType.double:
-        if (valueTemp is double) return valueTemp;
-        if (valueTemp is int) return valueTemp.toDouble();
-        if (valueTemp is String) return double.tryParse(valueTemp);
-        if (valueTemp is bool) return valueTemp ? 1.0 : 0.0;
-        if (valueTemp is DateTime) {
-          return valueTemp.millisecondsSinceEpoch.toDouble();
-        }
-        if (valueTemp is BigInt) {
-          // Try to convert BigInt to double, may lose precision
-          try {
-            return valueTemp.toDouble();
-          } catch (e) {
-            return null;
-          }
-        }
-        return null;
-      case DataType.text:
-        if (valueTemp is String) return valueTemp;
-        if (valueTemp is DateTime) {
-          try {
-            return valueTemp.toIso8601String();
-          } catch (e) {
-            Logger.warn(
-              'Failed to convert DateTime to string: $valueTemp',
-              label: 'DataStore._toString',
-            );
-            return null;
-          }
-        }
-        if (valueTemp is BigInt) {
-          return valueTemp.toString();
-        }
-        return valueTemp?.toString();
-      case DataType.blob:
-        if (valueTemp is Uint8List) return valueTemp;
-        if (valueTemp is String) {
-          return Uint8List.fromList(utf8.encode(valueTemp));
-        }
-        if (valueTemp is List<int>) return Uint8List.fromList(valueTemp);
-        return null;
-      case DataType.boolean:
-        if (valueTemp is bool) return valueTemp;
-        if (valueTemp is int) return valueTemp != 0;
-        if (valueTemp is double) return valueTemp != 0.0;
-        if (valueTemp is String) {
-          final lower = valueTemp.toLowerCase();
-          return lower == 'true' || lower == '1' || lower == 'yes';
-        }
-        if (valueTemp is BigInt) return valueTemp != BigInt.zero;
-        return null;
-      case DataType.datetime:
-        if (valueTemp == null) return null;
-        if (valueTemp is DateTime) return valueTemp.toIso8601String();
-        if (valueTemp is String) {
-          try {
-            return DateTime.parse(valueTemp).toIso8601String();
-          } catch (e) {
-            Logger.warn(
-              'Failed to parse DateTime from string: $valueTemp',
-              label: 'DataStore._toDateTimeString',
-            );
-            return null;
-          }
-        }
-        if (valueTemp is int) {
-          try {
-            return DateTime.fromMillisecondsSinceEpoch(valueTemp)
-                .toIso8601String();
-          } catch (e) {
-            Logger.warn(
-              'Failed to convert timestamp to DateTime: $valueTemp',
-              label: 'DataStore._toDateTimeString',
-            );
-            return null;
-          }
-        }
-        if (valueTemp is BigInt) {
-          try {
-            if (valueTemp <= BigInt.from(8640000000000000) &&
-                valueTemp >= BigInt.from(-8640000000000000)) {
-              return DateTime.fromMillisecondsSinceEpoch(valueTemp.toInt())
-                  .toIso8601String();
-            }
-            return null; // Out of range
-          } catch (e) {
-            Logger.warn(
-              'Failed to convert BigInt to DateTime: $valueTemp',
-              label: 'DataStore._toDateTimeString',
-            );
-            return null;
-          }
-        }
-        return null;
-      case DataType.array:
-        if (valueTemp is List) return valueTemp;
-        if (valueTemp is String) {
-          try {
-            return jsonDecode(valueTemp) as List?;
-          } catch (_) {
-            return [valueTemp];
-          }
-        }
-        return valueTemp == null ? null : [valueTemp];
-      case DataType.vector:
-        if (valueTemp is VectorData) return valueTemp;
-        if (valueTemp is List && valueTemp.every((v) => v is num)) {
-          return VectorData.fromList(valueTemp.cast<num>());
-        }
-        if (valueTemp is Uint8List) {
-          try {
-            return VectorData.fromBytes(valueTemp);
-          } catch (e) {
-            Logger.warn(
-              'Failed to convert binary data to vector: $e',
-              label: 'DataStore._toVector',
-            );
-            return null;
-          }
-        }
-        if (valueTemp is String) {
-          try {
-            final jsonList = jsonDecode(valueTemp);
-            if (jsonList is List && jsonList.every((v) => v is num)) {
-              return VectorData.fromList(jsonList.cast<num>());
-            }
-          } catch (e) {
-            Logger.warn(
-              'Failed to parse vector from string: $valueTemp',
-              label: 'DataStore._toVector',
-            );
-          }
-        }
-        return null;
     }
   }
 }
@@ -1065,6 +1137,15 @@ enum IndexType {
   hash, // hash index
   bitmap, // bitmap index
   vector, // vector similarity index
+}
+
+/// Field default value type
+enum DefaultValueType {
+  /// No special default value, use defaultValue static value
+  none,
+
+  /// Use current timestamp
+  currentTimestamp,
 }
 
 /// Primary key generation method

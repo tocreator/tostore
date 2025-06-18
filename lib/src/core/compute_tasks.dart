@@ -253,25 +253,25 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     final processedKeys = <String>[];
 
     // Process each key to delete
-    for (final key in request.keysToProcess) {
+    for (final compositeKey in request.keysToProcess) {
       try {
-        final indexEntry = request.entriesToDelete[key];
-        if (indexEntry == null) continue;
+        // Get index entry
+        final indexEntry = request.entriesToDelete[compositeKey];
+        if (indexEntry == null) {
+          continue;
+        }
 
-        final existingValues = await btree.search(key);
-        if (existingValues.isEmpty) continue;
-
+        // Get actual index key and record pointer from IndexBufferEntry
+        final actualIndexKey = indexEntry.indexEntry.indexKey;
         final recordPointer = indexEntry.indexEntry.recordPointer.toString();
-        if (existingValues.contains(recordPointer)) {
-          await btree.delete(key, recordPointer);
-          isModified = true;
-          processedKeys.add(key);
 
-          // For unique indexes, we can stop after finding the first match
-          if (request.isUnique) break;
+        // Delete the index entry
+        if (await btree.delete(actualIndexKey, recordPointer)) {
+          isModified = true;
+          processedKeys.add(compositeKey);
         }
       } catch (keyError) {
-        Logger.warn('Failed to process delete for key $key: $keyError',
+        Logger.warn('Failed to process delete for key $compositeKey: $keyError',
             label: 'processIndexDelete');
         // Continue with next key
         continue;
@@ -1663,20 +1663,35 @@ Map<String, dynamic> _applyFieldModification(
     name: fieldUpdate.name,
     type: fieldUpdate.type ?? (oldFieldSchema?.type ?? DataType.text),
     nullable: fieldUpdate.nullable ?? (oldFieldSchema?.nullable ?? true),
-    defaultValue: fieldUpdate.defaultValue ?? oldFieldSchema?.defaultValue,
+    defaultValue: fieldUpdate.isExplicitlySet('defaultValue')
+        ? fieldUpdate.defaultValue
+        : oldFieldSchema?.defaultValue,
     unique: fieldUpdate.unique ?? (oldFieldSchema?.unique ?? false),
-    maxLength: fieldUpdate.maxLength ?? oldFieldSchema?.maxLength,
-    minLength: fieldUpdate.minLength ?? oldFieldSchema?.minLength,
-    minValue: fieldUpdate.minValue ?? oldFieldSchema?.minValue,
-    maxValue: fieldUpdate.maxValue ?? oldFieldSchema?.maxValue,
-    comment: fieldUpdate.comment ?? oldFieldSchema?.comment,
+    maxLength: fieldUpdate.isExplicitlySet('maxLength')
+        ? fieldUpdate.maxLength
+        : oldFieldSchema?.maxLength,
+    minLength: fieldUpdate.isExplicitlySet('minLength')
+        ? fieldUpdate.minLength
+        : oldFieldSchema?.minLength,
+    minValue: fieldUpdate.isExplicitlySet('minValue')
+        ? fieldUpdate.minValue
+        : oldFieldSchema?.minValue,
+    maxValue: fieldUpdate.isExplicitlySet('maxValue')
+        ? fieldUpdate.maxValue
+        : oldFieldSchema?.maxValue,
+    comment: fieldUpdate.isExplicitlySet('comment')
+        ? fieldUpdate.comment
+        : oldFieldSchema?.comment,
+    defaultValueType: fieldUpdate.isExplicitlySet('defaultValueType')
+        ? (fieldUpdate.defaultValueType ?? DefaultValueType.none)
+        : (oldFieldSchema?.defaultValueType ?? DefaultValueType.none),
   );
 
   // 1. Process type changes
   if (fieldUpdate.type != null) {
     try {
       record[fieldUpdate.name] = fieldSchema.convertValue(
-        value: record[fieldUpdate.name],
+        record[fieldUpdate.name],
       );
     } catch (e) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
@@ -1699,7 +1714,8 @@ Map<String, dynamic> _applyFieldModification(
   }
 
   // 3. Process default value changes
-  if (fieldUpdate.defaultValue != null && record[fieldUpdate.name] == null) {
+  if (fieldUpdate.isExplicitlySet('defaultValue') &&
+      record[fieldUpdate.name] == null) {
     record[fieldUpdate.name] = fieldUpdate.defaultValue;
     Logger.debug(
       'Field ${fieldUpdate.name} has new default value, applied to null value',
@@ -1716,10 +1732,12 @@ Map<String, dynamic> _applyFieldModification(
   }
 
   // 5. Process length constraint changes (only log, do not directly process data itself)
-  if ((fieldUpdate.maxLength != null || fieldUpdate.minLength != null) &&
+  if ((fieldUpdate.isExplicitlySet('maxLength') ||
+          fieldUpdate.isExplicitlySet('minLength')) &&
       record[fieldUpdate.name] is String) {
     String value = record[fieldUpdate.name];
-    if (fieldUpdate.maxLength != null &&
+    if (fieldUpdate.isExplicitlySet('maxLength') &&
+        fieldUpdate.maxLength != null &&
         value.length > fieldUpdate.maxLength!) {
       record[fieldUpdate.name] = value.substring(0, fieldUpdate.maxLength!);
       Logger.warn(
@@ -1727,7 +1745,8 @@ Map<String, dynamic> _applyFieldModification(
         label: 'processMigrationRecords._applyFieldModification',
       );
     }
-    if (fieldUpdate.minLength != null &&
+    if (fieldUpdate.isExplicitlySet('minLength') &&
+        fieldUpdate.minLength != null &&
         value.length < fieldUpdate.minLength!) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
       Logger.warn(
@@ -1738,11 +1757,14 @@ Map<String, dynamic> _applyFieldModification(
   }
 
   // 6. Process value range constraint changes (only log, do not directly process data itself)
-  if ((fieldUpdate.minValue != null || fieldUpdate.maxValue != null) &&
+  if ((fieldUpdate.isExplicitlySet('minValue') ||
+          fieldUpdate.isExplicitlySet('maxValue')) &&
       record[fieldUpdate.name] is num) {
     num value = record[fieldUpdate.name];
 
-    if (fieldUpdate.minValue != null && value < fieldUpdate.minValue!) {
+    if (fieldUpdate.isExplicitlySet('minValue') &&
+        fieldUpdate.minValue != null &&
+        value < fieldUpdate.minValue!) {
       record[fieldUpdate.name] = fieldUpdate.minValue;
       Logger.warn(
         'Field ${fieldUpdate.name} below min value of ${fieldUpdate.minValue}, set to min',
@@ -1750,7 +1772,9 @@ Map<String, dynamic> _applyFieldModification(
       );
     }
 
-    if (fieldUpdate.maxValue != null && value > fieldUpdate.maxValue!) {
+    if (fieldUpdate.isExplicitlySet('maxValue') &&
+        fieldUpdate.maxValue != null &&
+        value > fieldUpdate.maxValue!) {
       record[fieldUpdate.name] = fieldUpdate.maxValue;
       Logger.warn(
         'Field ${fieldUpdate.name} exceeds max value of ${fieldUpdate.maxValue}, set to max',

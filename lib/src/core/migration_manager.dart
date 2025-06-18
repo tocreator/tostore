@@ -791,11 +791,12 @@ class MigrationManager {
             nullable: newField.nullable,
             defaultValue: newField.defaultValue,
             unique: newField.unique,
-            maxLength: newField.maxLength,
+            comment: newField.comment,
             minLength: newField.minLength,
+            maxLength: newField.maxLength,
             minValue: newField.minValue,
             maxValue: newField.maxValue,
-            comment: newField.comment,
+            defaultValueType: newField.defaultValueType,
           ),
         ));
       }
@@ -1122,6 +1123,7 @@ class MigrationManager {
       return false;
     }
 
+    // check if field is modified
     return oldField.type != newField.type ||
         oldField.nullable != newField.nullable ||
         oldField.unique != newField.unique ||
@@ -1130,7 +1132,8 @@ class MigrationManager {
         oldField.minValue != newField.minValue ||
         oldField.maxValue != newField.maxValue ||
         !areDefaultValuesEqual() ||
-        oldField.comment != newField.comment;
+        oldField.comment != newField.comment ||
+        oldField.defaultValueType != newField.defaultValueType;
   }
 
   /// Get next directory index for migration tasks

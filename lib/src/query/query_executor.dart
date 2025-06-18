@@ -801,7 +801,9 @@ class QueryExecutor {
                 // Apply filter conditions
                 for (var record in records) {
                   if (condition.matches(record)) {
-                    resultMap[record[primaryKey].toString()] = record;
+                    if (record.isNotEmpty) {
+                      resultMap[record[primaryKey].toString()] = record;
+                    }
 
                     // If exact primary key match is found, throw exception to immediately terminate all partition processing
                     if (exactPkMatch != null &&
@@ -815,7 +817,9 @@ class QueryExecutor {
               } else {
                 // No filter conditions, add all records
                 for (var record in records) {
-                  resultMap[record[primaryKey].toString()] = record;
+                  if (record.isNotEmpty) {
+                    resultMap[record[primaryKey].toString()] = record;
+                  }
                 }
               }
 
@@ -882,8 +886,10 @@ class QueryExecutor {
           onlyRead: true,
           processFunction: (records, partitionIndex) async {
             for (var record in records) {
-              if (condition == null || condition.matches(record)) {
-                resultMap[record[primaryKey].toString()] = record;
+              if (record.isNotEmpty) {
+                if (condition == null || condition.matches(record)) {
+                  resultMap[record[primaryKey].toString()] = record;
+                }
               }
             }
             return records;

@@ -65,6 +65,7 @@ class SchemaBuilder with FutureBuilderMixin {
     num? minValue,
     num? maxValue,
     String? comment,
+    DefaultValueType? defaultValueType,
   }) {
     _operations.add(MigrationOperation(
       type: MigrationType.modifyField,
@@ -80,6 +81,7 @@ class SchemaBuilder with FutureBuilderMixin {
         maxLength: maxLength,
         minValue: minValue,
         maxValue: maxValue,
+        defaultValueType: defaultValueType,
       ),
     ));
     return this;

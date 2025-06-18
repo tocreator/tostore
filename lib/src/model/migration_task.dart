@@ -140,8 +140,12 @@ class FieldSchemaUpdate {
   final int? maxLength;
   final num? minValue;
   final num? maxValue;
+  final DefaultValueType? defaultValueType;
 
-  const FieldSchemaUpdate({
+  // track which properties are explicitly set
+  final Map<String, bool> _explicitlySet;
+
+  FieldSchemaUpdate({
     required this.name,
     this.type,
     this.nullable,
@@ -152,7 +156,30 @@ class FieldSchemaUpdate {
     this.maxLength,
     this.minValue,
     this.maxValue,
-  });
+    this.defaultValueType,
+  }) : _explicitlySet = {
+          'type': type != null,
+          'nullable': nullable != null,
+          'defaultValue':
+              true, // defaultValue always considered explicitly set, even if null
+          'unique': unique != null,
+          'comment':
+              true, // comment always considered explicitly set, even if null
+          'minLength':
+              true, // minLength always considered explicitly set, even if null
+          'maxLength':
+              true, // maxLength always considered explicitly set, even if null
+          'minValue':
+              true, // minValue always considered explicitly set, even if null
+          'maxValue':
+              true, // maxValue always considered explicitly set, even if null
+          'defaultValueType': defaultValueType != null,
+        };
+
+  /// check if the property is explicitly set
+  bool isExplicitlySet(String propertyName) {
+    return _explicitlySet[propertyName] ?? false;
+  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -166,11 +193,27 @@ class FieldSchemaUpdate {
       'maxLength': maxLength,
       'minValue': minValue,
       'maxValue': maxValue,
+      if (defaultValueType != null)
+        'defaultValueType': defaultValueType.toString().split('.').last,
+      '_explicitlySet': _explicitlySet,
     };
   }
 
   factory FieldSchemaUpdate.fromJson(Map<String, dynamic> json) {
-    return FieldSchemaUpdate(
+    // Parse default value type
+    DefaultValueType? getDefaultValueType() {
+      final typeStr = json['defaultValueType'] as String?;
+      if (typeStr == null) return null;
+
+      switch (typeStr.toLowerCase()) {
+        case 'currenttimestamp':
+          return DefaultValueType.currentTimestamp;
+        default:
+          return DefaultValueType.none;
+      }
+    }
+
+    final result = FieldSchemaUpdate(
       name: json['name'],
       type: json['type'] != null
           ? DataType.values.firstWhere((e) => e.name == json['type'])
@@ -183,7 +226,16 @@ class FieldSchemaUpdate {
       maxLength: json['maxLength'],
       minValue: json['minValue'],
       maxValue: json['maxValue'],
+      defaultValueType: getDefaultValueType(),
     );
+
+    // if JSON contains _explicitlySet, use it to update _explicitlySet
+    if (json['_explicitlySet'] is Map) {
+      result._explicitlySet
+          .addAll(Map<String, bool>.from(json['_explicitlySet'] as Map));
+    }
+
+    return result;
   }
 }
 

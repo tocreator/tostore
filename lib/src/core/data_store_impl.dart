@@ -26,7 +26,6 @@ import '../model/table_info.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
-import 'statistics_collector.dart';
 import 'transaction_manager.dart';
 import 'migration_manager.dart';
 import 'integrity_checker.dart';
@@ -69,7 +68,6 @@ class DataStoreImpl {
   QueryOptimizer? _queryOptimizer;
   QueryExecutor? _queryExecutor;
   late DataCacheManager dataCacheManager;
-  StatisticsCollector? _statisticsCollector;
   MigrationManager? migrationManager;
   IntegrityChecker? _integrityChecker;
   KeyManager? _keyManager;
@@ -334,7 +332,6 @@ class DataStoreImpl {
           directoryManager = DirectoryManager(this);
           _transactionManager = TransactionManager(this);
           _indexManager = IndexManager(this);
-          _statisticsCollector = StatisticsCollector(this);
           _tableDataManager = TableDataManager(this);
           migrationManager = MigrationManager(this);
           _integrityChecker = IntegrityChecker(this);
@@ -533,7 +530,6 @@ class DataStoreImpl {
       _queryOptimizer = null;
       _indexManager = null;
       _queryExecutor = null;
-      _statisticsCollector = null;
       _config = null;
       _integrityChecker = null;
       _keyManager = null;
@@ -752,7 +748,7 @@ class DataStoreImpl {
         final schema = await getTableSchema(tableName);
         final primaryKeyValue = schema != null ? data[schema.primaryKey] : null;
         if (primaryKeyValue != null) {
-          dataCacheManager.invalidateRecord(
+          await dataCacheManager.invalidateRecord(
               tableName, primaryKeyValue.toString());
         }
 
@@ -856,24 +852,23 @@ class DataStoreImpl {
         }
 
         if (!data.containsKey(field.name)) {
-          if (field.defaultValue != null) {
-            final convertedDefault = field.convertValue();
-            if (convertedDefault == null) {
+          // get default value
+          final defaultVal = field.getDefaultValue();
+          if (defaultVal == null) {
+            // if field is not nullable and has no default value
+            if (!field.nullable) {
               Logger.warn(
-                'Invalid default value for field ${field.name}',
+                'Field ${field.name} cannot be null and has no default value',
                 label: 'DataStore._validateAndProcessData',
               );
               return null;
+            } else {
+              // allow null, set to null
+              result[field.name] = null;
             }
-            result[field.name] = convertedDefault;
-          } else if (!field.nullable) {
-            Logger.warn(
-              'Field ${field.name} cannot be null and has no default value',
-              label: 'DataStore._validateAndProcessData',
-            );
-            return null;
           } else {
-            result[field.name] = null;
+            // use converted default value
+            result[field.name] = defaultVal;
           }
         } else {
           final value = data[field.name];
@@ -894,7 +889,7 @@ class DataStoreImpl {
             } else {
               try {
                 // try to convert type
-                final convertedValue = field.convertValue(value: value);
+                final convertedValue = field.convertValue(value);
                 if (convertedValue == null) {
                   Logger.warn(
                     'Failed to convert value for field ${field.name}: $value to ${field.type}',
@@ -1061,7 +1056,7 @@ class DataStoreImpl {
             result[field.name] = value;
           } else {
             try {
-              final convertedValue = field.convertValue(value: value);
+              final convertedValue = field.convertValue(value);
               if (convertedValue == null) {
                 Logger.warn(
                   'Failed to convert value for field ${field.name}: $value to ${field.type}',
@@ -1238,10 +1233,10 @@ class DataStoreImpl {
         }
 
         // update cache and write queue, index
-        dataCacheManager.invalidateRecord(tableName, recordKey);
+        await dataCacheManager.invalidateRecord(tableName, recordKey);
         dataCacheManager.addCachedRecord(tableName, updatedRecord);
         // update write queue
-        tableDataManager.addToWriteBuffer(tableName, updatedRecord,
+        await tableDataManager.addToWriteBuffer(tableName, updatedRecord,
             isUpdate: true);
 
         // Add to success keys list
@@ -1293,8 +1288,7 @@ class DataStoreImpl {
       await _indexManager?.resetIndexes(tableName);
 
       //   clear application layer cache
-      dataCacheManager.invalidateCache(tableName, isFullTableCache: true);
-      _statisticsCollector?.invalidateCache(tableName);
+      await dataCacheManager.invalidateCache(tableName, isFullTableCache: true);
 
       await _transactionManager!.commit(transaction);
     } catch (e) {
@@ -1361,7 +1355,7 @@ class DataStoreImpl {
       // get table schema
       final schema = await getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
+        Logger.warn('Table $tableName does not exist',
             label: 'DataStore.deleteInternal');
         return DbResult.error(
           type: ResultType.notFound,
@@ -1441,7 +1435,7 @@ class DataStoreImpl {
           successKeys.add(pkValue);
 
           // Remove from record cache
-          dataCacheManager.invalidateRecord(tableName, pkValue);
+          await dataCacheManager.invalidateRecord(tableName, pkValue);
 
           // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
           writeQueue?.remove(pkValue);
@@ -1452,9 +1446,6 @@ class DataStoreImpl {
 
         // Update indexes - still necessary to keep indexes in sync
         await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
-
-        // Update statistics asynchronously
-        _updateStatisticsAsync(tableName);
 
         await _transactionManager!.commit(transaction);
         return DbResult.success(
@@ -1474,19 +1465,33 @@ class DataStoreImpl {
           // record original count
           int originalCount = records.length;
 
-          // filter out records that match the delete condition
-          final resultRecords = records.where((record) {
+          // Create a new list with all records (do not filter out)
+          final resultRecords = List<Map<String, dynamic>>.from(records);
+
+          // collect deleted records
+          final deletedRecords = <Map<String, dynamic>>[];
+
+          // replace deleted records with empty object {}, instead of removing
+          for (int i = 0; i < resultRecords.length; i++) {
+            final record = resultRecords[i];
+
+            // skip if already empty record
+            if (record.isEmpty) continue;
+
             final matches = condition.matches(record);
             if (matches) {
               totalDeleted++;
 
-              // remove from cache
+              // add to deleted records list
+              deletedRecords.add(record);
+
+              // get record primary key value
               final pkValue = record[primaryKey]?.toString();
               if (pkValue != null) {
                 // Add to deleted keys list
                 deletedKeys.add(pkValue);
 
-                dataCacheManager.invalidateRecord(tableName, pkValue);
+                await dataCacheManager.invalidateRecord(tableName, pkValue);
 
                 // remove from write queue (if exists)
                 writeQueue?.remove(pkValue);
@@ -1494,24 +1499,17 @@ class DataStoreImpl {
 
               // process limit
               if (limit != null && totalDeleted > limit) {
-                return true; // if exceeds limit, keep this record
+                continue; // if exceeds limit, do not delete this record
               }
 
-              return false; // if matches, delete this record
+              // replace deleted record with empty object {}, keep index position
+              resultRecords[i] = {};
             }
-            return true; // if not matches, keep this record
-          }).toList();
+          }
 
           totalProcessed += originalCount;
 
-          // update indexes (if modified)
-          if (resultRecords.length < originalCount) {
-            // calculate deleted records
-            final deletedRecords = records
-                .where((record) => !resultRecords
-                    .any((r) => r[primaryKey] == record[primaryKey]))
-                .toList();
-
+          if (deletedRecords.isNotEmpty) {
             // batch update indexes
             await _indexManager?.batchDeleteFromIndexes(
                 tableName, deletedRecords);
@@ -1525,9 +1523,6 @@ class DataStoreImpl {
           tableName: tableName,
           processFunction: processFunction,
         );
-
-        // update statistics
-        _updateStatisticsAsync(tableName);
 
         await _transactionManager!.commit(transaction);
         return DbResult.success(
@@ -1603,7 +1598,7 @@ class DataStoreImpl {
         }
 
         // Clear table cache and other memory caches
-        _invalidateTableCaches(tableName, isFullTableCache: true);
+        await _invalidateTableCaches(tableName, isFullTableCache: true);
 
         // Clear path cache
         _pathManager?.clearTableCache(tableName);
@@ -1862,10 +1857,7 @@ class DataStoreImpl {
         dataCacheManager.addCachedRecord(tableName, data);
       }
 
-      // 7. Async update information
-      _updateStatisticsAsync(tableName);
-
-      // 8. Async log transaction
+      // Async log transaction
       _logTransactionAsync('batchInsert', tableName, {
         'count': allData.length,
         'timestamp': DateTime.now().millisecondsSinceEpoch,
@@ -1914,18 +1906,6 @@ class DataStoreImpl {
         failedKeys: failedKeys,
       );
     }
-  }
-
-  /// Async update statistics
-  void _updateStatisticsAsync(String tableName) {
-    Future(() async {
-      try {
-        await _statisticsCollector?.collectTableStatistics(tableName);
-      } catch (e) {
-        Logger.error('Async update statistics failed: $e',
-            label: 'DataStore-batchInsert');
-      }
-    });
   }
 
   /// Async log transaction
@@ -2026,7 +2006,7 @@ class DataStoreImpl {
         processFunction: (records, partitionIndex) async {
           // Process records in current partition
           for (var record in records) {
-            if (record[primaryKey] != null) {
+            if (record[primaryKey] != null && record.isNotEmpty) {
               // Use primary key as Map key to avoid duplicate records
               resultMap[record[primaryKey].toString()] =
                   Map<String, dynamic>.from(record);
@@ -2484,17 +2464,54 @@ class DataStoreImpl {
         },
       );
 
-      // Use newField's properties directly, ensuring all provided values are applied
+      // create updated field, handle explicitly set to null case
+      dynamic updatedDefaultValue = oldField.defaultValue;
+      if (newField.isExplicitlySet('defaultValue')) {
+        updatedDefaultValue = newField.defaultValue;
+      }
+
+      int? updatedMaxLength = oldField.maxLength;
+      if (newField.isExplicitlySet('maxLength')) {
+        updatedMaxLength = newField.maxLength;
+      }
+
+      int? updatedMinLength = oldField.minLength;
+      if (newField.isExplicitlySet('minLength')) {
+        updatedMinLength = newField.minLength;
+      }
+
+      num? updatedMinValue = oldField.minValue;
+      if (newField.isExplicitlySet('minValue')) {
+        updatedMinValue = newField.minValue;
+      }
+
+      num? updatedMaxValue = oldField.maxValue;
+      if (newField.isExplicitlySet('maxValue')) {
+        updatedMaxValue = newField.maxValue;
+      }
+
+      String? updatedComment = oldField.comment;
+      if (newField.isExplicitlySet('comment')) {
+        updatedComment = newField.comment;
+      }
+
+      DefaultValueType updatedDefaultValueType = oldField.defaultValueType;
+      if (newField.isExplicitlySet('defaultValueType')) {
+        updatedDefaultValueType =
+            newField.defaultValueType ?? DefaultValueType.none;
+      }
+
       final updatedField = oldField.copyWith(
         type: newField.type ?? oldField.type,
         nullable: newField.nullable ?? oldField.nullable,
-        defaultValue: newField.defaultValue ?? oldField.defaultValue,
+        defaultValue: updatedDefaultValue,
         unique: newField.unique ?? oldField.unique,
-        comment: newField.comment ?? oldField.comment,
-        minLength: newField.minLength ?? oldField.minLength,
-        maxLength: newField.maxLength ?? oldField.maxLength,
-        minValue: newField.minValue ?? oldField.minValue,
-        maxValue: newField.maxValue ?? oldField.maxValue,
+        comment: updatedComment,
+        minLength: updatedMinLength,
+        maxLength: updatedMaxLength,
+        minValue: updatedMinValue,
+        maxValue: updatedMaxValue,
+        defaultValueType: updatedDefaultValueType,
       );
 
       // Update schema
@@ -2539,9 +2556,8 @@ class DataStoreImpl {
   /// Invalidate all caches for table
   Future<void> _invalidateTableCaches(String tableName,
       {bool isFullTableCache = false}) async {
-    dataCacheManager.invalidateCache(tableName,
+    await dataCacheManager.invalidateCache(tableName,
         isFullTableCache: isFullTableCache);
-    _statisticsCollector?.invalidateCache(tableName);
     tableDataManager.writeBuffer.remove(tableName);
 
     // Clear index cache

@@ -776,12 +776,48 @@ class BPlusTree {
     return entryCount;
   }
 
-  /// Delete key-value pair
-  Future<void> delete(dynamic key, dynamic value) async {
-    if (root == null) return;
+  /// Search for a value (recordPointer) directly
+  /// This is optimized for index operations that need to find entries by recordPointer only
+  Future<List<dynamic>> searchByRecordPointer(dynamic recordPointer) async {
+    if (root == null) return [];
+    final results = <dynamic>[];
+    final recordPointerStr = recordPointer.toString();
+
+    // Find leftmost leaf node
+    BPlusTreeNode? node = root;
+    while (node != null && !node.isLeaf) {
+      if (node.children.isEmpty) break;
+      node = node.children[0];
+    }
+
+    // Traverse all leaf nodes
+    while (node != null) {
+      for (int i = 0; i < node.keys.length; i++) {
+        // Check if recordPointer exists in values
+        if (i < node.values.length) {
+          for (final value in node.values[i]) {
+            if (value == recordPointer ||
+                value.toString() == recordPointerStr ||
+                value.toString() == recordPointerStr.toString()) {
+              // Found a match, add the key and value to results
+              results.add({'key': node.keys[i], 'value': value});
+            }
+          }
+        }
+      }
+      node = node.next;
+    }
+
+    return results;
+  }
+
+  /// Delete key-value pair and return whether deletion was successful
+  Future<bool> delete(dynamic key, dynamic value) async {
+    if (root == null) return false;
 
     final path = <BPlusTreeNode>[];
     BPlusTreeNode? currentNode = root;
+    bool deleted = false;
 
     // Find leaf node containing target key
     while (currentNode != null && !currentNode.isLeaf) {
@@ -795,7 +831,7 @@ class BPlusTree {
 
       // Safety check
       if (i >= currentNode.children.length) {
-        if (currentNode.children.isEmpty) return;
+        if (currentNode.children.isEmpty) return false;
         i = currentNode.children.length - 1;
       }
 
@@ -807,33 +843,43 @@ class BPlusTree {
       for (int i = 0; i < currentNode.keys.length; i++) {
         if (_compareKeys(key, currentNode.keys[i]) == 0) {
           if (value != null) {
-            // Only delete specific value
+            // Convert both to string for comparison if needed
+            final valueStr = value.toString();
+
+            // Check values to find the match
+            int initialLength = currentNode.values[i].length;
             currentNode.values[i].removeWhere((v) {
               if (v is Map && value is Map) {
                 return _mapsEqual(v, value);
               }
-              return v == value;
+              return v == value ||
+                  v.toString() == valueStr ||
+                  v.toString() == valueStr.toString();
             });
 
-            // If value list is empty, delete entire key-value pair
-            if (currentNode.values[i].isEmpty) {
-              currentNode.keys.removeAt(i);
-              currentNode.values.removeAt(i);
+            // If items were removed
+            if (currentNode.values[i].length < initialLength) {
+              deleted = true;
+
+              // If value list is empty, delete entire key-value pair
+              if (currentNode.values[i].isEmpty) {
+                currentNode.keys.removeAt(i);
+                currentNode.values.removeAt(i);
+              }
             }
           } else {
             // Delete entire key-value pair
             currentNode.keys.removeAt(i);
             currentNode.values.removeAt(i);
+            deleted = true;
           }
           break;
         }
       }
     }
 
-    // If node is empty and not root node, may need rebalancing
-    // Note: This simplified version does not handle tree rebalancing after deletion
-    // In most cases, B+ trees can work normally without immediate rebalancing after deletion
-    // True rebalancing scenarios are relatively rare
+    // Return whether deletion was successful
+    return deleted;
   }
 
   /// Compare if two Maps are equal

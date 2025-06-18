@@ -346,7 +346,7 @@ class IndexManager {
         // If all keys have been processed, exit early
         if (keysToDelete.isEmpty) {
           Logger.debug(
-              'All keys processed for unique index $tableName.$indexName, skipping remaining partitions',
+              'All keys processed for index $tableName.$indexName, skipping remaining partitions',
               label: 'IndexManager._processDeleteEntries');
           break;
         }
@@ -418,7 +418,7 @@ class IndexManager {
             }
 
             // Remove processed keys from the shared list
-            if (result.processedKeys.isNotEmpty) {
+            if (result.processedKeys.isNotEmpty && isUniqueIndex) {
               for (final key in result.processedKeys) {
                 keysToDelete.remove(key);
               }
@@ -439,9 +439,6 @@ class IndexManager {
 
           // If all keys have been processed, exit early
           if (keysToDelete.isEmpty && isUniqueIndex) {
-            Logger.debug(
-                'All keys processed for unique index $tableName.$indexName after processing ${i + 1} partitions (total: ${indexMeta.partitions.length})',
-                label: 'IndexManager._processDeleteEntries');
             break;
           }
         }
@@ -967,7 +964,6 @@ class IndexManager {
       if (_indexCache.containsKey(cacheKey)) {
         // Update access weight
         _updateIndexAccessWeight(cacheKey);
-
         return _indexCache[cacheKey];
       }
 

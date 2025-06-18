@@ -869,7 +869,9 @@ class TableDataManager {
             .take(currentBatchSize.toInt())
             .toList();
 
-        if (keysToProcess.isEmpty) {
+        if (keysToProcess.isEmpty ||
+            (_writeBuffer[tableName]?.isEmpty ?? true)) {
+          _writeBuffer.remove(tableName);
           break;
         }
 
@@ -1025,6 +1027,7 @@ class TableDataManager {
           } else {
             // if found table is empty before processing, remove it from processing list
             _processingTables.remove(tableName);
+            _writeBuffer.remove(tableName);
           }
         },
         description: 'batch process write buffer for multiple tables',
@@ -2437,7 +2440,11 @@ class TableDataManager {
         expectedValue: expectedValue,
       );
 
-      return records.isNotEmpty ? records.first : null;
+      // return non-empty record
+      if (records.isNotEmpty && records.first.isNotEmpty) {
+        return records.first;
+      }
+      return null;
     } catch (e) {
       Logger.error(
         'Failed to get record by pointer: $e',
@@ -3020,8 +3027,12 @@ class TableDataManager {
               // if partition is modified, save update
               PartitionMeta? updatedPartitionMeta;
               if (modified) {
-                if (resultRecords.isEmpty) {
-                  // partition is empty, delete partition file
+                // Check if all records are empty objects (deleted records)
+                bool allEmpty = resultRecords.isNotEmpty &&
+                    resultRecords.every((record) => record.isEmpty);
+
+                if (resultRecords.isEmpty || allEmpty) {
+                  // partition is empty or all records are empty, delete partition file
                   final partitionPath = await _dataStore.pathManager
                       .getPartitionFilePath(tableName, partitionIndex);
                   if (await _dataStore.storage.existsFile(partitionPath)) {
@@ -3146,8 +3157,12 @@ class TableDataManager {
 
             // if partition is modified, save update
             if (modified) {
-              if (resultRecords.isEmpty) {
-                // partition is empty, delete partition file
+              // Check if all records are empty objects (deleted records)
+              bool allEmpty = resultRecords.isNotEmpty &&
+                  resultRecords.every((record) => record.isEmpty);
+
+              if (resultRecords.isEmpty || allEmpty) {
+                // partition is empty or all records are empty, delete partition file
                 final partitionPath = await _dataStore.pathManager
                     .getPartitionFilePath(tableName, partition.index);
                 if (await _dataStore.storage.existsFile(partitionPath)) {
@@ -3746,7 +3761,9 @@ class TableDataManager {
             .take(currentBatchSize.toInt())
             .toList();
 
-        if (keysToProcess.isEmpty) {
+        if (keysToProcess.isEmpty ||
+            (_deleteBuffer[tableName]?.isEmpty ?? true)) {
+          _deleteBuffer.remove(tableName);
           break;
         }
 
