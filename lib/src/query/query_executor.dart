@@ -1,3 +1,4 @@
+import '../core/table_data_manager.dart';
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
@@ -800,10 +801,11 @@ class QueryExecutor {
               if (condition != null) {
                 // Apply filter conditions
                 for (var record in records) {
+                  // Skip deleted records
+                  if (isDeletedRecord(record)) continue;
+
                   if (condition.matches(record)) {
-                    if (record.isNotEmpty) {
-                      resultMap[record[primaryKey].toString()] = record;
-                    }
+                    resultMap[record[primaryKey].toString()] = record;
 
                     // If exact primary key match is found, throw exception to immediately terminate all partition processing
                     if (exactPkMatch != null &&
@@ -817,9 +819,10 @@ class QueryExecutor {
               } else {
                 // No filter conditions, add all records
                 for (var record in records) {
-                  if (record.isNotEmpty) {
-                    resultMap[record[primaryKey].toString()] = record;
-                  }
+                  // Skip deleted records
+                  if (isDeletedRecord(record)) continue;
+
+                  resultMap[record[primaryKey].toString()] = record;
                 }
               }
 
@@ -886,10 +889,11 @@ class QueryExecutor {
           onlyRead: true,
           processFunction: (records, partitionIndex) async {
             for (var record in records) {
-              if (record.isNotEmpty) {
-                if (condition == null || condition.matches(record)) {
-                  resultMap[record[primaryKey].toString()] = record;
-                }
+              // Skip deleted records
+              if (isDeletedRecord(record)) continue;
+
+              if (condition == null || condition.matches(record)) {
+                resultMap[record[primaryKey].toString()] = record;
               }
             }
             return records;

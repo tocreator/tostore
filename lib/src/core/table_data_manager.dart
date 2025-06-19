@@ -1328,16 +1328,20 @@ class TableDataManager {
     List<Map<String, dynamic>> records,
     String primaryKey,
     List<PartitionMeta>? existingPartitions, {
+    required BufferOperationType operationType,
     List<int>? encryptionKey,
     int? encryptionKeyId,
-    bool updateTableMeta = true,
   }) async {
     try {
-      // filter out empty records {} for statistics, but keep them in the records list to maintain the index position
-      final nonEmptyRecords =
-          records.where((record) => record.isNotEmpty).toList();
+      // if no records, return empty partition meta
+      if (records.isEmpty) {
+        // delete partition file if exists
+        final partitionPath = await _dataStore.pathManager
+            .getPartitionFilePath(tableName, partitionIndex);
+        if (await _dataStore.storage.existsFile(partitionPath)) {
+          await _dataStore.storage.deleteFile(partitionPath);
+        }
 
-      if (nonEmptyRecords.isEmpty) {
         return PartitionMeta(
           version: 1,
           index: partitionIndex,
@@ -1359,42 +1363,64 @@ class TableDataManager {
           .getPartitionFilePath(tableName, partitionIndex);
       final parentPath = await _dataStore.pathManager.getTablePath(tableName);
 
-      // parallel use isolate to calculate primary key range
+      // calculate non-deleted record count (only for statistics)
+
+      // handle primary key range
       dynamic minPk, maxPk;
+      bool shouldSaveKeyRange = false;
 
-      // check if should use range query optimization
-      bool shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
+      // check if primary key is ordered
+      shouldSaveKeyRange = await _isPrimaryKeyOrdered(tableName);
 
-      if (shouldSaveKeyRange && nonEmptyRecords.isNotEmpty) {
+      // handle primary key range based on operation type
+      if (operationType == BufferOperationType.update ||
+          operationType == BufferOperationType.delete) {
+        // for update and delete operation, get range from existing partitions
+        if (existingPartitions != null) {
+          for (final partition in existingPartitions) {
+            if (partition.index == partitionIndex) {
+              minPk = partition.minPrimaryKey;
+              maxPk = partition.maxPrimaryKey;
+              break;
+            }
+          }
+        }
+      }
+      // for insert and rewrite operation, calculate range
+      else if ((operationType == BufferOperationType.insert ||
+              operationType == BufferOperationType.rewrite) &&
+          shouldSaveKeyRange &&
+          records.isNotEmpty) {
         try {
           final request = PartitionRangeAnalysisRequest(
-            records: nonEmptyRecords,
+            records:
+                records, // pass all records, internal will filter deleted records
             primaryKey: primaryKey,
             partitionIndex: partitionIndex,
             existingPartitions: existingPartitions,
           );
 
-          // use try-catch to ensure correct handling of compute results
+          // use ComputeManager to execute range analysis
           PartitionRangeAnalysisResult rangeResult;
           try {
             rangeResult = await ComputeManager.run(
                 analyzePartitionKeyRange, request,
-                useIsolate: nonEmptyRecords.length > 500 ||
+                useIsolate: records.length > 500 ||
                     (existingPartitions?.length ?? 0) > 1000);
           } catch (computeError) {
             Logger.error(
                 'Error running analyzePartitionKeyRange in ComputeManager: $computeError',
                 label: 'TableDataManager._savePartitionFile');
 
-            // fallback to direct function call if error
+            // if compute error, call function directly
             rangeResult = await analyzePartitionKeyRange(request);
           }
 
-          // ensure valid result before using
+          // ensure result is valid before using
           minPk = rangeResult.minPk;
           maxPk = rangeResult.maxPk;
 
-          // If not ordered based on analysis result, mark table as non-ordered
+          // If analysis result is not ordered, mark table as non-ordered
           if (!rangeResult.isOrdered) {
             await _markTableAsUnordered(tableName);
           }
@@ -1413,7 +1439,7 @@ class TableDataManager {
         }
       }
 
-      // if should not save primary key range, set value to null
+      // if table is not ordered, clear primary key range
       if (!shouldSaveKeyRange) {
         minPk = null;
         maxPk = null;
@@ -1453,83 +1479,6 @@ class TableDataManager {
 
       // Write partition file
       await _dataStore.storage.writeAsBytes(partitionPath, encodedData);
-
-      // only update table meta when needed
-      if (updateTableMeta) {
-        // get current partition status and calculate exact change
-        FileMeta? fileMeta = await getTableFileMeta(tableName);
-        int oldRecordCount = 0;
-        int oldSize = 0;
-        bool isExistingPartition = false;
-
-        if (fileMeta != null && fileMeta.partitions != null) {
-          for (var partition in fileMeta.partitions!) {
-            if (partition.index == partitionIndex) {
-              oldRecordCount = partition.totalRecords;
-              oldSize = partition.fileSizeInBytes;
-              isExistingPartition = true;
-              break;
-            }
-          }
-        }
-
-        // Update main file meta
-        if (fileMeta == null) {
-          fileMeta = FileMeta(
-            version: 1,
-            type: FileType.data,
-            name: tableName,
-            fileSizeInBytes: updatedPartitionMeta.fileSizeInBytes,
-            totalRecords:
-                nonEmptyRecords.length, // only count non-empty records
-            timestamps: Timestamps(
-              created: timeStamp,
-              modified: timeStamp,
-            ),
-            partitions: [updatedPartitionMeta],
-          );
-        } else {
-          List<PartitionMeta> partitions =
-              List<PartitionMeta>.from(fileMeta.partitions ?? []);
-
-          int existingIndex =
-              partitions.indexWhere((c) => c.index == partitionIndex);
-
-          if (existingIndex >= 0) {
-            partitions[existingIndex] = updatedPartitionMeta;
-          } else {
-            partitions.add(updatedPartitionMeta);
-          }
-
-          // calculate exact change in record count and size
-          int recordsDelta = nonEmptyRecords.length -
-              (isExistingPartition ? oldRecordCount : 0);
-          int sizeDelta = updatedPartitionMeta.fileSizeInBytes -
-              (isExistingPartition ? oldSize : 0);
-
-          // update meta
-          fileMeta = fileMeta.copyWith(
-            totalRecords: fileMeta.totalRecords + recordsDelta,
-            fileSizeInBytes: fileMeta.fileSizeInBytes + sizeDelta,
-            timestamps: Timestamps(
-              created: fileMeta.timestamps.created,
-              modified: timeStamp,
-            ),
-            partitions: partitions,
-          );
-
-          // update stats in memory directly
-          _totalRecordCount += recordsDelta;
-          _totalDataSizeBytes += sizeDelta;
-
-          // mark need to save stats
-          _needSaveStats = true;
-        }
-
-        // write updated file meta
-        await updateTableFileMeta(tableName, fileMeta,
-            recalculateTotals: false);
-      }
 
       // Record operation duration
       final endTime = DateTime.now();
@@ -2124,8 +2073,8 @@ class TableDataManager {
           // output all records in partition index order
           for (var records in allPartitionRecords) {
             for (var record in records) {
-              // filter out empty records (deleted records)
-              if (record.isNotEmpty) {
+              // filter out deleted records
+              if (!isDeletedRecord(record)) {
                 yield record;
               }
             }
@@ -2139,8 +2088,8 @@ class TableDataManager {
                 encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
             for (var record in partitionRecords) {
-              // filter out empty records (deleted records)
-              if (record.isNotEmpty) {
+              // filter out deleted records
+              if (!isDeletedRecord(record)) {
                 yield record;
               }
             }
@@ -2151,8 +2100,8 @@ class TableDataManager {
       // Include pending data from write queue
       final pendingData = _writeBuffer[tableName] ?? {};
       for (var record in pendingData.entries) {
-        // ensure only return non-empty data
-        if (record.value.data.isNotEmpty) {
+        // ensure only return non-deleted data
+        if (!isDeletedRecord(record.value.data)) {
           yield record.value.data;
         }
       }
@@ -2362,7 +2311,8 @@ class TableDataManager {
 
                 // process records, filter out empty records
                 for (final record in partitionInfo.data) {
-                  if (record is Map<String, dynamic> && record.isNotEmpty) {
+                  if (record is Map<String, dynamic> &&
+                      !isDeletedRecord(record)) {
                     yield record;
                   }
                 }
@@ -2441,7 +2391,7 @@ class TableDataManager {
       );
 
       // return non-empty record
-      if (records.isNotEmpty && records.first.isNotEmpty) {
+      if (records.isNotEmpty && !isDeletedRecord(records.first)) {
         return records.first;
       }
       return null;
@@ -2536,9 +2486,9 @@ class TableDataManager {
           processedRecords,
           primaryKey,
           fileMeta.partitions!,
+          operationType: BufferOperationType.update,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
-          updateTableMeta: false,
         );
 
         // collect partition meta, for later update table meta
@@ -2848,7 +2798,7 @@ class TableDataManager {
                 existingPartitions,
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
-                updateTableMeta: false, // key: not update table meta
+                operationType: BufferOperationType.insert,
               );
             },
             description: 'parallel insert records to multiple partitions',
@@ -2898,7 +2848,7 @@ class TableDataManager {
               existingPartitions,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
-              updateTableMeta: false, // key: not update table meta
+              operationType: BufferOperationType.insert,
             );
 
             // collect partition meta
@@ -2920,8 +2870,11 @@ class TableDataManager {
         }
       } else if (operationType == BufferOperationType.delete ||
           operationType == BufferOperationType.update) {
-        // Create a mapping from primary key to record, for easy lookup
+        // Use Map to optimize lookup efficiency, avoid duplicate queries
         final recordsByPk = <String, Map<String, dynamic>>{};
+        final List<PartitionMeta> allPartitionMetas = [];
+
+        // create efficient lookup index
         for (final record in records) {
           final pk = record[primaryKey]?.toString() ?? '';
           if (pk.isNotEmpty) {
@@ -2973,9 +2926,6 @@ class TableDataManager {
             operationType == BufferOperationType.delete
                 ? 'delete'
                 : 'update')) {
-          // store all processed partition meta
-          List<PartitionMeta> allPartitionMetas = [];
-
           // read and process all related partitions
           final partitionResults =
               await processPartitionsConcurrently<Map<String, dynamic>>(
@@ -2993,18 +2943,18 @@ class TableDataManager {
               Set<String> processedKeys = {};
 
               if (operationType == BufferOperationType.delete) {
-                // use empty object {} to replace the record to be deleted, instead of physical deletion
+                // use deleted marker, instead of physical deletion
                 resultRecords =
                     List<Map<String, dynamic>>.from(partitionRecords);
                 for (int i = 0; i < resultRecords.length; i++) {
                   final record = resultRecords[i];
                   // skip already empty records
-                  if (record.isEmpty) continue;
+                  if (isDeletedRecord(record)) continue;
 
                   final pk = record[primaryKey]?.toString() ?? '';
                   if (recordsByPk.containsKey(pk)) {
-                    // use empty object {} to replace the record, keep the index unchanged
-                    resultRecords[i] = {};
+                    // use explicit delete marker instead of empty object, to prevent migration issues
+                    resultRecords[i] = {'_deleted_': true};
                     modified = true;
                     processedKeys.add(pk);
                   }
@@ -3029,7 +2979,7 @@ class TableDataManager {
               if (modified) {
                 // Check if all records are empty objects (deleted records)
                 bool allEmpty = resultRecords.isNotEmpty &&
-                    resultRecords.every((record) => record.isEmpty);
+                    resultRecords.every((record) => isDeletedRecord(record));
 
                 if (resultRecords.isEmpty || allEmpty) {
                   // partition is empty or all records are empty, delete partition file
@@ -3059,7 +3009,7 @@ class TableDataManager {
                     existingPartitions,
                     encryptionKey: encryptionKey,
                     encryptionKeyId: encryptionKeyId,
-                    updateTableMeta: false, // key: not update table meta
+                    operationType: BufferOperationType.update,
                   );
                 }
 
@@ -3079,10 +3029,10 @@ class TableDataManager {
           );
 
           // all partitions processed, update table meta once
-          if (allPartitionMetas.isNotEmpty) {
-            await _updateTableMetadataWithAllPartitions(
-                tableName, allPartitionMetas, existingPartitions);
-          }
+          // Even if allPartitionMetas is empty, we still need to update table metadata
+          // to reflect deletions that didn't create any meta entries
+          await _updateTableMetadataWithAllPartitions(
+              tableName, allPartitionMetas, existingPartitions);
 
           // if update operation, need to handle records not found (as insert operation)
           if (operationType == BufferOperationType.update) {
@@ -3114,6 +3064,9 @@ class TableDataManager {
           // sequential processing - avoid concurrent overhead for small amount
           final processedKeys = <String>{};
 
+          // Keep track of updated partition metadata for sequential processing
+          final List<PartitionMeta> sequentialPartitionMetas = [];
+
           for (final partition in partitionsToProcess) {
             // read partition records
             final partitionRecords = await readRecordsFromPartition(
@@ -3121,26 +3074,28 @@ class TableDataManager {
                 encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
             // handle based on operation type
-            bool modified = false;
             List<Map<String, dynamic>> resultRecords;
 
             if (operationType == BufferOperationType.delete) {
-              // use empty object {} to replace the record to be deleted, instead of physical deletion
+              // use deleted marker, instead of physical deletion
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
               for (int i = 0; i < resultRecords.length; i++) {
                 final record = resultRecords[i];
 
                 // only delete non-empty records
-                if (record.isNotEmpty) {
+                if (!isDeletedRecord(record)) {
                   final pk = record[primaryKey]?.toString() ?? '';
                   if (recordsByPk.containsKey(pk)) {
-                    // use empty object {} to replace the record, keep the index unchanged
-                    resultRecords[i] = {};
-                    modified = true;
+                    // use explicit delete marker instead of empty object, to prevent migration issues
+                    resultRecords[i] = {'_deleted_': true};
                     processedKeys.add(pk);
                   }
                 }
               }
+
+              // Ensure we still update table metadata even when no records were modified
+              // This is important to maintain correct stats
+              if (recordsByPk.isNotEmpty) {}
             } else {
               // update operation - update matching records
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
@@ -3149,37 +3104,37 @@ class TableDataManager {
                 final pk = record[primaryKey]?.toString() ?? '';
                 if (pk.isNotEmpty && recordsByPk.containsKey(pk)) {
                   resultRecords[i] = recordsByPk[pk]!;
-                  modified = true;
                   processedKeys.add(pk);
                 }
               }
             }
 
-            // if partition is modified, save update
-            if (modified) {
-              // Check if all records are empty objects (deleted records)
-              bool allEmpty = resultRecords.isNotEmpty &&
-                  resultRecords.every((record) => record.isEmpty);
+            // Always process partitions for delete/update operations
+            // to ensure proper metadata updates
+            // Check if all records are empty objects (deleted records)
+            bool allEmpty = resultRecords.isNotEmpty &&
+                resultRecords.every((record) => isDeletedRecord(record));
 
-              if (resultRecords.isEmpty || allEmpty) {
-                // partition is empty or all records are empty, delete partition file
-                final partitionPath = await _dataStore.pathManager
-                    .getPartitionFilePath(tableName, partition.index);
-                if (await _dataStore.storage.existsFile(partitionPath)) {
-                  await _dataStore.storage.deleteFile(partitionPath);
-                }
+            if (resultRecords.isEmpty || allEmpty) {
+              // partition is empty or all records are empty, delete partition file
+              final partitionPath = await _dataStore.pathManager
+                  .getPartitionFilePath(tableName, partition.index);
+              if (await _dataStore.storage.existsFile(partitionPath)) {
+                await _dataStore.storage.deleteFile(partitionPath);
+              }
 
-                // mark partition as empty
-                final partitionIndex = existingPartitions.indexOf(partition);
-                existingPartitions[partitionIndex] = partition.copyWith(
-                    totalRecords: 0,
-                    fileSizeInBytes: 0,
-                    timestamps: Timestamps(
-                        created: partition.timestamps.created,
-                        modified: DateTime.now()));
-              } else {
-                // rewrite partition file
-                await _savePartitionFile(
+              // mark partition as empty and add to the list of updated partitions
+              final updatedPartition = partition.copyWith(
+                  totalRecords: 0,
+                  fileSizeInBytes: 0,
+                  timestamps: Timestamps(
+                      created: partition.timestamps.created,
+                      modified: DateTime.now()));
+
+              sequentialPartitionMetas.add(updatedPartition);
+            } else {
+              // rewrite partition file and add metadata to the list
+              final updatedPartitionMeta = await _savePartitionFile(
                   tableName,
                   isGlobal,
                   partition.index,
@@ -3188,11 +3143,15 @@ class TableDataManager {
                   existingPartitions,
                   encryptionKey: encryptionKey,
                   encryptionKeyId: encryptionKeyId,
-                  updateTableMeta: true, // key: explicitly update table meta
-                );
-              }
+                  operationType: BufferOperationType.update);
+
+              sequentialPartitionMetas.add(updatedPartitionMeta);
             }
           }
+
+          // Update table metadata with all processed partitions
+          await _updateTableMetadataWithAllPartitions(
+              tableName, sequentialPartitionMetas, existingPartitions);
 
           // if update operation, need to handle records not found (as insert operation)
           if (operationType == BufferOperationType.update) {
@@ -3235,16 +3194,15 @@ class TableDataManager {
 
             // save partition but not update table meta
             return await _savePartitionFile(
-              tableName,
-              isGlobal,
-              partitionIndex,
-              recordsForPartition,
-              primaryKey,
-              [], // key: empty existing partitions list, because it's a full rewrite
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
-              updateTableMeta: false, // key: not update table meta
-            );
+                tableName,
+                isGlobal,
+                partitionIndex,
+                recordsForPartition,
+                primaryKey,
+                [], // key: empty existing partitions list, because it's a full rewrite
+                encryptionKey: encryptionKey,
+                encryptionKeyId: encryptionKeyId,
+                operationType: BufferOperationType.rewrite);
           },
           description: 'parallel rewrite table partitions',
         );
@@ -3318,37 +3276,43 @@ class TableDataManager {
         partitions: [],
       );
 
-      // deep copy existing partitions list
-      List<PartitionMeta> allPartitions =
-          List<PartitionMeta>.from(fileMeta.partitions ?? []);
+      // create efficient lookup index
+      final partitionsMap = {
+        for (var p in fileMeta.partitions ?? []) p.index: p
+      };
 
-      // update or add new processed partitions
+      // process new partition meta, update or add to Map
       for (var meta in partitionMetas) {
-        int index = allPartitions.indexWhere((p) => p.index == meta.index);
-        if (index >= 0) {
-          allPartitions[index] = meta;
+        // only add non-empty partition to table meta
+        if (meta.totalRecords > 0) {
+          partitionsMap[meta.index] = meta;
         } else {
-          allPartitions.add(meta);
+          // if partition is empty, remove from Map
+          partitionsMap.remove(meta.index);
         }
       }
 
-      // recalculate table total records and file size
+      // calculate total stats from ALL partitions after processing updates
       int totalRecords = 0;
       int totalSize = 0;
-      for (var partition in allPartitions) {
-        totalRecords += partition.totalRecords;
-        totalSize += partition.fileSizeInBytes;
+
+      // now calculate totals from all remaining partitions
+      for (var partition in partitionsMap.values) {
+        totalRecords += partition.totalRecords as int;
+        totalSize += partition.fileSizeInBytes as int;
       }
 
-      // Calculate the delta to update in-memory statistics
-      int recordsDelta = totalRecords - fileMeta.totalRecords;
-      int sizeDelta = totalSize - fileMeta.fileSizeInBytes;
+      // convert Map to List<PartitionMeta> with consistent ordering by partition index
+      final allPartitions = partitionsMap.values.toList().cast<PartitionMeta>()
+        ..sort((a, b) => a.index.compareTo(b.index));
 
-      // Update in-memory statistics
+      // calculate stats delta
+      final recordsDelta = totalRecords - fileMeta.totalRecords;
+      final sizeDelta = totalSize - fileMeta.fileSizeInBytes;
+
+      // update in-memory stats
       _totalRecordCount += recordsDelta;
       _totalDataSizeBytes += sizeDelta;
-
-      // mark need to save stats
       _needSaveStats = true;
 
       // update table meta
@@ -3585,9 +3549,9 @@ class TableDataManager {
             processedRecords,
             primaryKey,
             [], // No existing partitions for target table
+            operationType: BufferOperationType.rewrite,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
-            updateTableMeta: false, // Don't update table meta yet
           );
 
           // Collect partition meta, for later update table meta
@@ -3871,8 +3835,8 @@ class TableDataManager {
             final record = batch[j];
             final currentOffset = offset + j;
 
-            // skip empty record
-            if (record.isEmpty) continue;
+            // skip is deleted record
+            if (isDeletedRecord(record)) continue;
 
             try {
               final recordPointer = await StoreIndex.create(
@@ -3903,4 +3867,15 @@ class TableDataManager {
           label: 'TableDataManager._asyncCreateIndexes');
     }
   }
+}
+
+/// Check if a record is a deleted record (marked with _deleted_:true flag)
+bool isDeletedRecord(Map<String, dynamic> record) {
+  // Check for explicit deletion marker (preferred method)
+  if (record['_deleted_'] == true) {
+    return true;
+  }
+
+  // For backward compatibility: empty object is also considered a deleted record
+  return record.isEmpty;
 }

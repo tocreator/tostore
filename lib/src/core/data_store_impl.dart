@@ -726,7 +726,8 @@ class DataStoreImpl {
       dataCacheManager.addCachedRecord(tableName, validData);
 
       // 5. Add to write queue (insert operation)
-      tableDataManager.addToWriteBuffer(tableName, validData, isUpdate: false);
+      await tableDataManager.addToWriteBuffer(tableName, validData,
+          isUpdate: false);
 
       // 6. Commit transaction
       await _transactionManager!.commit(transaction);
@@ -1471,12 +1472,15 @@ class DataStoreImpl {
           // collect deleted records
           final deletedRecords = <Map<String, dynamic>>[];
 
-          // replace deleted records with empty object {}, instead of removing
+          // optimized: track if all non-deleted records have been deleted
+          bool allDeleted = true;
+
+          // replace deleted records with _deleted_:true marker, instead of removing
           for (int i = 0; i < resultRecords.length; i++) {
             final record = resultRecords[i];
 
-            // skip if already empty record
-            if (record.isEmpty) continue;
+            // skip if already deleted record
+            if (isDeletedRecord(record)) continue;
 
             final matches = condition.matches(record);
             if (matches) {
@@ -1502,8 +1506,11 @@ class DataStoreImpl {
                 continue; // if exceeds limit, do not delete this record
               }
 
-              // replace deleted record with empty object {}, keep index position
-              resultRecords[i] = {};
+              // replace with explicit delete marker instead of empty object, to prevent migration issues
+              resultRecords[i] = {'_deleted_': true};
+            } else {
+              // has non-deleted records
+              allDeleted = false;
             }
           }
 
@@ -1513,6 +1520,11 @@ class DataStoreImpl {
             // batch update indexes
             await _indexManager?.batchDeleteFromIndexes(
                 tableName, deletedRecords);
+
+            // Optimized: if all records are deleted, return empty list, directly remove the partition, more efficient
+            if (allDeleted) {
+              return [];
+            }
           }
 
           return resultRecords;
@@ -2006,7 +2018,7 @@ class DataStoreImpl {
         processFunction: (records, partitionIndex) async {
           // Process records in current partition
           for (var record in records) {
-            if (record[primaryKey] != null && record.isNotEmpty) {
+            if (record[primaryKey] != null && !isDeletedRecord(record)) {
               // Use primary key as Map key to avoid duplicate records
               resultMap[record[primaryKey].toString()] =
                   Map<String, dynamic>.from(record);

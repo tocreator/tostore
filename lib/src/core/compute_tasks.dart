@@ -12,6 +12,7 @@ import '../model/migration_task.dart';
 import '../handler/encoder.dart';
 import '../handler/value_comparator.dart';
 import '../handler/logger.dart';
+import 'table_data_manager.dart';
 
 /// Helper class for organizing parallel write jobs.
 class PartitionWriteJob {
@@ -571,7 +572,8 @@ Future<EncodedPartitionResult> encodePartitionData(
     }
 
     // count non-empty records
-    final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
+    final nonDeletedRecords =
+        request.records.where((r) => !isDeletedRecord(r)).toList();
 
     // calculate partition checksum
     Uint8List allRecordsData;
@@ -591,7 +593,7 @@ Future<EncodedPartitionResult> encodePartitionData(
     final partitionMeta = PartitionMeta(
       version: 1,
       index: request.partitionIndex,
-      totalRecords: nonEmptyRecords.length,
+      totalRecords: nonDeletedRecords.length,
       fileSizeInBytes: 0, // will be updated later
       minPrimaryKey: request.minPk,
       maxPrimaryKey: request.maxPk,
@@ -627,7 +629,7 @@ Future<EncodedPartitionResult> encodePartitionData(
       encodedData: encodedData,
       partitionMeta:
           partitionMeta.copyWith(fileSizeInBytes: encodedData.length),
-      nonEmptyRecordCount: nonEmptyRecords.length,
+      nonEmptyRecordCount: nonDeletedRecords.length,
     );
   } catch (e) {
     Logger.error('Failed to encode partition data: $e',
@@ -663,33 +665,53 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       return PartitionRangeAnalysisResult(recordCount: 0);
     }
 
-    final nonEmptyRecords = request.records.where((r) => r.isNotEmpty).toList();
-    if (nonEmptyRecords.isEmpty) {
+    // calculate non-deleted record count without creating new list
+    int nonEmptyCount = 0;
+
+    // find first non-deleted record to initialize minPk/maxPk
+    dynamic minPk;
+    dynamic maxPk;
+    String primaryKey = request.primaryKey;
+
+    // traverse once to find first non-deleted record and initialize minPk/maxPk
+    for (final record in request.records) {
+      if (!isDeletedRecord(record) && record.containsKey(primaryKey)) {
+        final pk = record[primaryKey];
+        if (pk != null) {
+          minPk = pk;
+          maxPk = pk;
+          nonEmptyCount++;
+          break;
+        }
+      }
+    }
+
+    // if no valid record found, return early
+    if (minPk == null) {
+      Logger.warn('No valid primary key "$primaryKey" found in records',
+          label: 'analyzePartitionKeyRange');
       return PartitionRangeAnalysisResult(recordCount: 0);
     }
 
-    // Check if primary key exists in first record
-    if (!nonEmptyRecords.first.containsKey(request.primaryKey)) {
-      Logger.warn('Primary key "${request.primaryKey}" not found in records',
-          label: 'analyzePartitionKeyRange');
-      return PartitionRangeAnalysisResult(recordCount: nonEmptyRecords.length);
-    }
+    // continue to traverse remaining records, find min/max values and count
+    for (int i = 0; i < request.records.length; i++) {
+      final record = request.records[i];
 
-    // initialize with the primary key value of the first record
-    dynamic minPk = nonEmptyRecords.first[request.primaryKey];
-    dynamic maxPk = minPk;
+      // skip already processed first record and invalid records
+      if (i == 0 && nonEmptyCount == 1) continue;
 
-    // iterate through all records to find the minimum and maximum values
-    for (final record in nonEmptyRecords) {
-      final pk = record[request.primaryKey];
-      if (pk != null) {
-        try {
-          if (_compareKeyValues(pk, minPk) < 0) minPk = pk;
-          if (_compareKeyValues(pk, maxPk) > 0) maxPk = pk;
-        } catch (compareError) {
-          // If comparison fails for a specific record, log and continue
-          Logger.warn('Failed to compare key values: $compareError, key=$pk',
-              label: 'analyzePartitionKeyRange');
+      if (!isDeletedRecord(record)) {
+        final pk = record[primaryKey];
+        if (pk != null) {
+          try {
+            if (_compareKeyValues(pk, minPk) < 0) minPk = pk;
+            if (_compareKeyValues(pk, maxPk) > 0) maxPk = pk;
+            nonEmptyCount++;
+          } catch (compareError) {
+            // If comparison fails for a specific record, log and continue
+            Logger.warn('Failed to compare key values: $compareError, key=$pk',
+                label: 'analyzePartitionKeyRange');
+          }
         }
       }
     }
@@ -770,7 +792,7 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
     final result = PartitionRangeAnalysisResult(
       minPk: minPk,
       maxPk: maxPk,
-      recordCount: nonEmptyRecords.length,
+      recordCount: nonEmptyCount,
       isOrdered: isOrdered,
     );
 
@@ -779,18 +801,11 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
     Logger.error('Failed to analyze partition key range: $e',
         label: 'analyzePartitionKeyRange');
 
-    // Even in case of error, ensure the return type is correct
-    try {
-      return PartitionRangeAnalysisResult(
-        recordCount: request.records.where((r) => r.isNotEmpty).length,
-        isOrdered: false, // Conservative approach on error
-      );
-    } catch (innerError) {
-      // Last defense mechanism: return a basic valid object
-      Logger.error('Critical error in partition analysis: $innerError',
-          label: 'analyzePartitionKeyRange');
-      return PartitionRangeAnalysisResult(recordCount: 0, isOrdered: false);
-    }
+    // return safe value when error occurs, avoid traversing again
+    return PartitionRangeAnalysisResult(
+      recordCount: 0,
+      isOrdered: false, // conservative approach on error
+    );
   }
 }
 
@@ -1548,6 +1563,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
         case MigrationType.addField:
           final field = operation.field!;
           modifiedRecords = modifiedRecords.map((record) {
+            // Skip processing deleted records
+            if (isDeletedRecord(record)) {
+              return record;
+            }
             if (!record.containsKey(field.name)) {
               record[field.name] = field.getDefaultValue();
             }
@@ -1558,6 +1577,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
         case MigrationType.removeField:
           final fieldName = operation.fieldName!;
           modifiedRecords = modifiedRecords.map((record) {
+            // Skip processing deleted records
+            if (isDeletedRecord(record)) {
+              return record;
+            }
             record.remove(fieldName);
             return record;
           }).toList();
@@ -1567,6 +1590,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
           final oldName = operation.fieldName!;
           final newName = operation.newName!;
           modifiedRecords = modifiedRecords.map((record) {
+            // Skip processing deleted records
+            if (isDeletedRecord(record)) {
+              return record;
+            }
             if (record.containsKey(oldName)) {
               record[newName] = record[oldName];
               record.remove(oldName);
@@ -1588,6 +1615,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
             }
           }
           modifiedRecords = modifiedRecords.map((record) {
+            // Skip processing deleted records
+            if (isDeletedRecord(record)) {
+              return record;
+            }
             if (record.containsKey(fieldUpdate.name)) {
               // Call the method to process field modification, pass old field information
               record = _applyFieldModification(record, fieldUpdate,
@@ -1625,6 +1656,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
             // Process primary key name changes
             if (oldConfig.name != newConfig.name) {
               modifiedRecords = modifiedRecords.map((record) {
+                // Skip processing deleted records
+                if (isDeletedRecord(record)) {
+                  return record;
+                }
                 if (record.containsKey(oldConfig.name)) {
                   // Copy old primary key field value to new primary key field
                   record[newConfig.name] = record[oldConfig.name];

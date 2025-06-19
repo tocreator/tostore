@@ -1,3 +1,4 @@
+import '../core/table_data_manager.dart';
 import '../handler/logger.dart';
 import '../handler/value_comparator.dart';
 
@@ -488,7 +489,12 @@ class QueryCondition {
   /// Check if the record matches the condition
   bool matches(Map<String, dynamic> record) {
     try {
-      // If there is no condition, match all records
+      // Always filter out deleted records first
+      if (isDeletedRecord(record)) {
+        return false;
+      }
+
+      // If there is no condition, match all records (except deleted ones)
       if (isEmpty) {
         return true;
       }

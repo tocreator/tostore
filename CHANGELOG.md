@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.0.9
+## 2.1.0
 
 ### Added
 - Added `DefaultValueType` to support default values that automatically fill current timestamp

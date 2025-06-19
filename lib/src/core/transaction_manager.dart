@@ -133,7 +133,7 @@ class TransactionManager {
 
     switch (operation['type']) {
       case 'insert':
-        tableDataManager.addToWriteBuffer(tableName, operation['data'],
+        await tableDataManager.addToWriteBuffer(tableName, operation['data'],
             isUpdate: false);
         break;
       case 'update':

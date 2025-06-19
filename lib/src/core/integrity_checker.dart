@@ -584,11 +584,6 @@ class IntegrityChecker {
         return false;
       }
 
-      // Check foreign key constraints if any
-      if (!await checkForeignKeyConstraints(tableName)) {
-        return false;
-      }
-
       return true;
     } catch (e) {
       return false;

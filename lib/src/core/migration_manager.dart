@@ -1509,6 +1509,30 @@ class MigrationManager {
     }
   }
 
+  /// Sort operations to ensure they are executed in correct order
+  List<MigrationOperation> _sortOperations(
+      List<MigrationOperation> operations) {
+    // Define operation type priority
+    final typePriority = {
+      MigrationType.setPrimaryKeyConfig: 1,
+      MigrationType.renameTable: 2,
+      MigrationType.addField: 3,
+      MigrationType.modifyField: 4,
+      MigrationType.renameField: 5,
+      MigrationType.removeField: 6,
+      MigrationType.addIndex: 7,
+      MigrationType.modifyIndex: 8,
+      MigrationType.removeIndex: 9,
+      MigrationType.dropTable: 10,
+    };
+
+    // Sort operations by priority
+    operations.sort((a, b) =>
+        (typePriority[a.type] ?? 99).compareTo(typePriority[b.type] ?? 99));
+
+    return operations;
+  }
+
   /// Apply migration operations to records
   Future<List<Map<String, dynamic>>> _applyMigrationOperations(
       List<Map<String, dynamic>> records, List<MigrationOperation> operations,
@@ -1646,30 +1670,6 @@ class MigrationManager {
         label: 'MigrationManager.initialize',
       );
     }
-  }
-
-  /// sort migration operations, ensure rename operation is executed after other operations
-  List<MigrationOperation> _sortOperations(
-      List<MigrationOperation> operations) {
-    // operation priority (the smaller the number, the higher the priority)
-    final priorityMap = <MigrationType, int>{
-      MigrationType.addField: 1, // add field first
-      MigrationType.setPrimaryKeyConfig: 2,
-      MigrationType.modifyField: 3, // then modify field properties
-      MigrationType.addIndex: 4,
-      MigrationType.modifyIndex: 5,
-      MigrationType.removeIndex: 6,
-      MigrationType.renameField: 7, // rename field
-      MigrationType.removeField: 8, // remove field
-      MigrationType.renameTable: 9, // rename table
-      MigrationType.dropTable: 10,
-    };
-
-    operations.sort((a, b) {
-      return (priorityMap[a.type] ?? 99).compareTo(priorityMap[b.type] ?? 99);
-    });
-
-    return operations;
   }
 
   /// check if specified space is being migrated
