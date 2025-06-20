@@ -721,8 +721,6 @@ class IndexMeta {
   /// whether the index is unique
   final bool isUnique;
 
-  /// B+tree order
-  final int bTreeOrder;
 
   /// partition list
   final List<IndexPartitionMeta> partitions;
@@ -739,7 +737,6 @@ class IndexMeta {
     required this.tableName,
     required this.fields,
     required this.isUnique,
-    required this.bTreeOrder,
     required this.partitions,
     required this.timestamps,
     this.isOrdered,
@@ -762,7 +759,6 @@ class IndexMeta {
       tableName: tableName ?? this.tableName,
       fields: fields ?? List.from(this.fields),
       isUnique: isUnique ?? this.isUnique,
-      bTreeOrder: bTreeOrder ?? this.bTreeOrder,
       partitions: partitions ?? List.from(this.partitions),
       timestamps: timestamps ?? this.timestamps,
       isOrdered: isOrdered ?? this.isOrdered,
@@ -776,7 +772,6 @@ class IndexMeta {
       tableName: json['tableName'] as String,
       fields: (json['fields'] as List).map((e) => e as String).toList(),
       isUnique: json['isUnique'] as bool,
-      bTreeOrder: json['bTreeOrder'] as int,
       partitions: (json['partitions'] as List)
           .map((e) => IndexPartitionMeta.fromJson(e as Map<String, dynamic>))
           .toList(),
@@ -793,7 +788,6 @@ class IndexMeta {
       'tableName': tableName,
       'fields': fields,
       'isUnique': isUnique,
-      'bTreeOrder': bTreeOrder,
       'partitions': partitions.map((e) => e.toJson()).toList(),
       'timestamps': timestamps.toJson(),
       if (isOrdered != null) 'isOrdered': isOrdered,
@@ -802,6 +796,6 @@ class IndexMeta {
 
   @override
   String toString() {
-    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, fields: $fields, isUnique: $isUnique, bTreeOrder: $bTreeOrder, partitions: $partitions, timestamps: $timestamps, isOrdered: $isOrdered)';
+    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, fields: $fields, isUnique: $isUnique, partitions: $partitions, timestamps: $timestamps, isOrdered: $isOrdered)';
   }
 }

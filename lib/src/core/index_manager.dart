@@ -381,7 +381,6 @@ class IndexManager {
             final request = IndexDeleteRequest(
                 content: content,
                 checksum: partition.checksum,
-                bTreeOrder: indexMeta.bTreeOrder,
                 isUnique: isUniqueIndex,
                 keysToProcess: localKeysToProcess,
                 entriesToDelete: Map.fromEntries(entriesToDelete.entries
@@ -635,7 +634,6 @@ class IndexManager {
                       final request = IndexProcessingRequest(
                         entries: job.entries,
                         existingPartitionContent: job.existingContent,
-                        bTreeOrder: indexMeta.bTreeOrder,
                         isUnique: indexMeta.isUnique,
                       );
                       return await ComputeManager.run(
@@ -1015,7 +1013,6 @@ class IndexManager {
     try {
       // Create an empty B+ tree
       final bTree = BPlusTree(
-        order: meta.bTreeOrder,
         isUnique: meta.isUnique,
       );
 
@@ -1147,7 +1144,6 @@ class IndexManager {
               tableName: tableName,
               fields: index.fields,
               isUnique: true,
-              bTreeOrder: meta.bTreeOrder,
               partitions: meta.partitions,
               timestamps: meta.timestamps,
             );
@@ -1168,7 +1164,7 @@ class IndexManager {
               if (!index.isUnique) {
                 // Re-create the index with the unique flag
                 _indexCache[cacheKey] =
-                    BPlusTree(order: meta.bTreeOrder, isUnique: true);
+                    BPlusTree(isUnique: true);
               }
             }
           }
@@ -1231,7 +1227,6 @@ class IndexManager {
                   tableName: tableName,
                   fields: [field.name],
                   isUnique: true,
-                  bTreeOrder: _dataStore.config.bTreeOrder,
                   partitions: [],
                   timestamps: Timestamps(
                     created: DateTime.now(),
@@ -2340,7 +2335,6 @@ class IndexManager {
         // Initialize B+ tree from file content
         final btree = BPlusTree.fromString(
           content,
-          order: meta.bTreeOrder,
           isUnique: meta.isUnique,
         );
 
@@ -3077,7 +3071,6 @@ class IndexManager {
           tableName: tableName,
           fields: [primaryKey],
           isUnique: true,
-          bTreeOrder: _dataStore.config.bTreeOrder,
           partitions: [],
           timestamps: Timestamps(
             created: DateTime.now(),
@@ -3101,7 +3094,6 @@ class IndexManager {
           tableName: tableName,
           fields: indexSchema.fields,
           isUnique: indexSchema.unique,
-          bTreeOrder: _dataStore.config.bTreeOrder,
           partitions: [],
           timestamps: Timestamps(
             created: DateTime.now(),

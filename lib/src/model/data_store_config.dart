@@ -30,9 +30,6 @@ class DataStoreConfig {
   /// transaction timeout
   final Duration transactionTimeout;
 
-  /// B-tree order
-  final int bTreeOrder;
-
   /// enable monitoring
   final bool enableMonitoring;
 
@@ -115,7 +112,6 @@ class DataStoreConfig {
     this.spaceName = 'default',
     this.compressionLevel = 6,
     this.transactionTimeout = const Duration(minutes: 5),
-    this.bTreeOrder = 200,
     this.enableMonitoring = true,
     this.enableCompression = true,
     this.enableAutoRepair = true,
@@ -167,7 +163,7 @@ class DataStoreConfig {
     if (PlatformHandler.isWeb) {
       return 5000; // Web platform
     } else if (PlatformHandler.isMobile) {
-      return 15000; // Mobile devices
+      return 35000; // Mobile devices
     } else {
       return 100000; // Desktop devices
     }
@@ -284,7 +280,6 @@ class DataStoreConfig {
       compressionLevel: json['compressionLevel'] as int? ?? 6,
       transactionTimeout:
           Duration(milliseconds: json['transactionTimeout'] as int? ?? 300000),
-      bTreeOrder: json['bTreeOrder'] as int? ?? 200,
       enableMonitoring: json['enableMonitoring'] as bool? ?? true,
       enableCompression: json['enableCompression'] as bool? ?? true,
       enableAutoRepair: json['enableAutoRepair'] as bool? ?? true,
@@ -328,7 +323,6 @@ class DataStoreConfig {
       'spaceName': spaceName,
       'compressionLevel': compressionLevel,
       'transactionTimeout': transactionTimeout.inMilliseconds,
-      'bTreeOrder': bTreeOrder,
       'enableMonitoring': enableMonitoring,
       'enableCompression': enableCompression,
       'enableAutoRepair': enableAutoRepair,
@@ -361,7 +355,6 @@ class DataStoreConfig {
     String? spaceName,
     int? compressionLevel,
     Duration? transactionTimeout,
-    int? bTreeOrder,
     bool? enableMonitoring,
     bool? enableCompression,
     bool? enableAutoRepair,
@@ -391,7 +384,6 @@ class DataStoreConfig {
       spaceName: spaceName ?? this.spaceName,
       compressionLevel: compressionLevel ?? this.compressionLevel,
       transactionTimeout: transactionTimeout ?? this.transactionTimeout,
-      bTreeOrder: bTreeOrder ?? this.bTreeOrder,
       enableMonitoring: enableMonitoring ?? this.enableMonitoring,
       enableCompression: enableCompression ?? this.enableCompression,
       enableAutoRepair: enableAutoRepair ?? this.enableAutoRepair,

@@ -15,35 +15,45 @@ class BPlusTree {
   /// Safe node size limit, special handling is used when exceeded
   static const int maxSafeNodeSize = 500;
 
+  /// Auto-select order based on platform/memory if not specified
+  static int _defaultOrder() {
+    // 服务器优先大order，桌面次之，移动/web较小
+    try {
+      // 这里假设有PlatformHandler等工具可用
+      if (const bool.fromEnvironment('dart.library.html')) {
+        return 256; // web
+      }
+      // 可根据实际平台API进一步细分
+      // 这里简单区分
+      return 2048; // 服务器/桌面
+    } catch (_) {
+      return 1024;
+    }
+  }
+
   /// Create a B+ tree
   BPlusTree({
-    required this.order,
+    int? order,
     this.isUnique = false,
-  });
+  }) : order = order ?? _defaultOrder();
 
   /// Create a B+ tree from a serialized string
-  factory BPlusTree.fromString(String data,
-      {int order = 100, bool isUnique = false}) {
+  factory BPlusTree.fromString(String data, {int? order, bool isUnique = false}) {
     final tree = BPlusTree(order: order, isUnique: isUnique);
     if (data.isEmpty) return tree;
-
     try {
       final lines = data.split('\n');
-
       // Process in batches to avoid handling too much data at once
       const batchSize = 1000;
       for (int i = 0; i < lines.length; i += batchSize) {
         final end = math.min(i + batchSize, lines.length);
         final batch = lines.sublist(i, end);
-
         for (var line in batch) {
           if (line.trim().isEmpty) continue;
           final parts = line.split('|');
           if (parts.length >= 2) {
             final key = deserializeValue(parts[0]);
             final values = deserializeValues(parts[1]);
-
-            // Insert each value individually
             for (var value in values) {
               try {
                 tree.insert(key, value);
@@ -54,8 +64,6 @@ class BPlusTree {
             }
           }
         }
-
-        // Add a tiny delay between batches to avoid memory spikes
         if (end < lines.length) {
           Future.delayed(Duration.zero);
         }
@@ -254,31 +262,23 @@ class BPlusTree {
       BPlusTreeNode node, List<BPlusTreeNode> path) async {
     // Safety check
     if (node.keys.length <= order - 1) return;
-
     try {
       // Node size graded processing
       if (node.keys.length > maxSafeNodeSize) {
-        await _handleOversizedNode(node, path);
+        await _handleOverSizedNode(node, path);
         return;
       }
-
       // Normal split logic - create a new node
       final rightNode = BPlusTreeNode(isLeaf: node.isLeaf);
-
       // Use dynamic split point, don't set a fixed upper limit
       int splitPoint = node.keys.length ~/ 2;
 
-      // Safety check
       if (splitPoint <= 0 || splitPoint >= node.keys.length) {
-        splitPoint =
-            math.max(1, math.min(node.keys.length - 1, node.keys.length ~/ 2));
+        splitPoint = math.max(1, math.min(node.keys.length - 1, node.keys.length ~/ 2));
       }
-
       // Copy right half of keys and values to new node
-      final rightKeys = node.keys.sublist(splitPoint);
-      final rightValues = node.values.sublist(splitPoint);
-
-      // Add keys and values to right node
+      final rightKeys = node.keys.sublist(splitPoint, node.keys.length);
+      final rightValues = node.values.sublist(splitPoint, node.values.length);
       for (int i = 0; i < rightKeys.length; i++) {
         rightNode.keys.add(rightKeys[i]);
         if (i < rightValues.length) {
@@ -287,24 +287,15 @@ class BPlusTree {
           rightNode.values.add([]);
         }
       }
-
-      // Handle children (for non-leaf nodes)
       if (!node.isLeaf) {
         _handleNonLeafSplit(node, rightNode, splitPoint);
       } else {
-        // Leaf node: connect linked list
         rightNode.next = node.next;
         node.next = rightNode;
       }
-
-      // Remove transferred keys and values from left node
       node.keys.removeRange(splitPoint, node.keys.length);
       node.values.removeRange(splitPoint, node.values.length);
-
-      // Key to promote to parent node (for searching, separating left and right subtrees)
       final promotedKey = rightNode.keys.first;
-
-      // Handle parent node
       if (path.isEmpty) {
         _createNewRoot(node, rightNode, promotedKey);
       } else {
@@ -313,28 +304,26 @@ class BPlusTree {
     } catch (e, stack) {
       Logger.error('Safe node split failed: $e\n$stack',
           label: 'BPlusTree._safeSplitNode');
-      // Catch errors but don't rethrow to avoid cascade failures
     }
   }
 
-  /// Handle oversized node (completely separated method)
-  Future<void> _handleOversizedNode(
+  /// Handle overSized node (completely separated method)
+  Future<void> _handleOverSizedNode(
       BPlusTreeNode node, List<BPlusTreeNode> path) async {
-    Logger.warn(
-        'Node too large(${node.keys.length}), using multi-stage splitting',
-        label: 'BPlusTree._handleOversizedNode');
-
-    // For oversized nodes, we split into three parts instead of two to reduce node size faster
+    // For overSized nodes, we split into three parts instead of two to reduce node size faster
     int firstSplitPoint = node.keys.length ~/ 3;
     int secondSplitPoint = firstSplitPoint * 2;
 
+    if (firstSplitPoint <= 0 || firstSplitPoint >= node.keys.length - 1) {
+      firstSplitPoint = math.max(1, node.keys.length ~/ 3);
+    }
+    if (secondSplitPoint <= firstSplitPoint || secondSplitPoint >= node.keys.length) {
+      secondSplitPoint = math.max(firstSplitPoint + 1, math.min(node.keys.length - 1, firstSplitPoint * 2));
+    }
     // Create a temporary node to store the remaining 2/3 of the data
     final tempNode = BPlusTreeNode(isLeaf: node.isLeaf);
-
-    // Move middle 1/3 to temporary node
     final midKeys = node.keys.sublist(firstSplitPoint, secondSplitPoint);
     final midValues = node.values.sublist(firstSplitPoint, secondSplitPoint);
-
     for (int i = 0; i < midKeys.length; i++) {
       tempNode.keys.add(midKeys[i]);
       if (i < midValues.length) {
@@ -343,12 +332,9 @@ class BPlusTree {
         tempNode.values.add([]);
       }
     }
-
-    // Create a third node for the last 1/3 of data
     final lastNode = BPlusTreeNode(isLeaf: node.isLeaf);
-    final lastKeys = node.keys.sublist(secondSplitPoint);
-    final lastValues = node.values.sublist(secondSplitPoint);
-
+    final lastKeys = node.keys.sublist(secondSplitPoint, node.keys.length);
+    final lastValues = node.values.sublist(secondSplitPoint, node.values.length);
     for (int i = 0; i < lastKeys.length; i++) {
       lastNode.keys.add(lastKeys[i]);
       if (i < lastValues.length) {
@@ -357,10 +343,7 @@ class BPlusTree {
         lastNode.values.add([]);
       }
     }
-
-    // Handle children (for non-leaf nodes)
     if (!node.isLeaf && node.children.isNotEmpty) {
-      // Assign children to middle node
       if (node.children.length > firstSplitPoint) {
         final midChildren = node.children.sublist(firstSplitPoint,
             math.min(secondSplitPoint + 1, node.children.length));
@@ -369,80 +352,56 @@ class BPlusTree {
           child.parent = tempNode;
         }
       }
-
-      // Assign children to last node
       if (node.children.length > secondSplitPoint) {
-        final lastChildren = node.children.sublist(secondSplitPoint);
+        final lastChildren = node.children.sublist(secondSplitPoint, node.children.length);
         for (var child in lastChildren) {
           lastNode.children.add(child);
           child.parent = lastNode;
         }
       }
-
-      // Adjust children of first node
       if (node.children.length > firstSplitPoint) {
         node.children.removeRange(firstSplitPoint, node.children.length);
       }
     } else if (node.isLeaf) {
-      // Leaf node linked list connection
       lastNode.next = node.next;
       node.next = tempNode;
       tempNode.next = lastNode;
     }
-
-    // Keep first 1/3 of data in first node
     node.keys.removeRange(firstSplitPoint, node.keys.length);
     node.values.removeRange(firstSplitPoint, node.values.length);
-
-    // Select keys to promote
     final promotedKey1 = tempNode.keys.first;
     final promotedKey2 = lastNode.keys.first;
-
-    // Create or update parent node
     if (path.isEmpty) {
-      // Create new root node
       final newRoot = BPlusTreeNode(isLeaf: false);
       newRoot.keys.add(promotedKey1);
       newRoot.keys.add(promotedKey2);
       newRoot.children.add(node);
       newRoot.children.add(tempNode);
       newRoot.children.add(lastNode);
-
       node.parent = newRoot;
       tempNode.parent = newRoot;
       lastNode.parent = newRoot;
-
       root = newRoot;
     } else {
-      // Insert two new nodes into parent node
       final parent = path.last;
       int insertPos = 0;
-
-      // Find current node's position in parent
       while (insertPos < parent.children.length &&
           parent.children[insertPos] != node) {
         insertPos++;
       }
-
       if (insertPos >= parent.children.length) {
         Logger.error('Cannot find current node in parent',
             label: 'BPlusTree._handleOversizedNode');
         return;
       }
-
-      // Insert middle node and its key
       parent.keys.insert(insertPos, promotedKey1);
       parent.children.insert(insertPos + 1, tempNode);
       tempNode.parent = parent;
-
-      // Insert last node and its key
       parent.keys.insert(insertPos + 1, promotedKey2);
       parent.children.insert(insertPos + 2, lastNode);
       lastNode.parent = parent;
-
-      // Check if parent node needs to be split
       if (parent.keys.length > order - 1) {
-        await Future.delayed(Duration.zero); // Avoid deep recursion
+        await Future.delayed(Duration.zero);
         try {
           await _safeSplitNode(parent, path.sublist(0, path.length - 1));
         } catch (e) {

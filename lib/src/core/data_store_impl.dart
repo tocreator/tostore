@@ -1937,7 +1937,7 @@ class DataStoreImpl {
     try {
       // Async load table record to cache
       if (!isMigrationInstance) {
-        _loadTableRecordToCache();
+        // _loadTableRecordToCache();
       }
     } catch (e) {
       Logger.error('Load data to cache failed: $e',

@@ -33,16 +33,12 @@ class IndexProcessingRequest {
   /// The string content of an existing partition file. Null for new partitions.
   final String? existingPartitionContent;
 
-  /// The B+ tree order.
-  final int bTreeOrder;
-
   /// Whether the index is unique.
   final bool isUnique;
 
   IndexProcessingRequest({
     required this.entries,
     this.existingPartitionContent,
-    required this.bTreeOrder,
     required this.isUnique,
   });
 }
@@ -55,8 +51,6 @@ class IndexDeleteRequest {
   /// The checksum of the partition file (optional)
   final String? checksum;
 
-  /// The B+ tree order
-  final int bTreeOrder;
 
   /// Whether the index is unique
   final bool isUnique;
@@ -70,7 +64,6 @@ class IndexDeleteRequest {
   IndexDeleteRequest({
     required this.content,
     this.checksum,
-    required this.bTreeOrder,
     required this.isUnique,
     required this.keysToProcess,
     required this.entriesToDelete,
@@ -145,12 +138,10 @@ Future<IndexProcessingResult> processIndexPartition(
           request.existingPartitionContent!.isNotEmpty) {
         btree = BPlusTree.fromString(
           request.existingPartitionContent!,
-          order: request.bTreeOrder,
           isUnique: request.isUnique,
         );
       } else {
         btree = BPlusTree(
-          order: request.bTreeOrder,
           isUnique: request.isUnique,
         );
       }
@@ -231,7 +222,6 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     try {
       btree = BPlusTree.fromString(
         request.content,
-        order: request.bTreeOrder,
         isUnique: request.isUnique,
       );
     } catch (treeError) {

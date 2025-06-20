@@ -191,7 +191,9 @@ class QueryExecutor {
               );
             }
           }
-          return _paginateResults(results, limit, offset);
+          if (results.isNotEmpty || isFullCache) {
+            return _paginateResults(results, limit, offset);
+          }
         }
       }
 
