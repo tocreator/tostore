@@ -2333,7 +2333,7 @@ class IndexManager {
         }
 
         // Initialize B+ tree from file content
-        final btree = BPlusTree.fromString(
+        final btree = await BPlusTree.fromString(
           content,
           isUnique: meta.isUnique,
         );

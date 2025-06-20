@@ -1,5 +1,6 @@
 import '../handler/logger.dart';
 import 'dart:math' as math;
+import '../handler/platform_handler.dart';
 
 /// B+ tree implementation with enhanced safety and performance
 class BPlusTree {
@@ -12,21 +13,58 @@ class BPlusTree {
   /// Root node
   BPlusTreeNode? root;
 
-  /// Safe node size limit, special handling is used when exceeded
-  static const int maxSafeNodeSize = 500;
+  /// Get safe node size limit based on platform
+  static int get maxSafeNodeSize => _getMaxSafeNodeSize();
+  
+  /// Calculate max safe node size based on platform and available memory
+  static int _getMaxSafeNodeSize() {
+    try {
+      if (PlatformHandler.isWeb) {
+        return 500; // Web platform has limited memory
+      } else if (PlatformHandler.isMobile) {
+        return 1000; // Mobile platform
+      } else if (PlatformHandler.isServerEnvironment) {
+        final cores = PlatformHandler.processorCores;
+        // Server environment - scale with CPU cores
+        return math.max(2000, cores * 250);
+      } else {
+        // Desktop environment
+        return 1500;
+      }
+    } catch (e) {
+      // Return safe default value on error
+      return 500;
+    }
+  }
 
   /// Auto-select order based on platform/memory if not specified
   static int _defaultOrder() {
-    // 服务器优先大order，桌面次之，移动/web较小
+    // Dynamically adjust order parameters based on platform type and memory size
     try {
-      // 这里假设有PlatformHandler等工具可用
-      if (const bool.fromEnvironment('dart.library.html')) {
-        return 256; // web
+      // Web platform uses smaller order
+      if (PlatformHandler.isWeb) {
+        return 256;
       }
-      // 可根据实际平台API进一步细分
-      // 这里简单区分
-      return 2048; // 服务器/桌面
-    } catch (_) {
+      
+      // Mobile platform uses medium order
+      if (PlatformHandler.isMobile) {
+        return 512;
+      }
+      
+      // Server environment uses larger order
+      if (PlatformHandler.isServerEnvironment) {
+        final cores = PlatformHandler.processorCores;
+        // Server adjusts based on core count, supports larger data sets
+        return math.max(2048, cores * 256);
+      }
+      
+      // Desktop platform adjusts based on available memory
+      final cores = PlatformHandler.processorCores;
+      return math.max(1024, cores * 128);
+    } catch (e) {
+      // Return safe default value on error
+      Logger.warn('Error determining B+Tree order: $e, using default value', 
+          label: 'BPlusTree._defaultOrder');
       return 1024;
     }
   }
@@ -38,13 +76,19 @@ class BPlusTree {
   }) : order = order ?? _defaultOrder();
 
   /// Create a B+ tree from a serialized string
-  factory BPlusTree.fromString(String data, {int? order, bool isUnique = false}) {
+  static Future<BPlusTree> fromString(String data, {int? order, bool isUnique = false}) async {
     final tree = BPlusTree(order: order, isUnique: isUnique);
     if (data.isEmpty) return tree;
     try {
       final lines = data.split('\n');
-      // Process in batches to avoid handling too much data at once
-      const batchSize = 1000;
+      // Use the same batch size calculation as batchInsert for consistency
+      int batchSize = _getDefaultBatchSize();
+      
+      // For very large data, reduce batch size to avoid memory issues
+      if (data.length > 10 * 1024 * 1024) { // >10MB
+        batchSize = batchSize ~/ 2;
+      }
+      
       for (int i = 0; i < lines.length; i += batchSize) {
         final end = math.min(i + batchSize, lines.length);
         final batch = lines.sublist(i, end);
@@ -56,7 +100,7 @@ class BPlusTree {
             final values = deserializeValues(parts[1]);
             for (var value in values) {
               try {
-                tree.insert(key, value);
+                await tree.insert(key, value);
               } catch (e) {
                 Logger.error('Insertion failed: $e, key=$key, value=$value',
                     label: 'BPlusTree.fromString');
@@ -65,7 +109,11 @@ class BPlusTree {
           }
         }
         if (end < lines.length) {
-          Future.delayed(Duration.zero);
+          // Dynamically adjust pause duration based on data size
+          final pauseDuration = lines.length > 100000 
+              ? const Duration(milliseconds: 5) // More time for GC with large data
+              : Duration.zero;
+          await Future.delayed(pauseDuration);
         }
       }
     } catch (e) {
@@ -161,8 +209,29 @@ class BPlusTree {
       throw ArgumentError('The number of keys and values must be the same');
     }
 
-    // Process 500 items per batch to avoid memory spikes
-    const batchSize = 500;
+    // For B+ tree, we use smaller batch size to avoid memory peaks
+    int batchSize;
+    try {
+      // Get configured batch size, but appropriately reduce for B+ tree operations to avoid memory issues
+      final configBatchSize = _getDefaultBatchSize();
+      // Dynamically adjust batch size based on data size
+      if (keys.length > 1000000) {
+        // Above 1 million data, use smaller batch to reduce memory pressure
+        batchSize = math.min(configBatchSize ~/ 4, 500);
+      } else if (keys.length > 100000) {
+        // 100,000 data
+        batchSize = math.min(configBatchSize ~/ 2, 1000);
+      } else {
+        // Small data, can use larger batch
+        batchSize = math.min(configBatchSize, 2000);
+      }
+    } catch (e) {
+      // Use safe default value on error
+      batchSize = 500;
+      Logger.warn('Error determining batch size: $e, using default value',
+          label: 'BPlusTree.batchInsert');
+    }
+
     for (int i = 0; i < keys.length; i += batchSize) {
       final end = math.min(i + batchSize, keys.length);
 
@@ -173,8 +242,34 @@ class BPlusTree {
 
       // Brief pause between batches to allow GC to work and prevent memory spikes
       if (end < keys.length) {
-        await Future.delayed(Duration.zero);
+        // Dynamically adjust pause duration based on batch size
+        final pauseDuration = keys.length > 100000 
+            ? const Duration(milliseconds: 5) // More time for GC with large data
+            : Duration.zero;
+        await Future.delayed(pauseDuration);
       }
+    }
+  }
+
+  /// Get default batch size
+  static int _getDefaultBatchSize() {
+    // Prioritize using PlatformHandler's recommended concurrency
+    try {
+      if (PlatformHandler.isWeb) {
+        return 500; // Web environment uses smaller batch
+      } else if (PlatformHandler.isMobile) {
+        return 1000; // Mobile device uses medium batch
+      } else if (PlatformHandler.isServerEnvironment) {
+        // Server environment adjusts based on core count
+        int cpuCount = PlatformHandler.processorCores;
+        return 2000 + (cpuCount * 500);
+      } else {
+        // Desktop environment
+        return 2000;
+      }
+    } catch (e) {
+      // Default safe value
+      return 1000;
     }
   }
 
@@ -264,7 +359,8 @@ class BPlusTree {
     if (node.keys.length <= order - 1) return;
     try {
       // Node size graded processing
-      if (node.keys.length > maxSafeNodeSize) {
+      final currentMaxSafeNodeSize = maxSafeNodeSize;
+      if (node.keys.length > currentMaxSafeNodeSize) {
         await _handleOverSizedNode(node, path);
         return;
       }
@@ -310,16 +406,36 @@ class BPlusTree {
   /// Handle overSized node (completely separated method)
   Future<void> _handleOverSizedNode(
       BPlusTreeNode node, List<BPlusTreeNode> path) async {
+    // Get current safe node size to determine split strategy
+    final currentMaxSafeNodeSize = maxSafeNodeSize;
+    final nodeSize = node.keys.length;
+    
+    // For extremely large nodes (over 3x safe size), split into four parts instead of three
+    final splitCount = nodeSize > currentMaxSafeNodeSize * 3 ? 4 : 3;
+    
     // For overSized nodes, we split into three parts instead of two to reduce node size faster
-    int firstSplitPoint = node.keys.length ~/ 3;
-    int secondSplitPoint = firstSplitPoint * 2;
+    final List<int> splitPoints = [];
+    for (int i = 1; i < splitCount; i++) {
+      splitPoints.add((nodeSize * i) ~/ splitCount);
+    }
+    
+    // Validate all split points
+    for (int i = 0; i < splitPoints.length; i++) {
+      // Ensure each split point is valid (not 0 and not equal to node length)
+      if (splitPoints[i] <= 0 || splitPoints[i] >= nodeSize) {
+        splitPoints[i] = math.max(1, math.min(nodeSize - 1, (nodeSize * (i + 1)) ~/ splitCount));
+      }
+      
+      // Ensure split points are in ascending order with minimum gap
+      if (i > 0 && (splitPoints[i] <= splitPoints[i-1] + 1)) {
+        splitPoints[i] = math.min(nodeSize - 1, splitPoints[i-1] + 2);
+      }
+    }
+    
+    // For simplicity in the rest of the code, extract first and second split points
+    int firstSplitPoint = splitPoints[0];
+    int secondSplitPoint = splitPoints.length > 1 ? splitPoints[1] : (nodeSize * 2) ~/ 3;
 
-    if (firstSplitPoint <= 0 || firstSplitPoint >= node.keys.length - 1) {
-      firstSplitPoint = math.max(1, node.keys.length ~/ 3);
-    }
-    if (secondSplitPoint <= firstSplitPoint || secondSplitPoint >= node.keys.length) {
-      secondSplitPoint = math.max(firstSplitPoint + 1, math.min(node.keys.length - 1, firstSplitPoint * 2));
-    }
     // Create a temporary node to store the remaining 2/3 of the data
     final tempNode = BPlusTreeNode(isLeaf: node.isLeaf);
     final midKeys = node.keys.sublist(firstSplitPoint, secondSplitPoint);

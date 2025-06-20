@@ -136,7 +136,7 @@ Future<IndexProcessingResult> processIndexPartition(
     try {
       if (request.existingPartitionContent != null &&
           request.existingPartitionContent!.isNotEmpty) {
-        btree = BPlusTree.fromString(
+        btree = await BPlusTree.fromString(
           request.existingPartitionContent!,
           isUnique: request.isUnique,
         );
@@ -220,7 +220,7 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     // Initialize B+ tree from content
     BPlusTree btree;
     try {
-      btree = BPlusTree.fromString(
+      btree = await BPlusTree.fromString(
         request.content,
         isUnique: request.isUnique,
       );

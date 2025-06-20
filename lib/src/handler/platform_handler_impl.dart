@@ -8,6 +8,23 @@ import '../handler/logger.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
+
+  // Platform type cache - these remain constant within the application lifecycle
+  static bool? _cachedIsMobile;
+  static bool? _cachedIsDesktop;
+  static bool? _cachedIsTestEnvironment;
+  static bool? _cachedIsAndroid;
+  static bool? _cachedIsIOS;
+  static bool? _cachedIsWindows;
+  static bool? _cachedIsMacOS;
+  static bool? _cachedIsLinux;
+  static bool? _cachedIsServerEnvironment;
+
+  // Processor info cache - these remain constant within the application lifecycle
+  static int? _cachedProcessorCores;
+  static DateTime? _lastProcessorCheck;
+  static const Duration _processorCacheTimeout = Duration(hours: 1);
+
   // Cache for memory values
   int? _cachedSystemMemoryMB;
   DateTime? _lastSystemMemoryFetch;
@@ -18,47 +35,163 @@ class PlatformHandlerImpl implements PlatformInterface {
   final _memoryFetchTimeout = const Duration(seconds: 5);
 
   @override
-  bool get isMobile => Platform.isAndroid || Platform.isIOS;
+  bool get isMobile {
+    // Lazy load cache: only calculate when first accessed
+    if (_cachedIsMobile == null) {
+      try {
+        _cachedIsMobile = Platform.isAndroid || Platform.isIOS;
+      } catch (e) {
+        _cachedIsMobile = false;
+        Logger.warn('Error detecting mobile platform: $e',
+            label: 'PlatformHandlerImpl.isMobile');
+      }
+    }
+    return _cachedIsMobile!;
+  }
 
   @override
-  bool get isDesktop =>
-      Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+  bool get isDesktop {
+    // Lazy load cache: only calculate when first accessed
+    if (_cachedIsDesktop == null) {
+      try {
+        _cachedIsDesktop = Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+      } catch (e) {
+        _cachedIsDesktop = false;
+        Logger.warn('Error detecting desktop platform: $e',
+            label: 'PlatformHandlerImpl.isDesktop');
+      }
+    }
+    return _cachedIsDesktop!;
+  }
 
   @override
   int get processorCores {
+    final now = DateTime.now();
+    
+    // Check if cache is valid (processor core count unlikely to change, but set long timeout for safety)
+    if (_cachedProcessorCores != null && 
+        _lastProcessorCheck != null &&
+        now.difference(_lastProcessorCheck!) < _processorCacheTimeout) {
+      return _cachedProcessorCores!;
+    }
+    
     try {
-      return Platform.numberOfProcessors;
+      _cachedProcessorCores = Platform.numberOfProcessors;
+      _lastProcessorCheck = now;
+      return _cachedProcessorCores!;
     } catch (e) {
-      return 4; // Return a safe value if an exception occurs
+      // Cache default value
+      _cachedProcessorCores = 4;
+      _lastProcessorCheck = now;
+      return _cachedProcessorCores!;
     }
   }
 
   @override
   bool get isTestEnvironment {
-    try {
-      return Platform.environment.containsKey('FLUTTER_TEST');
-    } catch (e) {
-      return false;
+    if (_cachedIsTestEnvironment == null) {
+      try {
+        _cachedIsTestEnvironment = Platform.environment.containsKey('FLUTTER_TEST');
+      } catch (e) {
+        _cachedIsTestEnvironment = false;
+      }
     }
+    return _cachedIsTestEnvironment!;
   }
 
   @override
   bool get isWeb => false;
 
   @override
-  bool get isAndroid => Platform.isAndroid;
+  bool get isAndroid {
+    if (_cachedIsAndroid == null) {
+      try {
+        _cachedIsAndroid = Platform.isAndroid;
+      } catch (e) {
+        _cachedIsAndroid = false;
+      }
+    }
+    return _cachedIsAndroid!;
+  }
 
   @override
-  bool get isIOS => Platform.isIOS;
+  bool get isIOS {
+    if (_cachedIsIOS == null) {
+      try {
+        _cachedIsIOS = Platform.isIOS;
+      } catch (e) {
+        _cachedIsIOS = false;
+      }
+    }
+    return _cachedIsIOS!;
+  }
 
   @override
-  bool get isWindows => Platform.isWindows;
+  bool get isWindows {
+    if (_cachedIsWindows == null) {
+      try {
+        _cachedIsWindows = Platform.isWindows;
+      } catch (e) {
+        _cachedIsWindows = false;
+      }
+    }
+    return _cachedIsWindows!;
+  }
 
   @override
-  bool get isMacOS => Platform.isMacOS;
+  bool get isMacOS {
+    if (_cachedIsMacOS == null) {
+      try {
+        _cachedIsMacOS = Platform.isMacOS;
+      } catch (e) {
+        _cachedIsMacOS = false;
+      }
+    }
+    return _cachedIsMacOS!;
+  }
 
   @override
-  bool get isLinux => Platform.isLinux;
+  bool get isLinux {
+    if (_cachedIsLinux == null) {
+      try {
+        _cachedIsLinux = Platform.isLinux;
+      } catch (e) {
+        _cachedIsLinux = false;
+      }
+    }
+    return _cachedIsLinux!;
+  }
+  
+  bool get isServerEnvironment {
+    if (_cachedIsServerEnvironment == null) {
+      try {
+        // Server environment detection strategy
+        if (isLinux) {
+          // Linux server may be a database server
+          _cachedIsServerEnvironment = true;
+        } else if (isMacOS && processorCores >= 8) {
+          // Mac server usually has more processor cores
+          _cachedIsServerEnvironment = true;
+        } else {
+          _cachedIsServerEnvironment = false;
+        }
+      } catch (e) {
+        _cachedIsServerEnvironment = false;
+        Logger.warn('Error detecting server environment: $e',
+            label: 'PlatformHandlerImpl.isServerEnvironment');
+      }
+    }
+    return _cachedIsServerEnvironment!;
+  }
+  
+
+  /// Clear memory related caches
+  void clearMemoryCaches() {
+    _cachedSystemMemoryMB = null;
+    _lastSystemMemoryFetch = null;
+    _cachedAvailableSystemMemoryMB = null;
+    _lastAvailableSystemMemoryFetch = null;
+  }
 
   /// Get system memory size (MB)
   @override
