@@ -1458,8 +1458,8 @@ class MigrationManager {
           if (schema != null) {
             await _dataStore.dataCacheManager.cacheEntireTable(
               currentTableName,
-              allMigratedRecords,
               schema.primaryKey,
+              allMigratedRecords,
               isFullTableCache: true,
             );
           }

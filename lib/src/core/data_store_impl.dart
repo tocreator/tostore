@@ -20,6 +20,7 @@ import '../model/table_schema.dart';
 import 'data_cache_manager.dart';
 import 'data_compressor.dart';
 import '../model/data_store_config.dart';
+import 'memory_manager.dart';
 import 'table_data_manager.dart';
 import 'index_manager.dart';
 import '../model/table_info.dart';
@@ -77,6 +78,9 @@ class DataStoreImpl {
   PathManager? _pathManager;
   DirectoryManager? directoryManager;
   LockManager? lockManager;
+  
+  MemoryManager? _memoryManager;
+  
   PathManager get pathManager {
     if (_pathManager == null) {
       throw StateError('PathManager not initialized');
@@ -102,6 +106,9 @@ class DataStoreImpl {
   QueryExecutor? getQueryExecutor() => _queryExecutor;
 
   IndexManager? get indexManager => _indexManager;
+  
+  /// Get memory manager
+  MemoryManager? get memoryManager => _memoryManager;
 
   /// Get current configuration
   DataStoreConfig get config {
@@ -314,6 +321,10 @@ class DataStoreImpl {
       schemaManager = SchemaManager(this);
       _pathManager = PathManager(this);
 
+      // Initialize memory manager
+      _memoryManager = MemoryManager();
+      await _memoryManager?.initialize(_config!);
+
       // Apply log configuration
       LogConfig.setConfig(
         enableLog: _config!.enableLog,
@@ -524,6 +535,9 @@ class DataStoreImpl {
       _indexManager?.dispose();
       dataCacheManager.clear();
       await _transactionManager?.commit(null);
+      
+      // Clean up memory manager resources
+      _memoryManager?.dispose();
 
       // Clear instance variables
       _transactionManager = null;
@@ -536,6 +550,7 @@ class DataStoreImpl {
       migrationManager = null;
       schemaManager = null;
       _tableDataManager = null;
+      _memoryManager = null;
 
       _globalConfigCache = null;
       _spaceConfigCache = null;
@@ -633,8 +648,8 @@ class DataStoreImpl {
         // Mark new table as full table cache
         await dataCacheManager.cacheEntireTable(
           schema.name,
-          [],
           schema.primaryKey,
+          [],
           isFullTableCache: true,
         );
 
@@ -1350,8 +1365,9 @@ class DataStoreImpl {
       final totalRecords =
           await tableDataManager.getTableRecordCount(tableName);
 
-      // use config.maxRecordCacheSize as threshold
-      final recordThreshold = config.maxRecordCacheSize;
+      // Get record cache size limit using memory manager
+      final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
+      final recordThreshold = (recordCacheSize / 1000).round(); // 1KB per record
 
       // get table schema
       final schema = await getTableSchema(tableName);
@@ -1976,8 +1992,8 @@ class DataStoreImpl {
             final records = await _loadAllRecords(tableName);
             await dataCacheManager.cacheEntireTable(
               tableName,
-              records,
               schema.primaryKey,
+              records,
             );
           }
         } catch (e, stackTrace) {

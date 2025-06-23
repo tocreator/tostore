@@ -5,18 +5,6 @@ import 'dart:math';
 
 /// data store config
 class DataStoreConfig {
-  /// Static cache for system memory size in MB
-  static int _cachedSystemMemoryMB = 0;
-
-  /// Static initializer to fetch and cache system memory
-  static void _initMemoryCache() {
-    PlatformHandler.getSystemMemoryMB().then((memoryMB) {
-      _cachedSystemMemoryMB = memoryMB > 0 ? memoryMB : 2048;
-    }).catchError((_) {
-      // Default value on error
-      _cachedSystemMemoryMB = 2048;
-    });
-  }
 
   /// database path
   final String? dbPath;
@@ -53,18 +41,6 @@ class DataStoreConfig {
   /// Note: After changing the encryption key, data encoded with the old key cannot be decoded. Please protect it carefully
   final String encryptionKey;
 
-  /// max table cache file size
-  final int maxTableCacheFileSize;
-
-  /// max query cache size
-  final int maxQueryCacheSize;
-
-  /// max record cache size
-  final int maxRecordCacheSize;
-
-  /// max index cache size
-  final int maxIndexCacheSize;
-
   /// migration config
   final MigrationConfig? migrationConfig;
 
@@ -74,9 +50,6 @@ class DataStoreConfig {
   /// max partition file size based on platform
   /// Web: 64KB, Mobile: 256KB, Desktop: 4MB
   final int maxPartitionFileSize;
-
-  /// Table schema cache size limit
-  final int maxSchemaCacheSize;
 
   /// Enable logging
   final bool enableLog;
@@ -106,6 +79,10 @@ class DataStoreConfig {
   /// null: no expiry (cache entries remain until manually cleared or evicted)
   /// other: duration after which cache entries are considered stale
   final Duration? queryCacheExpiryTime;
+  
+  /// Memory threshold in MB for all caches combined
+  /// If null, system will automatically determine appropriate value based on available memory
+  final int? memoryThresholdInMB;
 
   DataStoreConfig({
     this.dbPath,
@@ -119,14 +96,9 @@ class DataStoreConfig {
     this.enableEncodingObfuscation = true,
     this.encodingKey = "E9n8C7o6D7I8n3gkEY",
     this.encryptionKey = "E9n8C7r6y7P8T3ioNkEy",
-    int? maxTableCacheFileSize,
-    int? maxQueryCacheSize,
-    int? maxRecordCacheSize,
-    int? maxIndexCacheSize,
     this.migrationConfig = const MigrationConfig(),
     this.maxEntriesPerDir = 500,
     int? maxPartitionFileSize,
-    int? maxSchemaCacheSize,
     this.enableLog = true,
     this.logLevel = LogLevel.warn,
     int? maxConcurrent,
@@ -135,38 +107,16 @@ class DataStoreConfig {
     int? maxTablesPerFlush,
     bool? enableQueryCache,
     this.queryCacheExpiryTime,
+    this.memoryThresholdInMB,
   })  : maxPartitionFileSize =
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
-        maxTableCacheFileSize =
-            maxTableCacheFileSize ?? CacheSettings.maxTableCacheFileSize,
-        maxQueryCacheSize = maxQueryCacheSize ?? _getDefaultPlatformCacheSize(),
-        maxRecordCacheSize =
-            maxRecordCacheSize ?? _getDefaultPlatformCacheSize(),
-        maxIndexCacheSize = maxIndexCacheSize ?? _getDefaultPlatformCacheSize(),
-        maxSchemaCacheSize = maxSchemaCacheSize ?? _getDefaultSchemaCacheSize(),
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
         distributedNodeConfig =
             distributedNodeConfig ?? const DistributedNodeConfig(),
         maxBatchSize = maxBatchSize ?? _getDefaultBatchSize(),
         maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
         enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled() {
-    // Initialize async memory detection and cache optimization
-    CacheSettings.startMemoryOptimization();
-    // Initialize our system memory cache
-    if (_cachedSystemMemoryMB <= 0) {
-      _initMemoryCache();
-    }
-  }
-
-  /// get default platform cache size
-  static int _getDefaultPlatformCacheSize() {
-    if (PlatformHandler.isWeb) {
-      return 5000; // Web platform
-    } else if (PlatformHandler.isMobile) {
-      return 35000; // Mobile devices
-    } else {
-      return 100000; // Desktop devices
-    }
+    // no longer initialize memory detection and cache optimization, this will be handled by MemoryManager
   }
 
   /// Determine if query cache should be enabled by default
@@ -179,17 +129,6 @@ class DataStoreConfig {
   /// Returns true for client platforms, false for server platforms
   bool get shouldEnableQueryCache =>
       enableQueryCache ?? _getDefaultQueryCacheEnabled();
-
-  /// get default schema cache size
-  static int _getDefaultSchemaCacheSize() {
-    if (PlatformHandler.isWeb) {
-      return 1000; // Web platform
-    } else if (PlatformHandler.isMobile) {
-      return 2000; // Mobile devices
-    } else {
-      return 50000; // Desktop devices
-    }
-  }
 
   /// get default partition file size limit, based on platform
   static int _getDefaultMaxPartitionFileSize() {
@@ -287,11 +226,6 @@ class DataStoreConfig {
       enableEncodingObfuscation:
           json['enableEncodingObfuscation'] as bool? ?? true,
       encodingKey: json['encodingKey'] ?? "E9n8C7o6D7I8n3gkEY",
-      maxTableCacheFileSize:
-          json['maxTableCacheFileSize'] as int? ?? 10 * 1024 * 1024,
-      maxQueryCacheSize: json['maxQueryCacheSize'] as int? ?? 5000,
-      maxRecordCacheSize: json['maxRecordCacheSize'] as int? ?? 10000,
-      maxIndexCacheSize: json['maxIndexCacheSize'] as int? ?? 10000,
       encryptionKey: json['encryptionKey'] ?? "E9n8C7r6y7P8T3ioNkEy",
       migrationConfig: json['migrationConfig'] != null
           ? MigrationConfig.fromJson(
@@ -299,7 +233,6 @@ class DataStoreConfig {
           : const MigrationConfig(),
       maxEntriesPerDir: json['maxEntriesPerDir'] as int? ?? 500,
       maxPartitionFileSize: json['maxPartitionFileSize'] as int?,
-      maxSchemaCacheSize: json['maxSchemaCacheSize'] as int?,
       enableLog: json['enableLog'] as bool? ?? true,
       logLevel: _parseLogLevel(json['logLevel']),
       maxConcurrent: json['maxConcurrent'] as int?,
@@ -313,6 +246,7 @@ class DataStoreConfig {
       queryCacheExpiryTime: json['queryCacheExpiryTime'] != null
           ? Duration(milliseconds: json['queryCacheExpiryTime'] as int)
           : null,
+      memoryThresholdInMB: json['memoryThresholdInMB'] as int?,
     );
   }
 
@@ -329,15 +263,10 @@ class DataStoreConfig {
       'enableEncoding': enableEncoding,
       'enableEncodingObfuscation': enableEncodingObfuscation,
       'encodingKey': encodingKey,
-      'maxTableCacheSize': maxTableCacheFileSize,
-      'maxQueryCacheSize': maxQueryCacheSize,
-      'maxRecordCacheSize': maxRecordCacheSize,
-      'maxCacheSize': maxIndexCacheSize,
       'encryptionKey': encryptionKey,
       'migrationConfig': migrationConfig?.toJson(),
       'maxEntriesPerDir': maxEntriesPerDir,
       'maxPartitionFileSize': maxPartitionFileSize,
-      'maxSchemaCacheSize': maxSchemaCacheSize,
       'enableLog': enableLog,
       'logLevel': logLevel.toString().split('.').last,
       'maxConcurrent': maxConcurrent,
@@ -346,6 +275,7 @@ class DataStoreConfig {
       'maxTablesPerFlush': maxTablesPerFlush,
       'enableQueryCache': enableQueryCache,
       'queryCacheExpiryTime': queryCacheExpiryTime?.inMilliseconds,
+      'memoryThresholdInMB': memoryThresholdInMB,
     };
   }
 
@@ -361,15 +291,10 @@ class DataStoreConfig {
     bool? enableEncoding,
     bool? enableEncodingObfuscation,
     dynamic encodingKey,
-    int? maxTableCacheFileSize,
-    int? maxQueryCacheSize,
-    int? maxRecordCacheSize,
-    int? maxIndexCacheSize,
     String? encryptionKey,
     MigrationConfig? migrationConfig,
     int? maxEntriesPerDir,
     int? maxPartitionFileSize,
-    int? maxSchemaCacheSize,
     bool? enableLog,
     LogLevel? logLevel,
     int? maxConcurrent,
@@ -378,6 +303,7 @@ class DataStoreConfig {
     int? maxTablesPerFlush,
     bool? enableQueryCache,
     Duration? queryCacheExpiryTime,
+    int? memoryThresholdInMB,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
@@ -391,16 +317,10 @@ class DataStoreConfig {
       enableEncodingObfuscation:
           enableEncodingObfuscation ?? this.enableEncodingObfuscation,
       encodingKey: encodingKey ?? this.encodingKey,
-      maxTableCacheFileSize:
-          maxTableCacheFileSize ?? this.maxTableCacheFileSize,
-      maxQueryCacheSize: maxQueryCacheSize ?? this.maxQueryCacheSize,
-      maxRecordCacheSize: maxRecordCacheSize ?? this.maxRecordCacheSize,
-      maxIndexCacheSize: maxIndexCacheSize ?? this.maxIndexCacheSize,
       encryptionKey: encryptionKey ?? this.encryptionKey,
       migrationConfig: migrationConfig ?? this.migrationConfig,
       maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
       maxPartitionFileSize: maxPartitionFileSize ?? this.maxPartitionFileSize,
-      maxSchemaCacheSize: maxSchemaCacheSize ?? this.maxSchemaCacheSize,
       enableLog: enableLog ?? this.enableLog,
       logLevel: logLevel ?? this.logLevel,
       maxConcurrent: maxConcurrent ?? this.maxConcurrent,
@@ -410,6 +330,7 @@ class DataStoreConfig {
       maxTablesPerFlush: maxTablesPerFlush ?? this.maxTablesPerFlush,
       enableQueryCache: enableQueryCache ?? this.enableQueryCache,
       queryCacheExpiryTime: queryCacheExpiryTime ?? this.queryCacheExpiryTime,
+      memoryThresholdInMB: memoryThresholdInMB ?? this.memoryThresholdInMB,
     );
   }
 }
@@ -501,116 +422,3 @@ class DistributedNodeConfig {
   }
 }
 
-/// Cache settings manager (Singleton)
-class CacheSettings {
-  static final CacheSettings _instance = CacheSettings._internal();
-  factory CacheSettings() => _instance;
-  CacheSettings._internal();
-
-  // Optimized cache values
-  int _optimizedTableCacheSize = 0;
-  bool _optimizationInProgress = false;
-
-  // Get current table cache size
-  int get tableCacheSize => _optimizedTableCacheSize > 0
-      ? _optimizedTableCacheSize
-      : _getDefaultMaxTableCacheFileSize();
-
-  // Static access point
-  static int get maxTableCacheFileSize => CacheSettings().tableCacheSize;
-
-  /// Get default table file cache size (static method)
-  static int _getDefaultMaxTableCacheFileSize() {
-    if (PlatformHandler.isWeb) {
-      // Fixed smaller cache for Web environment
-      return 2 * 1024 * 1024; // 2MB
-    } else if (PlatformHandler.isMobile) {
-      // Medium configuration for mobile devices
-      return 10 * 1024 * 1024; // 10MB
-    } else if (PlatformHandler.isServerEnvironment) {
-      // Larger default cache for server environment
-      return 500 * 1024 * 1024; // 500MB
-    } else {
-      // Higher configuration for desktop devices
-      return 100 * 1024 * 1024; // 100MB
-    }
-  }
-
-  /// Start memory detection and cache optimization
-  static void startMemoryOptimization() {
-    final instance = CacheSettings();
-    if (instance._optimizationInProgress) return;
-
-    instance._optimizationInProgress = true;
-
-    PlatformHandler.getSystemMemoryMB().then((memoryMB) {
-      int newCacheSize;
-
-      if (PlatformHandler.isWeb) {
-        newCacheSize = 2 * 1024 * 1024; // Fixed 2MB for Web
-      } else if (PlatformHandler.isMobile) {
-        // Adjust based on available memory for mobile devices
-        if (memoryMB < 1024) {
-          newCacheSize = 5 * 1024 * 1024; // <1GB memory: 5MB cache
-        } else if (memoryMB < 2048) {
-          newCacheSize = 10 * 1024 * 1024; // 1-2GB memory: 10MB cache
-        } else if (memoryMB < 4096) {
-          newCacheSize = 20 * 1024 * 1024; // 2-4GB memory: 20MB cache
-        } else {
-          newCacheSize = 30 * 1024 * 1024; // >4GB memory: 30MB cache
-        }
-      } else if (PlatformHandler.isServerEnvironment) {
-        // Server environment - use larger proportion of available memory for cache
-        final memoryGB = memoryMB / 1024.0;
-
-        // Dynamic memory percentage calculation - the higher the memory, the lower the percentage used
-        // Use a smooth percentage decrease curve
-        // From 8GB's 40% to 1024GB's 10%
-        double percentageToUse;
-
-        if (memoryGB < 8) {
-          // Small server (<8GB) - fixed 40%
-          percentageToUse = 0.40;
-        } else {
-          // Use smooth transition: as memory increases, percentage decreases
-          // Basic formula: 40% - linear reduction rate * (memoryGB - 8) / 100
-          // Each increase of 100GB memory, the percentage decreases by 3%
-          double reductionRate = (memoryGB - 8) / 100.0 * 0.03;
-          percentageToUse = 0.40 - reductionRate;
-
-          // Ensure at least 10%
-          percentageToUse = max(percentageToUse, 0.10);
-        }
-
-        // Calculate cache size (MB)
-        int cacheSizeMB = (memoryMB * percentageToUse).toInt();
-
-        // Set minimum and maximum limits to avoid extreme values
-        cacheSizeMB = max(cacheSizeMB, 512); // At least 512MB
-
-        // Convert to bytes
-        newCacheSize = cacheSizeMB * 1024 * 1024;
-      } else {
-        // Adjust based on available memory for desktop devices
-        if (memoryMB < 2048) {
-          newCacheSize = 20 * 1024 * 1024; // <2GB memory: 20MB cache
-        } else if (memoryMB < 4096) {
-          newCacheSize = 50 * 1024 * 1024; // 2-4GB memory: 50MB cache
-        } else if (memoryMB < 8192) {
-          newCacheSize = 100 * 1024 * 1024; // 4-8GB memory: 100MB cache
-        } else if (memoryMB < 16384) {
-          newCacheSize = 200 * 1024 * 1024; // 8-16GB memory: 200MB cache
-        } else {
-          newCacheSize = 300 * 1024 * 1024; // >16GB memory: 300MB cache
-        }
-      }
-
-      // Update cache configuration
-      instance._optimizedTableCacheSize = newCacheSize;
-      instance._optimizationInProgress = false;
-    }).catchError((e) {
-      // Don't change default value on error
-      instance._optimizationInProgress = false;
-    });
-  }
-}

@@ -169,8 +169,11 @@ class QueryExecutor {
 
           // if not primary key query, cache it
           if (shouldUseQueryCache && !isPrimaryKeyQuery) {
+            final queryCacheSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+            final maxCacheResults = queryCacheSize ~/ 500; // Estimate 500 bytes per query result
+            
             final shouldCache = condition == null ||
-                (results.length < _dataStore.config.maxQueryCacheSize);
+                (results.length < maxCacheResults);
 
             if (shouldCache && results.isNotEmpty) {
               // Create query cache key
@@ -208,9 +211,12 @@ class QueryExecutor {
 
       // 5. Cache results if query cache is enabled
       if (shouldUseQueryCache) {
+        final queryCacheSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+        final maxCacheResults = queryCacheSize ~/ 500; // Estimate 500 bytes per query result
+        
         final shouldCache = condition == null ||
             (await _isSpecificQuery(tableName, condition)) ||
-            (results.length < _dataStore.config.maxQueryCacheSize);
+            (results.length < maxCacheResults);
 
         if (shouldCache && results.isNotEmpty) {
           // Create query cache key
@@ -933,8 +939,8 @@ class QueryExecutor {
       if (await _dataStore.tableDataManager.allowFullTableCache(tableName)) {
         await _dataStore.dataCacheManager.cacheEntireTable(
           tableName,
-          resultMap.values.toList(),
           primaryKey,
+          resultMap.values.toList(),
         );
         Logger.debug(
           'Full table scan updated table $tableName cache, record count: $recordCount, marked as full table cache',

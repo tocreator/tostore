@@ -127,6 +127,46 @@ class QueryCache {
       );
     }
   }
+
+  /// Evict specified number of entries
+  /// [count] The number of entries to evict
+  void evictByCount(int count) {
+    if (count <= 0 || _cache.isEmpty) return;
+    
+    try {
+      // If count is greater than cache size, clear all
+      if (count >= _cache.length) {
+        final oldSize = _cache.length;
+        _cache.clear();
+        Logger.debug(
+          'Cleared all $oldSize query cache entries',
+          label: 'QueryCache.evictByCount',
+        );
+        return;
+      }
+      
+      // Sort entries by last access time (oldest first)
+      final sortedEntries = _cache.entries.toList()
+        ..sort((a, b) => a.value.lastAccessed.compareTo(b.value.lastAccessed));
+      
+      // Remove the specified number of oldest entries
+      int removed = 0;
+      for (int i = 0; i < count && i < sortedEntries.length; i++) {
+        _cache.remove(sortedEntries[i].key);
+        removed++;
+      }
+      
+      Logger.debug(
+        'Evicted $removed query cache entries, remaining: ${_cache.length}',
+        label: 'QueryCache.evictByCount',
+      );
+    } catch (e) {
+      Logger.error(
+        'Error evicting query cache entries: $e',
+        label: 'QueryCache.evictByCount',
+      );
+    }
+  }
 }
 
 /// cached query

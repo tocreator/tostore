@@ -1181,11 +1181,11 @@ class TableDataManager {
       for (final cachedTable in cachedTables) {
         totalSize += await getTableFileSize(cachedTable);
       }
-      int tableCount = _dataStore.dataCacheManager.getTableCacheCountAll();
-      tableCount = tableCount + recordCount;
-      return _dataStore.config.maxTableCacheFileSize > totalSize ||
-          tableCount <
-              _dataStore.config.maxRecordCacheSize; // whether exceeds max limit
+
+      // Get record cache size using MemoryManager
+      final recordCacheSize = _dataStore.memoryManager?.getRecordCacheSize() ?? 10000000;
+      // Check if file size exceeds limit
+      return recordCacheSize * 0.9 > totalSize;
     } catch (e) {
       Logger.error('Failed to check if allow full table cache: $e',
           label: 'TableDataManager.allowFullTableCache');

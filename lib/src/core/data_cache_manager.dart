@@ -34,10 +34,109 @@ class DataCacheManager {
 
   DataCacheManager(this._dataStore)
       : _queryCache = QueryCache(
-          maxSize: _dataStore.config.maxQueryCacheSize,
+          maxSize: _dataStore.memoryManager?.getQueryCacheSize() ?? 10000,
         ) {
     // Register periodic tasks
     _registerCronJobs();
+    
+    // Register memory callbacks
+    _registerMemoryCallbacks();
+  }
+
+  /// Register memory callbacks
+  void _registerMemoryCallbacks() {
+    final memoryManager = _dataStore.memoryManager;
+    if (memoryManager != null) {
+      memoryManager.registerCacheEvictionCallback('query_cache', () {
+        _evictQueryCache(0.3); // Evict 30% of query cache
+      });
+      
+      memoryManager.registerCacheEvictionCallback('schema_cache', () {
+        _evictSchemaCache(0.3); // Evict 30% of schema cache
+      });
+    }
+  }
+  
+  /// Estimate schema size (in bytes)
+  int _estimateSchemaSize(TableSchema schema) {
+    // Base schema size
+    int size = 100;
+    
+    // Field contribution
+    size += schema.fields.length * 50; // Each field is about 50 bytes
+    
+    // Index contribution
+    size += schema.indexes.length * 30; // Each index is about 30 bytes
+    
+    // Other properties contribution
+    size += schema.name.length * 2; // Table name
+    size += 50; // Primary key configuration, etc.
+    
+    return size;
+  }
+  
+  /// Calculate current schema cache total size
+  int _calculateCurrentSchemaCacheSize() {
+    int totalSize = 0;
+    _schemaCache.forEach((name, schema) {
+      totalSize += _estimateSchemaSize(schema);
+    });
+    return totalSize;
+  }
+  
+  /// Estimate query cache size (in bytes)
+  int _estimateQueryCacheSize(int entryCount) {
+    // Assume each query cache is about 500 bytes on average
+    return entryCount * 500;
+  }
+  
+  /// Evict query cache
+  void _evictQueryCache(double ratio) {
+    if (ratio <= 0 || ratio > 1) return;
+    
+    try {
+      final toRemoveCount = (_queryCache.size * ratio).ceil();
+      if (toRemoveCount <= 0) return;
+      
+      _queryCache.evictByCount(toRemoveCount);
+      
+      Logger.info('Evicted $toRemoveCount query cache entries due to memory pressure',
+          label: 'DataCacheManager._evictQueryCache');
+    } catch (e) {
+      Logger.error('Failed to evict query cache: $e',
+          label: 'DataCacheManager._evictQueryCache');
+    }
+  }
+  
+  /// Evict schema cache
+  void _evictSchemaCache(double ratio) {
+    if (ratio <= 0 || ratio > 1) return;
+    if (_schemaCache.isEmpty) return;
+    
+    try {
+      final toRemoveCount = (_schemaCache.length * ratio).ceil();
+      if (toRemoveCount <= 0) return;
+      
+      // Only evict non-global table caches
+      final nonGlobalTables = _schemaCache.entries
+          .where((entry) => entry.value.isGlobal != true)
+          .toList();
+          
+      if (nonGlobalTables.isEmpty) return;
+      
+      // Remove specified number of table caches
+      final actualRemoveCount = min(toRemoveCount, nonGlobalTables.length);
+      for (int i = 0; i < actualRemoveCount; i++) {
+        final tableName = nonGlobalTables[i].key;
+        _schemaCache.remove(tableName);
+      }
+      
+      Logger.info('Evicted $actualRemoveCount schema cache entries due to memory pressure',
+          label: 'DataCacheManager._evictSchemaCache');
+    } catch (e) {
+      Logger.error('Failed to evict schema cache: $e',
+          label: 'DataCacheManager._evictSchemaCache');
+    }
   }
 
   /// Register periodic tasks
@@ -58,23 +157,27 @@ class DataCacheManager {
     }
 
     try {
-      // Check if table structure cache size exceeds limit
-      if (_schemaCache.length > _dataStore.config.maxSchemaCacheSize) {
-        // Calculate number to delete
-        final removeCount =
-            _schemaCache.length - _dataStore.config.maxSchemaCacheSize;
+      // Get schema cache size limit using memory manager
+      final schemaCacheMaxSize = _dataStore.memoryManager?.getSchemaCacheSize() ?? 10000;
+      
+      // Estimate current schema cache size
+      final currentSchemaSize = _calculateCurrentSchemaCacheSize();
+      
+      // Check if schema cache exceeds limit (using 90% as threshold)
+      if (currentSchemaSize > schemaCacheMaxSize * 0.9) {
+        // Calculate the ratio to be cleaned up
+        final removeRatio = 1.0 - (schemaCacheMaxSize * 0.7 / currentSchemaSize);
+        final removeCount = (removeRatio * _schemaCache.length).ceil();
 
         // Create list of non-global tables
         final nonGlobalTables = _schemaCache.entries
             .where((entry) => entry.value.isGlobal != true)
             .toList();
 
-        // If there are non-global tables, delete them
+        // If there are non-global tables, clean them up
         if (nonGlobalTables.isNotEmpty) {
-          // Delete at most the calculated number
-          final toRemove = nonGlobalTables.length < removeCount
-              ? nonGlobalTables.length
-              : removeCount;
+          // Clean up the maximum number of calculated entries
+          final toRemove = min(nonGlobalTables.length, removeCount);
 
           for (int i = 0; i < toRemove; i++) {
             final tableName = nonGlobalTables[i].key;
@@ -87,7 +190,10 @@ class DataCacheManager {
       }
 
       // Clean up query cache
-      if (_queryCache.size > _dataStore.config.maxQueryCacheSize) {
+      final queryCacheMaxSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+      final currentQueryCacheSize = _estimateQueryCacheSize(_queryCache.size);
+      
+      if (currentQueryCacheSize > queryCacheMaxSize * 0.9) {
         _queryCache.evictStaleEntries();
       }
 
@@ -601,31 +707,34 @@ class DataCacheManager {
     Logger.debug('Clear all cache', label: 'QueryCacheManager.clear');
   }
 
-  /// Cache all records of a table
-  Future<void> cacheEntireTable(String tableName,
-      List<Map<String, dynamic>> records, String primaryKeyField,
-      {bool isFullTableCache = true}) async {
+  /// Cache entire table
+  Future<void> cacheEntireTable(
+    String tableName,
+    String primaryKeyField,
+    List<Map<String, dynamic>> records, {
+    bool isFullTableCache = true,
+  }) async {
     try {
-      // Check parameter validity
-      if (tableName.isEmpty || primaryKeyField.isEmpty) {
-        return;
+      // Check if the number of records is too large, if so, don't cache the full table
+      bool needCacheFullTableCache = isFullTableCache;
+      
+      // Get memory manager
+      final memoryManager = _dataStore.memoryManager;
+      final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
+      
+      if (isFullTableCache && records.length > (recordCacheSize / 1000)) { // Calculate based on approximately 1KB per record
+        needCacheFullTableCache = false;
       }
 
-      // Check if table file size limit allows caching
-      final needCacheFullTableCache =
-          await _dataStore.tableDataManager.allowFullTableCache(tableName);
-
-      // If full table cache is requested but restricted, log a warning
       if (isFullTableCache && !needCacheFullTableCache) {
         Logger.warn(
-          'Table $tableName record count(${records.length}) exceeds full table cache limit(${_dataStore.config.maxRecordCacheSize})',
+          'Table $tableName record count(${records.length}) exceeds full table cache limit(${recordCacheSize / 1000})',
           label: 'DataCacheManager.cacheEntireTable',
         );
       }
 
       // Check table record cache size, perform cache eviction policy
-      if (getTableCacheCountAll() + records.length >
-          _dataStore.config.maxRecordCacheSize) {
+      if (getTableCacheCountAll() + records.length > (recordCacheSize / 1000)) {
         // Execute cache eviction policy
         _evictLowPriorityRecords();
       }
@@ -683,8 +792,11 @@ class DataCacheManager {
 
   /// Evict low priority records
   void _evictLowPriorityRecords() {
-    int totalEvictionCount = (_dataStore.config.maxRecordCacheSize * 0.3)
-        .round(); // Clear 30% of records
+    // Get record cache size using memory manager
+    final memoryManager = _dataStore.memoryManager;
+    final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
+    
+    int totalEvictionCount = (recordCacheSize * 0.3 / 1000).round(); // Clean up 30% of records, calculate based on approximately 1KB per record
     int evictedCount = 0;
 
     // First apply time decay to all table caches

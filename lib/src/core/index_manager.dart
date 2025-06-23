@@ -883,19 +883,33 @@ class IndexManager {
   void _checkAndCleanupCache() {
     try {
       final cacheSize = _indexCache.length;
-      final maxSize = _dataStore.config.maxIndexCacheSize;
 
-      if (cacheSize <= maxSize) return;
+      // Get index cache size limit using memory manager
+      final memoryManager = _dataStore.memoryManager;
+      
+      // Estimate current index cache total size (in bytes)
+      int currentIndexCacheSize = 0;
+      _indexCache.forEach((key, index) {
+        currentIndexCacheSize += _estimateIndexSize(index);
+      });
+      
+      final maxSize = memoryManager != null 
+          ? memoryManager.getIndexCacheSize() // Limit in bytes
+          : 10000;
 
-      // Need to clean cache, clean 30% of low weight
-      final needToRemove = (cacheSize * 0.3).ceil();
+      // If current index cache size is less than 90% of the limit, do not clean up
+      if (currentIndexCacheSize <= maxSize * 0.9) return;
+
+      // Need to clean up cache, calculate the ratio to be cleaned up
+      final removeRatio = 1.0 - (maxSize * 0.7 / currentIndexCacheSize);
+      final needToRemove = (cacheSize * removeRatio).ceil();
 
       // Sort by weight
       final weightEntries = _indexAccessWeights.entries.toList()
         ..sort((a, b) =>
             (a.value['weight'] as int).compareTo(b.value['weight'] as int));
 
-      // Delete 30% of lowest weight
+      // Remove index with lowest weight, clean up to less than 70% capacity
       int removed = 0;
       for (int i = 0; i < weightEntries.length && removed < needToRemove; i++) {
         final key = weightEntries[i].key;
@@ -912,6 +926,26 @@ class IndexManager {
       Logger.error('Failed to clean index cache: $e',
           label: 'IndexManager._checkAndCleanupCache');
     }
+  }
+  
+  /// Estimate index size (in bytes)
+  int _estimateIndexSize(BPlusTree index) {
+    // Index base structure size
+    int baseSize = 100;
+    
+    // Estimate size based on index entry count and complexity
+    // Each index entry includes key and value list
+    int keyValueSize = 0;
+    
+    try {
+      // Get index entry count using count() method
+      keyValueSize = index.count() * 40; // Average 40 bytes per index entry
+    } catch (e) {
+      // If size cannot be accessed, use default estimated value
+      keyValueSize = 1000; // Default assume 25 index entries
+    }
+    
+    return baseSize + keyValueSize;
   }
 
   /// Get index metadata
