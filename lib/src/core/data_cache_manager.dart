@@ -667,7 +667,7 @@ class DataCacheManager {
       // Set records
       if (records.isNotEmpty) {
         // Determine cache type
-        const cacheType = CacheType.runtime;
+        const cacheType = RecordCacheType.runtime;
 
         // Add records in batch
         tableCache.addRecords(records, cacheType: cacheType);

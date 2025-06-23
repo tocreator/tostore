@@ -38,7 +38,7 @@ class TableCache {
     _runtimeRecordCount = 0;
 
     for (final cache in recordsMap.values) {
-      if (cache.cacheType == CacheType.startup) {
+      if (cache.cacheType == RecordCacheType.startup) {
         _startupRecordCount++;
       } else {
         _runtimeRecordCount++;
@@ -63,7 +63,7 @@ class TableCache {
   /// Add or update record
   RecordCache addOrUpdateRecord(
     Map<String, dynamic> record, {
-    CacheType cacheType = CacheType.runtime,
+    RecordCacheType cacheType = RecordCacheType.runtime,
   }) {
     final pkValue = record[primaryKeyField]?.toString() ?? '';
     if (pkValue.isEmpty) {
@@ -92,7 +92,7 @@ class TableCache {
       recordsMap[pkValue] = newCache;
 
       // Update statistics
-      if (cacheType == CacheType.startup) {
+      if (cacheType == RecordCacheType.startup) {
         _startupRecordCount++;
       } else {
         _runtimeRecordCount++;
@@ -105,7 +105,7 @@ class TableCache {
   /// Batch add records
   void addRecords(
     List<Map<String, dynamic>> records, {
-    CacheType cacheType = CacheType.runtime,
+    RecordCacheType cacheType = RecordCacheType.runtime,
   }) {
     for (final record in records) {
       addOrUpdateRecord(record, cacheType: cacheType);
@@ -163,7 +163,8 @@ class TableCache {
       final cache = entry.value;
 
       // Skip if we need to preserve startup cache records
-      if (preserveStartupRecords && cache.cacheType == CacheType.startup) {
+      if (preserveStartupRecords &&
+          cache.cacheType == RecordCacheType.startup) {
         continue;
       }
 
@@ -174,7 +175,7 @@ class TableCache {
     // Execute eviction
     for (final key in keysToRemove) {
       final cache = recordsMap.remove(key);
-      if (cache != null && cache.cacheType == CacheType.startup) {
+      if (cache != null && cache.cacheType == RecordCacheType.startup) {
         _startupRecordCount--;
       } else if (cache != null) {
         _runtimeRecordCount--;
@@ -211,7 +212,7 @@ class TableCache {
 }
 
 /// Cache type enum
-enum CacheType {
+enum RecordCacheType {
   /// Critical cache loaded at startup
   startup,
 
@@ -226,7 +227,7 @@ class RecordCache {
   DateTime lastAccessed; // Last access time
   DateTime lastWeightUpdateDay; // Last day weight was updated
   int weightValue; // Weight value, range 0-10
-  CacheType cacheType; // Cache type: startup or runtime
+  RecordCacheType cacheType; // Cache type: startup or runtime
 
   RecordCache({
     required this.record,
@@ -234,7 +235,7 @@ class RecordCache {
     DateTime? lastAccessed,
     DateTime? lastWeightUpdateDay,
     this.weightValue = 0, // Initial weight is 0
-    this.cacheType = CacheType.runtime,
+    this.cacheType = RecordCacheType.runtime,
   })  : lastWeightUpdateDay = lastWeightUpdateDay ?? DateTime.now(),
         lastAccessed = lastAccessed ?? DateTime.now();
 
@@ -293,7 +294,7 @@ class RecordCache {
     final weightFactor = weightValue / 10.0;
 
     // Cache type weighting
-    final typeFactor = cacheType == CacheType.startup ? 0.3 : 0.0;
+    final typeFactor = cacheType == RecordCacheType.startup ? 0.3 : 0.0;
 
     // Additional time factor - further reduce priority for records not accessed for a very long time (beyond weight decay days)
     final daysUnaccessed = DateTime.now().difference(lastAccessed).inDays;
