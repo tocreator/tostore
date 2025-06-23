@@ -74,7 +74,7 @@ class CrontabManager {
     // Check if there are active short intervals
     bool hasShortInterval =
         _groups[ExecuteInterval.seconds3]!.callbacks.isNotEmpty ||
-            _groups[ExecuteInterval.seconds15]!.callbacks.isNotEmpty;
+            _groups[ExecuteInterval.seconds10]!.callbacks.isNotEmpty;
 
     // If there are only long-interval tasks, use longer check interval for efficiency
     if (!hasShortInterval) {
@@ -187,7 +187,7 @@ class CrontabManager {
         return '1 second';
       case ExecuteInterval.seconds3:
         return '3 seconds';
-      case ExecuteInterval.seconds15:
+      case ExecuteInterval.seconds10:
         return '15 seconds';
       case ExecuteInterval.hour1:
         return '1 hour';
@@ -205,8 +205,8 @@ enum ExecuteInterval {
   /// 3-second interval
   seconds3(Duration(seconds: 3)),
 
-  /// 15-second interval
-  seconds15(Duration(seconds: 15)),
+  /// 10-second interval
+  seconds10(Duration(seconds: 10)),
 
   /// 1-hour interval
   hour1(Duration(hours: 1)),
