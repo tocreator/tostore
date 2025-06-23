@@ -873,7 +873,7 @@ class IndexManager {
       // Check if cache needs to be cleaned
       _checkAndCleanupCache();
     } catch (e) {
-      // Weight update exception不影响主流程，只记录日志
+      // Weight update exception
       Logger.error('Failed to update index access weight: $e',
           label: 'IndexManager._updateIndexAccessWeight');
     }
