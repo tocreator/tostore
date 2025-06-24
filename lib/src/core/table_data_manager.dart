@@ -16,6 +16,7 @@ import '../handler/value_comparator.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import '../model/system_table.dart';
+import 'memory_manager.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -198,6 +199,9 @@ class TableDataManager {
   TableDataManager(this._dataStore) {
     // Register scheduled task to CrontabManager
     CrontabManager.addCallback(ExecuteInterval.seconds3, _processWriteBuffer);
+    
+    // Register memory callbacks
+    _registerMemoryCallbacks();
 
     // Initialize auto-increment ID generator and set periodic check task
     CrontabManager.addCallback(
@@ -205,12 +209,6 @@ class TableDataManager {
 
     // Load statistics
     _loadStatisticsFromConfig();
-    
-    // Register memory callback
-    _dataStore.memoryManager?.registerCacheEvictionCallback(
-      'table_meta_cache_eviction', 
-      _cleanupTableMetaCache
-    );
 
     CrontabManager.addCallback(
         ExecuteInterval.hour24, _updateTableStatisticsIfNeeded);
@@ -218,6 +216,15 @@ class TableDataManager {
     Future.delayed(const Duration(seconds: 10), () {
       _updateTableStatisticsIfNeeded();
     });
+  }
+
+  /// Register memory callbacks
+  void _registerMemoryCallbacks() {
+    final memoryManager = _dataStore.memoryManager;
+    if (memoryManager != null) {
+      // Register table metadata cache cleanup callback
+      memoryManager.registerCacheEvictionCallback(CacheType.tableMeta, _cleanupTableMetaCache);
+    }
   }
 
   /// Load statistics from configuration
@@ -445,7 +452,7 @@ class TableDataManager {
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
     
     // Cancel register memory callback
-    _dataStore.memoryManager?.unregisterCacheEvictionCallback('table_meta_cache_eviction');
+    _dataStore.memoryManager?.unregisterCacheEvictionCallback(CacheType.tableMeta);
 
     try {
       // Flush all pending data (both write and delete buffers)
@@ -4010,6 +4017,11 @@ class TableDataManager {
       Logger.error('Error during async index creation for table $tableName: $e',
           label: 'TableDataManager._asyncCreateIndexes');
     }
+  }
+
+  /// Get current table metadata cache size in bytes
+  int getCurrentTableMetaCacheSize() {
+    return _currentTableMetaCacheSize;
   }
 }
 

@@ -78,9 +78,9 @@ class DataStoreImpl {
   PathManager? _pathManager;
   DirectoryManager? directoryManager;
   LockManager? lockManager;
-  
+
   MemoryManager? _memoryManager;
-  
+
   PathManager get pathManager {
     if (_pathManager == null) {
       throw StateError('PathManager not initialized');
@@ -106,7 +106,7 @@ class DataStoreImpl {
   QueryExecutor? getQueryExecutor() => _queryExecutor;
 
   IndexManager? get indexManager => _indexManager;
-  
+
   /// Get memory manager
   MemoryManager? get memoryManager => _memoryManager;
 
@@ -323,7 +323,7 @@ class DataStoreImpl {
 
       // Initialize memory manager
       _memoryManager = MemoryManager();
-      await _memoryManager?.initialize(_config!);
+      await _memoryManager?.initialize(_config!, this);
 
       // Apply log configuration
       LogConfig.setConfig(
@@ -535,7 +535,7 @@ class DataStoreImpl {
       _indexManager?.dispose();
       dataCacheManager.clear();
       await _transactionManager?.commit(null);
-      
+
       // Clean up memory manager resources
       _memoryManager?.dispose();
 
@@ -1367,7 +1367,8 @@ class DataStoreImpl {
 
       // Get record cache size limit using memory manager
       final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
-      final recordThreshold = (recordCacheSize / 1000).round(); // 1KB per record
+      final recordThreshold =
+          (recordCacheSize / 1000).round(); // 1KB per record
 
       // get table schema
       final schema = await getTableSchema(tableName);

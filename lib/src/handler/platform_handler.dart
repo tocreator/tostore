@@ -32,8 +32,9 @@ class PlatformHandler {
   static Future<int> getSystemMemoryMB() => _instance.getSystemMemoryMB();
 
   /// Get available system memory (MB)
-  static Future<int> getAvailableSystemMemoryMB() =>
-      _instance.getAvailableSystemMemoryMB();
+  /// @param forceRefresh Whether to force a refresh of the memory information (bypass cache)
+  static Future<int> getAvailableSystemMemoryMB({bool forceRefresh = false}) =>
+      _instance.getAvailableSystemMemoryMB(forceRefresh: forceRefresh);
 
   /// Get system memory (GB)
   static Future<double> getSystemMemoryGB() async {

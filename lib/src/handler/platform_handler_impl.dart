@@ -26,13 +26,13 @@ class PlatformHandlerImpl implements PlatformInterface {
   static const Duration _processorCacheTimeout = Duration(hours: 1);
 
   // Cache for memory values
-  int? _cachedSystemMemoryMB;
-  DateTime? _lastSystemMemoryFetch;
+  static int? _cachedSystemMemoryMB;
+  static DateTime? _lastSystemMemoryFetch;
 
-  int? _cachedAvailableSystemMemoryMB;
-  DateTime? _lastAvailableSystemMemoryFetch;
+  static int? _cachedAvailableSystemMemoryMB;
+  static DateTime? _lastAvailableSystemMemoryFetch;
 
-  final _memoryFetchTimeout = const Duration(seconds: 5);
+  static const _memoryFetchTimeout = Duration(seconds: 5);
 
   @override
   bool get isMobile {
@@ -229,12 +229,12 @@ class PlatformHandlerImpl implements PlatformInterface {
 
   /// Get available system memory size (MB)
   @override
-  Future<int> getAvailableSystemMemoryMB() async {
+  Future<int> getAvailableSystemMemoryMB({bool forceRefresh = false}) async {
     final now = DateTime.now();
-    if (_cachedAvailableSystemMemoryMB != null &&
+    if (!forceRefresh &&
+        _cachedAvailableSystemMemoryMB != null &&
         _lastAvailableSystemMemoryFetch != null &&
-        now.difference(_lastAvailableSystemMemoryFetch!) <
-            _memoryFetchTimeout) {
+        now.difference(_lastAvailableSystemMemoryFetch!) < _memoryFetchTimeout) {
       return _cachedAvailableSystemMemoryMB!;
     }
 

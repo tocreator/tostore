@@ -8,6 +8,7 @@ import '../query/query_cache.dart';
 import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'dart:convert';
+import 'memory_manager.dart';
 
 /// Data cache manager
 class DataCacheManager {
@@ -22,6 +23,10 @@ class DataCacheManager {
 
   // Schema cache
   final Map<String, TableSchema> _schemaCache = {};
+  
+  // Incremental cache total size (bytes)
+  int _totalRecordCacheSize = 0;
+  int _totalSchemaCacheSize = 0;
 
   // Stats cache
   final Map<String, TableStatistics> _statsCache = {};
@@ -41,18 +46,40 @@ class DataCacheManager {
     
     // Register memory callbacks
     _registerMemoryCallbacks();
+    
+    // Initialize to 0, then recalculate before first use
+    _totalSchemaCacheSize = 0;
+    _totalRecordCacheSize = 0;
+    
+    // Calculate once at initialization (only once full table traversal)
+    Future.microtask(() {
+      if (_schemaCache.isNotEmpty) {
+        _totalSchemaCacheSize = _calculateCurrentSchemaCacheSize();
+      }
+      
+      // Calculate the total size of all table caches
+      if (tableCaches.isNotEmpty) {
+        _totalRecordCacheSize = tableCaches.values
+            .fold(0, (sum, cache) => sum + cache.totalCacheSize);
+      }
+    });
   }
 
   /// Register memory callbacks
   void _registerMemoryCallbacks() {
     final memoryManager = _dataStore.memoryManager;
     if (memoryManager != null) {
-      memoryManager.registerCacheEvictionCallback('query_cache', () {
+      // Register cache eviction callbacks
+      memoryManager.registerCacheEvictionCallback(CacheType.query, () {
         _evictQueryCache(0.3); // Evict 30% of query cache
       });
       
-      memoryManager.registerCacheEvictionCallback('schema_cache', () {
+      memoryManager.registerCacheEvictionCallback(CacheType.schema, () {
         _evictSchemaCache(0.3); // Evict 30% of schema cache
+      });
+      
+      memoryManager.registerCacheEvictionCallback(CacheType.record, () {
+        _evictLowPriorityRecords(); // Evict low priority records
       });
     }
   }
@@ -82,12 +109,6 @@ class DataCacheManager {
       totalSize += _estimateSchemaSize(schema);
     });
     return totalSize;
-  }
-  
-  /// Estimate query cache size (in bytes)
-  int _estimateQueryCacheSize(int entryCount) {
-    // Assume each query cache is about 500 bytes on average
-    return entryCount * 500;
   }
   
   /// Evict query cache
@@ -128,6 +149,11 @@ class DataCacheManager {
       final actualRemoveCount = min(toRemoveCount, nonGlobalTables.length);
       for (int i = 0; i < actualRemoveCount; i++) {
         final tableName = nonGlobalTables[i].key;
+        final schema = _schemaCache[tableName];
+        if (schema != null) {
+          // Subtract the size of the removed schema
+          _totalSchemaCacheSize -= _estimateSchemaSize(schema);
+        }
         _schemaCache.remove(tableName);
       }
       
@@ -160,8 +186,8 @@ class DataCacheManager {
       // Get schema cache size limit using memory manager
       final schemaCacheMaxSize = _dataStore.memoryManager?.getSchemaCacheSize() ?? 10000;
       
-      // Estimate current schema cache size
-      final currentSchemaSize = _calculateCurrentSchemaCacheSize();
+      // Use stored incremental cache size instead of recalculating
+      final currentSchemaSize = _totalSchemaCacheSize;
       
       // Check if schema cache exceeds limit (using 90% as threshold)
       if (currentSchemaSize > schemaCacheMaxSize * 0.9) {
@@ -181,6 +207,11 @@ class DataCacheManager {
 
           for (int i = 0; i < toRemove; i++) {
             final tableName = nonGlobalTables[i].key;
+            final schema = _schemaCache[tableName];
+            if (schema != null) {
+              // Subtract the size of the schema being removed
+              _totalSchemaCacheSize -= _estimateSchemaSize(schema);
+            }
             _schemaCache.remove(tableName);
           }
 
@@ -191,7 +222,8 @@ class DataCacheManager {
 
       // Clean up query cache
       final queryCacheMaxSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
-      final currentQueryCacheSize = _estimateQueryCacheSize(_queryCache.size);
+      // Use the actual query cache total size tracker
+      final currentQueryCacheSize = _queryCache.totalCacheSize;
       
       if (currentQueryCacheSize > queryCacheMaxSize * 0.9) {
         _queryCache.evictStaleEntries();
@@ -371,6 +403,20 @@ class DataCacheManager {
     }
   }
 
+  /// Add record to cache
+  void addCachedRecord(String tableName, Map<String, dynamic> record) {
+    final cache = tableCaches[tableName];
+    if (cache == null) return;
+
+    // Record the cache size before adding
+    final beforeSize = cache.totalCacheSize;
+    
+    cache.addOrUpdateRecord(record);
+    
+    // Update the total cache size
+    _totalRecordCacheSize += (cache.totalCacheSize - beforeSize);
+  }
+  
   /// Invalidate record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
@@ -380,7 +426,14 @@ class DataCacheManager {
       if (tableCache != null) {
         final pkString = primaryKeyValue.toString();
         // Get the record to be deleted (for later condition matching)
-        final recordToRemove = tableCache.getRecord(pkString)?.record;
+        final recordCache = tableCache.getRecord(pkString);
+        final recordToRemove = recordCache?.record;
+        
+        // If the record exists, subtract its size
+        if (recordCache != null) {
+          _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
+        }
+        
         // Remove record from cache, but don't affect full table cache status
         tableCache.recordsMap.remove(pkString);
 
@@ -512,6 +565,11 @@ class DataCacheManager {
 
       // If primaryKeyValues is empty, clear all related queries cache
       if (primaryKeyValues.isEmpty) {
+        // If the table cache exists, subtract its total size
+        if (tableCache != null) {
+          _totalRecordCacheSize -= tableCache.totalCacheSize;
+        }
+        
         // Clear table dependency cache
         _tableDependencies.remove(tableName);
 
@@ -539,11 +597,14 @@ class DataCacheManager {
       // Handle specific record invalidation
       if (tableCache != null) {
         // Collect the data of the records to be deleted, for subsequent condition matching
+        int reducedSize = 0; // Record the total size of the cache that was reduced
+        
         for (var pkValue in primaryKeyValues) {
           final pkString = pkValue.toString();
           final recordCache = tableCache.getRecord(pkString);
           if (recordCache != null) {
             recordsToRemove.add(recordCache.record);
+            reducedSize += recordCache.estimateMemoryUsage();
           }
         }
 
@@ -552,6 +613,9 @@ class DataCacheManager {
           final pkString = pkValue.toString();
           tableCache.recordsMap.remove(pkString);
         }
+        
+        // Update the total cache size
+        _totalRecordCacheSize -= reducedSize;
       }
 
       // Determine whether to use exact matching or conservative cleanup strategy
@@ -704,6 +768,11 @@ class DataCacheManager {
     tableCaches.clear();
     _schemaCache.clear();
     _statsCache.clear();
+    
+    // Reset cache size statistics
+    _totalRecordCacheSize = 0;
+    _totalSchemaCacheSize = 0;
+    
     Logger.debug('Clear all cache', label: 'QueryCacheManager.clear');
   }
 
@@ -744,15 +813,21 @@ class DataCacheManager {
 
       // Check if cache for this table already exists
       TableCache tableCache;
+      int oldCacheSize = 0;
+      
       if (tableCaches.containsKey(tableName)) {
         // Update existing cache
         tableCache = tableCaches[tableName]!;
+        oldCacheSize = tableCache.totalCacheSize; // Record the old cache size
+        
         tableCache.isFullTableCache = needCacheFullTableCache;
         tableCache.cacheTime = now;
         tableCache.lastAccessed = now;
 
         // Clear existing records (avoid mixed data causing inconsistency)
         if (needCacheFullTableCache) {
+          _totalRecordCacheSize -= oldCacheSize; // Subtract the old cache size from the total cache size
+          
           tableCaches.remove(tableName);
           tableCache = TableCache(
             tableName: tableName,
@@ -784,6 +859,17 @@ class DataCacheManager {
 
       // Store table cache
       tableCaches[tableName] = tableCache;
+      
+      // Update the total cache size
+      if (tableCaches.containsKey(tableName)) {
+        // If it is an existing cache and not fully reset, calculate the increment
+        if (!needCacheFullTableCache) {
+          _totalRecordCacheSize = _totalRecordCacheSize - oldCacheSize + tableCache.totalCacheSize;
+        } else {
+          // If it is a new or fully reset cache, add the new cache size directly
+          _totalRecordCacheSize += tableCache.totalCacheSize;
+        }
+      }
     } catch (e) {
       Logger.error('Cache entire table failed: $e',
           label: 'DataCacheManager.cacheEntireTable');
@@ -821,6 +907,9 @@ class DataCacheManager {
 
       // Record whether it was full table cache before eviction
       final wasFullTableCache = tableCache.isFullTableCache;
+      
+      // Record the cache size before eviction
+      final beforeSize = tableCache.totalCacheSize;
 
       // Perform eviction
       final result = tableCache.evictLowPriorityRecords(toEvict,
@@ -828,6 +917,9 @@ class DataCacheManager {
           );
 
       evictedCount += result['count'] as int;
+      
+      // Update the total cache size
+      _totalRecordCacheSize -= (beforeSize - tableCache.totalCacheSize);
 
       // If records were actually evicted and it was previously full table cache, update full table cache flag
       if ((result['count'] as int) > 0 && wasFullTableCache) {
@@ -898,17 +990,16 @@ class DataCacheManager {
     return cache.records;
   }
 
-  /// Add record to cache
-  void addCachedRecord(String tableName, Map<String, dynamic> record) {
-    final cache = tableCaches[tableName];
-    if (cache == null) return;
-
-    cache.addOrUpdateRecord(record);
-  }
-
   /// Cache schema
   void cacheSchema(String tableName, TableSchema schema) {
+    // If the schema for this table already exists, subtract its size first
+    if (_schemaCache.containsKey(tableName)) {
+      _totalSchemaCacheSize -= _estimateSchemaSize(_schemaCache[tableName]!);
+    }
+    
+    // Cache the new schema and add its size
     _schemaCache[tableName] = schema;
+    _totalSchemaCacheSize += _estimateSchemaSize(schema);
   }
 
   /// Get cached table schema
@@ -948,9 +1039,14 @@ class DataCacheManager {
       await persistAllCaches();
 
       // 2. Clear all non-global table caches
-      tableCaches.removeWhere((tableName, _) {
+      tableCaches.removeWhere((tableName, cache) {
         final schema = _schemaCache[tableName];
-        return schema?.isGlobal != true;
+        final isNonGlobal = schema?.isGlobal != true;
+        if (isNonGlobal) {
+          // Subtract the size of the table cache to be removed
+          _totalRecordCacheSize -= cache.totalCacheSize;
+        }
+        return isNonGlobal;
       });
 
       // 3. Clear related dependencies
@@ -960,7 +1056,14 @@ class DataCacheManager {
       });
 
       // 4. Clear non-global table structure cache
-      _schemaCache.removeWhere((tableName, schema) => schema.isGlobal != true);
+      _schemaCache.removeWhere((tableName, schema) {
+        final isNonGlobal = schema.isGlobal != true;
+        if (isNonGlobal) {
+          // Subtract the size of the schema cache to be removed
+          _totalSchemaCacheSize -= _estimateSchemaSize(schema);
+        }
+        return isNonGlobal;
+      });
 
       // 5. Clear statistics cache
       _statsCache.removeWhere((tableName, _) {
@@ -1039,6 +1142,12 @@ class DataCacheManager {
   Future<void> invalidateCache(String tableName,
       {bool isFullTableCache = false}) async {
     try {
+      // Get and subtract the old cache size
+      final oldCache = tableCaches[tableName];
+      if (oldCache != null) {
+        _totalRecordCacheSize -= oldCache.totalCacheSize;
+      }
+      
       // 1. Clear table dependency cache
       _tableDependencies.remove(tableName);
 
@@ -1055,7 +1164,10 @@ class DataCacheManager {
       }
 
       // 3. Clear schema cache
-      _schemaCache.remove(tableName);
+      if (_schemaCache.containsKey(tableName)) {
+        _totalSchemaCacheSize -= _estimateSchemaSize(_schemaCache[tableName]!);
+        _schemaCache.remove(tableName);
+      }
 
       // 4. Clear stats cache
       _statsCache.remove(tableName);
@@ -1121,6 +1233,21 @@ class DataCacheManager {
   int getTableCacheCountAll() {
     return tableCaches.values
         .fold(0, (sum, cache) => sum + (cache.recordCount));
+  }
+
+  /// Get current record cache size in bytes
+  int getCurrentRecordCacheSize() {
+    return _totalRecordCacheSize;
+  }
+  
+  /// Get current query cache size in bytes
+  int getCurrentQueryCacheSize() {
+    return _queryCache.totalCacheSize;
+  }
+  
+  /// Get current schema cache size in bytes
+  int getCurrentSchemaCacheSize() {
+    return _totalSchemaCacheSize;
   }
 
   /// Get list of all table cache names

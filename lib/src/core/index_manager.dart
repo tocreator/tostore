@@ -15,6 +15,7 @@ import 'crontab_manager.dart';
 import 'b_plus_tree.dart';
 import 'data_store_impl.dart';
 import 'compute_tasks.dart';
+import 'memory_manager.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -50,8 +51,24 @@ class IndexManager {
   // Current index metadata cache total size (bytes)
   int _currentIndexMetaCacheSize = 0;
   
+  // Current index cache total size (bytes)
+  int _currentIndexCacheSize = 0;
+  
   // Index metadata size cache - cache the size of each index metadata to avoid repeated calculation
   final Map<String, int> _indexMetaSizeCache = {};
+  
+  // Index cache size cache - cache the size of each index to avoid repeated calculation
+  final Map<String, int> _indexSizeCache = {};
+  
+  /// Get current index cache size in bytes
+  int getCurrentIndexCacheSize() {
+    return _currentIndexCacheSize;
+  }
+  
+  /// Get current index metadata cache size in bytes
+  int getCurrentIndexMetaCacheSize() {
+    return _currentIndexMetaCacheSize;
+  }
 
   // Whether the cron task has been initialized
   bool _cronInitialized = false;
@@ -94,15 +111,15 @@ class IndexManager {
     _registerMemoryCallbacks();
   }
   
-  /// Register memory callback function
+    /// Register memory callback function
   void _registerMemoryCallbacks() {
     final memoryManager = _dataStore.memoryManager;
     if (memoryManager != null) {
       // Register index cache cleanup callback
-      memoryManager.registerCacheEvictionCallback('index_cache_eviction', _cleanupIndexCache);
+      memoryManager.registerCacheEvictionCallback(CacheType.indexData, _cleanupIndexCache);
       
       // Register index metadata cache cleanup callback
-      memoryManager.registerCacheEvictionCallback('index_meta_cache_eviction', _cleanupIndexMetaCache);
+      memoryManager.registerCacheEvictionCallback(CacheType.indexMeta, _cleanupIndexMetaCache);
     }
   }
   
@@ -115,17 +132,11 @@ class IndexManager {
       // Get memory manager
       final memoryManager = _dataStore.memoryManager;
       if (memoryManager != null && !memoryManager.isLowMemoryMode()) {
-        // Check current index cache size against limit
-        // Estimate current index cache total size (in bytes)
-        int currentIndexCacheSize = 0;
-        _indexCache.forEach((key, index) {
-          currentIndexCacheSize += _estimateIndexSize(index);
-        });
         
         final cacheLimit = memoryManager.getIndexCacheSize();
         
         // If current cache size is less than 90% of the limit, no need to clean up
-        if (currentIndexCacheSize < cacheLimit * 0.9) {
+        if (_currentIndexCacheSize < cacheLimit * 0.9) {
           return;
         }
       }
@@ -140,9 +151,21 @@ class IndexManager {
       
       for (int i = 0; i < weightEntries.length && removed < cleanupCount; i++) {
         final key = weightEntries[i].key;
-        _indexCache.remove(key);
-        _indexFullyCached.remove(key);
-        removed++;
+        
+        // Get index size
+        final index = _indexCache[key];
+        if (index != null) {
+          final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
+          
+          // Update total cache size
+          _currentIndexCacheSize -= size;
+          _indexSizeCache.remove(key);
+          
+          // Remove index
+          _indexCache.remove(key);
+          _indexFullyCached.remove(key);
+          removed++;
+        }
       }
     } catch (e) {
       Logger.error('Failed to clean up index cache: $e',
@@ -1013,8 +1036,8 @@ class IndexManager {
     _disableFastProcessMode();
     
     // Unregister memory callback
-    _dataStore.memoryManager?.unregisterCacheEvictionCallback('index_cache_eviction');
-    _dataStore.memoryManager?.unregisterCacheEvictionCallback('index_meta_cache_eviction');
+    _dataStore.memoryManager?.unregisterCacheEvictionCallback(CacheType.indexData);
+    _dataStore.memoryManager?.unregisterCacheEvictionCallback(CacheType.indexMeta);
 
     _indexCache.clear();
     _indexMetaCache.clear();
@@ -1025,7 +1048,9 @@ class IndexManager {
     _indexLastWriteTime.clear();
     _deleteBuffer.clear();
     _indexMetaSizeCache.clear();
+    _indexSizeCache.clear();
     _currentIndexMetaCacheSize = 0;
+    _currentIndexCacheSize = 0;
     _pendingWrites = 0;
     _pendingEntriesCount = 0;
     _isClosing = false;
@@ -1351,14 +1376,24 @@ class IndexManager {
         return null;
       }
 
-      // Check if we should cache the full index
-      bool shouldFullCache = _shouldFullCacheIndex(tableName, indexName, meta);
-
-      // Update cache
-      _indexCache[cacheKey] = btree;
-      _indexFullyCached[cacheKey] = shouldFullCache;
       _updateIndexAccessWeight(cacheKey);
 
+      // Check if we should cache the full index
+      bool shouldFullCache = _shouldFullCacheIndex(tableName, indexName, meta);
+      if (shouldFullCache) {
+        // Get old index size
+        final oldIndex = _indexCache[cacheKey];
+        final oldSize = oldIndex != null ? _estimateIndexSize(oldIndex) : 0;
+      
+      // Add index to cache
+      _indexCache[cacheKey] = btree;
+      _indexFullyCached[cacheKey] = shouldFullCache;
+  
+      // Calculate new index size and update total size
+      final newSize = _estimateIndexSize(btree);
+      _indexSizeCache[cacheKey] = newSize;
+      _currentIndexCacheSize = _currentIndexCacheSize - oldSize + newSize;
+      }
       return btree;
     } catch (e) {
       Logger.error('Failed to get index: $e', label: 'IndexManager.getIndex');
