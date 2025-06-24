@@ -50,19 +50,6 @@ class DataCacheManager {
     // Initialize to 0, then recalculate before first use
     _totalSchemaCacheSize = 0;
     _totalRecordCacheSize = 0;
-    
-    // Calculate once at initialization (only once full table traversal)
-    Future.microtask(() {
-      if (_schemaCache.isNotEmpty) {
-        _totalSchemaCacheSize = _calculateCurrentSchemaCacheSize();
-      }
-      
-      // Calculate the total size of all table caches
-      if (tableCaches.isNotEmpty) {
-        _totalRecordCacheSize = tableCaches.values
-            .fold(0, (sum, cache) => sum + cache.totalCacheSize);
-      }
-    });
   }
 
   /// Register memory callbacks
@@ -101,15 +88,7 @@ class DataCacheManager {
     
     return size;
   }
-  
-  /// Calculate current schema cache total size
-  int _calculateCurrentSchemaCacheSize() {
-    int totalSize = 0;
-    _schemaCache.forEach((name, schema) {
-      totalSize += _estimateSchemaSize(schema);
-    });
-    return totalSize;
-  }
+
   
   /// Evict query cache
   void _evictQueryCache(double ratio) {
