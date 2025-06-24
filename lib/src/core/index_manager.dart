@@ -47,6 +47,12 @@ class IndexManager {
   // Last index write time - table name + index name -> last write time
   final Map<String, DateTime> _indexLastWriteTime = {};
 
+  // Current index metadata cache total size (bytes)
+  int _currentIndexMetaCacheSize = 0;
+  
+  // Index metadata size cache - cache the size of each index metadata to avoid repeated calculation
+  final Map<String, int> _indexMetaSizeCache = {};
+
   // Whether the cron task has been initialized
   bool _cronInitialized = false;
 
@@ -85,6 +91,142 @@ class IndexManager {
 
   IndexManager(this._dataStore) {
     _initCronTask();
+    _registerMemoryCallbacks();
+  }
+  
+  /// Register memory callback function
+  void _registerMemoryCallbacks() {
+    final memoryManager = _dataStore.memoryManager;
+    if (memoryManager != null) {
+      // Register index cache cleanup callback
+      memoryManager.registerCacheEvictionCallback('index_cache_eviction', _cleanupIndexCache);
+      
+      // Register index metadata cache cleanup callback
+      memoryManager.registerCacheEvictionCallback('index_meta_cache_eviction', _cleanupIndexMetaCache);
+    }
+  }
+  
+  /// Clean up index cache
+  void _cleanupIndexCache() {
+    try {
+      if (_indexCache.isEmpty) return;
+      
+      // Check if memory is under pressure
+      // Get memory manager
+      final memoryManager = _dataStore.memoryManager;
+      if (memoryManager != null && !memoryManager.isLowMemoryMode()) {
+        // Check current index cache size against limit
+        // Estimate current index cache total size (in bytes)
+        int currentIndexCacheSize = 0;
+        _indexCache.forEach((key, index) {
+          currentIndexCacheSize += _estimateIndexSize(index);
+        });
+        
+        final cacheLimit = memoryManager.getIndexCacheSize();
+        
+        // If current cache size is less than 90% of the limit, no need to clean up
+        if (currentIndexCacheSize < cacheLimit * 0.9) {
+          return;
+        }
+      }
+      
+      // Sort cache by access weight
+      final weightEntries = _indexAccessWeights.entries.toList()
+        ..sort((a, b) => (a.value['weight'] as int).compareTo(b.value['weight'] as int));
+      
+      // Clean up 30% of low weight cache
+      final cleanupCount = (weightEntries.length * 0.3).ceil();
+      int removed = 0;
+      
+      for (int i = 0; i < weightEntries.length && removed < cleanupCount; i++) {
+        final key = weightEntries[i].key;
+        _indexCache.remove(key);
+        _indexFullyCached.remove(key);
+        removed++;
+      }
+    } catch (e) {
+      Logger.error('Failed to clean up index cache: $e',
+          label: 'IndexManager._cleanupIndexCache');
+    }
+  }
+  
+  /// Clean up index metadata cache
+  void _cleanupIndexMetaCache() {
+    try {
+      if (_indexMetaCache.isEmpty) return;
+      
+      // Calculate the ratio to be cleared
+      final metaCacheLimit = _dataStore.memoryManager?.getIndexMetaCacheSize() ?? 10000;
+      
+      // If the cache is less than the limit, no need to clean up
+      if (_currentIndexMetaCacheSize < metaCacheLimit * 0.9) return;
+      
+      // Calculate target size (70% of the limit)
+      final targetSize = (metaCacheLimit * 0.7).toInt();
+      final needToRemoveBytes = _currentIndexMetaCacheSize - targetSize;
+      
+      if (needToRemoveBytes <= 0) return;
+      
+      // Optimization: use a bucket approach to avoid full sorting
+      // We'll divide time into buckets (e.g., by hour) and process oldest buckets first
+      final buckets = <int, List<String>>{};
+      int removedSize = 0;
+      
+      // Critical indexes to preserve (primary key and unique indexes)
+      final criticalIndexes = <String>{};
+      
+      // Single pass to categorize entries into time buckets
+      // Use epoch hours as bucket keys (rough time division)
+      for (final entry in _indexMetaCache.entries) {
+        final key = entry.key;
+        final parts = key.split(':');
+        
+        // Identify critical indexes to preserve
+        if (parts.length == 2 && (key.startsWith('pk_') || key.startsWith('uniq_'))) {
+          criticalIndexes.add(key);
+          continue;
+        }
+        
+        // Get last access time, convert to bucket
+        final lastAccess = _indexAccessWeights[key]?['lastAccess'] as DateTime? ?? DateTime(1970);
+        // Use hours since epoch as bucket key (coarse-grained time division)
+        final bucketKey = lastAccess.millisecondsSinceEpoch ~/ 3600000;
+        
+        // Add to appropriate bucket
+        buckets.putIfAbsent(bucketKey, () => <String>[]).add(key);
+      }
+      
+      // Process buckets from oldest to newest
+      final sortedBuckets = buckets.keys.toList()..sort();
+      
+      for (final bucketKey in sortedBuckets) {
+        final keysInBucket = buckets[bucketKey]!;
+        
+        // Process all keys in this time bucket
+        for (final key in keysInBucket) {
+          // Skip if we've removed enough already
+          if (removedSize >= needToRemoveBytes) break;
+          
+          // Remove this entry if not critical
+          if (!criticalIndexes.contains(key)) {
+            final metaSize = _indexMetaSizeCache[key] ?? 0;
+            _indexMetaCache.remove(key);
+            _indexMetaSizeCache.remove(key);
+            
+            removedSize += metaSize;
+          }
+        }
+        
+        // If we've removed enough, stop processing more buckets
+        if (removedSize >= needToRemoveBytes) break;
+      }
+      
+      // Update current cache size
+      _currentIndexMetaCacheSize -= removedSize;
+    } catch (e) {
+      Logger.error('Failed to clean up index metadata cache: $e',
+          label: 'IndexManager._cleanupIndexMetaCache');
+    }
   }
 
   /// Initialize cron task
@@ -869,6 +1011,10 @@ class IndexManager {
   void dispose() {
     // Ensure fast processing mode is disabled
     _disableFastProcessMode();
+    
+    // Unregister memory callback
+    _dataStore.memoryManager?.unregisterCacheEvictionCallback('index_cache_eviction');
+    _dataStore.memoryManager?.unregisterCacheEvictionCallback('index_meta_cache_eviction');
 
     _indexCache.clear();
     _indexMetaCache.clear();
@@ -878,6 +1024,8 @@ class IndexManager {
     _indexWriting.clear();
     _indexLastWriteTime.clear();
     _deleteBuffer.clear();
+    _indexMetaSizeCache.clear();
+    _currentIndexMetaCacheSize = 0;
     _pendingWrites = 0;
     _pendingEntriesCount = 0;
     _isClosing = false;
@@ -1062,6 +1210,24 @@ class IndexManager {
     return baseSize + keyValueSize;
   }
 
+  /// Estimate index metadata size (bytes)
+  int _estimateIndexMetaSize(IndexMeta meta) {
+    // Base structure size
+    int size = 100;
+    
+    // Field size
+    size += meta.fields.length * 20;
+    
+    // Partition size
+    size += meta.partitions.length * 100; // Each partition is about 100 bytes
+    
+    // String size
+    size += meta.name.length * 2;
+    size += meta.tableName.length * 2;
+    
+    return size;
+  }
+  
   /// Get index metadata
   Future<IndexMeta?> _getIndexMeta(String tableName, String indexName) async {
     try {
@@ -1088,8 +1254,20 @@ class IndexManager {
       final json = jsonDecode(content);
       final meta = IndexMeta.fromJson(json);
 
+      // Estimate metadata size
+      final metaSize = _estimateIndexMetaSize(meta);
+      
+      // Check if the metadata cache exceeds the limit
+      final metaCacheLimit = _dataStore.memoryManager?.getIndexMetaCacheSize() ?? 10000;
+      if (_currentIndexMetaCacheSize + metaSize > metaCacheLimit) {
+        // If the limit is exceeded, trigger metadata cache cleaning
+        _cleanupIndexMetaCache();
+      }
+      
       // Update cache
       _indexMetaCache[cacheKey] = meta;
+      _indexMetaSizeCache[cacheKey] = metaSize;
+      _currentIndexMetaCacheSize += metaSize;
 
       return meta;
     } catch (e) {
@@ -1572,7 +1750,22 @@ class IndexManager {
 
       // Update cache
       if (updateCache) {
+        // Get previous metadata size (if exists)
+        final oldSize = _indexMetaSizeCache[cacheKey] ?? 0;
+        
+        // Calculate new metadata size
+        final newSize = _estimateIndexMetaSize(meta);
+        
+        // Update cache size count
+        if (oldSize > 0) {
+          _currentIndexMetaCacheSize = _currentIndexMetaCacheSize - oldSize + newSize;
+        } else {
+          _currentIndexMetaCacheSize += newSize;
+        }
+        
+        // Update cache
         _indexMetaCache[cacheKey] = meta;
+        _indexMetaSizeCache[cacheKey] = newSize;
       }
 
       return meta;
@@ -2695,9 +2888,20 @@ class IndexManager {
   /// Invalidate index cache
   void invalidateCache(String tableName, String indexName) {
     final cacheKey = _getIndexCacheKey(tableName, indexName);
+    
+    // Remove index cache
     _indexCache.remove(cacheKey);
-    _indexMetaCache.remove(cacheKey);
     _indexFullyCached.remove(cacheKey);
+    
+    // Update index metadata cache size
+    final metaSize = _indexMetaSizeCache[cacheKey] ?? 0;
+    if (metaSize > 0) {
+      _currentIndexMetaCacheSize -= metaSize;
+      _indexMetaSizeCache.remove(cacheKey);
+    }
+    
+    // Remove index metadata cache
+    _indexMetaCache.remove(cacheKey);
 
     Logger.debug('Index cache invalidated: $tableName.$indexName',
         label: 'IndexManager.invalidateCache');

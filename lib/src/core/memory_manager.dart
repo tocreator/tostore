@@ -19,16 +19,18 @@ class MemoryManager {
   /// Allocation ratios for various caches
   static const double _recordCacheRatio = 0.40; // Record cache 40%
   static const double _indexCacheRatio = 0.30;  // Index cache 30%
-  static const double _queryCacheRatio = 0.20;  // Query cache 20% 
+  static const double _queryCacheRatio = 0.15;  // Query cache 15% 
   static const double _schemaCacheRatio = 0.05; // Schema cache 5%
-  static const double _metaCacheRatio = 0.05;   // Meta cache 5%
+  static const double _tableMetaCacheRatio = 0.05; // Table meta cache 5%
+  static const double _indexMetaCacheRatio = 0.05; // Index meta cache 5%
   
   /// Size thresholds for various caches (in bytes)
   int _recordCacheSize = 0;
   int _indexCacheSize = 0;
   int _queryCacheSize = 0;
   int _schemaCacheSize = 0;
-  int _metaCacheSize = 0;
+  int _tableMetaCacheSize = 0;
+  int _indexMetaCacheSize = 0;
   
   /// Last cache clear time
   DateTime _lastCacheClearTime = DateTime.now();
@@ -181,7 +183,8 @@ class MemoryManager {
     _indexCacheSize = (totalThresholdBytes * _indexCacheRatio).toInt();
     _queryCacheSize = (totalThresholdBytes * _queryCacheRatio).toInt();
     _schemaCacheSize = (totalThresholdBytes * _schemaCacheRatio).toInt();
-    _metaCacheSize = (totalThresholdBytes * _metaCacheRatio).toInt();
+    _tableMetaCacheSize = (totalThresholdBytes * _tableMetaCacheRatio).toInt();
+    _indexMetaCacheSize = (totalThresholdBytes * _indexMetaCacheRatio).toInt();
   }
   
   /// Register cache eviction callback
@@ -206,8 +209,11 @@ class MemoryManager {
   /// Get schema cache size limit
   int getSchemaCacheSize() => _schemaCacheSize;
   
-  /// Get meta cache size limit
-  int getMetaCacheSize() => _metaCacheSize;
+  /// Get table metadata cache size limit
+  int getTableMetaCacheSize() => _tableMetaCacheSize;
+  
+  /// Get index metadata cache size limit
+  int getIndexMetaCacheSize() => _indexMetaCacheSize;
   
   /// Get memory threshold (MB)
   int getMemoryThresholdMB() => _memoryThresholdInMB;
