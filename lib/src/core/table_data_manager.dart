@@ -102,92 +102,93 @@ class TableDataManager {
   int _estimateTableMetaSize(FileMeta meta) {
     // Base structure size
     int size = 100;
-    
+
     // Table name size
     size += meta.name.length * 2;
-    
+
     // Partition metadata size
     if (meta.partitions != null) {
       size += meta.partitions!.length * 150; // About 150 bytes per partition
     }
-    
+
     // Other fields size
     size += 50; // Version, type, size, record count, etc.
-    
+
     return size;
   }
-  
+
   /// Clean up table metadata cache
   void _cleanupTableMetaCache() {
     try {
       if (_fileMetaCache.isEmpty) return;
-      
+
       // Calculate the ratio to be cleared
-      final metaCacheLimit = _dataStore.memoryManager?.getTableMetaCacheSize() ?? 10000;
-      
+      final metaCacheLimit =
+          _dataStore.memoryManager?.getTableMetaCacheSize() ?? 10000;
+
       // If the cache is less than the limit, no need to clean up
       if (_currentTableMetaCacheSize < metaCacheLimit * 0.9) return;
-      
+
       // Calculate target size (70% of the limit)
       final targetSize = (metaCacheLimit * 0.7).toInt();
       final needToRemoveBytes = _currentTableMetaCacheSize - targetSize;
-      
+
       if (needToRemoveBytes <= 0) return;
-      
+
       // Optimization: use a bucket approach to avoid full sorting
       // We'll divide time into buckets (e.g., by hour) and process oldest buckets first
       final buckets = <int, List<String>>{};
       int removedSize = 0;
-      
+
       // System tables to preserve
       final systemTables = <String>{};
-      
+
       // Single pass to categorize entries into time buckets
       // Use epoch hours as bucket keys (rough time division)
       for (final entry in _fileMetaCache.entries) {
         final tableName = entry.key;
-        
+
         // Identify system tables to preserve
         if (SystemTable.isSystemTable(tableName)) {
           systemTables.add(tableName);
           continue;
         }
-        
+
         // Get last access time, convert to bucket
         final lastModified = _lastModifiedTimes[tableName] ?? DateTime(1970);
         // Use hours since epoch as bucket key (coarse-grained time division)
         final bucketKey = lastModified.millisecondsSinceEpoch ~/ 3600000;
-        
+
         // Add to appropriate bucket
         buckets.putIfAbsent(bucketKey, () => <String>[]).add(tableName);
       }
-      
+
       // Process buckets from oldest to newest
       final sortedBuckets = buckets.keys.toList()..sort();
-      
+
       for (final bucketKey in sortedBuckets) {
         final tablesInBucket = buckets[bucketKey]!;
-        
+
         // Process all tables in this time bucket
         for (final tableName in tablesInBucket) {
           // Skip if we've removed enough already
           if (removedSize >= needToRemoveBytes) break;
-          
+
           // Remove this entry if not a system table
           if (!systemTables.contains(tableName)) {
             final metaSize = _tableMetaSizeCache[tableName] ?? 0;
             _fileMetaCache.remove(tableName);
             _tableMetaSizeCache.remove(tableName);
             _lastModifiedTimes.remove(tableName);
-            
+
             removedSize += metaSize;
           }
         }
-        
+
         // If we've removed enough, stop processing more buckets
         if (removedSize >= needToRemoveBytes) break;
       }
-      
+
       // Update current cache size
       _currentTableMetaCacheSize -= removedSize;
     } catch (e) {
@@ -199,7 +200,7 @@ class TableDataManager {
   TableDataManager(this._dataStore) {
     // Register scheduled task to CrontabManager
     CrontabManager.addCallback(ExecuteInterval.seconds3, _processWriteBuffer);
-    
+
     // Register memory callbacks
     _registerMemoryCallbacks();
 
@@ -223,7 +224,8 @@ class TableDataManager {
     final memoryManager = _dataStore.memoryManager;
     if (memoryManager != null) {
       // Register table metadata cache cleanup callback
-      memoryManager.registerCacheEvictionCallback(CacheType.tableMeta, _cleanupTableMetaCache);
+      memoryManager.registerCacheEvictionCallback(
+          CacheType.tableMeta, _cleanupTableMetaCache);
     }
   }
 
@@ -450,9 +452,10 @@ class TableDataManager {
         ExecuteInterval.seconds3, _processWriteBuffer);
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
-    
+
     // Cancel register memory callback
-    _dataStore.memoryManager?.unregisterCacheEvictionCallback(CacheType.tableMeta);
+    _dataStore.memoryManager
+        ?.unregisterCacheEvictionCallback(CacheType.tableMeta);
 
     try {
       // Flush all pending data (both write and delete buffers)
@@ -756,19 +759,9 @@ class TableDataManager {
         );
         return result;
       }).catchError((error) {
-        final duration = DateTime.now().difference(startTime);
-        Logger.error(
-          '$description concurrent partition processing failed, time: ${duration.inMilliseconds}ms, error: $error',
-          label: 'TableDataManager.processPartitionsConcurrently',
-        );
         throw error;
       });
     } catch (e) {
-      final duration = DateTime.now().difference(startTime);
-      Logger.error(
-        '$description concurrent partition processing failed, time: ${duration.inMilliseconds}ms, error: $e',
-        label: 'TableDataManager.processPartitionsConcurrently',
-      );
       rethrow;
     }
   }
@@ -1304,7 +1297,8 @@ class TableDataManager {
       }
 
       // Get record cache size using MemoryManager
-      final recordCacheSize = _dataStore.memoryManager?.getRecordCacheSize() ?? 10000000;
+      final recordCacheSize =
+          _dataStore.memoryManager?.getRecordCacheSize() ?? 10000000;
       // Check if file size exceeds limit
       return recordCacheSize * 0.9 > totalSize;
     } catch (e) {
@@ -1364,12 +1358,13 @@ class TableDataManager {
         }
 
         final fileInfo = FileInfo.fromJson(jsonData);
-        
+
         // Estimate metadata size
         final metaSize = _estimateTableMetaSize(fileInfo.meta);
-        
+
         // Check if metadata cache exceeds limit
-        final metaCacheLimit = _dataStore.memoryManager?.getTableMetaCacheSize() ?? 10000;
+        final metaCacheLimit =
+            _dataStore.memoryManager?.getTableMetaCacheSize() ?? 10000;
         if (_currentTableMetaCacheSize + metaSize > metaCacheLimit * 0.9) {
           // If exceeds limit, trigger metadata cache cleanup
           _cleanupTableMetaCache();
@@ -1379,7 +1374,7 @@ class TableDataManager {
         _fileMetaCache[tableName] = fileInfo.meta;
         _tableMetaSizeCache[tableName] = metaSize;
         _currentTableMetaCacheSize += metaSize;
-        
+
         // Update last access time
         _lastModifiedTimes[tableName] = DateTime.now();
 
@@ -1436,17 +1431,18 @@ class TableDataManager {
     try {
       // Get previous metadata size (if exists)
       final oldSize = _tableMetaSizeCache[tableName] ?? 0;
-      
+
       // Calculate new metadata size
       final newSize = _estimateTableMetaSize(meta);
-      
+
       // Update cache size count
       if (oldSize > 0) {
-        _currentTableMetaCacheSize = _currentTableMetaCacheSize - oldSize + newSize;
+        _currentTableMetaCacheSize =
+            _currentTableMetaCacheSize - oldSize + newSize;
       } else {
         _currentTableMetaCacheSize += newSize;
       }
-      
+
       // update cache in memory first, ensure subsequent read can get the latest value
       _fileMetaCache[tableName] = meta;
       _tableMetaSizeCache[tableName] = newSize;

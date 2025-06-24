@@ -55,6 +55,8 @@ class QueryPlan {
         return 'TABLE SCAN on ${operation.value}';
       case QueryOperationType.indexScan:
         return 'INDEX SCAN using ${operation.indexName} with conditions: ${operation.value}';
+      case QueryOperationType.primaryKeyScan:
+        return 'PRIMARY KEY SCAN directly locating partition for: ${operation.value}';
       case QueryOperationType.filter:
         return 'FILTER by ${operation.value}';
       case QueryOperationType.sort:
@@ -95,10 +97,11 @@ class QueryOperation {
 
 /// query operation type
 enum QueryOperationType {
-  tableScan,
-  indexScan,
-  filter,
-  sort,
-  join,
-  cacheQuery,
+  tableScan, // scan all records in the table
+  indexScan, // use index to locate partition file
+  primaryKeyScan, // directly use primary key range mapping to locate partition file, skip index retrieval
+  filter, // filter records by conditions
+  sort, // sort records by conditions
+  join, // join tables
+  cacheQuery, // cache query results
 }

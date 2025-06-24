@@ -186,7 +186,7 @@ class QueryExecutor {
                 isUserManaged: enableQueryCache == true,
               );
 
-              _dataStore.dataCacheManager.cacheQuery(
+              await _dataStore.dataCacheManager.cacheQuery(
                 cacheKey,
                 results,
                 {tableName},
@@ -229,7 +229,7 @@ class QueryExecutor {
             isUserManaged: enableQueryCache == true,
           );
 
-          _dataStore.dataCacheManager.cacheQuery(
+          await _dataStore.dataCacheManager.cacheQuery(
             cacheKey,
             results,
             {tableName},
@@ -296,6 +296,15 @@ class QueryExecutor {
             operation.indexName!,
             operation.value as Map<String, dynamic>,
             condition, // Use complete conditions, will handle internally
+          );
+          break;
+          
+        case QueryOperationType.primaryKeyScan:
+          // Primary key scan directly locates partition file, skipping index query
+          results = await _performPrimaryKeyScan(
+            tableName,
+            operation.value as Map<String, dynamic>,
+            condition,
           );
           break;
 
@@ -1030,6 +1039,17 @@ class QueryExecutor {
       // Find partitions within the range
       final targetPartitions = <int>[];
 
+      // Optimization: For exact primary key match and ordered partitions, use binary search
+      if (fileMeta.isOrdered == true && pkMin == pkMax) {
+        // For exact primary key match, use binary search
+        final partitionIndex = _findPartitionWithBinarySearch(fileMeta.partitions!, pkMin);
+        if (partitionIndex != null) {
+          targetPartitions.add(partitionIndex);
+          return targetPartitions; // Early return with found partition
+        }
+      }
+      
+      // Standard linear search for ranges or when binary search found nothing
       for (var partition in fileMeta.partitions!) {
         // If min/max are not set, consider the partition
         if (partition.minPrimaryKey == null ||
@@ -1086,6 +1106,154 @@ class QueryExecutor {
     return null;
   }
 
+  /// Perform primary key scan, directly locate partition file through primary key range mapping
+  /// 
+  /// This method is optimized for primary key queries, compared to index queries:
+  /// 1. Avoid loading large index data
+  /// 2. Directly use primary key range mapping in table metadata to find corresponding partition
+  /// 3. Only read partition files containing target primary key
+  Future<List<Map<String, dynamic>>> _performPrimaryKeyScan(
+    String tableName,
+    Map<String, dynamic> conditions,
+    QueryCondition? queryCondition,
+  ) async {
+    try {
+      // Get table structure information
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        return [];
+      }
+      
+      final primaryKey = schema.primaryKey;
+      final pkValue = conditions[primaryKey];
+      
+      if (pkValue == null) {
+        // If there is no primary key value, fall back to table scan
+        return _performTableScan(tableName, queryCondition);
+      }
+      
+      // Get table file metadata
+      final fileMeta = await _dataStore.tableDataManager.getTableFileMeta(tableName);
+      if (fileMeta == null || fileMeta.partitions == null || fileMeta.partitions!.isEmpty) {
+        // If there is no partition information, fall back to table scan
+        return _performTableScan(tableName, queryCondition);
+      }
+      
+      // Reuse _getTargetPartitions for better consistency and to handle all query types (=, IN, BETWEEN, etc.)
+      final targetPartitions = await _getTargetPartitions(
+        tableName,
+        schema.isGlobal,
+        {primaryKey: conditions[primaryKey]}, // Only pass the primary key condition
+        primaryKey,
+        fileMeta
+      );
+      
+      if (targetPartitions.isEmpty) {
+        // If no suitable partitions are found, check the write buffer
+        final pendingData = _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+        final pendingRecord = pendingData[pkValue.toString()];
+        
+        if (pendingRecord != null) {
+          // If the write buffer exists and satisfies all conditions
+          if (queryCondition == null || queryCondition.matches(pendingRecord.data)) {
+            return [Map<String, dynamic>.from(pendingRecord.data)];
+          }
+        }
+        
+        // No records found
+        return [];
+      }
+      
+      // Result set
+      final resultMap = <String, Map<String, dynamic>>{};
+      
+      try {
+        // Only process target partitions
+        await _dataStore.tableDataManager.processTablePartitions(
+          tableName: tableName,
+          onlyRead: true,
+          targetPartitions: targetPartitions,
+          processFunction: (records, partitionIndex) async {
+            for (var record in records) {
+              // Skip deleted records
+              if (isDeletedRecord(record)) continue;
+              
+              // Primary key exact match
+              if (record[primaryKey] == pkValue) {
+                // If the record satisfies all query conditions
+                if (queryCondition == null || queryCondition.matches(record)) {
+                  resultMap[record[primaryKey].toString()] = record;
+                  // Terminate all partition processing immediately after finding a matching record
+                  throw 'exact_match_found:$partitionIndex:${record[primaryKey]}';
+                }
+              }
+            }
+            return records;
+          },
+        );
+      } catch (e) {
+        // Catch exact match exception, this is a normal early termination process
+        if (e is String && e.startsWith('exact_match_found:')) {
+          // No need to clean up the result set, because the matching record has been added to resultMap
+        } else {
+          Logger.error('Primary key scan error: $e', label: 'QueryExecutor._performPrimaryKeyScan');
+        }
+      }
+      
+      // Check the write buffer to see if there are any updated records
+      final pendingData = _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+      final pendingRecord = pendingData[pkValue.toString()];
+      
+      if (pendingRecord != null) {
+        // If the write buffer exists and satisfies all conditions
+        if (queryCondition == null || queryCondition.matches(pendingRecord.data)) {
+          resultMap[pkValue.toString()] = Map<String, dynamic>.from(pendingRecord.data);
+        }
+      }
+      
+      return resultMap.values.toList();
+    } catch (e) {
+      Logger.error('Primary key scan failed: $e', label: 'QueryExecutor._performPrimaryKeyScan');
+      // When failed, fall back to table scan
+      return _performTableScan(tableName, queryCondition);
+    }
+  }
+  
+  /// Use binary search to locate the partition containing the target primary key
+  /// 
+  /// When the number of partitions is large, binary search can reduce the query complexity from O(n) to O(log n)
+  /// Return the found partition index, if not found, return null
+  int? _findPartitionWithBinarySearch(List<dynamic> partitions, dynamic pkValue) {
+    if (partitions.isEmpty) return null;
+    
+    int left = 0;
+    int right = partitions.length - 1;
+    
+    while (left <= right) {
+      int mid = left + (right - left) ~/ 2;
+      var partition = partitions[mid];
+      
+      // Handle the case where the boundary is empty
+      if (partition.minPrimaryKey == null || partition.maxPrimaryKey == null) {
+        return partition.index;
+      }
+      
+      // Check if the primary key is within the current partition range
+      if (_isValueInRange(pkValue, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+        return partition.index;
+      }
+      
+      // Adjust the search range
+      if (_compareValues(pkValue, partition.minPrimaryKey) < 0) {
+        right = mid - 1; // Continue searching on the left
+      } else {
+        left = mid + 1; // Continue searching on the right
+      }
+    }
+    
+    return null; // No matching partition found
+  }
+  
   /// perform index scan
   Future<List<Map<String, dynamic>>> _performIndexScan(
     String tableName,

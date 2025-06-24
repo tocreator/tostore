@@ -83,25 +83,37 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return this;
   }
 
-  /// Clear the query cache for the current query condition
+    /// Clear the query cache for the current query condition
   /// Returns the number of cache entries removed
   Future<int> clearQueryCache() async {
     await $db.ensureInitialized();
     final cacheManager = $db.dataCacheManager;
+    
+    // Number of removed cache entries
+    int totalRemoved = 0;
 
-    // Build cache key from current query parameters
-    final cacheKey = QueryCacheKey(
-      tableName: $tableName,
-      condition: queryCondition,
-      orderBy: $orderBy,
-      limit: $limit,
-      offset: $offset,
-      joins: _joins,
-      isUserManaged: true,
-    );
+    // Try to clean up both user-managed and system-generated caches
+    for (bool isUserManaged in [true, false]) {
+      // Build cache key to ensure correct matching
+      final cacheKey = QueryCacheKey(
+        tableName: $tableName,
+        condition: queryCondition,
+        orderBy: $orderBy,
+        limit: $limit,
+        offset: $offset,
+        joins: _joins,
+        isUserManaged: isUserManaged,
+      );
 
-    // Clear cache for this specific query
-    return cacheManager.invalidateQuery($tableName, cacheKey.toString());
+      // Get cache key string
+      final cacheKeyString = cacheKey.toString();
+
+      // Clean up specific query cache
+      final removedCount = await cacheManager.invalidateQuery($tableName, cacheKeyString);
+      totalRemoved += removedCount;
+    }
+
+    return totalRemoved;
   }
 
   /// get first record

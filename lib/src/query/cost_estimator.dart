@@ -31,6 +31,14 @@ class CostEstimator {
           totalCost += indexCost.cost;
           estimatedRows = indexCost.rows;
           break;
+          
+        case QueryOperationType.primaryKeyScan:
+          // Primary key scan is more efficient than index scan as it directly locates partition
+          // Cost is approximately half of an index seek
+          totalCost += _indexSeekCost * 0.5;
+          // Typically returns exactly one row for direct primary key lookup
+          estimatedRows = 1;
+          break;
 
         case QueryOperationType.tableScan:
           totalCost += _tableScanCost * estimatedRows;

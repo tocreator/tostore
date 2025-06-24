@@ -77,15 +77,30 @@ class QueryOptimizer {
         return _createTableScanPlan(tableName, where, orderBy);
       }
 
-      // first try to use primary key index
+      // For primary key queries, use a dedicated primary key scan operation to directly locate the partition file
       if (where.containsKey(schema.primaryKey)) {
-        return QueryPlan([
-          QueryOperation(
-            type: QueryOperationType.indexScan,
-            indexName: 'pk_$tableName',
-            value: where,
-          ),
-        ]);
+        // Check if it is an exact match for the primary key
+        final pkValue = where[schema.primaryKey];
+        if (pkValue is Map && pkValue.containsKey('=')) {
+          // Exact match primary key query (e.g.: id = 123), use primaryKeyScan
+          return QueryPlan([
+            QueryOperation(
+              type: QueryOperationType.primaryKeyScan,
+              value: {
+                schema.primaryKey: pkValue['=']
+              },
+            ),
+          ]);
+        } else {
+          // Range query or other complex primary key queries, still use index scan
+          return QueryPlan([
+            QueryOperation(
+              type: QueryOperationType.indexScan,
+              indexName: 'pk_$tableName',
+              value: where,
+            ),
+          ]);
+        }
       }
 
       // try to use other indexes

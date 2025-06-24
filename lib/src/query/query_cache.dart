@@ -126,7 +126,7 @@ class QueryCache {
 
   /// invalidate a specific query
   /// returns 1 if removed, 0 if not found
-  int invalidateQuery(String queryKey) {
+  Future<int> invalidateQuery(String queryKey) async {
     if (_cache.containsKey(queryKey)) {
       // Subtract removed cache size
       _totalCacheSize -= _estimateCacheEntrySize(_cache[queryKey]!.results);
@@ -259,6 +259,9 @@ class QueryCacheKey {
   /// true: user explicitly created through useQueryCache(), will not expire automatically
   /// false: system-created cache, will expire automatically when records are modified
   final bool isUserManaged;
+  
+  /// Cache the result of toString to avoid repeated calculation
+  String? _cachedString;
 
   QueryCacheKey({
     required this.tableName,
@@ -272,83 +275,79 @@ class QueryCacheKey {
 
   @override
   String toString() {
-    return jsonEncode({
-      'tableName': tableName,
-      'condition': condition.build(),
-      'orderBy': orderBy,
-      'limit': limit,
-      'offset': offset,
-      'joins': joins
-          ?.map((j) => {
-                'type': j.type.toString().split('.').last,
-                'table': j.table,
-                'firstKey': j.firstKey,
-                'operator': j.operator,
-                'secondKey': j.secondKey,
-              })
-          .toList(),
-      'isUserManaged': isUserManaged,
-    });
+    // Use cached results to avoid repeated calculations
+    if (_cachedString != null) {
+      return _cachedString!;
+    }
+    
+    try {
+      // Uniformly generate cache keys for easier comparison and lookup
+      final Map<String, dynamic> keyData = {
+        'tableName': tableName,
+        'condition': condition.build(),
+        'isUserManaged': isUserManaged,
+      };
+      
+      // Only add non-empty values to reduce complexity
+      if (orderBy != null && orderBy!.isNotEmpty) keyData['orderBy'] = orderBy;
+      if (limit != null) keyData['limit'] = limit;
+      if (offset != null) keyData['offset'] = offset;
+      
+      if (joins != null && joins!.isNotEmpty) {
+        keyData['joins'] = joins!.map((j) => {
+          'type': j.type.toString().split('.').last,
+          'table': j.table,
+          'firstKey': j.firstKey,
+          'operator': j.operator,
+          'secondKey': j.secondKey,
+        }).toList();
+      }
+      
+      // Use JSON to generate cache keys to ensure consistency
+      _cachedString = jsonEncode(keyData);
+      return _cachedString!;
+    } catch (e) {
+      // Final fallback option, ensure cache key can always be generated
+      final fallbackKey = '$tableName-${condition.build()}-${DateTime.now().millisecondsSinceEpoch}';
+      return fallbackKey;
+    }
   }
 
   @override
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
-    return other is QueryCacheKey &&
-        other.tableName == tableName &&
-        _conditionEquals(other.condition, condition) &&
-        _listEquals(other.orderBy, orderBy) &&
-        other.limit == limit &&
-        other.offset == offset &&
-        other.isUserManaged == isUserManaged &&
-        _joinsEquals(other.joins, joins);
+    
+    // Use toString for comparison to ensure consistency
+    // Because the toString() method already contains all key properties
+    if (other is QueryCacheKey) {
+      return toString() == other.toString();
+    }
+    return false;
   }
 
   @override
   int get hashCode {
-    return Object.hash(
-      tableName,
-      condition.build().toString(),
-      orderBy?.join(','),
-      limit,
-      offset,
-      isUserManaged,
-      joins?.map((j) => j.toString()).join(';'),
-    );
-  }
-
-  bool _conditionEquals(QueryCondition a, QueryCondition b) {
-    return a.build().toString() == b.build().toString();
-  }
-
-  bool _listEquals(List? a, List? b) {
-    if (a == null && b == null) return true;
-    if (a == null || b == null) return false;
-    if (a.length != b.length) return false;
-    for (var i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
+    // Use consistent JSON structure to calculate hash values, ensure equivalent objects have the same hash
+    final Map<String, dynamic> keyData = {
+      'tableName': tableName,
+      'condition': condition.build().toString(),
+    };
+    
+    if (orderBy != null && orderBy!.isNotEmpty) keyData['orderBy'] = orderBy;
+    if (limit != null) keyData['limit'] = limit;
+    if (offset != null) keyData['offset'] = offset;
+    if (isUserManaged) keyData['isUserManaged'] = true;
+    
+    if (joins != null && joins!.isNotEmpty) {
+      keyData['joins'] = joins!.map((j) => {
+        'type': j.type.toString(),
+        'table': j.table,
+        'firstKey': j.firstKey,
+        'operator': j.operator,
+        'secondKey': j.secondKey,
+      }).toList();
     }
-    return true;
-  }
-
-  bool _joinsEquals(List<JoinClause>? a, List<JoinClause>? b) {
-    if (a == null && b == null) return true;
-    if (a == null || b == null) return false;
-    if (a.length != b.length) return false;
-
-    for (var i = 0; i < a.length; i++) {
-      final joinA = a[i];
-      final joinB = b[i];
-
-      if (joinA.type != joinB.type ||
-          joinA.table != joinB.table ||
-          joinA.firstKey != joinB.firstKey ||
-          joinA.operator != joinB.operator ||
-          joinA.secondKey != joinB.secondKey) {
-        return false;
-      }
-    }
-
-    return true;
+    
+    return keyData.toString().hashCode;
   }
 }
