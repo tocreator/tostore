@@ -6,6 +6,7 @@ import 'compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../handler/platform_handler.dart';
+import '../handler/value_comparator.dart';
 import '../model/file_info.dart';
 import '../model/store_index.dart';
 import '../model/table_schema.dart';
@@ -54,6 +55,9 @@ class IndexManager {
 
   // Number of asynchronous write operations being processed
   int _pendingWrites = 0;
+
+  // index order last check time mapping (milliseconds timestamp)
+  final Map<String, int> _lastOrderCheckTime = {};
 
   // Number of pending index entries to process
   int _pendingEntriesCount = 0;
@@ -479,23 +483,38 @@ class IndexManager {
           return p.index == updatedPartition.index ? updatedPartition : p;
         }).toList();
 
+        bool? isOrdered = meta.isOrdered;
+
+        // only ensure order when index is primary key and table meta is ordered
+        if (indexName == 'pk_$tableName' && meta.isOrdered == null) {
+          // check table meta has order flag
+          try {
+            final tableMeta =
+                await _dataStore.tableDataManager.getTableFileMeta(tableName);
+            if (tableMeta != null && tableMeta.isOrdered != null) {
+              // if table meta is ordered, set index meta to ordered
+              isOrdered = tableMeta.isOrdered;
+            }
+          } catch (e) {
+            // ignore error, keep original order flag
+          }
+        }
+
         // Create updated metadata
         final updatedMeta = meta.copyWith(
           partitions: partitions,
+          isOrdered: isOrdered, // keep original order flag
           timestamps: Timestamps(
             created: meta.timestamps.created,
             modified: DateTime.now(),
           ),
         );
 
-        // Update cache
-        _indexMetaCache[cacheKey] = updatedMeta;
-
-        // Write to file
-        final metaPath =
-            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage
-            .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+        await _updateIndexMetadata(
+            tableName: tableName,
+            indexName: indexName,
+            updatedMeta: updatedMeta,
+            acquireLock: false);
       } finally {
         // Release lock
         _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
@@ -558,6 +577,20 @@ class IndexManager {
                 writeBuffer.values.toList();
             writeBuffer.clear(); // Clear buffer immediately
 
+                         // Check if this is a primary key index and table has ordered flag
+              bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
+              bool isTableOrdered = false;
+              
+              // For primary key index, check table metadata ordered flag
+              if (isPrimaryKeyIndex) {
+                try {
+                  final tableMeta = await _dataStore.tableDataManager.getTableFileMeta(tableName);
+                  isTableOrdered = tableMeta?.isOrdered == true;
+                } catch (e) {
+                  // Ignore error, proceed with default handling
+                }
+              }
+
             // --- Pre-allocation Step ---
             final List<PartitionWriteJob> jobs = [];
             if (allEntries.isNotEmpty) {
@@ -571,6 +604,8 @@ class IndexManager {
                   : indexMeta.partitions.last.fileSizeInBytes;
 
               List<IndexBufferEntry> currentJobEntries = [];
+              dynamic minKey, maxKey;
+              
               for (final entry in allEntries) {
                 try {
                   final estimatedEntrySize =
@@ -578,16 +613,40 @@ class IndexManager {
                               entry.indexEntry.recordPointer.toString().length +
                               2)
                           .toInt();
+                          
+                  // Track min/max keys for primary key index when table is ordered
+                  if (isPrimaryKeyIndex && isTableOrdered) {
+                    final currentKey = entry.indexEntry.indexKey;
+                    if (minKey == null || ValueComparator.compare(currentKey, minKey) < 0) {
+                      minKey = currentKey;
+                    }
+                    if (maxKey == null || ValueComparator.compare(currentKey, maxKey) > 0) {
+                      maxKey = currentKey;
+                    }
+                  }
+                  
                   if (currentSize + estimatedEntrySize > maxPartitionFileSize &&
                       currentJobEntries.isNotEmpty) {
                     // Finalize current job and start a new one
-                    jobs.add(PartitionWriteJob(
+                    final job = PartitionWriteJob(
                         partitionIndex: partitionIndex,
-                        entries: currentJobEntries));
+                        entries: currentJobEntries);
+                        
+                    // Set min/max keys for primary key index when table is ordered
+                    if (isPrimaryKeyIndex && isTableOrdered) {
+                      job.minKey = minKey;
+                      job.maxKey = maxKey;
+                      // Reset for next partition
+                      minKey = null;
+                      maxKey = null;
+                    }
+                    
+                    jobs.add(job);
                     partitionIndex++;
                     currentSize = 0;
                     currentJobEntries = [];
                   }
+                  
                   currentJobEntries.add(entry);
                   currentSize += estimatedEntrySize;
                 } catch (e) {
@@ -595,11 +654,20 @@ class IndexManager {
                       label: 'IndexManager._processBatchIndexWrites');
                 }
               }
+              
               // Add the last job
               if (currentJobEntries.isNotEmpty) {
-                jobs.add(PartitionWriteJob(
+                final job = PartitionWriteJob(
                     partitionIndex: partitionIndex,
-                    entries: currentJobEntries));
+                    entries: currentJobEntries);
+                    
+                // Set min/max keys for primary key index when table is ordered
+                if (isPrimaryKeyIndex && isTableOrdered) {
+                  job.minKey = minKey;
+                  job.maxKey = maxKey;
+                }
+                
+                jobs.add(job);
               }
             }
 
@@ -687,10 +755,35 @@ class IndexManager {
                         results.isEmpty ? null : results.first;
 
                     if (existingPartition != null) {
+                      // Merge old and new key ranges for primary key indexes and ordered tables
+                      dynamic finalMinKey = existingPartition.minKey;
+                      dynamic finalMaxKey = existingPartition.maxKey;
+                      
+                      if (isPrimaryKeyIndex && isTableOrdered) {
+                        // If there is a newly written key range
+                        if (job.minKey != null) {
+                          // If there was no original range, or if the new minimum key is smaller than the original one
+                          if (finalMinKey == null || 
+                              ValueComparator.compare(job.minKey, finalMinKey) < 0) {
+                            finalMinKey = job.minKey;
+                          }
+                        }
+                        
+                        if (job.maxKey != null) {
+                          // If there was no original range, or if the new maximum key is larger than the original one
+                          if (finalMaxKey == null || 
+                              ValueComparator.compare(job.maxKey, finalMaxKey) > 0) {
+                            finalMaxKey = job.maxKey;
+                          }
+                        }
+                      }
+                      
                       allNewOrUpdatedPartitions.add(existingPartition.copyWith(
                         fileSizeInBytes: job.result!.newSize,
                         bTreeSize: job.result!.newSize,
                         entries: job.result!.entryCount,
+                        minKey: finalMinKey,
+                        maxKey: finalMaxKey,
                         timestamps: Timestamps(
                             created: existingPartition.timestamps.created,
                             modified: DateTime.now()),
@@ -701,8 +794,8 @@ class IndexManager {
                         version: 1,
                         index: job.partitionIndex,
                         fileSizeInBytes: job.result!.newSize,
-                        minKey: null,
-                        maxKey: null,
+                        minKey: job.minKey, // Use collected min key if available
+                        maxKey: job.maxKey, // Use collected max key if available
                         bTreeSize: job.result!.newSize,
                         entries: job.result!.entryCount,
                         timestamps: Timestamps(
@@ -730,16 +823,17 @@ class IndexManager {
 
               final updatedMeta = indexMeta.copyWith(
                 partitions: finalPartitions,
+                isOrdered: isTableOrdered,
                 timestamps: Timestamps(
                     created: indexMeta.timestamps.created,
                     modified: DateTime.now()),
               );
 
-              final metaPath = await _dataStore.pathManager
-                  .getIndexMetaPath(tableName, indexName);
-              await _dataStore.storage
-                  .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
-              _indexMetaCache[key] = updatedMeta;
+              // Use unified method to update metadata
+              await _updateIndexMetadata(
+                  tableName: tableName,
+                  indexName: indexName,
+                  updatedMeta: updatedMeta);
             }
           }
 
@@ -859,11 +953,31 @@ class IndexManager {
       // Update last access time
       weights['lastAccess'] = now;
 
-      // If it's a new day, update the weight value +1
+      // If it's a new day, update the weight value
       final lastUpdate =
           weights['lastWeightUpdate'] as DateTime? ?? DateTime(1970);
       if (currentDate.isAfter(lastUpdate)) {
-        weights['weight'] = (weights['weight'] as int? ?? 0) + 1;
+        // Get base weight increment
+        int weightIncrement = 1;
+
+        // Give higher weight to primary and unique indexes
+        final parts = cacheKey.split(':');
+        if (parts.length == 2) {
+          final tableName = parts[0];
+          final indexName = parts[1];
+
+          // Primary key index gets 3x weight
+          if (indexName == 'pk_$tableName') {
+            weightIncrement = 3;
+          }
+          // Unique index gets 2x weight
+          else if (indexName.startsWith('uniq_')) {
+            weightIncrement = 2;
+          }
+        }
+
+        // Apply weight increment
+        weights['weight'] = (weights['weight'] as int? ?? 0) + weightIncrement;
         weights['lastWeightUpdate'] = currentDate;
       }
 
@@ -886,14 +1000,14 @@ class IndexManager {
 
       // Get index cache size limit using memory manager
       final memoryManager = _dataStore.memoryManager;
-      
+
       // Estimate current index cache total size (in bytes)
       int currentIndexCacheSize = 0;
       _indexCache.forEach((key, index) {
         currentIndexCacheSize += _estimateIndexSize(index);
       });
-      
-      final maxSize = memoryManager != null 
+
+      final maxSize = memoryManager != null
           ? memoryManager.getIndexCacheSize() // Limit in bytes
           : 10000;
 
@@ -927,16 +1041,16 @@ class IndexManager {
           label: 'IndexManager._checkAndCleanupCache');
     }
   }
-  
+
   /// Estimate index size (in bytes)
   int _estimateIndexSize(BPlusTree index) {
     // Index base structure size
     int baseSize = 100;
-    
+
     // Estimate size based on index entry count and complexity
     // Each index entry includes key and value list
     int keyValueSize = 0;
-    
+
     try {
       // Get index entry count using count() method
       keyValueSize = index.count() * 40; // Average 40 bytes per index entry
@@ -944,7 +1058,7 @@ class IndexManager {
       // If size cannot be accessed, use default estimated value
       keyValueSize = 1000; // Default assume 25 index entries
     }
-    
+
     return baseSize + keyValueSize;
   }
 
@@ -988,7 +1102,9 @@ class IndexManager {
   /// Get index
   /// @param tableName Table name
   /// @param indexName Index name
-  Future<BPlusTree?> getIndex(String tableName, String indexName) async {
+  /// @param key Optional key to search for (enables partial index loading)
+  Future<BPlusTree?> getIndex(String tableName, String indexName,
+      {dynamic key}) async {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
@@ -1014,7 +1130,7 @@ class IndexManager {
           await _checkAndRebuildTableIndexes(tableName, tableSchema);
 
           // Try to get the index again after rebuilding
-          return getIndex(tableName, indexName);
+          return getIndex(tableName, indexName, key: key);
         }
 
         Logger.debug('not found index: $tableName.$indexName, skip index check',
@@ -1022,21 +1138,308 @@ class IndexManager {
         return null;
       }
 
-      // Initialize B+ tree
+      // Determine if we should load full index or selective loading based on key
+      if (key != null && meta.isOrdered == true) {
+        try {
+          // Selective loading: Find which partition might contain the key
+          final partitionIndex = meta.findPartitionForKey(key);
+          if (partitionIndex >= 0 && partitionIndex < meta.partitions.length) {
+            // Found specific partition - load only this one
+            final btree = await _loadSelectiveIndex(
+                tableName, indexName, meta, partitionIndex);
+            if (btree != null) {
+              // Cache the tree but mark it as not fully cached
+              _indexCache[cacheKey] = btree;
+              _indexFullyCached[cacheKey] = false;
+              _updateIndexAccessWeight(cacheKey);
+              return btree;
+            }
+          }
+        } catch (e) {
+          // if range query failed, maybe order flag is wrong, recheck order
+          Logger.debug('Selective index loading failed, rechecking order: $e',
+              label: 'IndexManager.getIndex');
+
+          // async detect order, not block current query
+          _detectAndUpdateIndexOrder(tableName, indexName);
+
+          // continue to load full index
+        }
+      }
+
+      // Default: Initialize full B+ tree with all partitions
       final btree = await _loadIndexFromFile(tableName, indexName, meta);
       if (btree == null) {
         return null;
       }
 
+      // Check if we should cache the full index
+      bool shouldFullCache = _shouldFullCacheIndex(tableName, indexName, meta);
+
       // Update cache
       _indexCache[cacheKey] = btree;
-      _indexFullyCached[cacheKey] =
-          true; // From file fully loaded, marked as complete
+      _indexFullyCached[cacheKey] = shouldFullCache;
       _updateIndexAccessWeight(cacheKey);
 
       return btree;
     } catch (e) {
       Logger.error('Failed to get index: $e', label: 'IndexManager.getIndex');
+      return null;
+    }
+  }
+
+  /// Determine if an index should be fully cached
+  bool _shouldFullCacheIndex(
+      String tableName, String indexName, IndexMeta meta) {
+    try {
+      // Always fully cache small indexes
+
+      if (meta.partitions.length < 100) {
+        return true;
+      }
+
+      // Get cache size limit
+      final memoryManager = _dataStore.memoryManager;
+      if (memoryManager == null) {
+        return false; // No memory manager, conservative approach
+      }
+
+      final indexCacheLimit = memoryManager.getIndexCacheSize();
+
+      // Calculate current index cache usage
+      int currentUsage = 0;
+      for (final entry in _indexCache.entries) {
+        currentUsage += _estimateIndexSize(entry.value);
+      }
+
+      // Estimate size of this index
+      int estimatedIndexSize = 0;
+      for (var partition in meta.partitions) {
+        estimatedIndexSize += partition.bTreeSize;
+      }
+
+      // If cache is under 80% capacity, allow full caching
+      if (currentUsage + estimatedIndexSize < indexCacheLimit * 0.8) {
+        return true;
+      }
+
+      // Special handling for important indexes
+      bool isPrimaryKey = indexName == 'pk_$tableName';
+      bool isUniqueIndex = meta.isUnique;
+
+      // If primary key or unique index, check if we're under 90% capacity
+      if ((isPrimaryKey || isUniqueIndex) &&
+          currentUsage + estimatedIndexSize < indexCacheLimit * 0.9) {
+        return true;
+      }
+
+      // Otherwise, don't fully cache
+      return false;
+    } catch (e) {
+      Logger.error('Error determining cache status: $e',
+          label: 'IndexManager._shouldFullCacheIndex');
+      return false; // Conservative approach on error
+    }
+  }
+
+  /// Load a selective index from file (only specific partition)
+  Future<BPlusTree?> _loadSelectiveIndex(String tableName, String indexName,
+      IndexMeta meta, int partitionIndex) async {
+    try {
+      // Create an empty B+ tree
+      final bTree = BPlusTree(
+        isUnique: meta.isUnique,
+      );
+
+      // Get the specific partition
+      final partition = meta.partitions[partitionIndex];
+      try {
+        final partitionPath = await _dataStore.pathManager
+            .getIndexPartitionPath(tableName, indexName, partition.index);
+
+        if (!await _dataStore.storage.existsFile(partitionPath)) {
+          return bTree; // Return empty tree if partition file doesn't exist
+        }
+
+        final content = await _dataStore.storage.readAsString(partitionPath);
+        if (content == null || content.isEmpty) {
+          return bTree; // Return empty tree if content is empty
+        }
+
+        // Verify checksum (if exists)
+        if (partition.checksum != null &&
+            !_verifyChecksum(content, partition.checksum!)) {
+          Logger.error(
+              'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
+              label: 'IndexManager._loadSelectiveIndex');
+          return bTree; // Return empty tree if checksum fails
+        }
+
+        // Parse B+ tree data
+        final data = _parseBTreeData(content);
+
+        // Add partition data into B+ tree
+        for (final entry in data.entries) {
+          for (final value in entry.value) {
+            await bTree.insert(entry.key, value);
+          }
+        }
+
+        return bTree;
+      } catch (e) {
+        Logger.error('Failed to load index partition: $e',
+            label: 'IndexManager._loadSelectiveIndex');
+        return bTree; // Return empty tree on error
+      }
+    } catch (e) {
+      Logger.error('Failed to load selective index: $e',
+          label: 'IndexManager._loadSelectiveIndex');
+      return null;
+    }
+  }
+
+  /// Check if a table has ordered primary key index
+  /// Used for optimizing range queries
+  Future<bool> isTablePrimaryKeyOrdered(String tableName) async {
+    try {
+      final pkIndexName = 'pk_$tableName';
+      final meta = await _getIndexMeta(tableName, pkIndexName);
+
+      // If metadata exists and isOrdered flag is set
+      if (meta != null) {
+        // Return the value if defined, otherwise default to false
+        return meta.isOrdered ?? false;
+      }
+
+      return false;
+    } catch (e) {
+      Logger.error('Failed to check if primary key is ordered: $e',
+          label: 'IndexManager.isTablePrimaryKeyOrdered');
+      return false;
+    }
+  }
+
+  /// Find partitions that may contain keys in a range
+  /// Returns list of partition indexes
+  Future<List<int>> findPartitionsForKeyRange(String tableName,
+      String indexName, dynamic startKey, dynamic endKey) async {
+    try {
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) return [];
+
+      // only use range optimization when index is ordered
+      if (meta.isOrdered == true) {
+        try {
+          // use IndexMeta method to find partitions
+          final partitions = meta.findPartitionsForKeyRange(startKey, endKey);
+
+          // if found partitions, return result
+          if (partitions.isNotEmpty) {
+            return partitions;
+          }
+
+          // if no partitions found but should have result, maybe order flag is wrong
+          // async detect order, not block current query
+          _detectAndUpdateIndexOrder(tableName, indexName);
+        } catch (e) {
+          Logger.debug(
+              'Range partition finding failed, possibly incorrect order flag: $e',
+              label: 'IndexManager.findPartitionsForKeyRange');
+
+          // async detect order
+          _detectAndUpdateIndexOrder(tableName, indexName);
+        }
+      }
+
+      // if index is not ordered or range query failed, return all partitions
+      return List.generate(meta.partitions.length, (i) => i);
+    } catch (e) {
+      Logger.error('Failed to find partitions for key range: $e',
+          label: 'IndexManager.findPartitionsForKeyRange');
+      return [];
+    }
+  }
+
+  /// Load index entries from specific partitions
+  /// Optimization for range queries - only loads data from relevant partitions
+  Future<BPlusTree?> getPartialIndex(
+      String tableName, String indexName, List<int> partitionIndices) async {
+    try {
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
+
+      // If index is fully cached, just return the cached instance
+      if (_indexCache.containsKey(cacheKey) &&
+          _indexFullyCached[cacheKey] == true) {
+        _updateIndexAccessWeight(cacheKey);
+        return _indexCache[cacheKey];
+      }
+
+      // Get metadata
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) return null;
+
+      // Create B+ tree
+      final bTree = BPlusTree(
+        isUnique: meta.isUnique,
+      );
+
+      // Load just the specified partitions
+      for (final partitionIndex in partitionIndices) {
+        // Find the partition by index
+        final partitionList =
+            meta.partitions.where((p) => p.index == partitionIndex);
+        if (partitionList.isEmpty) continue;
+
+        final partition = partitionList.first;
+
+        try {
+          final partitionPath = await _dataStore.pathManager
+              .getIndexPartitionPath(tableName, indexName, partition.index);
+
+          if (!await _dataStore.storage.existsFile(partitionPath)) {
+            continue;
+          }
+
+          final content = await _dataStore.storage.readAsString(partitionPath);
+          if (content == null || content.isEmpty) {
+            continue;
+          }
+
+          // Verify checksum
+          if (partition.checksum != null &&
+              !_verifyChecksum(content, partition.checksum!)) {
+            Logger.error(
+                'Index partition checksum verification failed: $tableName, $indexName, partition: ${partition.index}',
+                label: 'IndexManager.getPartialIndex');
+            continue;
+          }
+
+          // Parse and load data
+          final data = _parseBTreeData(content);
+          for (final entry in data.entries) {
+            for (final value in entry.value) {
+              await bTree.insert(entry.key, value);
+            }
+          }
+        } catch (e) {
+          Logger.error('Failed to load partition $partitionIndex: $e',
+              label: 'IndexManager.getPartialIndex');
+        }
+      }
+
+      // If we're loading most partitions, consider caching the tree
+      if (partitionIndices.length > meta.partitions.length * 0.7 &&
+          _shouldFullCacheIndex(tableName, indexName, meta)) {
+        // Worth caching, but not marked as fully cached
+        _indexCache[cacheKey] = bTree;
+        _indexFullyCached[cacheKey] = false;
+        _updateIndexAccessWeight(cacheKey);
+      }
+
+      return bTree;
+    } catch (e) {
+      Logger.error('Failed to get partial index: $e',
+          label: 'IndexManager.getPartialIndex');
       return null;
     }
   }
@@ -1130,6 +1533,61 @@ class IndexManager {
     return hash.toRadixString(16).padLeft(8, '0');
   }
 
+  /// Unified index metadata update method
+  /// @param tableName Table name
+  /// @param indexName Index name
+  /// @param updatedMeta Updated metadata, if null, get from memory cache
+  /// @param acquireLock Whether to acquire lock (default is true)
+  /// @param updateCache Whether to update memory cache (default is true)
+  /// @return Updated index metadata
+  Future<IndexMeta?> _updateIndexMetadata({
+    required String tableName,
+    required String indexName,
+    IndexMeta? updatedMeta,
+    bool acquireLock = true,
+    bool updateCache = true,
+  }) async {
+    final cacheKey = _getIndexCacheKey(tableName, indexName);
+
+    // If no updated metadata is provided, try to get from cache
+    final meta = updatedMeta ?? _indexMetaCache[cacheKey];
+    if (meta == null) return null;
+
+    // Create lock resource identifier
+    final lockResource = 'index_meta:$tableName:$indexName';
+    final operationId = 'update_meta_${DateTime.now().millisecondsSinceEpoch}';
+
+    try {
+      // Acquire lock (if needed)
+      if (acquireLock) {
+        await _dataStore.lockManager
+            ?.acquireExclusiveLock(lockResource, operationId);
+      }
+
+      // Update metadata file
+      final metaPath =
+          await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
+      await _dataStore.storage
+          .writeAsString(metaPath, jsonEncode(meta.toJson()));
+
+      // Update cache
+      if (updateCache) {
+        _indexMetaCache[cacheKey] = meta;
+      }
+
+      return meta;
+    } catch (e, stack) {
+      Logger.error('Failed to update index metadata: $e\n$stack',
+          label: 'IndexManager._updateIndexMetadata');
+      return null;
+    } finally {
+      // Release lock (if acquired)
+      if (acquireLock) {
+        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      }
+    }
+  }
+
   /// update index
   Future<void> updateIndexes(
     String tableName,
@@ -1197,8 +1655,7 @@ class IndexManager {
               final index = _indexCache[cacheKey]!;
               if (!index.isUnique) {
                 // Re-create the index with the unique flag
-                _indexCache[cacheKey] =
-                    BPlusTree(isUnique: true);
+                _indexCache[cacheKey] = BPlusTree(isUnique: true);
               }
             }
           }
@@ -2253,7 +2710,32 @@ class IndexManager {
   ) async {
     try {
       final pkIndexName = 'pk_$tableName';
-      final pkIndex = await getIndex(tableName, pkIndexName);
+
+      // Optimize primary key lookup: directly find the partition containing the primary key
+      final meta = await _getIndexMeta(tableName, pkIndexName);
+      if (meta != null &&
+          (meta.isOrdered ?? false) &&
+          meta.partitions.isNotEmpty) {
+        // Use binary search to find the partition containing the primary key
+        final partitionIndex = meta.findPartitionForKey(primaryKeyValue);
+
+        if (partitionIndex >= 0) {
+          // Load only the partition containing the primary key
+          final btree = await _loadSelectiveIndex(
+              tableName, pkIndexName, meta, partitionIndex);
+          if (btree != null) {
+            final results = await btree.search(primaryKeyValue);
+            if (results.isNotEmpty) {
+              // Found result
+              return StoreIndex.fromString(results.first.toString());
+            }
+          }
+        }
+      }
+
+      // Fallback to regular index lookup
+      final pkIndex =
+          await getIndex(tableName, pkIndexName, key: primaryKeyValue);
       if (pkIndex == null) return null;
 
       final results = await pkIndex.search(primaryKeyValue);
@@ -3099,6 +3581,18 @@ class IndexManager {
       // Create index metadata (if needed)
       if (rebuildPrimary) {
         final pkIndexName = 'pk_$tableName';
+        
+        // Check if table has ordered flag
+        bool? isOrdered;
+        try {
+          final tableMeta = await _dataStore.tableDataManager.getTableFileMeta(tableName);
+          if (tableMeta?.isOrdered != null) {
+            isOrdered = tableMeta!.isOrdered;
+          }
+        } catch (e) {
+          // Ignore error, proceed with default handling
+        }
+        
         final pkMeta = IndexMeta(
           version: 1,
           name: pkIndexName,
@@ -3106,17 +3600,16 @@ class IndexManager {
           fields: [primaryKey],
           isUnique: true,
           partitions: [],
+          isOrdered: isOrdered, // Inherit ordered flag from table metadata
           timestamps: Timestamps(
             created: DateTime.now(),
             modified: DateTime.now(),
           ),
         );
 
-        final metaPath = await _dataStore.pathManager
-            .getIndexMetaPath(tableName, pkIndexName);
-        await _dataStore.storage
-            .writeAsString(metaPath, jsonEncode(pkMeta.toJson()));
-        _indexMetaCache[_getIndexCacheKey(tableName, pkIndexName)] = pkMeta;
+        // Use unified method to update metadata
+        await _updateIndexMetadata(
+            tableName: tableName, indexName: pkIndexName, updatedMeta: pkMeta);
       }
 
       // Create metadata for other indexes
@@ -3135,11 +3628,9 @@ class IndexManager {
           ),
         );
 
-        final metaPath =
-            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage
-            .writeAsString(metaPath, jsonEncode(indexMeta.toJson()));
-        _indexMetaCache[_getIndexCacheKey(tableName, indexName)] = indexMeta;
+        // Use unified method to update metadata
+        await _updateIndexMetadata(
+            tableName: tableName, indexName: indexName, updatedMeta: indexMeta);
       }
 
       // Store index entries by partition
@@ -3360,5 +3851,85 @@ class IndexManager {
           label: 'IndexManager._rebuildTableIndexes');
       rethrow;
     }
+  }
+
+  /// Detect and update index order
+  /// @param tableName table name
+  /// @param indexName index name
+  Future<void> _detectAndUpdateIndexOrder(
+      String tableName, String indexName) async {
+    try {
+      // get index meta
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) return;
+
+      // only process primary key index or index with isOrdered is true
+      if (indexName != 'pk_$tableName' && meta.isOrdered != true) {
+        return;
+      }
+
+      // check last check time, avoid frequent detection
+      final lastCheckTime = _lastOrderCheckTime['$tableName:$indexName'] ?? 0;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      const checkInterval = 1000 * 60 * 60; // 1 hour
+
+      // if last check time is less than 1 hour, skip detection
+      if (now - lastCheckTime < checkInterval) {
+        return;
+      }
+
+      // for large index, use sampling detection
+      final isOrdered = _checkPartitionsOrderBySampling(meta.partitions);
+
+      // update meta
+      final updatedMeta = meta.copyWith(isOrdered: isOrdered);
+      await _updateIndexMetadata(
+          tableName: tableName, indexName: indexName, updatedMeta: updatedMeta);
+
+      // record last check time
+      _lastOrderCheckTime['$tableName:$indexName'] = now;
+    } catch (e, stack) {
+      Logger.error('Failed to detect index order: $e\n$stack',
+          label: 'IndexManager._detectAndUpdateIndexOrder');
+    }
+  }
+
+  /// check partitions order by sampling
+  bool _checkPartitionsOrderBySampling(List<IndexPartitionMeta> partitions) {
+    if (partitions.isEmpty || partitions.length == 1) return true;
+
+    // sample detection, check at most 10 uniformly distributed samples
+    final maxSamples = min(partitions.length, 10);
+    final step = (partitions.length / maxSamples).ceil();
+
+    dynamic lastMaxKey;
+
+    for (int i = 0; i < partitions.length; i += step) {
+      if (i >= partitions.length) break;
+
+      final partition = partitions[i];
+
+      // first partition, only record max key
+      if (lastMaxKey == null) {
+        lastMaxKey = partition.maxKey;
+        continue;
+      }
+
+      // check if current partition min key is greater than or equal to last partition max key
+      if (lastMaxKey != null && partition.minKey != null) {
+        if (ValueComparator.compare(partition.minKey, lastMaxKey) < 0) {
+          // range overlap, not ordered
+          return false;
+        }
+      } else if (partition.minKey == null) {
+        // if min key is null, conservative handling as possible not ordered
+        return false;
+      }
+
+      // update lastMaxKey
+      lastMaxKey = partition.maxKey;
+    }
+
+    return true;
   }
 }

@@ -21,6 +21,10 @@ class PartitionWriteJob {
   String? existingContent; // Loaded before sending to isolate
   Future<IndexProcessingResult>? future;
   IndexProcessingResult? result;
+  
+  // For primary key range tracking when table is ordered
+  dynamic minKey;
+  dynamic maxKey;
 
   PartitionWriteJob({required this.partitionIndex, required this.entries});
 }

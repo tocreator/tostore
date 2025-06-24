@@ -1,3 +1,5 @@
+import '../handler/value_comparator.dart';
+
 /// file info model
 class FileInfo {
   final String path;
@@ -721,14 +723,16 @@ class IndexMeta {
   /// whether the index is unique
   final bool isUnique;
 
-
-  /// partition list
+  /// partition list - when isOrdered is true, this list is sorted by minKey for binary search
   final List<IndexPartitionMeta> partitions;
 
   /// timestamps
   final Timestamps timestamps;
 
   /// whether the index is ordered, for range query optimization
+  /// true: partitions list is sorted by minKey and ranges do not overlap between partitions
+  /// false: partitions list is not ordered or ranges overlap
+  /// null: not determined, need to detect
   final bool? isOrdered;
 
   IndexMeta({
@@ -792,6 +796,141 @@ class IndexMeta {
       'timestamps': timestamps.toJson(),
       if (isOrdered != null) 'isOrdered': isOrdered,
     };
+  }
+
+  /// Find the appropriate partition for a key using binary search
+  /// Returns the index of the partition that may contain the key, or -1 if not found
+  int findPartitionForKey(dynamic key) {
+    if (isOrdered == null || isOrdered == false) return -1;
+    if (partitions.isEmpty) return -1;
+    
+    // Fast path for single partition
+    if (partitions.length == 1) {
+      final partition = partitions[0];
+      if (_isKeyInRange(key, partition.minKey, partition.maxKey)) {
+        return 0;
+      }
+      return -1;
+    }
+    
+    // Binary search implementation
+    int low = 0;
+    int high = partitions.length - 1;
+    
+    while (low <= high) {
+      int mid = (low + high) ~/ 2;
+      final partition = partitions[mid];
+      
+      // Check if key is within this partition's range
+      if (_isKeyInRange(key, partition.minKey, partition.maxKey)) {
+        return mid;
+      }
+      
+      // Compare key with partition boundaries
+      if (key == null || partition.minKey == null) {
+        // Handle null cases - can't compare null values
+        return -1;
+      }
+      
+      // Determine which half to search
+      if (_compareKeys(key, partition.minKey) < 0) {
+        // Key is smaller than the min of this partition, search left half
+        high = mid - 1;
+      } else {
+        // Key is larger than the max of this partition, search right half
+        low = mid + 1;
+      }
+    }
+    
+    return -1; // Not found in any partition
+  }
+  
+  /// Find partitions that may intersect with a key range using binary search
+  /// Returns a list of partition indices that may contain keys in the range
+  List<int> findPartitionsForKeyRange(dynamic startKey, dynamic endKey) {
+    if (isOrdered == null || isOrdered == false) {
+      // If not ordered, return all partitions
+      return List.generate(partitions.length, (i) => i);
+    }
+    
+    if (partitions.isEmpty) return [];
+    
+    List<int> result = [];
+    
+    // Handle single partition case efficiently
+    if (partitions.length == 1) {
+      if (_doRangesOverlap(startKey, endKey, partitions[0].minKey, partitions[0].maxKey)) {
+        result.add(0);
+      }
+      return result;
+    }
+    
+    // Find first potential partition (binary search for lower bound)
+    int low = 0;
+    int high = partitions.length - 1;
+    int firstPotentialIndex = partitions.length;
+    
+    while (low <= high) {
+      int mid = (low + high) ~/ 2;
+      final partition = partitions[mid];
+      
+      if (endKey == null || partition.minKey == null) {
+        // Handle null cases conservatively
+        firstPotentialIndex = 0;
+        break;
+      }
+      
+      if (_compareKeys(endKey, partition.minKey) >= 0) {
+        // This partition or higher ones could be relevant
+        firstPotentialIndex = mid;
+        high = mid - 1;
+      } else {
+        // Look in higher partitions
+        low = mid + 1;
+      }
+    }
+    
+    // Scan from first potential partition
+    for (int i = firstPotentialIndex; i < partitions.length; i++) {
+      final partition = partitions[i];
+      
+      // If current partition's min is beyond end key, we're done
+      if (startKey != null && partition.minKey != null && 
+          _compareKeys(startKey, partition.maxKey) > 0) {
+        break;
+      }
+      
+      if (_doRangesOverlap(startKey, endKey, partition.minKey, partition.maxKey)) {
+        result.add(i);
+      }
+    }
+    
+    return result;
+  }
+  
+  /// Helper function to determine if a key is within a range
+  bool _isKeyInRange(dynamic key, dynamic minKey, dynamic maxKey) {
+    if (key == null) return false;
+    if (minKey == null && maxKey == null) return true;
+    if (minKey == null) return _compareKeys(key, maxKey) <= 0;
+    if (maxKey == null) return _compareKeys(key, minKey) >= 0;
+    
+    return _compareKeys(key, minKey) >= 0 && _compareKeys(key, maxKey) <= 0;
+  }
+  
+  /// Helper function to check if two ranges overlap
+  bool _doRangesOverlap(dynamic start1, dynamic end1, dynamic start2, dynamic end2) {
+    // Handle null cases conservatively - assume possible overlap
+    if (start1 == null || end1 == null || start2 == null || end2 == null) return true;
+    
+    // Ranges overlap if one range doesn't entirely precede the other
+    return !(_compareKeys(end1, start2) < 0 || _compareKeys(start1, end2) > 0);
+  }
+  
+  /// Helper function to compare two keys using ValueComparator
+  int _compareKeys(dynamic a, dynamic b) {
+    // Use ValueComparator to compare keys, ensuring proper handling of various key types (base62, bigint, string, etc.)
+    return ValueComparator.compare(a, b);
   }
 
   @override
