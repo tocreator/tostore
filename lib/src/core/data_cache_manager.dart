@@ -416,6 +416,9 @@ class DataCacheManager {
         final pkString = primaryKeyValue.toString();
         final recordCache = tableCache.getRecord(pkString);
 
+        // Get record data, used for subsequent cleanup of related queries
+        final recordData = recordCache?.record;
+
         // Update the total cache size
         if (recordCache != null) {
           _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
@@ -423,6 +426,11 @@ class DataCacheManager {
 
         // Remove record from cache
         tableCache.recordsMap.remove(pkString);
+        
+        // clean up related queries affected by deleted record
+        if (recordData != null) {
+          await _cleanupRelatedQueries(tableName, primaryKeyValue, recordData);
+        }
       }
 
       // Clean up query results cache containing this primary key
