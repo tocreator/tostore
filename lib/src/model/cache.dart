@@ -14,10 +14,10 @@ class TableCache {
   // Cache statistics
   int _startupRecordCount = 0; // Startup cache record count
   int _runtimeRecordCount = 0; // Runtime cache record count
-  
+
   // Total cache size statistics (bytes)
   int _totalCacheSize = 0;
-  
+
   // Get total cache size
   int get totalCacheSize => _totalCacheSize;
 
@@ -37,7 +37,7 @@ class TableCache {
         lastAccessed = lastAccessed ?? DateTime.now() {
     // Count records by type
     _updateRecordTypeCounts();
-    
+
     // Initialize total cache size
     _recalculateTotalCacheSize();
   }
@@ -45,13 +45,13 @@ class TableCache {
   /// Recalculate total cache size (only used when initializing or resetting)
   void _recalculateTotalCacheSize() {
     _totalCacheSize = 0;
-    
+
     // Table basic overhead
     _totalCacheSize += 120; // Basic object overhead
-    
+
     // Record mapping overhead
     _totalCacheSize += recordsMap.length * 16; // Map entry overhead
-    
+
     // Each record overhead
     for (final cache in recordsMap.values) {
       _totalCacheSize += cache.estimateMemoryUsage();
@@ -99,7 +99,7 @@ class TableCache {
     // Update if already exists
     if (recordsMap.containsKey(pkValue)) {
       final existingCache = recordsMap[pkValue]!;
-      
+
       // Subtract old record size
       _totalCacheSize -= existingCache.estimateMemoryUsage();
 
@@ -108,7 +108,7 @@ class TableCache {
 
       // Record access, update weight
       existingCache.recordAccess();
-      
+
       // Add updated record size
       _totalCacheSize += existingCache.estimateMemoryUsage();
 
@@ -120,7 +120,7 @@ class TableCache {
         primaryKeyValue: pkValue,
         cacheType: cacheType,
       );
-      
+
       // Add new record size
       _totalCacheSize += newCache.estimateMemoryUsage();
 
@@ -132,7 +132,7 @@ class TableCache {
       } else {
         _runtimeRecordCount++;
       }
-      
+
       // Add Map entry overhead (each new entry)
       _totalCacheSize += 16; // Map entry overhead
 
@@ -147,7 +147,7 @@ class TableCache {
   }) {
     // Optimize batch add performance, pre-estimate size increment
     int batchSizeIncrement = 0;
-    
+
     // Sample estimate data size (at most sample 10 records)
     int sampleCount = min(10, records.length);
     if (sampleCount > 0 && records.isNotEmpty) {
@@ -155,24 +155,26 @@ class TableCache {
       for (int i = 0; i < sampleCount; i++) {
         int index = (i * records.length ~/ sampleCount);
         // Use JSON serialization to estimate size
-        totalSampleSize += jsonEncode(records[index]).length * 2; // Unicode characters occupy 2 bytes
+        totalSampleSize += jsonEncode(records[index]).length *
+            2; // Unicode characters occupy 2 bytes
       }
       // Estimate total incremental size
-      batchSizeIncrement = (totalSampleSize / sampleCount * records.length).round();
+      batchSizeIncrement =
+          (totalSampleSize / sampleCount * records.length).round();
       // Add record object overhead
       batchSizeIncrement += records.length * 80;
       // Add Map entry overhead
       batchSizeIncrement += records.length * 16;
     }
-    
+
     // Update total cache size estimate
     _totalCacheSize += batchSizeIncrement;
-    
+
     // Add records
     for (final record in records) {
       addOrUpdateRecord(record, cacheType: cacheType);
     }
-    
+
     // Correct total cache size (subtract estimated value, actual value is accumulated in addOrUpdateRecord)
     _totalCacheSize -= batchSizeIncrement;
   }
@@ -246,7 +248,7 @@ class TableCache {
         } else {
           _runtimeRecordCount--;
         }
-        
+
         // Subtract removed record size
         _totalCacheSize -= cache.estimateMemoryUsage();
         // Subtract Map entry overhead
@@ -276,23 +278,23 @@ class TableCache {
     // Check if the record exists
     if (recordsMap.containsKey(pkValue)) {
       final existingCache = recordsMap[pkValue]!;
-      
+
       // Subtract old record size
       _totalCacheSize -= existingCache.estimateMemoryUsage();
 
       // Update record content (preserve original object reference)
-      existingCache.record.clear();  // Clear old content
-      existingCache.record.addAll(record);  // Add new content
+      existingCache.record.clear(); // Clear old content
+      existingCache.record.addAll(record); // Add new content
 
       // Record access, update weight
       existingCache.recordAccess();
-      
+
       // Clear cache size estimate, will be recalculated next time accessed
       existingCache._cachedSize = -1;
-      
+
       // Add updated record size
       _totalCacheSize += existingCache.estimateMemoryUsage();
-      
+
       return existingCache;
     } else {
       // If the record does not exist, add a new record
@@ -324,7 +326,7 @@ class RecordCache {
   DateTime lastWeightUpdateDay; // Last day weight was updated
   int weightValue; // Weight value, range 0-10
   RecordCacheType cacheType; // Cache type: startup or runtime
-  
+
   // Cache record size estimate
   int _cachedSize = -1;
 
@@ -411,7 +413,7 @@ class RecordCache {
     if (_cachedSize >= 0) {
       return _cachedSize;
     }
-    
+
     // Use JSON serialization to estimate size (more accurate and efficient)
     try {
       String jsonString = jsonEncode(record);
@@ -420,7 +422,7 @@ class RecordCache {
       return _cachedSize;
     } catch (e) {
       // If JSON serialization fails, fall back to traditional estimation method
-      
+
       // Basic object overhead
       int total = 80; // Approximate size of object header and basic fields
 
@@ -445,7 +447,7 @@ class RecordCache {
           total += 8;
         }
       }
-      
+
       _cachedSize = total;
       return total;
     }

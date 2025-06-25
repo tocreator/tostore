@@ -15,7 +15,7 @@ class BPlusTree {
 
   /// Get safe node size limit based on platform
   static int get maxSafeNodeSize => _getMaxSafeNodeSize();
-  
+
   /// Calculate max safe node size based on platform and available memory
   static int _getMaxSafeNodeSize() {
     try {
@@ -45,24 +45,24 @@ class BPlusTree {
       if (PlatformHandler.isWeb) {
         return 256;
       }
-      
+
       // Mobile platform uses medium order
       if (PlatformHandler.isMobile) {
         return 512;
       }
-      
+
       // Server environment uses larger order
       if (PlatformHandler.isServerEnvironment) {
         final cores = PlatformHandler.processorCores;
         return math.min(8192, math.max(2048, cores * 512));
       }
-      
-      // Desktop platform 
+
+      // Desktop platform
       final cores = PlatformHandler.processorCores;
       return math.min(4096, math.max(1024, cores * 256));
     } catch (e) {
       // Return safe default value on error
-      Logger.warn('Error determining B+Tree order: $e, using default value', 
+      Logger.warn('Error determining B+Tree order: $e, using default value',
           label: 'BPlusTree._defaultOrder');
       return 1024;
     }
@@ -75,19 +75,21 @@ class BPlusTree {
   }) : order = order ?? _defaultOrder();
 
   /// Create a B+ tree from a serialized string
-  static Future<BPlusTree> fromString(String data, {int? order, bool isUnique = false}) async {
+  static Future<BPlusTree> fromString(String data,
+      {int? order, bool isUnique = false}) async {
     final tree = BPlusTree(order: order, isUnique: isUnique);
     if (data.isEmpty) return tree;
     try {
       final lines = data.split('\n');
       // Use the same batch size calculation as batchInsert for consistency
       int batchSize = _getDefaultBatchSize();
-      
+
       // For very large data, reduce batch size to avoid memory issues
-      if (data.length > 10 * 1024 * 1024) { // >10MB
+      if (data.length > 10 * 1024 * 1024) {
+        // >10MB
         batchSize = batchSize ~/ 2;
       }
-      
+
       for (int i = 0; i < lines.length; i += batchSize) {
         final end = math.min(i + batchSize, lines.length);
         final batch = lines.sublist(i, end);
@@ -109,8 +111,9 @@ class BPlusTree {
         }
         if (end < lines.length) {
           // Dynamically adjust pause duration based on data size
-          final pauseDuration = lines.length > 100000 
-              ? const Duration(milliseconds: 5) // More time for GC with large data
+          final pauseDuration = lines.length > 100000
+              ? const Duration(
+                  milliseconds: 5) // More time for GC with large data
               : Duration.zero;
           await Future.delayed(pauseDuration);
         }
@@ -212,7 +215,7 @@ class BPlusTree {
 
     // Pre-process data by sorting keys to improve B+ tree insertion efficiency
     final sortedIndices = List<int>.generate(keys.length, (i) => i);
-    
+
     try {
       // When data is large, sorting can improve insertion efficiency (especially sequential insertion is more efficient than random insertion)
       if (keys.length > 1000) {
@@ -224,7 +227,8 @@ class BPlusTree {
       }
     } catch (e) {
       // If sorting fails, keep the original order,不影响正确性，仅优化性能
-      Logger.warn('Failed to sort keys for batch insert: $e, continuing with unsorted insertion',
+      Logger.warn(
+          'Failed to sort keys for batch insert: $e, continuing with unsorted insertion',
           label: 'BPlusTree.batchInsert');
     }
 
@@ -255,44 +259,51 @@ class BPlusTree {
     if (keys.length > 500000) {
       // For extremely large batches, first create an optimized empty tree structure
       root ??= BPlusTreeNode(isLeaf: true);
-      
+
       // Use hierarchical batch processing strategy
       final totalBatches = (keys.length / batchSize).ceil();
-      
+
       // Calculate appropriate concurrency level to avoid excessive concurrency
-      final processorCount = PlatformHandler.isWeb ? 2 : PlatformHandler.processorCores;
-      final concurrencyLevel = math.min(8, math.min(totalBatches, processorCount));
-          
+      final processorCount =
+          PlatformHandler.isWeb ? 2 : PlatformHandler.processorCores;
+      final concurrencyLevel =
+          math.min(8, math.min(totalBatches, processorCount));
+
       if (concurrencyLevel > 1 && !PlatformHandler.isWeb) {
         // Use concurrent batch processing
         final batchesPerWorker = (totalBatches / concurrencyLevel).ceil();
         final workerTasks = <Future<void>>[];
-        
-        for (int workerIndex = 0; workerIndex < concurrencyLevel; workerIndex++) {
+
+        for (int workerIndex = 0;
+            workerIndex < concurrencyLevel;
+            workerIndex++) {
           final startBatchIndex = workerIndex * batchesPerWorker;
-          final endBatchIndex = math.min(startBatchIndex + batchesPerWorker, totalBatches);
-          
+          final endBatchIndex =
+              math.min(startBatchIndex + batchesPerWorker, totalBatches);
+
           final workerTask = () async {
-            for (int batchIndex = startBatchIndex; batchIndex < endBatchIndex; batchIndex++) {
+            for (int batchIndex = startBatchIndex;
+                batchIndex < endBatchIndex;
+                batchIndex++) {
               final startIdx = batchIndex * batchSize;
               final endIdx = math.min(startIdx + batchSize, keys.length);
-              
+
               // Process current batch
               for (int j = startIdx; j < endIdx; j++) {
                 final sortedIdx = sortedIndices[j];
                 await insert(keys[sortedIdx], values[sortedIdx]);
               }
-              
+
               // Pause between batches to reduce memory pressure
               if (endIdx < keys.length) {
                 await Future.delayed(const Duration(milliseconds: 1));
               }
             }
           }();
-          
+
           workerTasks.add(workerTask);
         }
-        
+
         // Wait for all work to complete
         await Future.wait(workerTasks);
         return;
@@ -312,8 +323,9 @@ class BPlusTree {
       // Brief pause between batches to allow GC to work and prevent memory spikes
       if (end < keys.length) {
         // Dynamically adjust pause duration based on batch size
-        final pauseDuration = keys.length > 100000 
-            ? const Duration(milliseconds: 5) // More time for GC with large data
+        final pauseDuration = keys.length > 100000
+            ? const Duration(
+                milliseconds: 5) // More time for GC with large data
             : Duration.zero;
         await Future.delayed(pauseDuration);
       }
@@ -368,10 +380,10 @@ class BPlusTree {
       while (!currentNode.isLeaf) {
         path.add(currentNode);
         currentDepth++;
-        
+
         // Safety check
         if (currentDepth > maxDepth) {
-          Logger.error('B+ tree depth exceeds safe limit: $currentDepth', 
+          Logger.error('B+ tree depth exceeds safe limit: $currentDepth',
               label: 'BPlusTree.insert');
           return; // Avoid potential infinite loop
         }
@@ -422,15 +434,15 @@ class BPlusTree {
       currentNode.keys.insert(insertPos, key);
       currentNode.values.insert(insertPos, [value]);
 
-      // Reduce split threshold to trigger split earlier to avoid oversized nodes
-      // Here we use 0.6 instead of 0.7, which can trigger split faster when nodes are small
-      if (currentNode.keys.length > order * 0.6) {
+      // Split the node if it's full.
+      // This is a more robust condition than using a fraction of the order.
+      if (currentNode.keys.length > order - 1) {
         try {
           await _safeSplitNode(currentNode, path);
         } catch (e, stack) {
           Logger.error('Node split failed: $e\n$stack',
               label: 'BPlusTree.insert');
-          
+
           // If split fails but the node is already very large, try emergency recovery
           if (currentNode.keys.length > order * 0.9) {
             try {
@@ -447,7 +459,7 @@ class BPlusTree {
           label: 'BPlusTree.insert');
     }
   }
-  
+
   /// Emergency procedure to split an oversized node when regular split fails
   /// This is a simplified version that prioritizes stability over optimal structure
   Future<void> _emergencySplitOversizedNode(
@@ -455,18 +467,20 @@ class BPlusTree {
     try {
       // Simply split the node into two parts
       final splitPoint = node.keys.length ~/ 2;
-      
+
       // Create a new node
       final rightNode = BPlusTreeNode(isLeaf: node.isLeaf);
-      
+
       // Copy right half of keys and values to new node
       for (int i = splitPoint; i < node.keys.length; i++) {
         rightNode.keys.add(node.keys[i]);
         rightNode.values.add(List<dynamic>.from(node.values[i]));
       }
-      
+
       // Handle child nodes (if not leaf node)
-      if (!node.isLeaf && node.children.isNotEmpty && splitPoint < node.children.length) {
+      if (!node.isLeaf &&
+          node.children.isNotEmpty &&
+          splitPoint < node.children.length) {
         for (int i = splitPoint + 1; i < node.children.length; i++) {
           rightNode.children.add(node.children[i]);
           node.children[i].parent = rightNode;
@@ -477,14 +491,14 @@ class BPlusTree {
         rightNode.next = node.next;
         node.next = rightNode;
       }
-      
+
       // From original node, remove copied keys and values
       node.keys.removeRange(splitPoint, node.keys.length);
       node.values.removeRange(splitPoint, node.values.length);
-      
+
       // Link new node to parent node
       final promotedKey = rightNode.keys.first;
-      
+
       if (path.isEmpty) {
         // Create new root node
         final newRoot = BPlusTreeNode(isLeaf: false);
@@ -498,16 +512,17 @@ class BPlusTree {
         // Insert into existing parent node
         final parent = path.last;
         int insertPos = 0;
-        while (insertPos < parent.children.length && parent.children[insertPos] != node) {
+        while (insertPos < parent.children.length &&
+            parent.children[insertPos] != node) {
           insertPos++;
         }
-        
+
         if (insertPos >= parent.children.length) {
           Logger.error('Cannot find node in parent during emergency split',
               label: 'BPlusTree._emergencySplitOversizedNode');
           return;
         }
-        
+
         parent.keys.insert(insertPos, promotedKey);
         parent.children.insert(insertPos + 1, rightNode);
         rightNode.parent = parent;
@@ -522,157 +537,116 @@ class BPlusTree {
   /// Safe node splitting algorithm - completely reimplemented
   Future<void> _safeSplitNode(
       BPlusTreeNode node, List<BPlusTreeNode> path) async {
-    // Safety check
+    // Safety check, although the caller should ensure this.
     if (node.keys.length <= order - 1) return;
-    
+
+    // Handle oversized nodes with a more robust 3-way split.
+    if (node.keys.length > maxSafeNodeSize) {
+      await _handleOverSizedNode(node, path);
+      return;
+    }
+
     try {
-      // Node size graded processing
-      final currentMaxSafeNodeSize = maxSafeNodeSize;
-      if (node.keys.length > currentMaxSafeNodeSize) {
-        await _handleOverSizedNode(node, path);
-        return;
-      }
-      
-      // Create a new node for right half
       final rightNode = BPlusTreeNode(isLeaf: node.isLeaf);
-      
-      // Safe calculation of split point
-      int splitPoint = 0;
-      if (node.keys.isNotEmpty) {
-        splitPoint = math.max(1, math.min(node.keys.length - 1, node.keys.length ~/ 2));
-      }
-      
-      // Collect elements to move instead of using sublist
-      final keysToMove = <dynamic>[];
-      final valuesToMove = <List<dynamic>>[];
-      
-      // First collect all elements to move
-      for (int i = splitPoint; i < node.keys.length; i++) {
-        keysToMove.add(node.keys[i]);
-        if (i < node.values.length) {
-          valuesToMove.add(List<dynamic>.from(node.values[i]));
-        } else {
-          valuesToMove.add([]);
-        }
-      }
-      
-      // Add collected elements to the new node
-      for (int i = 0; i < keysToMove.length; i++) {
-        rightNode.keys.add(keysToMove[i]);
-        rightNode.values.add(valuesToMove[i]);
-      }
-      
-      // Handle child nodes for non-leaf nodes
-      if (!node.isLeaf && node.children.isNotEmpty) {
-        // Handle child nodes safely - collect first, then add
-        final childrenToMove = <BPlusTreeNode>[];
-        
-        // Adjust child split index (child count is usually keys+1)
-        int childSplitIndex = math.min(splitPoint + 1, node.children.length);
-        
-        // Collect children to move
-        for (int i = childSplitIndex; i < node.children.length; i++) {
-          childrenToMove.add(node.children[i]);
-        }
-        
-        // Add collected children to right node and update parent
-        for (var child in childrenToMove) {
-          rightNode.children.add(child);
-          child.parent = rightNode;
-        }
-        
-        // Remove moved children from original node
-        // Use removeLast() to avoid index shifting issues
-        while (node.children.length > childSplitIndex) {
-          node.children.removeLast();
-        }
-      } else if (node.isLeaf) {
-        // Update leaf node linked list
+      final int splitPoint = node.keys.length ~/ 2;
+
+      dynamic promotedKey;
+
+      if (node.isLeaf) {
+        // --- LEAF NODE SPLIT ---
+        // The first key of the right half is copied to the parent.
+        promotedKey = node.keys[splitPoint];
+
+        // Move the second half of keys and values to the new right node.
+        rightNode.keys.addAll(node.keys.sublist(splitPoint));
+        rightNode.values.addAll(node.values.sublist(splitPoint));
+        node.keys.removeRange(splitPoint, node.keys.length);
+        node.values.removeRange(splitPoint, node.values.length);
+
+        // Link the leaf nodes.
         rightNode.next = node.next;
         node.next = rightNode;
+      } else {
+        // --- INTERNAL NODE SPLIT ---
+        // The middle key is moved up to the parent and removed from the children.
+        promotedKey = node.keys[splitPoint];
+
+        // Keys to the right of the promoted key move to the new right node.
+        rightNode.keys.addAll(node.keys.sublist(splitPoint + 1));
+
+        // Corresponding children move to the new right node.
+        rightNode.children.addAll(node.children.sublist(splitPoint + 1));
+        for (var child in rightNode.children) {
+          child.parent = rightNode;
+        }
+
+        // Trim the original node.
+        node.keys.removeRange(splitPoint, node.keys.length);
+        node.children.removeRange(splitPoint + 1, node.children.length);
       }
-      
-      // Remove moved elements from original node
-      // Use removeLast() in reverse order to avoid index issues
-      while (node.keys.length > splitPoint) {
-        node.keys.removeLast();
-      }
-      
-      while (node.values.length > splitPoint) {
-        node.values.removeLast();
-      }
-      
-      // Ensure right node has keys before promoting
-      if (rightNode.keys.isEmpty) {
-        Logger.error('Right node has no keys after split', label: 'BPlusTree._safeSplitNode');
-        return;
-      }
-      
-      // Get key to promote to parent
-      final promotedKey = rightNode.keys.first;
-      
-      // Handle tree structure update
+
+      // --- UPDATE PARENT ---
       if (path.isEmpty) {
-        // Create new root
+        // Create a new root if the split node was the root.
         _createNewRoot(node, rightNode, promotedKey);
       } else {
-        // Insert into parent node
+        // Insert the promoted key and the new node into the parent.
         await _insertIntoParent(node, rightNode, promotedKey, path);
       }
     } catch (e, stack) {
-      Logger.error('Safe node split failed with detailed error: $e\n$stack', 
+      Logger.error('Safe node split failed with detailed error: $e\n$stack',
           label: 'BPlusTree._safeSplitNode');
-      
-      // Try ultra-simple emergency split on failure
+      // On failure, attempt a last-resort emergency split.
       await _ultraSimpleEmergencySplit(node, path);
     }
   }
-  
+
   /// Ultra simple emergency node split when normal split fails
   /// This is a last resort method to maintain tree integrity
-  Future<void> _ultraSimpleEmergencySplit(BPlusTreeNode node, List<BPlusTreeNode> path) async {
+  Future<void> _ultraSimpleEmergencySplit(
+      BPlusTreeNode node, List<BPlusTreeNode> path) async {
     try {
       // Create a new node
       final rightNode = BPlusTreeNode(isLeaf: node.isLeaf);
-      
+
       // Use simplest possible approach - move last half to new node
       int targetNodeSize = math.max(2, node.keys.length ~/ 3);
-      
+
       while (node.keys.length > targetNodeSize) {
         // Always move the last element to avoid index issues
         if (node.keys.isNotEmpty) {
           final lastKey = node.keys.last;
           node.keys.removeLast();
-          
+
           rightNode.keys.insert(0, lastKey);
         }
-        
+
         if (node.values.isNotEmpty) {
           final lastValue = node.values.last;
           node.values.removeLast();
-          
+
           rightNode.values.insert(0, lastValue);
         }
       }
-      
+
       // Handle leaf node pointers
       if (node.isLeaf) {
         rightNode.next = node.next;
         node.next = rightNode;
       }
-      
+
       // Skip child node handling in emergency mode
       // This might create an invalid tree but prevents crashes
-      
+
       // Promote first key of right node
       if (rightNode.keys.isEmpty) {
-        Logger.error('Emergency split created empty right node', 
+        Logger.error('Emergency split created empty right node',
             label: 'BPlusTree._ultraSimpleEmergencySplit');
         return;
       }
-      
+
       final promotedKey = rightNode.keys.first;
-      
+
       // Update tree structure
       if (path.isEmpty) {
         // Create new root
@@ -690,9 +664,8 @@ class BPlusTree {
         parent.children.add(rightNode);
         rightNode.parent = parent;
       }
-    
     } catch (e) {
-      Logger.error('Emergency split also failed: $e', 
+      Logger.error('Emergency split also failed: $e',
           label: 'BPlusTree._ultraSimpleEmergencySplit');
     }
   }
@@ -703,77 +676,74 @@ class BPlusTree {
     try {
       // Get current safe node size to determine split strategy
       final nodeSize = node.keys.length;
-      
-      
+
       // Create additional nodes
       final midNode = BPlusTreeNode(isLeaf: node.isLeaf);
       final rightNode = BPlusTreeNode(isLeaf: node.isLeaf);
-      
-      // Calculate safe split points
-      final firstSplitPoint = math.max(2, nodeSize ~/ 3);
-      int secondSplitPoint = math.max(firstSplitPoint + 1, 2 * nodeSize ~/ 3);
-      
+
+      // Calculate safe split points to divide the node into three parts.
+      final firstSplitPoint = nodeSize ~/ 3;
+      final secondSplitPoint = 2 * nodeSize ~/ 3;
+
       // Safety check: verify split points
-      if (firstSplitPoint >= nodeSize || secondSplitPoint >= nodeSize) {
+      if (firstSplitPoint <= 0 ||
+          secondSplitPoint <= firstSplitPoint ||
+          secondSplitPoint >= nodeSize) {
         Logger.error(
-          'Invalid split points calculated: $firstSplitPoint, $secondSplitPoint for node with $nodeSize keys',
-          label: 'BPlusTree._handleOverSizedNode');
-          
+            'Invalid split points calculated: $firstSplitPoint, $secondSplitPoint for node with $nodeSize keys. Node size might be too small for a 3-way split.',
+            label: 'BPlusTree._handleOverSizedNode');
+
         // Fall back to simpler strategy
         await _ultraSimpleEmergencySplit(node, path);
         return;
       }
 
       // ------------- MIDDLE NODE FILLING -------------
-      // Use individual operations instead of bulk operations
-      int itemsToMove = secondSplitPoint - firstSplitPoint;
-      
-      for (int i = 0; i < itemsToMove; i++) {
-        if (firstSplitPoint < node.keys.length) {
-          midNode.keys.add(node.keys[firstSplitPoint]);
-          
-          if (firstSplitPoint < node.values.length) {
-            midNode.values.add(List<dynamic>.from(node.values[firstSplitPoint]));
-          } else {
-            midNode.values.add([]);
-          }
+      // Copy keys and values to the middle node.
+      for (int i = firstSplitPoint; i < secondSplitPoint; i++) {
+        midNode.keys.add(node.keys[i]);
+        if (i < node.values.length) {
+          midNode.values.add(List<dynamic>.from(node.values[i]));
+        } else {
+          midNode.values.add([]);
         }
       }
 
       // ------------- RIGHT NODE FILLING -------------
-      // Add remaining elements to right node
-      while (secondSplitPoint < node.keys.length) {
-        rightNode.keys.add(node.keys[secondSplitPoint]);
-        
-        if (secondSplitPoint < node.values.length) {
-          rightNode.values.add(List<dynamic>.from(node.values[secondSplitPoint]));
+      // Copy remaining elements to the right node.
+      for (int i = secondSplitPoint; i < nodeSize; i++) {
+        rightNode.keys.add(node.keys[i]);
+        if (i < node.values.length) {
+          rightNode.values.add(List<dynamic>.from(node.values[i]));
         } else {
           rightNode.values.add([]);
         }
-        
-        secondSplitPoint++;
       }
 
       // ------------- HANDLE CHILDREN -------------
       if (!node.isLeaf && node.children.isNotEmpty) {
-        // Calculate safe child indices
-        final childFirstSplit = math.min(firstSplitPoint + 1, node.children.length);
-        final childSecondSplit = math.min(secondSplitPoint + 1, node.children.length);
-        
+        // Calculate safe child indices, these should correspond to the keys that are being moved.
+        final childFirstSplit = firstSplitPoint;
+        final childSecondSplit = secondSplitPoint;
+
         // Move children to mid node
-        for (int i = childFirstSplit; i < childSecondSplit; i++) {
-          if (i < node.children.length) {
+        if (childFirstSplit < node.children.length) {
+          for (int i = childFirstSplit;
+              i < childSecondSplit && i < node.children.length;
+              i++) {
             final child = node.children[i];
             midNode.children.add(child);
             child.parent = midNode;
           }
         }
-        
+
         // Move children to right node
-        for (int i = childSecondSplit; i < node.children.length; i++) {
-          final child = node.children[i];
-          rightNode.children.add(child);
-          child.parent = rightNode;
+        if (childSecondSplit < node.children.length) {
+          for (int i = childSecondSplit; i < node.children.length; i++) {
+            final child = node.children[i];
+            rightNode.children.add(child);
+            child.parent = rightNode;
+          }
         }
       } else if (node.isLeaf) {
         // Update leaf node links
@@ -783,38 +753,39 @@ class BPlusTree {
       }
 
       // ------------- TRIM ORIGINAL NODE -------------
-      // Safe removal from original node using removeLast()
-      while (node.keys.length > firstSplitPoint) {
-        node.keys.removeLast();
+      // Safe removal from original node using removeRange for efficiency.
+      if (firstSplitPoint < node.keys.length) {
+        node.keys.removeRange(firstSplitPoint, node.keys.length);
       }
-      
-      while (node.values.length > firstSplitPoint) {
-        node.values.removeLast();
+      if (firstSplitPoint < node.values.length) {
+        node.values.removeRange(firstSplitPoint, node.values.length);
       }
-      
+
       // Safe trimming of children if needed
-      if (!node.isLeaf && node.children.length > firstSplitPoint + 1) {
-        while (node.children.length > firstSplitPoint + 1) {
-          node.children.removeLast();
+      if (!node.isLeaf) {
+        final childSplitPoint = firstSplitPoint;
+        if (childSplitPoint < node.children.length) {
+          node.children.removeRange(childSplitPoint, node.children.length);
         }
       }
 
       // ------------- PROMOTE KEYS TO PARENT -------------
       // Get keys to promote
       final promotedKey1 = midNode.keys.isNotEmpty ? midNode.keys.first : null;
-      final promotedKey2 = rightNode.keys.isNotEmpty ? rightNode.keys.first : null;
-      
+      final promotedKey2 =
+          rightNode.keys.isNotEmpty ? rightNode.keys.first : null;
+
       // Safety check - don't promote null keys
       if (promotedKey1 == null || promotedKey2 == null) {
         Logger.error(
-          'Null promoted key during oversized node split',
-          label: 'BPlusTree._handleOverSizedNode');
-          
+            'Null promoted key during oversized node split. Mid has keys: ${midNode.keys.isNotEmpty}, Right has keys: ${rightNode.keys.isNotEmpty}',
+            label: 'BPlusTree._handleOverSizedNode');
+
         // Fall back to emergency split
         await _ultraSimpleEmergencySplit(node, path);
         return;
       }
-      
+
       // Update tree structure
       if (path.isEmpty) {
         // Create new root
@@ -831,29 +802,30 @@ class BPlusTree {
       } else {
         // Add to existing parent
         final parent = path.last;
-        
+
         // Find position for insertion
         int insertPos = 0;
-        while (insertPos < parent.children.length && parent.children[insertPos] != node) {
+        while (insertPos < parent.children.length &&
+            parent.children[insertPos] != node) {
           insertPos++;
         }
-        
+
         if (insertPos >= parent.children.length) {
           Logger.error(
-            'Cannot find current node in parent during oversized node split',
-            label: 'BPlusTree._handleOverSizedNode');
+              'Cannot find current node in parent during oversized node split',
+              label: 'BPlusTree._handleOverSizedNode');
           return;
         }
-        
+
         // Insert new nodes and keys
         parent.keys.insert(insertPos, promotedKey1);
         parent.children.insert(insertPos + 1, midNode);
         midNode.parent = parent;
-        
+
         parent.keys.insert(insertPos + 1, promotedKey2);
         parent.children.insert(insertPos + 2, rightNode);
         rightNode.parent = parent;
-        
+
         // Check if parent needs to be split
         if (parent.keys.length > order - 1) {
           await Future.delayed(Duration.zero);
@@ -868,12 +840,11 @@ class BPlusTree {
     } catch (e, stack) {
       Logger.error('Failed to handle oversized node: $e\n$stack',
           label: 'BPlusTree._handleOverSizedNode');
-      
+
       // Fall back to emergency split
       await _ultraSimpleEmergencySplit(node, path);
     }
   }
-
 
   /// Create new root node
   void _createNewRoot(

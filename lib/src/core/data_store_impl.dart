@@ -1250,7 +1250,8 @@ class DataStoreImpl {
 
         // Update cached record directly (without changing order) and update query cache
         dataCacheManager.updateCachedRecord(tableName, updatedRecord);
-        await dataCacheManager.updateQueryCacheForRecord(tableName, recordKey, updatedRecord);
+        await dataCacheManager.updateQueryCacheForRecord(
+            tableName, recordKey, updatedRecord);
         // update write queue
         await tableDataManager.addToWriteBuffer(tableName, updatedRecord,
             isUpdate: true);

@@ -86,9 +86,7 @@ class QueryOptimizer {
           return QueryPlan([
             QueryOperation(
               type: QueryOperationType.primaryKeyScan,
-              value: {
-                schema.primaryKey: pkValue['=']
-              },
+              value: {schema.primaryKey: pkValue['=']},
             ),
           ]);
         } else {

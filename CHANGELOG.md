@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.2
+
+### Changed
+- Optimized cache cleanup logic for large-scale data scenarios.
+- Refined B+Tree node splitting algorithm to handle high-volume index data more robustly.
+- Optimized retrieval algorithms for binary search and range queries.
+
+### Fixed
+- Addressed an issue in the query cache cleanup mechanism.
+
 ## 2.1.0
 
 ### Added

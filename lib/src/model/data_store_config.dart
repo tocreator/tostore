@@ -5,7 +5,6 @@ import 'dart:math';
 
 /// data store config
 class DataStoreConfig {
-
   /// database path
   final String? dbPath;
 
@@ -79,7 +78,7 @@ class DataStoreConfig {
   /// null: no expiry (cache entries remain until manually cleared or evicted)
   /// other: duration after which cache entries are considered stale
   final Duration? queryCacheExpiryTime;
-  
+
   /// Memory threshold in MB for all caches combined
   /// If null, system will automatically determine appropriate value based on available memory
   final int? memoryThresholdInMB;
@@ -421,4 +420,3 @@ class DistributedNodeConfig {
     };
   }
 }
-

@@ -8,7 +8,6 @@ import '../handler/logger.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
-
   // Platform type cache - these remain constant within the application lifecycle
   static bool? _cachedIsMobile;
   static bool? _cachedIsDesktop;
@@ -54,7 +53,8 @@ class PlatformHandlerImpl implements PlatformInterface {
     // Lazy load cache: only calculate when first accessed
     if (_cachedIsDesktop == null) {
       try {
-        _cachedIsDesktop = Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+        _cachedIsDesktop =
+            Platform.isWindows || Platform.isMacOS || Platform.isLinux;
       } catch (e) {
         _cachedIsDesktop = false;
         Logger.warn('Error detecting desktop platform: $e',
@@ -67,14 +67,14 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   int get processorCores {
     final now = DateTime.now();
-    
+
     // Check if cache is valid (processor core count unlikely to change, but set long timeout for safety)
-    if (_cachedProcessorCores != null && 
+    if (_cachedProcessorCores != null &&
         _lastProcessorCheck != null &&
         now.difference(_lastProcessorCheck!) < _processorCacheTimeout) {
       return _cachedProcessorCores!;
     }
-    
+
     try {
       _cachedProcessorCores = Platform.numberOfProcessors;
       _lastProcessorCheck = now;
@@ -91,7 +91,8 @@ class PlatformHandlerImpl implements PlatformInterface {
   bool get isTestEnvironment {
     if (_cachedIsTestEnvironment == null) {
       try {
-        _cachedIsTestEnvironment = Platform.environment.containsKey('FLUTTER_TEST');
+        _cachedIsTestEnvironment =
+            Platform.environment.containsKey('FLUTTER_TEST');
       } catch (e) {
         _cachedIsTestEnvironment = false;
       }
@@ -161,7 +162,7 @@ class PlatformHandlerImpl implements PlatformInterface {
     }
     return _cachedIsLinux!;
   }
-  
+
   bool get isServerEnvironment {
     if (_cachedIsServerEnvironment == null) {
       try {
@@ -183,7 +184,6 @@ class PlatformHandlerImpl implements PlatformInterface {
     }
     return _cachedIsServerEnvironment!;
   }
-  
 
   /// Clear memory related caches
   void clearMemoryCaches() {
@@ -234,7 +234,8 @@ class PlatformHandlerImpl implements PlatformInterface {
     if (!forceRefresh &&
         _cachedAvailableSystemMemoryMB != null &&
         _lastAvailableSystemMemoryFetch != null &&
-        now.difference(_lastAvailableSystemMemoryFetch!) < _memoryFetchTimeout) {
+        now.difference(_lastAvailableSystemMemoryFetch!) <
+            _memoryFetchTimeout) {
       return _cachedAvailableSystemMemoryMB!;
     }
 

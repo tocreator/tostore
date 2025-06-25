@@ -83,12 +83,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return this;
   }
 
-    /// Clear the query cache for the current query condition
+  /// Clear the query cache for the current query condition
   /// Returns the number of cache entries removed
   Future<int> clearQueryCache() async {
     await $db.ensureInitialized();
     final cacheManager = $db.dataCacheManager;
-    
+
     // Number of removed cache entries
     int totalRemoved = 0;
 
@@ -109,7 +109,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       final cacheKeyString = cacheKey.toString();
 
       // Clean up specific query cache
-      final removedCount = await cacheManager.invalidateQuery($tableName, cacheKeyString);
+      final removedCount =
+          await cacheManager.invalidateQuery($tableName, cacheKeyString);
       totalRemoved += removedCount;
     }
 

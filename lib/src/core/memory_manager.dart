@@ -55,6 +55,9 @@ class MemoryManager {
     CacheType.indexMeta: null,
   };
 
+  /// Flag to prevent re-entrant cache cleanup
+  bool _isCleaning = false;
+
   /// Initialize memory manager
   Future<void> initialize(
       DataStoreConfig config, DataStoreImpl dataStore) async {
@@ -199,6 +202,10 @@ class MemoryManager {
 
   /// Trigger cache cleanup
   void _triggerCacheEviction() {
+    if (_isCleaning) {
+      return;
+    }
+
     final now = DateTime.now();
 
     // Ensure at least 30 seconds interval between two cleanups to avoid frequent cleanup
@@ -206,46 +213,50 @@ class MemoryManager {
       return;
     }
 
+    _isCleaning = true;
     _lastCacheClearTime = now;
 
-    // Clean up cache in order of priority, from low priority to high priority
-    _evictCacheByType(CacheType.record);
-    _checkCacheEvictionResult();
-    if (!_isLowMemoryMode) return;
+    // Run the entire eviction process asynchronously.
+    Future(() async {
+      try {
+        // Clean up cache in order of priority, from low priority to high priority
+        await _evictCacheAndCheck(CacheType.record);
+        if (!_isLowMemoryMode) return;
 
-    _evictCacheByType(CacheType.query);
-    _checkCacheEvictionResult();
-    if (!_isLowMemoryMode) return;
+        await _evictCacheAndCheck(CacheType.query);
+        if (!_isLowMemoryMode) return;
 
-    _evictCacheByType(CacheType.indexData);
-    _checkCacheEvictionResult();
-    if (!_isLowMemoryMode) return;
+        await _evictCacheAndCheck(CacheType.indexData);
+        if (!_isLowMemoryMode) return;
 
-    _evictCacheByType(CacheType.indexMeta);
-    _checkCacheEvictionResult();
+        await _evictCacheAndCheck(CacheType.indexMeta);
+        if (!_isLowMemoryMode) return;
 
-    // If memory is still insufficient, clean up important metadata caches
-    _evictCacheByType(CacheType.schema);
-    _checkCacheEvictionResult();
-    if (!_isLowMemoryMode) return;
+        // If memory is still insufficient, clean up important metadata caches
+        await _evictCacheAndCheck(CacheType.schema);
+        if (!_isLowMemoryMode) return;
 
-    _evictCacheByType(CacheType.tableMeta);
-    _checkCacheEvictionResult();
-    if (!_isLowMemoryMode) return;
-  }
-
-  /// Check cache eviction result after each cache type cleanup
-  void _checkCacheEvictionResult() {
-    // Schedule immediate memory check to determine if we can exit low memory mode
-    _checkMemoryUsageImmediate().then((isMemorySufficient) {
-      if (isMemorySufficient) {
-        _isLowMemoryMode = false;
+        await _evictCacheAndCheck(CacheType.tableMeta);
+      } catch (e) {
+        Logger.error('An error occurred during cache eviction process: $e',
+            label: 'MemoryManager._triggerCacheEviction');
+      } finally {
+        _isCleaning = false;
       }
     });
   }
 
+  /// Evict a specific cache type and then check the memory status.
+  Future<void> _evictCacheAndCheck(CacheType cacheType) async {
+    await _evictCacheByType(cacheType);
+    final isMemorySufficient = await _checkMemoryUsageImmediate();
+    if (isMemorySufficient) {
+      _isLowMemoryMode = false;
+    }
+  }
+
   /// Execute specific type cache cleanup
-  void _evictCacheByType(CacheType cacheType) {
+  Future<void> _evictCacheByType(CacheType cacheType) async {
     final callback = _cacheEvictionCallbacks[cacheType];
     if (callback == null) return;
 
@@ -253,8 +264,11 @@ class MemoryManager {
       // Measure cache size before eviction for relevant cache types
       int beforeSize = _getCurrentCacheSizeByType(cacheType);
 
-      // Execute eviction callback
-      callback();
+      // Execute eviction callback, which might be async
+      final result = callback();
+      if (result is Future) {
+        await result;
+      }
 
       // Measure cache size after eviction to verify the cleanup effect
       int afterSize = _getCurrentCacheSizeByType(cacheType);

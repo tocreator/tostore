@@ -21,7 +21,7 @@ class PartitionWriteJob {
   String? existingContent; // Loaded before sending to isolate
   Future<IndexProcessingResult>? future;
   IndexProcessingResult? result;
-  
+
   // For primary key range tracking when table is ordered
   dynamic minKey;
   dynamic maxKey;
@@ -54,7 +54,6 @@ class IndexDeleteRequest {
 
   /// The checksum of the partition file (optional)
   final String? checksum;
-
 
   /// Whether the index is unique
   final bool isUnique;
@@ -287,10 +286,9 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       isModified = false;
     }
 
-
     // Calculate checksum from the new content, always use the latest content
     final newChecksum = _calculateChecksum(newContent);
-    
+
     // Return the results with the newly calculated checksum
     return IndexDeleteResult(
       isModified: isModified,

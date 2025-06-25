@@ -126,7 +126,9 @@ class IndexManager {
   }
 
   /// Clean up index cache
-  void _cleanupIndexCache() {
+  Future<void> _cleanupIndexCache() async {
+    // This cleanup is now called by MemoryManager, which already handles re-entrancy
+    // and asynchronicity. We can directly perform the cleanup logic here.
     try {
       if (_indexCache.isEmpty) return;
 
@@ -142,31 +144,66 @@ class IndexManager {
         }
       }
 
-      // Sort cache by access weight
-      final weightEntries = _indexAccessWeights.entries.toList()
-        ..sort((a, b) =>
-            (a.value['weight'] as int).compareTo(b.value['weight'] as int));
+      // Optimization: Use buckets to avoid full sorting, which can cause freezes on large caches.
+      final buckets = <int, List<String>>{};
+      int maxWeight = 0;
 
-      // Clean up 30% of low weight cache
-      final cleanupCount = (weightEntries.length * 0.3).ceil();
+      // Bucket all entries by weight
+      _indexAccessWeights.forEach((key, value) {
+        // Ensure the key exists in the index cache before considering it for eviction
+        if (_indexCache.containsKey(key)) {
+          final weight = value['weight'] as int;
+          buckets.putIfAbsent(weight, () => []).add(key);
+          if (weight > maxWeight) {
+            maxWeight = weight;
+          }
+        }
+      });
+
+      final totalEntries =
+          buckets.values.fold<int>(0, (sum, list) => sum + list.length);
+      if (totalEntries == 0) return;
+
+      final cleanupCount = (totalEntries * 0.3).ceil();
       int removed = 0;
+      int processedInBatch = 0;
 
-      for (int i = 0; i < weightEntries.length && removed < cleanupCount; i++) {
-        final key = weightEntries[i].key;
+      // Iterate from the lowest weight upwards and remove entries
+      for (int weight = 0;
+          weight <= maxWeight && removed < cleanupCount;
+          weight++) {
+        if (buckets.containsKey(weight)) {
+          final keys = buckets[weight]!;
+          // Shuffle to evict random entries if multiple have the same weight
+          keys.shuffle();
+          for (final key in keys) {
+            if (removed >= cleanupCount) break;
 
-        // Get index size
-        final index = _indexCache[key];
-        if (index != null) {
-          final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
+            final index = _indexCache[key];
+            if (index != null) {
+              final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
 
-          // Update total cache size
-          _currentIndexCacheSize -= size;
-          _indexSizeCache.remove(key);
+              // Update total cache size
+              _currentIndexCacheSize -= size;
+              _indexSizeCache.remove(key);
 
-          // Remove index
-          _indexCache.remove(key);
-          _indexFullyCached.remove(key);
-          removed++;
+              // Remove index from all related caches
+              _indexCache.remove(key);
+              _indexFullyCached.remove(key);
+              _indexAccessWeights.remove(key);
+              removed++;
+              processedInBatch++;
+
+              // Use half of the configured maxBatchSize for cleanup tasks.
+              if (processedInBatch >=
+                  (_dataStore.config.maxBatchSize / 2).ceil()) {
+                // The delay is now handled by MemoryManager's serial execution,
+                // but a microtask yield can still be beneficial for extremely large buckets.
+                await Future.delayed(Duration.zero);
+                processedInBatch = 0;
+              }
+            }
+          }
         }
       }
     } catch (e) {
