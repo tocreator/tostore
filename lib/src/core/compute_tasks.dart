@@ -232,12 +232,14 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       Logger.error('Failed to initialize B+ tree: $treeError',
           label: 'processIndexDelete');
       // Return unmodified content as fallback
+      // Always calculate fresh checksum from content
+      final freshChecksum = _calculateChecksum(request.content);
       return IndexDeleteResult(
         isModified: false,
         newContent: request.content,
         entryCount: 0,
         processedKeys: [],
-        checksum: request.checksum ?? _calculateChecksum(request.content),
+        checksum: freshChecksum,
       );
     }
 
@@ -285,27 +287,30 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       isModified = false;
     }
 
-    // Calculate checksum for the new content
-    final checksum = _calculateChecksum(newContent);
 
-    // Return the results
+    // Calculate checksum from the new content, always use the latest content
+    final newChecksum = _calculateChecksum(newContent);
+    
+    // Return the results with the newly calculated checksum
     return IndexDeleteResult(
       isModified: isModified,
       newContent: newContent,
       entryCount: btree.count(),
       processedKeys: processedKeys,
-      checksum: checksum,
+      checksum: newChecksum,
     );
   } catch (e) {
     Logger.error('Failed to process index delete operation: $e',
         label: 'processIndexDelete');
     // Return unmodified content as fallback
+    // Always calculate checksum from current content to ensure consistency
+    final actualChecksum = _calculateChecksum(request.content);
     return IndexDeleteResult(
       isModified: false,
       newContent: request.content,
       entryCount: 0,
       processedKeys: [],
-      checksum: request.checksum ?? _calculateChecksum(request.content),
+      checksum: actualChecksum,
     );
   }
 }
