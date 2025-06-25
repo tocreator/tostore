@@ -98,8 +98,10 @@ class QueryExecutor {
           if (orderBy != null) {
             _applySort(updatedResults, orderBy);
           }
+          final filteredResults =
+              await _filterPendingDeletes(tableName, updatedResults);
           // query cache is already the correct return result, no need to paginate again
-          return _paginateResults(updatedResults, limit, offset);
+          return _paginateResults(filteredResults, limit, offset);
         }
       }
 
@@ -169,11 +171,13 @@ class QueryExecutor {
 
           // if not primary key query, cache it
           if (shouldUseQueryCache && !isPrimaryKeyQuery) {
-            final queryCacheSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
-            final maxCacheResults = queryCacheSize ~/ 500; // Estimate 500 bytes per query result
-            
-            final shouldCache = condition == null ||
-                (results.length < maxCacheResults);
+            final queryCacheSize =
+                _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+            final maxCacheResults =
+                queryCacheSize ~/ 500; // Estimate 500 bytes per query result
+
+            final shouldCache =
+                condition == null || (results.length < maxCacheResults);
 
             if (shouldCache && results.isNotEmpty) {
               // Create query cache key
@@ -195,7 +199,9 @@ class QueryExecutor {
             }
           }
           if (results.isNotEmpty || isFullCache) {
-            return _paginateResults(results, limit, offset);
+            final filteredResults =
+                await _filterPendingDeletes(tableName, results);
+            return _paginateResults(filteredResults, limit, offset);
           }
         }
       }
@@ -211,9 +217,11 @@ class QueryExecutor {
 
       // 5. Cache results if query cache is enabled
       if (shouldUseQueryCache) {
-        final queryCacheSize = _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
-        final maxCacheResults = queryCacheSize ~/ 500; // Estimate 500 bytes per query result
-        
+        final queryCacheSize =
+            _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+        final maxCacheResults =
+            queryCacheSize ~/ 500; // Estimate 500 bytes per query result
+
         final shouldCache = condition == null ||
             (await _isSpecificQuery(tableName, condition)) ||
             (results.length < maxCacheResults);
@@ -239,7 +247,8 @@ class QueryExecutor {
       }
 
       // 6. apply pagination and return results
-      final paginatedResults = _paginateResults(results, limit, offset);
+      final filteredResults = await _filterPendingDeletes(tableName, results);
+      final paginatedResults = _paginateResults(filteredResults, limit, offset);
       return paginatedResults;
     } catch (e, stackTrace) {
       Logger.error('query execution failed: $e',
@@ -298,7 +307,7 @@ class QueryExecutor {
             condition, // Use complete conditions, will handle internally
           );
           break;
-          
+
         case QueryOperationType.primaryKeyScan:
           // Primary key scan directly locates partition file, skipping index query
           results = await _performPrimaryKeyScan(
@@ -1042,13 +1051,14 @@ class QueryExecutor {
       // Optimization: For exact primary key match and ordered partitions, use binary search
       if (fileMeta.isOrdered == true && pkMin == pkMax) {
         // For exact primary key match, use binary search
-        final partitionIndex = _findPartitionWithBinarySearch(fileMeta.partitions!, pkMin);
+        final partitionIndex =
+            _findPartitionWithBinarySearch(fileMeta.partitions!, pkMin);
         if (partitionIndex != null) {
           targetPartitions.add(partitionIndex);
           return targetPartitions; // Early return with found partition
         }
       }
-      
+
       // Standard linear search for ranges or when binary search found nothing
       for (var partition in fileMeta.partitions!) {
         // If min/max are not set, consider the partition
@@ -1107,7 +1117,7 @@ class QueryExecutor {
   }
 
   /// Perform primary key scan, directly locate partition file through primary key range mapping
-  /// 
+  ///
   /// This method is optimized for primary key queries, compared to index queries:
   /// 1. Avoid loading large index data
   /// 2. Directly use primary key range mapping in table metadata to find corresponding partition
@@ -1123,50 +1133,56 @@ class QueryExecutor {
       if (schema == null) {
         return [];
       }
-      
+
       final primaryKey = schema.primaryKey;
       final pkValue = conditions[primaryKey];
-      
+
       if (pkValue == null) {
         // If there is no primary key value, fall back to table scan
         return _performTableScan(tableName, queryCondition);
       }
-      
+
       // Get table file metadata
-      final fileMeta = await _dataStore.tableDataManager.getTableFileMeta(tableName);
-      if (fileMeta == null || fileMeta.partitions == null || fileMeta.partitions!.isEmpty) {
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableFileMeta(tableName);
+      if (fileMeta == null ||
+          fileMeta.partitions == null ||
+          fileMeta.partitions!.isEmpty) {
         // If there is no partition information, fall back to table scan
         return _performTableScan(tableName, queryCondition);
       }
-      
+
       // Reuse _getTargetPartitions for better consistency and to handle all query types (=, IN, BETWEEN, etc.)
       final targetPartitions = await _getTargetPartitions(
-        tableName,
-        schema.isGlobal,
-        {primaryKey: conditions[primaryKey]}, // Only pass the primary key condition
-        primaryKey,
-        fileMeta
-      );
-      
+          tableName,
+          schema.isGlobal,
+          {
+            primaryKey: conditions[primaryKey]
+          }, // Only pass the primary key condition
+          primaryKey,
+          fileMeta);
+
       if (targetPartitions.isEmpty) {
         // If no suitable partitions are found, check the write buffer
-        final pendingData = _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+        final pendingData =
+            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
         final pendingRecord = pendingData[pkValue.toString()];
-        
+
         if (pendingRecord != null) {
           // If the write buffer exists and satisfies all conditions
-          if (queryCondition == null || queryCondition.matches(pendingRecord.data)) {
+          if (queryCondition == null ||
+              queryCondition.matches(pendingRecord.data)) {
             return [Map<String, dynamic>.from(pendingRecord.data)];
           }
         }
-        
+
         // No records found
         return [];
       }
-      
+
       // Result set
       final resultMap = <String, Map<String, dynamic>>{};
-      
+
       try {
         // Only process target partitions
         await _dataStore.tableDataManager.processTablePartitions(
@@ -1177,7 +1193,7 @@ class QueryExecutor {
             for (var record in records) {
               // Skip deleted records
               if (isDeletedRecord(record)) continue;
-              
+
               // Primary key exact match
               if (record[primaryKey] == pkValue) {
                 // If the record satisfies all query conditions
@@ -1196,53 +1212,60 @@ class QueryExecutor {
         if (e is String && e.startsWith('exact_match_found:')) {
           // No need to clean up the result set, because the matching record has been added to resultMap
         } else {
-          Logger.error('Primary key scan error: $e', label: 'QueryExecutor._performPrimaryKeyScan');
+          Logger.error('Primary key scan error: $e',
+              label: 'QueryExecutor._performPrimaryKeyScan');
         }
       }
-      
+
       // Check the write buffer to see if there are any updated records
-      final pendingData = _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
+      final pendingData =
+          _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
       final pendingRecord = pendingData[pkValue.toString()];
-      
+
       if (pendingRecord != null) {
         // If the write buffer exists and satisfies all conditions
-        if (queryCondition == null || queryCondition.matches(pendingRecord.data)) {
-          resultMap[pkValue.toString()] = Map<String, dynamic>.from(pendingRecord.data);
+        if (queryCondition == null ||
+            queryCondition.matches(pendingRecord.data)) {
+          resultMap[pkValue.toString()] =
+              Map<String, dynamic>.from(pendingRecord.data);
         }
       }
-      
+
       return resultMap.values.toList();
     } catch (e) {
-      Logger.error('Primary key scan failed: $e', label: 'QueryExecutor._performPrimaryKeyScan');
+      Logger.error('Primary key scan failed: $e',
+          label: 'QueryExecutor._performPrimaryKeyScan');
       // When failed, fall back to table scan
       return _performTableScan(tableName, queryCondition);
     }
   }
-  
+
   /// Use binary search to locate the partition containing the target primary key
-  /// 
+  ///
   /// When the number of partitions is large, binary search can reduce the query complexity from O(n) to O(log n)
   /// Return the found partition index, if not found, return null
-  int? _findPartitionWithBinarySearch(List<dynamic> partitions, dynamic pkValue) {
+  int? _findPartitionWithBinarySearch(
+      List<dynamic> partitions, dynamic pkValue) {
     if (partitions.isEmpty) return null;
-    
+
     int left = 0;
     int right = partitions.length - 1;
-    
+
     while (left <= right) {
       int mid = left + (right - left) ~/ 2;
       var partition = partitions[mid];
-      
+
       // Handle the case where the boundary is empty
       if (partition.minPrimaryKey == null || partition.maxPrimaryKey == null) {
         return partition.index;
       }
-      
+
       // Check if the primary key is within the current partition range
-      if (_isValueInRange(pkValue, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+      if (_isValueInRange(
+          pkValue, partition.minPrimaryKey, partition.maxPrimaryKey)) {
         return partition.index;
       }
-      
+
       // Adjust the search range
       if (_compareValues(pkValue, partition.minPrimaryKey) < 0) {
         right = mid - 1; // Continue searching on the left
@@ -1250,10 +1273,10 @@ class QueryExecutor {
         left = mid + 1; // Continue searching on the right
       }
     }
-    
+
     return null; // No matching partition found
   }
-  
+
   /// perform index scan
   Future<List<Map<String, dynamic>>> _performIndexScan(
     String tableName,
@@ -1496,6 +1519,39 @@ class QueryExecutor {
           label: 'QueryExecutor._isSpecificQuery');
       return false;
     }
+  }
+
+  /// filter out records that are pending deletion
+  Future<List<Map<String, dynamic>>> _filterPendingDeletes(
+      String tableName, List<Map<String, dynamic>> results) async {
+    if (results.isEmpty) {
+      return results;
+    }
+
+    // Get pending deletions from the delete buffer
+    final pendingDeleteKeys =
+        _dataStore.tableDataManager.getPendingDeletePrimaryKeys(tableName);
+
+    if (pendingDeleteKeys.isEmpty) {
+      return results;
+    }
+
+    // Get the primary key for the table to identify records
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      // Cannot filter without schema, so return original results as a fallback
+      Logger.warn(
+          'Could not filter pending deletes for table $tableName because schema was not found.',
+          label: 'QueryExecutor._filterPendingDeletes');
+      return results;
+    }
+    final primaryKey = schema.primaryKey;
+
+    // Remove records from the results if their primary key is in the pending deletion set
+    return results.where((record) {
+      final pkValue = record[primaryKey]?.toString();
+      return pkValue == null || !pendingDeleteKeys.contains(pkValue);
+    }).toList();
   }
 }
 

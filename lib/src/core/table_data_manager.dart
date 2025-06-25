@@ -4019,6 +4019,15 @@ class TableDataManager {
   int getCurrentTableMetaCacheSize() {
     return _currentTableMetaCacheSize;
   }
+
+  /// Get the set of primary key values for records pending deletion in the buffer.
+  Set<String> getPendingDeletePrimaryKeys(String tableName) {
+    final deleteQueue = _deleteBuffer[tableName];
+    if (deleteQueue == null || deleteQueue.isEmpty) {
+      return const <String>{};
+    }
+    return deleteQueue.keys.toSet();
+  }
 }
 
 /// Check if a record is a deleted record (marked with _deleted_:true flag)
