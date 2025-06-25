@@ -468,68 +468,28 @@ class DataCacheManager {
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
     try {
-      // Clean up primary key related cache - this is a direct path, efficient and necessary
+      // 1. Clean up primary key based query cache, this is a direct and efficient path
       await invalidateRecordByPrimaryKey(tableName, primaryKeyValue);
-
-      // Get table cache
+  
+      // 2. Try to get record data from the record cache
       final tableCache = tableCaches[tableName];
+      Map<String, dynamic>? recordData;
+  
       if (tableCache != null) {
         final pkString = primaryKeyValue.toString();
         final recordCache = tableCache.getRecord(pkString);
-
-        // Get record data, used for subsequent cleanup of related queries
-        final recordData = recordCache?.record;
-
-        // Update the total cache size
+        recordData = recordCache?.record;
+  
+        // Remove the record from the record cache if it exists
         if (recordCache != null) {
           _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
-        }
-
-        // Remove record from cache
-        tableCache.recordsMap.remove(pkString);
-        
-        // clean up related queries affected by deleted record
-        if (recordData != null) {
-          await _cleanupRelatedQueries(tableName, primaryKeyValue, recordData);
+          tableCache.recordsMap.remove(pkString);
         }
       }
-
-      // Clean up query results cache containing this primary key
-      final tableDependency = _tableDependencies[tableName];
-      if (tableDependency != null) {
-        final keysToRemove = <String>[];
-
-        for (var entry in tableDependency.entries) {
-          final queryInfo = entry.value;
-          final cacheKeyStr = entry.key;
-
-          // skip user-managed caches
-          try {
-            final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-            final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-            if (isUserManaged) continue;
-          } catch (e) {
-            // parse error, conservative handling, assume it is system cache
-          }
-
-          // Clean up full table cache and query cache containing this primary key
-          if (queryInfo.isFullTableCache ||
-              queryInfo.resultKeys.contains(primaryKeyValue.toString())) {
-            keysToRemove.add(entry.key);
-          }
-        }
-
-        // Remove related query cache
-        for (var key in keysToRemove) {
-          _queryCache.invalidate(key);
-          tableDependency.remove(key);
-        }
-
-        // If there are no related queries, clean up dependencies
-        if (tableDependency.isEmpty) {
-          _tableDependencies.remove(tableName);
-        }
-      }
+  
+      // 3. Clean up all related query caches.
+      // Pass in recordData if available to perform a more comprehensive cleanup.
+      await _cleanupRelatedQueries(tableName, primaryKeyValue, recordData);
     } catch (e) {
       Logger.error('Invalidate record cache failed: $e',
           label: 'DataCacheManager.invalidateRecord');
@@ -582,87 +542,84 @@ class DataCacheManager {
 
   /// Clean up queries related to specific records
   Future<void> _cleanupRelatedQueries(String tableName, dynamic primaryKeyValue,
-      Map<String, dynamic> recordData) async {
+      Map<String, dynamic>? recordData) async {
     final tableQueries = _tableDependencies[tableName];
     if (tableQueries == null) return;
 
-    // first clean up the primary key equal cache (direct fast path)
     try {
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema != null) {
-        // The primary key related query cleanup has already been executed in the invalidateRecord/invalidateRecords methods
-        // await invalidateRecordByPrimaryKey(tableName, primaryKeyValue);
+      final keysToRemove = <String>[];
+      final pkString = primaryKeyValue.toString();
 
-        // Optimization: get all fields involved in the record, for fast judgment of whether the query may match
-        final recordFields = recordData.keys.toSet();
+      // Get all fields of the record for quick checking of whether the query might match
+      final recordFields = recordData?.keys.toSet();
 
-        // List of keys to clean up
-        final keysToRemove = <String>[];
+      // Check each query
+      for (var entry in tableQueries.entries) {
+        final queryInfo = entry.value;
+        final cacheKeyStr = entry.key;
 
-        // Check each query
-        for (var entry in tableQueries.entries) {
-          final queryInfo = entry.value;
-          final cacheKeyStr = entry.key;
-
-          // skip user-managed caches, these caches need to be manually invalidated by the user
-          try {
-            final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-            final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-
-            if (isUserManaged) {
-              continue; // skip user-managed caches
-            }
-          } catch (e) {
-            // parse error, conservative handling, assume it is system cache
+        // Skip user-managed caches, which need to be manually invalidated by the user
+        try {
+          final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
+          final isUserManaged = cacheKeyMap['isUserManaged'] == true;
+          if (isUserManaged) {
+            continue; // Skip user-managed caches
           }
+        } catch (e) {
+          // Parse error, handle conservatively, assume it is a system cache
+        }
 
-          // 1. If it is a full table cache, clean up directly
-          if (queryInfo.isFullTableCache) {
-            keysToRemove.add(entry.key);
-            continue;
-          }
+        // 1. If it's a full table cache, clean it up directly
+        if (queryInfo.isFullTableCache) {
+          keysToRemove.add(cacheKeyStr);
+          continue;
+        }
 
-          // 2. If the query's primary key is in the result set, clean it up
-          if (queryInfo.resultKeys.contains(primaryKeyValue.toString())) {
-            keysToRemove.add(entry.key);
-            continue;
-          }
+        // 2. If the query's primary key is in the result set, clean it up
+        if (queryInfo.resultKeys.contains(pkString)) {
+          keysToRemove.add(cacheKeyStr);
+          continue;
+        }
+        
+        // If there is no record data, subsequent checks cannot be performed
+        if (recordData == null || recordFields == null) {
+          continue;
+        }
 
-          // 3. Optimization: check the intersection of query fields and record fields
-          final conditions = queryInfo.queryKey.condition.build();
-          bool hasFieldOverlap = false;
+        // 3. Optimization: check the intersection of query fields and record fields
+        final conditions = queryInfo.queryKey.condition.build();
+        bool hasFieldOverlap = false;
 
-          // If the query condition field intersects with the record field, it may need to be cleaned up
-          for (var field in conditions.keys) {
-            if (recordFields.contains(field) ||
-                field == 'OR' ||
-                field == 'AND') {
-              hasFieldOverlap = true;
-              break;
-            }
-          }
-
-          // If the query condition field does not intersect with the record field, skip
-          if (!hasFieldOverlap) {
-            continue;
-          }
-
-          // 4. Final check: if the record matches the query condition, clean up the cache
-          if (queryInfo.queryKey.condition.matches(recordData)) {
-            keysToRemove.add(entry.key);
+        // If the query condition fields intersect with the record fields, it may need to be cleaned up
+        for (var field in conditions.keys) {
+          if (recordFields.contains(field) ||
+              field == 'OR' ||
+              field == 'AND') {
+            hasFieldOverlap = true;
+            break;
           }
         }
 
-        // Remove related query cache
-        for (var key in keysToRemove) {
-          _queryCache.invalidate(key);
-          tableQueries.remove(key);
+        // If the query condition fields do not intersect with the record fields, skip
+        if (!hasFieldOverlap) {
+          continue;
         }
 
-        // If there are no related queries, clean up dependencies
-        if (tableQueries.isEmpty) {
-          _tableDependencies.remove(tableName);
+        // 4. Final check: if the record matches the query condition, clean up the cache
+        if (queryInfo.queryKey.condition.matches(recordData)) {
+          keysToRemove.add(cacheKeyStr);
         }
+      }
+
+      // Remove related query caches
+      for (var key in keysToRemove) {
+        _queryCache.invalidate(key);
+        tableQueries.remove(key);
+      }
+
+      // If there are no more related queries, clean up the dependency
+      if (tableQueries.isEmpty) {
+        _tableDependencies.remove(tableName);
       }
     } catch (e) {
       Logger.error('Failed to clean up related queries: $e',
