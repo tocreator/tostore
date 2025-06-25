@@ -403,6 +403,67 @@ class DataCacheManager {
     _totalRecordCacheSize += (cache.totalCacheSize - beforeSize);
   }
 
+  /// Update record in cache (without changing order)
+  void updateCachedRecord(String tableName, Map<String, dynamic> record) {
+    final cache = tableCaches[tableName];
+    if (cache == null) return;
+
+    // Record the size before updating
+    final beforeSize = cache.totalCacheSize;
+
+    cache.updateRecord(record);
+
+    // Update the total cache size
+    _totalRecordCacheSize += (cache.totalCacheSize - beforeSize);
+  }
+
+  /// Update record data in query cache
+  Future<void> updateQueryCacheForRecord(
+      String tableName, dynamic primaryKeyValue, Map<String, dynamic> updatedRecord) async {
+    try {
+      final tableDependency = _tableDependencies[tableName];
+      if (tableDependency != null) {
+        final pkString = primaryKeyValue.toString();
+        
+        for (var entry in tableDependency.entries) {
+          final queryInfo = entry.value;
+          final cacheKeyStr = entry.key;
+          
+          // Check if this query result contains the record
+          if (queryInfo.isFullTableCache || queryInfo.resultKeys.contains(pkString)) {
+            // Get query cache
+            final cachedResults = _queryCache.get(cacheKeyStr);
+            if (cachedResults != null) {
+              // Update the record in the query result, rather than deleting the entire query cache
+              bool found = false;
+              for (int i = 0; i < cachedResults.length; i++) {
+                if (cachedResults[i][queryInfo.primaryKeyField]?.toString() == pkString) {
+                  // Update the record content, keep the position in the result set
+                  cachedResults[i] = Map<String, dynamic>.from(updatedRecord);
+                  found = true;
+                  break;
+                }
+              }
+              
+              // If it is a full table cache but the record is not found, it may need to be added to the result
+              if (!found && queryInfo.isFullTableCache) {
+                // Check if the updated record matches the query condition
+                if (queryInfo.queryKey.condition.matches(updatedRecord)) {
+                  cachedResults.add(Map<String, dynamic>.from(updatedRecord));
+                  // Remember to update the resultKeys collection
+                  queryInfo.resultKeys.add(pkString);
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      Logger.error('Failed to update query cache for record: $e',
+          label: 'DataCacheManager.updateQueryCacheForRecord');
+    }
+  }
+
   /// Invalidate record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {

@@ -266,6 +266,40 @@ class TableCache {
     return _totalCacheSize;
   }
 
+  /// Update record directly, without changing its position in the cache
+  RecordCache updateRecord(Map<String, dynamic> record) {
+    final pkValue = record[primaryKeyField]?.toString() ?? '';
+    if (pkValue.isEmpty) {
+      throw ArgumentError('Record missing valid primary key: $primaryKeyField');
+    }
+
+    // Check if the record exists
+    if (recordsMap.containsKey(pkValue)) {
+      final existingCache = recordsMap[pkValue]!;
+      
+      // Subtract old record size
+      _totalCacheSize -= existingCache.estimateMemoryUsage();
+
+      // Update record content (preserve original object reference)
+      existingCache.record.clear();  // Clear old content
+      existingCache.record.addAll(record);  // Add new content
+
+      // Record access, update weight
+      existingCache.recordAccess();
+      
+      // Clear cache size estimate, will be recalculated next time accessed
+      existingCache._cachedSize = -1;
+      
+      // Add updated record size
+      _totalCacheSize += existingCache.estimateMemoryUsage();
+      
+      return existingCache;
+    } else {
+      // If the record does not exist, add a new record
+      return addOrUpdateRecord(record);
+    }
+  }
+
   @override
   String toString() {
     final fullCacheStr = isFullTableCache ? 'complete' : 'partial';
