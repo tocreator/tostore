@@ -1965,6 +1965,35 @@ class DataStoreImpl {
 
   /// load data from specified path
   Future<void> _loadTableRecordToCache() async {
+    final bool? enablePrewarm = config.enablePrewarmCache;
+
+    if (enablePrewarm == false) {
+      return; // Explicitly disabled
+    }
+
+    if (enablePrewarm == true) {
+      // Explicitly enabled, proceed with loading
+      await _executePrewarm();
+      return;
+    }
+
+    // If enablePrewarm is null (auto mode)
+    try {
+      final spaceConfig = await getSpaceConfig();
+      final totalSize = spaceConfig?.totalDataSizeBytes ?? 0;
+      final int prewarmThresholdBytes =
+          config.prewarmThresholdMB * 1024 * 1024;
+
+      if (totalSize < prewarmThresholdBytes) {
+        await _executePrewarm();
+      }
+    } catch (e) {
+      Logger.error('Failed to check for automatic prewarming: $e',
+          label: 'DataStore._loadTableRecordToCache');
+    }
+  }
+
+  Future<void> _executePrewarm() async {
     try {
       // From schemaManager get all tables
       final allTables = await getTableNames();
@@ -1991,69 +2020,32 @@ class DataStoreImpl {
 
           // Load all records
           if (await tableDataManager.allowFullTableCache(tableName)) {
-            final records = await _loadAllRecords(tableName);
+            // Use executeQuery to get a consistent snapshot, as it correctly
+            // handles merging write buffers and filtering delete buffers.
+            final records = await executeQuery(tableName, QueryCondition());
+
             await dataCacheManager.cacheEntireTable(
               tableName,
               schema.primaryKey,
               records,
             );
           }
+          // Yield control to the event loop to prevent UI freezing during a long prewarm process.
+          await Future.delayed(Duration.zero);
         } catch (e, stackTrace) {
           Logger.error('Load table data failed: $tableName, error: $e',
-              label: 'DataStore._loadTableRecordToCache');
+              label: 'DataStore._executePrewarm');
           Logger.error('Stack trace: $stackTrace',
-              label: 'DataStore._loadTableRecordToCache');
+              label: 'DataStore._executePrewarm');
           continue; // Continue load other tables
         }
       }
     } catch (e, stackTrace) {
-      Logger.error('Error in _loadTableRecordToCache: $e',
-          label: 'DataStore._loadTableRecordToCache');
+      Logger.error('Error in _executePrewarm: $e',
+          label: 'DataStore._executePrewarm');
       Logger.error('Stack trace: $stackTrace',
-          label: 'DataStore._loadTableRecordToCache');
+          label: 'DataStore._executePrewarm');
     }
-  }
-
-  /// load all records
-  Future<List<Map<String, dynamic>>> _loadAllRecords(String tableName) async {
-    final results = <Map<String, dynamic>>[];
-    final resultMap =
-        <String, Map<String, dynamic>>{}; // Use Map to avoid duplicates
-
-    try {
-      // Get table schema to get primary key
-      final schema = await getTableSchema(tableName);
-      if (schema == null) {
-        return results;
-      }
-
-      final primaryKey = schema.primaryKey;
-
-      // Use parallel processing instead of stream processing
-      await tableDataManager.processTablePartitions(
-        tableName: tableName,
-        onlyRead: true, // Only read, do not modify data
-        processFunction: (records, partitionIndex) async {
-          // Process records in current partition
-          for (var record in records) {
-            if (record[primaryKey] != null && !isDeletedRecord(record)) {
-              // Use primary key as Map key to avoid duplicate records
-              resultMap[record[primaryKey].toString()] =
-                  Map<String, dynamic>.from(record);
-            }
-          }
-          return records; // Return original records, do not modify
-        },
-      );
-
-      // Return result list
-      results.addAll(resultMap.values);
-    } catch (e) {
-      Logger.error('Failed to load records from $tableName: $e',
-          label: 'DataStore._loadAllRecords');
-    }
-
-    return results;
   }
 
   /// Sort tables by priority

@@ -83,6 +83,12 @@ class DataStoreConfig {
   /// If null, system will automatically determine appropriate value based on available memory
   final int? memoryThresholdInMB;
 
+  /// Whether to prewarm the cache, when is true, the cache will be prewarmed when the data store is initialized
+  final bool? enablePrewarmCache;
+
+  /// The threshold in megabytes for automatic cache prewarming when [enablePrewarmCache] is true.
+  final int prewarmThresholdMB;
+
   DataStoreConfig({
     this.dbPath,
     this.spaceName = 'default',
@@ -107,6 +113,8 @@ class DataStoreConfig {
     bool? enableQueryCache,
     this.queryCacheExpiryTime,
     this.memoryThresholdInMB,
+    this.enablePrewarmCache,
+    int? prewarmThresholdMB,
   })  : maxPartitionFileSize =
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
@@ -114,9 +122,8 @@ class DataStoreConfig {
             distributedNodeConfig ?? const DistributedNodeConfig(),
         maxBatchSize = maxBatchSize ?? _getDefaultBatchSize(),
         maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
-        enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled() {
-    // no longer initialize memory detection and cache optimization, this will be handled by MemoryManager
-  }
+        enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled(),
+        prewarmThresholdMB = prewarmThresholdMB ?? _getDefaultPrewarmThreshold();
 
   /// Determine if query cache should be enabled by default
   static bool _getDefaultQueryCacheEnabled() {
@@ -210,6 +217,20 @@ class DataStoreConfig {
     }
   }
 
+  static int _getDefaultPrewarmThreshold() {
+    int cpuCount = PlatformHandler.recommendedConcurrency;
+    if (PlatformHandler.isServerEnvironment) {
+      // Servers have high-performance I/O, so we can be more aggressive.
+      return 256 + (cpuCount * 25);
+    }
+    if (PlatformHandler.isDesktop) {
+      // Desktops usually have fast SSDs.
+      return 64 + (cpuCount * 15);
+    }
+    // Mobile devices have slower storage and more constrained memory.
+    return 5 + (cpuCount * 5);
+  }
+
   /// from json create config
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
     return DataStoreConfig(
@@ -246,6 +267,8 @@ class DataStoreConfig {
           ? Duration(milliseconds: json['queryCacheExpiryTime'] as int)
           : null,
       memoryThresholdInMB: json['memoryThresholdInMB'] as int?,
+      enablePrewarmCache: json['enablePrewarmCache'] as bool?,
+      prewarmThresholdMB: json['prewarmThresholdMB'] as int? ?? 10,
     );
   }
 
@@ -275,6 +298,8 @@ class DataStoreConfig {
       'enableQueryCache': enableQueryCache,
       'queryCacheExpiryTime': queryCacheExpiryTime?.inMilliseconds,
       'memoryThresholdInMB': memoryThresholdInMB,
+      'enablePrewarmCache': enablePrewarmCache,
+      'prewarmThresholdMB': prewarmThresholdMB,
     };
   }
 
@@ -303,6 +328,8 @@ class DataStoreConfig {
     bool? enableQueryCache,
     Duration? queryCacheExpiryTime,
     int? memoryThresholdInMB,
+    bool? enablePrewarmCache,
+    int? prewarmThresholdMB,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
@@ -330,6 +357,8 @@ class DataStoreConfig {
       enableQueryCache: enableQueryCache ?? this.enableQueryCache,
       queryCacheExpiryTime: queryCacheExpiryTime ?? this.queryCacheExpiryTime,
       memoryThresholdInMB: memoryThresholdInMB ?? this.memoryThresholdInMB,
+      enablePrewarmCache: enablePrewarmCache ?? this.enablePrewarmCache,
+      prewarmThresholdMB: prewarmThresholdMB ?? this.prewarmThresholdMB,
     );
   }
 }

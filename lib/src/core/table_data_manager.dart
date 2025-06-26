@@ -291,6 +291,8 @@ class TableDataManager {
           Logger.warn('Failed to calculate table statistics: $tableName, $e',
               label: 'TableDataManager._calculateTableStatistics');
         }
+        // Yield to the event loop to prevent UI freezing.
+        await Future.delayed(Duration.zero);
       }
 
       // Update statistics
@@ -663,107 +665,77 @@ class TableDataManager {
       return [];
     }
 
-    // Record start time for performance statistics
     final startTime = DateTime.now();
+    final effectiveMaxConcurrent = maxConcurrent ?? _effectiveMaxConcurrent;
+    final allResults = <T>[];
 
-    try {
-      final effectiveMaxConcurrent = maxConcurrent ?? _effectiveMaxConcurrent;
+    for (int i = 0; i < partitionIndexes.length; i += effectiveMaxConcurrent) {
+      final end = (i + effectiveMaxConcurrent < partitionIndexes.length)
+          ? i + effectiveMaxConcurrent
+          : partitionIndexes.length;
+      final batch = partitionIndexes.sublist(i, end);
 
-      // If there's only one partition, process it sequentially
-      if (partitionIndexes.length == 1) {
-        final partitionIndex = partitionIndexes.first;
-        final result = await processFunction(partitionIndex);
-        final duration = DateTime.now().difference(startTime);
-        Logger.debug(
-          '$description single partition processed, partition: $partitionIndex, time: ${duration.inMilliseconds}ms',
-          label: 'TableDataManager',
-        );
-        return [result];
+      if (batch.isEmpty) {
+        continue;
       }
 
-      // Pre-allocate result list to ensure consistent order of results
-      final results = List<T?>.filled(partitionIndexes.length, null);
-      final completer = Completer<List<T>>();
-      final queue = List<int>.from(partitionIndexes);
-      int runningTasks = 0;
-      final errors = <String, Exception>{};
+      final batchFutures = batch.map((partitionIndex) {
+        // Retry logic for each task
+        int retries = 0;
+        const maxRetries = 2;
 
-      // Process partition queue using non-recursive approach
-      void processNextBatch() {
-        if (queue.isEmpty && runningTasks == 0) {
-          if (errors.isEmpty) {
-            // Convert results to non-empty list
-            completer.complete(results.cast<T>());
-          } else {
-            // Aggregate all error messages
-            final errorMessage = errors.entries
-                .map((e) => 'Partition ${e.key}: ${e.value}')
-                .join('\n');
-            completer.completeError(Exception(
-                'Multiple partitions processing failed:\n$errorMessage'));
-          }
-          return;
-        }
-
-        // Calculate number of new tasks to start
-        final tasksToStart =
-            min(effectiveMaxConcurrent - runningTasks, queue.length);
-
-        // Start new batch of tasks
-        for (int i = 0; i < tasksToStart; i++) {
-          if (queue.isEmpty) break;
-
-          final partitionIndex = queue.removeAt(0);
-          final indexInOriginalList = partitionIndexes.indexOf(partitionIndex);
-          runningTasks++;
-
-          // Use Future to process tasks with timeout mechanism
-          Future<void> processTask() async {
-            try {
-              // Set task timeout
-              final result = await processFunction(partitionIndex)
-                  .timeout(const Duration(seconds: 50), onTimeout: () {
+        Future<T> attempt() async {
+          try {
+            // A more generous but still fixed timeout.
+            // A truly dynamic timeout would require partition size info here.
+            return await processFunction(partitionIndex).timeout(
+              const Duration(minutes: 2),
+              onTimeout: () {
                 throw TimeoutException(
-                    'Partition $partitionIndex processing timeout');
-              });
-              results[indexInOriginalList] = result;
-            } catch (e) {
-              final error = e is Exception
-                  ? e
-                  : Exception(
-                      'Partition $partitionIndex processing failed: $e');
-              Logger.error(
-                'Processing partition $partitionIndex failed: $e',
-                label: 'TableDataManager.processPartitionsConcurrently',
-              );
-              errors[partitionIndex.toString()] = error;
-            } finally {
-              runningTasks--;
-              // Non-recursive approach to schedule next batch
-              processNextBatch();
+                    'Partition $partitionIndex processing timeout after 2 minutes');
+              },
+            );
+          } catch (e) {
+            if (e is TimeoutException && retries < maxRetries) {
+              retries++;
+              Logger.warn(
+                  'Timeout processing partition $partitionIndex. Retrying ($retries/$maxRetries)...',
+                  label: 'TableDataManager.processPartitionsConcurrently');
+              // Optional: Add a small delay before retrying
+              await Future.delayed(Duration(milliseconds: 100 * retries));
+              return attempt();
             }
+            // Rethrow non-timeout errors or after max retries
+            rethrow;
           }
-
-          processTask();
         }
+
+        return attempt();
+      }).toList();
+
+      try {
+        final batchResults = await Future.wait(batchFutures);
+        allResults.addAll(batchResults);
+      } catch (e) {
+        Logger.error(
+          'A batch in concurrent processing failed: $e. Description: $description',
+          label: 'TableDataManager.processPartitionsConcurrently',
+        );
+        // Depending on requirements, you might want to rethrow or handle differently
+        rethrow;
       }
 
-      processNextBatch();
-
-      // Return results and record time on successful completion
-      return completer.future.then((result) {
-        final duration = DateTime.now().difference(startTime);
-        Logger.debug(
-          '$description concurrent processing completed, processed ${partitionIndexes.length} partitions, time: ${duration.inMilliseconds}ms',
-          label: 'TableDataManager',
-        );
-        return result;
-      }).catchError((error) {
-        throw error;
-      });
-    } catch (e) {
-      rethrow;
+      // After each batch, yield to the event loop using a more robust method if available.
+      await Future.delayed(Duration.zero);
     }
+
+    final duration = DateTime.now().difference(startTime);
+    Logger.debug(
+      '$description concurrent processing completed, processed ${partitionIndexes.length} partitions in ${duration.inMilliseconds}ms',
+      label: 'TableDataManager',
+    );
+
+    return allResults;
   }
 
   /// Determine if concurrent processing should be used
@@ -2240,6 +2212,7 @@ class TableDataManager {
                 yield record;
               }
             }
+            await Future.delayed(Duration.zero);
           }
         }
       }
@@ -3000,6 +2973,7 @@ class TableDataManager {
 
             // collect partition meta
             allPartitionMetas.add(partitionMeta);
+            await Future.delayed(Duration.zero);
           }
         }
 
@@ -3065,6 +3039,7 @@ class TableDataManager {
             // If partition has no range info, assume it needs processing
             partitionsToProcess.add(partition);
           }
+          await Future.delayed(Duration.zero);
         }
 
         // use concurrent processing
@@ -3294,6 +3269,7 @@ class TableDataManager {
 
               sequentialPartitionMetas.add(updatedPartitionMeta);
             }
+            await Future.delayed(Duration.zero);
           }
 
           // Update table metadata with all processed partitions
@@ -3379,6 +3355,7 @@ class TableDataManager {
                 await _dataStore.storage.deleteFile(partitionPath);
               }
             }
+            await Future.delayed(Duration.zero);
           }
         }
       }
