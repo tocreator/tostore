@@ -140,7 +140,7 @@ class TransactionManager {
         await tableDataManager.processTablePartitions(
           tableName: tableName,
           processFunction:
-              (List<Map<String, dynamic>> records, int partitionIndex) async {
+              (records, partitionIndex, controller) async {
             return records
                 .map<Map<String, dynamic>>((Map<String, dynamic> record) {
               if (record['id'] == operation['data']['id']) {
@@ -155,7 +155,7 @@ class TransactionManager {
         await tableDataManager.processTablePartitions(
           tableName: tableName,
           processFunction:
-              (List<Map<String, dynamic>> records, int partitionIndex) async {
+              (records, partitionIndex, controller) async {
             return records
                 .where((Map<String, dynamic> record) =>
                     record['id'] != operation['data']['id'])

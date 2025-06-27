@@ -17,6 +17,7 @@ import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import '../model/system_table.dart';
 import 'memory_manager.dart';
+import '../handler/parallel_processor.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -270,29 +271,26 @@ class TableDataManager {
       int totalRecords = 0;
       int totalSize = 0;
 
-      // Iterate through each table's statistics
-      for (final tableName in tableNames) {
-        try {
-          // Get table metadata
-          final meta = await getTableFileMeta(tableName);
-          if (meta != null) {
-            // Accumulate record count
-            totalRecords += meta.totalRecords;
+      // Use ParallelProcessor to fetch table metadata concurrently
+      final metaList = await ParallelProcessor.execute<FileMeta?>(
+        tableNames.map((tableName) {
+          return () => getTableFileMeta(tableName);
+        }).toList(),
+      );
 
-            // Calculate file size
-            if (meta.partitions != null) {
-              for (final partition in meta.partitions!) {
-                totalSize += partition.fileSizeInBytes;
-              }
+      // Iterate through the results to calculate statistics
+      for (final meta in metaList) {
+        if (meta != null) {
+          // Accumulate record count
+          totalRecords += meta.totalRecords;
+
+          // Calculate file size
+          if (meta.partitions != null) {
+            for (final partition in meta.partitions!) {
+              totalSize += partition.fileSizeInBytes;
             }
           }
-        } catch (e) {
-          // Individual table statistics failure doesn't affect overall
-          Logger.warn('Failed to calculate table statistics: $tableName, $e',
-              label: 'TableDataManager._calculateTableStatistics');
         }
-        // Yield to the event loop to prevent UI freezing.
-        await Future.delayed(Duration.zero);
       }
 
       // Update statistics
@@ -648,105 +646,6 @@ class TableDataManager {
     }
   }
 
-  /// General concurrent handling of multiple partition data
-  /// - [partitionIndexes]: List of partition indexes to process
-  /// - [processFunction]: Function to handle single partition
-  /// - [maxConcurrent]: Maximum number of concurrent tasks
-  /// - [requireLock]: Whether to acquire lock (write operations require lock)
-  /// - Returns: List of results from processing each partition
-  Future<List<T>> processPartitionsConcurrently<T>({
-    required List<int> partitionIndexes,
-    required Future<T> Function(int partitionIndex) processFunction,
-    int? maxConcurrent,
-    bool requireLock = true,
-    String description = 'Processing partitions',
-  }) async {
-    if (partitionIndexes.isEmpty) {
-      return [];
-    }
-
-    final startTime = DateTime.now();
-    final effectiveMaxConcurrent = maxConcurrent ?? _effectiveMaxConcurrent;
-    final allResults = <T>[];
-
-    for (int i = 0; i < partitionIndexes.length; i += effectiveMaxConcurrent) {
-      final end = (i + effectiveMaxConcurrent < partitionIndexes.length)
-          ? i + effectiveMaxConcurrent
-          : partitionIndexes.length;
-      final batch = partitionIndexes.sublist(i, end);
-
-      if (batch.isEmpty) {
-        continue;
-      }
-
-      final batchFutures = batch.map((partitionIndex) {
-        // Retry logic for each task
-        int retries = 0;
-        const maxRetries = 2;
-
-        Future<T> attempt() async {
-          try {
-            // A more generous but still fixed timeout.
-            // A truly dynamic timeout would require partition size info here.
-            return await processFunction(partitionIndex).timeout(
-              const Duration(minutes: 2),
-              onTimeout: () {
-                throw TimeoutException(
-                    'Partition $partitionIndex processing timeout after 2 minutes');
-              },
-            );
-          } catch (e) {
-            if (e is TimeoutException && retries < maxRetries) {
-              retries++;
-              Logger.warn(
-                  'Timeout processing partition $partitionIndex. Retrying ($retries/$maxRetries)...',
-                  label: 'TableDataManager.processPartitionsConcurrently');
-              // Optional: Add a small delay before retrying
-              await Future.delayed(Duration(milliseconds: 100 * retries));
-              return attempt();
-            }
-            // Rethrow non-timeout errors or after max retries
-            rethrow;
-          }
-        }
-
-        return attempt();
-      }).toList();
-
-      try {
-        final batchResults = await Future.wait(batchFutures);
-        allResults.addAll(batchResults);
-      } catch (e) {
-        Logger.error(
-          'A batch in concurrent processing failed: $e. Description: $description',
-          label: 'TableDataManager.processPartitionsConcurrently',
-        );
-        // Depending on requirements, you might want to rethrow or handle differently
-        rethrow;
-      }
-
-      // After each batch, yield to the event loop using a more robust method if available.
-      await Future.delayed(Duration.zero);
-    }
-
-    final duration = DateTime.now().difference(startTime);
-    Logger.debug(
-      '$description concurrent processing completed, processed ${partitionIndexes.length} partitions in ${duration.inMilliseconds}ms',
-      label: 'TableDataManager',
-    );
-
-    return allResults;
-  }
-
-  /// Determine if concurrent processing should be used
-  /// - [partitionIndexes]: List of partition indexes
-  /// - [operation]: Operation type description (for logging)
-  /// - Returns: true if concurrent processing should be used
-  bool _shouldUseConcurrent(List<int> partitionIndexes, String operation) {
-    // Enable concurrent processing if there's more than one partition
-    return partitionIndexes.length > 1;
-  }
-
   /// Get partition size limit for a table
   int _getPartitionSizeLimit(String tableName) {
     // If table has specific partition size configuration, use it
@@ -885,7 +784,7 @@ class TableDataManager {
   }
 
   /// Flush single table buffer
-  Future<void> _flushTableBuffer(String tableName) async {
+  Future<void> _flushTableBuffer(String tableName, {int? concurrency}) async {
     // Use lock manager's exclusive lock to ensure data for the same table isn't processed concurrently
     final lockKey = 'table_$tableName';
     bool lockAcquired = false;
@@ -997,22 +896,24 @@ class TableDataManager {
             await writeRecords(
                 tableName: tableName,
                 records: insertRecords,
-                operationType: BufferOperationType.insert);
+                operationType: BufferOperationType.insert,
+                concurrency: concurrency);
           }
 
           if (updateRecords.isNotEmpty) {
             await writeRecords(
                 tableName: tableName,
                 records: updateRecords,
-                operationType: BufferOperationType.update);
+                operationType: BufferOperationType.update,
+                concurrency: concurrency);
           }
 
           recordsProcessed += processedEntries.length;
 
-          // After current batch is processed, yield execution thread for 2ms to avoid blocking UI
+          // After current batch is processed, yield execution thread to avoid blocking UI
           if (_writeBuffer.containsKey(tableName) &&
               !(_writeBuffer[tableName]?.isEmpty ?? true)) {
-            await Future.delayed(const Duration(milliseconds: 2));
+            await Future.delayed(Duration.zero);
           }
         } catch (e) {
           Logger.error('Failed to process data for table $tableName: $e',
@@ -1097,26 +998,44 @@ class TableDataManager {
               .take(min(maxTablesPerFlush, availableTables.length))
               .toList();
 
+      if (tablesToProcess.isEmpty) {
+        return;
+      }
+
       // mark these tables as being processed
       for (final tableName in tablesToProcess) {
         _processingTables.add(tableName);
       }
 
-      // process each table separately by calling _flushTableBuffer
-      await processPartitionsConcurrently<void>(
-        partitionIndexes: tablesToProcess.asMap().keys.toList(),
-        processFunction: (index) async {
+      // Dynamic Concurrency Distribution
+      final totalConcurrency = _effectiveMaxConcurrent;
+      final numTables = tablesToProcess.length;
+      final baseConcurrency = totalConcurrency ~/ numTables;
+      final remainder = totalConcurrency % numTables;
+
+      final concurrencyPerTable = List.generate(
+          numTables, (i) => baseConcurrency + (i < remainder ? 1 : 0));
+
+      // Process tables in parallel using ParallelProcessor
+      await ParallelProcessor.execute<void>(
+        List.generate(tablesToProcess.length, (index) {
           final tableName = tablesToProcess[index];
-          if (_writeBuffer.containsKey(tableName) &&
-              !(_writeBuffer[tableName]?.isEmpty ?? true)) {
-            await _flushTableBuffer(tableName);
-          } else {
-            // if found table is empty before processing, remove it from processing list
-            _processingTables.remove(tableName);
-            _writeBuffer.remove(tableName);
-          }
-        },
-        description: 'batch process write buffer for multiple tables',
+          final concurrencyForThisTable = concurrencyPerTable[index];
+          return () async {
+            if (_writeBuffer.containsKey(tableName) &&
+                !(_writeBuffer[tableName]?.isEmpty ?? true)) {
+              await _flushTableBuffer(tableName,
+                  concurrency: concurrencyForThisTable);
+            } else {
+              // if found table is empty before processing, remove it from processing list
+              _processingTables.remove(tableName);
+              _writeBuffer.remove(tableName);
+            }
+          };
+        }),
+        // The outer concurrency is still governed by ParallelProcessor's default,
+        // which is set to _effectiveMaxConcurrent.
+        timeout: ParallelProcessor.noTimeout,
       );
 
       // after processing, record the result
@@ -2156,170 +2075,62 @@ class TableDataManager {
   /// Stream records from a table
   Stream<Map<String, dynamic>> streamRecords(String tableName,
       {List<int>? encryptionKey, int? encryptionKeyId}) async* {
-    try {
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      final isGlobal = schema.isGlobal;
-      final primaryKey = schema.primaryKey;
-
-      // use read lock to get file meta
-      final fileMeta = await getTableFileMeta(tableName);
-
-      // If we have partitions, stream from them
-      if (fileMeta != null &&
-          fileMeta.partitions != null &&
-          fileMeta.partitions!.isNotEmpty) {
-        // Sort partitions by index to maintain order
-        final partitions = List<PartitionMeta>.from(fileMeta.partitions!)
-          ..sort((a, b) => a.index.compareTo(b.index));
-
-        // check if should use concurrent processing
-        if (_shouldUseConcurrent(
-            partitions.map((p) => p.index).toList(), 'streamRecords')) {
-          // use concurrent processing multiple partitions (already added read lock inside)
-          final allPartitionRecords =
-              await _streamRecordsFromPartitionsConcurrently(
-            tableName: tableName,
-            partitions: partitions,
-            isGlobal: isGlobal,
-            primaryKey: primaryKey,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-          );
-
-          // output all records in partition index order
-          for (var records in allPartitionRecords) {
-            for (var record in records) {
-              // filter out deleted records
-              if (!isDeletedRecord(record)) {
-                yield record;
-              }
-            }
-          }
-        } else {
-          // sequential processing mode
-          for (var partition in partitions) {
-            // readRecordsFromPartition already uses read lock inside
-            final partitionRecords = await readRecordsFromPartition(
-                tableName, isGlobal, partition.index, primaryKey,
-                encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
-
-            for (var record in partitionRecords) {
-              // filter out deleted records
-              if (!isDeletedRecord(record)) {
-                yield record;
-              }
-            }
-            await Future.delayed(Duration.zero);
-          }
-        }
-      }
-
-      // Include pending data from write queue
-      final pendingData = _writeBuffer[tableName] ?? {};
-      for (var record in pendingData.entries) {
-        // ensure only return non-deleted data
-        if (!isDeletedRecord(record.value.data)) {
-          yield record.value.data;
-        }
-      }
-    } catch (e) {
-      Logger.error('Failed to stream records: $tableName, error: $e',
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      Logger.error('Failed to get schema for $tableName',
           label: 'TableDataManager.streamRecords');
+      return;
     }
-  }
+    final isGlobal = schema.isGlobal;
+    final primaryKey = schema.primaryKey;
 
-  /// concurrent read records from multiple partitions
-  /// keep partition order, but process multiple partitions concurrently to improve efficiency
-  Future<List<List<Map<String, dynamic>>>>
-      _streamRecordsFromPartitionsConcurrently({
-    required String tableName,
-    required List<PartitionMeta> partitions,
-    required bool isGlobal,
-    required String primaryKey,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
-  }) async {
-    try {
-      // sort partitions by index to ensure order
-      final partitionIndexes = partitions.map((p) => p.index).toList()
-        ..sort((a, b) => a.compareTo(b));
+    final fileMeta = await getTableFileMeta(tableName);
 
-      // use general concurrent processing mechanism to process partitions, specify this is read operation
-      final results =
-          await processPartitionsConcurrently<List<Map<String, dynamic>>>(
-        partitionIndexes: partitionIndexes,
-        processFunction: (partitionIndex) async {
-          return await readRecordsFromPartition(
-            tableName,
-            isGlobal,
-            partitionIndex,
-            primaryKey,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-          );
-        },
-        requireLock:
-            false, // read operation does not require lock, because read lock is already added inside processFunction
-        description: 'concurrent read partition records: $tableName',
-      );
+    // If we have partitions, stream from them in parallel while maintaining order.
+    if (fileMeta != null &&
+        fileMeta.partitions != null &&
+        fileMeta.partitions!.isNotEmpty) {
+      final partitions = List<PartitionMeta>.from(fileMeta.partitions!)
+        ..sort((a, b) => a.index.compareTo(b.index));
 
-      return results;
-    } catch (e) {
-      Logger.error(
-        'Failed to concurrent read records: $tableName, error: $e',
-        label: 'TableDataManager._streamRecordsFromPartitionsConcurrently',
-      );
-      rethrow;
-    }
-  }
+      // Create a list of futures to read each partition.
+      // The order of futures corresponds to the partition order.
+      final partitionReadFutures = partitions
+          .map((p) => readRecordsFromPartition(
+                tableName,
+                isGlobal,
+                p.index,
+                primaryKey,
+                encryptionKey: encryptionKey,
+                encryptionKeyId: encryptionKeyId,
+              ))
+          .toList();
 
-  /// Rewrite table records from a stream, writing in batches to avoid memory issues.
-  Future<void> rewriteRecordsFromStream({
-    required String tableName,
-    required Stream<Map<String, dynamic>> recordStream,
-    int batchSize = 1000,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
-  }) async {
-    // Start by clearing the table with a rewrite operation (empty records list)
-    await writeRecords(
-        tableName: tableName,
-        records: [],
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-        operationType:
-            BufferOperationType.rewrite // Explicitly use rewrite operation type
-        );
-
-    List<Map<String, dynamic>> batch = [];
-    await for (final record in recordStream) {
-      batch.add(record);
-      if (batch.length >= batchSize) {
-        await writeRecords(
-            tableName: tableName,
-            records: batch,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            operationType: BufferOperationType
-                .insert // Explicitly use insert operation type
-            );
-        batch.clear();
+      // Await each future in sequence to yield records in order.
+      // The I/O operations themselves run in parallel because the futures were created together.
+      for (final future in partitionReadFutures) {
+        try {
+          final records = await future;
+          for (final record in records) {
+            if (!isDeletedRecord(record)) {
+              yield record;
+            }
+          }
+        } catch (e, s) {
+          Logger.error('Error reading partition stream: $e\n$s',
+              label: 'TableDataManager.streamRecords');
+          // Continue to the next partition on error.
+        }
       }
     }
 
-    // Process any remaining records
-    if (batch.isNotEmpty) {
-      await writeRecords(
-          tableName: tableName,
-          records: batch,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          operationType:
-              BufferOperationType.insert // Explicitly use insert operation type
-          );
+    // Include pending data from the write buffer that hasn't been flushed yet.
+    final pendingData = _writeBuffer[tableName] ?? {};
+    for (var entry in pendingData.values) {
+      // ensure only return non-deleted data
+      if (!isDeletedRecord(entry.data)) {
+        yield entry.data;
+      }
     }
   }
 
@@ -2530,6 +2341,7 @@ class TableDataManager {
     required Future<List<Map<String, dynamic>>> Function(
       List<Map<String, dynamic>> records,
       int partitionIndex,
+      ParallelController controller,
     ) processFunction,
     bool onlyRead =
         false, // if true, only read records from partitions, do not write records
@@ -2538,6 +2350,7 @@ class TableDataManager {
     int? encryptionKeyId,
     List<int>?
         targetPartitions, // Specify the list of partitions to process, if null, process all partitions
+    ParallelController? controller,
   }) async {
     // get table meta
     final fileMeta = await getTableFileMeta(tableName);
@@ -2552,9 +2365,6 @@ class TableDataManager {
     }
     final isGlobal = schema.isGlobal;
     final primaryKey = schema.primaryKey;
-
-    // collect all partition meta, for later update table meta
-    final List<PartitionMeta> allPartitionMetas = [];
 
     // Determine the list of partitions to process
     List<int> partitionIndexesToProcess;
@@ -2582,41 +2392,44 @@ class TableDataManager {
           fileMeta.partitions!.map((p) => p.index).toList();
     }
 
-    // process all partitions
-    await processPartitionsConcurrently<void>(
-      partitionIndexes: partitionIndexesToProcess,
-      processFunction: (partitionIndex) async {
-        // read partition data
-        final records = await readRecordsFromPartition(
-            tableName, isGlobal, partitionIndex, primaryKey,
-            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+    final effectiveController = controller ?? ParallelController();
 
-        // process data
-        final processedRecords = await processFunction(records, partitionIndex);
+    // Process all partitions using ParallelProcessor and get the new metadata back.
+    final newPartitionMetas = await ParallelProcessor.execute<PartitionMeta?>(
+      partitionIndexesToProcess.map((partitionIndex) {
+        return () async {
+          // read partition data
+          final records = await readRecordsFromPartition(
+              tableName, isGlobal, partitionIndex, primaryKey,
+              encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
-        // if only read, return directly
-        if (onlyRead) {
-          return;
-        }
+          // process data
+          final processedRecords =
+              await processFunction(records, partitionIndex, effectiveController);
 
-        final partitionMeta = await _savePartitionFile(
-          tableName,
-          isGlobal,
-          partitionIndex,
-          processedRecords,
-          primaryKey,
-          fileMeta.partitions!,
-          operationType: BufferOperationType.update,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-        );
+          // if only read or if the process was stopped, return directly
+          if (onlyRead || effectiveController.isStopped) {
+            return null;
+          }
 
-        // collect partition meta, for later update table meta
-        allPartitionMetas.add(partitionMeta);
-      },
-      maxConcurrent: maxConcurrent,
-      requireLock: true, // need to lock
-      description: 'process table partitions: $tableName',
+          final partitionMeta = await _savePartitionFile(
+            tableName,
+            isGlobal,
+            partitionIndex,
+            processedRecords,
+            primaryKey,
+            fileMeta.partitions!,
+            operationType: BufferOperationType.update,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+
+          // Return the new metadata for this partition.
+          return partitionMeta;
+        };
+      }).toList(),
+      concurrency: maxConcurrent,
+      controller: effectiveController,
     );
 
     // if only read, return directly
@@ -2624,10 +2437,12 @@ class TableDataManager {
       return;
     }
 
-    if (allPartitionMetas.isNotEmpty) {
+    final validMetas = newPartitionMetas.whereType<PartitionMeta>().toList();
+
+    if (validMetas.isNotEmpty) {
       // update table meta
       await _updateTableMetadataWithAllPartitions(
-          tableName, allPartitionMetas, fileMeta.partitions);
+          tableName, validMetas, fileMeta.partitions);
     }
   }
 
@@ -2817,9 +2632,10 @@ class TableDataManager {
   Future<void> writeRecords({
     required String tableName,
     required List<Map<String, dynamic>> records,
+    required BufferOperationType operationType,
     List<int>? encryptionKey,
     int? encryptionKeyId,
-    BufferOperationType operationType = BufferOperationType.insert,
+    int? concurrency,
   }) async {
     if (tableName.isEmpty) {
       throw ArgumentError('Table name cannot be empty');
@@ -2861,78 +2677,26 @@ class TableDataManager {
         // store all processed partition meta
         List<PartitionMeta> allPartitionMetas = [];
 
-        // check if should use concurrent processing
-        if (_shouldUseConcurrent(partitionRecords.keys.toList(), 'insert')) {
-          // parallel processing of writing to each partition, but not update table meta
-          final partitionResults =
-              await processPartitionsConcurrently<PartitionMeta>(
-            partitionIndexes: partitionRecords.keys.toList(),
-            processFunction: (partitionIndex) async {
-              final recordsForPartition = partitionRecords[partitionIndex]!;
-              if (recordsForPartition.isEmpty) {
-                return PartitionMeta(
-                  version: 1,
-                  index: partitionIndex,
-                  totalRecords: 0,
-                  fileSizeInBytes: 0,
-                  minPrimaryKey: null,
-                  maxPrimaryKey: null,
-                  checksum: "",
-                  timestamps: Timestamps(
-                    created: DateTime.now(),
-                    modified: DateTime.now(),
-                  ),
-                  parentPath:
-                      await _dataStore.pathManager.getTablePath(tableName),
-                );
-              }
-
-              // if adding records to an existing partition, need to read existing records first
-              List<Map<String, dynamic>> allRecords = [];
-
-              final partitionExists =
-                  existingPartitions.any((p) => p.index == partitionIndex);
-              if (partitionExists) {
-                allRecords = await readRecordsFromPartition(
-                    tableName, isGlobal, partitionIndex, primaryKey,
-                    encryptionKey: encryptionKey,
-                    encryptionKeyId: encryptionKeyId);
-              }
-
-              // collect records to create index
-              if (recordsForPartition.isNotEmpty) {
-                recordsToCreateIndex[partitionIndex] = recordsForPartition;
-                partitionOffsets[partitionIndex] = allRecords.length;
-              }
-
-              // merge records
-              allRecords.addAll(recordsForPartition);
-
-              // save partition, but not update table meta
-              return await _savePartitionFile(
-                tableName,
-                isGlobal,
-                partitionIndex,
-                allRecords,
-                primaryKey,
-                existingPartitions,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-                operationType: BufferOperationType.insert,
+        final tasks = partitionRecords.keys.map((partitionIndex) {
+          return () async {
+            final recordsForPartition = partitionRecords[partitionIndex]!;
+            if (recordsForPartition.isEmpty) {
+              return PartitionMeta(
+                version: 1,
+                index: partitionIndex,
+                totalRecords: 0,
+                fileSizeInBytes: 0,
+                minPrimaryKey: null,
+                maxPrimaryKey: null,
+                checksum: "",
+                timestamps: Timestamps(
+                  created: DateTime.now(),
+                  modified: DateTime.now(),
+                ),
+                parentPath:
+                    await _dataStore.pathManager.getTablePath(tableName),
               );
-            },
-            description: 'parallel insert records to multiple partitions',
-          );
-
-          // collect all partition meta
-          allPartitionMetas.addAll(partitionResults);
-        } else {
-          // original implementation - sequential processing of partitions, but not update table meta
-          for (final partitionEntry in partitionRecords.entries) {
-            final partitionIndex = partitionEntry.key;
-            final recordsForPartition = partitionEntry.value;
-
-            if (recordsForPartition.isEmpty) continue;
+            }
 
             // if adding records to an existing partition, need to read existing records first
             List<Map<String, dynamic>> allRecords = [];
@@ -2946,20 +2710,17 @@ class TableDataManager {
                   encryptionKeyId: encryptionKeyId);
             }
 
-            // record original record count for index creation
-            final oldRecordsCount = allRecords.length;
-
             // collect records to create index
             if (recordsForPartition.isNotEmpty) {
               recordsToCreateIndex[partitionIndex] = recordsForPartition;
-              partitionOffsets[partitionIndex] = oldRecordsCount;
+              partitionOffsets[partitionIndex] = allRecords.length;
             }
 
             // merge records
             allRecords.addAll(recordsForPartition);
 
             // save partition, but not update table meta
-            final partitionMeta = await _savePartitionFile(
+            return await _savePartitionFile(
               tableName,
               isGlobal,
               partitionIndex,
@@ -2970,12 +2731,13 @@ class TableDataManager {
               encryptionKeyId: encryptionKeyId,
               operationType: BufferOperationType.insert,
             );
+          };
+        }).toList();
 
-            // collect partition meta
-            allPartitionMetas.add(partitionMeta);
-            await Future.delayed(Duration.zero);
-          }
-        }
+        final partitionResults =
+            await ParallelProcessor.execute<PartitionMeta>(tasks,
+                concurrency: concurrency);
+        allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());
 
         // all partitions processed, update table meta once
         await _updateTableMetadataWithAllPartitions(
@@ -3005,32 +2767,14 @@ class TableDataManager {
 
         // Identify which partitions might contain records
         final partitionsToProcess = <PartitionMeta>[];
+        int partitionCheckCount = 0;
         for (final partition in existingPartitions) {
           if (partition.minPrimaryKey != null &&
               partition.maxPrimaryKey != null) {
             // Check if any records may be in this partition range
             for (final pk in recordsByPk.keys) {
-              final minPk = partition.minPrimaryKey.toString();
-              final maxPk = partition.maxPrimaryKey.toString();
-
-              // try numeric comparison first
-              bool isInRange = false;
-              try {
-                final pkNum = double.parse(pk);
-                final minPkNum = double.parse(minPk);
-                final maxPkNum = double.parse(maxPk);
-
-                if (pkNum >= minPkNum && pkNum <= maxPkNum) {
-                  isInRange = true;
-                }
-              } catch (e) {
-                // if conversion fails, fallback to string comparison
-                if (pk.compareTo(minPk) >= 0 && pk.compareTo(maxPk) <= 0) {
-                  isInRange = true;
-                }
-              }
-
-              if (isInRange) {
+              if (ValueComparator.isInRange(
+                  pk, partition.minPrimaryKey, partition.maxPrimaryKey)) {
                 partitionsToProcess.add(partition);
                 break;
               }
@@ -3039,224 +2783,71 @@ class TableDataManager {
             // If partition has no range info, assume it needs processing
             partitionsToProcess.add(partition);
           }
-          await Future.delayed(Duration.zero);
+
+          // Yield to the event loop periodically to avoid blocking the UI thread
+          // when checking a large number of partitions.
+          partitionCheckCount++;
+          if (partitionCheckCount % 200 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
 
-        // use concurrent processing
-        if (_shouldUseConcurrent(
-            partitionsToProcess.map((p) => p.index).toList(),
-            operationType == BufferOperationType.delete
-                ? 'delete'
-                : 'update')) {
-          // read and process all related partitions
-          final partitionResults =
-              await processPartitionsConcurrently<Map<String, dynamic>>(
-            partitionIndexes: partitionsToProcess.map((p) => p.index).toList(),
-            processFunction: (partitionIndex) async {
-              // read partition records
-              final partitionRecords = await readRecordsFromPartition(
-                  tableName, isGlobal, partitionIndex, primaryKey,
-                  encryptionKey: encryptionKey,
-                  encryptionKeyId: encryptionKeyId);
-
-              // handle based on operation type
-              bool modified = false;
-              List<Map<String, dynamic>> resultRecords;
-              Set<String> processedKeys = {};
-
-              if (operationType == BufferOperationType.delete) {
-                // use deleted marker, instead of physical deletion
-                resultRecords =
-                    List<Map<String, dynamic>>.from(partitionRecords);
-                for (int i = 0; i < resultRecords.length; i++) {
-                  final record = resultRecords[i];
-                  // skip already empty records
-                  if (isDeletedRecord(record)) continue;
-
-                  final pk = record[primaryKey]?.toString() ?? '';
-                  if (recordsByPk.containsKey(pk)) {
-                    // use explicit delete marker instead of empty object, to prevent migration issues
-                    resultRecords[i] = {'_deleted_': true};
-                    modified = true;
-                    processedKeys.add(pk);
-                  }
-                }
-              } else {
-                // update operation - update matching records
-                resultRecords =
-                    List<Map<String, dynamic>>.from(partitionRecords);
-                for (int i = 0; i < resultRecords.length; i++) {
-                  final record = resultRecords[i];
-                  final pk = record[primaryKey]?.toString() ?? '';
-                  if (pk.isNotEmpty && recordsByPk.containsKey(pk)) {
-                    resultRecords[i] = recordsByPk[pk]!;
-                    modified = true;
-                    processedKeys.add(pk);
-                  }
-                }
-              }
-
-              // if partition is modified, save update
-              PartitionMeta? updatedPartitionMeta;
-              if (modified) {
-                // Check if all records are empty objects (deleted records)
-                bool allEmpty = resultRecords.isNotEmpty &&
-                    resultRecords.every((record) => isDeletedRecord(record));
-
-                if (resultRecords.isEmpty || allEmpty) {
-                  // partition is empty or all records are empty, delete partition file
-                  final partitionPath = await _dataStore.pathManager
-                      .getPartitionFilePath(tableName, partitionIndex);
-                  if (await _dataStore.storage.existsFile(partitionPath)) {
-                    await _dataStore.storage.deleteFile(partitionPath);
-                  }
-
-                  // mark partition as empty
-                  final partitionMeta = existingPartitions
-                      .firstWhere((p) => p.index == partitionIndex);
-                  updatedPartitionMeta = partitionMeta.copyWith(
-                      totalRecords: 0,
-                      fileSizeInBytes: 0,
-                      timestamps: Timestamps(
-                          created: partitionMeta.timestamps.created,
-                          modified: DateTime.now()));
-                } else {
-                  // rewrite partition file, but not update table meta
-                  updatedPartitionMeta = await _savePartitionFile(
-                    tableName,
-                    isGlobal,
-                    partitionIndex,
-                    resultRecords,
-                    primaryKey,
-                    existingPartitions,
-                    encryptionKey: encryptionKey,
-                    encryptionKeyId: encryptionKeyId,
-                    operationType: BufferOperationType.update,
-                  );
-                }
-
-                // save updated partition meta
-                allPartitionMetas.add(updatedPartitionMeta);
-              }
-
-              // return partition processing result
-              return {
-                'index': partitionIndex,
-                'modified': modified,
-                'processedKeys': processedKeys.toList(),
-              };
-            },
-            description:
-                '${operationType == BufferOperationType.delete ? "delete" : "update"} records',
-          );
-
-          // all partitions processed, update table meta once
-          // Even if allPartitionMetas is empty, we still need to update table metadata
-          // to reflect deletions that didn't create any meta entries
-          await _updateTableMetadataWithAllPartitions(
-              tableName, allPartitionMetas, existingPartitions);
-
-          // if update operation, need to handle records not found (as insert operation)
-          if (operationType == BufferOperationType.update) {
-            // collect all processed keys
-            final processedKeys = <String>{};
-            for (var result in partitionResults) {
-              final keys = (result['processedKeys'] as List).cast<String>();
-              processedKeys.addAll(keys);
-            }
-
-            // find records not processed
-            final recordsToInsert = records.where((record) {
-              final pk = record[primaryKey]?.toString() ?? '';
-              return pk.isNotEmpty && !processedKeys.contains(pk);
-            }).toList();
-
-            // if there are records not processed, recursively call but use insert operation
-            if (recordsToInsert.isNotEmpty) {
-              await writeRecords(
-                tableName: tableName,
-                records: recordsToInsert,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-                operationType: BufferOperationType.insert,
-              );
-            }
-          }
-        } else {
-          // sequential processing - avoid concurrent overhead for small amount
-          final processedKeys = <String>{};
-
-          // Keep track of updated partition metadata for sequential processing
-          final List<PartitionMeta> sequentialPartitionMetas = [];
-
-          for (final partition in partitionsToProcess) {
-            // read partition records
+        final tasks = partitionsToProcess.map((partition) {
+          return () async {
             final partitionRecords = await readRecordsFromPartition(
                 tableName, isGlobal, partition.index, primaryKey,
                 encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
-            // handle based on operation type
+            bool modified = false;
             List<Map<String, dynamic>> resultRecords;
+            Set<String> processedKeysInPartition = {};
 
             if (operationType == BufferOperationType.delete) {
-              // use deleted marker, instead of physical deletion
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
               for (int i = 0; i < resultRecords.length; i++) {
                 final record = resultRecords[i];
+                if (isDeletedRecord(record)) continue;
 
-                // only delete non-empty records
-                if (!isDeletedRecord(record)) {
-                  final pk = record[primaryKey]?.toString() ?? '';
-                  if (recordsByPk.containsKey(pk)) {
-                    // use explicit delete marker instead of empty object, to prevent migration issues
-                    resultRecords[i] = {'_deleted_': true};
-                    processedKeys.add(pk);
-                  }
+                final pk = record[primaryKey]?.toString() ?? '';
+                if (recordsByPk.containsKey(pk)) {
+                  resultRecords[i] = {'_deleted_': true};
+                  modified = true;
+                  processedKeysInPartition.add(pk);
                 }
               }
-
-              // Ensure we still update table metadata even when no records were modified
-              // This is important to maintain correct stats
-              if (recordsByPk.isNotEmpty) {}
             } else {
-              // update operation - update matching records
+              // update operation
               resultRecords = List<Map<String, dynamic>>.from(partitionRecords);
               for (int i = 0; i < resultRecords.length; i++) {
                 final record = resultRecords[i];
                 final pk = record[primaryKey]?.toString() ?? '';
                 if (pk.isNotEmpty && recordsByPk.containsKey(pk)) {
                   resultRecords[i] = recordsByPk[pk]!;
-                  processedKeys.add(pk);
+                  modified = true;
+                  processedKeysInPartition.add(pk);
                 }
               }
             }
 
-            // Always process partitions for delete/update operations
-            // to ensure proper metadata updates
-            // Check if all records are empty objects (deleted records)
-            bool allEmpty = resultRecords.isNotEmpty &&
-                resultRecords.every((record) => isDeletedRecord(record));
+            PartitionMeta? updatedPartitionMeta;
+            if (modified) {
+              bool allEmpty = resultRecords.isNotEmpty &&
+                  resultRecords.every((record) => isDeletedRecord(record));
 
-            if (resultRecords.isEmpty || allEmpty) {
-              // partition is empty or all records are empty, delete partition file
-              final partitionPath = await _dataStore.pathManager
-                  .getPartitionFilePath(tableName, partition.index);
-              if (await _dataStore.storage.existsFile(partitionPath)) {
-                await _dataStore.storage.deleteFile(partitionPath);
-              }
-
-              // mark partition as empty and add to the list of updated partitions
-              final updatedPartition = partition.copyWith(
-                  totalRecords: 0,
-                  fileSizeInBytes: 0,
-                  timestamps: Timestamps(
-                      created: partition.timestamps.created,
-                      modified: DateTime.now()));
-
-              sequentialPartitionMetas.add(updatedPartition);
-            } else {
-              // rewrite partition file and add metadata to the list
-              final updatedPartitionMeta = await _savePartitionFile(
+              if (resultRecords.isEmpty || allEmpty) {
+                final partitionPath = await _dataStore.pathManager
+                    .getPartitionFilePath(tableName, partition.index);
+                if (await _dataStore.storage.existsFile(partitionPath)) {
+                  await _dataStore.storage.deleteFile(partitionPath);
+                }
+                updatedPartitionMeta = partition.copyWith(
+                    totalRecords: 0,
+                    fileSizeInBytes: 0,
+                    timestamps: Timestamps(
+                        created: partition.timestamps.created,
+                        modified: DateTime.now()));
+              } else {
+                updatedPartitionMeta = await _savePartitionFile(
                   tableName,
                   isGlobal,
                   partition.index,
@@ -3265,35 +2856,54 @@ class TableDataManager {
                   existingPartitions,
                   encryptionKey: encryptionKey,
                   encryptionKeyId: encryptionKeyId,
-                  operationType: BufferOperationType.update);
-
-              sequentialPartitionMetas.add(updatedPartitionMeta);
+                  operationType: BufferOperationType.update,
+                );
+              }
             }
-            await Future.delayed(Duration.zero);
+            return {
+              'meta': updatedPartitionMeta,
+              'keys': processedKeysInPartition,
+            };
+          };
+        }).toList();
+
+        final partitionResults =
+            await ParallelProcessor.execute<Map<String, dynamic>>(tasks,
+                concurrency: concurrency);
+
+        final processedKeys = <String>{};
+        for (final result in partitionResults) {
+          if (result != null) {
+            if (result['meta'] is PartitionMeta) {
+              allPartitionMetas.add(result['meta']);
+            }
+            if (result['keys'] is Set<String>) {
+              processedKeys.addAll(result['keys']);
+            }
           }
+        }
 
-          // Update table metadata with all processed partitions
-          await _updateTableMetadataWithAllPartitions(
-              tableName, sequentialPartitionMetas, existingPartitions);
+        await _updateTableMetadataWithAllPartitions(
+            tableName, allPartitionMetas, existingPartitions);
 
-          // if update operation, need to handle records not found (as insert operation)
-          if (operationType == BufferOperationType.update) {
-            // find records not processed
-            final recordsToInsert = records.where((record) {
-              final pk = record[primaryKey]?.toString() ?? '';
-              return pk.isNotEmpty && !processedKeys.contains(pk);
-            }).toList();
+        // if update operation, need to handle records not found (as insert operation)
+        if (operationType == BufferOperationType.update) {
+          // find records not processed
+          final recordsToInsert = records.where((record) {
+            final pk = record[primaryKey]?.toString() ?? '';
+            return pk.isNotEmpty && !processedKeys.contains(pk);
+          }).toList();
 
-            // if there are records not processed, recursively call but use insert operation
-            if (recordsToInsert.isNotEmpty) {
-              await writeRecords(
-                tableName: tableName,
-                records: recordsToInsert,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-                operationType: BufferOperationType.insert,
-              );
-            }
+          // if there are records not processed, recursively call but use insert operation
+          if (recordsToInsert.isNotEmpty) {
+            await writeRecords(
+              tableName: tableName,
+              records: recordsToInsert,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+              operationType: BufferOperationType.insert,
+              concurrency: concurrency,
+            );
           }
         }
       } else if (operationType == BufferOperationType.rewrite) {
@@ -3307,11 +2917,8 @@ class TableDataManager {
         // store all processed partition meta
         List<PartitionMeta> allPartitionMetas = [];
 
-        // parallel write to new partitions
-        final partitionResults =
-            await processPartitionsConcurrently<PartitionMeta?>(
-          partitionIndexes: partitionRecords.keys.toList(),
-          processFunction: (partitionIndex) async {
+        final tasks = partitionRecords.keys.map((partitionIndex) {
+          return () async {
             final recordsForPartition = partitionRecords[partitionIndex]!;
             if (recordsForPartition.isEmpty) return null;
 
@@ -3326,16 +2933,14 @@ class TableDataManager {
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
                 operationType: BufferOperationType.rewrite);
-          },
-          description: 'parallel rewrite table partitions',
-        );
+          };
+        }).toList();
+        final partitionResults = await ParallelProcessor.execute<PartitionMeta?>(
+            tasks,
+            concurrency: concurrency);
 
         // collect all valid partition meta
-        for (var meta in partitionResults) {
-          if (meta != null) {
-            allPartitionMetas.add(meta);
-          }
-        }
+        allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());
 
         // all partitions processed, update table meta once
         await _updateTableMetadataWithAllPartitions(
@@ -3648,14 +3253,9 @@ class TableDataManager {
       final isGlobal = sourceSchema.isGlobal;
       final primaryKey = sourceSchema.primaryKey;
 
-      // Collect all partition meta for later update table meta
-      final List<PartitionMeta> allPartitionMetas = [];
-
-      // Process all partitions from source table
-      await processPartitionsConcurrently<void>(
-        partitionIndexes:
-            sourceFileMeta.partitions!.map((p) => p.index).toList(),
-        processFunction: (partitionIndex) async {
+      final tasks =
+          sourceFileMeta.partitions!.map((p) => p.index).map((partitionIndex) {
+        return () async {
           // Read source partition data
           final records = await readRecordsFromPartition(
               sourceTableName, isGlobal, partitionIndex, primaryKey,
@@ -3666,7 +3266,7 @@ class TableDataManager {
               await processFunction(records, partitionIndex);
 
           // Write to target table with same partition index
-          final partitionMeta = await _savePartitionFile(
+          return await _savePartitionFile(
             targetTableName,
             isGlobal,
             partitionIndex,
@@ -3677,19 +3277,16 @@ class TableDataManager {
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
-
-          // Collect partition meta, for later update table meta
-          allPartitionMetas.add(partitionMeta);
-        },
-        requireLock: true,
-        description:
-            'rewrite from source to target: $sourceTableName -> $targetTableName',
-      );
+        };
+      }).toList();
+      final partitionMetas =
+          await ParallelProcessor.execute<PartitionMeta>(tasks);
 
       // Update target table meta with all collected partitions
-      if (allPartitionMetas.isNotEmpty) {
+      final validMetas = partitionMetas.whereType<PartitionMeta>().toList();
+      if (validMetas.isNotEmpty) {
         await _updateTableMetadataWithAllPartitions(
-            targetTableName, allPartitionMetas, []);
+            targetTableName, validMetas, []);
       }
     } catch (e, stack) {
       Logger.error(
@@ -3719,44 +3316,60 @@ class TableDataManager {
     if (_deleteBuffer.isEmpty) return;
 
     final startTime = DateTime.now();
+    final maxTablesPerFlush = _dataStore.config.maxTablesPerFlush;
+    final maxBatchSize = _dataStore.config.maxBatchSize;
 
-    // Get list of tables to process
-    final tablesToProcess = _deleteBuffer.keys.toList();
+    // Get list of tables to process that are not already being processed
+    final availableTables = _deleteBuffer.keys
+        .where((tableName) => !_processingTables.contains(tableName))
+        .toList();
 
-    // Keep track of tables with errors to avoid infinite retry
-    final errorTables = <String>[];
+    if (availableTables.isEmpty) {
+      return;
+    }
 
-    // Decide maximum parallel operations based on configuration
-    final maxConcurrent = _effectiveMaxConcurrent;
+    // Sort tables by priority (larger queue size has higher priority)
+    availableTables.sort((a, b) =>
+        (_deleteBuffer[b]?.length ?? 0) - (_deleteBuffer[a]?.length ?? 0));
 
-    // Use a concurrent queue system
-    final processingQueue = <Future<void>>[];
-    const tableStartIndex = 0;
-    final maxTablesToProcess =
-        min(maxConcurrent, tablesToProcess.length - tableStartIndex);
+    // Filter for high-priority tables that meet the batch size threshold
+    final highPriorityTables = availableTables
+        .where(
+            (table) => (_deleteBuffer[table]?.length ?? 0) >= maxBatchSize / 2)
+        .take(maxTablesPerFlush)
+        .toList();
 
-    if (maxTablesToProcess <= 0) {
+    // If no high-priority tables, take the largest ones up to the flush limit
+    final tablesToProcess = highPriorityTables.isNotEmpty
+        ? highPriorityTables
+        : availableTables
+            .take(min(maxTablesPerFlush, availableTables.length))
+            .toList();
+
+    if (tablesToProcess.isEmpty) {
       return;
     }
 
     try {
-      // Process maxTablesToProcess tables in parallel
-      for (int i = 0; i < maxTablesToProcess; i++) {
-        final tableIndex = tableStartIndex + i;
-        if (tableIndex >= tablesToProcess.length) break;
+      // Dynamic Concurrency Distribution
+      final totalConcurrency = _effectiveMaxConcurrent;
+      final numTables = tablesToProcess.length;
+      final baseConcurrency = totalConcurrency ~/ numTables;
+      final remainder = totalConcurrency % numTables;
 
-        final tableName = tablesToProcess[tableIndex];
-        if (errorTables.contains(tableName)) continue;
+      final concurrencyPerTable = List.generate(
+          numTables, (i) => baseConcurrency + (i < remainder ? 1 : 0));
 
-        processingQueue.add(_flushTableDeleteBuffer(tableName).catchError((e) {
-          Logger.error('Error flushing delete buffer for table $tableName: $e',
-              label: 'TableDataManager.flushDeleteBuffer');
-          errorTables.add(tableName);
-        }));
-      }
-
-      // Wait for all processing to complete
-      await Future.wait(processingQueue);
+      // Process tables in parallel
+      await ParallelProcessor.execute<void>(
+        List.generate(tablesToProcess.length, (index) {
+          final tableName = tablesToProcess[index];
+          final concurrencyForThisTable = concurrencyPerTable[index];
+          return () => _flushTableDeleteBuffer(tableName,
+              concurrency: concurrencyForThisTable);
+        }),
+        timeout: ParallelProcessor.noTimeout,
+      );
 
       final duration = DateTime.now().difference(startTime).inMilliseconds;
 
@@ -3786,7 +3399,8 @@ class TableDataManager {
   }
 
   /// Flush single table delete buffer
-  Future<void> _flushTableDeleteBuffer(String tableName) async {
+  Future<void> _flushTableDeleteBuffer(String tableName,
+      {int? concurrency}) async {
     // Use lock manager's exclusive lock to ensure data for the same table isn't processed concurrently
     final lockKey = 'table_$tableName';
     bool lockAcquired = false;
@@ -3882,15 +3496,16 @@ class TableDataManager {
             await writeRecords(
                 tableName: tableName,
                 records: recordsToDelete,
-                operationType: BufferOperationType.delete);
+                operationType: BufferOperationType.delete,
+                concurrency: concurrency);
           }
 
           recordsProcessed += processedEntries.length;
 
-          // After current batch is processed, yield execution thread for 2ms to avoid blocking UI
+          // After current batch is processed, yield execution thread for 1ms to avoid blocking UI
           if (_deleteBuffer.containsKey(tableName) &&
               !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
-            await Future.delayed(const Duration(milliseconds: 2));
+            await Future.delayed(const Duration(milliseconds: 1));
           }
         } catch (e) {
           Logger.error('Failed to process delete data for table $tableName: $e',

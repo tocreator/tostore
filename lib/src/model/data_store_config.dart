@@ -201,20 +201,9 @@ class DataStoreConfig {
 
   /// Get default number of tables to process per flush
   static int _getDefaultTablesPerFlush() {
-    if (PlatformHandler.isWeb) {
-      return 2; // Web environment, limit concurrency
-    } else if (PlatformHandler.isMobile) {
-      return 5; // Mobile devices, moderate concurrency
-    } else if (PlatformHandler.isServerEnvironment) {
-      // Simple server formula: 8 base + 1 table per 2 CPU cores
-      int cpuCount = PlatformHandler.recommendedConcurrency;
-      int tablesPerFlush = 8 + (cpuCount ~/ 2);
-
-      // Cap at reasonable maximum
-      return min(tablesPerFlush, 24);
-    } else {
-      return 8; // Desktop devices, fully utilize multi-core processors
-    }
+    // This now simply reflects the max concurrency, as the list of tables to process
+    // acts as a buffer/queue for the concurrent processor.
+    return _getDefaultMaxConcurrent();
   }
 
   static int _getDefaultPrewarmThreshold() {

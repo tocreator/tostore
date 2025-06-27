@@ -1435,7 +1435,7 @@ class MigrationManager {
             // no rename table operation, directly process data migration
             await migrationInstance.tableDataManager.processTablePartitions(
                 tableName: currentTableName,
-                processFunction: (records, partitionIndex) async {
+                processFunction: (records, partitionIndex, controller) async {
                   final migratedRecords = await _applyMigrationOperations(
                       records, sortedOperations,
                       oldSchema: oldSchema);

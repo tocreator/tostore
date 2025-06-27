@@ -193,7 +193,7 @@ class KeyManager {
       // Concurrent partition processing interface
       await _dataStore.tableDataManager.processTablePartitions(
         tableName: tableName,
-        processFunction: (records, partitionIndex) async {
+        processFunction: (records, partitionIndex, controller) async {
           return records;
         },
         encryptionKey: newKey,

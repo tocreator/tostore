@@ -817,54 +817,46 @@ class QueryExecutor {
         // Check for early return in case of exact primary key match
         final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
 
-        try {
-          // Efficiently process target partitions
-          await _dataStore.tableDataManager.processTablePartitions(
-            tableName: tableName,
-            onlyRead: true,
-            targetPartitions: targetPartitions, // Use target partitions list
-            processFunction: (records, partitionIndex) async {
-              if (condition != null) {
-                // Apply filter conditions
-                for (var record in records) {
-                  // Skip deleted records
-                  if (isDeletedRecord(record)) continue;
+        // Efficiently process target partitions
+        await _dataStore.tableDataManager.processTablePartitions(
+          tableName: tableName,
+          onlyRead: true,
+          targetPartitions: targetPartitions, // Use target partitions list
+          processFunction: (records, partitionIndex, controller) async {
+            if (controller.isStopped) {
+              return records;
+            }
 
-                  if (condition.matches(record)) {
-                    resultMap[record[primaryKey].toString()] = record;
+            if (condition != null) {
+              // Apply filter conditions
+              for (var record in records) {
+                // Skip deleted records
+                if (isDeletedRecord(record)) continue;
 
-                    // If exact primary key match is found, throw exception to immediately terminate all partition processing
-                    if (exactPkMatch != null &&
-                        record[primaryKey] == exactPkMatch) {
-                      // Create a deep copy of the record
-                      final matchRecord = Map<String, dynamic>.from(record);
-                      throw 'exact_match_found:$partitionIndex:${matchRecord[primaryKey]}';
-                    }
+                if (condition.matches(record)) {
+                  resultMap[record[primaryKey].toString()] = record;
+
+                  // If exact primary key match is found, stop all partition processing
+                  if (exactPkMatch != null &&
+                      record[primaryKey] == exactPkMatch) {
+                    controller.stop();
+                    return records;
                   }
                 }
-              } else {
-                // No filter conditions, add all records
-                for (var record in records) {
-                  // Skip deleted records
-                  if (isDeletedRecord(record)) continue;
-
-                  resultMap[record[primaryKey].toString()] = record;
-                }
               }
+            } else {
+              // No filter conditions, add all records
+              for (var record in records) {
+                // Skip deleted records
+                if (isDeletedRecord(record)) continue;
 
-              return records;
-            },
-          );
-        } catch (e) {
-          // Catch exact match exception, this is a normal early termination process
-          if (e is String && e.startsWith('exact_match_found:')) {
-            // No need to clear result set here, because the exact match record has been added to resultMap
-          } else {
-            // Other exceptions log
-            Logger.error('Error during table scan: $e',
-                label: 'QueryExecutor._performTableScan');
-          }
-        }
+                resultMap[record[primaryKey].toString()] = record;
+              }
+            }
+
+            return records;
+          },
+        );
 
         // Process records in write queue that match the condition
         final pendingData =
@@ -913,7 +905,8 @@ class QueryExecutor {
         await _dataStore.tableDataManager.processTablePartitions(
           tableName: tableName,
           onlyRead: true,
-          processFunction: (records, partitionIndex) async {
+          maxConcurrent: _dataStore.config.maxConcurrent,
+          processFunction: (records, partitionIndex, controller) async {
             for (var record in records) {
               // Skip deleted records
               if (isDeletedRecord(record)) continue;
@@ -1183,39 +1176,33 @@ class QueryExecutor {
       // Result set
       final resultMap = <String, Map<String, dynamic>>{};
 
-      try {
-        // Only process target partitions
-        await _dataStore.tableDataManager.processTablePartitions(
-          tableName: tableName,
-          onlyRead: true,
-          targetPartitions: targetPartitions,
-          processFunction: (records, partitionIndex) async {
-            for (var record in records) {
-              // Skip deleted records
-              if (isDeletedRecord(record)) continue;
+      // Only process target partitions
+      await _dataStore.tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true,
+        targetPartitions: targetPartitions,
+        processFunction: (records, partitionIndex, controller) async {
+          if (controller.isStopped) {
+            return records;
+          }
+          for (var record in records) {
+            // Skip deleted records
+            if (isDeletedRecord(record)) continue;
 
-              // Primary key exact match
-              if (record[primaryKey] == pkValue) {
-                // If the record satisfies all query conditions
-                if (queryCondition == null || queryCondition.matches(record)) {
-                  resultMap[record[primaryKey].toString()] = record;
-                  // Terminate all partition processing immediately after finding a matching record
-                  throw 'exact_match_found:$partitionIndex:${record[primaryKey]}';
-                }
+            // Primary key exact match
+            if (record[primaryKey] == pkValue) {
+              // If the record satisfies all query conditions
+              if (queryCondition == null || queryCondition.matches(record)) {
+                resultMap[record[primaryKey].toString()] = record;
+                // Terminate all partition processing immediately after finding a matching record
+                controller.stop();
+                return records;
               }
             }
-            return records;
-          },
-        );
-      } catch (e) {
-        // Catch exact match exception, this is a normal early termination process
-        if (e is String && e.startsWith('exact_match_found:')) {
-          // No need to clean up the result set, because the matching record has been added to resultMap
-        } else {
-          Logger.error('Primary key scan error: $e',
-              label: 'QueryExecutor._performPrimaryKeyScan');
-        }
-      }
+          }
+          return records;
+        },
+      );
 
       // Check the write buffer to see if there are any updated records
       final pendingData =

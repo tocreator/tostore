@@ -1129,7 +1129,7 @@ class IndexManager {
 
       if (hasChanges) {
         // Set closing flag, ensure synchronous processing
-        _isClosing = true;
+    _isClosing = true;
 
         // Force processing all write buffers
         await _processIndexWriteBuffer();
@@ -2635,28 +2635,29 @@ class IndexManager {
             }
 
             // if table cache is not available, check table file partitions
-            try {
-              await _dataStore.tableDataManager.processTablePartitions(
-                  tableName: tableName,
-                  onlyRead: true,
-                  processFunction: (records, partitionIndex) async {
-                    for (var record in records) {
-                      if (record[field.name] == value &&
-                          (!isUpdate || record[primaryKey] != primaryValue)) {
-                        throw 'unique_constraint_violation: ${field.name} = $value';
-                      }
-                    }
+            bool isViolated = false;
+            await _dataStore.tableDataManager.processTablePartitions(
+                tableName: tableName,
+                onlyRead: true,
+                processFunction: (records, partitionIndex, controller) async {
+                  if (controller.isStopped) {
                     return records;
-                  });
-            } catch (e) {
-              if (e is String && e.startsWith('unique_constraint_violation:')) {
-                Logger.warn(
-                    'Unique field constraint violation: ${field.name} = $value',
-                    label: 'IndexManager.checkUniqueConstraints');
-                return false;
-              } else {
-                rethrow;
-              }
+                  }
+                  for (var record in records) {
+                    if (record[field.name] == value &&
+                        (!isUpdate || record[primaryKey] != primaryValue)) {
+                      isViolated = true;
+                      controller.stop();
+                      return records;
+                    }
+                  }
+                  return records;
+                });
+            if (isViolated) {
+              Logger.warn(
+                  'Unique field constraint violation: ${field.name} = $value',
+                  label: 'IndexManager.checkUniqueConstraints');
+              return false;
             }
           }
         }
@@ -2783,29 +2784,30 @@ class IndexManager {
         }
 
         // check table file partitions
-        try {
-          await _dataStore.tableDataManager.processTablePartitions(
-              tableName: tableName,
-              onlyRead: true,
-              processFunction: (records, partitionIndex) async {
-                for (var record in records) {
-                  final recordIndexKey = _createIndexKey(record, index.fields);
-                  if (recordIndexKey == indexKey &&
-                      (!isUpdate || record[primaryKey] != primaryValue)) {
-                    throw 'unique_constraint_violation: ${index.fields.join("+")} = $indexKey';
-                  }
-                }
+        bool isViolated = false;
+        await _dataStore.tableDataManager.processTablePartitions(
+            tableName: tableName,
+            onlyRead: true,
+            processFunction: (records, partitionIndex, controller) async {
+              if (controller.isStopped) {
                 return records;
-              });
-        } catch (e) {
-          if (e is String && e.startsWith('unique_constraint_violation:')) {
-            Logger.warn(
-                'Unique index constraint violation: ${index.fields.join("+")} = $indexKey',
-                label: 'IndexManager.checkUniqueConstraints');
-            return false;
-          } else {
-            rethrow;
-          }
+              }
+              for (var record in records) {
+                final recordIndexKey = _createIndexKey(record, index.fields);
+                if (recordIndexKey == indexKey &&
+                    (!isUpdate || record[primaryKey] != primaryValue)) {
+                  isViolated = true;
+                  controller.stop();
+                  return records;
+                }
+              }
+              return records;
+            });
+        if (isViolated) {
+          Logger.warn(
+              'Unique index constraint violation: ${index.fields.join("+")} = $indexKey',
+              label: 'IndexManager.checkUniqueConstraints');
+          return false;
         }
       }
 
@@ -4004,7 +4006,7 @@ class IndexManager {
           tableName: tableName,
           onlyRead: true,
           maxConcurrent: maxConcurrent,
-          processFunction: (records, partitionIndex) async {
+          processFunction: (records, partitionIndex, controller) async {
             // Create index data container for this partition
             if (!partitionIndexData.containsKey(partitionIndex)) {
               partitionIndexData[partitionIndex] = {};

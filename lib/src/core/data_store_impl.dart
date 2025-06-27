@@ -40,6 +40,7 @@ import '../model/log_config.dart';
 import 'old_structure_migration_handler.dart';
 import 'directory_manager.dart';
 import '../model/space_info.dart';
+import '../handler/parallel_processor.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -311,6 +312,15 @@ class DataStoreImpl {
       } else {
         _config = config.copyWith(dbPath: dbPath);
       }
+
+      // Configure the global parallel processor with sensible defaults
+      ParallelProcessor.setConfig(
+        concurrency: _config!.maxConcurrent,
+        // Calculate a dynamic timeout based on max partition size.
+        // Formula: 5 seconds base + 1 second per 128KB.
+        timeout: Duration(
+            seconds: 5 + (_config!.maxPartitionFileSize / (128 * 1024)).ceil()),
+      );
 
       // Ensure _currentSpaceName is synchronized with config.spaceName
       _currentSpaceName = _config!.spaceName;
@@ -1480,7 +1490,8 @@ class DataStoreImpl {
 
         // build a process function, to check if each partition's record matches the delete condition
         Future<List<Map<String, dynamic>>> processFunction(
-            List<Map<String, dynamic>> records, int partitionIndex) async {
+            List<Map<String, dynamic>> records, int partitionIndex,
+            ParallelController controller) async {
           // record original count
           int originalCount = records.length;
 

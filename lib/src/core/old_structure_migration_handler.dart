@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../handler/common.dart';
 import '../handler/logger.dart';
+import '../model/buffer_entry.dart';
 import 'data_store_impl.dart';
 import 'path_manager.dart';
 import 'storage_adapter.dart';
@@ -273,6 +274,7 @@ class OldStructureMigrationHandler {
               await dataStore.tableDataManager.writeRecords(
                 tableName: tableName,
                 records: records,
+                operationType: BufferOperationType.insert,
               );
             } catch (e) {
               Logger.error(
