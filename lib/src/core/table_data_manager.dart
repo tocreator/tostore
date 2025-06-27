@@ -1181,11 +1181,7 @@ class TableDataManager {
         }
       }
 
-      final cachedTables = _dataStore.dataCacheManager.getAllFullTableCaches();
-      int totalSize = 0;
-      for (final cachedTable in cachedTables) {
-        totalSize += await getTableFileSize(cachedTable);
-      }
+      final totalSize = _dataStore.dataCacheManager.getCurrentRecordCacheSize();
 
       // Get record cache size using MemoryManager
       final recordCacheSize =
@@ -2414,8 +2410,8 @@ class TableDataManager {
               encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
 
           // process data
-          final processedRecords =
-              await processFunction(records, partitionIndex, effectiveController);
+          final processedRecords = await processFunction(
+              records, partitionIndex, effectiveController);
 
           // if only read or if the process was stopped, return directly
           if (onlyRead || effectiveController.isStopped) {
@@ -2747,9 +2743,9 @@ class TableDataManager {
           };
         }).toList();
 
-        final partitionResults =
-            await ParallelProcessor.execute<PartitionMeta>(tasks,
-                concurrency: concurrency);
+        final partitionResults = await ParallelProcessor.execute<PartitionMeta>(
+            tasks,
+            concurrency: concurrency);
         allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());
 
         // all partitions processed, update table meta once
@@ -2954,9 +2950,9 @@ class TableDataManager {
                 operationType: BufferOperationType.rewrite);
           };
         }).toList();
-        final partitionResults = await ParallelProcessor.execute<PartitionMeta?>(
-            tasks,
-            concurrency: concurrency);
+        final partitionResults =
+            await ParallelProcessor.execute<PartitionMeta?>(tasks,
+                concurrency: concurrency);
 
         // collect all valid partition meta
         allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());

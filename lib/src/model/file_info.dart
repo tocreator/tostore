@@ -723,6 +723,12 @@ class IndexMeta {
   /// whether the index is unique
   final bool isUnique;
 
+  /// total size of all partitions in bytes
+  final int totalSizeInBytes;
+
+  /// total number of entries in the index
+  final int totalEntries;
+
   /// partition list - when isOrdered is true, this list is sorted by minKey for binary search
   final List<IndexPartitionMeta> partitions;
 
@@ -744,6 +750,8 @@ class IndexMeta {
     required this.partitions,
     required this.timestamps,
     this.isOrdered,
+    this.totalSizeInBytes = 0,
+    this.totalEntries = 0,
   });
 
   IndexMeta copyWith({
@@ -756,6 +764,8 @@ class IndexMeta {
     List<IndexPartitionMeta>? partitions,
     Timestamps? timestamps,
     bool? isOrdered,
+    int? totalSizeInBytes,
+    int? totalEntries,
   }) {
     return IndexMeta(
       version: version ?? this.version,
@@ -766,22 +776,39 @@ class IndexMeta {
       partitions: partitions ?? List.from(this.partitions),
       timestamps: timestamps ?? this.timestamps,
       isOrdered: isOrdered ?? this.isOrdered,
+      totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
+      totalEntries: totalEntries ?? this.totalEntries,
     );
   }
 
   factory IndexMeta.fromJson(Map<String, dynamic> json) {
+    final partitions = (json['partitions'] as List)
+        .map((e) => IndexPartitionMeta.fromJson(e as Map<String, dynamic>))
+        .toList();
+
+    int totalSize = json['totalSizeInBytes'] as int? ?? 0;
+    // For backward compatibility, calculate if not present
+    if (totalSize == 0 && partitions.isNotEmpty) {
+      totalSize = partitions.fold<int>(0, (sum, p) => sum + p.bTreeSize);
+    }
+    int totalEntries = json['totalEntries'] as int? ?? 0;
+    // For backward compatibility, calculate if not present
+    if (totalEntries == 0 && partitions.isNotEmpty) {
+      totalEntries = partitions.fold<int>(0, (sum, p) => sum + p.entries);
+    }
+
     return IndexMeta(
       version: json['version'] as int,
       name: json['name'] as String,
       tableName: json['tableName'] as String,
       fields: (json['fields'] as List).map((e) => e as String).toList(),
       isUnique: json['isUnique'] as bool,
-      partitions: (json['partitions'] as List)
-          .map((e) => IndexPartitionMeta.fromJson(e as Map<String, dynamic>))
-          .toList(),
+      partitions: partitions,
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       isOrdered: json['isOrdered'] as bool?,
+      totalSizeInBytes: totalSize,
+      totalEntries: totalEntries,
     );
   }
 
@@ -792,6 +819,8 @@ class IndexMeta {
       'tableName': tableName,
       'fields': fields,
       'isUnique': isUnique,
+      'totalSizeInBytes': totalSizeInBytes,
+      'totalEntries': totalEntries,
       'partitions': partitions.map((e) => e.toJson()).toList(),
       'timestamps': timestamps.toJson(),
       if (isOrdered != null) 'isOrdered': isOrdered,
@@ -941,6 +970,6 @@ class IndexMeta {
 
   @override
   String toString() {
-    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, fields: $fields, isUnique: $isUnique, partitions: $partitions, timestamps: $timestamps, isOrdered: $isOrdered)';
+    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, fields: $fields, isUnique: $isUnique, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, partitions: $partitions, timestamps: $timestamps, isOrdered: $isOrdered)';
   }
 }

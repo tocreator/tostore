@@ -39,7 +39,8 @@ class DataCacheManager {
 
   DataCacheManager(this._dataStore)
       : _queryCache = QueryCache(
-          maxSize: _dataStore.memoryManager?.getQueryCacheSize() ?? 10000,
+          maxSizeBytes: _dataStore.memoryManager?.getQueryCacheSize() ??
+              5000000, // Default to 5MB
         ) {
     // Register periodic tasks
     _registerCronJobs();
@@ -305,7 +306,7 @@ class DataCacheManager {
       }
 
       // Record the dependency between queries and tables
-      for (var table in tables) {
+      for (var table in tables.toList()) {
         final schema = await _dataStore.getTableSchema(table);
         if (schema == null) {
           Logger.error('Table $table does not exist',
@@ -432,7 +433,7 @@ class DataCacheManager {
       if (tableDependency != null) {
         final pkString = primaryKeyValue.toString();
 
-        for (var entry in tableDependency.entries) {
+        for (var entry in tableDependency.entries.toList()) {
           final queryInfo = entry.value;
           final cacheKeyStr = entry.key;
 
@@ -514,7 +515,7 @@ class DataCacheManager {
     final keysToRemove = <String>[];
 
     // Check each query, only clean up full table cache queries
-    for (var entry in tableDependency.entries) {
+    for (var entry in tableDependency.entries.toList()) {
       final queryInfo = entry.value;
 
       // skip user-managed caches, these caches need to be manually invalidated by the user
@@ -556,7 +557,7 @@ class DataCacheManager {
 
       int processedCount = 0;
       // Check each query
-      for (var entry in tableQueries.entries) {
+      for (var entry in tableQueries.entries.toList()) {
         final queryInfo = entry.value;
         final cacheKeyStr = entry.key;
 
@@ -746,7 +747,7 @@ class DataCacheManager {
 
     int processedCount = 0;
     // Check each query
-    for (var entry in tableDependency.entries) {
+    for (var entry in tableDependency.entries.toList()) {
       final queryInfo = entry.value;
 
       // Skip user-managed caches, these caches need to be manually invalidated by the user
@@ -822,88 +823,63 @@ class DataCacheManager {
       final memoryManager = _dataStore.memoryManager;
       final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
 
-      if (isFullTableCache && records.length > (recordCacheSize / 1000)) {
-        // Calculate based on approximately 1KB per record
+      // Use the standardized estimation method to get the byte size of the new records.
+      final estimatedNewRecordsSize = TableCache.estimateRecordsSize(records);
+
+      if (isFullTableCache && estimatedNewRecordsSize > recordCacheSize) {
+        // The table is too large to be considered a "full table cache" against the total limit.
         needCacheFullTableCache = false;
       }
 
       if (isFullTableCache && !needCacheFullTableCache) {
         Logger.warn(
-          'Table $tableName record count(${records.length}) exceeds full table cache limit(${recordCacheSize / 1000})',
+          'Table $tableName with estimated size ${estimatedNewRecordsSize / 1024}KB exceeds the record cache limit of ${recordCacheSize / 1024}KB. It will not be marked as a full table cache.',
           label: 'DataCacheManager.cacheEntireTable',
         );
       }
 
-      // Check table record cache size, perform cache eviction policy
-      if (_totalRecordCacheSize + records.length > (recordCacheSize / 1000)) {
-        // Execute cache eviction policy
+      // Check if adding the new records would exceed the allocated cache size.
+      if (_totalRecordCacheSize + estimatedNewRecordsSize > recordCacheSize) {
+        // Execute cache eviction policy if the limit is exceeded.
         _evictLowPriorityRecords();
       }
 
       // Get current time as cache time
       final now = DateTime.now();
 
-      // Check if cache for this table already exists
-      TableCache tableCache;
-      int oldCacheSize = 0;
+      // --- Refactored Cache Update Logic ---
 
-      if (tableCaches.containsKey(tableName)) {
-        // Update existing cache
-        tableCache = tableCaches[tableName]!;
-        oldCacheSize = tableCache.totalCacheSize; // Record the old cache size
+      // 1. Get the cache size of the table *before* any modifications.
+      final oldCacheSize = tableCaches[tableName]?.totalCacheSize ?? 0;
 
-        tableCache.isFullTableCache = needCacheFullTableCache;
-        tableCache.cacheTime = now;
-        tableCache.lastAccessed = now;
-
-        // Clear existing records (avoid mixed data causing inconsistency)
-        if (needCacheFullTableCache) {
-          _totalRecordCacheSize -=
-              oldCacheSize; // Subtract the old cache size from the total cache size
-
-          tableCaches.remove(tableName);
-          tableCache = TableCache(
-            tableName: tableName,
-            primaryKeyField: primaryKeyField,
-            isFullTableCache: needCacheFullTableCache,
-            cacheTime: now,
-            lastAccessed: now,
-          );
-        }
-      } else {
-        // Create new table cache
-        tableCache = TableCache(
+      // 2. Get or create the TableCache instance.
+      final tableCache = tableCaches.putIfAbsent(tableName, () {
+        return TableCache(
           tableName: tableName,
           primaryKeyField: primaryKeyField,
-          isFullTableCache: needCacheFullTableCache,
-          cacheTime: now,
-          lastAccessed: now,
         );
+      });
+
+      // If this is a full cache replacement, clear out the old records first.
+      // This correctly resets the table's internal size before adding new records.
+      if (needCacheFullTableCache) {
+        tableCache.clearRecords();
       }
 
-      // Set records
+      // 3. Update cache metadata and add new records. `addRecords` will correctly
+      //    update the internal `totalCacheSize` of the tableCache instance.
+      tableCache.isFullTableCache = needCacheFullTableCache;
+      tableCache.cacheTime = now;
+      tableCache.lastAccessed = now;
       if (records.isNotEmpty) {
-        // Determine cache type
-        const cacheType = RecordCacheType.runtime;
-
-        // Add records in batch
-       await tableCache.addRecords(records, cacheType: cacheType);
+        await tableCache.addRecords(records,
+            cacheType: RecordCacheType.runtime);
       }
 
-      // Store table cache
-      tableCaches[tableName] = tableCache;
-
-      // Update the total cache size
-      if (tableCaches.containsKey(tableName)) {
-        // If it is an existing cache and not fully reset, calculate the increment
-        if (!needCacheFullTableCache) {
-          _totalRecordCacheSize =
-              _totalRecordCacheSize - oldCacheSize + tableCache.totalCacheSize;
-        } else {
-          // If it is a new or fully reset cache, add the new cache size directly
-          _totalRecordCacheSize += tableCache.totalCacheSize;
-        }
-      }
+      // 4. Atomically update the global cache size.
+      // The change is simply the difference between the new and old size of the table's cache.
+      final newCacheSize = tableCache.totalCacheSize;
+      _totalRecordCacheSize += (newCacheSize - oldCacheSize);
     } catch (e) {
       Logger.error('Cache entire table failed: $e',
           label: 'DataCacheManager.cacheEntireTable');
@@ -924,16 +900,18 @@ class DataCacheManager {
 
       int evictedCount = 0;
 
+ 
+
       // First apply time decay to all table caches.
       // This is still an async operation, but we don't need to await it here
       // as the top-level MemoryManager call is already awaited.
-      _applyTimeDecayToAllCaches();
+      await _applyTimeDecayToAllCaches();
 
       // Optimization: Use logarithmic buckets to categorize tables by size, avoiding a full sort.
       final buckets = <int, List<TableCache>>{};
       int maxBucket = 0;
 
-      for (var tableCache in tableCaches.values) {
+      for (var tableCache in tableCaches.values.toList()) {
         if (tableCache.recordCount > 0) {
           final bucketKey = (log(tableCache.recordCount) / log(10)).floor();
           buckets.putIfAbsent(bucketKey, () => []).add(tableCache);
@@ -952,7 +930,7 @@ class DataCacheManager {
           // Sort within the smaller bucket to still prioritize larger tables
           tablesInBucket.sort((a, b) => b.recordCount.compareTo(a.recordCount));
 
-          for (var tableCache in tablesInBucket) {
+          for (var tableCache in tablesInBucket.toList()) {
             if (evictedCount >= totalEvictionCount) break;
 
             final toEvict = min(
@@ -981,10 +959,6 @@ class DataCacheManager {
             // If records were actually evicted and it was previously full table cache, update full table cache flag
             if ((result['count'] as int) > 0 && wasFullTableCache) {
               tableCache.isFullTableCache = false;
-              Logger.debug(
-                'Table ${tableCache.tableName} removed ${result['count']} records due to cache eviction, no longer full table cache',
-                label: 'DataCacheManager._evictLowPriorityRecords',
-              );
             }
 
             // Yielding is now handled by the MemoryManager's serial execution.
@@ -1007,7 +981,7 @@ class DataCacheManager {
   /// Apply time decay to all table caches
   Future<void> _applyTimeDecayToAllCaches() async {
     int processedCount = 0;
-    for (var tableCache in tableCaches.values) {
+    for (var tableCache in tableCaches.values.toList()) {
       await tableCache.applyTimeDecay();
       processedCount++;
       // Yield to the event loop to avoid blocking.
@@ -1198,7 +1172,7 @@ class DataCacheManager {
     final result = <Map<String, dynamic>>[];
     int processedCount = 0;
 
-    for (final recordCache in cache.recordsMap.values) {
+    for (final recordCache in cache.recordsMap.values.toList()) {
       final record = recordCache.record;
       if (record[fieldName] == fieldValue) {
         result.add(Map<String, dynamic>.from(record));

@@ -1,13 +1,13 @@
 import 'dart:convert';
-import 'dart:math';
 
 import '../model/join_clause.dart';
 import 'query_condition.dart';
 import '../handler/logger.dart';
+import '../model/cache.dart';
 
 /// query cache
 class QueryCache {
-  final int _maxSize;
+  final int _maxSizeBytes;
   final Map<String, CachedQuery> _cache = {};
   Map<String, CachedQuery> get cache => _cache;
 
@@ -18,9 +18,9 @@ class QueryCache {
   int get totalCacheSize => _totalCacheSize;
 
   QueryCache({
-    int maxSize = 5000,
+    int maxSizeBytes = 5000000, // Default to 5MB
     Duration maxAge = const Duration(minutes: 10),
-  }) : _maxSize = maxSize;
+  }) : _maxSizeBytes = maxSizeBytes;
 
   /// get cache size
   int get size => _cache.length;
@@ -44,66 +44,50 @@ class QueryCache {
     return cached.results;
   }
 
-  /// Estimate query result size
-  int _estimateCacheEntrySize(List<Map<String, dynamic>> results) {
-    // Basic size (CachedQuery object overhead)
-    int size = 100;
-
-    // Special handling for empty result set
-    if (results.isEmpty) {
-      return size;
-    }
-
-    // Sample calculation size (at most sample 10 records)
-    int sampleSize = min(10, results.length);
-    if (sampleSize > 0) {
-      int totalSampleSize = 0;
-      for (int i = 0; i < sampleSize; i++) {
-        int index = (i * results.length ~/ sampleSize);
-        // Use JSON serialization to estimate size
-        totalSampleSize +=
-            jsonEncode(results[index]).length * 2; // Unicode chars are 2 bytes
-      }
-      // Estimate total size: average size per record * number of records
-      size += (totalSampleSize / sampleSize * results.length).round();
-    }
-
-    return size;
-  }
-
   /// cache query results
   Future<void> put(String key, List<Map<String, dynamic>> results,
       String tableName, String primaryKeyField,
       {Duration? expiryDuration}) async {
     // Calculate new cache size
-    int newEntrySize = _estimateCacheEntrySize(results);
+    int newEntrySize = TableCache.estimateRecordsSize(results) +
+        100; // Standardized estimation + object overhead
 
     // If replacing existing cache, subtract old cache size
     if (_cache.containsKey(key)) {
-      int oldSize = _estimateCacheEntrySize(_cache[key]!.results);
+      int oldSize =
+          TableCache.estimateRecordsSize(_cache[key]!.results) + 100;
       _totalCacheSize -= oldSize;
     }
 
-    if (_cache.length >= _maxSize) {
-      // Find and remove the oldest cache entry by last access time
+    // Evict oldest entries until there is enough space for the new entry.
+    while (_totalCacheSize + newEntrySize > _maxSizeBytes && _cache.isNotEmpty) {
       MapEntry<String, CachedQuery>? oldest;
-      int processedCount = 0;
+      // This loop to find the oldest is inefficient but simple.
+      // For high-performance scenarios, a linked list or priority queue would be better.
       for (final entry in _cache.entries) {
         if (oldest == null ||
             entry.value.lastAccessed.isBefore(oldest.value.lastAccessed)) {
           oldest = entry;
         }
-        processedCount++;
-        if (processedCount % 500 == 0) {
-          await Future.delayed(Duration.zero);
-        }
       }
 
       if (oldest != null) {
-        // Subtract removed cache size
-        _totalCacheSize -= _estimateCacheEntrySize(oldest.value.results);
-        _cache.remove(oldest.key);
+        // Invalidate the oldest entry to free up space.
+        // The invalidate method already handles the size reduction.
+        invalidate(oldest.key);
+      } else {
+        // Should not happen if cache is not empty.
+        break;
       }
+    }
+
+    // After making space, check if the new entry can be added.
+    if (_totalCacheSize + newEntrySize > _maxSizeBytes) {
+      Logger.warn(
+        'Query result for key $key ($newEntrySize bytes) is too large to fit in the cache limit of $_maxSizeBytes bytes.',
+        label: 'QueryCache.put',
+      );
+      return;
     }
 
     final now = DateTime.now();
@@ -131,7 +115,8 @@ class QueryCache {
   void invalidate(String key) {
     // Subtract removed cache size
     if (_cache.containsKey(key)) {
-      _totalCacheSize -= _estimateCacheEntrySize(_cache[key]!.results);
+      _totalCacheSize -=
+          (TableCache.estimateRecordsSize(_cache[key]!.results) + 100);
     }
 
     _cache.remove(key);
@@ -142,7 +127,8 @@ class QueryCache {
   Future<int> invalidateQuery(String queryKey) async {
     if (_cache.containsKey(queryKey)) {
       // Subtract removed cache size
-      _totalCacheSize -= _estimateCacheEntrySize(_cache[queryKey]!.results);
+      _totalCacheSize -=
+          (TableCache.estimateRecordsSize(_cache[queryKey]!.results) + 100);
 
       _cache.remove(queryKey);
       return 1;
@@ -175,7 +161,7 @@ class QueryCache {
       }
 
       // If still over capacity, remove oldest entries
-      if (_cache.length >= _maxSize) {
+      if (_totalCacheSize > _maxSizeBytes) {
         // Use a bucket-based approach to avoid sorting, which is slow.
         // Group entries by access time into buckets.
         final buckets = <int, List<MapEntry<String, CachedQuery>>>{};
@@ -185,7 +171,7 @@ class QueryCache {
             Duration.minutesPerHour;
 
         int processedCount = 0;
-        for (final entry in _cache.entries) {
+        for (final entry in _cache.entries.toList()) {
           final ageHours =
               (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
                   oneHourMs;
@@ -236,12 +222,7 @@ class QueryCache {
     try {
       // If count is greater than cache size, clear all
       if (count >= _cache.length) {
-        final oldSize = _cache.length;
         clear(); // Use clear method to ensure total cache size is reset
-        Logger.debug(
-          'Cleared all $oldSize query cache entries',
-          label: 'QueryCache.evictByCount',
-        );
         return;
       }
 
@@ -253,7 +234,7 @@ class QueryCache {
           Duration.minutesPerHour;
 
       int processedCount = 0;
-      for (final entry in _cache.entries) {
+      for (final entry in _cache.entries.toList()) {
         final ageHours =
             (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
                 oneHourMs;

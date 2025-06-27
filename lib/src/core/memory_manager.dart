@@ -76,10 +76,6 @@ class MemoryManager {
     _registerMemoryMonitor();
 
     _initialized = true;
-
-    Logger.info(
-        'MemoryManager initialized with threshold: $_memoryThresholdInMB MB',
-        label: 'MemoryManager.initialize');
   }
 
   /// Configure memory threshold

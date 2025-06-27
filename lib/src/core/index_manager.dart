@@ -560,7 +560,6 @@ class IndexManager {
           indexMeta.isUnique ||
           indexName.startsWith('uniq_');
 
-
       // If the number of partitions is 0, there are no index files present
       if (indexMeta.partitions.isEmpty) return;
 
@@ -666,12 +665,18 @@ class IndexManager {
         }
 
         // Create updated main metadata, no need to sort again
+        final totalSize =
+            finalPartitions.fold<int>(0, (sum, p) => sum + p.bTreeSize);
+        final totalEntries =
+            finalPartitions.fold<int>(0, (sum, p) => sum + p.entries);
         final updatedMeta = indexMeta.copyWith(
           partitions: finalPartitions,
           timestamps: Timestamps(
             created: indexMeta.timestamps.created,
             modified: DateTime.now(),
           ),
+          totalSizeInBytes: totalSize,
+          totalEntries: totalEntries,
         );
 
         // Update main metadata
@@ -731,8 +736,8 @@ class IndexManager {
             // Check if there's any data to process
             bool hasInserts =
                 _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
-            bool hasDeletes =
-                _deleteBuffer.containsKey(key) && _deleteBuffer[key]!.isNotEmpty;
+            bool hasDeletes = _deleteBuffer.containsKey(key) &&
+                _deleteBuffer[key]!.isNotEmpty;
 
             if (!hasInserts && !hasDeletes) {
               _indexWriting[key] = false;
@@ -779,11 +784,12 @@ class IndexManager {
                 int processedCount = 0;
                 for (final entry in allEntries) {
                   try {
-                    final estimatedEntrySize =
-                        (entry.indexEntry.indexKey.toString().length +
-                                entry.indexEntry.recordPointer.toString().length +
-                                2)
-                            .toInt();
+                    final estimatedEntrySize = (entry.indexEntry.indexKey
+                                .toString()
+                                .length +
+                            entry.indexEntry.recordPointer.toString().length +
+                            2)
+                        .toInt();
 
                     // Track min/max keys for primary key index when table is ordered
                     if (isPrimaryKeyIndex && isTableOrdered) {
@@ -798,7 +804,8 @@ class IndexManager {
                       }
                     }
 
-                    if (currentSize + estimatedEntrySize > maxPartitionFileSize &&
+                    if (currentSize + estimatedEntrySize >
+                            maxPartitionFileSize &&
                         currentJobEntries.isNotEmpty) {
                       // Finalize current job and start a new one
                       final job = PartitionWriteJob(
@@ -884,8 +891,8 @@ class IndexManager {
                         );
                         return await ComputeManager.run(
                             processIndexPartition, request,
-                            useIsolate:
-                                (job.existingContent?.length ?? 0) > 500 * 1024);
+                            useIsolate: (job.existingContent?.length ?? 0) >
+                                500 * 1024);
                       } catch (e, stack) {
                         Logger.error(
                             'Error preparing or running compute job for partition ${job.partitionIndex}: $e\n$stack',
@@ -1007,12 +1014,18 @@ class IndexManager {
                 final finalPartitions = partitionMap.values.toList()
                   ..sort((a, b) => a.index.compareTo(b.index));
 
+                final totalSize =
+                    finalPartitions.fold<int>(0, (sum, p) => sum + p.bTreeSize);
+                final totalEntries =
+                    finalPartitions.fold<int>(0, (sum, p) => sum + p.entries);
                 final updatedMeta = indexMeta.copyWith(
                   partitions: finalPartitions,
                   isOrdered: isTableOrdered,
                   timestamps: Timestamps(
                       created: indexMeta.timestamps.created,
                       modified: DateTime.now()),
+                  totalSizeInBytes: totalSize,
+                  totalEntries: totalEntries,
                 );
 
                 // Use unified method to update metadata
@@ -1112,7 +1125,7 @@ class IndexManager {
 
       if (hasChanges) {
         // Set closing flag, ensure synchronous processing
-    _isClosing = true;
+        _isClosing = true;
 
         // Force processing all write buffers
         await _processIndexWriteBuffer();
@@ -1449,10 +1462,7 @@ class IndexManager {
       int currentUsage = _currentIndexCacheSize;
 
       // Estimate size of this index
-      int estimatedIndexSize = 0;
-      for (var partition in meta.partitions) {
-        estimatedIndexSize += partition.bTreeSize;
-      }
+      int estimatedIndexSize = meta.totalSizeInBytes;
 
       // Special handling for important indexes
       bool isPrimaryKey = indexName == 'pk_$tableName';
@@ -1463,12 +1473,11 @@ class IndexManager {
           currentUsage + estimatedIndexSize < indexCacheLimit * 0.9) {
         return true;
       }
-      
+
       // If cache is under 80% capacity, allow full caching
       if (currentUsage + estimatedIndexSize < indexCacheLimit * 0.8) {
         return true;
       }
-
 
       // Otherwise, don't fully cache
       return false;
@@ -1681,7 +1690,8 @@ class IndexManager {
             if (!await _dataStore.storage.existsFile(partitionPath)) {
               return;
             }
-            final content = await _dataStore.storage.readAsString(partitionPath);
+            final content =
+                await _dataStore.storage.readAsString(partitionPath);
             if (content == null || content.isEmpty) {
               return;
             }
@@ -1855,6 +1865,8 @@ class IndexManager {
               isUnique: true,
               partitions: meta.partitions,
               timestamps: meta.timestamps,
+              totalSizeInBytes: meta.totalSizeInBytes,
+              totalEntries: meta.totalEntries,
             );
 
             // Update index metadata
@@ -1940,6 +1952,8 @@ class IndexManager {
                     created: DateTime.now(),
                     modified: DateTime.now(),
                   ),
+                  totalSizeInBytes: 0,
+                  totalEntries: 0,
                 );
 
                 // Write index metadata
@@ -2246,6 +2260,8 @@ class IndexManager {
               created: meta.timestamps.created,
               modified: DateTime.now(),
             ),
+            totalSizeInBytes: 0,
+            totalEntries: 0,
           );
 
           // Write updated index metadata
@@ -2467,10 +2483,9 @@ class IndexManager {
           final pendingData =
               _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
           int processedCount = 0;
-          for (var record in pendingData.entries) {
+          for (var record in pendingData.entries.toList()) {
             if (record.value.data[primaryKey] == primaryValue) {
-              Logger.warn(
-                  'Primary key duplicate in write queue: $primaryValue',
+              Logger.warn('Primary key duplicate in write queue: $primaryValue',
                   label: 'IndexManager.checkUniqueConstraints');
               return false;
             }
@@ -2499,7 +2514,8 @@ class IndexManager {
             // Check which index actually exists
             if (await _getIndexMeta(tableName, indexName) != null) {
               effectiveIndexName = indexName;
-            } else if (await _getIndexMeta(tableName, uniqueIndexName) != null) {
+            } else if (await _getIndexMeta(tableName, uniqueIndexName) !=
+                null) {
               effectiveIndexName = uniqueIndexName;
             }
 
@@ -2514,7 +2530,7 @@ class IndexManager {
                 bool hasDuplicate = false;
 
                 int processedCount = 0;
-                for (var record in pendingData.entries) {
+                for (var record in pendingData.entries.toList()) {
                   if (record.value.data[field.name] == value &&
                       (!isUpdate ||
                           record.value.data[primaryKey] != primaryValue)) {
@@ -2669,7 +2685,7 @@ class IndexManager {
           bool hasDuplicate = false;
 
           int processedCount = 0;
-          for (var entry in pendingData.entries) {
+          for (var entry in pendingData.entries.toList()) {
             final record = entry.value.data;
             final recordIndexKey = _createIndexKey(record, index.fields);
             if (recordIndexKey == indexKey &&
@@ -2900,7 +2916,8 @@ class IndexManager {
   ) async {
     try {
       final pkIndexName = 'pk_$tableName';
-      final results = await searchIndex(tableName, pkIndexName, primaryKeyValue);
+      final results =
+          await searchIndex(tableName, pkIndexName, primaryKeyValue);
 
       if (results.isEmpty) return null;
 
@@ -3779,6 +3796,8 @@ class IndexManager {
             created: DateTime.now(),
             modified: DateTime.now(),
           ),
+          totalSizeInBytes: 0,
+          totalEntries: 0,
         );
 
         // Use unified method to update metadata
@@ -3800,6 +3819,8 @@ class IndexManager {
             created: DateTime.now(),
             modified: DateTime.now(),
           ),
+          totalSizeInBytes: 0,
+          totalEntries: 0,
         );
 
         // Use unified method to update metadata

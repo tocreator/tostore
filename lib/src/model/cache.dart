@@ -42,6 +42,15 @@ class TableCache {
     _recalculateTotalCacheSize();
   }
 
+  /// Clears all records from the cache and resets the size counters.
+  void clearRecords() {
+    recordsMap.clear();
+    _startupRecordCount = 0;
+    _runtimeRecordCount = 0;
+    // After clearing, reset the size to the base overhead of the TableCache object itself.
+    _recalculateTotalCacheSize();
+  }
+
   /// Recalculate total cache size (only used when initializing or resetting)
   void _recalculateTotalCacheSize() {
     _totalCacheSize = 0;
@@ -145,30 +154,6 @@ class TableCache {
     List<Map<String, dynamic>> records, {
     RecordCacheType cacheType = RecordCacheType.runtime,
   }) async {
-    // Optimize batch add performance, pre-estimate size increment
-    int batchSizeIncrement = 0;
-
-    // Sample estimate data size (at most sample 10 records)
-    int sampleCount = min(10, records.length);
-    if (sampleCount > 0 && records.isNotEmpty) {
-      int totalSampleSize = 0;
-      for (int i = 0; i < sampleCount; i++) {
-        int index = (i * records.length ~/ sampleCount);
-        // Use JSON serialization to estimate size
-        totalSampleSize += jsonEncode(records[index]).length *
-            2; // Unicode characters occupy 2 bytes
-      }
-      // Estimate total incremental size
-      batchSizeIncrement =
-          (totalSampleSize / sampleCount * records.length).round();
-      // Add record object overhead
-      batchSizeIncrement += records.length * 80;
-      // Add Map entry overhead
-      batchSizeIncrement += records.length * 16;
-    }
-
-    // Update total cache size estimate
-    _totalCacheSize += batchSizeIncrement;
 
     int processedCount = 0;
     // Add records
@@ -179,9 +164,6 @@ class TableCache {
         await Future.delayed(Duration.zero);
       }
     }
-
-    // Correct total cache size (subtract estimated value, actual value is accumulated in addOrUpdateRecord)
-    _totalCacheSize -= batchSizeIncrement;
   }
 
   /// Get record and record access
@@ -203,7 +185,7 @@ class TableCache {
   /// Apply time decay to all records
   Future<void> applyTimeDecay() async {
     int processedCount = 0;
-    for (final cache in recordsMap.values) {
+    for (final cache in recordsMap.values.toList()) {
       cache.applyTimeDecay();
       processedCount++;
       if (processedCount % 500 == 0) {
@@ -229,7 +211,7 @@ class TableCache {
     // which is very slow for large caches.
     final buckets = List.generate(11, (_) => <MapEntry<String, RecordCache>>[]);
     int processedCount = 0;
-    for (final entry in recordsMap.entries) {
+    for (final entry in recordsMap.entries.toList()) {
       final priority = entry.value.calculatePriority();
       final bucketIndex = (priority * 10).floor().clamp(0, 10);
       buckets[bucketIndex].add(entry);
@@ -252,7 +234,7 @@ class TableCache {
       // Shuffle to evict randomly from within the same priority bucket
       bucket.shuffle();
 
-      for (final entry in bucket) {
+      for (final entry in bucket.toList()) {
         if (evictedCount >= count) break;
 
         final cache = entry.value;
@@ -274,7 +256,7 @@ class TableCache {
 
     // Execute eviction
     processedCount = 0;
-    for (final key in keysToRemove) {
+    for (final key in keysToRemove.toList()) {
       final cache = recordsMap.remove(key);
       if (cache != null) {
         if (cache.cacheType == RecordCacheType.startup) {
@@ -304,6 +286,25 @@ class TableCache {
   int estimateMemoryUsage() {
     // Return incremental accumulated cache size
     return _totalCacheSize;
+  }
+
+  /// Statically estimates the memory size of a list of records using a sampling technique.
+  static int estimateRecordsSize(List<Map<String, dynamic>> records) {
+    if (records.isEmpty) return 0;
+
+    // To maintain performance, we estimate the size based on a small sample of records.
+    int sampleCount = min(10, records.length);
+    if (sampleCount == 0) return 0;
+
+    double totalSampleSize = 0;
+    for (int i = 0; i < sampleCount; i++) {
+      // Select records spread evenly across the list for a representative sample.
+      final index = (i * records.length ~/ sampleCount);
+      totalSampleSize += RecordCache.estimateRecordSize(records[index]);
+    }
+
+    final averageRecordSize = totalSampleSize / sampleCount;
+    return (averageRecordSize * records.length).round();
   }
 
   /// Update record directly, without changing its position in the cache
@@ -452,24 +453,31 @@ class RecordCache {
       return _cachedSize;
     }
 
+    // Use the standardized static method for estimation and cache the result.
+    _cachedSize = RecordCache.estimateRecordSize(record);
+    return _cachedSize;
+  }
+
+  @override
+  String toString() {
+    return 'RecordCache{pk: $primaryKeyValue, weight: $weightValue, priority: ${calculatePriority().toStringAsFixed(2)}, type: $cacheType}';
+  }
+
+  /// Statically estimates the memory usage of a single record map in bytes.
+  ///
+  /// This method is the standardized logic for size estimation and is used across the cache system.
+  /// It uses JSON serialization for a more accurate and efficient estimation.
+  static int estimateRecordSize(Map<String, dynamic> record) {
     // Use JSON serialization to estimate size (more accurate and efficient)
     try {
       String jsonString = jsonEncode(record);
       // JSON string length * 2 (Unicode characters) + object overhead
-      _cachedSize = jsonString.length * 2 + 80;
-      return _cachedSize;
+      return jsonString.length * 2 + 80;
     } catch (e) {
-      // If JSON serialization fails, fall back to traditional estimation method
-
-      // Basic object overhead
+      // If JSON serialization fails, fall back to a traditional, safer estimation method.
       int total = 80; // Approximate size of object header and basic fields
-
-      // Calculate record content size
       for (var entry in record.entries) {
-        // Key name overhead
         total += entry.key.length * 2;
-
-        // Estimate value overhead based on type
         var value = entry.value;
         if (value is String) {
           total += value.length * 2;
@@ -482,17 +490,10 @@ class RecordCache {
         } else if (value is Map) {
           total += 16 + value.length * 16;
         } else {
-          total += 8;
+          total += 8; // Default for other types
         }
       }
-
-      _cachedSize = total;
       return total;
     }
-  }
-
-  @override
-  String toString() {
-    return 'RecordCache{pk: $primaryKeyValue, weight: $weightValue, priority: ${calculatePriority().toStringAsFixed(2)}, type: $cacheType}';
   }
 }

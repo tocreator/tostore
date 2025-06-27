@@ -78,7 +78,7 @@ class QueryExecutor {
           final pendingData =
               _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
           if (condition != null) {
-            for (var record in pendingData.entries) {
+            for (var record in pendingData.entries.toList()) {
               if (condition.matches(record.value.data)) {
                 resultMap[record.value.data[primaryKey].toString()] =
                     Map<String, dynamic>.from(record.value.data);
@@ -86,7 +86,7 @@ class QueryExecutor {
             }
           } else {
             // Add all pending records
-            for (var record in pendingData.entries) {
+            for (var record in pendingData.entries.toList()) {
               resultMap[record.value.data[primaryKey].toString()] =
                   Map<String, dynamic>.from(record.value.data);
             }
@@ -873,7 +873,7 @@ class QueryExecutor {
                 Map<String, dynamic>.from(pendingRecord.data);
           }
         } else if (condition != null) {
-          for (var record in pendingData.entries) {
+          for (var record in pendingData.entries.toList()) {
             if (condition.matches(record.value.data)) {
               resultMap[record.value.data[primaryKey].toString()] =
                   Map<String, dynamic>.from(record.value.data);
@@ -881,7 +881,7 @@ class QueryExecutor {
           }
         } else {
           // Add all pending records
-          for (var record in pendingData.entries) {
+          for (var record in pendingData.entries.toList()) {
             resultMap[record.value.data[primaryKey].toString()] =
                 Map<String, dynamic>.from(record.value.data);
           }
@@ -928,7 +928,7 @@ class QueryExecutor {
     final pendingData =
         _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
     if (condition != null) {
-      for (var record in pendingData.entries) {
+      for (var record in pendingData.entries.toList()) {
         if (condition.matches(record.value.data)) {
           resultMap[record.value.data[primaryKey].toString()] =
               Map<String, dynamic>.from(record.value.data);
@@ -936,7 +936,7 @@ class QueryExecutor {
       }
     } else {
       // Add all pending records
-      for (var record in pendingData.entries) {
+      for (var record in pendingData.entries.toList()) {
         resultMap[record.value.data[primaryKey].toString()] =
             Map<String, dynamic>.from(record.value.data);
       }
@@ -944,18 +944,12 @@ class QueryExecutor {
 
     // Cache entire table if we should mark as full table cache
     if (shouldMarkAsFullTableCache) {
-      final recordCount = resultMap.values.length;
-
       // Determine if full table caching is allowed
       if (await _dataStore.tableDataManager.allowFullTableCache(tableName)) {
         await _dataStore.dataCacheManager.cacheEntireTable(
           tableName,
           primaryKey,
           resultMap.values.toList(),
-        );
-        Logger.debug(
-          'Full table scan updated table $tableName cache, record count: $recordCount, marked as full table cache',
-          label: 'QueryExecutor._performTableScan',
         );
       }
     }
@@ -1321,7 +1315,7 @@ class QueryExecutor {
       final results = <Map<String, dynamic>>[];
 
       // handle primary key index and normal index results
-      for (var pointer in indexResults) {
+      for (var pointer in indexResults.toList()) {
         // handle String and StoreIndex types
         StoreIndex storeIndex;
         if (pointer is String) {

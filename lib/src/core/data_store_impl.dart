@@ -313,6 +313,12 @@ class DataStoreImpl {
         _config = config.copyWith(dbPath: dbPath);
       }
 
+      // Apply log configuration
+      LogConfig.setConfig(
+        enableLog: _config!.enableLog,
+        logLevel: _config!.logLevel,
+      );
+
       // Configure the global parallel processor with sensible defaults
       ParallelProcessor.setConfig(
         concurrency: _config!.maxConcurrent,
@@ -334,12 +340,6 @@ class DataStoreImpl {
       // Initialize memory manager
       _memoryManager = MemoryManager();
       await _memoryManager?.initialize(_config!, this);
-
-      // Apply log configuration
-      LogConfig.setConfig(
-        enableLog: _config!.enableLog,
-        logLevel: _config!.logLevel,
-      );
 
       // Initialize key components in parallel
       final initTasks = <Future<void>>[
@@ -1490,7 +1490,8 @@ class DataStoreImpl {
 
         // build a process function, to check if each partition's record matches the delete condition
         Future<List<Map<String, dynamic>>> processFunction(
-            List<Map<String, dynamic>> records, int partitionIndex,
+            List<Map<String, dynamic>> records,
+            int partitionIndex,
             ParallelController controller) async {
           // record original count
           int originalCount = records.length;
@@ -1992,8 +1993,7 @@ class DataStoreImpl {
     try {
       final spaceConfig = await getSpaceConfig();
       final totalSize = spaceConfig?.totalDataSizeBytes ?? 0;
-      final int prewarmThresholdBytes =
-          config.prewarmThresholdMB * 1024 * 1024;
+      final int prewarmThresholdBytes = config.prewarmThresholdMB * 1024 * 1024;
 
       if (totalSize < prewarmThresholdBytes) {
         await _executePrewarm();
