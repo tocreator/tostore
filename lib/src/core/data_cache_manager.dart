@@ -90,14 +90,14 @@ class DataCacheManager {
   }
 
   /// Evict query cache
-  void _evictQueryCache(double ratio) {
+  Future<void> _evictQueryCache(double ratio) async {
     if (ratio <= 0 || ratio > 1) return;
 
     try {
       final toRemoveCount = (_queryCache.size * ratio).ceil();
       if (toRemoveCount <= 0) return;
 
-      _queryCache.evictByCount(toRemoveCount);
+      await _queryCache.evictByCount(toRemoveCount);
 
       Logger.info(
           'Evicted $toRemoveCount query cache entries due to memory pressure',
@@ -156,7 +156,7 @@ class DataCacheManager {
   }
 
   /// Clean up expired cache
-  void _cleanupExpiredCache() {
+  Future<void> _cleanupExpiredCache() async {
     // Check if space switching is in progress
     if (_isSwitchingSpace) {
       return;
@@ -209,7 +209,7 @@ class DataCacheManager {
       final currentQueryCacheSize = _queryCache.totalCacheSize;
 
       if (currentQueryCacheSize > queryCacheMaxSize * 0.9) {
-        _queryCache.evictStaleEntries();
+        await _queryCache.evictStaleEntries();
       }
 
       // Update initialization configuration
@@ -287,13 +287,22 @@ class DataCacheManager {
       }
 
       // Query results are stored only once in _queryCache
-      _queryCache.put(
+      await _queryCache.put(
         cacheKey,
         results,
         tables.first,
         schema.primaryKey,
         expiryDuration: expiryDuration,
       );
+
+      // Determine if it is a user-managed cache once
+      bool isUserManaged = false;
+      try {
+        final cacheKeyMap = jsonDecode(cacheKey) as Map<String, dynamic>;
+        isUserManaged = cacheKeyMap['isUserManaged'] == true;
+      } catch (e) {
+        // Parse error, conservative handling, assume it is system cache
+      }
 
       // Record the dependency between queries and tables
       for (var table in tables) {
@@ -316,6 +325,7 @@ class DataCacheManager {
                   primaryKeyField: primaryKey,
                   results: results,
                   isFullTableCache: isFullTableQuery,
+                  isUserManaged: isUserManaged,
                 ));
       }
     } catch (e) {
@@ -508,16 +518,8 @@ class DataCacheManager {
       final queryInfo = entry.value;
 
       // skip user-managed caches, these caches need to be manually invalidated by the user
-      try {
-        final cacheKeyStr = entry.key;
-        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-
-        if (isUserManaged) {
-          continue; // skip user-managed caches
-        }
-      } catch (e) {
-        // parse error, conservative handling, assume it is system cache
+      if (queryInfo.isUserManaged) {
+        continue; // skip user-managed caches
       }
 
       // Full table cache or query with empty condition
@@ -552,20 +554,15 @@ class DataCacheManager {
       // Get all fields of the record for quick checking of whether the query might match
       final recordFields = recordData?.keys.toSet();
 
+      int processedCount = 0;
       // Check each query
       for (var entry in tableQueries.entries) {
         final queryInfo = entry.value;
         final cacheKeyStr = entry.key;
 
         // Skip user-managed caches, which need to be manually invalidated by the user
-        try {
-          final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-          final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-          if (isUserManaged) {
-            continue; // Skip user-managed caches
-          }
-        } catch (e) {
-          // Parse error, handle conservatively, assume it is a system cache
+        if (queryInfo.isUserManaged) {
+          continue; // Skip user-managed caches
         }
 
         // 1. If it's a full table cache, clean it up directly
@@ -606,6 +603,11 @@ class DataCacheManager {
         if (queryInfo.queryKey.condition.matches(recordData)) {
           keysToRemove.add(cacheKeyStr);
         }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          // Yield to event loop to avoid blocking UI
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Remove related query caches
@@ -641,7 +643,7 @@ class DataCacheManager {
         }
 
         // Clean up all table-related query caches
-        _cleanupAllTableRelatedQueries(tableName);
+        await _cleanupAllTableRelatedQueries(tableName);
 
         // Clean up table cache
         tableCaches.remove(tableName);
@@ -660,7 +662,7 @@ class DataCacheManager {
       } else {
         // If the number of primary keys is too large, clean up all table-related query caches
 
-        _cleanupAllTableRelatedQueries(tableName);
+        await _cleanupAllTableRelatedQueries(tableName);
       }
 
       // Handle records in table cache
@@ -668,6 +670,7 @@ class DataCacheManager {
         int reducedSize =
             0; // Record the total size of the cache that was reduced
 
+        int processedCount = 0;
         // Remove records with specified primary key values from cache
         for (var pkValue in primaryKeyValues) {
           final pkString = pkValue.toString();
@@ -675,6 +678,11 @@ class DataCacheManager {
           if (recordCache != null) {
             reducedSize += recordCache.estimateMemoryUsage();
             tableCache.recordsMap.remove(pkString);
+          }
+          processedCount++;
+          if (processedCount % 500 == 0) {
+            // Yield to event loop to avoid blocking UI
+            await Future.delayed(Duration.zero);
           }
         }
 
@@ -691,16 +699,8 @@ class DataCacheManager {
 
           // Clean up all non-user-managed query caches
           for (var entry in tableDependency.entries) {
-            try {
-              final cacheKeyStr = entry.key;
-              final cacheKeyMap =
-                  jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-              final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-              if (!isUserManaged) {
-                keysToRemove.add(cacheKeyStr);
-              }
-            } catch (e) {
-              // parse error, conservative handling, assume it is system cache
+            final queryInfo = entry.value;
+            if (!queryInfo.isUserManaged) {
               keysToRemove.add(entry.key);
             }
           }
@@ -712,7 +712,8 @@ class DataCacheManager {
           }
         } else {
           // When the number of primary keys is moderate, clean up query caches containing these primary keys
-          _cleanupQueriesContainingPrimaryKeys(tableName, primaryKeyValues);
+          await _cleanupQueriesContainingPrimaryKeys(
+              tableName, primaryKeyValues);
         }
 
         // If there are no related queries, clean up dependencies
@@ -731,8 +732,8 @@ class DataCacheManager {
   }
 
   /// Clean up queries containing specified primary key values
-  void _cleanupQueriesContainingPrimaryKeys(
-      String tableName, Set<dynamic> primaryKeyValues) {
+  Future<void> _cleanupQueriesContainingPrimaryKeys(
+      String tableName, Set<dynamic> primaryKeyValues) async {
     final tableDependency = _tableDependencies[tableName];
     if (tableDependency == null) return;
 
@@ -743,21 +744,14 @@ class DataCacheManager {
     final primaryKeyStrings =
         primaryKeyValues.map((pk) => pk.toString()).toSet();
 
+    int processedCount = 0;
     // Check each query
     for (var entry in tableDependency.entries) {
       final queryInfo = entry.value;
-      final cacheKeyStr = entry.key;
 
       // Skip user-managed caches, these caches need to be manually invalidated by the user
-      try {
-        final cacheKeyMap = jsonDecode(cacheKeyStr) as Map<String, dynamic>;
-        final isUserManaged = cacheKeyMap['isUserManaged'] == true;
-
-        if (isUserManaged) {
-          continue; // skip user-managed caches
-        }
-      } catch (e) {
-        // parse error, conservative handling, assume it is system cache
+      if (queryInfo.isUserManaged) {
+        continue; // skip user-managed caches
       }
 
       // Optimization: if it is a full table cache, clean up directly
@@ -778,6 +772,11 @@ class DataCacheManager {
 
       if (hasIntersection) {
         keysToRemove.add(entry.key);
+      }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        // Yield to event loop to avoid blocking UI
+        await Future.delayed(Duration.zero);
       }
     }
 
@@ -888,7 +887,7 @@ class DataCacheManager {
         const cacheType = RecordCacheType.runtime;
 
         // Add records in batch
-        tableCache.addRecords(records, cacheType: cacheType);
+       await tableCache.addRecords(records, cacheType: cacheType);
       }
 
       // Store table cache
@@ -970,7 +969,7 @@ class DataCacheManager {
             final beforeSize = tableCache.totalCacheSize;
 
             // Perform eviction
-            final result = tableCache.evictLowPriorityRecords(toEvict,
+            final result = await tableCache.evictLowPriorityRecords(toEvict,
                 preserveStartupRecords: true // Preserve startup records
                 );
 
@@ -1009,7 +1008,7 @@ class DataCacheManager {
   Future<void> _applyTimeDecayToAllCaches() async {
     int processedCount = 0;
     for (var tableCache in tableCaches.values) {
-      tableCache.applyTimeDecay();
+      await tableCache.applyTimeDecay();
       processedCount++;
       // Yield to the event loop to avoid blocking.
       // Use half of the configured maxBatchSize for cleanup tasks.
@@ -1188,21 +1187,27 @@ class DataCacheManager {
   }
 
   /// Query records by field value
-  List<Map<String, dynamic>> queryRecordsByField(
+  Future<List<Map<String, dynamic>>> queryRecordsByField(
     String tableName,
     String fieldName,
     dynamic fieldValue,
-  ) {
+  ) async {
     final cache = tableCaches[tableName];
     if (cache == null) return [];
 
     final result = <Map<String, dynamic>>[];
+    int processedCount = 0;
 
     for (final recordCache in cache.recordsMap.values) {
       final record = recordCache.record;
       if (record[fieldName] == fieldValue) {
         result.add(Map<String, dynamic>.from(record));
         recordCache.recordAccess();
+      }
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        // Yield to event loop to avoid blocking UI
+        await Future.delayed(Duration.zero);
       }
     }
 
@@ -1228,11 +1233,18 @@ class DataCacheManager {
 
       // 2. Clear all related queries cache in general cache
       final keysToRemove = <String>[];
-      _queryCache.cache.forEach((key, queryCache) {
-        if (queryCache.tableName == tableName) {
-          keysToRemove.add(key);
+      int processedCount = 0;
+      final entries = _queryCache.cache.entries.toList();
+      for (final entry in entries) {
+        if (entry.value.tableName == tableName) {
+          keysToRemove.add(entry.key);
         }
-      });
+        processedCount++;
+        if (processedCount % 500 == 0) {
+          // Yield to event loop to avoid blocking UI
+          await Future.delayed(Duration.zero);
+        }
+      }
 
       for (var key in keysToRemove) {
         _queryCache.invalidate(key);
@@ -1339,17 +1351,24 @@ class DataCacheManager {
   }
 
   /// Clean up all queries related to a specific table
-  void _cleanupAllTableRelatedQueries(String tableName) {
+  Future<void> _cleanupAllTableRelatedQueries(String tableName) async {
     // Clean up full table cache queries
     _cleanupFullTableQueriesOnly(tableName);
 
     // Clean up all table-related query caches (traverse global query cache)
     final keysToRemove = <String>[];
-    _queryCache.cache.forEach((key, queryCache) {
-      if (queryCache.tableName == tableName) {
-        keysToRemove.add(key);
+    int processedCount = 0;
+    final entries = _queryCache.cache.entries.toList();
+    for (final entry in entries) {
+      if (entry.value.tableName == tableName) {
+        keysToRemove.add(entry.key);
       }
-    });
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        // Yield to event loop to avoid blocking UI
+        await Future.delayed(Duration.zero);
+      }
+    }
 
     for (var key in keysToRemove) {
       _queryCache.invalidate(key);
@@ -1367,12 +1386,14 @@ class _QueryInfo {
   final Set<String>
       resultKeys; // Only store primary key values of query results, not complete record content
   final bool isFullTableCache; // Whether it is a full table cache
+  final bool isUserManaged; // Whether it is user-managed cache
 
   _QueryInfo({
     required this.queryKey,
     required this.primaryKeyField,
     required List<Map<String, dynamic>> results,
     this.isFullTableCache = false,
+    this.isUserManaged = false,
   }) : resultKeys = results
             .map((record) => record[primaryKeyField]?.toString() ?? '')
             .where((key) => key.isNotEmpty)

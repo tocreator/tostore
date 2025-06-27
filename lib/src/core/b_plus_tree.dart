@@ -113,7 +113,7 @@ class BPlusTree {
           // Dynamically adjust pause duration based on data size
           final pauseDuration = lines.length > 100000
               ? const Duration(
-                  milliseconds: 5) // More time for GC with large data
+                  milliseconds: 2) // More time for GC with large data
               : Duration.zero;
           await Future.delayed(pauseDuration);
         }
@@ -325,7 +325,7 @@ class BPlusTree {
         // Dynamically adjust pause duration based on batch size
         final pauseDuration = keys.length > 100000
             ? const Duration(
-                milliseconds: 5) // More time for GC with large data
+                milliseconds: 2) // More time for GC with large data
             : Duration.zero;
         await Future.delayed(pauseDuration);
       }

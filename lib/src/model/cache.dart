@@ -141,10 +141,10 @@ class TableCache {
   }
 
   /// Batch add records
-  void addRecords(
+  Future<void> addRecords(
     List<Map<String, dynamic>> records, {
     RecordCacheType cacheType = RecordCacheType.runtime,
-  }) {
+  }) async {
     // Optimize batch add performance, pre-estimate size increment
     int batchSizeIncrement = 0;
 
@@ -170,9 +170,14 @@ class TableCache {
     // Update total cache size estimate
     _totalCacheSize += batchSizeIncrement;
 
+    int processedCount = 0;
     // Add records
     for (final record in records) {
       addOrUpdateRecord(record, cacheType: cacheType);
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     // Correct total cache size (subtract estimated value, actual value is accumulated in addOrUpdateRecord)
@@ -196,50 +201,79 @@ class TableCache {
   }
 
   /// Apply time decay to all records
-  void applyTimeDecay() {
+  Future<void> applyTimeDecay() async {
+    int processedCount = 0;
     for (final cache in recordsMap.values) {
       cache.applyTimeDecay();
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
   }
 
   /// Evict low priority records
   /// Returns the number of evicted records and freed memory
-  Map<String, int> evictLowPriorityRecords(int count,
+  Future<Map<String, int>> evictLowPriorityRecords(int count,
       {bool preserveStartupRecords =
           true // Whether to preserve startup cache records
-      }) {
+      }) async {
     if (count <= 0 || recordsMap.isEmpty) {
       return {'count': 0, 'memory': 0};
     }
 
     // First apply time decay
-    applyTimeDecay();
+    await applyTimeDecay();
 
-    // Calculate priority for all records and sort
-    final sortedRecords = recordsMap.entries.toList()
-      ..sort((a, b) =>
-          a.value.calculatePriority().compareTo(b.value.calculatePriority()));
+    // Optimization: Use a bucket-based approach to avoid sorting all records,
+    // which is very slow for large caches.
+    final buckets = List.generate(11, (_) => <MapEntry<String, RecordCache>>[]);
+    int processedCount = 0;
+    for (final entry in recordsMap.entries) {
+      final priority = entry.value.calculatePriority();
+      final bucketIndex = (priority * 10).floor().clamp(0, 10);
+      buckets[bucketIndex].add(entry);
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        await Future.delayed(Duration.zero);
+      }
+    }
 
     // Records to remove
     final keysToRemove = <String>[];
     int freedMemory = 0;
+    int evictedCount = 0;
 
-    // Evict from low priority
-    for (int i = 0; i < count && i < sortedRecords.length; i++) {
-      final entry = sortedRecords[i];
-      final cache = entry.value;
+    // Evict from low priority buckets first
+    for (int i = 0; i < buckets.length && evictedCount < count; i++) {
+      final bucket = buckets[i];
+      if (bucket.isEmpty) continue;
 
-      // Skip if we need to preserve startup cache records
-      if (preserveStartupRecords &&
-          cache.cacheType == RecordCacheType.startup) {
-        continue;
+      // Shuffle to evict randomly from within the same priority bucket
+      bucket.shuffle();
+
+      for (final entry in bucket) {
+        if (evictedCount >= count) break;
+
+        final cache = entry.value;
+
+        // Skip if we need to preserve startup cache records
+        if (preserveStartupRecords &&
+            cache.cacheType == RecordCacheType.startup) {
+          continue;
+        }
+
+        keysToRemove.add(entry.key);
+        freedMemory += cache.estimateMemoryUsage();
+        evictedCount++;
+        if (evictedCount % 500 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
-
-      keysToRemove.add(entry.key);
-      freedMemory += cache.estimateMemoryUsage();
     }
 
     // Execute eviction
+    processedCount = 0;
     for (final key in keysToRemove) {
       final cache = recordsMap.remove(key);
       if (cache != null) {
@@ -253,6 +287,10 @@ class TableCache {
         _totalCacheSize -= cache.estimateMemoryUsage();
         // Subtract Map entry overhead
         _totalCacheSize -= 16;
+      }
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 

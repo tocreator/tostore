@@ -72,9 +72,9 @@ class QueryCache {
   }
 
   /// cache query results
-  void put(String key, List<Map<String, dynamic>> results, String tableName,
-      String primaryKeyField,
-      {Duration? expiryDuration}) {
+  Future<void> put(String key, List<Map<String, dynamic>> results,
+      String tableName, String primaryKeyField,
+      {Duration? expiryDuration}) async {
     // Calculate new cache size
     int newEntrySize = _estimateCacheEntrySize(results);
 
@@ -86,13 +86,24 @@ class QueryCache {
 
     if (_cache.length >= _maxSize) {
       // Find and remove the oldest cache entry by last access time
-      final oldest = _cache.entries.reduce((a, b) =>
-          a.value.lastAccessed.isBefore(b.value.lastAccessed) ? a : b);
+      MapEntry<String, CachedQuery>? oldest;
+      int processedCount = 0;
+      for (final entry in _cache.entries) {
+        if (oldest == null ||
+            entry.value.lastAccessed.isBefore(oldest.value.lastAccessed)) {
+          oldest = entry;
+        }
+        processedCount++;
+        if (processedCount % 500 == 0) {
+          await Future.delayed(Duration.zero);
+        }
+      }
 
-      // Subtract removed cache size
-      _totalCacheSize -= _estimateCacheEntrySize(oldest.value.results);
-
-      _cache.remove(oldest.key);
+      if (oldest != null) {
+        // Subtract removed cache size
+        _totalCacheSize -= _estimateCacheEntrySize(oldest.value.results);
+        _cache.remove(oldest.key);
+      }
     }
 
     final now = DateTime.now();
@@ -146,7 +157,7 @@ class QueryCache {
   }
 
   /// Evict expired and least recently used entries to make room
-  void evictStaleEntries() {
+  Future<void> evictStaleEntries() async {
     try {
       final now = DateTime.now();
 
@@ -163,22 +174,49 @@ class QueryCache {
             key); // Use invalidate method to ensure total cache size is reduced
       }
 
-      // If still over capacity, remove oldest entries by last access time
+      // If still over capacity, remove oldest entries
       if (_cache.length >= _maxSize) {
-        final sortedEntries = _cache.entries.toList()
-          ..sort(
-              (a, b) => a.value.lastAccessed.compareTo(b.value.lastAccessed));
+        // Use a bucket-based approach to avoid sorting, which is slow.
+        // Group entries by access time into buckets.
+        final buckets = <int, List<MapEntry<String, CachedQuery>>>{};
+        final nowMs = now.millisecondsSinceEpoch;
+        const oneHourMs = Duration.millisecondsPerSecond *
+            Duration.secondsPerMinute *
+            Duration.minutesPerHour;
 
-        // Remove oldest entries until under capacity
+        int processedCount = 0;
+        for (final entry in _cache.entries) {
+          final ageHours =
+              (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
+                  oneHourMs;
+          buckets.putIfAbsent(ageHours, () => []).add(entry);
+          processedCount++;
+          if (processedCount % 500 == 0) {
+            await Future.delayed(Duration.zero);
+          }
+        }
+
         final removeCount =
             (_cache.length * 0.2).ceil(); // Remove 20% of entries
-        for (int i = 0; i < removeCount && i < sortedEntries.length; i++) {
-          invalidate(sortedEntries[i]
-              .key); // Use invalidate method to ensure total cache size is reduced
+        int removed = 0;
+
+        final sortedBucketKeys = buckets.keys.toList()
+          ..sort((a, b) => b.compareTo(a)); // Oldest first (largest ageHours)
+
+        for (final key in sortedBucketKeys) {
+          if (removed >= removeCount) break;
+          final bucket = buckets[key]!;
+          bucket.shuffle(); // Evict randomly within the same bucket
+
+          for (final entry in bucket) {
+            if (removed >= removeCount) break;
+            invalidate(entry.key);
+            removed++;
+          }
         }
 
         Logger.debug(
-          'Evicted $removeCount stale query cache entries, remaining: ${_cache.length}, total size: ${(_totalCacheSize / 1024).toStringAsFixed(1)}KB',
+          'Evicted $removed stale query cache entries, remaining: ${_cache.length}, total size: ${(_totalCacheSize / 1024).toStringAsFixed(1)}KB',
           label: 'QueryCache.evictStaleEntries',
         );
       }
@@ -192,7 +230,7 @@ class QueryCache {
 
   /// Evict specified number of entries
   /// [count] The number of entries to evict
-  void evictByCount(int count) {
+  Future<void> evictByCount(int count) async {
     if (count <= 0 || _cache.isEmpty) return;
 
     try {
@@ -207,16 +245,39 @@ class QueryCache {
         return;
       }
 
-      // Sort entries by last access time (oldest first)
-      final sortedEntries = _cache.entries.toList()
-        ..sort((a, b) => a.value.lastAccessed.compareTo(b.value.lastAccessed));
+      // Use a bucket-based approach to avoid sorting
+      final buckets = <int, List<MapEntry<String, CachedQuery>>>{};
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      const oneHourMs = Duration.millisecondsPerSecond *
+          Duration.secondsPerMinute *
+          Duration.minutesPerHour;
 
-      // Remove the specified number of oldest entries
+      int processedCount = 0;
+      for (final entry in _cache.entries) {
+        final ageHours =
+            (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
+                oneHourMs;
+        buckets.putIfAbsent(ageHours, () => []).add(entry);
+        processedCount++;
+        if (processedCount % 500 == 0) {
+          await Future.delayed(Duration.zero);
+        }
+      }
+
       int removed = 0;
-      for (int i = 0; i < count && i < sortedEntries.length; i++) {
-        invalidate(sortedEntries[i]
-            .key); // Use invalidate method to ensure total cache size is reduced
-        removed++;
+      final sortedBucketKeys = buckets.keys.toList()
+        ..sort((a, b) => b.compareTo(a)); // Oldest first (largest age)
+
+      for (final key in sortedBucketKeys) {
+        if (removed >= count) break;
+        final bucket = buckets[key]!;
+        bucket.shuffle();
+
+        for (final entry in bucket) {
+          if (removed >= count) break;
+          invalidate(entry.key);
+          removed++;
+        }
       }
 
       Logger.debug(

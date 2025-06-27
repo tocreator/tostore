@@ -2052,6 +2052,11 @@ class TableDataManager {
                 break;
               }
             }
+
+            // Periodically yield to prevent blocking the UI thread
+            if (i % 200 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
         }
       }
@@ -2205,7 +2210,7 @@ class TableDataManager {
             // if there is primary key and target key, try to optimize partition search
             if (effectivePrimaryKey != null && targetKey != null) {
               // try to find partitions that might contain target key
-              partitionsToProcess = _findPotentialPartitionsForKey(
+              partitionsToProcess = await _findPotentialPartitionsForKey(
                   fileMeta.partitions!, targetKey);
 
               if (partitionsToProcess.isEmpty) {
@@ -2265,10 +2270,11 @@ class TableDataManager {
   }
 
   /// find partitions that might contain target key
-  List<PartitionMeta> _findPotentialPartitionsForKey(
-      List<PartitionMeta> partitions, String targetKey) {
+  Future<List<PartitionMeta>> _findPotentialPartitionsForKey(
+      List<PartitionMeta> partitions, String targetKey) async {
     final result = <PartitionMeta>[];
 
+    int processedCount = 0;
     // First check if any partition contains target key
     for (final partition in partitions) {
       // If partition has primary key range info, check if target key is in range
@@ -2284,6 +2290,10 @@ class TableDataManager {
       } else {
         // If partition has no range info, assume it needs processing
         result.add(partition);
+      }
+      processedCount++;
+      if (processedCount % 200 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 
@@ -2608,6 +2618,9 @@ class TableDataManager {
               // return found matching record
               return [currentRecord];
             }
+            if (i % 500 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
           return [];
         }
@@ -2814,6 +2827,9 @@ class TableDataManager {
                   modified = true;
                   processedKeysInPartition.add(pk);
                 }
+                if (i % 500 == 0) {
+                  await Future.delayed(Duration.zero);
+                }
               }
             } else {
               // update operation
@@ -2825,6 +2841,9 @@ class TableDataManager {
                   resultRecords[i] = recordsByPk[pk]!;
                   modified = true;
                   processedKeysInPartition.add(pk);
+                }
+                if (i % 500 == 0) {
+                  await Future.delayed(Duration.zero);
                 }
               }
             }
@@ -3141,6 +3160,7 @@ class TableDataManager {
         // delete directory failed, fallback to file level delete
         final fileMeta = await getTableFileMeta(tableName);
         if (fileMeta != null && fileMeta.partitions != null) {
+          int processedCount = 0;
           for (final partition in fileMeta.partitions!) {
             if (partition.fileSizeInBytes > 0) {
               final partitionPath = await _dataStore.pathManager
@@ -3148,6 +3168,10 @@ class TableDataManager {
               if (await _dataStore.storage.existsFile(partitionPath)) {
                 await _dataStore.storage.deleteFile(partitionPath);
               }
+            }
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
             }
           }
         }
@@ -3594,10 +3618,8 @@ class TableDataManager {
 
           offset += batch.length;
 
-          // reduce pause time, improve throughput
-          if (i + indexBatchSize < recordsForIndex.length) {
-            await Future.delayed(const Duration(milliseconds: 1));
-          }
+          // Yield to the event loop after processing each batch to keep the UI responsive.
+          await Future.delayed(Duration.zero);
         }
       }
     } catch (e) {
