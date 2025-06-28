@@ -171,11 +171,15 @@ class QueryCache {
             Duration.minutesPerHour;
 
         int processedCount = 0;
-        for (final entry in _cache.entries.toList()) {
+        // Use the efficient key-collection pattern
+        for (final key in _cache.keys.toList()) {
+          final entryValue = _cache[key];
+          if (entryValue == null) continue;
+
           final ageHours =
-              (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
+              (nowMs - entryValue.lastAccessed.millisecondsSinceEpoch) ~/
                   oneHourMs;
-          buckets.putIfAbsent(ageHours, () => []).add(entry);
+          buckets.putIfAbsent(ageHours, () => []).add(MapEntry(key, entryValue));
           processedCount++;
           if (processedCount % 500 == 0) {
             await Future.delayed(Duration.zero);
@@ -234,11 +238,15 @@ class QueryCache {
           Duration.minutesPerHour;
 
       int processedCount = 0;
-      for (final entry in _cache.entries.toList()) {
+      // Use the efficient key-collection pattern
+      for (final key in _cache.keys.toList()) {
+        final entryValue = _cache[key];
+        if (entryValue == null) continue;
+
         final ageHours =
-            (nowMs - entry.value.lastAccessed.millisecondsSinceEpoch) ~/
+            (nowMs - entryValue.lastAccessed.millisecondsSinceEpoch) ~/
                 oneHourMs;
-        buckets.putIfAbsent(ageHours, () => []).add(entry);
+        buckets.putIfAbsent(ageHours, () => []).add(MapEntry(key, entryValue));
         processedCount++;
         if (processedCount % 500 == 0) {
           await Future.delayed(Duration.zero);

@@ -433,9 +433,9 @@ class DataCacheManager {
       if (tableDependency != null) {
         final pkString = primaryKeyValue.toString();
 
-        for (var entry in tableDependency.entries.toList()) {
-          final queryInfo = entry.value;
-          final cacheKeyStr = entry.key;
+        for (var cacheKeyStr in tableDependency.keys.toList()) {
+          final queryInfo = tableDependency[cacheKeyStr];
+          if (queryInfo == null) continue;
 
           // Check if this query result contains the record
           if (queryInfo.isFullTableCache ||
@@ -515,8 +515,9 @@ class DataCacheManager {
     final keysToRemove = <String>[];
 
     // Check each query, only clean up full table cache queries
-    for (var entry in tableDependency.entries.toList()) {
-      final queryInfo = entry.value;
+    for (var cacheKeyStr in tableDependency.keys.toList()) {
+      final queryInfo = tableDependency[cacheKeyStr];
+      if (queryInfo == null) continue;
 
       // skip user-managed caches, these caches need to be manually invalidated by the user
       if (queryInfo.isUserManaged) {
@@ -526,7 +527,7 @@ class DataCacheManager {
       // Full table cache or query with empty condition
       if (queryInfo.isFullTableCache ||
           queryInfo.queryKey.condition.build().isEmpty) {
-        keysToRemove.add(entry.key);
+        keysToRemove.add(cacheKeyStr);
       }
     }
 
@@ -556,10 +557,11 @@ class DataCacheManager {
       final recordFields = recordData?.keys.toSet();
 
       int processedCount = 0;
-      // Check each query
-      for (var entry in tableQueries.entries.toList()) {
-        final queryInfo = entry.value;
-        final cacheKeyStr = entry.key;
+      // Check each query using the efficient key-collection pattern
+      for (final cacheKeyStr in tableQueries.keys.toList()) {
+        final queryInfo = tableQueries[cacheKeyStr];
+        // The entry could have been removed by another process in the await gap.
+        if (queryInfo == null) continue;
 
         // Skip user-managed caches, which need to be manually invalidated by the user
         if (queryInfo.isUserManaged) {
@@ -657,7 +659,7 @@ class DataCacheManager {
       // If the number of primary keys is small, handle each primary key separately
       if (primaryKeyValues.length <= batchSize) {
         // Clean up directly related caches for each primary key (efficient path)
-        for (var pkValue in primaryKeyValues) {
+        for (var pkValue in primaryKeyValues.toList()) {
           await invalidateRecordByPrimaryKey(tableName, pkValue);
         }
       } else {
@@ -673,7 +675,7 @@ class DataCacheManager {
 
         int processedCount = 0;
         // Remove records with specified primary key values from cache
-        for (var pkValue in primaryKeyValues) {
+        for (var pkValue in primaryKeyValues.toList()) {
           final pkString = pkValue.toString();
           final recordCache = tableCache.getRecord(pkString);
           if (recordCache != null) {
@@ -746,9 +748,11 @@ class DataCacheManager {
         primaryKeyValues.map((pk) => pk.toString()).toSet();
 
     int processedCount = 0;
-    // Check each query
-    for (var entry in tableDependency.entries.toList()) {
-      final queryInfo = entry.value;
+    // Check each query using the efficient key-collection pattern
+    for (final key in tableDependency.keys.toList()) {
+      final queryInfo = tableDependency[key];
+      // The entry could have been removed by another process in the await gap.
+      if (queryInfo == null) continue;
 
       // Skip user-managed caches, these caches need to be manually invalidated by the user
       if (queryInfo.isUserManaged) {
@@ -757,7 +761,7 @@ class DataCacheManager {
 
       // Optimization: if it is a full table cache, clean up directly
       if (queryInfo.isFullTableCache) {
-        keysToRemove.add(entry.key);
+        keysToRemove.add(key);
         continue;
       }
 
@@ -772,7 +776,7 @@ class DataCacheManager {
       }
 
       if (hasIntersection) {
-        keysToRemove.add(entry.key);
+        keysToRemove.add(key);
       }
       processedCount++;
       if (processedCount % 50 == 0) {
@@ -900,8 +904,6 @@ class DataCacheManager {
 
       int evictedCount = 0;
 
- 
-
       // First apply time decay to all table caches.
       // This is still an async operation, but we don't need to await it here
       // as the top-level MemoryManager call is already awaited.
@@ -911,7 +913,11 @@ class DataCacheManager {
       final buckets = <int, List<TableCache>>{};
       int maxBucket = 0;
 
-      for (var tableCache in tableCaches.values.toList()) {
+      // Use the efficient key-collection pattern
+      for (final key in tableCaches.keys.toList()) {
+        final tableCache = tableCaches[key];
+        if (tableCache == null) continue;
+
         if (tableCache.recordCount > 0) {
           final bucketKey = (log(tableCache.recordCount) / log(10)).floor();
           buckets.putIfAbsent(bucketKey, () => []).add(tableCache);
@@ -930,8 +936,10 @@ class DataCacheManager {
           // Sort within the smaller bucket to still prioritize larger tables
           tablesInBucket.sort((a, b) => b.recordCount.compareTo(a.recordCount));
 
-          for (var tableCache in tablesInBucket.toList()) {
+          // Use a standard indexed for-loop for maximum efficiency and safety.
+          for (int i = 0; i < tablesInBucket.length; i++) {
             if (evictedCount >= totalEvictionCount) break;
+            final tableCache = tablesInBucket[i];
 
             final toEvict = min(
                 (tableCache.recordCount * 0.3)
@@ -981,7 +989,11 @@ class DataCacheManager {
   /// Apply time decay to all table caches
   Future<void> _applyTimeDecayToAllCaches() async {
     int processedCount = 0;
-    for (var tableCache in tableCaches.values.toList()) {
+    // Use the efficient key-collection pattern for better performance
+    for (final key in tableCaches.keys.toList()) {
+      final tableCache = tableCaches[key];
+      if (tableCache == null) continue;
+
       await tableCache.applyTimeDecay();
       processedCount++;
       // Yield to the event loop to avoid blocking.
@@ -1172,7 +1184,10 @@ class DataCacheManager {
     final result = <Map<String, dynamic>>[];
     int processedCount = 0;
 
-    for (final recordCache in cache.recordsMap.values.toList()) {
+    // Use the efficient key-collection pattern
+    for (final key in cache.recordsMap.keys.toList()) {
+      final recordCache = cache.recordsMap[key];
+      if (recordCache == null) continue;
       final record = recordCache.record;
       if (record[fieldName] == fieldValue) {
         result.add(Map<String, dynamic>.from(record));
@@ -1208,10 +1223,14 @@ class DataCacheManager {
       // 2. Clear all related queries cache in general cache
       final keysToRemove = <String>[];
       int processedCount = 0;
-      final entries = _queryCache.cache.entries.toList();
-      for (final entry in entries) {
-        if (entry.value.tableName == tableName) {
-          keysToRemove.add(entry.key);
+      // Use the efficient key-collection pattern to iterate
+      final keys = _queryCache.cache.keys.toList();
+      for (final key in keys) {
+        final entryValue = _queryCache.cache[key];
+        // The entry could have been removed by another process in the await gap.
+        if (entryValue == null) continue;
+        if (entryValue.tableName == tableName) {
+          keysToRemove.add(key);
         }
         processedCount++;
         if (processedCount % 500 == 0) {
@@ -1332,10 +1351,14 @@ class DataCacheManager {
     // Clean up all table-related query caches (traverse global query cache)
     final keysToRemove = <String>[];
     int processedCount = 0;
-    final entries = _queryCache.cache.entries.toList();
-    for (final entry in entries) {
-      if (entry.value.tableName == tableName) {
-        keysToRemove.add(entry.key);
+    // Use the efficient key-collection pattern
+    final keys = _queryCache.cache.keys.toList();
+    for (final key in keys) {
+      final entryValue = _queryCache.cache[key];
+      // The entry could have been removed by another process in the await gap.
+      if (entryValue == null) continue;
+      if (entryValue.tableName == tableName) {
+        keysToRemove.add(key);
       }
       processedCount++;
       if (processedCount % 500 == 0) {

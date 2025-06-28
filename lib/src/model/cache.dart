@@ -154,13 +154,10 @@ class TableCache {
     List<Map<String, dynamic>> records, {
     RecordCacheType cacheType = RecordCacheType.runtime,
   }) async {
-
-    int processedCount = 0;
-    // Add records
-    for (final record in records) {
-      addOrUpdateRecord(record, cacheType: cacheType);
-      processedCount++;
-      if (processedCount % 500 == 0) {
+    // Use a standard for-loop for efficiency and safety with async gaps.
+    for (int i = 0; i < records.length; i++) {
+      addOrUpdateRecord(records[i], cacheType: cacheType);
+      if ((i + 1) % 500 == 0) {
         await Future.delayed(Duration.zero);
       }
     }
@@ -185,7 +182,11 @@ class TableCache {
   /// Apply time decay to all records
   Future<void> applyTimeDecay() async {
     int processedCount = 0;
-    for (final cache in recordsMap.values.toList()) {
+    // Use the efficient key-collection pattern
+    for (final key in recordsMap.keys.toList()) {
+      final cache = recordsMap[key];
+      if (cache == null) continue;
+
       cache.applyTimeDecay();
       processedCount++;
       if (processedCount % 500 == 0) {
@@ -211,10 +212,15 @@ class TableCache {
     // which is very slow for large caches.
     final buckets = List.generate(11, (_) => <MapEntry<String, RecordCache>>[]);
     int processedCount = 0;
-    for (final entry in recordsMap.entries.toList()) {
-      final priority = entry.value.calculatePriority();
+    // Use the efficient key-collection pattern
+    for (final key in recordsMap.keys.toList()) {
+      final entryValue = recordsMap[key];
+      if (entryValue == null) continue;
+
+      final priority = entryValue.calculatePriority();
       final bucketIndex = (priority * 10).floor().clamp(0, 10);
-      buckets[bucketIndex].add(entry);
+      // Create a new MapEntry to add to the bucket
+      buckets[bucketIndex].add(MapEntry(key, entryValue));
       processedCount++;
       if (processedCount % 500 == 0) {
         await Future.delayed(Duration.zero);
@@ -234,9 +240,9 @@ class TableCache {
       // Shuffle to evict randomly from within the same priority bucket
       bucket.shuffle();
 
-      for (final entry in bucket.toList()) {
+      for (int j = 0; j < bucket.length && evictedCount < count; j++) {
         if (evictedCount >= count) break;
-
+        final entry = bucket[j];
         final cache = entry.value;
 
         // Skip if we need to preserve startup cache records

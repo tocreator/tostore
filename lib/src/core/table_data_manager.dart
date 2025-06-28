@@ -828,51 +828,32 @@ class TableDataManager {
       // Track processed records
       int recordsProcessed = 0;
 
-      // Continue processing buffer as long as there's data and table buffer exists
-      while (_writeBuffer.containsKey(tableName) &&
-          !(_writeBuffer[tableName]?.isEmpty ?? true)) {
-        // Get current queue size
-        final currentQueueSize = _writeBuffer[tableName]!.length;
+      // Get all keys at the beginning to create a static list for iteration.
+      final allKeys = _writeBuffer.containsKey(tableName)
+          ? _writeBuffer[tableName]!.keys.toList()
+          : <String>[];
+      final initialQueueSize = allKeys.length;
 
-        // If we've processed all data from the initial queue and remaining data is less than a batch, stop processing
-        // This avoids frequent processing of small batches, improving efficiency
-        if (recordsProcessed >= totalQueueSize &&
-            currentQueueSize < maxBatchSize) {
-          break;
-        }
+      // Process the static list of keys in batches.
+      for (int i = 0; i < initialQueueSize; i += maxBatchSize) {
+        // Determine the sublist of keys for the current batch.
+        final endIndex = min(i + maxBatchSize, initialQueueSize);
+        if (i >= endIndex) break; // Should not happen, but for safety.
+        final keysToProcess = allKeys.sublist(i, endIndex);
 
-        // Determine batch size for this iteration, directly from current buffer state
-        final currentBatchSize = min(currentQueueSize, maxBatchSize);
-
-        if (currentBatchSize <= 0) {
-          break;
-        }
-
-        // Get latest keys directly from current buffer
-        final keysToProcess = _writeBuffer[tableName]!
-            .keys
-            .take(currentBatchSize.toInt())
-            .toList();
-
-        if (keysToProcess.isEmpty ||
-            (_writeBuffer[tableName]?.isEmpty ?? true)) {
-          _writeBuffer.remove(tableName);
-          break;
-        }
-
-        // Group by operation type
+        // Group by operation type from the live buffer
         final insertRecords = <Map<String, dynamic>>[];
         final updateRecords = <Map<String, dynamic>>[];
         // Store processed entries for error recovery
         final processedEntries = <String, BufferEntry>{};
 
-        // Extract data from original buffer and remove immediately
+        // Extract data from original buffer and remove immediately.
+        // It's safe to modify the buffer here because we are iterating over a static key list.
         for (final key in keysToProcess) {
           final entry = _writeBuffer[tableName]?[key];
           if (entry != null) {
             processedEntries[key] = entry;
-            _writeBuffer[tableName]!
-                .remove(key); // Remove from original buffer immediately
+            _writeBuffer[tableName]!.remove(key); // Remove from live buffer
 
             final data = entry.data;
             final operation = entry.operation;
@@ -884,8 +865,7 @@ class TableDataManager {
             }
           }
         }
-
-        // If table buffer is now empty, remove it from write buffer
+        // If the table buffer in the main map becomes empty, remove it.
         if (_writeBuffer[tableName]?.isEmpty ?? true) {
           _writeBuffer.remove(tableName);
         }
@@ -911,10 +891,7 @@ class TableDataManager {
           recordsProcessed += processedEntries.length;
 
           // After current batch is processed, yield execution thread to avoid blocking UI
-          if (_writeBuffer.containsKey(tableName) &&
-              !(_writeBuffer[tableName]?.isEmpty ?? true)) {
-            await Future.delayed(Duration.zero);
-          }
+          await Future.delayed(Duration.zero);
         } catch (e) {
           Logger.error('Failed to process data for table $tableName: $e',
               label: 'TableDataManager._flushTableBuffer');
@@ -1139,21 +1116,27 @@ class TableDataManager {
     final meta = await getTableFileMeta(tableName);
     final metadataCount = meta?.totalRecords ?? 0;
 
-    // check pending records in write buffer
-    final pendingRecords = _writeBuffer[tableName];
-    if (pendingRecords == null || pendingRecords.isEmpty) {
-      return metadataCount; // no pending records
-    }
-
     // calculate pending insert records count (only count insert operation, not update operation)
     int pendingInsertCount = 0;
-    for (final entry in pendingRecords.entries) {
-      if (entry.value.operation == BufferOperationType.insert) {
-        pendingInsertCount++;
+    final pendingWrites = _writeBuffer[tableName];
+    if (pendingWrites != null) {
+      for (final entry in pendingWrites.values) {
+        if (entry.operation == BufferOperationType.insert) {
+          pendingInsertCount++;
+        }
       }
     }
 
-    return metadataCount + pendingInsertCount;
+    // calculate pending delete records count
+    int pendingDeleteCount = 0;
+    final pendingDeletes = _deleteBuffer[tableName];
+    if (pendingDeletes != null) {
+      pendingDeleteCount = pendingDeletes.length;
+    }
+
+    // The final count is the stored count, plus pending inserts, minus pending deletes.
+    // Use max(0, ...) to ensure the count doesn't go negative due to inconsistencies.
+    return max(0, metadataCount + pendingInsertCount - pendingDeleteCount);
   }
 
   /// get table file size
@@ -2033,9 +2016,10 @@ class TableDataManager {
           isOrdered = false;
         } else {
           // check partition ordered
-          for (int i = 1; i < meta.partitions!.length; i++) {
-            final prevPartition = meta.partitions![i - 1];
-            final currentPartition = meta.partitions![i];
+          final partitions = meta.partitions!;
+          for (int i = 1; i < partitions.length; i++) {
+            final prevPartition = partitions[i - 1];
+            final currentPartition = partitions[i];
 
             // if max value of previous partition is greater than or equal to min value of current partition, then non-ordered
             if (prevPartition.maxPrimaryKey != null &&
@@ -2109,9 +2093,10 @@ class TableDataManager {
 
       // Await each future in sequence to yield records in order.
       // The I/O operations themselves run in parallel because the futures were created together.
-      for (final future in partitionReadFutures) {
+      final futures = partitionReadFutures;
+      for (int i = 0; i < futures.length; i++) {
         try {
-          final records = await future;
+          final records = await futures[i];
           for (final record in records) {
             if (!isDeletedRecord(record)) {
               yield record;
@@ -2127,7 +2112,11 @@ class TableDataManager {
 
     // Include pending data from the write buffer that hasn't been flushed yet.
     final pendingData = _writeBuffer[tableName] ?? {};
-    for (var entry in pendingData.values) {
+    final pendingKeys = pendingData.keys.toList();
+    for (final key in pendingKeys) {
+      final entry = pendingData[key];
+      // The entry could have been removed by another process in the await gap.
+      if (entry == null) continue;
       // ensure only return non-deleted data
       if (!isDeletedRecord(entry.data)) {
         yield entry.data;
@@ -2224,7 +2213,9 @@ class TableDataManager {
             }
 
             // process selected partitions
-            for (final partition in partitionsToProcess) {
+            final partitions = partitionsToProcess;
+            for (int i = 0; i < partitions.length; i++) {
+              final partition = partitions[i];
               // calculate directory based on partition index
               final dirIndex =
                   partition.index ~/ _dataStore.config.maxEntriesPerDir;
@@ -2242,7 +2233,9 @@ class TableDataManager {
                     jsonDecode(decodedString) as Map<String, dynamic>);
 
                 // process records, filter out empty records
-                for (final record in partitionInfo.data) {
+                final pData = partitionInfo.data;
+                for (int j = 0; j < pData.length; j++) {
+                  final record = pData[j];
                   if (record is Map<String, dynamic> &&
                       !isDeletedRecord(record)) {
                     yield record;
@@ -2270,9 +2263,9 @@ class TableDataManager {
       List<PartitionMeta> partitions, String targetKey) async {
     final result = <PartitionMeta>[];
 
-    int processedCount = 0;
-    // First check if any partition contains target key
-    for (final partition in partitions) {
+    // Use a standard for-loop for efficiency and safety with async gaps.
+    for (int i = 0; i < partitions.length; i++) {
+      final partition = partitions[i];
       // If partition has primary key range info, check if target key is in range
       if (partition.minPrimaryKey != null && partition.maxPrimaryKey != null) {
         // Use ValueComparator to check if target key is in range
@@ -2287,8 +2280,7 @@ class TableDataManager {
         // If partition has no range info, assume it needs processing
         result.add(partition);
       }
-      processedCount++;
-      if (processedCount % 200 == 0) {
+      if ((i + 1) % 200 == 0) {
         await Future.delayed(Duration.zero);
       }
     }
@@ -2777,7 +2769,9 @@ class TableDataManager {
         // Identify which partitions might contain records
         final partitionsToProcess = <PartitionMeta>[];
         int partitionCheckCount = 0;
-        for (final partition in existingPartitions) {
+        // Use a standard for-loop for efficiency and safety with async gaps.
+        for (int i = 0; i < existingPartitions.length; i++) {
+          final partition = existingPartitions[i];
           if (partition.minPrimaryKey != null &&
               partition.maxPrimaryKey != null) {
             // Check if any records may be in this partition range
@@ -2966,8 +2960,10 @@ class TableDataManager {
 
         // delete unused old partitions
         if (existingPartitions.isNotEmpty) {
-          final newPartitionIndexes = partitionRecords.keys.toList();
-          for (var oldPartition in existingPartitions) {
+          final newPartitionIndexes = partitionRecords.keys.toSet();
+          final oldPartitions = existingPartitions;
+          for (int i = 0; i < oldPartitions.length; i++) {
+            final oldPartition = oldPartitions[i];
             if (!newPartitionIndexes.contains(oldPartition.index)) {
               final partitionPath = await _dataStore.pathManager
                   .getPartitionFilePath(tableName, oldPartition.index);
@@ -2975,7 +2971,9 @@ class TableDataManager {
                 await _dataStore.storage.deleteFile(partitionPath);
               }
             }
-            await Future.delayed(Duration.zero);
+            if ((i + 1) % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
         }
       }
@@ -3157,7 +3155,8 @@ class TableDataManager {
         final fileMeta = await getTableFileMeta(tableName);
         if (fileMeta != null && fileMeta.partitions != null) {
           int processedCount = 0;
-          for (final partition in fileMeta.partitions!) {
+          for (int i = 0; i < fileMeta.partitions!.length; i++) {
+            final partition = fileMeta.partitions![i];
             if (partition.fileSizeInBytes > 0) {
               final partitionPath = await _dataStore.pathManager
                   .getPartitionFilePath(tableName, partition.index);
@@ -3273,8 +3272,9 @@ class TableDataManager {
       final isGlobal = sourceSchema.isGlobal;
       final primaryKey = sourceSchema.primaryKey;
 
-      final tasks =
-          sourceFileMeta.partitions!.map((p) => p.index).map((partitionIndex) {
+      final sourcePartitions = sourceFileMeta.partitions!;
+      final tasks = List.generate(sourcePartitions.length, (i) {
+        final partitionIndex = sourcePartitions[i].index;
         return () async {
           // Read source partition data
           final records = await readRecordsFromPartition(
@@ -3298,7 +3298,7 @@ class TableDataManager {
             encryptionKeyId: encryptionKeyId,
           );
         };
-      }).toList();
+      });
       final partitionMetas =
           await ParallelProcessor.execute<PartitionMeta>(tasks);
 
@@ -3465,42 +3465,32 @@ class TableDataManager {
       // Track processed records
       int recordsProcessed = 0;
 
-      // Continue processing buffer as long as there's data and table buffer exists
-      while (_deleteBuffer.containsKey(tableName) &&
-          !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
-        // Get current queue size
-        final currentQueueSize = _deleteBuffer[tableName]!.length;
+      // Get all keys at the beginning to create a static list for iteration.
+      final allKeys = _deleteBuffer.containsKey(tableName)
+          ? _deleteBuffer[tableName]!.keys.toList()
+          : <String>[];
+      final initialQueueSize = allKeys.length;
 
-        // Determine batch size for current iteration
-        final currentBatchSize = min(maxBatchSize, currentQueueSize);
-        if (currentBatchSize <= 0) {
-          break;
-        }
-
-        // Get latest keys directly from current buffer
-        final keysToProcess = _deleteBuffer[tableName]!
-            .keys
-            .take(currentBatchSize.toInt())
-            .toList();
-
-        if (keysToProcess.isEmpty ||
-            (_deleteBuffer[tableName]?.isEmpty ?? true)) {
-          _deleteBuffer.remove(tableName);
-          break;
-        }
+      // Process the static list of keys in batches.
+      for (int i = 0; i < initialQueueSize; i += maxBatchSize) {
+        // Determine the sublist of keys for the current batch.
+        final endIndex = min(i + maxBatchSize, initialQueueSize);
+        if (i >= endIndex) break;
+        final keysToProcess = allKeys.sublist(i, endIndex);
 
         // Prepare a list of records to delete
         final recordsToDelete = <Map<String, dynamic>>[];
         // Store processed entries for error recovery
         final processedEntries = <String, BufferEntry>{};
 
-        // Extract data from original buffer and remove immediately
+        // Extract data from original buffer and remove immediately.
+        // It's safe to modify the buffer here because we are iterating over a static key list.
         for (final key in keysToProcess) {
           final entry = _deleteBuffer[tableName]?[key];
           if (entry != null) {
             processedEntries[key] = entry;
             _deleteBuffer[tableName]!
-                .remove(key); // Remove from original buffer immediately
+                .remove(key); // Remove from live buffer
             recordsToDelete.add(entry.data);
           }
         }
@@ -3586,9 +3576,10 @@ class TableDataManager {
         int offset = oldRecordsCount; // calculate offset from old record count
 
         // batch process index creation
-        for (int i = 0; i < recordsForIndex.length; i += indexBatchSize) {
-          final endIndex = min(i + indexBatchSize, recordsForIndex.length);
-          final batch = recordsForIndex.sublist(i, endIndex);
+        final records = recordsForIndex;
+        for (int i = 0; i < records.length; i += indexBatchSize) {
+          final endIndex = min(i + indexBatchSize, records.length);
+          final batch = records.sublist(i, endIndex);
 
           for (int j = 0; j < batch.length; j++) {
             final record = batch[j];

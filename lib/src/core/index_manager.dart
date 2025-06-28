@@ -17,6 +17,7 @@ import 'data_store_impl.dart';
 import 'compute_tasks.dart';
 import 'memory_manager.dart';
 import '../handler/parallel_processor.dart';
+import '../model/system_table.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -151,7 +152,9 @@ class IndexManager {
 
       // Bucket all entries by weight
       int processedCount = 0;
-      for (final entry in _indexAccessWeights.entries) {
+      final accessWeights = _indexAccessWeights.entries.toList();
+      for (int i = 0; i < accessWeights.length; i++) {
+        final entry = accessWeights[i];
         final key = entry.key;
         final value = entry.value;
 
@@ -177,16 +180,22 @@ class IndexManager {
       int removed = 0;
       int processedInBatch = 0;
 
+      // Create a sorted list of weights to iterate over.
+      final sortedWeights = buckets.keys.toList()..sort();
+
       // Iterate from the lowest weight upwards and remove entries
-      for (int weight = 0;
-          weight <= maxWeight && removed < cleanupCount;
-          weight++) {
+      for (final weight in sortedWeights) {
+        if (removed >= cleanupCount) break;
         if (buckets.containsKey(weight)) {
           final keys = buckets[weight]!;
           // Shuffle to evict random entries if multiple have the same weight
           keys.shuffle();
-          for (final key in keys) {
+
+          // Use a standard indexed for-loop for safety against concurrent modification.
+          final keysToProcess = keys.toList();
+          for (int i = 0; i < keysToProcess.length; i++) {
             if (removed >= cleanupCount) break;
+            final key = keysToProcess[i];
 
             final index = _indexCache[key];
             if (index != null) {
@@ -247,32 +256,38 @@ class IndexManager {
       // Critical indexes to preserve (primary key and unique indexes)
       final criticalIndexes = <String>{};
 
+      // System tables to preserve
+      final systemTables = <String>{};
+
       // Single pass to categorize entries into time buckets
       // Use epoch hours as bucket keys (rough time division)
-      int processedCount = 0;
-      for (final entry in _indexMetaCache.entries) {
-        final key = entry.key;
-        final parts = key.split(':');
+      // Use a standard indexed for-loop for safety
+      final metaCacheEntries = _indexMetaCache.entries.toList();
+      for (int i = 0; i < metaCacheEntries.length; i++) {
+        final entry = metaCacheEntries[i];
+        final indexName = entry.key;
+        final meta = entry.value;
 
-        // Identify critical indexes to preserve
-        if (parts.length == 2 &&
-            (key.startsWith('pk_') || key.startsWith('uniq_'))) {
-          criticalIndexes.add(key);
+        // Identify critical indexes to preserve (primary key and unique indexes)
+        if (indexName.startsWith('pk_') || meta.isUnique) {
+          criticalIndexes.add(indexName);
+          continue; // Critical indexes are not put into eviction buckets
+        }
+
+        // Identify system tables to preserve
+        if (SystemTable.isSystemTable(meta.tableName)) {
+          systemTables.add(indexName);
           continue;
         }
 
         // Get last access time, convert to bucket
-        final lastAccess =
-            _indexAccessWeights[key]?['lastAccess'] as DateTime? ??
-                DateTime(1970);
+        final lastModified = meta.timestamps.modified;
         // Use hours since epoch as bucket key (coarse-grained time division)
-        final bucketKey = lastAccess.millisecondsSinceEpoch ~/ 3600000;
+        final bucketKey = lastModified.millisecondsSinceEpoch ~/ 3600000;
 
         // Add to appropriate bucket
-        buckets.putIfAbsent(bucketKey, () => <String>[]).add(key);
-
-        processedCount++;
-        if (processedCount % 500 == 0) {
+        buckets.putIfAbsent(bucketKey, () => <String>[]).add(indexName);
+        if (i % 500 == 0) {
           await Future.delayed(Duration.zero);
         }
       }
@@ -281,23 +296,24 @@ class IndexManager {
       final sortedBuckets = buckets.keys.toList()..sort();
 
       for (final bucketKey in sortedBuckets) {
-        final keysInBucket = buckets[bucketKey]!;
-
-        // Process all keys in this time bucket
-        for (final key in keysInBucket) {
+        final indexesInBucket = buckets[bucketKey]!;
+        // Use a standard indexed for-loop for safety
+        final indexesToProcess = indexesInBucket.toList();
+        for (int i = 0; i < indexesToProcess.length; i++) {
+          final indexName = indexesToProcess[i];
           // Skip if we've removed enough already
           if (removedSize >= needToRemoveBytes) break;
 
-          // Remove this entry if not critical
-          if (!criticalIndexes.contains(key)) {
-            final metaSize = _indexMetaSizeCache[key] ?? 0;
-            _indexMetaCache.remove(key);
-            _indexMetaSizeCache.remove(key);
+          // Remove this entry if not a system table or a critical index
+          if (!systemTables.contains(indexName) &&
+              !criticalIndexes.contains(indexName)) {
+            final metaSize = _indexMetaSizeCache[indexName] ?? 0;
+            _indexMetaCache.remove(indexName);
+            _indexMetaSizeCache.remove(indexName);
 
             removedSize += metaSize;
           }
-          processedCount++;
-          if (processedCount % 500 == 0) {
+          if (i % 500 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -1352,9 +1368,15 @@ class IndexManager {
 
       // Check cache
       if (_indexCache.containsKey(cacheKey)) {
-        // Update access weight
-        _updateIndexAccessWeight(cacheKey);
-        return _indexCache[cacheKey];
+        // We have an index in the cache
+
+        // For key-specific requests with partial cache, or any request with full cache
+        if (key != null || _indexFullyCached[cacheKey] == true) {
+          _updateIndexAccessWeight(cacheKey);
+          return _indexCache[cacheKey];
+        }
+        // For full index requests (key==null) but only partially cached index,
+        // continue to load the full index
       }
 
       // Check index metadata
@@ -2241,7 +2263,7 @@ class IndexManager {
         final meta = await _getIndexMeta(tableName, indexName);
         if (meta != null) {
           int partitionCount = 0;
-          for (final partition in meta.partitions) {
+          for (final partition in meta.partitions.toList()) {
             final partitionPath = await _dataStore.pathManager
                 .getIndexPartitionPath(tableName, indexName, partition.index);
             await _dataStore.storage.deleteFile(partitionPath);
@@ -2475,16 +2497,21 @@ class IndexManager {
           return false;
         }
 
-        // After searching, if the index was loaded, it will be in the cache.
-        if (!_indexCache.containsKey(cacheKey)) {
+        // If primary key index is fully cached and result is empty, can directly return true
+        if (_indexFullyCached[cacheKey] == true) {
+          // Index is fully cached and search returned empty results,
+          // which means there are definitely no duplicates in the index
+        }
+        // Only check write buffer if index was not fully cached
+        else if (!_indexCache.containsKey(cacheKey)) {
           // If not in cache, it means it was searched partition by partition,
           // which is equivalent to checking the full index.
           // Now, we still need to check the write buffer for pending operations.
           final pendingData =
               _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
           int processedCount = 0;
-          for (var record in pendingData.entries.toList()) {
-            if (record.value.data[primaryKey] == primaryValue) {
+          for (var key in pendingData.keys.toList()) {
+            if (pendingData[key]!.data[primaryKey] == primaryValue) {
               Logger.warn('Primary key duplicate in write queue: $primaryValue',
                   label: 'IndexManager.checkUniqueConstraints');
               return false;
@@ -2521,19 +2548,27 @@ class IndexManager {
 
             // if any index found
             if (effectiveIndexName != null) {
+              final cacheKey = _getIndexCacheKey(tableName, effectiveIndexName);
+              final isFullyCached = _indexFullyCached[cacheKey] == true;
+
               final results =
                   await searchIndex(tableName, effectiveIndexName, value);
 
               if (results.isEmpty) {
+                // If index is fully cached and result is empty, can directly return true
+                if (isFullyCached) {
+                  continue;
+                }
+
                 final pendingData =
                     _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
                 bool hasDuplicate = false;
 
                 int processedCount = 0;
-                for (var record in pendingData.entries.toList()) {
-                  if (record.value.data[field.name] == value &&
+                for (var key in pendingData.keys.toList()) {
+                  if (pendingData[key]!.data[field.name] == value &&
                       (!isUpdate ||
-                          record.value.data[primaryKey] != primaryValue)) {
+                          pendingData[key]!.data[primaryKey] != primaryValue)) {
                     hasDuplicate = true;
                     break;
                   }
@@ -2676,9 +2711,17 @@ class IndexManager {
 
         // get index name and cache key
         final indexName = index.actualIndexName;
+        final cacheKey = _getIndexCacheKey(tableName, indexName);
+        final isFullyCached = _indexFullyCached[cacheKey] == true;
+
         final results = await searchIndex(tableName, indexName, indexKey);
 
         if (results.isEmpty) {
+          // If index is fully cached and result is empty, can directly return true
+          if (isFullyCached) {
+            continue;
+          }
+
           // index has no result, check write buffer
           final pendingData =
               _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
@@ -2764,7 +2807,7 @@ class IndexManager {
 
     int processedCount = 0;
     // check each index key, determine which is global table
-    for (final key in keysToCheck) {
+    for (final key in keysToCheck.toList()) {
       try {
         // extract table name from index key (format: tableName:indexName or tableName_indexName)
         final parts = key.split(':');
@@ -2792,7 +2835,7 @@ class IndexManager {
     final globalDeleteKeysToKeep = <String>[];
 
     processedCount = 0;
-    for (final key in deleteKeysToCheck) {
+    for (final key in deleteKeysToCheck.toList()) {
       try {
         final parts = key.split(':');
         final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
@@ -2825,8 +2868,8 @@ class IndexManager {
     try {
       // Get index size from cached metadata
       int processedCount = 0;
-      for (final meta in _indexMetaCache.values) {
-        for (final partition in meta.partitions) {
+      for (final meta in _indexMetaCache.values.toList()) {
+        for (final partition in meta.partitions.toList()) {
           totalSize += partition.fileSizeInBytes;
         }
         processedCount++;
@@ -2841,7 +2884,7 @@ class IndexManager {
             await _dataStore.schemaManager?.getAllTableSchemas() ?? [];
 
         processedCount = 0;
-        for (final schemaData in schemaList) {
+        for (final schemaData in schemaList.toList()) {
           try {
             final schema = Map<String, dynamic>.from(schemaData);
             final tableName = schema['name'] as String?;
@@ -2955,7 +2998,7 @@ class IndexManager {
 
               int processedCount = 0;
               // find the record that matches the pointer in the cached records
-              for (final record in cachedRecords) {
+              for (final record in cachedRecords.toList()) {
                 final pkValue = record[primaryKey];
                 if (pkValue != null) {
                   // check if the index pointer of the primary key value is the one we are looking for
@@ -4138,8 +4181,9 @@ class IndexManager {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
 
-      // 1. Check cache first
-      if (_indexCache.containsKey(cacheKey)) {
+      // 1. Check cache first - only use cache if it's fully loaded
+      if (_indexCache.containsKey(cacheKey) &&
+          _indexFullyCached[cacheKey] == true) {
         _updateIndexAccessWeight(cacheKey);
         return await _indexCache[cacheKey]!.search(key);
       }

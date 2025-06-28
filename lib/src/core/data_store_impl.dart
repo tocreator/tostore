@@ -2016,7 +2016,9 @@ class DataStoreImpl {
       final prioritizedTables = await _prioritizeTables(allTables);
 
       // Load tables
-      for (var tableName in prioritizedTables) {
+      // Use a standard indexed for-loop for maximum safety and efficiency.
+      for (int i = 0; i < prioritizedTables.length; i++) {
+        final tableName = prioritizedTables[i];
         try {
           // Check if table exists in current space
           final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
