@@ -44,8 +44,9 @@ class QueryExecutor {
       }
 
       // Determine if query cache should be used
-      final shouldUseQueryCache =
-          enableQueryCache ?? _dataStore.config.shouldEnableQueryCache;
+      bool shouldUseQueryCache = enableQueryCache ??
+          (_dataStore.config.shouldEnableQueryCache &&
+              !_dataStore.dataCacheManager.isAutoCacheDisabled);
 
       if (shouldUseQueryCache) {
         final cacheKey = QueryCacheKey(
@@ -169,17 +170,14 @@ class QueryExecutor {
           // Update access time
           _dataStore.dataCacheManager.recordTableAccess(tableName);
 
+          if (results.isNotEmpty) {
+            results = await _filterPendingDeletes(tableName, results);
+          }
+
           // if not primary key query, cache it
           if (shouldUseQueryCache && !isPrimaryKeyQuery) {
-            final queryCacheSize =
-                _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
-            final maxCacheResults =
-                queryCacheSize ~/ 500; // Estimate 500 bytes per query result
-
-            final shouldCache =
-                condition == null || (results.length < maxCacheResults);
-
-            if (shouldCache && results.isNotEmpty) {
+            if (await _dataStore.dataCacheManager
+                .shouldCacheQuery(results: results)) {
               // Create query cache key
               final cacheKey = QueryCacheKey(
                 tableName: tableName,
@@ -199,9 +197,7 @@ class QueryExecutor {
             }
           }
           if (results.isNotEmpty || isFullCache) {
-            final filteredResults =
-                await _filterPendingDeletes(tableName, results);
-            return _paginateResults(filteredResults, limit, offset);
+            return _paginateResults(results, limit, offset);
           }
         }
       }
@@ -215,18 +211,13 @@ class QueryExecutor {
         _applySort(results, orderBy);
       }
 
-      // 5. Cache results if query cache is enabled
+      // 5. apply pagination and return results
+      final filteredResults = await _filterPendingDeletes(tableName, results);
+
+      // 6. Cache results if query cache is enabled
       if (shouldUseQueryCache) {
-        final queryCacheSize =
-            _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
-        final maxCacheResults =
-            queryCacheSize ~/ 500; // Estimate 500 bytes per query result
-
-        final shouldCache = condition == null ||
-            (await _isSpecificQuery(tableName, condition)) ||
-            (results.length < maxCacheResults);
-
-        if (shouldCache && results.isNotEmpty) {
+        if (await _dataStore.dataCacheManager
+            .shouldCacheQuery(results: filteredResults)) {
           // Create query cache key
           final cacheKey = QueryCacheKey(
             tableName: tableName,
@@ -239,15 +230,13 @@ class QueryExecutor {
 
           await _dataStore.dataCacheManager.cacheQuery(
             cacheKey,
-            results,
+            filteredResults,
             {tableName},
             expiryDuration: queryCacheExpiry,
           );
         }
       }
 
-      // 6. apply pagination and return results
-      final filteredResults = await _filterPendingDeletes(tableName, results);
       final paginatedResults = _paginateResults(filteredResults, limit, offset);
       return paginatedResults;
     } catch (e, stackTrace) {

@@ -62,11 +62,13 @@ class ParallelProcessor {
   /// Returns a `Future` that completes with a list of results in the original order.
   static Future<List<T?>> execute<T>(
     List<Future<T> Function()> tasks, {
+    String? label,
     ParallelController? controller,
     int? concurrency,
     Duration? timeout,
     bool? continueOnError,
   }) async {
+    final effectiveLabel = label != null ? ".$label" : "";
     final effectiveConcurrency = max(1, concurrency ?? _concurrency);
     final effectiveContinueOnError = continueOnError ?? _continueOnError;
 
@@ -143,8 +145,8 @@ class ParallelProcessor {
       } catch (e, s) {
         if (e != 'stopped') {
           Logger.error(
-            'Parallel task at index $index failed: $e\n$s',
-            label: 'ParallelProcessor',
+            '$effectiveLabel Parallel task at index $index failed: $e\n$s',
+            label: "ParallelProcessor$effectiveLabel",
           );
         }
 
@@ -188,4 +190,4 @@ class ParallelProcessor {
       rethrow;
     }
   }
-} 
+}

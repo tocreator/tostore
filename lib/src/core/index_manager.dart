@@ -127,102 +127,77 @@ class IndexManager {
     }
   }
 
-  /// Clean up index cache
+  /// Clean up index cache by evicting entire indexes based on LRU.
   Future<void> _cleanupIndexCache() async {
-    // This cleanup is now called by MemoryManager, which already handles re-entrancy
-    // and asynchronicity. We can directly perform the cleanup logic here.
     try {
       if (_indexCache.isEmpty) return;
 
-      // Check if memory is under pressure
-      // Get memory manager
       final memoryManager = _dataStore.memoryManager;
-      if (memoryManager != null && !memoryManager.isLowMemoryMode()) {
-        final cacheLimit = memoryManager.getIndexCacheSize();
+      if (memoryManager == null) return;
 
-        // If current cache size is less than 90% of the limit, no need to clean up
-        if (_currentIndexCacheSize < cacheLimit * 0.9) {
-          return;
-        }
+      // Determine the target size to bring usage down to 70% of the limit.
+      final cacheLimit = memoryManager.getIndexCacheSize();
+      final targetCacheSize = (cacheLimit * 0.7).toInt();
+
+      if (_currentIndexCacheSize <= targetCacheSize) {
+        return;
       }
 
-      // Optimization: Use buckets to avoid full sorting, which can cause freezes on large caches.
-      final buckets = <int, List<String>>{};
-      int maxWeight = 0;
+      final bytesToEvict = _currentIndexCacheSize - targetCacheSize;
+      int bytesEvicted = 0;
 
-      // Bucket all entries by weight
+      // 1. Get all candidate indexes, sorted by last access time (LRU).
+      // Sorting the list of indexes itself should be fast.
+      final evictableIndexes = _indexAccessWeights.entries.toList()
+        ..sort((a, b) {
+          final lastAccessA = a.value['lastAccess'] as DateTime? ?? DateTime(1970);
+          final lastAccessB = b.value['lastAccess'] as DateTime? ?? DateTime(1970);
+          return lastAccessA.compareTo(lastAccessB); // Oldest first
+        });
+
+      final indexesToRemove = <String>[];
       int processedCount = 0;
-      final accessWeights = _indexAccessWeights.entries.toList();
-      for (int i = 0; i < accessWeights.length; i++) {
-        final entry = accessWeights[i];
-        final key = entry.key;
-        final value = entry.value;
 
-        // Ensure the key exists in the index cache before considering it for eviction
-        if (_indexCache.containsKey(key)) {
-          final weight = value['weight'] as int;
-          buckets.putIfAbsent(weight, () => []).add(key);
-          if (weight > maxWeight) {
-            maxWeight = weight;
-          }
+      // 2. Identify which entire indexes to evict.
+      for (final entry in evictableIndexes) {
+        if (bytesEvicted >= bytesToEvict) break;
+
+        final key = entry.key;
+        final index = _indexCache[key];
+        if (index != null) {
+          final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
+          bytesEvicted += size;
+          indexesToRemove.add(key);
         }
+
+        // Yield to the event loop to prevent UI jank if there are many indexes.
         processedCount++;
-        if (processedCount % 500 == 0) {
+        if (processedCount % 20 == 0) {
           await Future.delayed(Duration.zero);
         }
       }
 
-      final totalEntries =
-          buckets.values.fold<int>(0, (sum, list) => sum + list.length);
-      if (totalEntries == 0) return;
-
-      final cleanupCount = (totalEntries * 0.3).ceil();
-      int removed = 0;
-      int processedInBatch = 0;
-
-      // Create a sorted list of weights to iterate over.
-      final sortedWeights = buckets.keys.toList()..sort();
-
-      // Iterate from the lowest weight upwards and remove entries
-      for (final weight in sortedWeights) {
-        if (removed >= cleanupCount) break;
-        if (buckets.containsKey(weight)) {
-          final keys = buckets[weight]!;
-          // Shuffle to evict random entries if multiple have the same weight
-          keys.shuffle();
-
-          // Use a standard indexed for-loop for safety against concurrent modification.
-          final keysToProcess = keys.toList();
-          for (int i = 0; i < keysToProcess.length; i++) {
-            if (removed >= cleanupCount) break;
-            final key = keysToProcess[i];
-
-            final index = _indexCache[key];
-            if (index != null) {
-              final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
-
-              // Update total cache size
-              _currentIndexCacheSize -= size;
-              _indexSizeCache.remove(key);
-
-              // Remove index from all related caches
-              _indexCache.remove(key);
-              _indexFullyCached.remove(key);
-              _indexAccessWeights.remove(key);
-              removed++;
-              processedInBatch++;
-
-              // Use half of the configured maxBatchSize for cleanup tasks.
-              if (processedInBatch >=
-                  (_dataStore.config.maxBatchSize / 2).ceil()) {
-                // The delay is now handled by MemoryManager's serial execution,
-                // but a microtask yield can still be beneficial for extremely large buckets.
-                await Future.delayed(Duration.zero);
-                processedInBatch = 0;
-              }
-            }
-          }
+      // 3. Perform the actual eviction.
+      for (final key in indexesToRemove) {
+        final index = _indexCache.remove(key);
+        if (index != null) {
+          final size = _indexSizeCache.remove(key) ?? 0;
+          _currentIndexCacheSize -= size;
+          _indexFullyCached.remove(key);
+          _indexAccessWeights.remove(key);
         }
+
+        // Yield again during removal if the list is very large.
+        processedCount++;
+        if (processedCount % 20 == 0) {
+          await Future.delayed(Duration.zero);
+        }
+      }
+
+      if (bytesEvicted > 0) {
+        Logger.debug(
+            'Cache eviction: evicted ${indexesToRemove.length} entire indexes (${(bytesEvicted / 1024).toStringAsFixed(2)} KB) to free up memory.',
+            label: 'IndexManager._cleanupIndexCache');
       }
     } catch (e) {
       Logger.error('Failed to clean up index cache: $e',
@@ -430,8 +405,6 @@ class IndexManager {
   Future<void> _processIndexWriteBuffer({List<String>? specificKeys}) async {
     // If already processing, avoid duplicate execution
     if (!_isClosing && _isProcessingWriteBuffer) {
-      Logger.debug('Index write buffer is being processed, skipping',
-          label: 'IndexManager._processIndexWriteBuffer');
       return;
     }
 
@@ -582,6 +555,9 @@ class IndexManager {
       // Create a mutable copy of the key list for concurrency security
       final keysToDelete = List<String>.from(entriesToDelete.keys);
 
+      // A specific resource name for locking the keysToDelete list for this operation.
+      final listLockResource = 'internal:keysToDelete:$tableName:$indexName';
+
       // Collect updated partition metadata
       final List<IndexPartitionMeta> updatedPartitions = [];
 
@@ -648,7 +624,17 @@ class IndexManager {
             }
 
             if (isUniqueIndex && result.processedKeys.isNotEmpty) {
-              keysToDelete.removeWhere((k) => result.processedKeys.contains(k));
+              final opId =
+                  'op-del-keys-${DateTime.now().microsecondsSinceEpoch}';
+              try {
+                await _dataStore.lockManager
+                    ?.acquireExclusiveLock(listLockResource, opId);
+                keysToDelete
+                    .removeWhere((k) => result.processedKeys.contains(k));
+              } finally {
+                _dataStore.lockManager
+                    ?.releaseExclusiveLock(listLockResource, opId);
+              }
             }
           } catch (e, stack) {
             Logger.error(
@@ -658,7 +644,9 @@ class IndexManager {
         });
       }
 
-      await ParallelProcessor.execute<void>(tasks);
+      await ParallelProcessor.execute<void>(tasks,
+          label: 'IndexManager._processDeleteEntries',
+          timeout: ParallelProcessor.noTimeout);
 
       // After all partitions are processed, update the main metadata
       if (updatedPartitions.isNotEmpty) {
@@ -1080,7 +1068,9 @@ class IndexManager {
         }
       });
     }
-    await ParallelProcessor.execute<void>(tasks);
+    await ParallelProcessor.execute<void>(tasks,
+        label: 'IndexManager._processBatchIndexWrites',
+        timeout: ParallelProcessor.noTimeout);
   }
 
   void dispose() {
@@ -1733,7 +1723,7 @@ class IndexManager {
         });
       }
       // Parallel execute all partition tasks
-      await ParallelProcessor.execute<void>(tasks);
+      await ParallelProcessor.execute<void>(tasks, label: 'IndexManager._loadIndexFromFile');
       return bTree;
     } catch (e) {
       Logger.error('Failed to load index from file: $e',
@@ -3251,7 +3241,7 @@ class IndexManager {
 
       // Force buffer processing if the batch is large
       if (records.length > 1000) {
-        await _processIndexWriteBuffer();
+        _processIndexWriteBuffer();
       }
     } catch (e, stack) {
       Logger.error('Failed to batch delete records from indexes: $e\n$stack',
@@ -4251,7 +4241,7 @@ class IndexManager {
         }
 
         final resultsFromPartitions =
-            await ParallelProcessor.execute<List<dynamic>>(tasks);
+            await ParallelProcessor.execute<List<dynamic>>(tasks, label: 'IndexManager.searchIndex');
 
         final allResults = <dynamic>[];
         for (final resultList in resultsFromPartitions) {

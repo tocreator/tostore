@@ -83,6 +83,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return this;
   }
 
+  /// Disable query result caching for this query, overriding the global setting.
+  QueryBuilder noQueryCache() {
+    _enableQueryCache = false;
+    _invalidateFuture();
+    return this;
+  }
+
   /// Clear the query cache for the current query condition
   /// Returns the number of cache entries removed
   Future<int> clearQueryCache() async {

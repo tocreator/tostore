@@ -276,6 +276,7 @@ class TableDataManager {
         tableNames.map((tableName) {
           return () => getTableFileMeta(tableName);
         }).toList(),
+        label: 'TableDataManager._calculateTableStatistics',
       );
 
       // Iterate through the results to calculate statistics
@@ -1013,6 +1014,7 @@ class TableDataManager {
         // The outer concurrency is still governed by ParallelProcessor's default,
         // which is set to _effectiveMaxConcurrent.
         timeout: ParallelProcessor.noTimeout,
+        label: "TableDataManager.flushWriteBuffer",
       );
 
       // after processing, record the result
@@ -2428,6 +2430,7 @@ class TableDataManager {
       }).toList(),
       concurrency: maxConcurrent,
       controller: effectiveController,
+      label: 'TableDataManager.processTablePartitions',
     );
 
     // if only read, return directly
@@ -2737,7 +2740,8 @@ class TableDataManager {
 
         final partitionResults = await ParallelProcessor.execute<PartitionMeta>(
             tasks,
-            concurrency: concurrency);
+            concurrency: concurrency,
+            label: 'TableDataManager.writeRecords.insert');
         allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());
 
         // all partitions processed, update table meta once
@@ -2878,7 +2882,8 @@ class TableDataManager {
 
         final partitionResults =
             await ParallelProcessor.execute<Map<String, dynamic>>(tasks,
-                concurrency: concurrency);
+                concurrency: concurrency,
+                label: 'TableDataManager.writeRecords.update');
 
         final processedKeys = <String>{};
         for (final result in partitionResults) {
@@ -2946,7 +2951,8 @@ class TableDataManager {
         }).toList();
         final partitionResults =
             await ParallelProcessor.execute<PartitionMeta?>(tasks,
-                concurrency: concurrency);
+                concurrency: concurrency,
+                label: 'TableDataManager.writeRecords.rewrite');
 
         // collect all valid partition meta
         allPartitionMetas.addAll(partitionResults.whereType<PartitionMeta>());
@@ -3299,8 +3305,9 @@ class TableDataManager {
           );
         };
       });
-      final partitionMetas =
-          await ParallelProcessor.execute<PartitionMeta>(tasks);
+      final partitionMetas = await ParallelProcessor.execute<PartitionMeta>(
+          tasks,
+          label: 'TableDataManager.rewriteRecordsFromSourceTable');
 
       // Update target table meta with all collected partitions
       final validMetas = partitionMetas.whereType<PartitionMeta>().toList();
@@ -3389,6 +3396,7 @@ class TableDataManager {
               concurrency: concurrencyForThisTable);
         }),
         timeout: ParallelProcessor.noTimeout,
+        label: 'TableDataManager.flushDeleteBuffer',
       );
 
       final duration = DateTime.now().difference(startTime).inMilliseconds;
@@ -3489,8 +3497,7 @@ class TableDataManager {
           final entry = _deleteBuffer[tableName]?[key];
           if (entry != null) {
             processedEntries[key] = entry;
-            _deleteBuffer[tableName]!
-                .remove(key); // Remove from live buffer
+            _deleteBuffer[tableName]!.remove(key); // Remove from live buffer
             recordsToDelete.add(entry.data);
           }
         }

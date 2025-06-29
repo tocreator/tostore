@@ -8,6 +8,7 @@ import 'data_store_impl.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
+import 'table_data_manager.dart' show isDeletedRecord;
 
 /// Migration manager for handling database version upgrades
 ///
@@ -1416,9 +1417,12 @@ class MigrationManager {
 
               // if need cache, collect records
               if (shouldCache) {
-                allMigratedRecords.addAll(modifiedRecords
+                // Filter out deleted records before adding to the collection for caching
+                final filteredRecords = modifiedRecords
+                    .where((r) => !isDeletedRecord(r))
                     .map((r) => Map<String, dynamic>.from(r))
-                    .toList());
+                    .toList();
+                allMigratedRecords.addAll(filteredRecords);
               }
 
               return modifiedRecords;
@@ -1442,9 +1446,12 @@ class MigrationManager {
 
                   // if need cache, collect records
                   if (shouldCache) {
-                    allMigratedRecords.addAll(migratedRecords
+                    // Filter out deleted records before adding to the collection for caching
+                    final filteredRecords = migratedRecords
+                        .where((r) => !isDeletedRecord(r))
                         .map((r) => Map<String, dynamic>.from(r))
-                        .toList());
+                        .toList();
+                    allMigratedRecords.addAll(filteredRecords);
                   }
 
                   return migratedRecords;

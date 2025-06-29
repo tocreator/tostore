@@ -325,7 +325,8 @@ class DataStoreImpl {
         // Calculate a dynamic timeout based on max partition size.
         // Formula: 5 seconds base + 1 second per 128KB.
         timeout: Duration(
-            seconds: 5 + (_config!.maxPartitionFileSize / (128 * 1024)).ceil()),
+            seconds:
+                10 + (_config!.maxPartitionFileSize / (128 * 1024)).ceil()),
       );
 
       // Ensure _currentSpaceName is synchronized with config.spaceName
@@ -1372,14 +1373,12 @@ class DataStoreImpl {
     final transaction = await _transactionManager!.beginTransaction();
 
     try {
-      // get table record count, for later processing
-      final totalRecords =
-          await tableDataManager.getTableRecordCount(tableName);
+      // Get table file metadata to make an informed decision on the deletion strategy
+      final tableMeta = await tableDataManager.getTableFileMeta(tableName);
+      final totalSizeInBytes = tableMeta?.fileSizeInBytes ?? 0;
 
-      // Get record cache size limit using memory manager
+      // Get memory manager to access cache size limits
       final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
-      final recordThreshold =
-          (recordCacheSize / 1000).round(); // 1KB per record
 
       // get table schema
       final schema = await getTableSchema(tableName);
@@ -1439,8 +1438,17 @@ class DataStoreImpl {
         }
       }
 
+      // Decide strategy:
+      // If the table's total size is small (e.g., less than 20% of the record cache limit)
+      // or if it's an optimizable query (on a PK or unique index),
+      // we can load matching records into memory for deletion.
+      // This is generally faster for smaller datasets.
+      final bool useInMemoryStrategy =
+          isOptimizableQuery || (totalSizeInBytes < recordCacheSize * 0.2);
+      // const bool useInMemoryStrategy = false;
+
       // when table record count is less than threshold or this is an optimizable query, use regular method
-      if (totalRecords <= recordThreshold || isOptimizableQuery) {
+      if (useInMemoryStrategy) {
         // standard method: get all records
         final recordsToDelete = await executeQuery(tableName, condition,
             orderBy: orderBy, limit: limit, offset: offset);
@@ -1482,96 +1490,106 @@ class DataStoreImpl {
           message: 'Successfully deleted ${successKeys.length} records',
         );
       } else {
-        // create counters
-        int totalProcessed = 0;
-        int totalDeleted = 0;
-        // Collect deleted record keys
-        final List<String> deletedKeys = [];
+        final lockKey = 'table_$tableName';
+        final operationId =
+            'process_partitions_delete_${DateTime.now().millisecondsSinceEpoch}';
+        try {
+          await lockManager!.acquireExclusiveLock(lockKey, operationId);
+          // create counters
+          int totalProcessed = 0;
+          int totalDeleted = 0;
+          // Collect deleted record keys
+          final List<String> deletedKeys = [];
 
-        // build a process function, to check if each partition's record matches the delete condition
-        Future<List<Map<String, dynamic>>> processFunction(
-            List<Map<String, dynamic>> records,
-            int partitionIndex,
-            ParallelController controller) async {
-          // record original count
-          int originalCount = records.length;
+          // build a process function, to check if each partition's record matches the delete condition
+          Future<List<Map<String, dynamic>>> processFunction(
+              records, partitionIndex, controller) async {
+            // record original count
+            int originalCount = records.length;
 
-          // Create a new list with all records (do not filter out)
-          final resultRecords = List<Map<String, dynamic>>.from(records);
+            // Create a new list with all records (do not filter out)
+            final resultRecords = List<Map<String, dynamic>>.from(records);
 
-          // collect deleted records
-          final deletedRecords = <Map<String, dynamic>>[];
+            // collect deleted records
+            final deletedRecords = <Map<String, dynamic>>[];
 
-          // optimized: track if all non-deleted records have been deleted
-          bool allDeleted = true;
+            // optimized: track if all non-deleted records have been deleted
+            bool allDeleted = true;
 
-          // replace deleted records with _deleted_:true marker, instead of removing
-          for (int i = 0; i < resultRecords.length; i++) {
-            final record = resultRecords[i];
+            // replace deleted records with _deleted_:true marker, instead of removing
+            for (int i = 0; i < resultRecords.length; i++) {
+              final record = resultRecords[i];
 
-            // skip if already deleted record
-            if (isDeletedRecord(record)) continue;
+              // skip if already deleted record
+              if (isDeletedRecord(record)) continue;
 
-            final matches = condition.matches(record);
-            if (matches) {
-              totalDeleted++;
+              final matches = condition.matches(record);
+              if (matches) {
+                // Apply limit before processing the record for deletion
+                if (limit != null && totalDeleted >= limit) {
+                  if (!controller.isStopped) {
+                    controller.stop();
+                  }
+                  allDeleted = false;
+                  continue; // Stop processing further matches in this partition
+                }
 
-              // add to deleted records list
-              deletedRecords.add(record);
+                totalDeleted++;
 
-              // get record primary key value
-              final pkValue = record[primaryKey]?.toString();
-              if (pkValue != null) {
-                // Add to deleted keys list
-                deletedKeys.add(pkValue);
+                // add to deleted records list
+                deletedRecords.add(record);
 
-                await dataCacheManager.invalidateRecord(tableName, pkValue);
+                // get record primary key value
+                final pkValue = record[primaryKey]?.toString();
+                if (pkValue != null) {
+                  // Add to deleted keys list
+                  deletedKeys.add(pkValue);
 
-                // remove from write queue (if exists)
-                writeQueue?.remove(pkValue);
+                  // remove from write queue (if exists)
+                  writeQueue?.remove(pkValue);
+                }
+
+                // replace with explicit delete marker instead of empty object, to prevent migration issues
+                resultRecords[i] = {'_deleted_': true};
+              } else {
+                // has non-deleted records
+                allDeleted = false;
               }
-
-              // process limit
-              if (limit != null && totalDeleted > limit) {
-                continue; // if exceeds limit, do not delete this record
-              }
-
-              // replace with explicit delete marker instead of empty object, to prevent migration issues
-              resultRecords[i] = {'_deleted_': true};
-            } else {
-              // has non-deleted records
-              allDeleted = false;
             }
+
+            totalProcessed += originalCount;
+
+            if (deletedRecords.isNotEmpty) {
+              await dataCacheManager.invalidateRecords(tableName, deletedKeys);
+              // batch update indexes
+              await _indexManager?.batchDeleteFromIndexes(
+                  tableName, deletedRecords);
+
+              // Optimized: if all records are deleted, return empty list, directly remove the partition, more efficient
+              if (allDeleted) {
+                return [];
+              }
+            }
+
+            return resultRecords;
           }
 
-          totalProcessed += originalCount;
+          // use processTablePartitions to process all partition
+          await tableDataManager.processTablePartitions(
+            tableName: tableName,
+            processFunction: processFunction,
+          );
 
-          if (deletedRecords.isNotEmpty) {
-            // batch update indexes
-            await _indexManager?.batchDeleteFromIndexes(
-                tableName, deletedRecords);
-
-            // Optimized: if all records are deleted, return empty list, directly remove the partition, more efficient
-            if (allDeleted) {
-              return [];
-            }
-          }
-
-          return resultRecords;
+          await _transactionManager!.commit(transaction);
+          return DbResult.success(
+            successKeys: deletedKeys,
+            message:
+                'Successfully deleted $totalDeleted records (processed $totalProcessed)',
+          );
+        } finally {
+          // Always ensure the lock is released.
+          lockManager!.releaseExclusiveLock(lockKey, operationId);
         }
-
-        // use processTablePartitions to process all partition
-        await tableDataManager.processTablePartitions(
-          tableName: tableName,
-          processFunction: processFunction,
-        );
-
-        await _transactionManager!.commit(transaction);
-        return DbResult.success(
-          successKeys: deletedKeys,
-          message:
-              'Successfully deleted $totalDeleted records (processed $totalProcessed)',
-        );
       }
     } catch (e) {
       Logger.error('Delete failed: $e', label: 'DataStore-delete');

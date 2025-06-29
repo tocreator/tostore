@@ -37,6 +37,10 @@ class DataCacheManager {
   // Space switching status flag
   bool _isSwitchingSpace = false;
 
+  // threshold-based auto-disable
+  bool _autoQueryCacheDisabled = false;
+  bool get isAutoCacheDisabled => _autoQueryCacheDisabled;
+
   DataCacheManager(this._dataStore)
       : _queryCache = QueryCache(
           maxSizeBytes: _dataStore.memoryManager?.getQueryCacheSize() ??
@@ -287,6 +291,14 @@ class DataCacheManager {
         return;
       }
 
+      // Determine if it is a user-managed cache once
+      bool isUserManaged = key.isUserManaged;
+
+      // If auto-caching is disabled, do not cache non-user-managed queries
+      if (_autoQueryCacheDisabled && !isUserManaged) {
+        return;
+      }
+
       // Query results are stored only once in _queryCache
       await _queryCache.put(
         cacheKey,
@@ -295,15 +307,6 @@ class DataCacheManager {
         schema.primaryKey,
         expiryDuration: expiryDuration,
       );
-
-      // Determine if it is a user-managed cache once
-      bool isUserManaged = false;
-      try {
-        final cacheKeyMap = jsonDecode(cacheKey) as Map<String, dynamic>;
-        isUserManaged = cacheKeyMap['isUserManaged'] == true;
-      } catch (e) {
-        // Parse error, conservative handling, assume it is system cache
-      }
 
       // Record the dependency between queries and tables
       for (var table in tables.toList()) {
@@ -328,6 +331,11 @@ class DataCacheManager {
                   isFullTableCache: isFullTableQuery,
                   isUserManaged: isUserManaged,
                 ));
+      }
+      // Check threshold after adding
+      final threshold = _dataStore.config.queryCacheCountThreshold;
+      if (threshold != null && !isUserManaged && _queryCache.size > threshold) {
+        await _disableAndCleanupAutoQueryCache();
       }
     } catch (e) {
       Logger.error('Cache query results failed: $e',
@@ -474,10 +482,79 @@ class DataCacheManager {
     }
   }
 
+  /// Invalidate multiple records from the cache for a specific table.
+  /// [primaryKeyValues] is a list of primary key values to invalidate.
+  Future<void> invalidateRecords(
+      String tableName, List<String> primaryKeyValues) async {
+    try {
+      // 1. Invalidate records from the TableCache
+      final tableCache = tableCaches[tableName];
+      final List<Map<String, dynamic>> recordsData = [];
+      if (tableCache != null) {
+        // First, collect record data for the primary keys to be invalidated.
+        for (final pkValue in primaryKeyValues) {
+          // Do not use getRecord as it updates access time. Access map directly.
+          final recordCache = tableCache.recordsMap[pkValue];
+          if (recordCache != null) {
+            recordsData.add(recordCache.record);
+          }
+        }
+        // Now, remove the records from the cache.
+        for (final pkValue in primaryKeyValues) {
+          final removed = tableCache.recordsMap.remove(pkValue);
+          if (removed != null) {
+            tableCache.removeRecordAndUpdateStats(removed);
+          }
+        }
+      }
+
+      // if query caching is disabled, do not touch the query cache at all.
+      if (_dataStore.config.shouldEnableQueryCache == false ||
+          _autoQueryCacheDisabled) {
+        return;
+      }
+
+      // 2. Invalidate relevant queries from the QueryCache
+      const int batchThreshold = 100;
+
+      if (primaryKeyValues.isEmpty) {
+        await _cleanupAllTableRelatedQueries(tableName);
+        return;
+      }
+
+      if (primaryKeyValues.length > batchThreshold) {
+        await _cleanupAllTableRelatedQueries(tableName);
+      } else {
+        await _cleanupQueriesContainingPrimaryKeys(
+            tableName, primaryKeyValues.toSet(), recordsData);
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to invalidate records: $e',
+        label: 'DataCacheManager.invalidateRecords',
+      );
+    }
+  }
+
   /// Invalidate record related cache
   Future<void> invalidateRecord(
       String tableName, dynamic primaryKeyValue) async {
     try {
+      // If query caching is disabled globally, only invalidate the record cache.
+      if (_dataStore.config.shouldEnableQueryCache == false ||
+          _autoQueryCacheDisabled) {
+        final tableCache = tableCaches[tableName];
+        if (tableCache != null) {
+          final pkString = primaryKeyValue.toString();
+          final recordCache = tableCache.getRecord(pkString);
+          if (recordCache != null) {
+            _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
+            tableCache.recordsMap.remove(pkString);
+          }
+        }
+        return;
+      }
+
       // 1. Clean up primary key based query cache, this is a direct and efficient path
       await invalidateRecordByPrimaryKey(tableName, primaryKeyValue);
 
@@ -506,7 +583,95 @@ class DataCacheManager {
     }
   }
 
-  /// Only clean up full table cache queries
+  /// Clean up queries containing specified primary key values
+  Future<void> _cleanupQueriesContainingPrimaryKeys(String tableName,
+      Set<dynamic> primaryKeyValues, List<Map<String, dynamic>> records) async {
+    final tableDependency = _tableDependencies[tableName];
+    if (tableDependency == null) return;
+
+    final keysToRemove = <String>{};
+    final primaryKeyStrings =
+        primaryKeyValues.map((pk) => pk.toString()).toSet();
+    int processedCount = 0;
+
+    for (final key in tableDependency.keys.toList()) {
+      if (keysToRemove.contains(key)) continue;
+
+      final queryInfo = tableDependency[key];
+      if (queryInfo == null) continue;
+      if (queryInfo.isUserManaged) continue;
+
+      if (queryInfo.isFullTableCache) {
+        keysToRemove.add(key);
+        continue;
+      }
+
+      bool hasIntersection = false;
+      for (final resultKey in queryInfo.resultKeys) {
+        if (primaryKeyStrings.contains(resultKey)) {
+          hasIntersection = true;
+          break;
+        }
+      }
+
+      if (hasIntersection) {
+        keysToRemove.add(key);
+        continue;
+      }
+
+      // Final check: if any of the records match the query condition, clean up the cache
+      if (records.isNotEmpty) {
+        for (final recordData in records) {
+          if (queryInfo.queryKey.condition.matches(recordData)) {
+            keysToRemove.add(key);
+            break; // One match is enough to invalidate this query
+          }
+        }
+      }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        // Yield to event loop to avoid blocking UI
+        await Future.delayed(Duration.zero);
+      }
+    }
+
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+      tableDependency.remove(key);
+    }
+
+    if (tableDependency.isEmpty) {
+      _tableDependencies.remove(tableName);
+    }
+  }
+
+  /// Clean up all queries related to a specific table
+  Future<void> _cleanupAllTableRelatedQueries(String tableName) async {
+    _cleanupFullTableQueriesOnly(tableName);
+
+    final keysToRemove = <String>[];
+    final allQueryKeys = _queryCache.cache.keys.toList();
+    int processedCount = 0;
+    for (final key in allQueryKeys) {
+      final query = _queryCache.cache[key];
+      if (query != null && query.tableName == tableName) {
+        keysToRemove.add(key);
+      }
+      processedCount++;
+      if (processedCount % 500 == 0) {
+        // Yield to event loop to avoid blocking UI
+        await Future.delayed(Duration.zero);
+      }
+    }
+
+    for (var key in keysToRemove) {
+      _queryCache.invalidate(key);
+    }
+
+    _tableDependencies.remove(tableName);
+  }
+
+  /// Clean up all queries related to a specific table
   void _cleanupFullTableQueriesOnly(String tableName) {
     final tableDependency = _tableDependencies[tableName];
     if (tableDependency == null) return;
@@ -629,174 +794,6 @@ class DataCacheManager {
     }
   }
 
-  /// Invalidate records related cache
-  Future<void> invalidateRecords(
-    String tableName,
-    Set<dynamic> primaryKeyValues,
-  ) async {
-    try {
-      // Check if the table cache exists
-      final tableCache = tableCaches[tableName];
-
-      // If the primary key value set is empty, clean up all related query caches
-      if (primaryKeyValues.isEmpty) {
-        // If the table cache exists, subtract its total size
-        if (tableCache != null) {
-          _totalRecordCacheSize -= tableCache.totalCacheSize;
-        }
-
-        // Clean up all table-related query caches
-        await _cleanupAllTableRelatedQueries(tableName);
-
-        // Clean up table cache
-        tableCaches.remove(tableName);
-        return;
-      }
-
-      // Optimization: batch process primary key value quantity
-      const int batchSize = 100; // Set a reasonable batch size
-
-      // If the number of primary keys is small, handle each primary key separately
-      if (primaryKeyValues.length <= batchSize) {
-        // Clean up directly related caches for each primary key (efficient path)
-        for (var pkValue in primaryKeyValues.toList()) {
-          await invalidateRecordByPrimaryKey(tableName, pkValue);
-        }
-      } else {
-        // If the number of primary keys is too large, clean up all table-related query caches
-
-        await _cleanupAllTableRelatedQueries(tableName);
-      }
-
-      // Handle records in table cache
-      if (tableCache != null) {
-        int reducedSize =
-            0; // Record the total size of the cache that was reduced
-
-        int processedCount = 0;
-        // Remove records with specified primary key values from cache
-        for (var pkValue in primaryKeyValues.toList()) {
-          final pkString = pkValue.toString();
-          final recordCache = tableCache.getRecord(pkString);
-          if (recordCache != null) {
-            reducedSize += recordCache.estimateMemoryUsage();
-            tableCache.recordsMap.remove(pkString);
-          }
-          processedCount++;
-          if (processedCount % 500 == 0) {
-            // Yield to event loop to avoid blocking UI
-            await Future.delayed(Duration.zero);
-          }
-        }
-
-        // Update the total cache size
-        _totalRecordCacheSize -= reducedSize;
-      }
-
-      // Get table dependency
-      final tableDependency = _tableDependencies[tableName];
-      if (tableDependency != null) {
-        // If the number of primary keys exceeds the threshold, clean up all table-related queries
-        if (primaryKeyValues.length > batchSize) {
-          final keysToRemove = <String>[];
-
-          // Clean up all non-user-managed query caches
-          for (var entry in tableDependency.entries) {
-            final queryInfo = entry.value;
-            if (!queryInfo.isUserManaged) {
-              keysToRemove.add(entry.key);
-            }
-          }
-
-          // Remove related query cache
-          for (var key in keysToRemove) {
-            _queryCache.invalidate(key);
-            tableDependency.remove(key);
-          }
-        } else {
-          // When the number of primary keys is moderate, clean up query caches containing these primary keys
-          await _cleanupQueriesContainingPrimaryKeys(
-              tableName, primaryKeyValues);
-        }
-
-        // If there are no related queries, clean up dependencies
-        if (tableDependency.isEmpty) {
-          _tableDependencies.remove(tableName);
-        }
-      }
-    } catch (e) {
-      Logger.error(
-        'Invalidate records cache failed: $e\n'
-        'tableName: $tableName\n'
-        'primaryKeyValues: $primaryKeyValues',
-        label: 'DataCacheManager.invalidateRecords',
-      );
-    }
-  }
-
-  /// Clean up queries containing specified primary key values
-  Future<void> _cleanupQueriesContainingPrimaryKeys(
-      String tableName, Set<dynamic> primaryKeyValues) async {
-    final tableDependency = _tableDependencies[tableName];
-    if (tableDependency == null) return;
-
-    // List of keys to clean up
-    final keysToRemove = <String>[];
-
-    // Convert the primary key value set to a string set for faster lookup
-    final primaryKeyStrings =
-        primaryKeyValues.map((pk) => pk.toString()).toSet();
-
-    int processedCount = 0;
-    // Check each query using the efficient key-collection pattern
-    for (final key in tableDependency.keys.toList()) {
-      final queryInfo = tableDependency[key];
-      // The entry could have been removed by another process in the await gap.
-      if (queryInfo == null) continue;
-
-      // Skip user-managed caches, these caches need to be manually invalidated by the user
-      if (queryInfo.isUserManaged) {
-        continue; // skip user-managed caches
-      }
-
-      // Optimization: if it is a full table cache, clean up directly
-      if (queryInfo.isFullTableCache) {
-        keysToRemove.add(key);
-        continue;
-      }
-
-      // If any primary key in the query result is in the primary key set to be deleted, clean up the query
-      // Directly check the intersection of the primary key set, instead of traversing the complete record
-      bool hasIntersection = false;
-      for (final key in queryInfo.resultKeys) {
-        if (primaryKeyStrings.contains(key)) {
-          hasIntersection = true;
-          break;
-        }
-      }
-
-      if (hasIntersection) {
-        keysToRemove.add(key);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        // Yield to event loop to avoid blocking UI
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    // Remove related query cache
-    for (var key in keysToRemove) {
-      _queryCache.invalidate(key);
-      tableDependency.remove(key);
-    }
-
-    // If there are no related queries, clean up dependencies
-    if (tableDependency.isEmpty) {
-      _tableDependencies.remove(tableName);
-    }
-  }
-
   /// Clear all cache
   void clear() {
     _queryCache.clear();
@@ -890,117 +887,67 @@ class DataCacheManager {
     }
   }
 
-  /// Evict low priority records
+  /// Evict low priority records by evicting whole tables based on LRU.
   Future<void> _evictLowPriorityRecords() async {
-    // Re-entrancy and asynchronicity are now handled by MemoryManager.
     try {
-      // Get record cache size using memory manager
+      if (tableCaches.isEmpty) return;
       final memoryManager = _dataStore.memoryManager;
-      final recordCacheSize = memoryManager?.getRecordCacheSize() ?? 10000;
+      if (memoryManager == null) return;
 
-      int totalEvictionCount = (recordCacheSize * 0.3 / 1000)
-          .round(); // Clean up 30% of records, calculate based on approximately 1KB per record
-      if (totalEvictionCount <= 0) return;
+      final cacheLimit = memoryManager.getRecordCacheSize();
+      final targetCacheSize = (cacheLimit * 0.7).toInt();
 
-      int evictedCount = 0;
+      if (_totalRecordCacheSize <= targetCacheSize) {
+        return;
+      }
 
-      // First apply time decay to all table caches.
-      // This is still an async operation, but we don't need to await it here
-      // as the top-level MemoryManager call is already awaited.
-      await _applyTimeDecayToAllCaches();
+      int bytesToEvict = _totalRecordCacheSize - targetCacheSize;
+      int bytesEvicted = 0;
 
-      // Optimization: Use logarithmic buckets to categorize tables by size, avoiding a full sort.
-      final buckets = <int, List<TableCache>>{};
-      int maxBucket = 0;
+      // 1. Get all table caches as candidates for eviction.
+      // This sort is on the list of tables, which is usually small.
+      // So, a synchronous sort is acceptable here.
+      final evictableTables = tableCaches.values.toList()
+        ..sort((a, b) => a.lastAccessed.compareTo(b.lastAccessed));
 
-      // Use the efficient key-collection pattern
-      for (final key in tableCaches.keys.toList()) {
-        final tableCache = tableCaches[key];
-        if (tableCache == null) continue;
+      final tablesToRemove = <String>[];
+      int processedCount = 0;
 
-        if (tableCache.recordCount > 0) {
-          final bucketKey = (log(tableCache.recordCount) / log(10)).floor();
-          buckets.putIfAbsent(bucketKey, () => []).add(tableCache);
-          if (bucketKey > maxBucket) {
-            maxBucket = bucketKey;
-          }
+      // 2. Identify which entire tables to evict.
+      for (final tableCache in evictableTables) {
+        if (bytesEvicted >= bytesToEvict) break;
+
+        bytesEvicted += tableCache.totalCacheSize;
+        tablesToRemove.add(tableCache.tableName);
+
+        // Yield to the event loop to prevent UI jank if there are many tables.
+        processedCount++;
+        if (processedCount % 20 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
-      // Start evicting from tables with most records (from largest bucket)
-      for (int bucketKey = maxBucket;
-          bucketKey >= 0 && evictedCount < totalEvictionCount;
-          bucketKey--) {
-        if (buckets.containsKey(bucketKey)) {
-          final tablesInBucket = buckets[bucketKey]!;
-          // Sort within the smaller bucket to still prioritize larger tables
-          tablesInBucket.sort((a, b) => b.recordCount.compareTo(a.recordCount));
-
-          // Use a standard indexed for-loop for maximum efficiency and safety.
-          for (int i = 0; i < tablesInBucket.length; i++) {
-            if (evictedCount >= totalEvictionCount) break;
-            final tableCache = tablesInBucket[i];
-
-            final toEvict = min(
-                (tableCache.recordCount * 0.3)
-                    .round(), // Evict at most 30% from each table
-                totalEvictionCount - evictedCount);
-
-            if (toEvict <= 0) continue;
-
-            // Record whether it was full table cache before eviction
-            final wasFullTableCache = tableCache.isFullTableCache;
-
-            // Record the cache size before eviction
-            final beforeSize = tableCache.totalCacheSize;
-
-            // Perform eviction
-            final result = await tableCache.evictLowPriorityRecords(toEvict,
-                preserveStartupRecords: true // Preserve startup records
-                );
-
-            evictedCount += result['count'] as int;
-
-            // Update the total cache size
-            _totalRecordCacheSize -= (beforeSize - tableCache.totalCacheSize);
-
-            // If records were actually evicted and it was previously full table cache, update full table cache flag
-            if ((result['count'] as int) > 0 && wasFullTableCache) {
-              tableCache.isFullTableCache = false;
-            }
-
-            // Yielding is now handled by the MemoryManager's serial execution.
-            // A microtask yield within the loop can still be beneficial.
-            await Future.delayed(Duration.zero);
-          }
+      // 3. Perform the actual removal.
+      for (final tableName in tablesToRemove) {
+        final removedCache = tableCaches.remove(tableName);
+        if (removedCache != null) {
+          _totalRecordCacheSize -= removedCache.totalCacheSize;
+        }
+        // Yield again during removal if the list is very large.
+        processedCount++;
+        if (processedCount % 20 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
-      if (evictedCount > 0) {
-        Logger.debug('Cache eviction completed: evicted $evictedCount records',
+      if (bytesEvicted > 0) {
+        Logger.debug(
+            'Cache eviction: evicted ${tablesToRemove.length} entire tables (${(bytesEvicted / 1024).toStringAsFixed(2)} KB) to free up memory.',
             label: 'DataCacheManager._evictLowPriorityRecords');
       }
     } catch (e) {
       Logger.error('Failed to evict low priority records: $e',
           label: 'DataCacheManager._evictLowPriorityRecords');
-    }
-  }
-
-  /// Apply time decay to all table caches
-  Future<void> _applyTimeDecayToAllCaches() async {
-    int processedCount = 0;
-    // Use the efficient key-collection pattern for better performance
-    for (final key in tableCaches.keys.toList()) {
-      final tableCache = tableCaches[key];
-      if (tableCache == null) continue;
-
-      await tableCache.applyTimeDecay();
-      processedCount++;
-      // Yield to the event loop to avoid blocking.
-      // Use half of the configured maxBatchSize for cleanup tasks.
-      if (processedCount % ((_dataStore.config.maxBatchSize / 2).ceil()) == 0) {
-        await Future.delayed(const Duration(milliseconds: 1));
-      }
     }
   }
 
@@ -1343,36 +1290,71 @@ class DataCacheManager {
         .toList();
   }
 
-  /// Clean up all queries related to a specific table
-  Future<void> _cleanupAllTableRelatedQueries(String tableName) async {
-    // Clean up full table cache queries
-    _cleanupFullTableQueriesOnly(tableName);
+  /// Determines whether a given query result should be cached based on a unified set of rules.
+  Future<bool> shouldCacheQuery({
+    required List<Map<String, dynamic>> results,
+  }) async {
+    // Check runtime and global configs for auto-caching
+    if (_autoQueryCacheDisabled || !_dataStore.config.shouldEnableQueryCache) {
+      return false; // Auto-caching is disabled
+    }
 
-    // Clean up all table-related query caches (traverse global query cache)
-    final keysToRemove = <String>[];
-    int processedCount = 0;
-    // Use the efficient key-collection pattern
-    final keys = _queryCache.cache.keys.toList();
-    for (final key in keys) {
-      final entryValue = _queryCache.cache[key];
-      // The entry could have been removed by another process in the await gap.
-      if (entryValue == null) continue;
-      if (entryValue.tableName == tableName) {
-        keysToRemove.add(key);
-      }
-      processedCount++;
-      if (processedCount % 500 == 0) {
-        // Yield to event loop to avoid blocking UI
-        await Future.delayed(Duration.zero);
+    // Check result size to avoid caching excessively large results
+    final queryCacheSizeLimit =
+        _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
+    final currentCacheSize = _queryCache.totalCacheSize;
+    final estimatedResultSize = TableCache.estimateRecordsSize(results);
+
+    // Rule 1: The new item should fit without causing immediate eviction
+    if ((currentCacheSize + estimatedResultSize) > queryCacheSizeLimit) {
+      return false;
+    }
+
+    // Rule 2: A single query result should not occupy more than 25% of the total query cache.
+    final singleQuerySizeThreshold = (queryCacheSizeLimit * 0.25).toInt();
+    if (estimatedResultSize >= singleQuerySizeThreshold) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /// Disables automatic query caching and cleans up all auto-generated caches.
+  /// This is triggered when the number of query caches exceeds the configured threshold.
+  Future<void> _disableAndCleanupAutoQueryCache() async {
+    if (_autoQueryCacheDisabled) return; // Only run once
+
+    _autoQueryCacheDisabled = true;
+    final keysToRemove = <String>{};
+    final allEntries = _queryCache.cache.entries.toList();
+
+    for (final entry in allEntries) {
+      try {
+        final keyMap = jsonDecode(entry.key) as Map<String, dynamic>;
+        if (keyMap['isUserManaged'] != true) {
+          keysToRemove.add(entry.key);
+        }
+      } catch (e) {
+        // If key is malformed, assume it's an auto-cache and remove it for safety.
+        keysToRemove.add(entry.key);
       }
     }
 
-    for (var key in keysToRemove) {
+    for (final key in keysToRemove) {
       _queryCache.invalidate(key);
     }
 
-    // Remove table dependency
-    _tableDependencies.remove(tableName);
+    // Also clean up _tableDependencies for the removed keys
+    final Set<String> removedKeysSet = keysToRemove.toSet();
+    _tableDependencies.forEach((tableName, queryMap) {
+      queryMap.removeWhere((key, queryInfo) => removedKeysSet.contains(key));
+    });
+    // Clean up any tables that no longer have dependencies
+    _tableDependencies.removeWhere((key, value) => value.isEmpty);
+
+    Logger.info(
+        'Cleaned up ${keysToRemove.length} auto-generated query caches.',
+        label: 'DataCacheManager');
   }
 }
 

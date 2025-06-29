@@ -79,6 +79,12 @@ class DataStoreConfig {
   /// other: duration after which cache entries are considered stale
   final Duration? queryCacheExpiryTime;
 
+  
+  /// The threshold for the number of query caches. When this value is exceeded,
+  /// automatic query caching will be disabled to avoid performance degradation.
+  /// User-managed caches will not be affected. Set to null to disable this feature.
+  final int? queryCacheCountThreshold;
+
   /// Memory threshold in MB for all caches combined
   /// If null, system will automatically determine appropriate value based on available memory
   final int? memoryThresholdInMB;
@@ -115,6 +121,7 @@ class DataStoreConfig {
     this.memoryThresholdInMB,
     this.enablePrewarmCache,
     int? prewarmThresholdMB,
+    this.queryCacheCountThreshold = 2000,
   })  : maxPartitionFileSize =
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
@@ -258,6 +265,7 @@ class DataStoreConfig {
       memoryThresholdInMB: json['memoryThresholdInMB'] as int?,
       enablePrewarmCache: json['enablePrewarmCache'] as bool?,
       prewarmThresholdMB: json['prewarmThresholdMB'] as int? ?? 10,
+      queryCacheCountThreshold: json['queryCacheCountThreshold'] as int? ?? 2000,
     );
   }
 
@@ -289,6 +297,7 @@ class DataStoreConfig {
       'memoryThresholdInMB': memoryThresholdInMB,
       'enablePrewarmCache': enablePrewarmCache,
       'prewarmThresholdMB': prewarmThresholdMB,
+      'queryCacheCountThreshold': queryCacheCountThreshold,
     };
   }
 
@@ -319,6 +328,7 @@ class DataStoreConfig {
     int? memoryThresholdInMB,
     bool? enablePrewarmCache,
     int? prewarmThresholdMB,
+    int? queryCacheCountThreshold,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
@@ -348,6 +358,8 @@ class DataStoreConfig {
       memoryThresholdInMB: memoryThresholdInMB ?? this.memoryThresholdInMB,
       enablePrewarmCache: enablePrewarmCache ?? this.enablePrewarmCache,
       prewarmThresholdMB: prewarmThresholdMB ?? this.prewarmThresholdMB,
+      queryCacheCountThreshold:
+          queryCacheCountThreshold ?? this.queryCacheCountThreshold,
     );
   }
 }

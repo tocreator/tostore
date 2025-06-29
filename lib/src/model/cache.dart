@@ -347,6 +347,23 @@ class TableCache {
     }
   }
 
+  /// Removes a record and updates the cache size and statistics.
+  /// This should be called after a record has been removed from `recordsMap`.
+  void removeRecordAndUpdateStats(RecordCache removedCache) {
+    // Subtract the size of the removed record
+    _totalCacheSize -= removedCache.estimateMemoryUsage();
+
+    // Subtract map entry overhead
+    _totalCacheSize -= 16;
+
+    // Update record type counts
+    if (removedCache.cacheType == RecordCacheType.startup) {
+      _startupRecordCount--;
+    } else {
+      _runtimeRecordCount--;
+    }
+  }
+
   @override
   String toString() {
     final fullCacheStr = isFullTableCache ? 'complete' : 'partial';
