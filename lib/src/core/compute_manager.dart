@@ -42,4 +42,17 @@ class ComputeManager {
       }
     }
   }
+
+  /// Pre-warms the compute workers (isolates) to reduce the latency of the first `run` call.
+  /// This is useful to call during application startup.
+  static Future<void> prewarm() async {
+    // On native platforms, this will initialize the isolate pool.
+    // On web, this is a no-op.
+    try {
+      await compute_impl.prewarm();
+    } catch (e) {
+      Logger.warn('Compute worker pre-warming not available on this platform.',
+          label: 'ComputeManager.prewarm');
+    }
+  }
 }

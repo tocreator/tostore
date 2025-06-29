@@ -308,6 +308,28 @@ final taskId = await db.updateSchema('users')
 // Monitor migration progress
 final status = await db.queryMigrationTaskStatus(taskId);
 print('Migration progress: ${status?.progressPercentage}%');
+
+
+
+// Manual Query Cache Management (Server-Side)
+// is enabled by default on client platforms (mobile, desktop).
+// For server-side applications or large-scale data scenarios where granular control is needed,
+// you can manually manage the cache using the following APIs for optimal performance.
+
+// Manually cache a query result for 5 minutes. If no duration is provided, the cache will not expire.
+final activeUsers = await db.query('users')
+    .where('is_active', '=', true)
+    .useQueryCache(const Duration(minutes: 5));
+
+// When underlying data changes, use clearQueryCache to precisely invalidate the cache and ensure consistency.
+await db.query('users')
+    .where('is_active', '=', true)
+    .clearQueryCache();
+
+// For queries that require the absolute latest data, you can explicitly disable the cache.
+final freshUserData = await db.query('users')
+    .where('is_active', '=', true)
+    .noQueryCache();
 ```
 
 ## Distributed Architecture

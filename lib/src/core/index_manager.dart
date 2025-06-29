@@ -1349,110 +1349,6 @@ class IndexManager {
     }
   }
 
-  /// Get index
-  /// @param tableName Table name
-  /// @param indexName Index name
-  /// @param key Optional key to search for (enables partial index loading)
-  Future<BPlusTree?> getIndex(String tableName, String indexName,
-      {dynamic key}) async {
-    try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Check cache
-      if (_indexCache.containsKey(cacheKey)) {
-        // We have an index in the cache
-
-        // For key-specific requests with partial cache, or any request with full cache
-        if (key != null || _indexFullyCached[cacheKey] == true) {
-          _updateIndexAccessWeight(cacheKey);
-          return _indexCache[cacheKey];
-        }
-        // For full index requests (key==null) but only partially cached index,
-        // continue to load the full index
-      }
-
-      // Check index metadata
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) {
-        // When index metadata is not found, check if the table exists
-        final tableSchema = await _dataStore.getTableSchema(tableName);
-        if (tableSchema == null) {
-          return null;
-        }
-
-        // Table exists but index not found, check if we need to rebuild
-        if (tableSchema.fields.isNotEmpty) {
-          // Check table index status and rebuild indexes if needed
-          await _checkAndRebuildTableIndexes(tableName, tableSchema);
-
-          // Try to get the index again after rebuilding
-          return getIndex(tableName, indexName, key: key);
-        }
-
-        Logger.debug('not found index: $tableName.$indexName, skip index check',
-            label: 'IndexManager.getIndex');
-        return null;
-      }
-
-      // Determine if we should load full index or selective loading based on key
-      if (key != null && meta.isOrdered == true) {
-        try {
-          // Selective loading: Find which partition might contain the key
-          final partitionIndex = meta.findPartitionForKey(key);
-          if (partitionIndex >= 0 && partitionIndex < meta.partitions.length) {
-            // Found specific partition - load only this one
-            final btree = await _loadSelectiveIndex(
-                tableName, indexName, meta, partitionIndex);
-            if (btree != null) {
-              // Cache the tree but mark it as not fully cached
-              _indexCache[cacheKey] = btree;
-              _indexFullyCached[cacheKey] = false;
-              _updateIndexAccessWeight(cacheKey);
-              return btree;
-            }
-          }
-        } catch (e) {
-          // if range query failed, maybe order flag is wrong, recheck order
-          Logger.debug('Selective index loading failed, rechecking order: $e',
-              label: 'IndexManager.getIndex');
-
-          // async detect order, not block current query
-          _detectAndUpdateIndexOrder(tableName, indexName);
-
-          // continue to load full index
-        }
-      }
-
-      // Default: Initialize full B+ tree with all partitions
-      final btree = await _loadIndexFromFile(tableName, indexName, meta);
-      if (btree == null) {
-        return null;
-      }
-
-      _updateIndexAccessWeight(cacheKey);
-
-      // Check if we should cache the full index
-      bool shouldFullCache = _shouldFullCacheIndex(tableName, indexName, meta);
-      if (shouldFullCache) {
-        // Get old index size
-        final oldIndex = _indexCache[cacheKey];
-        final oldSize = oldIndex != null ? _estimateIndexSize(oldIndex) : 0;
-
-        // Add index to cache
-        _indexCache[cacheKey] = btree;
-        _indexFullyCached[cacheKey] = shouldFullCache;
-
-        // Calculate new index size and update total size
-        final newSize = _estimateIndexSize(btree);
-        _indexSizeCache[cacheKey] = newSize;
-        _currentIndexCacheSize = _currentIndexCacheSize - oldSize + newSize;
-      }
-      return btree;
-    } catch (e) {
-      Logger.error('Failed to get index: $e', label: 'IndexManager.getIndex');
-      return null;
-    }
-  }
 
   /// Determine if an index should be fully cached
   bool _shouldFullCacheIndex(
@@ -1506,42 +1402,31 @@ class IndexManager {
   Future<BPlusTree?> _loadSelectiveIndex(String tableName, String indexName,
       IndexMeta meta, int partitionIndex) async {
     try {
-      // Create an empty B+ tree
-      final bTree = BPlusTree(
-        isUnique: meta.isUnique,
-      );
-
       // Get the specific partition
       final partition = meta.partitions[partitionIndex];
-      try {
-        final partitionPath = await _dataStore.pathManager
-            .getIndexPartitionPath(tableName, indexName, partition.index);
+      final partitionPath = await _dataStore.pathManager
+          .getIndexPartitionPath(tableName, indexName, partition.index);
 
-        if (!await _dataStore.storage.existsFile(partitionPath)) {
-          return bTree; // Return empty tree if partition file doesn't exist
-        }
-
-        final content = await _dataStore.storage.readAsString(partitionPath);
-        if (content == null || content.isEmpty) {
-          return bTree; // Return empty tree if content is empty
-        }
-
-        // Parse B+ tree data
-        final data = _parseBTreeData(content);
-
-        // Add partition data into B+ tree
-        for (final entry in data.entries) {
-          for (final value in entry.value) {
-            await bTree.insert(entry.key, value);
-          }
-        }
-
-        return bTree;
-      } catch (e) {
-        Logger.error('Failed to load index partition: $e',
-            label: 'IndexManager._loadSelectiveIndex');
-        return bTree; // Return empty tree on error
+      if (!await _dataStore.storage.existsFile(partitionPath)) {
+        return BPlusTree(isUnique: meta.isUnique);
       }
+
+      final content = await _dataStore.storage.readAsString(partitionPath);
+      if (content == null || content.isEmpty) {
+        return BPlusTree(isUnique: meta.isUnique);
+      }
+
+      // Build the B+ tree from the single partition content in a background isolate.
+      final request = BuildTreeRequest(
+          partitionsContent: [content], isUnique: meta.isUnique);
+
+      final btree = await ComputeManager.run(
+        buildTreeTask,
+        request,
+        useIsolate: true, // It's a heavy task.
+      );
+
+      return btree;
     } catch (e) {
       Logger.error('Failed to load selective index: $e',
           label: 'IndexManager._loadSelectiveIndex');
@@ -1629,56 +1514,63 @@ class IndexManager {
       final meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) return null;
 
-      // Create B+ tree
-      final bTree = BPlusTree(
-        isUnique: meta.isUnique,
-      );
+      // 1. Read all required partition files in parallel.
+      final tasks = <Future<String?> Function()>[];
+      final partitionMap = {for (var p in meta.partitions) p.index: p};
 
-      // Load just the specified partitions
       for (final partitionIndex in partitionIndices) {
-        // Find the partition by index
-        final partitionList =
-            meta.partitions.where((p) => p.index == partitionIndex);
-        if (partitionList.isEmpty) continue;
+        final partition = partitionMap[partitionIndex];
+        if (partition == null) continue;
 
-        final partition = partitionList.first;
-
-        try {
-          final partitionPath = await _dataStore.pathManager
-              .getIndexPartitionPath(tableName, indexName, partition.index);
-
-          if (!await _dataStore.storage.existsFile(partitionPath)) {
-            continue;
-          }
-
-          final content = await _dataStore.storage.readAsString(partitionPath);
-          if (content == null || content.isEmpty) {
-            continue;
-          }
-
-          // Parse and load data
-          final data = _parseBTreeData(content);
-          for (final entry in data.entries) {
-            for (final value in entry.value) {
-              await bTree.insert(entry.key, value);
+        tasks.add(() async {
+          try {
+            final partitionPath = await _dataStore.pathManager
+                .getIndexPartitionPath(tableName, indexName, partition.index);
+            if (!await _dataStore.storage.existsFile(partitionPath)) {
+              return null;
             }
+            return await _dataStore.storage.readAsString(partitionPath);
+          } catch (e) {
+            Logger.error(
+                'Failed to read index partition ${partition.index}: $e',
+                label: 'IndexManager.getPartialIndex');
+            return null;
           }
-        } catch (e) {
-          Logger.error('Failed to load partition $partitionIndex: $e',
-              label: 'IndexManager.getPartialIndex');
-        }
+        });
       }
+
+      final partitionContents = await ParallelProcessor.execute<String?>(tasks,
+          label: 'IndexManager.getPartialIndex.read');
+
+      final validContents = partitionContents
+          .whereType<String>()
+          .where((s) => s.isNotEmpty)
+          .toList();
+
+      if (validContents.isEmpty) {
+        return BPlusTree(isUnique: meta.isUnique);
+      }
+
+      // 2. Build the B+ tree from contents in a background isolate.
+      final request = BuildTreeRequest(
+          partitionsContent: validContents, isUnique: meta.isUnique);
+
+      final btree = await ComputeManager.run(
+        buildTreeTask,
+        request,
+        useIsolate: true, // Heavy task, always use isolate.
+      );
 
       // If we're loading most partitions, consider caching the tree
       if (partitionIndices.length > meta.partitions.length * 0.7 &&
           _shouldFullCacheIndex(tableName, indexName, meta)) {
         // Worth caching, but not marked as fully cached
-        _indexCache[cacheKey] = bTree;
+        _indexCache[cacheKey] = btree;
         _indexFullyCached[cacheKey] = false;
         _updateIndexAccessWeight(cacheKey);
       }
 
-      return bTree;
+      return btree;
     } catch (e) {
       Logger.error('Failed to get partial index: $e',
           label: 'IndexManager.getPartialIndex');
@@ -1690,66 +1582,53 @@ class IndexManager {
   Future<BPlusTree?> _loadIndexFromFile(
       String tableName, String indexName, IndexMeta meta) async {
     try {
-      // Create an empty B+ tree
-      final bTree = BPlusTree(
-        isUnique: meta.isUnique,
-      );
-      // Load index data from each partition
-      final tasks = <Future<void> Function()>[];
+      // 1. Read all partition files in parallel.
+      final tasks = <Future<String?> Function()>[];
       for (final partition in meta.partitions) {
         tasks.add(() async {
           try {
             final partitionPath = await _dataStore.pathManager
                 .getIndexPartitionPath(tableName, indexName, partition.index);
             if (!await _dataStore.storage.existsFile(partitionPath)) {
-              return;
+              return null;
             }
-            final content =
-                await _dataStore.storage.readAsString(partitionPath);
-            if (content == null || content.isEmpty) {
-              return;
-            }
-            // Parse B+ tree data
-            final data = _parseBTreeData(content);
-            // Merge to main B+ tree (serial, need lock)
-            for (final entry in data.entries) {
-              for (final value in entry.value) {
-                // Since BPlusTree is not thread-safe, merging needs to be serial
-                await bTree.insert(entry.key, value);
-              }
-            }
+            return await _dataStore.storage.readAsString(partitionPath);
           } catch (e) {
-            Logger.error('Failed to load index partition: $e',
+            Logger.error(
+                'Failed to read index partition ${partition.index}: $e',
                 label: 'IndexManager._loadIndexFromFile');
+            return null;
           }
         });
       }
-      // Parallel execute all partition tasks
-      await ParallelProcessor.execute<void>(tasks,
-          label: 'IndexManager._loadIndexFromFile');
-      return bTree;
+      final partitionContents = await ParallelProcessor.execute<String?>(tasks,
+          label: 'IndexManager._loadIndexFromFile.read');
+
+      final validContents = partitionContents
+          .whereType<String>()
+          .where((s) => s.isNotEmpty)
+          .toList();
+
+      if (validContents.isEmpty) {
+        return BPlusTree(isUnique: meta.isUnique);
+      }
+
+      // 2. Build the B+ tree from contents in a background isolate.
+      final request = BuildTreeRequest(
+          partitionsContent: validContents, isUnique: meta.isUnique);
+
+      final btree = await ComputeManager.run(
+        buildTreeTask,
+        request,
+        useIsolate: true, // Heavy task, always use isolate.
+      );
+
+      return btree;
     } catch (e) {
       Logger.error('Failed to load index from file: $e',
           label: 'IndexManager._loadIndexFromFile');
       return null;
     }
-  }
-
-  /// Parse B+ tree data
-  Map<dynamic, List<dynamic>> _parseBTreeData(String content) {
-    final result = <dynamic, List<dynamic>>{};
-    const LineSplitter().convert(content).forEach((line) {
-      if (line.trim().isEmpty) return;
-
-      final parts = line.split('|');
-      if (parts.length >= 2) {
-        final key = BPlusTree.deserializeValue(parts[0]);
-        final values = BPlusTree.deserializeValues(parts[1]);
-        result[key] = values;
-      }
-    });
-
-    return result;
   }
 
   /// Calculate content checksum
@@ -2624,7 +2503,7 @@ class IndexManager {
                 .isTableFullyCached(tableName)) {
               final cachedRecords =
                   _dataStore.dataCacheManager.getEntireTable(tableName);
-              if (cachedRecords != null) {
+              if (cachedRecords != null && cachedRecords.isNotEmpty) {
                 // optimize: use HashMap to avoid O(n) scan
                 final valueMap = <dynamic, List<Map<String, dynamic>>>{};
 
@@ -2983,27 +2862,23 @@ class IndexManager {
 
             // optimize: check if primary key index is loaded
             final pkIndexName = 'pk_$tableName';
-            final pkIndex = await getIndex(tableName, pkIndexName);
+            final pointerStr = pointer.toString();
 
-            if (pkIndex != null) {
-              // reverse lookup: get all records from index, find the record that matches the target pointer
-              final pointerStr = pointer.toString();
-
-              int processedCount = 0;
-              // find the record that matches the pointer in the cached records
-              for (final record in cachedRecords.toList()) {
-                final pkValue = record[primaryKey];
-                if (pkValue != null) {
-                  // check if the index pointer of the primary key value is the one we are looking for
-                  final results = await pkIndex.search(pkValue);
-                  if (results.contains(pointerStr)) {
-                    return record; // found matching record
-                  }
+            int processedCount = 0;
+            // find the record that matches the pointer in the cached records
+            for (final record in cachedRecords.toList()) {
+              final pkValue = record[primaryKey];
+              if (pkValue != null) {
+                // check if the index pointer of the primary key value is the one we are looking for
+                final results =
+                    await searchIndex(tableName, pkIndexName, pkValue);
+                if (results.contains(pointerStr)) {
+                  return record; // found matching record
                 }
-                processedCount++;
-                if (processedCount % 500 == 0) {
-                  await Future.delayed(Duration.zero);
-                }
+              }
+              processedCount++;
+              if (processedCount % 500 == 0) {
+                await Future.delayed(Duration.zero);
               }
             }
           }
@@ -3176,66 +3051,76 @@ class IndexManager {
       }
 
       final primaryKey = schema.primaryKey;
+      final pkIndexName = 'pk_$tableName';
+
+      // Step 1: Batch get all StoreIndex pointers for the primary keys.
+      final primaryKeyValues =
+          records.map((r) => r[primaryKey]).where((k) => k != null).toList();
+
+      if (primaryKeyValues.isEmpty) return;
+
+      final pkPointers =
+          await batchSearchIndex(tableName, pkIndexName, primaryKeyValues);
+
+      // Create a map for quick lookup: primaryKey -> record
+      final recordMap = {
+        for (var r in records)
+          if (r[primaryKey] != null) r[primaryKey]: r
+      };
+
+      // Create a map for quick lookup: primaryKey -> StoreIndex string
+      final Map<dynamic, String> storeIndexMap = {};
+      pkPointers.forEach((key, pointers) {
+        if (pointers.isNotEmpty) {
+          // Assuming primary key is unique, so there's only one pointer.
+          storeIndexMap[key] = pointers.first.toString();
+        }
+      });
+
+      if (storeIndexMap.isEmpty) {
+        Logger.warn('No records to delete found in the index for $tableName.',
+            label: 'IndexManager.batchDeleteFromIndexes');
+        return;
+      }
 
       int processedCount = 0;
-      // Process each record and add to delete buffer
-      for (final record in records) {
-        final primaryKeyValue = record[primaryKey];
-        if (primaryKeyValue == null) continue;
+      // Step 2: Efficiently add all entries to the delete buffer.
+      for (final pkEntry in storeIndexMap.entries) {
+        final primaryKeyValue = pkEntry.key;
+        final storeIndexStr = pkEntry.value;
+        final record = recordMap[primaryKeyValue];
 
-        // Get StoreIndex by primary key
-        final storeIndex =
-            await getStoreIndexByPrimaryKey(tableName, primaryKeyValue);
-        if (storeIndex == null) continue;
-
-        final storeIndexStr = storeIndex.toString();
+        if (record == null) continue;
 
         // 1. Delete from primary key index
-        final pkIndexName = 'pk_$tableName';
         await addToDeleteBuffer(
             tableName, pkIndexName, primaryKeyValue, storeIndexStr);
 
         // 2. Delete from normal indexes and unique indexes
         for (final index in schema.indexes) {
           final indexName = index.actualIndexName;
-
-          if (index.fields.length == 1) {
-            // Single field index
-            final fieldName = index.fields[0];
-            final fieldValue = record[fieldName];
-
-            if (fieldValue != null) {
-              await addToDeleteBuffer(
-                  tableName, indexName, fieldValue, storeIndexStr);
-            }
-          } else {
-            // Composite index
-            final compositeKey = _createIndexKey(record, index.fields);
-            if (compositeKey != null) {
-              await addToDeleteBuffer(
-                  tableName, indexName, compositeKey, storeIndexStr);
-            }
+          final indexKey = _createIndexKey(record, index.fields);
+          if (indexKey != null) {
+            await addToDeleteBuffer(
+                tableName, indexName, indexKey, storeIndexStr);
           }
         }
 
         // 3. Handle unique fields with auto-generated indexes
         for (final field in schema.fields) {
-          if (field.unique && field.name != primaryKey) {
-            // Check if the field already has a dedicated index
-            bool hasExplicitIndex = schema.indexes.any((index) =>
-                index.fields.length == 1 && index.fields.first == field.name);
-
-            if (!hasExplicitIndex) {
-              final fieldValue = record[field.name];
-              if (fieldValue != null) {
-                // Build unique index name
-                final uniqueIndexName = 'uniq_${field.name}';
-                await addToDeleteBuffer(
-                    tableName, uniqueIndexName, fieldValue, storeIndexStr);
-              }
+          if (field.unique &&
+              field.name != primaryKey &&
+              !schema.indexes.any((i) =>
+                  i.fields.length == 1 && i.fields.first == field.name)) {
+            final fieldValue = record[field.name];
+            if (fieldValue != null) {
+              final uniqueIndexName = 'uniq_${field.name}';
+              await addToDeleteBuffer(
+                  tableName, uniqueIndexName, fieldValue, storeIndexStr);
             }
           }
         }
+
         processedCount++;
         if (processedCount % 500 == 0) {
           await Future.delayed(Duration.zero);
@@ -4175,23 +4060,22 @@ class IndexManager {
 
       final meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) {
-        return []; // No index, no results
-      }
-
-      // 2. Optimization for ordered indexes with point queries
-      if (key != null && meta.isOrdered == true) {
-        final partitionIndex = meta.findPartitionForKey(key);
-        if (partitionIndex >= 0 && partitionIndex < meta.partitions.length) {
-          final btree = await _loadSelectiveIndex(
-              tableName, indexName, meta, partitionIndex);
-          if (btree != null) {
-            // This is a partial load, so don't cache the full tree
-            return await btree.search(key);
-          }
+        // Auto-rebuild logic from the former getIndex method
+        final tableSchema = await _dataStore.getTableSchema(tableName);
+        if (tableSchema == null) {
+          return [];
         }
+        if (tableSchema.fields.isNotEmpty) {
+          await _checkAndRebuildTableIndexes(tableName, tableSchema);
+          // Retry the search after attempting to rebuild.
+          return searchIndex(tableName, indexName, key);
+        }
+        Logger.debug('not found index: $tableName.$indexName, skip index check',
+            label: 'IndexManager.searchIndex');
+        return [];
       }
 
-      // 3. Decide on loading strategy based on size
+      // 2. Decide on loading strategy based on size
       final shouldLoadFull = _shouldFullCacheIndex(tableName, indexName, meta);
 
       if (shouldLoadFull) {
@@ -4202,13 +4086,28 @@ class IndexManager {
         _updateIndexAccessWeight(cacheKey);
         _indexCache[cacheKey] = btree;
         _indexFullyCached[cacheKey] = true;
-        _indexSizeCache[cacheKey] = _estimateIndexSize(btree);
-        _currentIndexCacheSize += _indexSizeCache[cacheKey]!;
+        final newSize = _estimateIndexSize(btree);
+        _indexSizeCache[cacheKey] = newSize;
+        _currentIndexCacheSize += newSize;
 
         return await btree.search(key);
       } else {
-        // 4. Index is too large, search partition by partition without caching
+        // Index is too large, search without full caching.
 
+        // 2a. Optimization for ordered indexes with point queries
+        if (key != null && meta.isOrdered == true) {
+          final partitionIndex = meta.findPartitionForKey(key);
+          if (partitionIndex >= 0 && partitionIndex < meta.partitions.length) {
+            final btree = await _loadSelectiveIndex(
+                tableName, indexName, meta, partitionIndex);
+            if (btree != null) {
+              return await btree.search(key);
+            }
+          }
+          // If key is not in a known partition range, fall through to full scan.
+        }
+
+        // 2b. Fallback to searching partition by partition without caching
         final tasks = <Future<List<dynamic>> Function()>[];
         for (final partition in meta.partitions) {
           tasks.add(() async {
@@ -4223,9 +4122,17 @@ class IndexManager {
               if (content == null || content.isEmpty) {
                 return <dynamic>[];
               }
-              final tempBTree =
-                  await BPlusTree.fromString(content, isUnique: meta.isUnique);
-              return await tempBTree.search(key);
+              // Use ComputeManager to run parsing and searching in an isolate
+              final request = SearchTaskRequest(
+                  content: content, key: key, isUnique: meta.isUnique);
+
+              final results = await ComputeManager.run(
+                searchIndexPartitionTask,
+                request,
+                useIsolate: content.length >
+                    1024 * 10, // Use isolate for content > 10KB
+              );
+              return results;
             } catch (e) {
               Logger.error(
                   'Failed to search index partition ${partition.index}: $e',
@@ -4251,6 +4158,126 @@ class IndexManager {
       Logger.error('Failed to search index $tableName.$indexName: $e',
           label: 'IndexManager.searchIndex');
       return [];
+    }
+  }
+
+  /// Batch search an index for a given list of keys.
+  Future<Map<dynamic, List<dynamic>>> batchSearchIndex(
+      String tableName, String indexName, List<dynamic> keys) async {
+    final Map<dynamic, List<dynamic>> allResults = {};
+    if (keys.isEmpty) {
+      return allResults;
+    }
+
+    try {
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
+
+      // 1. Check cache first - if fully loaded, perform search in memory.
+      if (_indexCache.containsKey(cacheKey) &&
+          _indexFullyCached[cacheKey] == true) {
+        _updateIndexAccessWeight(cacheKey);
+        final btree = _indexCache[cacheKey]!;
+        for (final key in keys) {
+          final results = await btree.search(key);
+          if (results.isNotEmpty) {
+            allResults[key] = results;
+          }
+        }
+        return allResults;
+      }
+
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) {
+        return allResults; // No index, no results.
+      }
+
+      // Group keys by the partition they should reside in.
+      final Map<int, List<dynamic>> partitionJobs = {};
+
+      if (meta.isOrdered == true) {
+        // For ordered indexes, we can find the exact partition for each key.
+        for (final key in keys) {
+          final partitionIndex = meta.findPartitionForKey(key);
+          if (partitionIndex != -1) {
+            partitionJobs.putIfAbsent(partitionIndex, () => []).add(key);
+          }
+          // Note: If key is out of range, it won't be found. This is expected.
+        }
+      } else {
+        // For non-ordered indexes, every key must be checked against every partition.
+        final allPartitions = meta.partitions.map((p) => p.index).toList();
+        for (final partitionIndex in allPartitions) {
+          partitionJobs.putIfAbsent(partitionIndex, () => []).addAll(keys);
+        }
+      }
+
+      if (partitionJobs.isEmpty) {
+        return allResults;
+      }
+
+      // Execute search tasks in parallel for each relevant partition.
+      final tasks = <Future<BatchSearchTaskResult> Function()>[];
+      final partitionMetas = {for (var p in meta.partitions) p.index: p};
+
+      for (final jobEntry in partitionJobs.entries) {
+        final partitionIndex = jobEntry.key;
+        final keysForPartition = jobEntry.value;
+        final partitionMeta = partitionMetas[partitionIndex];
+
+        if (partitionMeta == null) continue;
+
+        tasks.add(() async {
+          try {
+            final partitionPath = await _dataStore.pathManager
+                .getIndexPartitionPath(tableName, indexName, partitionIndex);
+            if (!await _dataStore.storage.existsFile(partitionPath)) {
+              return BatchSearchTaskResult(found: {});
+            }
+            final content =
+                await _dataStore.storage.readAsString(partitionPath);
+            if (content == null || content.isEmpty) {
+              return BatchSearchTaskResult(found: {});
+            }
+
+            final request = BatchSearchTaskRequest(
+              content: content,
+              keys: keysForPartition,
+              isUnique: meta.isUnique,
+            );
+
+            return await ComputeManager.run(
+              batchSearchIndexPartitionTask,
+              request,
+              useIsolate:
+                  content.length > 1024 * 10 || keysForPartition.length > 50,
+            );
+          } catch (e) {
+            Logger.error(
+                'Failed to batch search index partition $partitionIndex: $e',
+                label: 'IndexManager.batchSearchIndex');
+            return BatchSearchTaskResult(found: {});
+          }
+        });
+      }
+
+      final resultsFromPartitions =
+          await ParallelProcessor.execute<BatchSearchTaskResult>(tasks,
+              label: 'IndexManager.batchSearchIndex');
+
+      // Merge results from all partitions.
+      for (final result in resultsFromPartitions) {
+        if (result != null) {
+          result.found.forEach((key, value) {
+            allResults.putIfAbsent(key, () => []).addAll(value);
+          });
+        }
+      }
+
+      return allResults;
+    } catch (e) {
+      Logger.error('Failed to batch search index $tableName.$indexName: $e',
+          label: 'IndexManager.batchSearchIndex');
+      return allResults;
     }
   }
 }

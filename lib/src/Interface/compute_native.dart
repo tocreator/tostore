@@ -40,6 +40,9 @@ class _IsolatePool {
         futures.add(_createIsolate(i));
         _taskCount[i] = 0;
         _avgTaskTime[i] = 0;
+        // Yield to the event loop after initiating each isolate creation.
+        // This prevents blocking the main thread during startup, especially when creating multiple isolates.
+        await Future.delayed(Duration.zero);
       }
 
       // wait for all isolates to be initialized
@@ -270,4 +273,10 @@ final _isolatePool = _IsolatePool();
 /// The [message] is the argument passed to the [function].
 Future<R> compute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
   return _isolatePool.execute<Q, R>(function, message);
+}
+
+/// Pre-warms the isolate pool to reduce latency on the first compute call.
+Future<void> prewarm() async {
+  // this will initialize and pre-warm all isolates in the pool
+  await _isolatePool._ensureInitialized();
 }

@@ -305,6 +305,27 @@ final taskId = await db.updateSchema('users')
 // 监控迁移进度
 final status = await db.queryMigrationTaskStatus(taskId);
 print('迁移进度: ${status?.progressPercentage}%');
+
+
+// 手动查询缓存管理 (服务端)
+// 在客户端平台（移动端、桌面端）会智能管理。
+// 对于服务端或大规模数据等需要精细控制的场景，您可以通过以下API手动管理缓存以获得最佳性能。
+
+// 手动缓存一个查询结果5分钟。若不提供时长，则缓存永不过期。
+final activeUsers = await db.query('users')
+    .where('is_active', '=', true)
+    .useQueryCache(const Duration(minutes: 5));
+
+// 当相关数据发生变更时，使用 clearQueryCache 来精确地让缓存失效，确保数据一致性。
+await db.query('users')
+    .where('is_active', '=', true)
+    .clearQueryCache();
+
+// 对于需要获取最新实时数据的查询，可以显式禁用缓存。
+final freshUserData = await db.query('users')
+    .where('is_active', '=', true)
+    .noQueryCache();
+    
 ```
 
 ## 分布式架构

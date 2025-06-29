@@ -7,3 +7,7 @@ Future<R> compute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
   // directly. It will still be asynchronous if the function returns a Future.
   return await function(message);
 }
+
+Future<void> prewarm() async {
+  // On the web, isolates are not available, so we do nothing.
+}

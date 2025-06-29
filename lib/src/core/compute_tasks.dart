@@ -2167,3 +2167,110 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
     );
   }
 }
+
+/// Request data for building a B+ tree from multiple partition contents.
+class BuildTreeRequest {
+  final List<String> partitionsContent;
+  final bool isUnique;
+
+  BuildTreeRequest({required this.partitionsContent, required this.isUnique});
+}
+
+/// A top-level function to build a B+ tree from multiple partition contents.
+Future<BPlusTree> buildTreeTask(BuildTreeRequest request) async {
+  final bTree = BPlusTree(isUnique: request.isUnique);
+
+  for (final content in request.partitionsContent) {
+    if (content.isEmpty) continue;
+
+    final data = _parseBTreeData(content);
+    for (final entry in data.entries) {
+      for (final value in entry.value) {
+        await bTree.insert(entry.key, value);
+      }
+    }
+  }
+  return bTree;
+}
+
+Map<dynamic, List<dynamic>> _parseBTreeData(String content) {
+  final result = <dynamic, List<dynamic>>{};
+  const LineSplitter().convert(content).forEach((line) {
+    if (line.trim().isEmpty) return;
+
+    final parts = line.split('|');
+    if (parts.length >= 2) {
+      final key = BPlusTree.deserializeValue(parts[0]);
+      final values = BPlusTree.deserializeValues(parts[1]);
+      result[key] = values;
+    }
+  });
+
+  return result;
+}
+
+/// Request for searching an index partition.
+class SearchTaskRequest {
+  final String content;
+  final dynamic key;
+  final bool isUnique;
+
+  SearchTaskRequest(
+      {required this.content, required this.key, required this.isUnique});
+}
+
+/// A top-level function to search a single index partition in an isolate.
+Future<List<dynamic>> searchIndexPartitionTask(
+    SearchTaskRequest request) async {
+  try {
+    if (request.content.isEmpty) {
+      return [];
+    }
+    final btree =
+        await BPlusTree.fromString(request.content, isUnique: request.isUnique);
+    return await btree.search(request.key);
+  } catch (e) {
+    Logger.error('Failed to search index partition in isolate: $e',
+        label: 'searchIndexPartitionTask');
+    return [];
+  }
+}
+
+/// Request for batch searching an index partition.
+class BatchSearchTaskRequest {
+  final String content;
+  final List<dynamic> keys;
+  final bool isUnique;
+
+  BatchSearchTaskRequest(
+      {required this.content, required this.keys, required this.isUnique});
+}
+
+/// Result from batch searching an index partition.
+class BatchSearchTaskResult {
+  final Map<dynamic, List<dynamic>> found;
+  BatchSearchTaskResult({required this.found});
+}
+
+/// A top-level function to batch search a single index partition in an isolate.
+Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
+    BatchSearchTaskRequest request) async {
+  final Map<dynamic, List<dynamic>> found = {};
+  try {
+    if (request.content.isEmpty || request.keys.isEmpty) {
+      return BatchSearchTaskResult(found: found);
+    }
+    final btree =
+        await BPlusTree.fromString(request.content, isUnique: request.isUnique);
+    for (final key in request.keys) {
+      final results = await btree.search(key);
+      if (results.isNotEmpty) {
+        found[key] = results;
+      }
+    }
+  } catch (e) {
+    Logger.error('Failed to batch search index partition in isolate: $e',
+        label: 'batchSearchIndexPartitionTask');
+  }
+  return BatchSearchTaskResult(found: found);
+}

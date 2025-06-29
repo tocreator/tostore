@@ -1259,10 +1259,6 @@ class QueryExecutor {
       if (schema == null) {
         return [];
       }
-      final index = await _indexManager.getIndex(tableName, indexName);
-      if (index == null) {
-        return _performTableScan(tableName, queryCondition);
-      }
       // get actual index name
       String actualIndexName;
       if (indexName.startsWith('pk_')) {
@@ -1272,6 +1268,7 @@ class QueryExecutor {
         // normal index need to find from schema.indexes
         final indexSchema = schema.indexes.firstWhere(
           (idx) => idx.actualIndexName == indexName,
+          orElse: () => throw Exception('Index $indexName not found in schema for table $tableName'),
         );
         actualIndexName = indexSchema.actualIndexName;
       }
@@ -1292,13 +1289,18 @@ class QueryExecutor {
         fieldName = indexSchema.fields.first;
       }
       if (searchValue == null) {
+        // Fallback to table scan if the condition value for the index is not provided.
         return _performTableScan(tableName, queryCondition);
       }
 
-      // use index partitions for search
-      final indexResults = await index.search(searchValue);
+      // use searchIndex to get pointers
+      final indexResults =
+          await _indexManager.searchIndex(tableName, actualIndexName, searchValue);
+
       if (indexResults.isEmpty) {
-        return _performTableScan(tableName, queryCondition);
+        // If the index search returns no pointers, it means no records match.
+        // There is no need to perform a table scan.
+        return [];
       }
       // get full records
       final results = <Map<String, dynamic>>[];
