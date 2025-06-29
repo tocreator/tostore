@@ -340,13 +340,16 @@ class DataStoreImpl {
 
       // Initialize memory manager
       _memoryManager = MemoryManager();
-      await _memoryManager?.initialize(_config!, this);
+      
+      await Future.wait([
+            getGlobalConfig(),
+            getSpaceConfig(),
+            _memoryManager!.initialize(_config!, this),
+          ]);
 
       // Initialize key components in parallel
       final initTasks = <Future<void>>[
         Future(() async {
-          await getGlobalConfig();
-          await getSpaceConfig();
           _keyManager = KeyManager(this);
           await _keyManager!.initialize();
         }),
@@ -378,8 +381,6 @@ class DataStoreImpl {
         await _startSetupAndUpgrade();
       }
 
-      // load data to cache
-      await _loadDataToCache();
 
       _isInitialized = true;
       if (!_initCompleter.isCompleted) {
@@ -387,6 +388,10 @@ class DataStoreImpl {
       }
 
       if (!isMigrationInstance) {
+        
+       // load data to cache
+       _loadTableRecordToCache();
+
         CrontabManager.start();
 
         // Database open callback
@@ -1980,18 +1985,6 @@ class DataStoreImpl {
     });
   }
 
-  /// load data to cache
-  Future<void> _loadDataToCache() async {
-    try {
-      // Async load table record to cache
-      if (!isMigrationInstance) {
-        _loadTableRecordToCache();
-      }
-    } catch (e) {
-      Logger.error('Load data to cache failed: $e',
-          label: 'DataStore._loadDataToCache');
-    }
-  }
 
   /// load data from specified path
   Future<void> _loadTableRecordToCache() async {
@@ -2001,14 +1994,16 @@ class DataStoreImpl {
       return; // Explicitly disabled
     }
 
-    if (enablePrewarm == true) {
+  
+
+    // If enablePrewarm is null (auto mode)
+    try {
+   if (enablePrewarm == true) {
       // Explicitly enabled, proceed with loading
       await _executePrewarm();
       return;
     }
 
-    // If enablePrewarm is null (auto mode)
-    try {
       final spaceConfig = await getSpaceConfig();
       final totalSize = spaceConfig?.totalDataSizeBytes ?? 0;
       final int prewarmThresholdBytes = config.prewarmThresholdMB * 1024 * 1024;
