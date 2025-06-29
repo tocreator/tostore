@@ -340,12 +340,12 @@ class DataStoreImpl {
 
       // Initialize memory manager
       _memoryManager = MemoryManager();
-      
+
       await Future.wait([
-            getGlobalConfig(),
-            getSpaceConfig(),
-            _memoryManager!.initialize(_config!, this),
-          ]);
+        getGlobalConfig(),
+        getSpaceConfig(),
+        _memoryManager!.initialize(_config!, this),
+      ]);
 
       // Initialize key components in parallel
       final initTasks = <Future<void>>[
@@ -381,16 +381,14 @@ class DataStoreImpl {
         await _startSetupAndUpgrade();
       }
 
-
       _isInitialized = true;
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
       }
 
       if (!isMigrationInstance) {
-        
-       // load data to cache
-       _loadTableRecordToCache();
+        // load data to cache
+        _loadTableRecordToCache();
 
         CrontabManager.start();
 
@@ -1444,13 +1442,12 @@ class DataStoreImpl {
       }
 
       // Decide strategy:
-      // If the table's total size is small (e.g., less than 20% of the record cache limit)
+      // If the table's total size is small (e.g., less than 30% of the record cache limit)
       // or if it's an optimizable query (on a PK or unique index),
       // we can load matching records into memory for deletion.
       // This is generally faster for smaller datasets.
       final bool useInMemoryStrategy =
-          isOptimizableQuery || (totalSizeInBytes < recordCacheSize * 0.2);
-      // const bool useInMemoryStrategy = false;
+          isOptimizableQuery || (totalSizeInBytes < recordCacheSize * 0.3);
 
       // when table record count is less than threshold or this is an optimizable query, use regular method
       if (useInMemoryStrategy) {
@@ -1985,7 +1982,6 @@ class DataStoreImpl {
     });
   }
 
-
   /// load data from specified path
   Future<void> _loadTableRecordToCache() async {
     final bool? enablePrewarm = config.enablePrewarmCache;
@@ -1994,15 +1990,13 @@ class DataStoreImpl {
       return; // Explicitly disabled
     }
 
-  
-
     // If enablePrewarm is null (auto mode)
     try {
-   if (enablePrewarm == true) {
-      // Explicitly enabled, proceed with loading
-      await _executePrewarm();
-      return;
-    }
+      if (enablePrewarm == true) {
+        // Explicitly enabled, proceed with loading
+        await _executePrewarm();
+        return;
+      }
 
       final spaceConfig = await getSpaceConfig();
       final totalSize = spaceConfig?.totalDataSizeBytes ?? 0;

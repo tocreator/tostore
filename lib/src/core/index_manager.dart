@@ -150,8 +150,10 @@ class IndexManager {
       // Sorting the list of indexes itself should be fast.
       final evictableIndexes = _indexAccessWeights.entries.toList()
         ..sort((a, b) {
-          final lastAccessA = a.value['lastAccess'] as DateTime? ?? DateTime(1970);
-          final lastAccessB = b.value['lastAccess'] as DateTime? ?? DateTime(1970);
+          final lastAccessA =
+              a.value['lastAccess'] as DateTime? ?? DateTime(1970);
+          final lastAccessB =
+              b.value['lastAccess'] as DateTime? ?? DateTime(1970);
           return lastAccessA.compareTo(lastAccessB); // Oldest first
         });
 
@@ -1723,7 +1725,8 @@ class IndexManager {
         });
       }
       // Parallel execute all partition tasks
-      await ParallelProcessor.execute<void>(tasks, label: 'IndexManager._loadIndexFromFile');
+      await ParallelProcessor.execute<void>(tasks,
+          label: 'IndexManager._loadIndexFromFile');
       return bTree;
     } catch (e) {
       Logger.error('Failed to load index from file: $e',
@@ -3411,13 +3414,10 @@ class IndexManager {
         // Update last write time
         _indexLastWriteTime[cacheKey] = DateTime.now();
 
-        // Also remove from memory cache if it exists
+        // Also remove from memory cache if it exists, but don't wait for it.
         if (_indexCache.containsKey(cacheKey)) {
-          try {
-            await _indexCache[cacheKey]!.delete(key, storeIndexStr);
-          } catch (e) {
-            // Ignore errors in memory cache update
-          }
+          // Fire-and-forget cache update to avoid blocking.
+          _indexCache[cacheKey]!.delete(key, storeIndexStr);
         }
 
         return; // Operations cancel out, no need to add to delete buffer
@@ -3438,15 +3438,10 @@ class IndexManager {
       // Add to buffer
       _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
-      // Also remove from memory cache if it exists
+      // Also remove from memory cache if it exists, but don't wait for it.
       if (_indexCache.containsKey(cacheKey)) {
-        try {
-          await _indexCache[cacheKey]!.delete(key, storeIndexStr);
-        } catch (e) {
-          // Ignore errors in memory cache update
-          Logger.warn('Failed to update memory cache for deletion: $e',
-              label: 'IndexManager.addToDeleteBuffer');
-        }
+        // Fire-and-forget cache update to avoid blocking.
+        _indexCache[cacheKey]!.delete(key, storeIndexStr);
       }
 
       // Record last write time
@@ -4241,7 +4236,8 @@ class IndexManager {
         }
 
         final resultsFromPartitions =
-            await ParallelProcessor.execute<List<dynamic>>(tasks, label: 'IndexManager.searchIndex');
+            await ParallelProcessor.execute<List<dynamic>>(tasks,
+                label: 'IndexManager.searchIndex');
 
         final allResults = <dynamic>[];
         for (final resultList in resultsFromPartitions) {
