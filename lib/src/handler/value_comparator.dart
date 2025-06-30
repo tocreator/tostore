@@ -5,44 +5,74 @@ class ValueComparator {
   /// - Zero if a == b
   /// - Positive number if a > b
   static int compare(dynamic a, dynamic b) {
-    // Handle null cases
+    // 1. Handle null cases
     if (a == null && b == null) return 0;
     if (a == null) return -1;
     if (b == null) return 1;
 
-    // If both are numbers (int, double, num), compare them directly
-    if (a is num && b is num) {
-      return a.compareTo(b);
+    // 2. Fast path for common identical types
+    if (a.runtimeType == b.runtimeType) {
+      if (a is String) return compareStrings(a, b);
+      if (a is int) return compareInts(a, b);
+      if (a is double) return compareDoubles(a, b);
+      if (a is BigInt) return a.compareTo(b as BigInt);
     }
 
-    // If both are BigInt, compare them directly
+    // 3. Mixed-type comparison
+    if (a is num && b is num) {
+      return (a).compareTo(b);
+    }
+
     if (a is BigInt && b is BigInt) {
       return a.compareTo(b);
     }
 
-    // If one is BigInt and one is num, convert both to BigInt
     if ((a is BigInt && b is num) || (a is num && b is BigInt)) {
       BigInt aBig = a is BigInt ? a : BigInt.from(a as num);
       BigInt bBig = b is BigInt ? b : BigInt.from(b as num);
       return aBig.compareTo(bBig);
     }
 
-    // Convert to strings for further comparisons
-    String aStr = a.toString();
-    String bStr = b.toString();
+    // For other mixed types, or if one is a String, convert to string and compare
+    return compareStrings(a.toString(), b.toString());
+  }
 
-    // Special case: If both are strings, normalize them first
-    if (a is String && b is String) {
-      // If they are directly equal, return 0
-      if (a == b) return 0;
+  /// Compares two integers.
+  static int compareInts(int a, int b) {
+    return a.compareTo(b);
+  }
 
-      // Normalize strings - remove extra quotes
-      aStr = _normalizeString(a);
-      bStr = _normalizeString(b);
+  /// Compares two doubles.
+  static int compareDoubles(double a, double b) {
+    return a.compareTo(b);
+  }
 
-      // After normalization, check equality again
-      if (aStr == bStr) return 0;
+  /// Compares two strings that are base62-encoded shortcodes.
+  ///
+  /// In base62 encoding (or similar length-significant encodings),
+  /// a longer string represents a larger value. When lengths are equal,
+  /// a standard lexicographical string comparison is used. This is
+  /// suitable for comparing time-based, Base62-encoded primary keys.
+  static int compareShortCodes(String a, String b) {
+    // First, compare by length. A longer shortcode is always greater.
+    final lengthCompare = a.length.compareTo(b.length);
+    if (lengthCompare != 0) {
+      return lengthCompare;
     }
+    // If lengths are equal, perform a standard string comparison.
+    return a.compareTo(b);
+  }
+
+  /// Compares two strings with advanced logic.
+  /// It handles numeric strings, shortcodes, and natural sorting.
+  static int compareStrings(String a, String b) {
+    if (a == b) return 0;
+
+    // Normalize strings - remove extra quotes
+    String aStr = _normalizeString(a);
+    String bStr = _normalizeString(b);
+
+    if (aStr == bStr) return 0;
 
     // Check if both are numeric strings (highest priority)
     if (isNumericString(aStr) && isNumericString(bStr)) {
@@ -52,18 +82,13 @@ class ValueComparator {
     // Check if both are shortcode format (second priority)
     if (isShortCodeFormat(aStr) && isShortCodeFormat(bStr)) {
       // 1. First compare length: in Base62 encoding, a longer code always represents a larger value
-      if (aStr.length != bStr.length) {
-        return aStr.length.compareTo(bStr.length);
-      }
-
-      // 2. When length is the same, directly use string comparison
-      return aStr.compareTo(bStr);
+      return compareShortCodes(aStr, bStr);
     }
 
     // Natural sorting for strings with embedded numbers (third priority)
-    if (a is String && b is String) {
-      int result = _compareStringsNaturally(aStr, bStr);
-      if (result != 0) return result;
+    final naturalResult = _compareStringsNaturally(aStr, bStr);
+    if (naturalResult != 0) {
+      return naturalResult;
     }
 
     // Default: standard string comparison
@@ -184,22 +209,44 @@ class ValueComparator {
 
   /// Compares two numeric strings.
   static int compareNumericStrings(String a, String b) {
+    // Determine if we are comparing integers or floating-point numbers
+    final bool isAInt = RegExp(r'^\d+$').hasMatch(a);
+    final bool isBInt = RegExp(r'^\d+$').hasMatch(b);
+
     try {
-      // If they're both integers, use BigInt for comparison
-      if (RegExp(r'^\d+$').hasMatch(a) && RegExp(r'^\d+$').hasMatch(b)) {
-        BigInt aBig = tryParseBigInt(a) ?? BigInt.zero;
-        BigInt bBig = tryParseBigInt(b) ?? BigInt.zero;
-        return aBig.compareTo(bBig);
+      // If both appear to be integers, use BigInt for a precise comparison.
+      if (isAInt && isBInt) {
+        return compareBigIntStrings(a, b);
       }
 
-      // Otherwise use double (handles decimals)
-      double aDouble = double.parse(a);
-      double bDouble = double.parse(b);
+      // If one or both might be a double, compare them as doubles.
+      // This correctly handles comparisons between integers and doubles as well.
+      final aDouble = double.parse(a);
+      final bDouble = double.parse(b);
       return aDouble.compareTo(bDouble);
     } catch (_) {
-      // Fall back to string comparison if parsing fails
+      // Fall back to string comparison if any parsing fails
       return a.compareTo(b);
     }
+  }
+
+  /// Compares two strings that are known to represent large integers (BigInt).
+  ///
+  /// This provides a direct and efficient way to compare string-encoded BigInts,
+  /// which is ideal for `timestampBased` and `datePrefixed` primary keys.
+  /// It attempts to parse both strings as BigInt for a numerical comparison.
+  /// If parsing fails for either string, it falls back to a standard
+  /// lexicographical comparison as a safeguard.
+  static int compareBigIntStrings(String a, String b) {
+    final aBig = tryParseBigInt(a);
+    final bBig = tryParseBigInt(b);
+
+    if (aBig != null && bBig != null) {
+      return aBig.compareTo(bBig);
+    }
+
+    // Fallback for safety, handles cases where strings are not valid BigInts.
+    return a.compareTo(b);
   }
 
   /// Safely tries to parse a string as BigInt.
