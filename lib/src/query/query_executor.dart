@@ -1276,17 +1276,14 @@ class QueryExecutor {
       // get search value
       dynamic searchValue;
       // get field name for comparison
-      String fieldName;
       if (actualIndexName.startsWith('pk_')) {
         searchValue = conditions[schema.primaryKey];
-        fieldName = schema.primaryKey;
       } else {
         // for normal index, find index info from schema.indexes
         final indexSchema = schema.indexes.firstWhere(
           (idx) => idx.actualIndexName == indexName,
         );
         searchValue = conditions[indexSchema.fields.first];
-        fieldName = indexSchema.fields.first;
       }
       if (searchValue == null) {
         // Fallback to table scan if the condition value for the index is not provided.
@@ -1297,68 +1294,46 @@ class QueryExecutor {
       final indexResults =
           await _indexManager.searchIndex(tableName, actualIndexName, searchValue);
 
+      if (indexResults.requiresTableScan) {
+        return _performTableScan(tableName, queryCondition);
+      }
+
       if (indexResults.isEmpty) {
         // If the index search returns no pointers, it means no records match.
         // There is no need to perform a table scan.
         return [];
       }
-      // get full records
+
+      // Group pointers by partition to optimize record fetching
+      final pointersByPartition = indexResults.pointersByPartition;
+      if (pointersByPartition.isEmpty) {
+        return [];
+      }
+
       final results = <Map<String, dynamic>>[];
 
-      // handle primary key index and normal index results
-      for (var pointer in indexResults.toList()) {
-        // handle String and StoreIndex types
-        StoreIndex storeIndex;
-        if (pointer is String) {
-          final storeIndexTemp = StoreIndex.fromString(pointer);
-          if (storeIndexTemp == null) {
-            Logger.debug(
-              'Skipped invalid index result: $pointer',
-              label: 'QueryExecutor._performIndexScan',
-            );
-            continue;
-          }
-          storeIndex = storeIndexTemp;
-        } else if (pointer is StoreIndex) {
-          storeIndex = pointer;
-        } else {
-          // skip unrecognized format
-          Logger.debug(
-              'Skipped unrecognized index result format: ${pointer.runtimeType}',
-              label: 'QueryExecutor._performIndexScan');
-          continue;
-        }
+      // Process each partition's results in batch
+      for (final entry in pointersByPartition.entries) {
+        final partitionId = entry.key;
+        final pointers = entry.value;
+        if (pointers.isEmpty) continue;
 
-        // get actual value for comparison
-        dynamic actualValue = searchValue;
-        if (searchValue is Map && searchValue.containsKey('=')) {
-          actualValue = searchValue['='];
-        }
+        final storeIndexes = pointers
+            .map((p) => StoreIndex.fromString(p))
+            .whereType<StoreIndex>()
+            .toList();
+        if (storeIndexes.isEmpty) continue;
 
-        // get record, pass field name and expected value for verification
-        final record = await _dataStore.tableDataManager.getRecordByPointer(
-            tableName, storeIndex,
-            fieldName: fieldName, expectedValue: actualValue);
+        // Fetch all records for the current partition at once
+        final records = await _dataStore.tableDataManager
+            .getRecordsByPointers(tableName, partitionId, storeIndexes);
 
-        if (record != null) {
-          // apply additional conditions (if any)
-          if (queryCondition != null) {
-            if (queryCondition.matches(record)) {
-              results.add(record);
-            }
-          } else {
+        for (final record in records) {
+          // The index search is the primary filter.
+          // Further filtering by queryCondition ensures all other `AND` clauses are met.
+          if (queryCondition == null || queryCondition.matches(record)) {
             results.add(record);
           }
-        } else {
-          // record not found, index expired, add to delete buffer
-          Logger.debug(
-            'Detected expired index, adding to delete buffer: $tableName.$indexName: $actualValue -> $storeIndex',
-            label: 'QueryExecutor._performIndexScan',
-          );
-
-          // add to delete buffer for later cleanup
-          await _indexManager.addToDeleteBuffer(
-              tableName, actualIndexName, actualValue, storeIndex.toString());
         }
       }
 

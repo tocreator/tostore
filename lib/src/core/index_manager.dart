@@ -18,6 +18,8 @@ import 'compute_tasks.dart';
 import 'memory_manager.dart';
 import '../handler/parallel_processor.dart';
 import '../model/system_table.dart';
+import '../model/index_search_result.dart';
+import '../query/query_condition.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -2350,318 +2352,130 @@ class IndexManager {
       if (schema == null) {
         return false;
       }
+
       final primaryKey = schema.primaryKey;
       final primaryValue = data[primaryKey];
 
-      // 1. check primary key uniqueness
-      if (!isUpdate) {
-        final pkIndexName = 'pk_$tableName';
-        final cacheKey = _getIndexCacheKey(tableName, pkIndexName);
+      String? selfStoreIndexStr;
+      if (isUpdate && primaryValue != null) {
+        final selfStoreIndex =
+            await getStoreIndexByPrimaryKey(tableName, primaryValue);
+        selfStoreIndexStr = selfStoreIndex?.toString();
+      }
 
-        // Use the new search method
-        final existingIds =
-            await searchIndex(tableName, pkIndexName, primaryValue);
+      // 1. Consolidate all unique constraints to check.
+      final constraints = <_UniqueConstraint>[];
 
-        if (existingIds.isNotEmpty) {
-          // primary key duplicate
-          Logger.warn('Primary key duplicate: $primaryValue',
-              label: 'IndexManager.checkUniqueConstraints');
-          return false;
-        }
+      // Add primary key constraint (only for inserts)
+      if (!isUpdate && primaryValue != null) {
+        constraints.add(_UniqueConstraint(
+            fields: [primaryKey],
+            value: primaryValue,
+            indexName: 'pk_$tableName'));
+      }
 
-        // If primary key index is fully cached and result is empty, can directly return true
-        if (_indexFullyCached[cacheKey] == true) {
-          // Index is fully cached and search returned empty results,
-          // which means there are definitely no duplicates in the index
-        }
-        // Only check write buffer if index was not fully cached
-        else if (!_indexCache.containsKey(cacheKey)) {
-          // If not in cache, it means it was searched partition by partition,
-          // which is equivalent to checking the full index.
-          // Now, we still need to check the write buffer for pending operations.
-          final pendingData =
-              _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-          int processedCount = 0;
-          for (var key in pendingData.keys.toList()) {
-            if (pendingData[key]!.data[primaryKey] == primaryValue) {
-              Logger.warn('Primary key duplicate in write queue: $primaryValue',
-                  label: 'IndexManager.checkUniqueConstraints');
-              return false;
-            }
-            processedCount++;
-            if (processedCount % 500 == 0) {
-              await Future.delayed(Duration.zero);
-            }
+      // Add all unique indexes from schema (single and composite)
+      for (final index in schema.indexes) {
+        if (index.unique) {
+          final value = _createIndexKey(data, index.fields);
+          if (value != null) {
+            constraints.add(_UniqueConstraint(
+                fields: index.fields,
+                value: value,
+                indexName: index.actualIndexName));
           }
         }
       }
 
-      // 2. check unique field constraints
-      for (var field in schema.fields) {
-        if (field.unique && field.name != primaryKey) {
+      // Add unique fields that don't have an explicit index
+      final indexedFields = schema.indexes
+          .where((i) => i.fields.length == 1 && i.unique)
+          .map((i) => i.fields.first)
+          .toSet();
+      for (final field in schema.fields) {
+        if (field.unique &&
+            field.name != primaryKey &&
+            !indexedFields.contains(field.name)) {
           final value = data[field.name];
           if (value != null) {
-            // build index name
-            final tempSchema = IndexSchema(fields: [field.name], unique: true);
-            final indexName = tempSchema.actualIndexName;
-            final uniqueIndexName = 'uniq_${field.name}';
-
-            // try to get field index (normal index or auto generated unique index)
-
-            String? effectiveIndexName;
-
-            // Check which index actually exists
-            if (await _getIndexMeta(tableName, indexName) != null) {
-              effectiveIndexName = indexName;
-            } else if (await _getIndexMeta(tableName, uniqueIndexName) !=
-                null) {
-              effectiveIndexName = uniqueIndexName;
-            }
-
-            // if any index found
-            if (effectiveIndexName != null) {
-              final cacheKey = _getIndexCacheKey(tableName, effectiveIndexName);
-              final isFullyCached = _indexFullyCached[cacheKey] == true;
-
-              final results =
-                  await searchIndex(tableName, effectiveIndexName, value);
-
-              if (results.isEmpty) {
-                // If index is fully cached and result is empty, can directly return true
-                if (isFullyCached) {
-                  continue;
-                }
-
-                final pendingData =
-                    _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-                bool hasDuplicate = false;
-
-                int processedCount = 0;
-                for (var key in pendingData.keys.toList()) {
-                  if (pendingData[key]!.data[field.name] == value &&
-                      (!isUpdate ||
-                          pendingData[key]!.data[primaryKey] != primaryValue)) {
-                    hasDuplicate = true;
-                    break;
-                  }
-                  processedCount++;
-                  if (processedCount % 500 == 0) {
-                    await Future.delayed(Duration.zero);
-                  }
-                }
-
-                if (hasDuplicate) {
-                  Logger.warn(
-                      'Unique field constraint violation in write queue: ${field.name} = $value',
-                      label: 'IndexManager.checkUniqueConstraints');
-                  return false;
-                }
-                continue;
-              } else {
-                // has result, for update operation, need to exclude self
-                if (isUpdate) {
-                  bool hasDuplicate = false;
-                  int processedCount = 0;
-                  for (final pointer in results) {
-                    // get record to check if it is self
-                    final storeIndex = StoreIndex.fromString(pointer);
-                    if (storeIndex == null) continue;
-
-                    final record =
-                        await _getRecordByPointer(tableName, storeIndex);
-                    if (record != null && record[primaryKey] != primaryValue) {
-                      hasDuplicate = true;
-                      break;
-                    }
-                    processedCount++;
-                    if (processedCount % 500 == 0) {
-                      await Future.delayed(Duration.zero);
-                    }
-                  }
-
-                  if (hasDuplicate) {
-                    Logger.warn(
-                        'Unique field constraint violation: ${field.name} = $value',
-                        label: 'IndexManager.checkUniqueConstraints');
-                    return false;
-                  }
-                } else {
-                  // new record, index has result means unique constraint violation
-                  Logger.warn(
-                      'Unique field constraint violation: ${field.name} = $value',
-                      label: 'IndexManager.checkUniqueConstraints');
-                  return false;
-                }
-              }
-
-              // index check passed, continue to check next field
-              continue;
-            }
-
-            // index not found, check table cache
-            if (await _dataStore.dataCacheManager
-                .isTableFullyCached(tableName)) {
-              final cachedRecords =
-                  _dataStore.dataCacheManager.getEntireTable(tableName);
-              if (cachedRecords != null && cachedRecords.isNotEmpty) {
-                // optimize: use HashMap to avoid O(n) scan
-                final valueMap = <dynamic, List<Map<String, dynamic>>>{};
-
-                int processedCount = 0;
-                // only build mapping for current value, avoid scanning entire table
-                for (var record in cachedRecords) {
-                  final recordValue = record[field.name];
-                  if (recordValue == value) {
-                    if (!valueMap.containsKey(value)) {
-                      valueMap[value] = [];
-                    }
-                    valueMap[value]!.add(record);
-                  }
-                  processedCount++;
-                  if (processedCount % 500 == 0) {
-                    await Future.delayed(Duration.zero);
-                  }
-                }
-
-                // check if there is conflict (non-self record)
-                final matchingRecords = valueMap[value] ?? [];
-                for (final record in matchingRecords) {
-                  if (!isUpdate || record[primaryKey] != primaryValue) {
-                    Logger.warn(
-                        'Unique field constraint violation in cache: ${field.name} = $value',
-                        label: 'IndexManager.checkUniqueConstraints');
-                    return false;
-                  }
-                }
-
-                // cache has no conflict, continue to check next field
-                continue;
-              }
-            }
-
-            // if table cache is not available, check table file partitions
-            bool isViolated = false;
-            int recordsChecked = 0;
-            await _dataStore.tableDataManager.processTablePartitions(
-                tableName: tableName,
-                onlyRead: true,
-                processFunction: (records, partitionIndex, controller) async {
-                  if (controller.isStopped) {
-                    return records;
-                  }
-                  for (var record in records) {
-                    if (record[field.name] == value &&
-                        (!isUpdate || record[primaryKey] != primaryValue)) {
-                      isViolated = true;
-                      controller.stop();
-                      return records;
-                    }
-                    recordsChecked++;
-                    if (recordsChecked % 500 == 0) {
-                      await Future.delayed(Duration.zero);
-                    }
-                  }
-                  return records;
-                });
-            if (isViolated) {
-              Logger.warn(
-                  'Unique field constraint violation: ${field.name} = $value',
-                  label: 'IndexManager.checkUniqueConstraints');
-              return false;
-            }
+            constraints.add(_UniqueConstraint(
+                fields: [field.name],
+                value: value,
+                indexName: 'uniq_${field.name}'));
           }
         }
       }
 
-      // 3. check composite unique index
-      for (var index in schema.indexes) {
-        if (!index.unique) continue;
+      // 2. Iterate and check each constraint.
+      for (final constraint in constraints) {
+        // A. Check the index.
+        final searchResult =
+            await searchIndex(tableName, constraint.indexName, constraint.value);
 
-        // build composite index key
-        final indexKey = _createIndexKey(data, index.fields);
-        if (indexKey == null) continue;
-
-        // get index name and cache key
-        final indexName = index.actualIndexName;
-        final cacheKey = _getIndexCacheKey(tableName, indexName);
-        final isFullyCached = _indexFullyCached[cacheKey] == true;
-
-        final results = await searchIndex(tableName, indexName, indexKey);
-
-        if (results.isEmpty) {
-          // If index is fully cached and result is empty, can directly return true
-          if (isFullyCached) {
-            continue;
+        if (searchResult.requiresTableScan) {
+          // B. Index not available, fall back to a direct query via QueryExecutor.
+          // Handle both single and composite keys.
+          final queryCondition = QueryCondition();
+          for (final field in constraint.fields) {
+            queryCondition.where(field, '=', data[field]);
           }
 
-          // index has no result, check write buffer
-          final pendingData =
-              _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-          bool hasDuplicate = false;
+          final existingRecords =
+              await _dataStore.executeQuery(tableName, queryCondition, limit: 2); // Limit 2 is enough to detect a collision
 
-          int processedCount = 0;
-          for (var entry in pendingData.entries.toList()) {
-            final record = entry.value.data;
-            final recordIndexKey = _createIndexKey(record, index.fields);
-            if (recordIndexKey == indexKey &&
-                (!isUpdate || record[primaryKey] != primaryValue)) {
-              hasDuplicate = true;
-              break;
-            }
-            processedCount++;
-            if (processedCount % 500 == 0) {
-              await Future.delayed(Duration.zero);
-            }
-          }
-
-          if (hasDuplicate) {
-            Logger.warn(
-                'Unique index constraint violation in write queue: ${index.fields.join("+")} = $indexKey',
-                label: 'IndexManager.checkUniqueConstraints');
-            return false;
-          }
-          continue;
-        } else {
-          // has result, check update situation
-          if (isUpdate) {
-            bool hasDuplicate = false;
-            int processedCount = 0;
-            for (final pointer in results) {
-              final storeIndex = StoreIndex.fromString(pointer);
-              if (storeIndex == null) continue;
-
-              final record = await _getRecordByPointer(tableName, storeIndex);
-              if (record != null && record[primaryKey] != primaryValue) {
-                hasDuplicate = true;
-                break;
-              }
-              processedCount++;
-              if (processedCount % 500 == 0) {
-                await Future.delayed(Duration.zero);
+          if (existingRecords.isNotEmpty) {
+            bool isCollision = false;
+            if (!isUpdate) {
+              // On insert, any result is a violation.
+              isCollision = true;
+            } else {
+              // On update, it's a violation if we find a record that is not the one being updated.
+              if (existingRecords.any((rec) => rec[primaryKey] != primaryValue)) {
+                isCollision = true;
               }
             }
 
-            if (hasDuplicate) {
+            if (isCollision) {
               Logger.warn(
-                  'Unique index constraint violation: ${index.fields.join("+")} = $indexKey',
+                  'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (table scan).',
                   label: 'IndexManager.checkUniqueConstraints');
               return false;
             }
+          }
+        } else if (!searchResult.isEmpty) {
+          // C. Index found potential duplicates.
+          final allPointers =
+              searchResult.pointersByPartition.values.expand((p) => p);
+
+          bool isCollision = false;
+          if (!isUpdate) {
+            isCollision = true; // Any found pointer is a collision on insert.
           } else {
-            // new record, index has result means unique constraint violation
+            // On update, it's a collision if the found pointer is not the record itself.
+            if (selfStoreIndexStr != null) {
+              if (allPointers.any((p) => p != selfStoreIndexStr)) {
+                isCollision = true;
+              }
+            } else if (allPointers.isNotEmpty) {
+              // Cannot identify self, so any found pointer is a potential collision.
+              isCollision = true;
+            }
+          }
+
+          if (isCollision) {
             Logger.warn(
-                'Unique index constraint violation: ${index.fields.join("+")} = $indexKey',
+                'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (index hit).',
                 label: 'IndexManager.checkUniqueConstraints');
             return false;
           }
         }
       }
 
-      return true;
+      return true; // All checks passed.
     } catch (e, stack) {
       Logger.error('Failed to check unique constraints: $e\n$stack',
           label: 'IndexManager.checkUniqueConstraints');
-      return false;
+      return false; // Fail safe.
     }
   }
 
@@ -2831,12 +2645,16 @@ class IndexManager {
   ) async {
     try {
       final pkIndexName = 'pk_$tableName';
-      final results =
+      final searchResult =
           await searchIndex(tableName, pkIndexName, primaryKeyValue);
 
-      if (results.isEmpty) return null;
+      if (searchResult.isEmpty || searchResult.requiresTableScan) return null;
 
-      return StoreIndex.fromString(results.first.toString());
+      final allPointers =
+          searchResult.pointersByPartition.values.expand((p) => p).toList();
+      if (allPointers.isEmpty) return null;
+
+      return StoreIndex.fromString(allPointers.first.toString());
     } catch (e) {
       Logger.error(
         'Failed to get record storage index by primary key: $e',
@@ -2846,54 +2664,6 @@ class IndexManager {
     }
   }
 
-  /// get record by pointer, prioritize cache
-  Future<Map<String, dynamic>?> _getRecordByPointer(
-      String tableName, StoreIndex pointer) async {
-    try {
-      // First check if table is fully cached
-      if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
-        final cachedRecords =
-            _dataStore.dataCacheManager.getEntireTable(tableName);
-        if (cachedRecords != null && cachedRecords.isNotEmpty) {
-          // get primary key name
-          final schema = await _dataStore.getTableSchema(tableName);
-          if (schema != null) {
-            final primaryKey = schema.primaryKey;
-
-            // optimize: check if primary key index is loaded
-            final pkIndexName = 'pk_$tableName';
-            final pointerStr = pointer.toString();
-
-            int processedCount = 0;
-            // find the record that matches the pointer in the cached records
-            for (final record in cachedRecords.toList()) {
-              final pkValue = record[primaryKey];
-              if (pkValue != null) {
-                // check if the index pointer of the primary key value is the one we are looking for
-                final results =
-                    await searchIndex(tableName, pkIndexName, pkValue);
-                if (results.contains(pointerStr)) {
-                  return record; // found matching record
-                }
-              }
-              processedCount++;
-              if (processedCount % 500 == 0) {
-                await Future.delayed(Duration.zero);
-              }
-            }
-          }
-        }
-      }
-
-      // cache miss or cannot get from cache, fallback to read from file
-      return await _dataStore.tableDataManager
-          .getRecordByPointer(tableName, pointer);
-    } catch (e) {
-      Logger.error('Failed to get record by pointer: $e',
-          label: 'IndexManager._getRecordByPointer');
-      return null;
-    }
-  }
 
   /// Process index partitions one by one with callback
   /// @param tableName Table name
@@ -4046,16 +3816,31 @@ class IndexManager {
   /// If the index is small, it will be fully loaded and cached for fast access.
   /// If the index is too large to fit in memory, it will be searched
   /// partition by partition in parallel to avoid memory overflow.
-  Future<List<dynamic>> searchIndex(
+  Future<IndexSearchResult> searchIndex(
       String tableName, String indexName, dynamic key) async {
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
+
+      // Helper function to group pointers by partition
+      Map<int, List<String>> groupPointers(List<dynamic> pointers) {
+        final Map<int, List<String>> map = {};
+        if (pointers.isEmpty) return map;
+
+        for (final pointerStr in pointers) {
+          final storeIndex = StoreIndex.fromString(pointerStr.toString());
+          if (storeIndex != null) {
+            (map[storeIndex.partitionId] ??= []).add(pointerStr.toString());
+          }
+        }
+        return map;
+      }
 
       // 1. Check cache first - only use cache if it's fully loaded
       if (_indexCache.containsKey(cacheKey) &&
           _indexFullyCached[cacheKey] == true) {
         _updateIndexAccessWeight(cacheKey);
-        return await _indexCache[cacheKey]!.search(key);
+        final pointers = await _indexCache[cacheKey]!.search(key);
+        return IndexSearchResult(pointersByPartition: groupPointers(pointers));
       }
 
       final meta = await _getIndexMeta(tableName, indexName);
@@ -4063,7 +3848,7 @@ class IndexManager {
         // Auto-rebuild logic from the former getIndex method
         final tableSchema = await _dataStore.getTableSchema(tableName);
         if (tableSchema == null) {
-          return [];
+          return IndexSearchResult.empty();
         }
         if (tableSchema.fields.isNotEmpty) {
           await _checkAndRebuildTableIndexes(tableName, tableSchema);
@@ -4072,7 +3857,13 @@ class IndexManager {
         }
         Logger.debug('not found index: $tableName.$indexName, skip index check',
             label: 'IndexManager.searchIndex');
-        return [];
+        return IndexSearchResult.tableScan();
+      }
+
+      // Priority : Check for full table cache. If it exists, we should use it
+      // instead of the index, as it's more faster.
+      if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
+        return IndexSearchResult.tableScan();
       }
 
       // 2. Decide on loading strategy based on size
@@ -4081,7 +3872,7 @@ class IndexManager {
       if (shouldLoadFull) {
         // Load fully, cache, then search
         final btree = await _loadIndexFromFile(tableName, indexName, meta);
-        if (btree == null) return [];
+        if (btree == null) return IndexSearchResult.tableScan();
 
         _updateIndexAccessWeight(cacheKey);
         _indexCache[cacheKey] = btree;
@@ -4090,7 +3881,8 @@ class IndexManager {
         _indexSizeCache[cacheKey] = newSize;
         _currentIndexCacheSize += newSize;
 
-        return await btree.search(key);
+        final pointers = await btree.search(key);
+        return IndexSearchResult(pointersByPartition: groupPointers(pointers));
       } else {
         // Index is too large, search without full caching.
 
@@ -4101,26 +3893,31 @@ class IndexManager {
             final btree = await _loadSelectiveIndex(
                 tableName, indexName, meta, partitionIndex);
             if (btree != null) {
-              return await btree.search(key);
+              final pointers = await btree.search(key);
+              return IndexSearchResult(pointersByPartition: {
+                if (pointers.isNotEmpty)
+                  partitionIndex: pointers.map((p) => p.toString()).toList()
+              });
             }
           }
           // If key is not in a known partition range, fall through to full scan.
         }
 
         // 2b. Fallback to searching partition by partition without caching
-        final tasks = <Future<List<dynamic>> Function()>[];
+        final tasks =
+            <Future<MapEntry<int, List<dynamic>>> Function()>[];
         for (final partition in meta.partitions) {
           tasks.add(() async {
             try {
               final partitionPath = await _dataStore.pathManager
                   .getIndexPartitionPath(tableName, indexName, partition.index);
               if (!await _dataStore.storage.existsFile(partitionPath)) {
-                return <dynamic>[];
+                return MapEntry(partition.index, []);
               }
               final content =
                   await _dataStore.storage.readAsString(partitionPath);
               if (content == null || content.isEmpty) {
-                return <dynamic>[];
+                return MapEntry(partition.index, []);
               }
               // Use ComputeManager to run parsing and searching in an isolate
               final request = SearchTaskRequest(
@@ -4132,32 +3929,36 @@ class IndexManager {
                 useIsolate: content.length >
                     1024 * 10, // Use isolate for content > 10KB
               );
-              return results;
+              return MapEntry(partition.index, results);
             } catch (e) {
               Logger.error(
                   'Failed to search index partition ${partition.index}: $e',
                   label: 'IndexManager.searchIndex');
-              return <dynamic>[];
+              return MapEntry(partition.index, []);
             }
           });
         }
 
         final resultsFromPartitions =
-            await ParallelProcessor.execute<List<dynamic>>(tasks,
+            await ParallelProcessor.execute<MapEntry<int, List<dynamic>>>(
+                tasks,
                 label: 'IndexManager.searchIndex');
 
-        final allResults = <dynamic>[];
-        for (final resultList in resultsFromPartitions) {
-          if (resultList != null) {
-            allResults.addAll(resultList);
+        final Map<int, List<String>> allResults = {};
+        for (final partitionResult in resultsFromPartitions) {
+          if (partitionResult != null && partitionResult.value.isNotEmpty) {
+            final partitionId = partitionResult.key;
+            final pointers = partitionResult.value;
+            allResults[partitionId] =
+                pointers.map((p) => p.toString()).toList();
           }
         }
-        return allResults;
+        return IndexSearchResult(pointersByPartition: allResults);
       }
     } catch (e) {
       Logger.error('Failed to search index $tableName.$indexName: $e',
           label: 'IndexManager.searchIndex');
-      return [];
+      return IndexSearchResult.tableScan();
     }
   }
 
@@ -4281,3 +4082,16 @@ class IndexManager {
     }
   }
 }
+
+class _UniqueConstraint {
+  final List<String> fields;
+  final dynamic value;
+  final String indexName;
+
+  _UniqueConstraint({
+    required this.fields,
+    required this.value,
+    required this.indexName,
+  });
+}
+

@@ -3636,6 +3636,47 @@ class TableDataManager {
     }
     return deleteQueue.keys.toSet();
   }
+
+  Future<List<Map<String, dynamic>>> getRecordsByPointers(String tableName,
+      int partitionId, List<StoreIndex> pointers) async {
+    if (pointers.isEmpty) return [];
+
+    try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) return [];
+      final primaryKey = schema.primaryKey;
+      final isGlobal = schema.isGlobal;
+      
+      // Use the existing, reliable method to read all records from the partition.
+      final allRecordsInPartition = await readRecordsFromPartition(
+          tableName, isGlobal, partitionId, primaryKey);
+      if (allRecordsInPartition.isEmpty) return [];
+
+      // The above loop is incorrect. Let's use the offset correctly.
+      var results = <Map<String, dynamic>>[];
+      final pointerOffsets = pointers.map((p) => p.offset).toSet();
+      for (int i = 0; i < allRecordsInPartition.length; i++) {
+        if (pointerOffsets.contains(i)) {
+          results.add(allRecordsInPartition[i]);
+        }
+        // yield to the event loop after processing each batch to keep the UI responsive.
+        if (i % 100 == 0) {
+          await Future.delayed(Duration.zero);
+        }
+      }
+
+      // filter out deleted records
+      results = results.where((record) => !isDeletedRecord(record)).toList();
+      
+
+      return results;
+    } catch (e) {
+      Logger.error(
+          'Failed to get records by pointers for table $tableName, partition $partitionId: $e',
+          label: 'TableDataManager.getRecordsByPointers');
+      return [];
+    }
+  }
 }
 
 /// Check if a record is a deleted record (marked with _deleted_:true flag)
