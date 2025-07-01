@@ -79,7 +79,6 @@ class DataStoreConfig {
   /// other: duration after which cache entries are considered stale
   final Duration? queryCacheExpiryTime;
 
-  
   /// The threshold for the number of query caches. When this value is exceeded,
   /// automatic query caching will be disabled to avoid performance degradation.
   /// User-managed caches will not be affected. Set to null to disable this feature.
@@ -130,7 +129,8 @@ class DataStoreConfig {
         maxBatchSize = maxBatchSize ?? _getDefaultBatchSize(),
         maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
         enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled(),
-        prewarmThresholdMB = prewarmThresholdMB ?? _getDefaultPrewarmThreshold();
+        prewarmThresholdMB =
+            prewarmThresholdMB ?? _getDefaultPrewarmThreshold();
 
   /// Determine if query cache should be enabled by default
   static bool _getDefaultQueryCacheEnabled() {
@@ -265,7 +265,8 @@ class DataStoreConfig {
       memoryThresholdInMB: json['memoryThresholdInMB'] as int?,
       enablePrewarmCache: json['enablePrewarmCache'] as bool?,
       prewarmThresholdMB: json['prewarmThresholdMB'] as int? ?? 10,
-      queryCacheCountThreshold: json['queryCacheCountThreshold'] as int? ?? 2000,
+      queryCacheCountThreshold:
+          json['queryCacheCountThreshold'] as int? ?? 2000,
     );
   }
 

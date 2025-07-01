@@ -54,13 +54,13 @@ class QueryCache {
 
     // If replacing existing cache, subtract old cache size
     if (_cache.containsKey(key)) {
-      int oldSize =
-          TableCache.estimateRecordsSize(_cache[key]!.results) + 100;
+      int oldSize = TableCache.estimateRecordsSize(_cache[key]!.results) + 100;
       _totalCacheSize -= oldSize;
     }
 
     // Evict oldest entries until there is enough space for the new entry.
-    while (_totalCacheSize + newEntrySize > _maxSizeBytes && _cache.isNotEmpty) {
+    while (
+        _totalCacheSize + newEntrySize > _maxSizeBytes && _cache.isNotEmpty) {
       MapEntry<String, CachedQuery>? oldest;
       // This loop to find the oldest is inefficient but simple.
       // For high-performance scenarios, a linked list or priority queue would be better.
@@ -179,7 +179,9 @@ class QueryCache {
           final ageHours =
               (nowMs - entryValue.lastAccessed.millisecondsSinceEpoch) ~/
                   oneHourMs;
-          buckets.putIfAbsent(ageHours, () => []).add(MapEntry(key, entryValue));
+          buckets
+              .putIfAbsent(ageHours, () => [])
+              .add(MapEntry(key, entryValue));
           processedCount++;
           if (processedCount % 500 == 0) {
             await Future.delayed(Duration.zero);

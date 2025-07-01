@@ -828,7 +828,9 @@ class QueryExecutor {
 
                   // If exact primary key match is found, stop all partition processing
                   if (exactPkMatch != null &&
-                      ValueComparator.compare(record[primaryKey], exactPkMatch) == 0) {
+                      ValueComparator.compare(
+                              record[primaryKey], exactPkMatch) ==
+                          0) {
                     controller.stop();
                     return records;
                   }

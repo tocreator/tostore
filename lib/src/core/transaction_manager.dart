@@ -139,8 +139,7 @@ class TransactionManager {
       case 'update':
         await tableDataManager.processTablePartitions(
           tableName: tableName,
-          processFunction:
-              (records, partitionIndex, controller) async {
+          processFunction: (records, partitionIndex, controller) async {
             return records
                 .map<Map<String, dynamic>>((Map<String, dynamic> record) {
               if (record['id'] == operation['data']['id']) {
@@ -154,8 +153,7 @@ class TransactionManager {
       case 'delete':
         await tableDataManager.processTablePartitions(
           tableName: tableName,
-          processFunction:
-              (records, partitionIndex, controller) async {
+          processFunction: (records, partitionIndex, controller) async {
             return records
                 .where((Map<String, dynamic> record) =>
                     record['id'] != operation['data']['id'])
