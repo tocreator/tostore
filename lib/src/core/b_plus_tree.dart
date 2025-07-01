@@ -79,7 +79,9 @@ class BPlusTree {
 
   /// Create a B+ tree from a serialized string
   static Future<BPlusTree> fromString(String data,
-      {int? order, bool isUnique = false, ComparatorFunction? comparator}) async {
+      {int? order,
+      bool isUnique = false,
+      ComparatorFunction? comparator}) async {
     final tree = BPlusTree(order: order, isUnique: isUnique);
     if (data.isEmpty) return tree;
     try {
@@ -322,7 +324,8 @@ class BPlusTree {
       // Process current batch
       for (int j = i; j < end; j++) {
         final sortedIdx = sortedIndices[j];
-        await insert(keys[sortedIdx], values[sortedIdx], comparator: comparator);
+        await insert(keys[sortedIdx], values[sortedIdx],
+            comparator: comparator);
       }
 
       // Brief pause between batches to allow GC to work and prevent memory spikes
@@ -963,7 +966,8 @@ class BPlusTree {
     // Search for key in leaf node
     if (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
-        if (_compareKeys(searchKey, node.keys[i], comparator: comparator) == 0) {
+        if (_compareKeys(searchKey, node.keys[i], comparator: comparator) ==
+            0) {
           // Ensure index is valid
           if (i < node.values.length) {
             // Return a copy to prevent modification
@@ -1201,7 +1205,8 @@ class BPlusTree {
     // Find and delete key or value in leaf node
     if (currentNode != null) {
       for (int i = 0; i < currentNode.keys.length; i++) {
-        if (_compareKeys(key, currentNode.keys[i], comparator: comparator) == 0) {
+        if (_compareKeys(key, currentNode.keys[i], comparator: comparator) ==
+            0) {
           if (value != null) {
             // Convert both to string for comparison if needed
             final valueStr = value.toString();

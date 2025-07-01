@@ -3880,7 +3880,6 @@ class IndexManager {
       dynamic endValue = condition.endValue;
 
       bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
-
       if (isPrimaryKeyIndex) {
         comparator = ValueComparator.getPrimaryKeyComparator(
             tableSchema.primaryKeyConfig.type);
@@ -3991,19 +3990,6 @@ class IndexManager {
           });
         }
         return limit != null && totalFound >= limit;
-      }
-
-      if (condition.operator == '=' && meta.isOrdered == true) {
-        final partitionIndex = meta.findPartitionForKey(startValue);
-        if (partitionIndex != -1) {
-          final btree = await _loadSelectiveIndex(
-              tableName, indexName, meta, partitionIndex);
-          if (btree != null) {
-            final pointers = await performBTreeSearchAndGroup(btree);
-            addResults(pointers);
-          }
-          return IndexSearchResult(pointersByPartition: allPointersByPartition);
-        }
       }
 
       List<int> partitionIndices;

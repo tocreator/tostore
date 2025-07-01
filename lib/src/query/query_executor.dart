@@ -1292,7 +1292,14 @@ class QueryExecutor {
       }
 
       // Convert the raw map condition to a structured IndexCondition
-      final indexCondition = IndexCondition.fromMap(conditions);
+      IndexCondition indexCondition;
+      final indexConditionValue = conditions.values.first;
+      if (indexConditionValue is Map<String, dynamic>) {
+        indexCondition = IndexCondition.fromMap(indexConditionValue);
+      } else {
+        // Fallback for simple equality like { "id": 123 }, convert to { "=": 123 }
+        indexCondition = IndexCondition.fromMap({'=': indexConditionValue});
+      }
 
       // use searchIndex to get pointers
       final indexResults =

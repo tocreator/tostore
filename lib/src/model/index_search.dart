@@ -51,8 +51,7 @@ class IndexSearchResult {
 
   /// Returns true if no pointers were found across any partitions.
   bool get isEmpty => pointersByPartition.values.every((list) => list.isEmpty);
-} 
-
+}
 
 /// Represents a condition for a single index search.
 /// This provides a type-safe way to define index queries instead of using raw maps.
