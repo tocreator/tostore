@@ -1,3 +1,9 @@
+import '../model/table_schema.dart';
+
+/// A function that compares two keys.
+typedef ComparatorFunction = int Function(dynamic a, dynamic b);
+
+/// Utility class for comparing values of different types.
 class ValueComparator {
   /// Compares two values of potentially different types.
   /// Returns:
@@ -5,6 +11,10 @@ class ValueComparator {
   /// - Zero if a == b
   /// - Positive number if a > b
   static int compare(dynamic a, dynamic b) {
+    if (a == b) {
+      return 0;
+    }
+
     // 1. Handle null cases
     if (a == null && b == null) return 0;
     if (a == null) return -1;
@@ -16,6 +26,9 @@ class ValueComparator {
       if (a is int) return compareInts(a, b);
       if (a is double) return compareDoubles(a, b);
       if (a is BigInt) return a.compareTo(b as BigInt);
+      if (a is DateTime && b is DateTime) {
+        return a.compareTo(b);
+      }
     }
 
     // 3. Mixed-type comparison
@@ -373,6 +386,57 @@ class ValueComparator {
     }
 
     return result;
+  }
+
+  /// Returns a specialized, high-performance comparator for a given data type.
+  ///
+  /// This avoids repeated type checking during bulk operations like sorting or searching.
+  static ComparatorFunction getFieldComparator(DataType? type) {
+    switch (type) {
+      case DataType.integer:
+        return (a, b) => (a as int).compareTo(b as int);
+      case DataType.double:
+        return (a, b) => (a as double).compareTo(b as double);
+      case DataType.text:
+        return (a, b) => compareStrings(a as String, b as String);
+      case DataType.boolean:
+        return (a, b) {
+          // Explicitly compare bools to avoid casting errors if data is stored as 0/1
+          final bool aBool = a is bool ? a : (a == 1);
+          final bool bBool = b is bool ? b : (b == 1);
+          return aBool == bBool ? 0 : (aBool ? 1 : -1);
+        };
+      case DataType.datetime:
+        return (a, b) => (a as DateTime).compareTo(b as DateTime);
+      case DataType.blob:
+        // For blobs, fall back to a generic comparison as direct comparison is not meaningful
+        return compare;
+      case null:
+      default:
+        // If type is not specified, use the general-purpose but slower comparison method.
+        return compare;
+    }
+  }
+
+  /// Returns a specialized, high-performance comparator for a given primary key type.
+  /// This is more efficient than the generic `getComparator` because it leverages
+  /// the known format of primary keys (e.g., numeric strings, shortcodes).
+  static ComparatorFunction getPrimaryKeyComparator(PrimaryKeyType pkType) {
+    switch (pkType) {
+      case PrimaryKeyType.sequential:
+      case PrimaryKeyType.timestampBased:
+      case PrimaryKeyType.datePrefixed:
+        // These are numeric strings, best compared as BigInts for accuracy.
+        return (a, b) => compareBigIntStrings(a.toString(), b.toString());
+      case PrimaryKeyType.shortCode:
+        // These are base62-like strings where length is the primary sort key.
+        return (a, b) => compareShortCodes(a.toString(), b.toString());
+      case PrimaryKeyType.none:
+      default:
+        // User-defined string primary keys. Use the full natural sort comparison
+        // as we don't know the format. It's the safest and most flexible.
+        return (a, b) => compareStrings(a.toString(), b.toString());
+    }
   }
 }
 

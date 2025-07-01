@@ -40,10 +40,14 @@ class IndexProcessingRequest {
   /// Whether the index is unique.
   final bool isUnique;
 
+  /// The data type of the index key, for optimized comparison.
+  final DataType? keyType;
+
   IndexProcessingRequest({
     required this.entries,
     this.existingPartitionContent,
     required this.isUnique,
+    this.keyType,
   });
 }
 
@@ -64,12 +68,16 @@ class IndexDeleteRequest {
   /// The entries to delete mapped by key
   final Map<String, IndexBufferEntry> entriesToDelete;
 
+  /// The data type of the index key, for optimized comparison.
+  final DataType? keyType;
+
   IndexDeleteRequest({
     required this.content,
     this.checksum,
     required this.isUnique,
     required this.keysToProcess,
     required this.entriesToDelete,
+    this.keyType,
   });
 }
 
@@ -134,6 +142,9 @@ class IndexProcessingResult {
 Future<IndexProcessingResult> processIndexPartition(
     IndexProcessingRequest request) async {
   try {
+    // Get the specific comparator for the key type.
+    final comparator = ValueComparator.getFieldComparator(request.keyType);
+
     // Initialize B+ tree, either from existing content or as a new tree.
     BPlusTree btree;
     try {
@@ -142,6 +153,7 @@ Future<IndexProcessingResult> processIndexPartition(
         btree = await BPlusTree.fromString(
           request.existingPartitionContent!,
           isUnique: request.isUnique,
+          comparator: comparator,
         );
       } else {
         btree = BPlusTree(
@@ -160,7 +172,8 @@ Future<IndexProcessingResult> processIndexPartition(
     for (final bufferEntry in request.entries) {
       try {
         final entry = bufferEntry.indexEntry;
-        await btree.insert(entry.indexKey, entry.recordPointer.toString());
+        await btree.insert(entry.indexKey, entry.recordPointer.toString(),
+            comparator: comparator);
       } catch (insertError) {
         failedCount++;
         Logger.warn('Failed to insert entry: $insertError',
@@ -205,6 +218,9 @@ Future<IndexProcessingResult> processIndexPartition(
 /// from a B+ tree, and returns an [IndexDeleteResult].
 Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
   try {
+    // Get the specific comparator for the key type.
+    final comparator = ValueComparator.getFieldComparator(request.keyType);
+
     // Verify checksum if provided
     if (request.checksum != null &&
         !_verifyChecksum(request.content, request.checksum!)) {
@@ -226,6 +242,7 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       btree = await BPlusTree.fromString(
         request.content,
         isUnique: request.isUnique,
+        comparator: comparator,
       );
     } catch (treeError) {
       Logger.error('Failed to initialize B+ tree: $treeError',
@@ -262,7 +279,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         final recordPointer = indexEntry.indexEntry.recordPointer.toString();
 
         // Delete the index entry
-        if (await btree.delete(actualIndexKey, recordPointer)) {
+        if (await btree.delete(actualIndexKey, recordPointer,
+            comparator: comparator)) {
           isModified = true;
           processedKeys.add(compositeKey);
         }
@@ -2214,9 +2232,13 @@ class SearchTaskRequest {
   final String content;
   final dynamic key;
   final bool isUnique;
+  final DataType? keyType;
 
   SearchTaskRequest(
-      {required this.content, required this.key, required this.isUnique});
+      {required this.content,
+      required this.key,
+      required this.isUnique,
+      this.keyType});
 }
 
 /// A top-level function to search a single index partition in an isolate.
@@ -2226,9 +2248,10 @@ Future<List<dynamic>> searchIndexPartitionTask(
     if (request.content.isEmpty) {
       return [];
     }
-    final btree =
-        await BPlusTree.fromString(request.content, isUnique: request.isUnique);
-    return await btree.search(request.key);
+    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final btree = await BPlusTree.fromString(request.content,
+        isUnique: request.isUnique, comparator: comparator);
+    return await btree.search(request.key, comparator: comparator);
   } catch (e) {
     Logger.error('Failed to search index partition in isolate: $e',
         label: 'searchIndexPartitionTask');
@@ -2241,9 +2264,13 @@ class BatchSearchTaskRequest {
   final String content;
   final List<dynamic> keys;
   final bool isUnique;
+  final DataType? keyType;
 
   BatchSearchTaskRequest(
-      {required this.content, required this.keys, required this.isUnique});
+      {required this.content,
+      required this.keys,
+      required this.isUnique,
+      this.keyType});
 }
 
 /// Result from batch searching an index partition.
@@ -2260,10 +2287,11 @@ Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
     if (request.content.isEmpty || request.keys.isEmpty) {
       return BatchSearchTaskResult(found: found);
     }
-    final btree =
-        await BPlusTree.fromString(request.content, isUnique: request.isUnique);
+    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final btree = await BPlusTree.fromString(request.content,
+        isUnique: request.isUnique, comparator: comparator);
     for (final key in request.keys) {
-      final results = await btree.search(key);
+      final results = await btree.search(key, comparator: comparator);
       if (results.isNotEmpty) {
         found[key] = results;
       }

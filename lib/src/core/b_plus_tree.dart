@@ -1,6 +1,9 @@
+import 'dart:convert';
+
 import '../handler/logger.dart';
 import 'dart:math' as math;
 import '../handler/platform_handler.dart';
+import '../handler/value_comparator.dart';
 
 /// B+ tree implementation with enhanced safety and performance
 class BPlusTree {
@@ -76,11 +79,11 @@ class BPlusTree {
 
   /// Create a B+ tree from a serialized string
   static Future<BPlusTree> fromString(String data,
-      {int? order, bool isUnique = false}) async {
+      {int? order, bool isUnique = false, ComparatorFunction? comparator}) async {
     final tree = BPlusTree(order: order, isUnique: isUnique);
     if (data.isEmpty) return tree;
     try {
-      final lines = data.split('\n');
+      final lines = const LineSplitter().convert(data);
       // Use the same batch size calculation as batchInsert for consistency
       int batchSize = _getDefaultBatchSize();
 
@@ -101,7 +104,7 @@ class BPlusTree {
             final values = deserializeValues(parts[1]);
             for (var value in values) {
               try {
-                await tree.insert(key, value);
+                await tree.insert(key, value, comparator: comparator);
               } catch (e) {
                 Logger.error('Insertion failed: $e, key=$key, value=$value',
                     label: 'BPlusTree.fromString');
@@ -206,7 +209,8 @@ class BPlusTree {
   }
 
   /// Batch insert key-value pairs - method for improved efficiency
-  Future<void> batchInsert(List<dynamic> keys, List<dynamic> values) async {
+  Future<void> batchInsert(List<dynamic> keys, List<dynamic> values,
+      {ComparatorFunction? comparator}) async {
     if (keys.length != values.length) {
       throw ArgumentError('The number of keys and values must be the same');
     }
@@ -222,7 +226,7 @@ class BPlusTree {
         sortedIndices.sort((a, b) {
           final keyA = keys[a];
           final keyB = keys[b];
-          return _compareKeys(keyA, keyB);
+          return _compareKeys(keyA, keyB, comparator: comparator);
         });
       }
     } catch (e) {
@@ -291,7 +295,8 @@ class BPlusTree {
               // Process current batch
               for (int j = startIdx; j < endIdx; j++) {
                 final sortedIdx = sortedIndices[j];
-                await insert(keys[sortedIdx], values[sortedIdx]);
+                await insert(keys[sortedIdx], values[sortedIdx],
+                    comparator: comparator);
               }
 
               // Pause between batches to reduce memory pressure
@@ -317,7 +322,7 @@ class BPlusTree {
       // Process current batch
       for (int j = i; j < end; j++) {
         final sortedIdx = sortedIndices[j];
-        await insert(keys[sortedIdx], values[sortedIdx]);
+        await insert(keys[sortedIdx], values[sortedIdx], comparator: comparator);
       }
 
       // Brief pause between batches to allow GC to work and prevent memory spikes
@@ -355,7 +360,8 @@ class BPlusTree {
   }
 
   /// Insert key-value pair - optimized version
-  Future<void> insert(dynamic key, dynamic value) async {
+  Future<void> insert(dynamic key, dynamic value,
+      {ComparatorFunction? comparator}) async {
     // Handle null key
     if (key == null) return;
 
@@ -391,7 +397,8 @@ class BPlusTree {
         // Locate child node
         int i = 0;
         while (i < currentNode.keys.length &&
-            _compareKeys(key, currentNode.keys[i]) >= 0) {
+            _compareKeys(key, currentNode.keys[i], comparator: comparator) >=
+                0) {
           i++;
         }
 
@@ -410,13 +417,17 @@ class BPlusTree {
       // Find exact insertion position in leaf node
       int insertPos = 0;
       while (insertPos < currentNode.keys.length &&
-          _compareKeys(key, currentNode.keys[insertPos]) > 0) {
+          _compareKeys(key, currentNode.keys[insertPos],
+                  comparator: comparator) >
+              0) {
         insertPos++;
       }
 
       // Check if key already exists
       if (insertPos < currentNode.keys.length &&
-          _compareKeys(key, currentNode.keys[insertPos]) == 0) {
+          _compareKeys(key, currentNode.keys[insertPos],
+                  comparator: comparator) ==
+              0) {
         // Update existing key
         if (isUnique) {
           // Unique index, replace value
@@ -899,31 +910,22 @@ class BPlusTree {
   }
 
   /// Safe key comparison method
-  int _compareKeys(dynamic key1, dynamic key2) {
-    // Handle null cases
-    if (key1 == null && key2 == null) return 0;
-    if (key1 == null) return -1;
-    if (key2 == null) return 1;
-
-    // Compare same types
-    if (key1 is num && key2 is num) {
-      return key1.compareTo(key2);
+  int _compareKeys(dynamic key1, dynamic key2,
+      {ComparatorFunction? comparator}) {
+    if (comparator != null) {
+      try {
+        return comparator(key1, key2);
+      } catch (e) {
+        // Fallback to generic comparison if the specific one fails
+        return ValueComparator.compare(key1, key2);
+      }
     }
-
-    if (key1 is String && key2 is String) {
-      return key1.compareTo(key2);
-    }
-
-    if (key1 is DateTime && key2 is DateTime) {
-      return key1.compareTo(key2);
-    }
-
-    // Convert different types to string for comparison
-    return key1.toString().compareTo(key2.toString());
+    return ValueComparator.compare(key1, key2);
   }
 
   /// Search for values corresponding to the specified key
-  Future<List<dynamic>> search(dynamic key) async {
+  Future<List<dynamic>> search(dynamic key,
+      {ComparatorFunction? comparator}) async {
     // Handle condition object
     dynamic searchKey = key;
     if (key is Map) {
@@ -941,8 +943,8 @@ class BPlusTree {
     while (node != null && !node.isLeaf) {
       // Binary search for child node
       int i = 0;
-      while (
-          i < node.keys.length && _compareKeys(searchKey, node.keys[i]) >= 0) {
+      while (i < node.keys.length &&
+          _compareKeys(searchKey, node.keys[i], comparator: comparator) >= 0) {
         i++;
       }
 
@@ -961,7 +963,7 @@ class BPlusTree {
     // Search for key in leaf node
     if (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
-        if (_compareKeys(searchKey, node.keys[i]) == 0) {
+        if (_compareKeys(searchKey, node.keys[i], comparator: comparator) == 0) {
           // Ensure index is valid
           if (i < node.values.length) {
             // Return a copy to prevent modification
@@ -975,7 +977,8 @@ class BPlusTree {
   }
 
   /// Range query (satisfying index manager requirements)
-  Future<List<Map<String, dynamic>>> range(dynamic start, dynamic end) async {
+  Future<List<Map<String, dynamic>>> range(dynamic start, dynamic end,
+      {ComparatorFunction? comparator}) async {
     final results = <Map<String, dynamic>>[];
     if (root == null) return results;
 
@@ -984,7 +987,8 @@ class BPlusTree {
     while (node != null && !node.isLeaf) {
       // Find child node containing start value
       int i = 0;
-      while (i < node.keys.length && _compareKeys(start, node.keys[i]) >= 0) {
+      while (i < node.keys.length &&
+          _compareKeys(start, node.keys[i], comparator: comparator) >= 0) {
         i++;
       }
 
@@ -1001,8 +1005,8 @@ class BPlusTree {
     while (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
         // Check if key is in range
-        if (_compareKeys(node.keys[i], start) >= 0 &&
-            _compareKeys(node.keys[i], end) <= 0) {
+        if (_compareKeys(node.keys[i], start, comparator: comparator) >= 0 &&
+            _compareKeys(node.keys[i], end, comparator: comparator) <= 0) {
           // Ensure value index is valid
           if (i < node.values.length) {
             // Try to extract Map<String, dynamic> type values
@@ -1022,7 +1026,7 @@ class BPlusTree {
         }
 
         // If exceeded upper range limit, stop searching
-        if (_compareKeys(node.keys[i], end) > 0) {
+        if (_compareKeys(node.keys[i], end, comparator: comparator) > 0) {
           return results;
         }
       }
@@ -1036,7 +1040,9 @@ class BPlusTree {
 
   /// Range query (returns all types of values)
   Future<List<dynamic>> searchRange(dynamic start, dynamic end,
-      {bool includeStart = true, bool includeEnd = true}) async {
+      {bool includeStart = true,
+      bool includeEnd = true,
+      ComparatorFunction? comparator}) async {
     final results = <dynamic>[];
     if (root == null) return results;
 
@@ -1044,7 +1050,8 @@ class BPlusTree {
     BPlusTreeNode? node = root;
     while (node != null && !node.isLeaf) {
       int i = 0;
-      while (i < node.keys.length && _compareKeys(start, node.keys[i]) >= 0) {
+      while (i < node.keys.length &&
+          _compareKeys(start, node.keys[i], comparator: comparator) >= 0) {
         i++;
       }
 
@@ -1061,8 +1068,8 @@ class BPlusTree {
     while (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
         final key = node.keys[i];
-        final startCompare = _compareKeys(key, start);
-        final endCompare = _compareKeys(key, end);
+        final startCompare = _compareKeys(key, start, comparator: comparator);
+        final endCompare = _compareKeys(key, end, comparator: comparator);
 
         // Check if key is in range (considering include/exclude boundaries)
         final inRange = (includeStart ? startCompare >= 0 : startCompare > 0) &&
@@ -1164,7 +1171,8 @@ class BPlusTree {
   }
 
   /// Delete key-value pair and return whether deletion was successful
-  Future<bool> delete(dynamic key, dynamic value) async {
+  Future<bool> delete(dynamic key, dynamic value,
+      {ComparatorFunction? comparator}) async {
     if (root == null) return false;
 
     final path = <BPlusTreeNode>[];
@@ -1177,7 +1185,7 @@ class BPlusTree {
 
       int i = 0;
       while (i < currentNode.keys.length &&
-          _compareKeys(key, currentNode.keys[i]) >= 0) {
+          _compareKeys(key, currentNode.keys[i], comparator: comparator) >= 0) {
         i++;
       }
 
@@ -1193,7 +1201,7 @@ class BPlusTree {
     // Find and delete key or value in leaf node
     if (currentNode != null) {
       for (int i = 0; i < currentNode.keys.length; i++) {
-        if (_compareKeys(key, currentNode.keys[i]) == 0) {
+        if (_compareKeys(key, currentNode.keys[i], comparator: comparator) == 0) {
           if (value != null) {
             // Convert both to string for comparison if needed
             final valueStr = value.toString();
@@ -1245,6 +1253,36 @@ class BPlusTree {
     }
 
     return true;
+  }
+
+  /// Scans all leaf nodes to find keys matching a pattern.
+  /// This is used for non-prefix LIKE queries and can be slow.
+  Future<List<dynamic>> scanAndMatch(String pattern) async {
+    final results = <dynamic>[];
+    if (root == null) return results;
+
+    // Find the leftmost leaf node to start the scan
+    BPlusTreeNode? node = root;
+    while (node != null && !node.isLeaf) {
+      if (node.children.isEmpty) break;
+      node = node.children[0];
+    }
+
+    // Traverse the leaf node chain
+    while (node != null) {
+      for (int i = 0; i < node.keys.length; i++) {
+        final key = node.keys[i];
+        // Ensure the key is a string before attempting a pattern match
+        if (key is String && ValueComparator.matchesPattern(key, pattern)) {
+          if (i < node.values.length) {
+            results.addAll(node.values[i]);
+          }
+        }
+      }
+      node = node.next; // Move to the next leaf
+    }
+
+    return results;
   }
 }
 

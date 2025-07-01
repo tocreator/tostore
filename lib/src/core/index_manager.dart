@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import '../model/index_search.dart';
 import 'compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
@@ -18,7 +19,6 @@ import 'compute_tasks.dart';
 import 'memory_manager.dart';
 import '../handler/parallel_processor.dart';
 import '../model/system_table.dart';
-import '../model/index_search_result.dart';
 import '../query/query_condition.dart';
 
 /// Index Manager
@@ -1351,7 +1351,6 @@ class IndexManager {
     }
   }
 
-
   /// Determine if an index should be fully cached
   bool _shouldFullCacheIndex(
       String tableName, String indexName, IndexMeta meta) {
@@ -2408,66 +2407,74 @@ class IndexManager {
 
       // 2. Iterate and check each constraint.
       for (final constraint in constraints) {
-        // A. Check the index.
-        final searchResult =
-            await searchIndex(tableName, constraint.indexName, constraint.value);
+        try {
+          // A. Check the index.
+          final searchResult = await searchIndex(tableName,
+              constraint.indexName, IndexCondition.equals(constraint.value));
 
-        if (searchResult.requiresTableScan) {
-          // B. Index not available, fall back to a direct query via QueryExecutor.
-          // Handle both single and composite keys.
-          final queryCondition = QueryCondition();
-          for (final field in constraint.fields) {
-            queryCondition.where(field, '=', data[field]);
-          }
+          if (searchResult.requiresTableScan) {
+            // B. Index not available, fall back to a direct query via QueryExecutor.
+            // Handle both single and composite keys.
+            final queryCondition = QueryCondition();
+            for (final field in constraint.fields) {
+              queryCondition.where(field, '=', data[field]);
+            }
 
-          final existingRecords =
-              await _dataStore.executeQuery(tableName, queryCondition, limit: 2); // Limit 2 is enough to detect a collision
+            final existingRecords = await _dataStore.executeQuery(
+                tableName, queryCondition,
+                limit: 2); // Limit 2 is enough to detect a collision
 
-          if (existingRecords.isNotEmpty) {
+            if (existingRecords.isNotEmpty) {
+              bool isCollision = false;
+              if (!isUpdate) {
+                // On insert, any result is a violation.
+                isCollision = true;
+              } else {
+                // On update, it's a violation if we find a record that is not the one being updated.
+                if (existingRecords
+                    .any((rec) => rec[primaryKey] != primaryValue)) {
+                  isCollision = true;
+                }
+              }
+
+              if (isCollision) {
+                Logger.warn(
+                    'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (table scan).',
+                    label: 'IndexManager.checkUniqueConstraints');
+                return false;
+              }
+            }
+          } else if (!searchResult.isEmpty) {
+            // C. Index found potential duplicates.
+            final allPointers =
+                searchResult.pointersByPartition.values.expand((p) => p);
+
             bool isCollision = false;
             if (!isUpdate) {
-              // On insert, any result is a violation.
-              isCollision = true;
+              isCollision = true; // Any found pointer is a collision on insert.
             } else {
-              // On update, it's a violation if we find a record that is not the one being updated.
-              if (existingRecords.any((rec) => rec[primaryKey] != primaryValue)) {
+              // On update, it's a collision if the found pointer is not the record itself.
+              if (selfStoreIndexStr != null) {
+                if (allPointers.any((p) => p != selfStoreIndexStr)) {
+                  isCollision = true;
+                }
+              } else if (allPointers.isNotEmpty) {
+                // Cannot identify self, so any found pointer is a potential collision.
                 isCollision = true;
               }
             }
 
             if (isCollision) {
               Logger.warn(
-                  'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (table scan).',
+                  'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (index hit).',
                   label: 'IndexManager.checkUniqueConstraints');
               return false;
             }
           }
-        } else if (!searchResult.isEmpty) {
-          // C. Index found potential duplicates.
-          final allPointers =
-              searchResult.pointersByPartition.values.expand((p) => p);
-
-          bool isCollision = false;
-          if (!isUpdate) {
-            isCollision = true; // Any found pointer is a collision on insert.
-          } else {
-            // On update, it's a collision if the found pointer is not the record itself.
-            if (selfStoreIndexStr != null) {
-              if (allPointers.any((p) => p != selfStoreIndexStr)) {
-                isCollision = true;
-              }
-            } else if (allPointers.isNotEmpty) {
-              // Cannot identify self, so any found pointer is a potential collision.
-              isCollision = true;
-            }
-          }
-
-          if (isCollision) {
-            Logger.warn(
-                'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (index hit).',
-                label: 'IndexManager.checkUniqueConstraints');
-            return false;
-          }
+        } catch (e, stack) {
+          Logger.error('Failed to check unique constraints: $e\n$stack',
+              label: 'IndexManager.checkUniqueConstraints');
+          return false; // Fail safe.
         }
       }
 
@@ -2645,8 +2652,8 @@ class IndexManager {
   ) async {
     try {
       final pkIndexName = 'pk_$tableName';
-      final searchResult =
-          await searchIndex(tableName, pkIndexName, primaryKeyValue);
+      final searchResult = await searchIndex(
+          tableName, pkIndexName, IndexCondition.equals(primaryKeyValue));
 
       if (searchResult.isEmpty || searchResult.requiresTableScan) return null;
 
@@ -2663,7 +2670,6 @@ class IndexManager {
       return null;
     }
   }
-
 
   /// Process index partitions one by one with callback
   /// @param tableName Table name
@@ -3811,152 +3817,212 @@ class IndexManager {
     return true;
   }
 
-  /// Search an index for a given key, using an intelligent strategy.
+  /// Searches an index using a structured condition, with optimizations for performance and memory.
   ///
-  /// If the index is small, it will be fully loaded and cached for fast access.
-  /// If the index is too large to fit in memory, it will be searched
-  /// partition by partition in parallel to avoid memory overflow.
+  /// This method intelligently decides whether to load an entire index into memory
+  /// or search it partition by partition based on the index size and query type.
+  /// It supports equality and range queries with an optional limit to control result size.
+  ///
+  /// @param tableName The name of the table.
+  /// @param indexName The name of the index to search.
+  /// @param condition The structured IndexCondition for the search.
+  /// @param limit An optional limit on the number of records to return.
+  /// @return An IndexSearchResult containing the pointers to matching records.
   Future<IndexSearchResult> searchIndex(
-      String tableName, String indexName, dynamic key) async {
+    String tableName,
+    String indexName,
+    IndexCondition condition, {
+    int? limit,
+  }) async {
     try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Helper function to group pointers by partition
-      Map<int, List<String>> groupPointers(List<dynamic> pointers) {
-        final Map<int, List<String>> map = {};
-        if (pointers.isEmpty) return map;
-
-        for (final pointerStr in pointers) {
-          final storeIndex = StoreIndex.fromString(pointerStr.toString());
-          if (storeIndex != null) {
-            (map[storeIndex.partitionId] ??= []).add(pointerStr.toString());
-          }
-        }
-        return map;
-      }
-
-      // 1. Check cache first - only use cache if it's fully loaded
-      if (_indexCache.containsKey(cacheKey) &&
-          _indexFullyCached[cacheKey] == true) {
-        _updateIndexAccessWeight(cacheKey);
-        final pointers = await _indexCache[cacheKey]!.search(key);
-        return IndexSearchResult(pointersByPartition: groupPointers(pointers));
-      }
-
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) {
-        // Auto-rebuild logic from the former getIndex method
-        final tableSchema = await _dataStore.getTableSchema(tableName);
-        if (tableSchema == null) {
+      // Handle 'IN' by decomposing into a batch search first
+      if (condition.operator.toLowerCase() == 'in') {
+        if (condition.value is! List || (condition.value as List).isEmpty) {
           return IndexSearchResult.empty();
         }
-        if (tableSchema.fields.isNotEmpty) {
-          await _checkAndRebuildTableIndexes(tableName, tableSchema);
-          // Retry the search after attempting to rebuild.
-          return searchIndex(tableName, indexName, key);
+        final results = await batchSearchIndex(
+            tableName, indexName, condition.value as List);
+        final allPointers = results.values.expand((p) => p).toList();
+        final Map<int, List<String>> grouped = {};
+        for (final pointer in allPointers) {
+          final storeIndex = StoreIndex.fromString(pointer.toString());
+          if (storeIndex != null) {
+            grouped
+                .putIfAbsent(storeIndex.partitionId, () => [])
+                .add(pointer.toString());
+          }
         }
-        Logger.debug('not found index: $tableName.$indexName, skip index check',
-            label: 'IndexManager.searchIndex');
+        return IndexSearchResult(pointersByPartition: grouped);
+      }
+
+      // 1. Metadata, Schema, and Comparator setup
+      final meta = await _getIndexMeta(tableName, indexName);
+      if (meta == null) {
+        final tableSchemaOnDemand = await _dataStore.getTableSchema(tableName);
+        if (tableSchemaOnDemand != null &&
+            tableSchemaOnDemand.fields.isNotEmpty) {
+          await _checkAndRebuildTableIndexes(tableName, tableSchemaOnDemand);
+          return searchIndex(tableName, indexName, condition, limit: limit);
+        }
         return IndexSearchResult.tableScan();
       }
 
-      // Priority : Check for full table cache. If it exists, we should use it
-      // instead of the index, as it's more faster.
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema == null) return IndexSearchResult.tableScan();
+
+      ComparatorFunction comparator;
+      dynamic startValue = condition.value;
+      dynamic endValue = condition.endValue;
+
+      bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
+
+      if (isPrimaryKeyIndex) {
+        comparator = ValueComparator.getPrimaryKeyComparator(
+            tableSchema.primaryKeyConfig.type);
+        startValue = startValue?.toString().trim();
+        endValue = endValue?.toString().trim();
+      } else {
+        comparator = ValueComparator.compare; // Default
+        if (meta.fields.length == 1) {
+          final fieldSchema = tableSchema.fields
+              .firstWhere((f) => f.name == meta.fields.first, orElse: null);
+          comparator = ValueComparator.getFieldComparator(fieldSchema.type);
+          startValue = fieldSchema.convertValue(condition.value);
+          endValue = fieldSchema.convertValue(condition.endValue);
+        }
+      }
+
+      // A helper function to perform search on a btree instance and group results
+      Future<Map<int, List<String>>> performBTreeSearchAndGroup(
+          BPlusTree btree) async {
+        List<dynamic> pointers = [];
+        switch (condition.operator) {
+          case '=':
+            pointers = await btree.search(startValue, comparator: comparator);
+            break;
+          case '>':
+            pointers = await btree.searchRange(startValue, null,
+                includeStart: false, comparator: comparator);
+            break;
+          case '>=':
+            pointers = await btree.searchRange(startValue, null,
+                includeStart: true, comparator: comparator);
+            break;
+          case '<':
+            pointers = await btree.searchRange(null, startValue,
+                includeEnd: false, comparator: comparator);
+            break;
+          case '<=':
+            pointers = await btree.searchRange(null, startValue,
+                includeEnd: true, comparator: comparator);
+            break;
+          case 'between':
+            pointers = await btree.searchRange(startValue, endValue,
+                comparator: comparator);
+            break;
+          case 'like':
+            if (startValue is String) {
+              if (startValue.endsWith('%') && !startValue.startsWith('%')) {
+                final prefix = startValue.substring(0, startValue.length - 1);
+                pointers = await btree.searchRange(prefix, '$prefix\uffff',
+                    comparator: comparator);
+              } else {
+                pointers = await btree.scanAndMatch(startValue);
+              }
+            }
+            break;
+        }
+        final Map<int, List<String>> grouped = {};
+        for (final pointer in pointers) {
+          final storeIndex = StoreIndex.fromString(pointer.toString());
+          if (storeIndex != null) {
+            grouped
+                .putIfAbsent(storeIndex.partitionId, () => [])
+                .add(pointer.toString());
+          }
+        }
+        return grouped;
+      }
+
+      // 2. Cache Check
+      final cacheKey = _getIndexCacheKey(tableName, indexName);
+      if (_indexCache.containsKey(cacheKey) &&
+          _indexFullyCached[cacheKey] == true) {
+        _updateIndexAccessWeight(cacheKey);
+        final btree = _indexCache[cacheKey]!;
+        final pointers = await performBTreeSearchAndGroup(btree);
+        return IndexSearchResult(pointersByPartition: pointers);
+      }
+
+      // Priority: Check for full table cache.
       if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
         return IndexSearchResult.tableScan();
       }
 
-      // 2. Decide on loading strategy based on size
-      final shouldLoadFull = _shouldFullCacheIndex(tableName, indexName, meta);
-
-      if (shouldLoadFull) {
-        // Load fully, cache, then search
+      // 3. Decide on loading strategy
+      if (_shouldFullCacheIndex(tableName, indexName, meta)) {
         final btree = await _loadIndexFromFile(tableName, indexName, meta);
         if (btree == null) return IndexSearchResult.tableScan();
-
         _updateIndexAccessWeight(cacheKey);
         _indexCache[cacheKey] = btree;
         _indexFullyCached[cacheKey] = true;
-        final newSize = _estimateIndexSize(btree);
-        _indexSizeCache[cacheKey] = newSize;
-        _currentIndexCacheSize += newSize;
+        _indexSizeCache[cacheKey] = _estimateIndexSize(btree);
+        _currentIndexCacheSize += _indexSizeCache[cacheKey] ?? 0;
+        return searchIndex(tableName, indexName, condition, limit: limit);
+      }
 
-        final pointers = await btree.search(key);
-        return IndexSearchResult(pointersByPartition: groupPointers(pointers));
-      } else {
-        // Index is too large, search without full caching.
+      // 4. Partition-by-partition search
+      final Map<int, List<String>> allPointersByPartition = {};
+      int totalFound = 0;
 
-        // 2a. Optimization for ordered indexes with point queries
-        if (key != null && meta.isOrdered == true) {
-          final partitionIndex = meta.findPartitionForKey(key);
-          if (partitionIndex >= 0 && partitionIndex < meta.partitions.length) {
-            final btree = await _loadSelectiveIndex(
-                tableName, indexName, meta, partitionIndex);
-            if (btree != null) {
-              final pointers = await btree.search(key);
-              return IndexSearchResult(pointersByPartition: {
-                if (pointers.isNotEmpty)
-                  partitionIndex: pointers.map((p) => p.toString()).toList()
-              });
-            }
-          }
-          // If key is not in a known partition range, fall through to full scan.
-        }
-
-        // 2b. Fallback to searching partition by partition without caching
-        final tasks =
-            <Future<MapEntry<int, List<dynamic>>> Function()>[];
-        for (final partition in meta.partitions) {
-          tasks.add(() async {
-            try {
-              final partitionPath = await _dataStore.pathManager
-                  .getIndexPartitionPath(tableName, indexName, partition.index);
-              if (!await _dataStore.storage.existsFile(partitionPath)) {
-                return MapEntry(partition.index, []);
-              }
-              final content =
-                  await _dataStore.storage.readAsString(partitionPath);
-              if (content == null || content.isEmpty) {
-                return MapEntry(partition.index, []);
-              }
-              // Use ComputeManager to run parsing and searching in an isolate
-              final request = SearchTaskRequest(
-                  content: content, key: key, isUnique: meta.isUnique);
-
-              final results = await ComputeManager.run(
-                searchIndexPartitionTask,
-                request,
-                useIsolate: content.length >
-                    1024 * 10, // Use isolate for content > 10KB
-              );
-              return MapEntry(partition.index, results);
-            } catch (e) {
-              Logger.error(
-                  'Failed to search index partition ${partition.index}: $e',
-                  label: 'IndexManager.searchIndex');
-              return MapEntry(partition.index, []);
-            }
+      bool addResults(Map<int, List<String>> pointers) {
+        if (pointers.isNotEmpty) {
+          pointers.forEach((partitionId, pointerList) {
+            allPointersByPartition
+                .putIfAbsent(partitionId, () => [])
+                .addAll(pointerList);
+            totalFound += pointerList.length;
           });
         }
-
-        final resultsFromPartitions =
-            await ParallelProcessor.execute<MapEntry<int, List<dynamic>>>(
-                tasks,
-                label: 'IndexManager.searchIndex');
-
-        final Map<int, List<String>> allResults = {};
-        for (final partitionResult in resultsFromPartitions) {
-          if (partitionResult != null && partitionResult.value.isNotEmpty) {
-            final partitionId = partitionResult.key;
-            final pointers = partitionResult.value;
-            allResults[partitionId] =
-                pointers.map((p) => p.toString()).toList();
-          }
-        }
-        return IndexSearchResult(pointersByPartition: allResults);
+        return limit != null && totalFound >= limit;
       }
-    } catch (e) {
-      Logger.error('Failed to search index $tableName.$indexName: $e',
+
+      if (condition.operator == '=' && meta.isOrdered == true) {
+        final partitionIndex = meta.findPartitionForKey(startValue);
+        if (partitionIndex != -1) {
+          final btree = await _loadSelectiveIndex(
+              tableName, indexName, meta, partitionIndex);
+          if (btree != null) {
+            final pointers = await performBTreeSearchAndGroup(btree);
+            addResults(pointers);
+          }
+          return IndexSearchResult(pointersByPartition: allPointersByPartition);
+        }
+      }
+
+      List<int> partitionIndices;
+      if (meta.isOrdered == true &&
+          ['>', '>=', '<', '<=', 'between'].contains(condition.operator)) {
+        partitionIndices = await findPartitionsForKeyRange(
+            tableName, indexName, startValue, endValue);
+      } else {
+        partitionIndices = meta.partitions.map((p) => p.index).toList();
+      }
+
+      for (final partitionIndex in partitionIndices) {
+        final btree = await _loadSelectiveIndex(
+            tableName, indexName, meta, partitionIndex);
+        if (btree == null) continue;
+
+        final pointers = await performBTreeSearchAndGroup(btree);
+        if (addResults(pointers)) {
+          break; // Limit reached
+        }
+      }
+
+      return IndexSearchResult(pointersByPartition: allPointersByPartition);
+    } catch (e, stack) {
+      Logger.error('Failed to search index $tableName.$indexName: $e\n$stack',
           label: 'IndexManager.searchIndex');
       return IndexSearchResult.tableScan();
     }
@@ -3978,8 +4044,15 @@ class IndexManager {
           _indexFullyCached[cacheKey] == true) {
         _updateIndexAccessWeight(cacheKey);
         final btree = _indexCache[cacheKey]!;
+        final tableSchema = await _dataStore.getTableSchema(tableName);
+        final isPk = indexName == 'pk_$tableName';
+        final pkType = tableSchema?.primaryKeyConfig.type;
+        final comparator = isPk && pkType != null
+            ? ValueComparator.getPrimaryKeyComparator(pkType)
+            : ValueComparator.compare;
+
         for (final key in keys) {
-          final results = await btree.search(key);
+          final results = await btree.search(key, comparator: comparator);
           if (results.isNotEmpty) {
             allResults[key] = results;
           }
@@ -3991,6 +4064,9 @@ class IndexManager {
       if (meta == null) {
         return allResults; // No index, no results.
       }
+
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      final isPk = indexName == 'pk_$tableName';
 
       // Group keys by the partition they should reside in.
       final Map<int, List<dynamic>> partitionJobs = {};
@@ -4040,10 +4116,18 @@ class IndexManager {
               return BatchSearchTaskResult(found: {});
             }
 
+            DataType? dataType;
+            if (tableSchema != null && !isPk && meta.fields.isNotEmpty) {
+              final fieldSchema = tableSchema.fields
+                  .firstWhere((f) => f.name == meta.fields.first);
+              dataType = fieldSchema.type;
+            }
+
             final request = BatchSearchTaskRequest(
               content: content,
               keys: keysForPartition,
               isUnique: meta.isUnique,
+              keyType: dataType,
             );
 
             return await ComputeManager.run(
@@ -4094,4 +4178,3 @@ class _UniqueConstraint {
     required this.indexName,
   });
 }
-

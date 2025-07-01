@@ -2,6 +2,7 @@ import '../core/table_data_manager.dart';
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
+import '../model/index_search.dart';
 import '../model/store_index.dart';
 import '../model/file_info.dart';
 import '../model/join_clause.dart';
@@ -1290,9 +1291,12 @@ class QueryExecutor {
         return _performTableScan(tableName, queryCondition);
       }
 
+      // Convert the raw map condition to a structured IndexCondition
+      final indexCondition = IndexCondition.fromMap(conditions);
+
       // use searchIndex to get pointers
       final indexResults =
-          await _indexManager.searchIndex(tableName, actualIndexName, searchValue);
+          await _indexManager.searchIndex(tableName, actualIndexName, indexCondition);
 
       if (indexResults.requiresTableScan) {
         return _performTableScan(tableName, queryCondition);
