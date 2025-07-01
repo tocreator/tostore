@@ -3856,21 +3856,26 @@ class IndexManager {
       }
 
       // 1. Metadata, Schema, and Comparator setup
-      final meta = await _getIndexMeta(tableName, indexName);
+      IndexMeta? meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) {
         final tableSchemaOnDemand = await _dataStore.getTableSchema(tableName);
         if (tableSchemaOnDemand != null &&
             tableSchemaOnDemand.fields.isNotEmpty) {
           await _checkAndRebuildTableIndexes(tableName, tableSchemaOnDemand);
-          return searchIndex(tableName, indexName, condition, limit: limit);
+          meta = await _getIndexMeta(tableName, indexName); // Try again
+          if (meta == null) {
+            // If still not found after rebuild, fallback to table scan
+            return IndexSearchResult.tableScan();
+          }
+        } else {
+          return IndexSearchResult.tableScan();
         }
-        return IndexSearchResult.tableScan();
       }
 
       final tableSchema = await _dataStore.getTableSchema(tableName);
       if (tableSchema == null) return IndexSearchResult.tableScan();
 
-      ComparatorFunction comparator;
+      ComparatorFunction comparator = ValueComparator.compare;
       dynamic startValue = condition.value;
       dynamic endValue = condition.endValue;
 
@@ -3885,7 +3890,7 @@ class IndexManager {
         comparator = ValueComparator.compare; // Default
         if (meta.fields.length == 1) {
           final fieldSchema = tableSchema.fields
-              .firstWhere((f) => f.name == meta.fields.first, orElse: null);
+              .firstWhere((f) => f.name == meta?.fields.first);
           comparator = ValueComparator.getFieldComparator(fieldSchema.type);
           startValue = fieldSchema.convertValue(condition.value);
           endValue = fieldSchema.convertValue(condition.endValue);
@@ -3968,7 +3973,8 @@ class IndexManager {
         _indexFullyCached[cacheKey] = true;
         _indexSizeCache[cacheKey] = _estimateIndexSize(btree);
         _currentIndexCacheSize += _indexSizeCache[cacheKey] ?? 0;
-        return searchIndex(tableName, indexName, condition, limit: limit);
+        final pointers = await performBTreeSearchAndGroup(btree);
+        return IndexSearchResult(pointersByPartition: pointers);
       }
 
       // 4. Partition-by-partition search
@@ -4001,11 +4007,33 @@ class IndexManager {
       }
 
       List<int> partitionIndices;
-      if (meta.isOrdered == true &&
-          ['>', '>=', '<', '<=', 'between'].contains(condition.operator)) {
-        partitionIndices = await findPartitionsForKeyRange(
-            tableName, indexName, startValue, endValue);
+      bool isPrefixSearch = condition.operator == 'like' &&
+          condition.value is String &&
+          condition.value.endsWith('%') &&
+          !condition.value.startsWith('%');
+
+      if (meta.isOrdered == true) {
+        if (condition.operator == '=') {
+          // Optimization for equality check on an ordered index
+          final partitionIndex = meta.findPartitionForKey(startValue);
+          partitionIndices = partitionIndex != -1 ? [partitionIndex] : [];
+        } else if (isPrefixSearch) {
+          // Optimization for "like 'prefix%'" on an ordered index
+          final prefix =
+              condition.value.substring(0, condition.value.length - 1);
+          partitionIndices = await findPartitionsForKeyRange(
+              tableName, indexName, prefix, '$prefix\uffff');
+        } else if (['>', '>=', '<', '<=', 'between']
+            .contains(condition.operator)) {
+          // Optimization for range queries on an ordered index
+          partitionIndices = await findPartitionsForKeyRange(
+              tableName, indexName, startValue, endValue);
+        } else {
+          // Fallback for other operators on an ordered index (e.g., like '%value%')
+          partitionIndices = meta.partitions.map((p) => p.index).toList();
+        }
       } else {
+        // For non-ordered indexes, we must scan all partitions
         partitionIndices = meta.partitions.map((p) => p.index).toList();
       }
 
