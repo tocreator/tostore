@@ -3844,7 +3844,7 @@ class IndexManager {
             tableName, indexName, condition.value as List);
         final allPointers = results.values.expand((p) => p).toList();
         final Map<int, List<String>> grouped = {};
-        
+
         // Add async yield to avoid UI jank
         int processedCount = 0;
         for (final pointer in allPointers) {
@@ -3854,7 +3854,7 @@ class IndexManager {
                 .putIfAbsent(storeIndex.partitionId, () => [])
                 .add(pointer.toString());
           }
-          
+
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
           if (processedCount % 500 == 0) {
@@ -3937,7 +3937,7 @@ class IndexManager {
 
                 if (pointers.isNotEmpty) {
                   final filtered = <dynamic>[];
-                  
+
                   // Add async yield to avoid UI jank
                   int processedCount = 0;
                   for (final pointer in pointers) {
@@ -3946,7 +3946,7 @@ class IndexManager {
                     if (storeIndex != null) {
                       filtered.add(pointer);
                     }
-                    
+
                     // Yield to the event loop to prevent UI jank if there are many indexes.
                     processedCount++;
                     if (processedCount % 500 == 0) {
@@ -3962,7 +3962,7 @@ class IndexManager {
             break;
         }
         final Map<int, List<String>> grouped = {};
-        
+
         // Add async yield to avoid UI jank
         int processedCount = 0;
         for (final pointer in pointers) {
@@ -3972,7 +3972,7 @@ class IndexManager {
                 .putIfAbsent(storeIndex.partitionId, () => [])
                 .add(pointer.toString());
           }
-          
+
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
           if (processedCount % 500 == 0) {
@@ -4068,7 +4068,7 @@ class IndexManager {
         if (addResults(pointers)) {
           break; // Limit reached
         }
-        
+
         // Yield to the event loop to prevent UI jank if there are many indexes.
         if (i % 5 == 4) {
           await Future.delayed(Duration.zero);
@@ -4113,7 +4113,7 @@ class IndexManager {
           if (results.isNotEmpty) {
             allResults[key] = results;
           }
-          
+
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
           if (processedCount % 20 == 0) {
@@ -4144,7 +4144,7 @@ class IndexManager {
             partitionJobs.putIfAbsent(partitionIndex, () => []).add(key);
           }
           // Note: If key is out of range, it won't be found. This is expected.
-          
+
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
           if (processedCount % 20 == 0) {
@@ -4216,7 +4216,7 @@ class IndexManager {
             return BatchSearchTaskResult(found: {});
           }
         });
-        
+
         // Yield to the event loop to prevent UI jank if there are many indexes.
         jobCount++;
         if (jobCount % 10 == 0) {
@@ -4236,7 +4236,7 @@ class IndexManager {
           result.found.forEach((key, value) {
             allResults.putIfAbsent(key, () => []).addAll(value);
           });
-          
+
           // Yield to the event loop to prevent UI jank if there are many indexes.
           resultCount++;
           if (resultCount % 10 == 0) {

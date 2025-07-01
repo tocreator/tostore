@@ -915,15 +915,26 @@ class BPlusTree {
   /// Safe key comparison method
   int _compareKeys(dynamic key1, dynamic key2,
       {ComparatorFunction? comparator}) {
-    if (comparator != null) {
-      try {
-        return comparator(key1, key2);
-      } catch (e) {
-        // Fallback to generic comparison if the specific one fails
-        return ValueComparator.compare(key1, key2);
-      }
+    // Handle null cases
+    if (key1 == null && key2 == null) return 0;
+    if (key1 == null) return -1;
+    if (key2 == null) return 1;
+
+    // Compare same types
+    if (key1 is num && key2 is num) {
+      return key1.compareTo(key2);
     }
-    return ValueComparator.compare(key1, key2);
+
+    if (key1 is String && key2 is String) {
+      return key1.compareTo(key2);
+    }
+
+    if (key1 is DateTime && key2 is DateTime) {
+      return key1.compareTo(key2);
+    }
+
+    // Convert different types to string for comparison
+    return key1.toString().compareTo(key2.toString());
   }
 
   /// Search for values corresponding to the specified key
@@ -1079,17 +1090,19 @@ class BPlusTree {
     while (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
         final key = node.keys[i];
-        
+
         // Check lower and upper bounds
-        bool passesLowerBound = !hasLowerBound || // If no lower bound, default to pass
-            (includeStart 
-                ? _compareKeys(key, start, comparator: comparator) >= 0
-                : _compareKeys(key, start, comparator: comparator) > 0);
-                
-        bool passesUpperBound = !hasUpperBound || // If no upper bound, default to pass
-            (includeEnd
-                ? _compareKeys(key, end, comparator: comparator) <= 0
-                : _compareKeys(key, end, comparator: comparator) < 0);
+        bool passesLowerBound =
+            !hasLowerBound || // If no lower bound, default to pass
+                (includeStart
+                    ? _compareKeys(key, start, comparator: comparator) >= 0
+                    : _compareKeys(key, start, comparator: comparator) > 0);
+
+        bool passesUpperBound =
+            !hasUpperBound || // If no upper bound, default to pass
+                (includeEnd
+                    ? _compareKeys(key, end, comparator: comparator) <= 0
+                    : _compareKeys(key, end, comparator: comparator) < 0);
 
         // Only add results when both lower and upper bounds are satisfied
         if (passesLowerBound && passesUpperBound && i < node.values.length) {
@@ -1097,7 +1110,8 @@ class BPlusTree {
         }
 
         // If the upper bound is exceeded, stop searching early
-        if (hasUpperBound && _compareKeys(key, end, comparator: comparator) > 0) {
+        if (hasUpperBound &&
+            _compareKeys(key, end, comparator: comparator) > 0) {
           return results;
         }
       }
