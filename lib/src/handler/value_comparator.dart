@@ -395,6 +395,8 @@ class ValueComparator {
     switch (type) {
       case DataType.integer:
         return (a, b) => (a as int).compareTo(b as int);
+      case DataType.bigInt:
+        return (a, b) => (a as BigInt).compareTo(b as BigInt);
       case DataType.double:
         return (a, b) => (a as double).compareTo(b as double);
       case DataType.text:
@@ -411,9 +413,15 @@ class ValueComparator {
       case DataType.blob:
         // For blobs, fall back to a generic comparison as direct comparison is not meaningful
         return compare;
-      case null:
+      case DataType.array:
+        // For array type, compare as strings for now
+        return (a, b) => compare(a.toString(), b.toString());
+      case DataType.vector:
+        // For vector data, use generic comparison
+        return compare;
       default:
-        // If type is not specified, use the general-purpose but slower comparison method.
+        // If type is not specified or for any future types, 
+        // use the general-purpose but slower comparison method.
         return compare;
     }
   }
