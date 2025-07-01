@@ -1050,13 +1050,20 @@ class BPlusTree {
     final results = <dynamic>[];
     if (root == null) return results;
 
+    // Handle null values
+    bool hasLowerBound = start != null;
+    bool hasUpperBound = end != null;
+
     // Find starting leaf node
     BPlusTreeNode? node = root;
     while (node != null && !node.isLeaf) {
       int i = 0;
-      while (i < node.keys.length &&
-          _compareKeys(start, node.keys[i], comparator: comparator) >= 0) {
-        i++;
+      // If no lower bound, start from the leftmost node
+      if (hasLowerBound) {
+        while (i < node.keys.length &&
+            _compareKeys(start, node.keys[i], comparator: comparator) >= 0) {
+          i++;
+        }
       }
 
       // Safety check
@@ -1072,19 +1079,25 @@ class BPlusTree {
     while (node != null) {
       for (int i = 0; i < node.keys.length; i++) {
         final key = node.keys[i];
-        final startCompare = _compareKeys(key, start, comparator: comparator);
-        final endCompare = _compareKeys(key, end, comparator: comparator);
+        
+        // Check lower and upper bounds
+        bool passesLowerBound = !hasLowerBound || // If no lower bound, default to pass
+            (includeStart 
+                ? _compareKeys(key, start, comparator: comparator) >= 0
+                : _compareKeys(key, start, comparator: comparator) > 0);
+                
+        bool passesUpperBound = !hasUpperBound || // If no upper bound, default to pass
+            (includeEnd
+                ? _compareKeys(key, end, comparator: comparator) <= 0
+                : _compareKeys(key, end, comparator: comparator) < 0);
 
-        // Check if key is in range (considering include/exclude boundaries)
-        final inRange = (includeStart ? startCompare >= 0 : startCompare > 0) &&
-            (includeEnd ? endCompare <= 0 : endCompare < 0);
-
-        if (inRange && i < node.values.length) {
+        // Only add results when both lower and upper bounds are satisfied
+        if (passesLowerBound && passesUpperBound && i < node.values.length) {
           results.addAll(node.values[i]);
         }
 
-        // If exceeded upper range limit, stop searching
-        if (endCompare > 0) {
+        // If the upper bound is exceeded, stop searching early
+        if (hasUpperBound && _compareKeys(key, end, comparator: comparator) > 0) {
           return results;
         }
       }

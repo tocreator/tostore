@@ -9,6 +9,7 @@ import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'dart:convert';
 import 'memory_manager.dart';
+import '../handler/value_comparator.dart';
 
 /// Data cache manager
 class DataCacheManager {
@@ -1136,7 +1137,7 @@ class DataCacheManager {
       final recordCache = cache.recordsMap[key];
       if (recordCache == null) continue;
       final record = recordCache.record;
-      if (record[fieldName] == fieldValue) {
+      if (ValueComparator.compare(record[fieldName], fieldValue) == 0) {
         result.add(Map<String, dynamic>.from(record));
         recordCache.recordAccess();
       }

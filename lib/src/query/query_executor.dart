@@ -828,7 +828,7 @@ class QueryExecutor {
 
                   // If exact primary key match is found, stop all partition processing
                   if (exactPkMatch != null &&
-                      record[primaryKey] == exactPkMatch) {
+                      ValueComparator.compare(record[primaryKey], exactPkMatch) == 0) {
                     controller.stop();
                     return records;
                   }
@@ -1173,8 +1173,8 @@ class QueryExecutor {
             // Skip deleted records
             if (isDeletedRecord(record)) continue;
 
-            // Primary key exact match
-            if (record[primaryKey] == pkValue) {
+            //  Primary key exact match
+            if (ValueComparator.compare(record[primaryKey], pkValue) == 0) {
               // If the record satisfies all query conditions
               if (queryCondition == null || queryCondition.matches(record)) {
                 resultMap[record[primaryKey].toString()] = record;
@@ -1269,7 +1269,8 @@ class QueryExecutor {
         // normal index need to find from schema.indexes
         final indexSchema = schema.indexes.firstWhere(
           (idx) => idx.actualIndexName == indexName,
-          orElse: () => throw Exception('Index $indexName not found in schema for table $tableName'),
+          orElse: () => throw Exception(
+              'Index $indexName not found in schema for table $tableName'),
         );
         actualIndexName = indexSchema.actualIndexName;
       }
@@ -1297,13 +1298,13 @@ class QueryExecutor {
       if (indexConditionValue is Map<String, dynamic>) {
         indexCondition = IndexCondition.fromMap(indexConditionValue);
       } else {
-        // Fallback for simple equality like { "id": 123 }, convert to { "=": 123 }
+        // Fallback for simple equality like
         indexCondition = IndexCondition.fromMap({'=': indexConditionValue});
       }
 
       // use searchIndex to get pointers
-      final indexResults =
-          await _indexManager.searchIndex(tableName, actualIndexName, indexCondition);
+      final indexResults = await _indexManager.searchIndex(
+          tableName, actualIndexName, indexCondition);
 
       if (indexResults.requiresTableScan) {
         return _performTableScan(tableName, queryCondition);

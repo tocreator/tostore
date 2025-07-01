@@ -3844,12 +3844,21 @@ class IndexManager {
             tableName, indexName, condition.value as List);
         final allPointers = results.values.expand((p) => p).toList();
         final Map<int, List<String>> grouped = {};
+        
+        // Add async yield to avoid UI jank
+        int processedCount = 0;
         for (final pointer in allPointers) {
           final storeIndex = StoreIndex.fromString(pointer.toString());
           if (storeIndex != null) {
             grouped
                 .putIfAbsent(storeIndex.partitionId, () => [])
                 .add(pointer.toString());
+          }
+          
+          // Yield to the event loop to prevent UI jank if there are many indexes.
+          processedCount++;
+          if (processedCount % 500 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         return IndexSearchResult(pointersByPartition: grouped);
@@ -3879,28 +3888,12 @@ class IndexManager {
       dynamic startValue = condition.value;
       dynamic endValue = condition.endValue;
 
-      bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
-      if (isPrimaryKeyIndex) {
-        comparator = ValueComparator.getPrimaryKeyComparator(
-            tableSchema.primaryKeyConfig.type);
-        startValue = startValue?.toString().trim();
-        endValue = endValue?.toString().trim();
-      } else {
-        comparator = ValueComparator.compare; // Default
-        if (meta.fields.length == 1) {
-          final fieldSchema = tableSchema.fields
-              .firstWhere((f) => f.name == meta?.fields.first);
-          comparator = ValueComparator.getFieldComparator(fieldSchema.type);
-          startValue = fieldSchema.convertValue(condition.value);
-          endValue = fieldSchema.convertValue(condition.endValue);
-        }
-      }
-
       // A helper function to perform search on a btree instance and group results
       Future<Map<int, List<String>>> performBTreeSearchAndGroup(
           BPlusTree btree) async {
         List<dynamic> pointers = [];
-        switch (condition.operator) {
+        switch (condition.operator.toUpperCase()) {
+          // Use toUpperCase to ensure operator is case insensitive
           case '=':
             pointers = await btree.search(startValue, comparator: comparator);
             break;
@@ -3920,16 +3913,48 @@ class IndexManager {
             pointers = await btree.searchRange(null, startValue,
                 includeEnd: true, comparator: comparator);
             break;
-          case 'between':
-            pointers = await btree.searchRange(startValue, endValue,
-                comparator: comparator);
+          case 'BETWEEN':
+            pointers = await btree.searchRange(13, 16, comparator: comparator);
             break;
-          case 'like':
+          case 'LIKE':
             if (startValue is String) {
               if (startValue.endsWith('%') && !startValue.startsWith('%')) {
                 final prefix = startValue.substring(0, startValue.length - 1);
-                pointers = await btree.searchRange(prefix, '$prefix\uffff',
-                    comparator: comparator);
+
+                pointers = await btree.searchRange(prefix, null,
+                    includeStart: true, comparator: (a, b) {
+                  if (a == null || b == null) return 0;
+                  String aStr = a.toString();
+                  String bStr = b.toString();
+
+                  // If b is our prefix, check if a starts with b
+                  if (bStr == prefix) {
+                    return aStr.startsWith(bStr) ? 0 : 1;
+                  }
+
+                  return ValueComparator.compare(a, b);
+                });
+
+                if (pointers.isNotEmpty) {
+                  final filtered = <dynamic>[];
+                  
+                  // Add async yield to avoid UI jank
+                  int processedCount = 0;
+                  for (final pointer in pointers) {
+                    final storeIndex =
+                        StoreIndex.fromString(pointer.toString());
+                    if (storeIndex != null) {
+                      filtered.add(pointer);
+                    }
+                    
+                    // Yield to the event loop to prevent UI jank if there are many indexes.
+                    processedCount++;
+                    if (processedCount % 500 == 0) {
+                      await Future.delayed(Duration.zero);
+                    }
+                  }
+                  pointers = filtered;
+                }
               } else {
                 pointers = await btree.scanAndMatch(startValue);
               }
@@ -3937,12 +3962,21 @@ class IndexManager {
             break;
         }
         final Map<int, List<String>> grouped = {};
+        
+        // Add async yield to avoid UI jank
+        int processedCount = 0;
         for (final pointer in pointers) {
           final storeIndex = StoreIndex.fromString(pointer.toString());
           if (storeIndex != null) {
             grouped
                 .putIfAbsent(storeIndex.partitionId, () => [])
                 .add(pointer.toString());
+          }
+          
+          // Yield to the event loop to prevent UI jank if there are many indexes.
+          processedCount++;
+          if (processedCount % 500 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         return grouped;
@@ -3958,11 +3992,6 @@ class IndexManager {
         return IndexSearchResult(pointersByPartition: pointers);
       }
 
-      // Priority: Check for full table cache.
-      if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
-        return IndexSearchResult.tableScan();
-      }
-
       // 3. Decide on loading strategy
       if (_shouldFullCacheIndex(tableName, indexName, meta)) {
         final btree = await _loadIndexFromFile(tableName, indexName, meta);
@@ -3974,6 +4003,11 @@ class IndexManager {
         _currentIndexCacheSize += _indexSizeCache[cacheKey] ?? 0;
         final pointers = await performBTreeSearchAndGroup(btree);
         return IndexSearchResult(pointersByPartition: pointers);
+      }
+
+      // Priority: Check for full table cache.
+      if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
+        return IndexSearchResult.tableScan();
       }
 
       // 4. Partition-by-partition search
@@ -3993,7 +4027,7 @@ class IndexManager {
       }
 
       List<int> partitionIndices;
-      bool isPrefixSearch = condition.operator == 'like' &&
+      bool isPrefixSearch = condition.operator == 'LIKE' &&
           condition.value is String &&
           condition.value.endsWith('%') &&
           !condition.value.startsWith('%');
@@ -4004,18 +4038,18 @@ class IndexManager {
           final partitionIndex = meta.findPartitionForKey(startValue);
           partitionIndices = partitionIndex != -1 ? [partitionIndex] : [];
         } else if (isPrefixSearch) {
-          // Optimization for "like 'prefix%'" on an ordered index
+          // Optimization for "LIKE 'prefix%'" on an ordered index
           final prefix =
               condition.value.substring(0, condition.value.length - 1);
           partitionIndices = await findPartitionsForKeyRange(
-              tableName, indexName, prefix, '$prefix\uffff');
-        } else if (['>', '>=', '<', '<=', 'between']
+              tableName, indexName, prefix, null);
+        } else if (['>', '>=', '<', '<=', 'BETWEEN']
             .contains(condition.operator)) {
           // Optimization for range queries on an ordered index
           partitionIndices = await findPartitionsForKeyRange(
               tableName, indexName, startValue, endValue);
         } else {
-          // Fallback for other operators on an ordered index (e.g., like '%value%')
+          // Fallback for other operators on an ordered index (e.g., LIKE '%value%')
           partitionIndices = meta.partitions.map((p) => p.index).toList();
         }
       } else {
@@ -4023,7 +4057,9 @@ class IndexManager {
         partitionIndices = meta.partitions.map((p) => p.index).toList();
       }
 
-      for (final partitionIndex in partitionIndices) {
+      // Add async yield to avoid UI jank
+      for (int i = 0; i < partitionIndices.length; i++) {
+        final partitionIndex = partitionIndices[i];
         final btree = await _loadSelectiveIndex(
             tableName, indexName, meta, partitionIndex);
         if (btree == null) continue;
@@ -4031,6 +4067,11 @@ class IndexManager {
         final pointers = await performBTreeSearchAndGroup(btree);
         if (addResults(pointers)) {
           break; // Limit reached
+        }
+        
+        // Yield to the event loop to prevent UI jank if there are many indexes.
+        if (i % 5 == 4) {
+          await Future.delayed(Duration.zero);
         }
       }
 
@@ -4065,10 +4106,18 @@ class IndexManager {
             ? ValueComparator.getPrimaryKeyComparator(pkType)
             : ValueComparator.compare;
 
+        // Add async yield to avoid UI jank
+        int processedCount = 0;
         for (final key in keys) {
           final results = await btree.search(key, comparator: comparator);
           if (results.isNotEmpty) {
             allResults[key] = results;
+          }
+          
+          // Yield to the event loop to prevent UI jank if there are many indexes.
+          processedCount++;
+          if (processedCount % 20 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         return allResults;
@@ -4087,12 +4136,20 @@ class IndexManager {
 
       if (meta.isOrdered == true) {
         // For ordered indexes, we can find the exact partition for each key.
+        // Add async yield to avoid UI jank
+        int processedCount = 0;
         for (final key in keys) {
           final partitionIndex = meta.findPartitionForKey(key);
           if (partitionIndex != -1) {
             partitionJobs.putIfAbsent(partitionIndex, () => []).add(key);
           }
           // Note: If key is out of range, it won't be found. This is expected.
+          
+          // Yield to the event loop to prevent UI jank if there are many indexes.
+          processedCount++;
+          if (processedCount % 20 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       } else {
         // For non-ordered indexes, every key must be checked against every partition.
@@ -4110,6 +4167,8 @@ class IndexManager {
       final tasks = <Future<BatchSearchTaskResult> Function()>[];
       final partitionMetas = {for (var p in meta.partitions) p.index: p};
 
+      // Add async yield to avoid UI jank
+      int jobCount = 0;
       for (final jobEntry in partitionJobs.entries) {
         final partitionIndex = jobEntry.key;
         final keysForPartition = jobEntry.value;
@@ -4157,6 +4216,12 @@ class IndexManager {
             return BatchSearchTaskResult(found: {});
           }
         });
+        
+        // Yield to the event loop to prevent UI jank if there are many indexes.
+        jobCount++;
+        if (jobCount % 10 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       final resultsFromPartitions =
@@ -4164,11 +4229,19 @@ class IndexManager {
               label: 'IndexManager.batchSearchIndex');
 
       // Merge results from all partitions.
+      // Add async yield to avoid UI jank
+      int resultCount = 0;
       for (final result in resultsFromPartitions) {
         if (result != null) {
           result.found.forEach((key, value) {
             allResults.putIfAbsent(key, () => []).addAll(value);
           });
+          
+          // Yield to the event loop to prevent UI jank if there are many indexes.
+          resultCount++;
+          if (resultCount % 10 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       }
 

@@ -3522,7 +3522,7 @@ class TableDataManager {
           // After current batch is processed, yield execution thread for 1ms to avoid blocking UI
           if (_deleteBuffer.containsKey(tableName) &&
               !(_deleteBuffer[tableName]?.isEmpty ?? true)) {
-            await Future.delayed(const Duration(milliseconds: 1));
+            await Future.delayed(Duration.zero);
           }
         } catch (e) {
           Logger.error('Failed to process delete data for table $tableName: $e',
@@ -3613,7 +3613,9 @@ class TableDataManager {
           offset += batch.length;
 
           // Yield to the event loop after processing each batch to keep the UI responsive.
-          await Future.delayed(Duration.zero);
+          if (i + indexBatchSize < recordsForIndex.length) {
+            await Future.delayed(Duration.zero);
+          }
         }
       }
     } catch (e) {
@@ -3637,8 +3639,8 @@ class TableDataManager {
     return deleteQueue.keys.toSet();
   }
 
-  Future<List<Map<String, dynamic>>> getRecordsByPointers(String tableName,
-      int partitionId, List<StoreIndex> pointers) async {
+  Future<List<Map<String, dynamic>>> getRecordsByPointers(
+      String tableName, int partitionId, List<StoreIndex> pointers) async {
     if (pointers.isEmpty) return [];
 
     try {
@@ -3646,7 +3648,7 @@ class TableDataManager {
       if (schema == null) return [];
       final primaryKey = schema.primaryKey;
       final isGlobal = schema.isGlobal;
-      
+
       // Use the existing, reliable method to read all records from the partition.
       final allRecordsInPartition = await readRecordsFromPartition(
           tableName, isGlobal, partitionId, primaryKey);
@@ -3667,7 +3669,6 @@ class TableDataManager {
 
       // filter out deleted records
       results = results.where((record) => !isDeletedRecord(record)).toList();
-      
 
       return results;
     } catch (e) {
