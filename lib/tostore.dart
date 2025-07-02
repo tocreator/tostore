@@ -23,6 +23,7 @@ export 'src/model/query_result.dart';
 export 'src/model/migration_task.dart';
 export 'src/model/result_type.dart';
 export 'src/query/query_condition.dart';
+export 'src/handler/logger.dart' show LogType;
 
 import 'src/chain/delete_builder.dart';
 import 'src/chain/update_builder.dart';

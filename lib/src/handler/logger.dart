@@ -50,6 +50,7 @@ class Logger {
         ? "log-info"
         : "log-info  $label";
     _log(text, label: label);
+    _handler(text, LogType.info, label);
   }
 
   /// print debug log
@@ -63,6 +64,7 @@ class Logger {
         ? "log-debug"
         : "log-debug  $label";
     _log(text, label: label);
+    _handler(text, LogType.debug, label);
   }
 
   /// print warn log
@@ -95,7 +97,7 @@ class Logger {
 
   /// unified log handler
   static void _handler(String message, LogType type, String label) {
-    if (!kDebugMode && LogConfig.enableLog) {
+    if (LogConfig.enableLog) {
       if (_onLogHandler != null) {
         _onLogHandler!(message, type, label);
       } else if (LogConfig.onLogHandler != null) {

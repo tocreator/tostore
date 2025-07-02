@@ -13,7 +13,6 @@ import '../model/file_info.dart';
 import '../model/global_config.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
-import '../model/buffer_entry.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -305,19 +304,20 @@ class DataStoreImpl {
         await close();
       }
 
-      dbPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
+      // First, set up the configuration so that logging is enabled immediately.
+      // This ensures that any errors during path resolution are also captured.
+      _config = config ?? DataStoreConfig();
 
-      if (config == null) {
-        _config = DataStoreConfig(dbPath: dbPath);
-      } else {
-        _config = config.copyWith(dbPath: dbPath);
-      }
-
-      // Apply log configuration
+      // Apply log configuration as early as possible.
       LogConfig.setConfig(
         enableLog: _config!.enableLog,
         logLevel: _config!.logLevel,
       );
+
+      dbPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
+
+      // Now, update the config with the final path.
+      _config = _config!.copyWith(dbPath: dbPath);
 
       // Configure the global parallel processor with sensible defaults
       ParallelProcessor.setConfig(
@@ -347,27 +347,19 @@ class DataStoreImpl {
         _memoryManager!.initialize(_config!, this),
       ]);
 
-      // Initialize key components in parallel
-      final initTasks = <Future<void>>[
-        Future(() async {
-          _keyManager = KeyManager(this);
-          await _keyManager!.initialize();
-        }),
-        Future(() {
-          directoryManager = DirectoryManager(this);
-          _transactionManager = TransactionManager(this);
-          _indexManager = IndexManager(this);
-          _tableDataManager = TableDataManager(this);
-          migrationManager = MigrationManager(this);
-          _integrityChecker = IntegrityChecker(this);
-          _queryOptimizer = QueryOptimizer(this);
-          _queryExecutor = QueryExecutor(this, _indexManager!);
-          dataCacheManager = DataCacheManager(this);
-        })
-      ];
+      // Initialize key components sequentially to avoid race conditions during the first run.
+      _keyManager = KeyManager(this);
+      await _keyManager!.initialize();
 
-      // Wait for all initialization tasks to complete
-      await Future.wait(initTasks);
+      directoryManager = DirectoryManager(this);
+      _transactionManager = TransactionManager(this);
+      _indexManager = IndexManager(this);
+      _tableDataManager = TableDataManager(this);
+      migrationManager = MigrationManager(this);
+      _integrityChecker = IntegrityChecker(this);
+      _queryOptimizer = QueryOptimizer(this);
+      _queryExecutor = QueryExecutor(this, _indexManager!);
+      dataCacheManager = DataCacheManager(this);
 
       _baseInitialized = true;
 
@@ -404,7 +396,7 @@ class DataStoreImpl {
       }
       Logger.error('Database initialization failed: $e\n$stack',
           label: 'DataStore.initialize');
-      rethrow;
+      return false;
     } finally {
       _initializing = false;
     }
@@ -1792,158 +1784,136 @@ class DataStoreImpl {
       final primaryKey = schema.primaryKey;
       final validRecords = <Map<String, dynamic>>[];
       final invalidRecords = <Map<String, dynamic>>[];
+      final List<String> successKeys = [];
+      final List<String> failedKeys = [];
 
-      for (var record in records) {
-        final validData =
-            await _validateAndProcessData(schema, record, tableName);
-        if (validData != null) {
-          validRecords.add(validData);
-        } else {
-          invalidRecords.add(record);
+      // Begin a single transaction for the entire batch
+      final transaction = await _transactionManager!.beginTransaction();
+
+      try {
+        // Process records in smaller batches to maintain memory efficiency
+        const int batchSize = 1000;
+
+        for (int i = 0; i < records.length; i += batchSize) {
+          final int end =
+              (i + batchSize < records.length) ? i + batchSize : records.length;
+          final currentBatch = records.sublist(i, end);
+
+          // Process each record in the current batch
+          for (var record in currentBatch) {
+            try {
+              // Validate and process data
+              final validData =
+                  await _validateAndProcessData(schema, record, tableName);
+              if (validData == null) {
+                invalidRecords.add(record);
+                final failedKey = record[primaryKey]?.toString() ?? '';
+                if (failedKey.isNotEmpty) {
+                  failedKeys.add(failedKey);
+                }
+                continue;
+              }
+
+              // Check unique constraints
+              if (await _indexManager?.checkUniqueConstraints(
+                      tableName, validData) ==
+                  false) {
+                invalidRecords.add(record);
+                final failedKey = validData[primaryKey]?.toString() ?? '';
+                if (failedKey.isNotEmpty) {
+                  failedKeys.add(failedKey);
+                }
+                continue;
+              }
+
+              // Add to valid records
+              validRecords.add(validData);
+
+              // Add to cache and write buffer (like the insert method does)
+              dataCacheManager.addCachedRecord(tableName, validData);
+              await tableDataManager.addToWriteBuffer(tableName, validData,
+                  isUpdate: false);
+
+              // Track successful keys
+              final successKey = validData[primaryKey]?.toString() ?? '';
+              if (successKey.isNotEmpty) {
+                successKeys.add(successKey);
+              }
+            } catch (e) {
+              // Handle individual record errors
+              Logger.warn('Error processing record: $e',
+                  label: 'DataStore.batchInsert');
+              invalidRecords.add(record);
+              final failedKey = record[primaryKey]?.toString() ?? '';
+              if (failedKey.isNotEmpty) {
+                failedKeys.add(failedKey);
+              }
+
+              if (!allowPartialErrors) {
+                // If not allowing partial errors, rollback and return error
+                await _transactionManager!.rollback(transaction);
+                return DbResult.error(
+                  type: ResultType.dbError,
+                  message: 'Error processing record: $e',
+                  failedKeys: failedKeys,
+                );
+              }
+            }
+          }
+
+          // Yield to event loop periodically to prevent UI freezing
+          await Future.delayed(Duration.zero);
         }
-      }
 
-      if (validRecords.isEmpty) {
-        // if no valid records, collect failed keys list
-        final failedKeys = invalidRecords
-            .map((record) => record[primaryKey]?.toString() ?? '')
-            .where((key) => key.isNotEmpty)
-            .toList();
-
-        return DbResult.error(
-          type: ResultType.validationFailed,
-          message: 'All data validation failed',
-          failedKeys: failedKeys,
-        );
-      }
-
-      // If not allowing partial errors and some records failed validation, return error
-      if (!allowPartialErrors && invalidRecords.isNotEmpty) {
-        // Collect failed keys
-        final failedKeys = invalidRecords
-            .map((record) => record[primaryKey]?.toString() ?? '')
-            .where((key) => key.isNotEmpty)
-            .toList();
-
-        return DbResult.error(
-          type: ResultType.validationFailed,
-          message:
-              'Some records failed validation. Set allowPartialErrors=true to insert valid records.',
-          failedKeys: failedKeys,
-        );
-      }
-
-      // 2. Check unique constraints and filter duplicate data
-      final uniqueRecords = <Map<String, dynamic>>[];
-      final failedRecords = <Map<String, dynamic>>[];
-      for (var record in validRecords) {
-        if (await _indexManager?.checkUniqueConstraints(tableName, record) ==
-            true) {
-          uniqueRecords.add(record);
-        } else {
-          failedRecords.add(record);
-          Logger.warn('Skip duplicate data: $record',
-              label: 'DataStore-batchInsert');
-        }
-      }
-
-      if (uniqueRecords.isEmpty) {
-        Logger.warn('All data are duplicates, batch insert canceled',
-            label: 'DataStore-batchInsert');
-        // Collect primary keys of all failed records
-        final failedKeys = failedRecords
-            .map((record) => record[primaryKey]?.toString() ?? '')
-            .where((key) => key.isNotEmpty)
-            .toList();
-        return DbResult.error(
-          type: ResultType.uniqueViolation,
-          message: 'All records have unique constraint conflicts',
-          failedKeys: failedKeys,
-        );
-      }
-
-      // If not allowing partial errors and some records failed due to unique constraints
-      if (!allowPartialErrors && failedRecords.isNotEmpty) {
-        // Collect failed keys
-        final failedKeys = failedRecords
-            .map((record) => record[primaryKey]?.toString() ?? '')
-            .where((key) => key.isNotEmpty)
-            .toList();
-
-        return DbResult.error(
-          type: ResultType.uniqueViolation,
-          message:
-              'Some records have unique constraint conflicts. Set allowPartialErrors=true to insert valid records.',
-          failedKeys: failedKeys,
-        );
-      }
-
-      // 3. Get data in write queue (if any)
-      final pendingEntries = tableDataManager.writeBuffer[tableName] ?? {};
-      tableDataManager.writeBuffer.remove(tableName); // Clear queue
-
-      // 4. Convert pending WriteBufferEntry to raw data
-      final pendingRecords = pendingEntries.values.map((e) => e.data).toList();
-
-      // 5. Merge all data to write
-      final allData = [...pendingRecords, ...uniqueRecords];
-
-      // 6. use WriteRecords to append records directly, not clear table and rewrite
-      // Use a batch size that balances performance and memory usage
-      final batchSize = config.migrationConfig?.batchSize ?? 1000;
-
-      if (allData.length > batchSize) {
-        // if data is large, process in batches to avoid memory issues
-        for (int i = 0; i < allData.length; i += batchSize) {
-          final end =
-              (i + batchSize < allData.length) ? i + batchSize : allData.length;
-          final batch = allData.sublist(i, end);
-
-          await tableDataManager.writeRecords(
-            tableName: tableName,
-            records: batch,
-            operationType: BufferOperationType.insert,
+        // If no valid records and not allowing partial errors, return error
+        if (validRecords.isEmpty) {
+          await _transactionManager!.rollback(transaction);
+          return DbResult.error(
+            type: ResultType.validationFailed,
+            message: 'All data validation failed',
+            failedKeys: failedKeys,
           );
         }
-      } else {
-        // if data is small, process once
-        await tableDataManager.writeRecords(
-          tableName: tableName,
-          records: allData,
-          operationType: BufferOperationType.insert,
-        );
+
+        // If not allowing partial errors and some records failed, return error
+        if (!allowPartialErrors && invalidRecords.isNotEmpty) {
+          await _transactionManager!.rollback(transaction);
+          return DbResult.error(
+            type: ResultType.validationFailed,
+            message:
+                'Some records failed validation or have unique constraint conflicts',
+            failedKeys: failedKeys,
+          );
+        }
+
+        // Commit the transaction to ensure all data is written
+        await _transactionManager!.commit(transaction);
+
+        // Async log transaction
+        _logTransactionAsync('batchInsert', tableName, {
+          'count': validRecords.length,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        });
+
+        // Return result
+        if (invalidRecords.isEmpty) {
+          return DbResult.success(
+            successKeys: successKeys,
+            message: 'All records inserted successfully',
+          );
+        } else {
+          return DbResult.batch(
+            successKeys: successKeys,
+            failedKeys: failedKeys,
+            message:
+                'Partial records inserted successfully, ${validRecords.length} successful, ${failedKeys.length} failed',
+          );
+        }
+      } catch (e) {
+        // Rollback transaction on error
+        await _transactionManager!.rollback(transaction);
+        rethrow;
       }
-
-      // Update cache
-      for (var data in allData) {
-        dataCacheManager.addCachedRecord(tableName, data);
-      }
-
-      // Async log transaction
-      _logTransactionAsync('batchInsert', tableName, {
-        'count': allData.length,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-      });
-
-      // Return primary keys of all successfully inserted records (converted to strings)
-      final List<String> primaryKeys = uniqueRecords
-          .map((record) => record[primaryKey]?.toString() ?? '')
-          .where((key) => key.isNotEmpty)
-          .toList();
-
-      // Calculate number of failed records
-      final List<String> failedKeys = failedRecords
-          .map((record) => record[primaryKey]?.toString() ?? '')
-          .where((key) => key.isNotEmpty)
-          .toList();
-
-      return DbResult.batch(
-        successKeys: primaryKeys,
-        failedKeys: failedKeys,
-        message: uniqueRecords.length == records.length
-            ? 'All records inserted successfully'
-            : 'Partial records inserted successfully, ${uniqueRecords.length} successful, ${failedKeys.length} failed',
-      );
     } catch (e) {
       Logger.error('Batch insertion failed: $e',
           label: 'DataStore-batchInsert');

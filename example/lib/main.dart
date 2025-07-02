@@ -1,7 +1,45 @@
-import 'dart:developer';
-
+import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
+
+/// A simple class to hold log data along with its type.
+class LogEntry {
+  final String message;
+  final LogType type;
+  final DateTime timestamp;
+
+  LogEntry(
+      {required this.message, required this.type, required this.timestamp});
+}
+
+/// A simple service to manage and notify about logs.
+class LogService {
+  final ValueNotifier<List<LogEntry>> _logs = ValueNotifier([]);
+  ValueNotifier<List<LogEntry>> get logs => _logs;
+
+  void add(String message, [LogType type = LogType.info]) {
+    // To avoid UI freezing with a large number of logs, we keep a reasonable limit.
+    const maxLogs = 200;
+    final now = DateTime.now();
+    final timestampString =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+    final newLogs = List<LogEntry>.from(_logs.value);
+    newLogs.add(LogEntry(
+        message: '[$timestampString] $message', type: type, timestamp: now));
+    if (newLogs.length > maxLogs) {
+      newLogs.removeRange(0, newLogs.length - maxLogs);
+    }
+    _logs.value = newLogs;
+    developer.log(message);
+  }
+
+  void clear() {
+    _logs.value = [];
+  }
+}
+
+final logService = LogService();
 
 /// This example demonstrates the core features of Tostore using a user management system
 /// with global settings. It shows how to:
@@ -15,13 +53,16 @@ class TostoreExample {
   /// Initialize database and create tables
   Future<void> initialize() async {
     db = ToStore(
+      config: DataStoreConfig(
+        enableLog: true,
+        logLevel: LogLevel.debug,
+      ),
       schemas: [
         // suitable for table structure definition in frequent startup scenarios of mobile applications, accurately identifying table structure changes, automatically upgrading and migrating data
         const TableSchema(
           name: 'users',
-          primaryKeyConfig: PrimaryKeyConfig(
-            name: 'id',
-          ),
+          primaryKeyConfig:
+              PrimaryKeyConfig(name: 'id', type: PrimaryKeyType.sequential),
           fields: [
             FieldSchema(name: 'username', type: DataType.text, nullable: false),
             FieldSchema(name: 'email', type: DataType.text, nullable: false),
@@ -31,7 +72,7 @@ class TostoreExample {
             FieldSchema(name: 'age', type: DataType.integer),
             FieldSchema(name: 'tags', type: DataType.text),
             FieldSchema(name: 'type', type: DataType.text),
-            FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 0),
+            FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 10),
           ],
           indexes: [
             IndexSchema(fields: ['username'], unique: true),
@@ -137,7 +178,7 @@ class TostoreExample {
         .where('email', 'like', '%@example.com')
         .listen((userData) {
       // handle each data as needed, avoid memory pressure
-      log('handle user: ${userData['username']}');
+      logService.add('handle user: ${userData['username']}');
     });
   }
 
@@ -191,7 +232,7 @@ class TostoreExample {
 
     // get current space info
     final spaceInfo = await db.getSpaceInfo();
-    log("${spaceInfo.toJson()}");
+    logService.add("${spaceInfo.toJson()}");
   }
 
   /// Example: Advanced queries
@@ -234,7 +275,7 @@ class TostoreExample {
   Future<void> backupExample() async {
     // Create backup
     final backupPath = await db.backup(compress: false);
-    log('Backup created at: $backupPath');
+    logService.add('Backup created at: $backupPath');
 
     // Restore from backup
     await db.restore(backupPath, deleteAfterRestore: true);
@@ -311,7 +352,8 @@ class TostoreExample {
         vectors.add(vector);
         doc['embedding'] = vector;
 
-        log('document title: ${doc['document_title']}, vector dimensions: ${vector.dimensions}');
+        logService.add(
+            'document title: ${doc['document_title']}, vector dimensions: ${vector.dimensions}');
       }
     }
 
@@ -320,18 +362,18 @@ class TostoreExample {
       final vector1 = vectors[0];
       final vector2 = vectors[1];
 
-      log('vector1: ${vector1.toString()}');
-      log('vector2: ${vector2.toString()}');
+      logService.add('vector1: ${vector1.toString()}');
+      logService.add('vector2: ${vector2.toString()}');
 
       // calculate vector similarity
       final similarity = vector1.cosineSimilarity(vector2);
-      log('vector similarity: $similarity');
+      logService.add('vector similarity: $similarity');
 
       // calculate euclidean distance
       final distance = vector1.euclideanDistance(vector2);
-      log('vector distance: $distance');
+      logService.add('vector distance: $distance');
     } else {
-      log('not enough vector data for comparison');
+      logService.add('not enough vector data for comparison');
     }
   }
 
@@ -393,7 +435,7 @@ class TostoreExample {
 
     // query migration task status
     final status = await db.queryMigrationTaskStatus(taskId);
-    log('migration progress: ${status?.progressPercentage}%');
+    logService.add('migration progress: ${status?.progressPercentage}%');
   }
 
   /// Example: Complex nested queries with predefined conditions
@@ -449,7 +491,8 @@ class TostoreExample {
         .limit(20);
 
     for (var user in result.data) {
-      log('user: ${user['username']}, type: ${user['type']}, fans: ${user['fans']}, tags: ${user['tags']}');
+      logService.add(
+          'user: ${user['username']}, type: ${user['type']}, fans: ${user['fans']}, tags: ${user['tags']}');
     }
 
     // equivalent SQL:
@@ -458,6 +501,15 @@ class TostoreExample {
     //   AND (type = 'app' OR id >= 1 OR fans >= 200)
     //   OR ([custom condition: tag contains 'recommend'])
     // LIMIT 20
+  }
+
+  Future<int> clearExamples() async {
+    final stopwatch = Stopwatch()..start();
+    await db.clear('users');
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('Table "users" cleared in ${elapsed}ms');
+    return elapsed;
   }
 
   /// Example: Join queries with table relationships
@@ -502,8 +554,147 @@ class TostoreExample {
         .orderByDesc('comments.created_at');
 
     for (var item in postsWithComments.data) {
-      log('post: ${item['title']}, author: ${item['author']}, comment: ${item['comment']}');
+      logService.add(
+          'post: ${item['title']}, author: ${item['author']}, comment: ${item['comment']}');
     }
+  }
+
+  Future<int> addOneExamples() async {
+    final stopwatch = Stopwatch()..start();
+    await db.insert('users', {
+      'username': 'user_200',
+      'email': 'user_2000@example.com',
+      'tags': '4f4h3fd4fi33JlIDN2lh3777',
+      'is_active': false,
+    });
+    stopwatch.stop();
+    return stopwatch.elapsedMilliseconds;
+  }
+
+  Future<int> addExamples() async {
+    logService.add('Preparing 10,000 records for batch insert...');
+    Stopwatch stopwatch = Stopwatch()..start();
+
+    // batch insert, 1000 records per batch
+    const int batchSize = 1000;
+    const int totalRecords = 10000;
+
+    for (int start = 0; start < totalRecords; start += batchSize) {
+      final int end =
+          (start + batchSize < totalRecords) ? start + batchSize : totalRecords;
+      logService.add(
+          'Processing batch ${start ~/ batchSize + 1}/${(totalRecords / batchSize).ceil()}...');
+
+      // prepare records for current batch
+      final users = <Map<String, dynamic>>[];
+      for (var i = start; i < end; i++) {
+        users.add({
+          'username': 'user_$i',
+          'email': 'user_$i@example.com',
+          'tags': '4f4h3fd4fi33JlIDN2lh3777',
+          'is_active': i > 5,
+        });
+      }
+
+      // batch insert current batch
+      await db.batchInsert('users', users);
+
+      // yield to event loop, keep UI responsive
+      await Future.delayed(Duration.zero);
+    }
+
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('insert time: ${elapsed}ms');
+
+    final queryResult = await db.query('users').count();
+    logService.add('query count: $queryResult');
+    return elapsed;
+  }
+
+  Future<int> addExamplesOneByOne() async {
+    logService.add('Starting to add 10,000 records one by one...');
+    final stopwatch = Stopwatch()..start();
+    for (var i = 0; i < 10000; i++) {
+      await db.insert('users', {
+        'username': 'user_single_$i',
+        'email': 'user_single_$i@example.com',
+        'tags': '4f4h3fd4fi33JlIDN2lh3777',
+        'is_active': i > 5,
+      });
+      // Yield to the event loop to prevent UI freezing
+      if (i % 100 == 0) {
+        // Yield more sparingly to improve performance while keeping UI responsive
+        await Future.delayed(Duration.zero);
+      }
+    }
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('Finished adding 10k records one-by-one in ${elapsed}ms');
+    final queryResult = await db.query('users').count();
+    logService.add('query count: $queryResult');
+    return elapsed;
+  }
+
+  Future<int> deleteExamples() async {
+    final stopwatch = Stopwatch()..start();
+    final deleteResult = await db.delete('users').where('id', '>', '5');
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('delete : ${deleteResult.toJson()}');
+    logService.add('delete time: ${elapsed}ms');
+    return elapsed;
+  }
+
+  Future<int> updateOneExamples() async {
+    Stopwatch stopwatch = Stopwatch()..start();
+    final updateResult = await db.upsert('users', {
+      'username': 'user_update6',
+      'email': 'user_update3@example.com',
+      'tags': 'user_update',
+      'is_active': false,
+    }).where('username', '=', 'user_331');
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('update : ${updateResult.toJson()}');
+    logService.add('update time: ${elapsed}ms');
+
+    final queryResult =
+        await db.query('users').where('username', '=', 'user_331');
+    logService.add('query : ${queryResult.toJson()}');
+    return elapsed;
+  }
+
+  Future<int> deleteOneExamples() async {
+    Stopwatch stopwatch = Stopwatch()..start();
+    final deleteResult =
+        await db.delete('users').where('username', '=', 'user_331').limit(5);
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+    logService.add('delete : ${deleteResult.toJson()}');
+    logService.add('delete time: ${elapsed}ms');
+
+    final queryResult =
+        await db.query('users').where('username', '=', 'user_331').limit(5);
+    logService.add('query : ${queryResult.toJson()}');
+    return elapsed;
+  }
+
+  Future<int> queryExamples() async {
+    // for (int i = 0; i < 1000; i++) {
+    //   await db.query('users').where('username', '=', 'user_$i');
+    // }
+    Stopwatch stopwatch = Stopwatch()..start();
+    final queryResult = await db.query('users').where('id', '<', '6').limit(8);
+    stopwatch.stop();
+    final elapsed = stopwatch.elapsedMilliseconds;
+
+    logService.add('query time: ${elapsed}ms');
+    logService
+        .add('query result: ${queryResult.length} ${queryResult.toJson()}');
+    final queryCount = await db.query('users').count();
+    logService.add('query count: $queryCount');
+    return elapsed;
   }
 }
 
@@ -511,14 +702,662 @@ class TostoreExample {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  final example = TostoreExample();
-  await example.initialize();
+  // It's crucial to set the log handler *before* any potential errors can occur.
+  // This ensures that initialization logs are captured and displayed in the UI.
+  LogConfig.setConfig(
+    onLogHandler: (message, type, label) {
+      logService.add('[$label] $message', type);
+    },
+  );
 
-  runApp(const MaterialApp(
-    home: Scaffold(
-      body: Center(
-        child: Text('Check console for example outputs'),
+  final example = TostoreExample();
+
+  // The example app will now run even if initialization fails,
+  // allowing the user to see the error logs in the ListView.
+  runApp(MyApp(example: example));
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key, required this.example});
+  final TostoreExample example;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Tostore Example',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff0aa6e8)),
+        useMaterial3: true,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
-    ),
-  ));
+      home: TostoreExamplePage(example: example),
+    );
+  }
+}
+
+class TostoreExamplePage extends StatefulWidget {
+  const TostoreExamplePage({super.key, required this.example});
+  final TostoreExample example;
+  @override
+  State<TostoreExamplePage> createState() => _TostoreExamplePageState();
+}
+
+class _TostoreExamplePageState extends State<TostoreExamplePage> {
+  final ScrollController _scrollController = ScrollController();
+  final TextEditingController _searchController = TextEditingController();
+  LogType? _selectedLogType;
+  String _lastOperationInfo = 'Please initialize the database first.';
+  bool _isDbInitialized = false;
+  bool _isInitializing = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeDatabase();
+    logService.logs.addListener(_scrollToBottom);
+    _searchController.addListener(() {
+      setState(() {
+        // Just rebuild the widget when text changes
+      });
+    });
+  }
+
+  Future<void> _initializeDatabase() async {
+    setState(() {
+      _isInitializing = true;
+      _lastOperationInfo = 'Initializing Database...';
+    });
+
+    final stopwatch = Stopwatch()..start();
+    try {
+      await widget.example.initialize();
+      stopwatch.stop();
+      if (mounted) {
+        setState(() {
+          _isDbInitialized = true;
+          _isInitializing = false;
+          _lastOperationInfo =
+              'DB Initialized: ${stopwatch.elapsedMilliseconds}ms';
+        });
+      }
+    } catch (e, s) {
+      stopwatch.stop();
+      logService.add(
+          '!!!!!! DATABASE INITIALIZATION FAILED !!!!!!', LogType.error);
+      logService.add('Error: $e', LogType.error);
+      logService.add('StackTrace: $s', LogType.error);
+      if (mounted) {
+        setState(() {
+          _isDbInitialized = false;
+          _isInitializing = false;
+          _lastOperationInfo = 'DB Initialization FAILED!';
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    logService.logs.removeListener(_scrollToBottom);
+    _scrollController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Widget _buildActionButton({required String text, VoidCallback? onPressed}) {
+    return ElevatedButton(
+      onPressed: onPressed,
+      style: ElevatedButton.styleFrom(
+        foregroundColor: Colors.white,
+        backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+        elevation: 2,
+        shadowColor: const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      ),
+      child: Text(
+        text,
+        textAlign: TextAlign.center,
+        style: const TextStyle(fontWeight: FontWeight.bold),
+        maxLines: 2,
+        overflow: TextOverflow.visible,
+      ),
+    );
+  }
+
+  Widget _buildFilterButton(
+      String text, LogType? type, int count, BuildContext context) {
+    final isSelected = _selectedLogType == type;
+    final Color backgroundColor;
+    final Color foregroundColor;
+    final double elevation;
+    final Color? shadowColor;
+
+    if (isSelected) {
+      backgroundColor = const Color.fromARGB(255, 10, 150, 210);
+      foregroundColor = Colors.white;
+      elevation = 2;
+      shadowColor = const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4);
+    } else {
+      backgroundColor = Theme.of(context).colorScheme.secondaryContainer;
+      foregroundColor = Theme.of(context).colorScheme.onSecondaryContainer;
+      elevation = 0;
+      shadowColor = null;
+    }
+
+    return ElevatedButton(
+      onPressed: () {
+        setState(() {
+          _selectedLogType = type;
+        });
+      },
+      style: ElevatedButton.styleFrom(
+        backgroundColor: backgroundColor,
+        foregroundColor: foregroundColor,
+        elevation: elevation,
+        shadowColor: shadowColor,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+      ),
+      child: Text('$text ($count)'),
+    );
+  }
+
+  Color _getLogColor(LogType type) {
+    switch (type) {
+      case LogType.error:
+        return Colors.red;
+      case LogType.warn:
+        return Colors.orange;
+      case LogType.debug:
+        return Colors.blueAccent;
+      case LogType.info:
+      default:
+        return Colors.black;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      appBar: AppBar(
+        title: const Text('Tostore Demo'),
+        actions: [
+          IconButton(
+            icon: const Icon(
+              Icons.info_outline,
+              color: Colors.black54,
+              size: 28,
+            ),
+            tooltip: 'Database Info',
+            onPressed: _isDbInitialized ? _showDatabaseInfoDialog : null,
+          ),
+          IconButton(
+            icon: const Icon(Icons.copy_outlined, size: 24),
+            tooltip: 'Copy Visible Logs',
+            onPressed: () {
+              // Get the current list of all logs
+              final allLogs = logService.logs.value;
+
+              // Apply the same filtering logic as the list view
+              final filteredByType = _selectedLogType == null
+                  ? allLogs
+                  : allLogs
+                      .where((log) => log.type == _selectedLogType)
+                      .toList();
+
+              final searchText = _searchController.text.toLowerCase();
+              final filteredLogs = searchText.isEmpty
+                  ? filteredByType
+                  : filteredByType
+                      .where((log) =>
+                          log.message.toLowerCase().contains(searchText))
+                      .toList();
+
+              if (filteredLogs.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('No logs to copy.')),
+                );
+                return;
+              }
+
+              // Format logs into a single string
+              final logsText =
+                  filteredLogs.map((log) => log.message).join('\n');
+
+              // Copy to clipboard
+              Clipboard.setData(ClipboardData(text: logsText));
+
+              // Show confirmation
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                    content: Text('Visible logs copied to clipboard!')),
+              );
+            },
+          ),
+          IconButton(
+            icon: const Icon(
+              Icons.cleaning_services_rounded,
+              size: 24,
+            ),
+            tooltip: 'Clear Logs',
+            onPressed: () {
+              logService.clear();
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: Container(
+              color: Theme.of(context).colorScheme.surface.withOpacity(0.1),
+              padding: const EdgeInsets.all(8.0),
+              child: ValueListenableBuilder<List<LogEntry>>(
+                valueListenable: logService.logs,
+                builder: (context, logs, child) {
+                  // First, filter by selected log type
+                  final filteredByType = _selectedLogType == null
+                      ? logs
+                      : logs
+                          .where((log) => log.type == _selectedLogType)
+                          .toList();
+
+                  // Then, filter by search text
+                  final searchText = _searchController.text.toLowerCase();
+                  final filteredLogs = searchText.isEmpty
+                      ? filteredByType
+                      : filteredByType
+                          .where((log) =>
+                              log.message.toLowerCase().contains(searchText))
+                          .toList();
+
+                  if (filteredLogs.isEmpty) {
+                    return const Center(
+                        child: Text('No logs match your filter.'));
+                  }
+                  return ListView.builder(
+                    controller: _scrollController,
+                    itemCount: filteredLogs.length,
+                    itemBuilder: (context, index) {
+                      final logEntry = filteredLogs[index];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8.0, vertical: 4.0),
+                        child: Text(
+                          logEntry.message,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _getLogColor(logEntry.type),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
+          ),
+          const Divider(height: 1),
+          SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: _searchController,
+                    decoration: InputDecoration(
+                      hintText: 'Search in logs...',
+                      prefixIcon: const Icon(Icons.search),
+                      suffixIcon: _searchController.text.isNotEmpty
+                          ? IconButton(
+                              icon: const Icon(Icons.clear),
+                              onPressed: () {
+                                _searchController.clear();
+                              },
+                            )
+                          : null,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .outline
+                                .withOpacity(0.8)),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  ValueListenableBuilder<List<LogEntry>>(
+                    valueListenable: logService.logs,
+                    builder: (context, logs, child) {
+                      // Calculate counts for each log type
+                      final allCount = logs.length;
+                      final infoCount =
+                          logs.where((log) => log.type == LogType.info).length;
+                      final debugCount =
+                          logs.where((log) => log.type == LogType.debug).length;
+                      final warnCount =
+                          logs.where((log) => log.type == LogType.warn).length;
+                      final errorCount =
+                          logs.where((log) => log.type == LogType.error).length;
+
+                      return Wrap(
+                        spacing: 8.0,
+                        runSpacing: 4.0,
+                        alignment: WrapAlignment.start,
+                        children: [
+                          _buildFilterButton('All', null, allCount, context),
+                          _buildFilterButton(
+                              'Info', LogType.info, infoCount, context),
+                          _buildFilterButton(
+                              'Debug', LogType.debug, debugCount, context),
+                          _buildFilterButton(
+                              'Warn', LogType.warn, warnCount, context),
+                          _buildFilterButton(
+                              'Error', LogType.error, errorCount, context),
+                        ],
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  if (_isInitializing)
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(
+                            horizontal: 16.0, vertical: 24),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            CircularProgressIndicator(),
+                            SizedBox(width: 20),
+                            Text('Initializing...'),
+                          ],
+                        ),
+                      ),
+                    )
+                  else
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          height: 40,
+                          alignment: Alignment.center,
+                          child: Text(
+                            _lastOperationInfo,
+                            style: Theme.of(context).textTheme.titleMedium,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 12,
+                          alignment: WrapAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Batch Add 10k',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .addExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Batch Add 10k: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Slow Add 10k',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .addExamplesOneByOne();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Slow Add 10k: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Add One',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .addOneExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Add One: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Query',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .queryExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Query: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Update One',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .updateOneExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Update One: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Delete One',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .deleteOneExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Delete One: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Delete Many',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .deleteExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Delete Many: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Clear Table',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .clearExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Clear Table: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showDatabaseInfoDialog() async {
+    // Show a loading dialog first
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return const Dialog(
+          child: Padding(
+            padding: EdgeInsets.all(20.0),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 20),
+                Text("Fetching DB Info..."),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    try {
+      final db = widget.example.db;
+      final spaceInfo = await db.getSpaceInfo();
+      final tableNames = spaceInfo.tables;
+      final totalRecords = spaceInfo.recordCount;
+
+      if (!mounted) return;
+      Navigator.of(context).pop(); // Close the loading dialog
+
+      // Show the info dialog
+      showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+            title: const Text('Database Information'),
+            content: SingleChildScrollView(
+              child: ListBody(
+                children: <Widget>[
+                  _buildInfoRow('Space Name:', spaceInfo.spaceName),
+                  _buildInfoRow('Data Size:',
+                      '${(spaceInfo.dataSizeBytes / 1024).toStringAsFixed(2)} KB'),
+                  _buildInfoRow('Tables:', tableNames.join(', ')),
+                  _buildInfoRow(
+                      'Total Records:', totalRecords.toString(), true),
+                ],
+              ),
+            ),
+            actions: <Widget>[
+              TextButton(
+                child: const Text('OK'),
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+              ),
+            ],
+          );
+        },
+      );
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context).pop(); // Close the loading dialog
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to get DB info: $e')),
+      );
+    }
+  }
+
+  Widget _buildInfoRow(String title, String value,
+      [bool isHighlighted = false]) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: RichText(
+        text: TextSpan(
+          style: Theme.of(context).textTheme.bodyMedium,
+          children: <TextSpan>[
+            TextSpan(
+                text: '$title ',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            TextSpan(
+                text: value,
+                style: isHighlighted
+                    ? TextStyle(
+                        color: Theme.of(context).colorScheme.primary,
+                        fontWeight: FontWeight.bold)
+                    : null),
+          ],
+        ),
+      ),
+    );
+  }
 }

@@ -151,7 +151,7 @@ class DirectoryManager {
       // save updated configuration
       await _dataStore.saveSpaceConfigToFile(updatedConfig);
 
-      // 确保目录存在
+      // ensure directory exists
       final dirPath = _getTableSubDirectoryPath(isGlobal, selectedDirIndex);
       await _dataStore.storage.ensureDirectoryExists(dirPath);
 

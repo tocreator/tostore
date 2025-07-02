@@ -87,31 +87,35 @@ class KeyManager {
 
   // when spaceConfig is null,then create key spaceConfig
   Future<SpaceConfig> createKeySpaceConfig() async {
-    final newKey = _dataStore.config.encodingKey; // may be null
-    SpaceConfig? spaceConfig;
-    if (newKey.isNotEmpty) {
-      try {
+    final newKey = _dataStore.config.encodingKey;
+    try {
+      if (newKey.isNotEmpty) {
         final encryptedBytes = ChaCha20Poly1305.encrypt(
             plaintext: newKey,
             key: ChaCha20Poly1305.generateKeyFromString(
                 _dataStore.config.encryptionKey));
         final encryptedBase64 = base64.encode(encryptedBytes);
-        spaceConfig = SpaceConfig(
+        return SpaceConfig(
             current: EncryptionKeyInfo(key: encryptedBase64, keyId: 1),
             previous: null,
             version: 0);
-        return spaceConfig;
-      } catch (e) {
-        Logger.error(
-            'Failed to save new key during first-time initialization: $e');
+      } else {
+        // If no key is provided, still create a valid config with an empty key.
+        Logger.info(
+            'No encoding key provided; creating space config with an empty key.');
         return SpaceConfig(
             current: const EncryptionKeyInfo(key: '', keyId: 1),
             previous: null,
             version: 0);
       }
-    } else {
-      Logger.info('No encoding key provided during initialization.');
-      throw Exception('No encoding key provided during initialization.');
+    } catch (e) {
+      Logger.error(
+          'Failed to create or encrypt key during first-time initialization: $e');
+      // Return a default empty config on error to allow the app to proceed.
+      return SpaceConfig(
+          current: const EncryptionKeyInfo(key: '', keyId: 1),
+          previous: null,
+          version: 0);
     }
   }
 

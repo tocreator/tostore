@@ -2900,24 +2900,20 @@ class TableDataManager {
         await _updateTableMetadataWithAllPartitions(
             tableName, allPartitionMetas, existingPartitions);
 
-        // if update operation, need to handle records not found (as insert operation)
+        // if update operation, need to handle records not found
         if (operationType == BufferOperationType.update) {
           // find records not processed
-          final recordsToInsert = records.where((record) {
+          final recordsNotProcessed = records.where((record) {
             final pk = record[primaryKey]?.toString() ?? '';
             return pk.isNotEmpty && !processedKeys.contains(pk);
           }).toList();
 
-          // if there are records not processed, recursively call but use insert operation
-          if (recordsToInsert.isNotEmpty) {
-            await writeRecords(
-              tableName: tableName,
-              records: recordsToInsert,
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
-              operationType: BufferOperationType.insert,
-              concurrency: concurrency,
-            );
+          // If there are unprocessed records, it means that these records were not found during the update,
+          // which may be due to data inconsistency. Log a warning here.
+          if (recordsNotProcessed.isNotEmpty) {
+            Logger.warn(
+                'Update operation for table `$tableName` found ${recordsNotProcessed.length} records that did not exist in the data file. Primary keys: ${recordsNotProcessed.map((r) => r[primaryKey]?.toString()).join(', ')}',
+                label: 'TableDataManager.writeRecords');
           }
         }
       } else if (operationType == BufferOperationType.rewrite) {
