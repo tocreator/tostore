@@ -420,7 +420,7 @@ class ValueComparator {
         // For vector data, use generic comparison
         return compare;
       default:
-        // If type is not specified or for any future types, 
+        // If type is not specified or for any future types,
         // use the general-purpose but slower comparison method.
         return compare;
     }

@@ -77,7 +77,7 @@ class Logger {
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-warn"
         : "log-warn  $label";
-    _log(text, label: "[!] $label");
+    _log(text, label: "💡  $label");
     _handler(text, LogType.warn, label);
   }
 
@@ -91,7 +91,7 @@ class Logger {
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-error"
         : "log-error  $label";
-    _log(text, label: "[X] $label");
+    _log(text, label: "🔴  $label");
     _handler(text, LogType.error, label);
   }
 

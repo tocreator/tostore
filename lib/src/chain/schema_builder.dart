@@ -8,6 +8,7 @@ class SchemaBuilder with FutureBuilderMixin {
   final DataStoreImpl _dataStore;
   final String _tableName;
   final List<MigrationOperation> _operations = [];
+  bool _allowAfterDataMigration = false;
 
   SchemaBuilder(this._dataStore, this._tableName);
 
@@ -120,6 +121,12 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
+  /// Confirms that data migration is allowed to run after this schema change.
+  SchemaBuilder allowAfterDataMigration() {
+    _allowAfterDataMigration = true;
+    return this;
+  }
+
   /// Rename table
   SchemaBuilder renameTable(String newTableName) {
     _operations.add(MigrationOperation(
@@ -142,8 +149,10 @@ class SchemaBuilder with FutureBuilderMixin {
   @override
   Future<String> get future async {
     // create migration task
-    final task = await _dataStore.migrationManager
-        ?.addMigrationTask(_tableName, _operations, startProcessing: false);
+    final task = await _dataStore.migrationManager?.addMigrationTask(
+        _tableName, _operations,
+        startProcessing: false,
+        allowAfterDataMigration: _allowAfterDataMigration);
 
     if (task == null) {
       return ''; // Return empty string to indicate creation failed

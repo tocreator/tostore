@@ -2,11 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.1.3
+## 2.1.4
 
 ### Added
 - Implemented a unified parallel computing scheduler to manage and execute concurrent tasks efficiently.
 - Introduced `noQueryCache` method to allow explicit disabling of the query cache for individual queries.
+- Added performance testing and one-click validation for all database interfaces, enabling comprehensive automated integrity checks.
 
 ### Changed
 - Optimized CPU-intensive operations by offloading them to background isolates, ensuring a smooth UI experience while maximizing computational throughput.

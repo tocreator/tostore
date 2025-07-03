@@ -1,4 +1,4 @@
-import 'dart:math' show max, sqrt;
+import 'dart:math' show sqrt;
 import 'dart:typed_data';
 import 'dart:convert';
 import '../handler/logger.dart';
@@ -714,26 +714,7 @@ class FieldSchema {
 
     // handle not nullable constraint
     if (!nullable) {
-      switch (type) {
-        case DataType.integer:
-          return max(minValue?.toInt() ?? 0, 0);
-        case DataType.bigInt:
-          return BigInt.from(max(minValue?.toInt() ?? 0, 0));
-        case DataType.double:
-          return max(minValue?.toDouble() ?? 0.0, 0.0);
-        case DataType.text:
-          return '';
-        case DataType.boolean:
-          return false;
-        case DataType.datetime:
-          return DateTime.now().toIso8601String();
-        case DataType.blob:
-          return Uint8List(0);
-        case DataType.array:
-          return [];
-        case DataType.vector:
-          return const VectorData([]); // Empty vector as default
-      }
+      return null;
     }
 
     // allow null and no default value, return null

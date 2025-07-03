@@ -2,44 +2,7 @@ import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
-
-/// A simple class to hold log data along with its type.
-class LogEntry {
-  final String message;
-  final LogType type;
-  final DateTime timestamp;
-
-  LogEntry(
-      {required this.message, required this.type, required this.timestamp});
-}
-
-/// A simple service to manage and notify about logs.
-class LogService {
-  final ValueNotifier<List<LogEntry>> _logs = ValueNotifier([]);
-  ValueNotifier<List<LogEntry>> get logs => _logs;
-
-  void add(String message, [LogType type = LogType.info]) {
-    // To avoid UI freezing with a large number of logs, we keep a reasonable limit.
-    const maxLogs = 200;
-    final now = DateTime.now();
-    final timestampString =
-        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
-    final newLogs = List<LogEntry>.from(_logs.value);
-    newLogs.add(LogEntry(
-        message: '[$timestampString] $message', type: type, timestamp: now));
-    if (newLogs.length > maxLogs) {
-      newLogs.removeRange(0, newLogs.length - maxLogs);
-    }
-    _logs.value = newLogs;
-    developer.log(message);
-  }
-
-  void clear() {
-    _logs.value = [];
-  }
-}
-
-final logService = LogService();
+import 'database_tester.dart';
 
 /// This example demonstrates the core features of Tostore using a user management system
 /// with global settings. It shows how to:
@@ -559,19 +522,8 @@ class TostoreExample {
     }
   }
 
-  Future<int> addOneExamples() async {
-    final stopwatch = Stopwatch()..start();
-    await db.insert('users', {
-      'username': 'user_200',
-      'email': 'user_2000@example.com',
-      'tags': '4f4h3fd4fi33JlIDN2lh3777',
-      'is_active': false,
-    });
-    stopwatch.stop();
-    return stopwatch.elapsedMilliseconds;
-  }
-
   Future<int> addExamples() async {
+    await db.clear('users');
     logService.add('Preparing 10,000 records for batch insert...');
     Stopwatch stopwatch = Stopwatch()..start();
 
@@ -582,9 +534,6 @@ class TostoreExample {
     for (int start = 0; start < totalRecords; start += batchSize) {
       final int end =
           (start + batchSize < totalRecords) ? start + batchSize : totalRecords;
-      logService.add(
-          'Processing batch ${start ~/ batchSize + 1}/${(totalRecords / batchSize).ceil()}...');
-
       // prepare records for current batch
       final users = <Map<String, dynamic>>[];
       for (var i = start; i < end; i++) {
@@ -613,12 +562,13 @@ class TostoreExample {
   }
 
   Future<int> addExamplesOneByOne() async {
+    await db.clear('users');
     logService.add('Starting to add 10,000 records one by one...');
     final stopwatch = Stopwatch()..start();
     for (var i = 0; i < 10000; i++) {
       await db.insert('users', {
-        'username': 'user_single_$i',
-        'email': 'user_single_$i@example.com',
+        'username': 'user_$i',
+        'email': 'user_$i@example.com',
         'tags': '4f4h3fd4fi33JlIDN2lh3777',
         'is_active': i > 5,
       });
@@ -646,44 +596,7 @@ class TostoreExample {
     return elapsed;
   }
 
-  Future<int> updateOneExamples() async {
-    Stopwatch stopwatch = Stopwatch()..start();
-    final updateResult = await db.upsert('users', {
-      'username': 'user_update6',
-      'email': 'user_update3@example.com',
-      'tags': 'user_update',
-      'is_active': false,
-    }).where('username', '=', 'user_331');
-    stopwatch.stop();
-    final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('update : ${updateResult.toJson()}');
-    logService.add('update time: ${elapsed}ms');
-
-    final queryResult =
-        await db.query('users').where('username', '=', 'user_331');
-    logService.add('query : ${queryResult.toJson()}');
-    return elapsed;
-  }
-
-  Future<int> deleteOneExamples() async {
-    Stopwatch stopwatch = Stopwatch()..start();
-    final deleteResult =
-        await db.delete('users').where('username', '=', 'user_331').limit(5);
-    stopwatch.stop();
-    final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('delete : ${deleteResult.toJson()}');
-    logService.add('delete time: ${elapsed}ms');
-
-    final queryResult =
-        await db.query('users').where('username', '=', 'user_331').limit(5);
-    logService.add('query : ${queryResult.toJson()}');
-    return elapsed;
-  }
-
   Future<int> queryExamples() async {
-    // for (int i = 0; i < 1000; i++) {
-    //   await db.query('users').where('username', '=', 'user_$i');
-    // }
     Stopwatch stopwatch = Stopwatch()..start();
     final queryResult = await db.query('users').where('id', '<', '6').limit(8);
     stopwatch.stop();
@@ -706,7 +619,7 @@ void main() async {
   // This ensures that initialization logs are captured and displayed in the UI.
   LogConfig.setConfig(
     onLogHandler: (message, type, label) {
-      logService.add('[$label] $message', type);
+      logService.add('[$label] $message', type, true);
     },
   );
 
@@ -750,17 +663,61 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   String _lastOperationInfo = 'Please initialize the database first.';
   bool _isDbInitialized = false;
   bool _isInitializing = true;
+  bool _canScrollUp = false;
+  bool _canScrollDown = false;
+  bool _isAtBottom = true; // Assume we start at the bottom
 
   @override
   void initState() {
     super.initState();
     _initializeDatabase();
-    logService.logs.addListener(_scrollToBottom);
+    logService.logs.addListener(_onLogsChanged);
+    _scrollController.addListener(_scrollListener);
     _searchController.addListener(() {
       setState(() {
         // Just rebuild the widget when text changes
       });
     });
+    // Set the initial state of the scroll buttons after the first frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollListener());
+  }
+
+  void _onLogsChanged() {
+    // If we were at the bottom before the new logs were added, maintain that position.
+    if (_isAtBottom) {
+      _scrollToBottom();
+    }
+    // After logs are added, the scroll extent might change, so re-evaluate button states.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollListener());
+  }
+
+  void _scrollListener() {
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+
+    // Use a small tolerance for floating point comparisons
+    _isAtBottom = position.pixels >= position.maxScrollExtent - 1.0;
+    final atTop = position.pixels <= position.minScrollExtent + 1.0;
+
+    final canScrollUp = !atTop;
+    final canScrollDown = !_isAtBottom;
+
+    if (_canScrollUp != canScrollUp || _canScrollDown != canScrollDown) {
+      if (mounted) {
+        setState(() {
+          _canScrollUp = canScrollUp;
+          _canScrollDown = canScrollDown;
+        });
+      }
+    }
+  }
+
+  void _updateOperationInfo(String info) {
+    if (mounted) {
+      setState(() {
+        _lastOperationInfo = info;
+      });
+    }
   }
 
   Future<void> _initializeDatabase() async {
@@ -799,20 +756,41 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
   @override
   void dispose() {
-    logService.logs.removeListener(_scrollToBottom);
+    logService.logs.removeListener(_onLogsChanged);
+    _scrollController.removeListener(_scrollListener);
     _scrollController.dispose();
     _searchController.dispose();
     super.dispose();
   }
 
+  void _scrollToTop() {
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        0,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
   void _scrollToBottom() {
+    // its scroll extents after the widget tree has been rebuilt with new log entries.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
+        final maxScroll = _scrollController.position.maxScrollExtent;
+        _scrollController.jumpTo(maxScroll);
+
+        // Sometimes, the maxScrollExtent is not updated in a single frame, especially
+        // with a large number of list items. We schedule a second check to ensure
+        // we are at the very bottom.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollController.hasClients &&
+              _scrollController.position.pixels !=
+                  _scrollController.position.maxScrollExtent) {
+            _scrollController
+                .jumpTo(_scrollController.position.maxScrollExtent);
+          }
+        });
       }
     });
   }
@@ -828,13 +806,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         ),
         elevation: 2,
         shadowColor: const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
       ),
       child: Text(
         text,
         textAlign: TextAlign.center,
-        style: const TextStyle(fontWeight: FontWeight.bold),
-        maxLines: 2,
+        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+        maxLines: 1,
         overflow: TextOverflow.visible,
       ),
     );
@@ -842,11 +820,16 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
   Widget _buildFilterButton(
       String text, LogType? type, int count, BuildContext context) {
+    if (count == 0 && type != null) {
+      // Don't show the button if there are no logs of this type (except for 'All')
+      return const SizedBox.shrink();
+    }
     final isSelected = _selectedLogType == type;
     final Color backgroundColor;
     final Color foregroundColor;
     final double elevation;
     final Color? shadowColor;
+    Color? countColor;
 
     if (isSelected) {
       backgroundColor = const Color.fromARGB(255, 10, 150, 210);
@@ -854,10 +837,17 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       elevation = 2;
       shadowColor = const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4);
     } else {
-      backgroundColor = Theme.of(context).colorScheme.secondaryContainer;
+      backgroundColor = const Color.fromARGB(255, 227, 232, 235);
       foregroundColor = Theme.of(context).colorScheme.onSecondaryContainer;
       elevation = 0;
       shadowColor = null;
+
+      // Set count color for non-selected buttons
+      if (type == LogType.error) {
+        countColor = Colors.red;
+      } else if (type == LogType.warn) {
+        countColor = Colors.orange;
+      }
     }
 
     return ElevatedButton(
@@ -871,11 +861,33 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         foregroundColor: foregroundColor,
         elevation: elevation,
         shadowColor: shadowColor,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
         ),
       ),
-      child: Text('$text ($count)'),
+      child: RichText(
+        text: TextSpan(
+          style: TextStyle(
+            color: foregroundColor,
+            fontWeight: FontWeight.normal,
+          ),
+          children: [
+            TextSpan(text: '$text ('),
+            TextSpan(
+              text: '$count',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color:
+                    countColor, // This will be null for selected, which is fine
+              ),
+            ),
+            const TextSpan(text: ')'),
+          ],
+        ),
+      ),
     );
   }
 
@@ -901,13 +913,14 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         title: const Text('Tostore Demo'),
         actions: [
           IconButton(
-            icon: const Icon(
-              Icons.info_outline,
-              color: Colors.black54,
-              size: 28,
-            ),
-            tooltip: 'Database Info',
-            onPressed: _isDbInitialized ? _showDatabaseInfoDialog : null,
+            icon: const Icon(Icons.arrow_upward),
+            tooltip: 'Scroll to Top',
+            onPressed: _canScrollUp ? _scrollToTop : null,
+          ),
+          IconButton(
+            icon: const Icon(Icons.arrow_downward),
+            tooltip: 'Scroll to Bottom',
+            onPressed: _canScrollDown ? _scrollToBottom : null,
           ),
           IconButton(
             icon: const Icon(Icons.copy_outlined, size: 24),
@@ -1016,7 +1029,71 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
               ),
             ),
           ),
-          const Divider(height: 1),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: _searchController,
+                decoration: InputDecoration(
+                  hintText: 'Search in logs...',
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: _searchController.text.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            _searchController.clear();
+                          },
+                        )
+                      : null,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide:
+                        BorderSide(color: Colors.grey.shade300, width: 0.8),
+                  ),
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                ),
+              ),
+              const SizedBox(height: 14),
+              ValueListenableBuilder<List<LogEntry>>(
+                valueListenable: logService.logs,
+                builder: (context, logs, child) {
+                  // Calculate counts for each log type
+                  final allCount = logs.length;
+                  final infoCount =
+                      logs.where((log) => log.type == LogType.info).length;
+                  final debugCount =
+                      logs.where((log) => log.type == LogType.debug).length;
+                  final warnCount =
+                      logs.where((log) => log.type == LogType.warn).length;
+                  final errorCount =
+                      logs.where((log) => log.type == LogType.error).length;
+
+                  return Wrap(
+                    spacing: 8.0,
+                    runSpacing: 8.0,
+                    alignment: WrapAlignment.start,
+                    children: [
+                      _buildFilterButton('All', null, allCount, context),
+                      _buildFilterButton(
+                          'Info', LogType.info, infoCount, context),
+                      _buildFilterButton(
+                          'Debug', LogType.debug, debugCount, context),
+                      _buildFilterButton(
+                          'Warn', LogType.warn, warnCount, context),
+                      _buildFilterButton(
+                          'Error', LogType.error, errorCount, context),
+                    ],
+                  );
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          const Divider(height: 0.1),
           SingleChildScrollView(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
@@ -1024,68 +1101,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  TextField(
-                    controller: _searchController,
-                    decoration: InputDecoration(
-                      hintText: 'Search in logs...',
-                      prefixIcon: const Icon(Icons.search),
-                      suffixIcon: _searchController.text.isNotEmpty
-                          ? IconButton(
-                              icon: const Icon(Icons.clear),
-                              onPressed: () {
-                                _searchController.clear();
-                              },
-                            )
-                          : null,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: BorderSide(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .outline
-                                .withOpacity(0.8)),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 8),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  ValueListenableBuilder<List<LogEntry>>(
-                    valueListenable: logService.logs,
-                    builder: (context, logs, child) {
-                      // Calculate counts for each log type
-                      final allCount = logs.length;
-                      final infoCount =
-                          logs.where((log) => log.type == LogType.info).length;
-                      final debugCount =
-                          logs.where((log) => log.type == LogType.debug).length;
-                      final warnCount =
-                          logs.where((log) => log.type == LogType.warn).length;
-                      final errorCount =
-                          logs.where((log) => log.type == LogType.error).length;
-
-                      return Wrap(
-                        spacing: 8.0,
-                        runSpacing: 4.0,
-                        alignment: WrapAlignment.start,
-                        children: [
-                          _buildFilterButton('All', null, allCount, context),
-                          _buildFilterButton(
-                              'Info', LogType.info, infoCount, context),
-                          _buildFilterButton(
-                              'Debug', LogType.debug, debugCount, context),
-                          _buildFilterButton(
-                              'Warn', LogType.warn, warnCount, context),
-                          _buildFilterButton(
-                              'Error', LogType.error, errorCount, context),
-                        ],
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 16),
                   if (_isInitializing)
                     const Center(
                       child: Padding(
@@ -1119,6 +1134,40 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                           runSpacing: 12,
                           alignment: WrapAlignment.center,
                           children: [
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Clear Table',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .clearExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Clear Table: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
+                            SizedBox(
+                              width: MediaQuery.of(context).size.width / 2 - 22,
+                              child: _buildActionButton(
+                                  text: 'Query',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final elapsed = await widget.example
+                                              .queryExamples();
+                                          if (mounted) {
+                                            setState(() {
+                                              _lastOperationInfo =
+                                                  'Query: ${elapsed}ms';
+                                            });
+                                          }
+                                        }),
+                            ),
                             SizedBox(
                               width: MediaQuery.of(context).size.width / 2 - 22,
                               child: _buildActionButton(
@@ -1156,74 +1205,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                             SizedBox(
                               width: MediaQuery.of(context).size.width / 2 - 22,
                               child: _buildActionButton(
-                                  text: 'Add One',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .addOneExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Add One: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Query',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .queryExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Query: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Update One',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .updateOneExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Update One: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Delete One',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .deleteOneExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Delete One: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
                                   text: 'Delete Many',
                                   onPressed: !_isDbInitialized
                                       ? null
@@ -1241,19 +1222,17 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                             SizedBox(
                               width: MediaQuery.of(context).size.width / 2 - 22,
                               child: _buildActionButton(
-                                  text: 'Clear Table',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .clearExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Clear Table: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
+                                text: 'Run Integrity Tests',
+                                onPressed: !_isDbInitialized
+                                    ? null
+                                    : () async {
+                                        final tester = DatabaseTester(
+                                            widget.example.db,
+                                            logService,
+                                            _updateOperationInfo);
+                                        await tester.runAllTests();
+                                      },
+                              ),
                             ),
                           ],
                         ),
@@ -1267,97 +1246,47 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       ),
     );
   }
+}
 
-  Future<void> _showDatabaseInfoDialog() async {
-    // Show a loading dialog first
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return const Dialog(
-          child: Padding(
-            padding: EdgeInsets.all(20.0),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(width: 20),
-                Text("Fetching DB Info..."),
-              ],
-            ),
-          ),
-        );
-      },
-    );
+/// A simple class to hold log data along with its type.
+class LogEntry {
+  final String message;
+  final LogType type;
+  final DateTime timestamp;
 
-    try {
-      final db = widget.example.db;
-      final spaceInfo = await db.getSpaceInfo();
-      final tableNames = spaceInfo.tables;
-      final totalRecords = spaceInfo.recordCount;
+  LogEntry(
+      {required this.message, required this.type, required this.timestamp});
+}
 
-      if (!mounted) return;
-      Navigator.of(context).pop(); // Close the loading dialog
+/// A simple service to manage and notify about logs.
+class LogService {
+  final ValueNotifier<List<LogEntry>> _logs = ValueNotifier([]);
+  ValueNotifier<List<LogEntry>> get logs => _logs;
 
-      // Show the info dialog
-      showDialog(
-        context: context,
-        builder: (BuildContext context) {
-          return AlertDialog(
-            title: const Text('Database Information'),
-            content: SingleChildScrollView(
-              child: ListBody(
-                children: <Widget>[
-                  _buildInfoRow('Space Name:', spaceInfo.spaceName),
-                  _buildInfoRow('Data Size:',
-                      '${(spaceInfo.dataSizeBytes / 1024).toStringAsFixed(2)} KB'),
-                  _buildInfoRow('Tables:', tableNames.join(', ')),
-                  _buildInfoRow(
-                      'Total Records:', totalRecords.toString(), true),
-                ],
-              ),
-            ),
-            actions: <Widget>[
-              TextButton(
-                child: const Text('OK'),
-                onPressed: () {
-                  Navigator.of(context).pop();
-                },
-              ),
-            ],
-          );
-        },
-      );
-    } catch (e) {
-      if (!mounted) return;
-      Navigator.of(context).pop(); // Close the loading dialog
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to get DB info: $e')),
-      );
+  void add(String message,
+      [LogType type = LogType.info, bool fromCallback = false]) {
+    // To avoid UI freezing with a large number of logs, we keep a reasonable limit.
+    const maxLogs = 200;
+    final now = DateTime.now();
+    final timestampString =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+    final newLogs = List<LogEntry>.from(_logs.value);
+    newLogs.add(LogEntry(
+        message: '[$timestampString] $message', type: type, timestamp: now));
+    if (newLogs.length > maxLogs) {
+      newLogs.removeRange(0, newLogs.length - maxLogs);
+    }
+    _logs.value = newLogs;
+
+    // Only print to the developer console if the log is NOT from the internal callback.
+    if (!fromCallback) {
+      developer.log(message);
     }
   }
 
-  Widget _buildInfoRow(String title, String value,
-      [bool isHighlighted = false]) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4.0),
-      child: RichText(
-        text: TextSpan(
-          style: Theme.of(context).textTheme.bodyMedium,
-          children: <TextSpan>[
-            TextSpan(
-                text: '$title ',
-                style: const TextStyle(fontWeight: FontWeight.bold)),
-            TextSpan(
-                text: value,
-                style: isHighlighted
-                    ? TextStyle(
-                        color: Theme.of(context).colorScheme.primary,
-                        fontWeight: FontWeight.bold)
-                    : null),
-          ],
-        ),
-      ),
-    );
+  void clear() {
+    _logs.value = [];
   }
 }
+
+final logService = LogService();

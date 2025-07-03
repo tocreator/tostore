@@ -86,8 +86,8 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
         final pkValue = _data[primaryKey];
         // Strategy: Try-Update-Then-Insert, applied to the primary key.
         // This avoids race conditions inherent in a "read-then-write" approach.
-        final specificCondition =
-            QueryCondition()..where(primaryKey, '=', pkValue);
+        final specificCondition = QueryCondition()
+          ..where(primaryKey, '=', pkValue);
 
         final updateResult = await $db.updateInternal(
           $tableName,

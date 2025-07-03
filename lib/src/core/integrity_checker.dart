@@ -434,17 +434,6 @@ class IntegrityChecker {
 
       // whether it is a new table or not, validate table structure
       try {
-        // validate field default value validity for all fields
-        for (final field in newSchema.fields) {
-          final defaultValue = field.getDefaultValue();
-          if (!field.validateValue(defaultValue)) {
-            Logger.error(
-                'Field[${field.name}] default value validation failed, type: ${field.type}',
-                label: 'IntegrityChecker.validateMigration');
-            return false;
-          }
-        }
-
         // for non-new table, try to get records from stream and validate structure
         if (!isNewTable) {
           final stream = _dataStore.tableDataManager.streamRecords(tableName);

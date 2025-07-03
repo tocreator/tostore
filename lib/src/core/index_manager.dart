@@ -2854,8 +2854,6 @@ class IndexManager {
       });
 
       if (storeIndexMap.isEmpty) {
-        Logger.warn('No records to delete found in the index for $tableName.',
-            label: 'IndexManager.batchDeleteFromIndexes');
         return;
       }
 
