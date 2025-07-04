@@ -419,9 +419,11 @@ class ValueComparator {
       case DataType.vector:
         // For vector data, use generic comparison
         return compare;
-      default:
-        // If type is not specified or for any future types,
-        // use the general-purpose but slower comparison method.
+      case DataType.json:
+        // For json data, use generic comparison which falls back to string comparison.
+        return compare;
+      case null:
+        // If type is not specified, use the general-purpose but slower comparison method.
         return compare;
     }
   }

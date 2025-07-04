@@ -904,6 +904,20 @@ class FieldSchema {
           }
         }
         return null;
+      case DataType.json:
+        if (value is Map) return value;
+        if (value is String) {
+          try {
+            final decoded = jsonDecode(value);
+            if (decoded is Map) {
+              return decoded;
+            }
+            return null;
+          } catch (_) {
+            return null;
+          }
+        }
+        return null;
     }
   }
 
@@ -1004,6 +1018,8 @@ class FieldSchema {
         return value is VectorData ||
             (value is List && value.every((v) => v is num)) ||
             value is Uint8List;
+      case DataType.json:
+        return value is Map;
     }
   }
 }
@@ -1110,6 +1126,7 @@ enum DataType {
   datetime,
   array,
   vector, // Vector data type for storing numerical vector (embeddings)
+  json,
 }
 
 /// index type enum
