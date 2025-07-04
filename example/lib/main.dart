@@ -1029,68 +1029,71 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
               ),
             ),
           ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextField(
-                controller: _searchController,
-                decoration: InputDecoration(
-                  hintText: 'Search in logs...',
-                  prefixIcon: const Icon(Icons.search),
-                  suffixIcon: _searchController.text.isNotEmpty
-                      ? IconButton(
-                          icon: const Icon(Icons.clear),
-                          onPressed: () {
-                            _searchController.clear();
-                          },
-                        )
-                      : null,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: _searchController,
+                  decoration: InputDecoration(
+                    hintText: 'Search in logs...',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: _searchController.text.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear),
+                            onPressed: () {
+                              _searchController.clear();
+                            },
+                          )
+                        : null,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide:
+                          BorderSide(color: Colors.grey.shade300, width: 0.8),
+                    ),
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide:
-                        BorderSide(color: Colors.grey.shade300, width: 0.8),
-                  ),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 ),
-              ),
-              const SizedBox(height: 14),
-              ValueListenableBuilder<List<LogEntry>>(
-                valueListenable: logService.logs,
-                builder: (context, logs, child) {
-                  // Calculate counts for each log type
-                  final allCount = logs.length;
-                  final infoCount =
-                      logs.where((log) => log.type == LogType.info).length;
-                  final debugCount =
-                      logs.where((log) => log.type == LogType.debug).length;
-                  final warnCount =
-                      logs.where((log) => log.type == LogType.warn).length;
-                  final errorCount =
-                      logs.where((log) => log.type == LogType.error).length;
+                const SizedBox(height: 14),
+                ValueListenableBuilder<List<LogEntry>>(
+                  valueListenable: logService.logs,
+                  builder: (context, logs, child) {
+                    // Calculate counts for each log type
+                    final allCount = logs.length;
+                    final infoCount =
+                        logs.where((log) => log.type == LogType.info).length;
+                    final debugCount =
+                        logs.where((log) => log.type == LogType.debug).length;
+                    final warnCount =
+                        logs.where((log) => log.type == LogType.warn).length;
+                    final errorCount =
+                        logs.where((log) => log.type == LogType.error).length;
 
-                  return Wrap(
-                    spacing: 8.0,
-                    runSpacing: 8.0,
-                    alignment: WrapAlignment.start,
-                    children: [
-                      _buildFilterButton('All', null, allCount, context),
-                      _buildFilterButton(
-                          'Info', LogType.info, infoCount, context),
-                      _buildFilterButton(
-                          'Debug', LogType.debug, debugCount, context),
-                      _buildFilterButton(
-                          'Warn', LogType.warn, warnCount, context),
-                      _buildFilterButton(
-                          'Error', LogType.error, errorCount, context),
-                    ],
-                  );
-                },
-              ),
-            ],
+                    return Wrap(
+                      spacing: 8.0,
+                      runSpacing: 8.0,
+                      alignment: WrapAlignment.start,
+                      children: [
+                        _buildFilterButton('All', null, allCount, context),
+                        _buildFilterButton(
+                            'Info', LogType.info, infoCount, context),
+                        _buildFilterButton(
+                            'Debug', LogType.debug, debugCount, context),
+                        _buildFilterButton(
+                            'Warn', LogType.warn, warnCount, context),
+                        _buildFilterButton(
+                            'Error', LogType.error, errorCount, context),
+                      ],
+                    );
+                  },
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 20),
           const Divider(height: 0.1),

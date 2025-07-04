@@ -439,7 +439,6 @@ class ValueComparator {
       case PrimaryKeyType.shortCode:
         // These are base62-like strings where length is the primary sort key.
         return (a, b) => compareShortCodes(a.toString(), b.toString());
-      case PrimaryKeyType.none:
       default:
         // User-defined string primary keys. Use the full natural sort comparison
         // as we don't know the format. It's the safest and most flexible.
