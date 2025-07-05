@@ -611,6 +611,10 @@ class TostoreExample {
   }
 }
 
+// This flag is controlled by the DatabaseTester to precisely enable/disable
+// suppression of expected warnings during specific tests.
+bool _suppressSpecificWarnings = false;
+
 /// Simple UI to run examples
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -619,6 +623,17 @@ void main() async {
   // This ensures that initialization logs are captured and displayed in the UI.
   LogConfig.setConfig(
     onLogHandler: (message, type, label) {
+      // This is a special case to ignore an expected warning during a specific test.
+      // The non-nullable constraint test intentionally tries to insert a null value
+      // to verify that the database correctly rejects it. This generates a
+      // warning log that, while correct, could confuse users of the example app
+      // into thinking there is an unexpected error. We filter it out here *only*
+      // when the DatabaseTester explicitly asks for it.
+      if (_suppressSpecificWarnings &&
+          type == LogType.warn &&
+          message.contains('cannot be null')) {
+        return; // Suppress expected warning from non-nullable constraint test
+      }
       logService.add('[$label] $message', type, true);
     },
   );
@@ -1229,9 +1244,15 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                     ? null
                                     : () async {
                                         final tester = DatabaseTester(
-                                            widget.example.db,
-                                            logService,
-                                            _updateOperationInfo);
+                                          widget.example.db,
+                                          logService,
+                                          _updateOperationInfo,
+                                          // Pass a callback to let the tester control suppression.
+                                          (isSuppressing) {
+                                            _suppressSpecificWarnings =
+                                                isSuppressing;
+                                          },
+                                        );
                                         await tester.runAllTests();
                                       },
                               ),

@@ -8,8 +8,10 @@ class DatabaseTester {
   final ToStore db;
   final LogService log;
   final Function(String) _updateLastOperation;
+  final void Function(bool) setWarningSuppression;
 
-  DatabaseTester(this.db, this.log, this._updateLastOperation);
+  DatabaseTester(this.db, this.log, this._updateLastOperation,
+      this.setWarningSuppression);
 
   void _passTest(String message) {
     log.add('✅ PASS: $message', LogType.info);
@@ -87,7 +89,18 @@ class DatabaseTester {
 
         _updateLastOperation(
             'Running Test ${i + 1}/${tests.length}: $testName...');
-        final bool passed = await testFunction();
+        bool passed;
+        // Precisely control warning suppression only for the non-nullable test.
+        if (testName == 'Non-Nullable Constraint') {
+          setWarningSuppression(true);
+          try {
+            passed = await testFunction();
+          } finally {
+            setWarningSuppression(false);
+          }
+        } else {
+          passed = await testFunction();
+        }
         allTestsPassed &= passed;
 
         if (!passed && testName == 'Clear & Delete All') {
@@ -106,6 +119,9 @@ class DatabaseTester {
     } catch (e, s) {
       _failTest('An unexpected error occurred during tests: $e\n$s');
       allTestsPassed = false;
+    } finally {
+      // Ensure suppression is always turned off even if the test loop fails.
+      setWarningSuppression(false);
     }
 
     _updateLastOperation(
