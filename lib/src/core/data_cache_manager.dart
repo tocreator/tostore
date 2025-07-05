@@ -10,6 +10,7 @@ import 'crontab_manager.dart';
 import 'dart:convert';
 import 'memory_manager.dart';
 import '../handler/value_comparator.dart';
+import 'dart:async';
 
 /// Data cache manager
 class DataCacheManager {
@@ -41,6 +42,20 @@ class DataCacheManager {
   // threshold-based auto-disable
   bool _autoQueryCacheDisabled = false;
   bool get isAutoCacheDisabled => _autoQueryCacheDisabled;
+
+  // A simple set for getQuery to quickly check if a table's cache is locked for reading.
+  final Set<String> _lockedTablesWithQuery = <String>{};
+  // A reference counter to track the number of concurrent background invalidation
+  // jobs running for a specific table. The read lock is only released when this hits zero.
+  final Map<String, int> _invalidationRefCounts = {};
+
+  // --- Self-Calibrating Performance Model ---
+  // The average time it takes to perform a single condition check.
+  // This value is learned and updated at runtime.
+  // Initialized to a reasonable default (e.g., 50 microseconds).
+  Duration _averageCheckDuration = const Duration(microseconds: 50);
+  // A counter to stabilize the initial average calculations.
+  int _calibrationSamples = 0;
 
   DataCacheManager(this._dataStore)
       : _queryCache = QueryCache(
@@ -346,6 +361,14 @@ class DataCacheManager {
 
   /// Get cached query results
   List<Map<String, dynamic>>? getQuery(QueryCacheKey key) {
+    final tableName = key.tableName;
+
+    // If the table's cache is actively being cleaned in the background,
+    // we must bypass the cache to guarantee consistency.
+    if (_lockedTablesWithQuery.contains(tableName)) {
+      return null;
+    }
+
     final results = _queryCache.get(key.toString());
     return results;
   }
@@ -504,18 +527,6 @@ class DataCacheManager {
         }
       }
 
-      // if query caching is disabled, do not touch the query cache at all.
-      if (_dataStore.config.shouldEnableQueryCache == false ||
-          _autoQueryCacheDisabled) {
-        return;
-      }
-
-      // 2. Invalidate relevant queries from the QueryCache
-      if (primaryKeyValues.isEmpty) {
-        await _cleanupAllTableRelatedQueries(tableName);
-        return;
-      }
-
       await invalidateAffectedQueries(
         tableName,
         records: records,
@@ -538,17 +549,91 @@ class DataCacheManager {
     List<Map<String, dynamic>>? records,
     Set<String>? primaryKeyValues,
   }) async {
+    // if query caching is disabled.
+    if (_dataStore.config.shouldEnableQueryCache == false ||
+        _autoQueryCacheDisabled) {
+      return;
+    }
+
+    // A request with no specifics is a signal to clear all query caches for the table.
     if ((records == null || records.isEmpty) &&
         (primaryKeyValues == null || primaryKeyValues.isEmpty)) {
+      await _cleanupAllTableRelatedQueries(tableName);
       return;
     }
 
     final tableDependency = _tableDependencies[tableName];
     if (tableDependency == null || tableDependency.isEmpty) return;
 
+    // --- Adaptive, Self-Calibrating Decision Logic ---
+    final int changeCount = records?.length ?? 0;
+    final int tableCacheCount = tableDependency.length;
+
+    // 1. Calculate the projected number of computationally expensive checks.
+    final int projectedChecks = tableCacheCount * changeCount;
+
+    // 2. Predict the total duration based on the learned average check time.
+    final Duration estimatedDuration = _averageCheckDuration * projectedChecks;
+
+    // 3. Compare with a real-time threshold.
+    if (estimatedDuration > const Duration(milliseconds: 200)) {
+      // **High-Cost Operation: Use Reference-Counted Background Invalidation**
+
+      // 1. Acquire lock and increment the reference counter.
+      _lockedTablesWithQuery.add(tableName);
+      _invalidationRefCounts.update(tableName, (count) => count + 1,
+          ifAbsent: () => 1);
+
+      // 2. Launch the fine-grained cleanup in a non-blocking background task.
+      // We ALWAYS launch a new task to handle the new data.
+      Future(() async {
+        try {
+          await _performFineGrainedInvalidation(
+              tableName, tableDependency, records, primaryKeyValues,
+              performCalibration: false);
+        } catch (e) {
+          Logger.error(
+              'Background cache invalidation for table $tableName failed: $e',
+              label: 'DataCacheManager.invalidateAffectedQueries');
+        } finally {
+          // 3. Decrement the reference counter and release the lock ONLY if it's the last job.
+          final currentCount = _invalidationRefCounts[tableName];
+          if (currentCount != null) {
+            if (currentCount <= 1) {
+              // This is the last worker, release the lock fully.
+              _invalidationRefCounts.remove(tableName);
+              _lockedTablesWithQuery.remove(tableName);
+            } else {
+              // Other workers are still running. Just decrement the count.
+              _invalidationRefCounts[tableName] = currentCount - 1;
+            }
+          }
+        }
+      });
+    } else {
+      // **Low-Cost Operation: Perform Invalidation Synchronously and Calibrate**
+      await _performFineGrainedInvalidation(
+          tableName, tableDependency, records, primaryKeyValues,
+          performCalibration: true);
+    }
+  }
+
+  /// Performs the actual logic of iterating through and removing affected query caches.
+  /// This can be called synchronously for low-cost operations or in the background for high-cost ones.
+  Future<void> _performFineGrainedInvalidation(
+    String tableName,
+    Map<String, _QueryInfo> tableDependency,
+    List<Map<String, dynamic>>? records,
+    Set<String>? primaryKeyValues, {
+    required bool performCalibration,
+  }) async {
+    final stopwatch = performCalibration ? (Stopwatch()..start()) : null;
+
     final keysToRemove = <String>{};
+    int totalChecks = 0;
     int processedCount = 0;
 
+    // Use a copy of the keys to prevent modification during iteration issues.
     for (final key in tableDependency.keys.toList()) {
       if (keysToRemove.contains(key)) continue;
 
@@ -578,6 +663,9 @@ class DataCacheManager {
       // Condition-based check: if any of the affected records match the query condition, invalidate the cache.
       if (records != null && records.isNotEmpty) {
         for (final recordData in records) {
+          if (performCalibration) {
+            totalChecks++; // Increment for each check
+          }
           if (queryInfo.queryKey.condition.matches(recordData)) {
             keysToRemove.add(key);
             break; // One match is enough to invalidate this query.
@@ -599,6 +687,28 @@ class DataCacheManager {
 
     if (tableDependency.isEmpty) {
       _tableDependencies.remove(tableName);
+    }
+
+    if (performCalibration && stopwatch != null && totalChecks > 0) {
+      stopwatch.stop();
+      // --- Self-Calibration Logic ---
+      final currentDuration = stopwatch.elapsed;
+      final avgForThisRun = currentDuration ~/ totalChecks;
+      final newAvgMicros = avgForThisRun.inMicroseconds;
+
+      // Use a moving average to smooth out the value and adapt over time.
+      // Give more weight to the new value initially to converge faster.
+      final weight = (_calibrationSamples < 10) ? 0.5 : 0.1;
+      final oldAvgMicros = _averageCheckDuration.inMicroseconds;
+
+      _averageCheckDuration = Duration(
+          microseconds:
+              (oldAvgMicros * (1 - weight) + newAvgMicros * weight).round());
+
+      if (_calibrationSamples < 100) {
+        // Cap the sample count
+        _calibrationSamples++;
+      }
     }
   }
 
