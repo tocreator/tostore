@@ -485,21 +485,16 @@ class DataCacheManager {
 
   /// Invalidate multiple records from the cache for a specific table.
   /// [primaryKeyValues] is a list of primary key values to invalidate.
+  /// [records] contains the data of the records being invalidated, used for accurate query cache invalidation.
   Future<void> invalidateRecords(
-      String tableName, List<String> primaryKeyValues) async {
+    String tableName,
+    List<String> primaryKeyValues,
+    List<Map<String, dynamic>> records,
+  ) async {
     try {
       // 1. Invalidate records from the TableCache
       final tableCache = tableCaches[tableName];
-      final List<Map<String, dynamic>> recordsData = [];
       if (tableCache != null) {
-        // First, collect record data for the primary keys to be invalidated.
-        for (final pkValue in primaryKeyValues) {
-          // Do not use getRecord as it updates access time. Access map directly.
-          final recordCache = tableCache.recordsMap[pkValue];
-          if (recordCache != null) {
-            recordsData.add(recordCache.record);
-          }
-        }
         // Now, remove the records from the cache.
         for (final pkValue in primaryKeyValues) {
           final removed = tableCache.recordsMap.remove(pkValue);
@@ -516,19 +511,16 @@ class DataCacheManager {
       }
 
       // 2. Invalidate relevant queries from the QueryCache
-      const int batchThreshold = 100;
-
       if (primaryKeyValues.isEmpty) {
         await _cleanupAllTableRelatedQueries(tableName);
         return;
       }
 
-      if (primaryKeyValues.length > batchThreshold) {
-        await _cleanupAllTableRelatedQueries(tableName);
-      } else {
-        await _cleanupQueriesContainingPrimaryKeys(
-            tableName, primaryKeyValues.toSet(), recordsData);
-      }
+      await invalidateAffectedQueries(
+        tableName,
+        records: records,
+        primaryKeyValues: primaryKeyValues.toSet(),
+      );
     } catch (e) {
       Logger.error(
         'Failed to invalidate records: $e',
@@ -537,98 +529,62 @@ class DataCacheManager {
     }
   }
 
-  /// Invalidate record related cache
-  Future<void> invalidateRecord(
-      String tableName, dynamic primaryKeyValue) async {
-    try {
-      // If query caching is disabled globally, only invalidate the record cache.
-      if (_dataStore.config.shouldEnableQueryCache == false ||
-          _autoQueryCacheDisabled) {
-        final tableCache = tableCaches[tableName];
-        if (tableCache != null) {
-          final pkString = primaryKeyValue.toString();
-          final recordCache = tableCache.getRecord(pkString);
-          if (recordCache != null) {
-            _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
-            tableCache.recordsMap.remove(pkString);
-          }
-        }
-        return;
-      }
-
-      // 1. Clean up primary key based query cache, this is a direct and efficient path
-      await invalidateRecordByPrimaryKey(tableName, primaryKeyValue);
-
-      // 2. Try to get record data from the record cache
-      final tableCache = tableCaches[tableName];
-      Map<String, dynamic>? recordData;
-
-      if (tableCache != null) {
-        final pkString = primaryKeyValue.toString();
-        final recordCache = tableCache.getRecord(pkString);
-        recordData = recordCache?.record;
-
-        // Remove the record from the record cache if it exists
-        if (recordCache != null) {
-          _totalRecordCacheSize -= recordCache.estimateMemoryUsage();
-          tableCache.recordsMap.remove(pkString);
-        }
-      }
-
-      // 3. Clean up all related query caches.
-      // Pass in recordData if available to perform a more comprehensive cleanup.
-      await _cleanupRelatedQueries(tableName, primaryKeyValue, recordData);
-    } catch (e) {
-      Logger.error('Invalidate record cache failed: $e',
-          label: 'DataCacheManager.invalidateRecord');
+  /// Unified method for cleaning up query caches based on affected records (for insertion, update, deletion).
+  /// [records] is used for condition matching.
+  /// [primaryKeyValues] is used for fast path invalidation based on result keys.
+  /// At least one of them should be provided.
+  Future<void> invalidateAffectedQueries(
+    String tableName, {
+    List<Map<String, dynamic>>? records,
+    Set<String>? primaryKeyValues,
+  }) async {
+    if ((records == null || records.isEmpty) &&
+        (primaryKeyValues == null || primaryKeyValues.isEmpty)) {
+      return;
     }
-  }
 
-  /// Clean up queries containing specified primary key values
-  Future<void> _cleanupQueriesContainingPrimaryKeys(String tableName,
-      Set<dynamic> primaryKeyValues, List<Map<String, dynamic>> records) async {
     final tableDependency = _tableDependencies[tableName];
-    if (tableDependency == null) return;
+    if (tableDependency == null || tableDependency.isEmpty) return;
 
     final keysToRemove = <String>{};
-    final primaryKeyStrings =
-        primaryKeyValues.map((pk) => pk.toString()).toSet();
     int processedCount = 0;
 
     for (final key in tableDependency.keys.toList()) {
       if (keysToRemove.contains(key)) continue;
 
       final queryInfo = tableDependency[key];
-      if (queryInfo == null) continue;
-      if (queryInfo.isUserManaged) continue;
+      if (queryInfo == null || queryInfo.isUserManaged) continue;
 
       if (queryInfo.isFullTableCache) {
         keysToRemove.add(key);
         continue;
       }
 
-      bool hasIntersection = false;
-      for (final resultKey in queryInfo.resultKeys) {
-        if (primaryKeyStrings.contains(resultKey)) {
-          hasIntersection = true;
-          break;
+      // Fast-path check: if the query result contains any of the affected primary keys, invalidate directly.
+      if (primaryKeyValues != null && primaryKeyValues.isNotEmpty) {
+        bool hasIntersection = false;
+        for (final resultKey in queryInfo.resultKeys) {
+          if (primaryKeyValues.contains(resultKey)) {
+            hasIntersection = true;
+            break;
+          }
+        }
+        if (hasIntersection) {
+          keysToRemove.add(key);
+          continue;
         }
       }
 
-      if (hasIntersection) {
-        keysToRemove.add(key);
-        continue;
-      }
-
-      // Final check: if any of the records match the query condition, clean up the cache
-      if (records.isNotEmpty) {
+      // Condition-based check: if any of the affected records match the query condition, invalidate the cache.
+      if (records != null && records.isNotEmpty) {
         for (final recordData in records) {
           if (queryInfo.queryKey.condition.matches(recordData)) {
             keysToRemove.add(key);
-            break; // One match is enough to invalidate this query
+            break; // One match is enough to invalidate this query.
           }
         }
       }
+
       processedCount++;
       if (processedCount % 50 == 0) {
         // Yield to event loop to avoid blocking UI
@@ -706,92 +662,6 @@ class DataCacheManager {
     // If there are no related queries, clean up dependencies
     if (tableDependency.isEmpty) {
       _tableDependencies.remove(tableName);
-    }
-  }
-
-  /// Clean up queries related to specific records
-  Future<void> _cleanupRelatedQueries(String tableName, dynamic primaryKeyValue,
-      Map<String, dynamic>? recordData) async {
-    final tableQueries = _tableDependencies[tableName];
-    if (tableQueries == null) return;
-
-    try {
-      final keysToRemove = <String>[];
-      final pkString = primaryKeyValue.toString();
-
-      // Get all fields of the record for quick checking of whether the query might match
-      final recordFields = recordData?.keys.toSet();
-
-      int processedCount = 0;
-      // Check each query using the efficient key-collection pattern
-      for (final cacheKeyStr in tableQueries.keys.toList()) {
-        final queryInfo = tableQueries[cacheKeyStr];
-        // The entry could have been removed by another process in the await gap.
-        if (queryInfo == null) continue;
-
-        // Skip user-managed caches, which need to be manually invalidated by the user
-        if (queryInfo.isUserManaged) {
-          continue; // Skip user-managed caches
-        }
-
-        // 1. If it's a full table cache, clean it up directly
-        if (queryInfo.isFullTableCache) {
-          keysToRemove.add(cacheKeyStr);
-          continue;
-        }
-
-        // 2. If the query's primary key is in the result set, clean it up
-        if (queryInfo.resultKeys.contains(pkString)) {
-          keysToRemove.add(cacheKeyStr);
-          continue;
-        }
-
-        // If there is no record data, subsequent checks cannot be performed
-        if (recordData == null || recordFields == null) {
-          continue;
-        }
-
-        // 3. Optimization: check the intersection of query fields and record fields
-        final conditions = queryInfo.queryKey.condition.build();
-        bool hasFieldOverlap = false;
-
-        // If the query condition fields intersect with the record fields, it may need to be cleaned up
-        for (var field in conditions.keys) {
-          if (recordFields.contains(field) || field == 'OR' || field == 'AND') {
-            hasFieldOverlap = true;
-            break;
-          }
-        }
-
-        // If the query condition fields do not intersect with the record fields, skip
-        if (!hasFieldOverlap) {
-          continue;
-        }
-
-        // 4. Final check: if the record matches the query condition, clean up the cache
-        if (queryInfo.queryKey.condition.matches(recordData)) {
-          keysToRemove.add(cacheKeyStr);
-        }
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          // Yield to event loop to avoid blocking UI
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // Remove related query caches
-      for (var key in keysToRemove) {
-        _queryCache.invalidate(key);
-        tableQueries.remove(key);
-      }
-
-      // If there are no more related queries, clean up the dependency
-      if (tableQueries.isEmpty) {
-        _tableDependencies.remove(tableName);
-      }
-    } catch (e) {
-      Logger.error('Failed to clean up related queries: $e',
-          label: 'DataCacheManager._cleanupRelatedQueries');
     }
   }
 

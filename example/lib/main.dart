@@ -805,7 +805,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           borderRadius: BorderRadius.circular(12),
         ),
         elevation: 2,
-        shadowColor: const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4),
+        shadowColor: const Color.fromARGB(102, 6, 126, 177),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
       ),
       child: Text(
@@ -835,7 +835,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       backgroundColor = const Color.fromARGB(255, 10, 150, 210);
       foregroundColor = Colors.white;
       elevation = 2;
-      shadowColor = const Color.fromARGB(255, 6, 126, 177).withOpacity(0.4);
+      shadowColor = const Color.fromARGB(102, 6, 126, 177);
     } else {
       backgroundColor = const Color.fromARGB(255, 227, 232, 235);
       foregroundColor = Theme.of(context).colorScheme.onSecondaryContainer;
@@ -900,7 +900,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       case LogType.debug:
         return Colors.blueAccent;
       case LogType.info:
-      default:
         return Colors.black;
     }
   }
@@ -982,7 +981,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         children: [
           Expanded(
             child: Container(
-              color: Theme.of(context).colorScheme.surface.withOpacity(0.1),
+              color: Theme.of(context).colorScheme.surface.withAlpha(26),
               padding: const EdgeInsets.all(8.0),
               child: ValueListenableBuilder<List<LogEntry>>(
                 valueListenable: logService.logs,

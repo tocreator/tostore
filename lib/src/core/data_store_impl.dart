@@ -701,6 +701,7 @@ class DataStoreImpl {
 
     // 1. Begin transaction
     final transaction = await _transactionManager!.beginTransaction();
+    Map<String, dynamic>? validData;
 
     try {
       // 2. Data validation
@@ -713,7 +714,7 @@ class DataStoreImpl {
           message: 'Table $tableName does not exist',
         );
       }
-      final validData = await _validateAndProcessData(schema, data, tableName);
+      validData = await _validateAndProcessData(schema, data, tableName);
       if (validData == null) {
         return DbResult.error(
           type: ResultType.validationFailed,
@@ -753,6 +754,10 @@ class DataStoreImpl {
       // 6. Commit transaction
       await _transactionManager!.commit(transaction);
 
+      // Invalidate query caches that might be affected by the new record
+      await dataCacheManager.invalidateAffectedQueries(tableName,
+          records: [validData]);
+
       // Return string type primary key value
       final primaryKeyValue = validData[schema.primaryKey];
       return DbResult.success(
@@ -768,10 +773,14 @@ class DataStoreImpl {
 
         // Clear cache
         final schema = await getTableSchema(tableName);
-        final primaryKeyValue = schema != null ? data[schema.primaryKey] : null;
+        final primaryKeyValue = validData != null && schema != null
+            ? validData[schema.primaryKey]
+            : null;
         if (primaryKeyValue != null) {
-          await dataCacheManager.invalidateRecord(
-              tableName, primaryKeyValue.toString());
+          await dataCacheManager
+              .invalidateRecords(tableName, [primaryKeyValue.toString()], [
+            validData!,
+          ]);
         }
 
         // clear write queue
@@ -1465,12 +1474,15 @@ class DataStoreImpl {
           // Add to success keys
           successKeys.add(pkValue);
 
-          // Remove from record cache
-          await dataCacheManager.invalidateRecord(tableName, pkValue);
+        
 
           // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
           writeQueue?.remove(pkValue);
         }
+
+        // Remove from record cache
+        await dataCacheManager.invalidateRecords(
+            tableName, successKeys, recordsToDelete);
 
         // Add records to delete buffer instead of directly writing to file
         await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
@@ -1554,7 +1566,8 @@ class DataStoreImpl {
             totalProcessed += originalCount;
 
             if (deletedRecords.isNotEmpty) {
-              await dataCacheManager.invalidateRecords(tableName, deletedKeys);
+              await dataCacheManager.invalidateRecords(
+                  tableName, deletedKeys, deletedRecords);
               // batch update indexes
               await _indexManager?.batchDeleteFromIndexes(
                   tableName, deletedRecords);
@@ -1894,6 +1907,11 @@ class DataStoreImpl {
           'count': validRecords.length,
           'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
+
+        // Invalidate query caches for all newly inserted valid records
+        // Use a non-blocking future to avoid delaying the response
+        Future(() => dataCacheManager.invalidateAffectedQueries(
+            tableName, records: validRecords));
 
         // Return result
         if (invalidRecords.isEmpty) {
