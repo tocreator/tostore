@@ -681,6 +681,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   String _lastOperationInfo = 'Please initialize the database first.';
   bool _isDbInitialized = false;
   bool _isInitializing = true;
+  bool _isTesting = false; // Add state to track if a test is running
   bool _canScrollUp = false;
   bool _canScrollDown = false;
   bool _isAtBottom = true; // Assume we start at the bottom
@@ -1158,10 +1159,30 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                           Container(
                             height: 40,
                             alignment: Alignment.center,
-                            child: Text(
-                              _lastOperationInfo,
-                              style: Theme.of(context).textTheme.titleMedium,
-                              overflow: TextOverflow.ellipsis,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                if (_isTesting) ...[
+                                  const SizedBox(
+                                    height: 16,
+                                    width: 16,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2.0),
+                                  ),
+                                  const SizedBox(width: 12),
+                                ],
+                                Expanded(
+                                  child: Text(
+                                    _lastOperationInfo,
+                                    style:
+                                        Theme.of(context).textTheme.titleMedium,
+                                    overflow: TextOverflow.ellipsis,
+                                    textAlign: _isTesting
+                                        ? TextAlign.start
+                                        : TextAlign.center,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                           Wrap(
@@ -1173,16 +1194,28 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                     text: 'Clear Table',
-                                    onPressed: !_isDbInitialized
+                                    onPressed: !_isDbInitialized || _isTesting
                                         ? null
                                         : () async {
-                                            final elapsed = await widget.example
-                                                .clearExamples();
-                                            if (mounted) {
-                                              setState(() {
-                                                _lastOperationInfo =
-                                                    'Clear Table: ${elapsed}ms';
-                                              });
+                                            setState(() {
+                                              _isTesting = true;
+                                              _lastOperationInfo =
+                                                  'Clearing tables...';
+                                            });
+                                            try {
+                                              final elapsed = await widget
+                                                  .example
+                                                  .clearExamples();
+                                              if (mounted) {
+                                                _updateOperationInfo(
+                                                    'Clear Table: ${elapsed}ms');
+                                              }
+                                            } finally {
+                                              if (mounted) {
+                                                setState(() {
+                                                  _isTesting = false;
+                                                });
+                                              }
                                             }
                                           }),
                               ),
@@ -1190,16 +1223,27 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                     text: 'Query',
-                                    onPressed: !_isDbInitialized
+                                    onPressed: !_isDbInitialized || _isTesting
                                         ? null
                                         : () async {
-                                            final elapsed = await widget.example
-                                                .queryExamples();
-                                            if (mounted) {
-                                              setState(() {
-                                                _lastOperationInfo =
-                                                    'Query: ${elapsed}ms';
-                                              });
+                                            setState(() {
+                                              _isTesting = true;
+                                              _lastOperationInfo = 'Querying...';
+                                            });
+                                            try {
+                                              final elapsed = await widget
+                                                  .example
+                                                  .queryExamples();
+                                              if (mounted) {
+                                                _updateOperationInfo(
+                                                    'Query: ${elapsed}ms');
+                                              }
+                                            } finally {
+                                              if (mounted) {
+                                                setState(() {
+                                                  _isTesting = false;
+                                                });
+                                              }
                                             }
                                           }),
                               ),
@@ -1207,16 +1251,28 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                     text: 'Batch Add 10k',
-                                    onPressed: !_isDbInitialized
+                                    onPressed: !_isDbInitialized || _isTesting
                                         ? null
                                         : () async {
-                                            final elapsed = await widget.example
-                                                .addExamples();
-                                            if (mounted) {
-                                              setState(() {
-                                                _lastOperationInfo =
-                                                    'Batch Add 10k: ${elapsed}ms';
-                                              });
+                                            setState(() {
+                                              _isTesting = true;
+                                              _lastOperationInfo =
+                                                  'Batch Adding...';
+                                            });
+                                            try {
+                                              final elapsed = await widget
+                                                  .example
+                                                  .addExamples();
+                                              if (mounted) {
+                                                _updateOperationInfo(
+                                                    'Batch Add 10k: ${elapsed}ms');
+                                              }
+                                            } finally {
+                                              if (mounted) {
+                                                setState(() {
+                                                  _isTesting = false;
+                                                });
+                                              }
                                             }
                                           }),
                               ),
@@ -1224,16 +1280,28 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                     text: 'Slow Add 10k',
-                                    onPressed: !_isDbInitialized
+                                    onPressed: !_isDbInitialized || _isTesting
                                         ? null
                                         : () async {
-                                            final elapsed = await widget.example
-                                                .addExamplesOneByOne();
-                                            if (mounted) {
-                                              setState(() {
-                                                _lastOperationInfo =
-                                                    'Slow Add 10k: ${elapsed}ms';
-                                              });
+                                            setState(() {
+                                              _isTesting = true;
+                                              _lastOperationInfo =
+                                                  'Slow Adding...';
+                                            });
+                                            try {
+                                              final elapsed = await widget
+                                                  .example
+                                                  .addExamplesOneByOne();
+                                              if (mounted) {
+                                                _updateOperationInfo(
+                                                    'Slow Add 10k: ${elapsed}ms');
+                                              }
+                                            } finally {
+                                              if (mounted) {
+                                                setState(() {
+                                                  _isTesting = false;
+                                                });
+                                              }
                                             }
                                           }),
                               ),
@@ -1241,16 +1309,28 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                     text: 'Delete Many',
-                                    onPressed: !_isDbInitialized
+                                    onPressed: !_isDbInitialized || _isTesting
                                         ? null
                                         : () async {
-                                            final elapsed = await widget.example
-                                                .deleteExamples();
-                                            if (mounted) {
-                                              setState(() {
-                                                _lastOperationInfo =
-                                                    'Delete Many: ${elapsed}ms';
-                                              });
+                                            setState(() {
+                                              _isTesting = true;
+                                              _lastOperationInfo =
+                                                  'Deleting...';
+                                            });
+                                            try {
+                                              final elapsed = await widget
+                                                  .example
+                                                  .deleteExamples();
+                                              if (mounted) {
+                                                _updateOperationInfo(
+                                                    'Delete Many: ${elapsed}ms');
+                                              }
+                                            } finally {
+                                              if (mounted) {
+                                                setState(() {
+                                                  _isTesting = false;
+                                                });
+                                              }
                                             }
                                           }),
                               ),
@@ -1258,7 +1338,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                   text: 'Concurrency Test',
-                                  onPressed: !_isDbInitialized
+                                  onPressed: !_isDbInitialized || _isTesting
                                       ? null
                                       : _showConcurrencyTestDialog,
                                 ),
@@ -1267,20 +1347,31 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 width: MediaQuery.of(context).size.width / 2 - 22,
                                 child: _buildActionButton(
                                   text: 'Run Integrity Tests',
-                                  onPressed: !_isDbInitialized
+                                  onPressed: !_isDbInitialized || _isTesting
                                       ? null
                                       : () async {
-                                          final tester = DatabaseTester(
-                                            widget.example.db,
-                                            logService,
-                                            _updateOperationInfo,
-                                            // Pass a callback to let the tester control suppression.
-                                            (isSuppressing) {
-                                              _suppressSpecificWarnings =
-                                                  isSuppressing;
-                                            },
-                                          );
-                                          await tester.runAllTests();
+                                          setState(() {
+                                            _isTesting = true;
+                                          });
+                                          try {
+                                            final tester = DatabaseTester(
+                                              widget.example.db,
+                                              logService,
+                                              _updateOperationInfo,
+                                              // Pass a callback to let the tester control suppression.
+                                              (isSuppressing) {
+                                                _suppressSpecificWarnings =
+                                                    isSuppressing;
+                                              },
+                                            );
+                                            await tester.runAllTests();
+                                          } finally {
+                                            if (mounted) {
+                                              setState(() {
+                                                _isTesting = false;
+                                              });
+                                            }
+                                          }
                                         },
                                 ),
                               ),
@@ -1307,16 +1398,27 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
     if (config != null) {
       _updateOperationInfo('Running Custom Concurrency Test...');
-      final tester = DatabaseTester(
-        widget.example.db,
-        logService,
-        _updateOperationInfo,
-        (isSuppressing) {
-          _suppressSpecificWarnings = isSuppressing;
-        },
-      );
-      await tester.runConfigurableConcurrencyTest(config);
-      _updateOperationInfo('✅ Custom Concurrency Test Finished');
+      setState(() {
+        _isTesting = true;
+      });
+      try {
+        final tester = DatabaseTester(
+          widget.example.db,
+          logService,
+          _updateOperationInfo,
+          (isSuppressing) {
+            _suppressSpecificWarnings = isSuppressing;
+          },
+        );
+        await tester.runConfigurableConcurrencyTest(config);
+        _updateOperationInfo('✅ Custom Concurrency Test Finished');
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isTesting = false;
+          });
+        }
+      }
     }
   }
 }
@@ -1334,20 +1436,20 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
 
   final _controllers = {
     'users': {
-      'insert': TextEditingController(text: '100'),
-      'read': TextEditingController(text: '100'),
+      'insert': TextEditingController(text: '500'),
+      'read': TextEditingController(text: '500'),
       'update': TextEditingController(text: '50'),
       'delete': TextEditingController(text: '50'),
     },
     'posts': {
-      'insert': TextEditingController(text: '200'),
-      'read': TextEditingController(text: '100'),
+      'insert': TextEditingController(text: '500'),
+      'read': TextEditingController(text: '500'),
       'update': TextEditingController(text: '50'),
       'delete': TextEditingController(text: '50'),
     },
     'comments': {
       'insert': TextEditingController(text: '500'),
-      'read': TextEditingController(text: '100'),
+      'read': TextEditingController(text: '500'),
       'update': TextEditingController(text: '50'),
       'delete': TextEditingController(text: '50'),
     },
@@ -1377,26 +1479,43 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
+      // 1. Make dialog wider by reducing horizontal padding
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
       title: const Text('Configure Concurrency Test'),
-      content: SingleChildScrollView(
-        child: Form(
-          key: _formKey,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: _controllers.entries.map((tableEntry) {
-              return _buildTableSection(tableEntry.key, tableEntry.value);
-            }).toList(),
+      // Use a SizedBox to constrain the content width
+      content: SizedBox(
+        width: MediaQuery.of(context).size.width, // Use full screen width
+        child: SingleChildScrollView(
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: _controllers.entries.map((tableEntry) {
+                return _buildTableSection(tableEntry.key, tableEntry.value);
+              }).toList(),
+            ),
           ),
         ),
       ),
+      // 2. Center the buttons
+      actionsAlignment: MainAxisAlignment.center,
+      actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
+        const SizedBox(width: 16),
+        // 3. Style the Run Test button to match the main screen
         ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            foregroundColor: Colors.white,
+            backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+          ),
           onPressed: _onRun,
-          child: const Text('Run Test'),
+          child: const Text('Run Test', style: TextStyle(fontSize: 16)),
         ),
       ],
     );
@@ -1405,7 +1524,8 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
   Widget _buildTableSection(
       String title, Map<String, TextEditingController> controllers) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 16.0),
+      // 4. Adjust spacing for better visual layout
+      padding: const EdgeInsets.only(bottom: 24.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1413,11 +1533,15 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
             '${title[0].toUpperCase()}${title.substring(1)}',
             style: Theme.of(context).textTheme.titleLarge,
           ),
-          const SizedBox(height: 8),
-          _buildOperationRow('Inserts', controllers['insert']!),
-          _buildOperationRow('Reads', controllers['read']!),
-          _buildOperationRow('Updates', controllers['update']!),
-          _buildOperationRow('Deletes', controllers['delete']!),
+          const SizedBox(height: 16),
+          if (controllers.containsKey('insert'))
+            _buildOperationRow('Inserts', controllers['insert']!),
+          if (controllers.containsKey('read'))
+            _buildOperationRow('Reads', controllers['read']!),
+          if (controllers.containsKey('update'))
+            _buildOperationRow('Updates', controllers['update']!),
+          if (controllers.containsKey('delete'))
+            _buildOperationRow('Deletes', controllers['delete']!),
         ],
       ),
     );
@@ -1425,10 +1549,17 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
 
   Widget _buildOperationRow(String label, TextEditingController controller) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      // 4. Adjust spacing
+      padding: const EdgeInsets.symmetric(vertical: 6.0),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Expanded(flex: 2, child: Text(label)),
+          Expanded(
+            flex: 2,
+            child: Text(label, style: const TextStyle(fontSize: 16)),
+          ),
+          // 4. Add space between label and field
+          const SizedBox(width: 24),
           Expanded(
             flex: 3,
             child: TextFormField(

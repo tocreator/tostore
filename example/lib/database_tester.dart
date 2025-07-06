@@ -565,8 +565,8 @@ class DatabaseTester {
         String idField = 'id',
         String nameField = 'id',
       }) async {
-        final updateCount = tableConfig['update']!;
-        final deleteCount = tableConfig['delete']!;
+        final updateCount = tableConfig['update'] ?? 0;
+        final deleteCount = tableConfig['delete'] ?? 0;
         final baseCount = updateCount + deleteCount;
 
         _updateLastOperation('Preparing $baseCount base records for $tableName...');
@@ -622,7 +622,7 @@ class DatabaseTester {
         }
         
         // Add Reads
-        final readCount = tableConfig['read']!;
+        final readCount = tableConfig['read'] ?? 0;
         if (baseItems.isNotEmpty) {
             for (var i = 0; i < readCount; i++) {
                 final item = baseItems[random.nextInt(baseItems.length)];
@@ -631,7 +631,7 @@ class DatabaseTester {
         }
 
         // Add new Inserts
-        final insertCount = tableConfig['insert']!;
+        final insertCount = tableConfig['insert'] ?? 0;
         for (var i = 0; i < insertCount; i++) {
             operations.add(insertGenerator(baseCount + i).future);
         }
@@ -704,11 +704,12 @@ class DatabaseTester {
       final commentConfig = config['comments']!;
 
       int calculateExpectedCount(List<Map<String, dynamic>> baseItems, Map<String, int> config) {
-        final updateCount = config['update']!;
-        final deleteCount = config['delete']!;
+        final updateCount = config['update'] ?? 0;
+        final deleteCount = config['delete'] ?? 0;
+        final insertCount = config['insert'] ?? 0;
         // The number of items that were actually scheduled for deletion.
         final actualDeletes = min(deleteCount, max(0, baseItems.length - updateCount));
-        return baseItems.length + config['insert']! - actualDeletes;
+        return baseItems.length + insertCount - actualDeletes;
       }
 
       final expectedUserCount = calculateExpectedCount(baseUsers, userConfig);
