@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 import 'package:tostore/tostore.dart';
-import 'main.dart';
+import 'service/log_service.dart';
 
 /// A comprehensive testing suite for validating Tostore's core functionalities.
 /// It covers basic CRUD, upsert, joins, multi-space, and various edge cases.
@@ -63,7 +63,7 @@ class DatabaseTester {
   /// Main test runner that executes all test suites.
   Future<bool> runAllTests() async {
     log.clear();
-    log.add('--- Starting Database Integrity Tests ---', LogType.info);
+    log.add('--- Starting Database Run All Tests ---', LogType.info);
     _updateLastOperation('Running All Tests...');
     await Future.delayed(
         const Duration(milliseconds: 100)); // Allow UI to update
@@ -128,6 +128,12 @@ class DatabaseTester {
     } finally {
       // Ensure suppression is always turned off even if the test loop fails.
       setWarningSuppression(false);
+      // CRITICAL: Clean up all tables after tests are finished to ensure a clean state.
+      _updateLastOperation('Cleaning up test data...');
+      await db.clear('users');
+      await db.clear('posts');
+      await db.clear('comments');
+      log.add('--- All test data cleared. ---', LogType.info);
     }
 
     _updateLastOperation(

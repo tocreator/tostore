@@ -755,8 +755,8 @@ class DataStoreImpl {
       await _transactionManager!.commit(transaction);
 
       // Invalidate query caches that might be affected by the new record
-      await dataCacheManager.invalidateAffectedQueries(tableName,
-          records: [validData]);
+      await dataCacheManager
+          .invalidateAffectedQueries(tableName, records: [validData]);
 
       // Return string type primary key value
       final primaryKeyValue = validData[schema.primaryKey];
@@ -777,8 +777,9 @@ class DataStoreImpl {
             ? validData[schema.primaryKey]
             : null;
         if (primaryKeyValue != null) {
-          await dataCacheManager
-              .invalidateRecords(tableName, [primaryKeyValue.toString()], [
+          await dataCacheManager.invalidateRecords(tableName, [
+            primaryKeyValue.toString()
+          ], [
             validData!,
           ]);
         }
@@ -1474,8 +1475,6 @@ class DataStoreImpl {
           // Add to success keys
           successKeys.add(pkValue);
 
-        
-
           // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
           writeQueue?.remove(pkValue);
         }
@@ -1964,8 +1963,8 @@ class DataStoreImpl {
 
         // Invalidate query caches for all newly inserted valid records
         // Use a non-blocking future to avoid delaying the response
-        Future(() => dataCacheManager.invalidateAffectedQueries(
-            tableName, records: validRecords));
+        Future(() => dataCacheManager.invalidateAffectedQueries(tableName,
+            records: validRecords));
 
         // Return result
         if (invalidRecords.isEmpty) {
@@ -2273,6 +2272,11 @@ class DataStoreImpl {
         final updatedConfig = globalConfig.addSpace(spaceName);
         await saveGlobalConfig(updatedConfig);
       }
+
+      Logger.info(
+        'Switched space from [$oldSpaceName] to [$spaceName]',
+        label: 'DataStoreImpl.switchSpace',
+      );
 
       return true;
     } catch (e) {
