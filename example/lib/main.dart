@@ -16,6 +16,7 @@ class TostoreExample {
   /// Initialize database and create tables
   Future<void> initialize() async {
     db = ToStore(
+      dbName: 'tostore_example',
       config: DataStoreConfig(
         enableLog: true,
         logLevel: LogLevel.debug,
@@ -469,9 +470,11 @@ class TostoreExample {
   Future<int> clearExamples() async {
     final stopwatch = Stopwatch()..start();
     await db.clear('users');
+    await db.clear('posts');
+    await db.clear('comments');
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('Table "users" cleared in ${elapsed}ms');
+    logService.add('Table "users", "posts" and "comments" cleared in ${elapsed}ms');
     return elapsed;
   }
 
@@ -991,278 +994,462 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           ),
         ],
       ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Expanded(
-            child: Container(
-              color: Theme.of(context).colorScheme.surface.withAlpha(26),
-              padding: const EdgeInsets.all(8.0),
-              child: ValueListenableBuilder<List<LogEntry>>(
-                valueListenable: logService.logs,
-                builder: (context, logs, child) {
-                  // First, filter by selected log type
-                  final filteredByType = _selectedLogType == null
-                      ? logs
-                      : logs
-                          .where((log) => log.type == _selectedLogType)
-                          .toList();
-
-                  // Then, filter by search text
-                  final searchText = _searchController.text.toLowerCase();
-                  final filteredLogs = searchText.isEmpty
-                      ? filteredByType
-                      : filteredByType
-                          .where((log) =>
-                              log.message.toLowerCase().contains(searchText))
-                          .toList();
-
-                  if (filteredLogs.isEmpty) {
-                    return const Center(
-                        child: Text('No logs match your filter.'));
-                  }
-                  return ListView.builder(
-                    controller: _scrollController,
-                    itemCount: filteredLogs.length,
-                    itemBuilder: (context, index) {
-                      final logEntry = filteredLogs[index];
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8.0, vertical: 4.0),
-                        child: Text(
-                          logEntry.message,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _getLogColor(logEntry.type),
-                          ),
-                        ),
-                      );
-                    },
-                  );
-                },
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                TextField(
-                  controller: _searchController,
-                  decoration: InputDecoration(
-                    hintText: 'Search in logs...',
-                    prefixIcon: const Icon(Icons.search),
-                    suffixIcon: _searchController.text.isNotEmpty
-                        ? IconButton(
-                            icon: const Icon(Icons.clear),
-                            onPressed: () {
-                              _searchController.clear();
-                            },
-                          )
-                        : null,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide:
-                          BorderSide(color: Colors.grey.shade300, width: 0.8),
-                    ),
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                ValueListenableBuilder<List<LogEntry>>(
+      body: SafeArea(
+        top: false, // We only want to avoid the bottom system intrusions (like the home bar)
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Container(
+                color: Theme.of(context).colorScheme.surface.withAlpha(26),
+                padding: const EdgeInsets.all(8.0),
+                child: ValueListenableBuilder<List<LogEntry>>(
                   valueListenable: logService.logs,
                   builder: (context, logs, child) {
-                    // Calculate counts for each log type
-                    final allCount = logs.length;
-                    final infoCount =
-                        logs.where((log) => log.type == LogType.info).length;
-                    final debugCount =
-                        logs.where((log) => log.type == LogType.debug).length;
-                    final warnCount =
-                        logs.where((log) => log.type == LogType.warn).length;
-                    final errorCount =
-                        logs.where((log) => log.type == LogType.error).length;
+                    // First, filter by selected log type
+                    final filteredByType = _selectedLogType == null
+                        ? logs
+                        : logs
+                            .where((log) => log.type == _selectedLogType)
+                            .toList();
 
-                    return Wrap(
-                      spacing: 8.0,
-                      runSpacing: 8.0,
-                      alignment: WrapAlignment.start,
-                      children: [
-                        _buildFilterButton('All', null, allCount, context),
-                        _buildFilterButton(
-                            'Info', LogType.info, infoCount, context),
-                        _buildFilterButton(
-                            'Debug', LogType.debug, debugCount, context),
-                        _buildFilterButton(
-                            'Warn', LogType.warn, warnCount, context),
-                        _buildFilterButton(
-                            'Error', LogType.error, errorCount, context),
-                      ],
+                    // Then, filter by search text
+                    final searchText = _searchController.text.toLowerCase();
+                    final filteredLogs = searchText.isEmpty
+                        ? filteredByType
+                        : filteredByType
+                            .where((log) =>
+                                log.message.toLowerCase().contains(searchText))
+                            .toList();
+
+                    if (filteredLogs.isEmpty) {
+                      return const Center(
+                          child: Text('No logs match your filter.'));
+                    }
+                    return ListView.builder(
+                      controller: _scrollController,
+                      itemCount: filteredLogs.length,
+                      itemBuilder: (context, index) {
+                        final logEntry = filteredLogs[index];
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8.0, vertical: 4.0),
+                          child: Text(
+                            logEntry.message,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: _getLogColor(logEntry.type),
+                            ),
+                          ),
+                        );
+                      },
                     );
                   },
                 ),
-              ],
+              ),
             ),
-          ),
-          const SizedBox(height: 20),
-          const Divider(height: 0.1),
-          SingleChildScrollView(
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_isInitializing)
-                    const Center(
-                      child: Padding(
-                        padding: EdgeInsets.symmetric(
-                            horizontal: 16.0, vertical: 24),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            CircularProgressIndicator(),
-                            SizedBox(width: 20),
-                            Text('Initializing...'),
-                          ],
+            ValueListenableBuilder<List<LogEntry>>(
+              valueListenable: logService.logs,
+              builder: (context, logs, child) {
+                if (logs.isEmpty) {
+                  // If there are no logs, don't show the search and filter UI.
+                  return const SizedBox.shrink();
+                }
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: _searchController,
+                        decoration: InputDecoration(
+                          hintText: 'Search in logs...',
+                          prefixIcon: const Icon(Icons.search),
+                          suffixIcon: _searchController.text.isNotEmpty
+                              ? IconButton(
+                                  icon: const Icon(Icons.clear),
+                                  onPressed: () {
+                                    _searchController.clear();
+                                  },
+                                )
+                              : null,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            borderSide: BorderSide(
+                                color: Colors.grey.shade300, width: 0.8),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 8),
                         ),
                       ),
-                    )
-                  else
-                    Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Container(
-                          height: 40,
-                          alignment: Alignment.center,
-                          child: Text(
-                            _lastOperationInfo,
-                            style: Theme.of(context).textTheme.titleMedium,
-                            overflow: TextOverflow.ellipsis,
+                      const SizedBox(height: 14),
+                      ValueListenableBuilder<List<LogEntry>>(
+                        valueListenable: logService.logs,
+                        builder: (context, logs, child) {
+                          // Calculate counts for each log type
+                          final allCount = logs.length;
+                          final infoCount = logs
+                              .where((log) => log.type == LogType.info)
+                              .length;
+                          final debugCount = logs
+                              .where((log) => log.type == LogType.debug)
+                              .length;
+                          final warnCount = logs
+                              .where((log) => log.type == LogType.warn)
+                              .length;
+                          final errorCount = logs
+                              .where((log) => log.type == LogType.error)
+                              .length;
+
+                          return Wrap(
+                            spacing: 8.0,
+                            runSpacing: 8.0,
+                            alignment: WrapAlignment.start,
+                            children: [
+                              _buildFilterButton('All', null, allCount, context),
+                              _buildFilterButton(
+                                  'Info', LogType.info, infoCount, context),
+                              _buildFilterButton(
+                                  'Debug', LogType.debug, debugCount, context),
+                              _buildFilterButton(
+                                  'Warn', LogType.warn, warnCount, context),
+                              _buildFilterButton(
+                                  'Error', LogType.error, errorCount, context),
+                            ],
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 20),
+            const Divider(height: 0.1),
+            SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16.0, 16.0, 16.0, 16.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (_isInitializing)
+                      const Center(
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(
+                              horizontal: 16.0, vertical: 24),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              CircularProgressIndicator(),
+                              SizedBox(width: 20),
+                              Text('Initializing...'),
+                            ],
                           ),
                         ),
-                        Wrap(
-                          spacing: 12,
-                          runSpacing: 12,
-                          alignment: WrapAlignment.center,
-                          children: [
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Clear Table',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .clearExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Clear Table: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
+                      )
+                    else
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            height: 40,
+                            alignment: Alignment.center,
+                            child: Text(
+                              _lastOperationInfo,
+                              style: Theme.of(context).textTheme.titleMedium,
+                              overflow: TextOverflow.ellipsis,
                             ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Query',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .queryExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Query: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Batch Add 10k',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .addExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Batch Add 10k: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Slow Add 10k',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .addExamplesOneByOne();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Slow Add 10k: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                  text: 'Delete Many',
-                                  onPressed: !_isDbInitialized
-                                      ? null
-                                      : () async {
-                                          final elapsed = await widget.example
-                                              .deleteExamples();
-                                          if (mounted) {
-                                            setState(() {
-                                              _lastOperationInfo =
-                                                  'Delete Many: ${elapsed}ms';
-                                            });
-                                          }
-                                        }),
-                            ),
-                            SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 22,
-                              child: _buildActionButton(
-                                text: 'Run Integrity Tests',
-                                onPressed: !_isDbInitialized
-                                    ? null
-                                    : () async {
-                                        final tester = DatabaseTester(
-                                          widget.example.db,
-                                          logService,
-                                          _updateOperationInfo,
-                                          // Pass a callback to let the tester control suppression.
-                                          (isSuppressing) {
-                                            _suppressSpecificWarnings =
-                                                isSuppressing;
-                                          },
-                                        );
-                                        await tester.runAllTests();
-                                      },
+                          ),
+                          Wrap(
+                            spacing: 12,
+                            runSpacing: 12,
+                            alignment: WrapAlignment.center,
+                            children: [
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                    text: 'Clear Table',
+                                    onPressed: !_isDbInitialized
+                                        ? null
+                                        : () async {
+                                            final elapsed = await widget.example
+                                                .clearExamples();
+                                            if (mounted) {
+                                              setState(() {
+                                                _lastOperationInfo =
+                                                    'Clear Table: ${elapsed}ms';
+                                              });
+                                            }
+                                          }),
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                ],
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                    text: 'Query',
+                                    onPressed: !_isDbInitialized
+                                        ? null
+                                        : () async {
+                                            final elapsed = await widget.example
+                                                .queryExamples();
+                                            if (mounted) {
+                                              setState(() {
+                                                _lastOperationInfo =
+                                                    'Query: ${elapsed}ms';
+                                              });
+                                            }
+                                          }),
+                              ),
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                    text: 'Batch Add 10k',
+                                    onPressed: !_isDbInitialized
+                                        ? null
+                                        : () async {
+                                            final elapsed = await widget.example
+                                                .addExamples();
+                                            if (mounted) {
+                                              setState(() {
+                                                _lastOperationInfo =
+                                                    'Batch Add 10k: ${elapsed}ms';
+                                              });
+                                            }
+                                          }),
+                              ),
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                    text: 'Slow Add 10k',
+                                    onPressed: !_isDbInitialized
+                                        ? null
+                                        : () async {
+                                            final elapsed = await widget.example
+                                                .addExamplesOneByOne();
+                                            if (mounted) {
+                                              setState(() {
+                                                _lastOperationInfo =
+                                                    'Slow Add 10k: ${elapsed}ms';
+                                              });
+                                            }
+                                          }),
+                              ),
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                    text: 'Delete Many',
+                                    onPressed: !_isDbInitialized
+                                        ? null
+                                        : () async {
+                                            final elapsed = await widget.example
+                                                .deleteExamples();
+                                            if (mounted) {
+                                              setState(() {
+                                                _lastOperationInfo =
+                                                    'Delete Many: ${elapsed}ms';
+                                              });
+                                            }
+                                          }),
+                              ),
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                  text: 'Concurrency Test',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : _showConcurrencyTestDialog,
+                                ),
+                              ),
+                              SizedBox(
+                                width: MediaQuery.of(context).size.width / 2 - 22,
+                                child: _buildActionButton(
+                                  text: 'Run Integrity Tests',
+                                  onPressed: !_isDbInitialized
+                                      ? null
+                                      : () async {
+                                          final tester = DatabaseTester(
+                                            widget.example.db,
+                                            logService,
+                                            _updateOperationInfo,
+                                            // Pass a callback to let the tester control suppression.
+                                            (isSuppressing) {
+                                              _suppressSpecificWarnings =
+                                                  isSuppressing;
+                                            },
+                                          );
+                                          await tester.runAllTests();
+                                        },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                  ],
+                ),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showConcurrencyTestDialog() async {
+    final config = await showDialog<Map<String, Map<String, int>>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const ConcurrencyTestDialog(),
+    );
+
+    if (config != null) {
+      _updateOperationInfo('Running Custom Concurrency Test...');
+      final tester = DatabaseTester(
+        widget.example.db,
+        logService,
+        _updateOperationInfo,
+        (isSuppressing) {
+          _suppressSpecificWarnings = isSuppressing;
+        },
+      );
+      await tester.runConfigurableConcurrencyTest(config);
+      _updateOperationInfo('✅ Custom Concurrency Test Finished');
+    }
+  }
+}
+
+/// A dialog for configuring and running a custom concurrency test.
+class ConcurrencyTestDialog extends StatefulWidget {
+  const ConcurrencyTestDialog({super.key});
+
+  @override
+  State<ConcurrencyTestDialog> createState() => _ConcurrencyTestDialogState();
+}
+
+class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
+  final _formKey = GlobalKey<FormState>();
+
+  final _controllers = {
+    'users': {
+      'insert': TextEditingController(text: '100'),
+      'read': TextEditingController(text: '100'),
+      'update': TextEditingController(text: '50'),
+      'delete': TextEditingController(text: '50'),
+    },
+    'posts': {
+      'insert': TextEditingController(text: '200'),
+      'read': TextEditingController(text: '100'),
+      'update': TextEditingController(text: '50'),
+      'delete': TextEditingController(text: '50'),
+    },
+    'comments': {
+      'insert': TextEditingController(text: '500'),
+      'read': TextEditingController(text: '100'),
+      'update': TextEditingController(text: '50'),
+      'delete': TextEditingController(text: '50'),
+    },
+  };
+
+  @override
+  void dispose() {
+    for (final table in _controllers.values) {
+      for (final controller in table.values) {
+        controller.dispose();
+      }
+    }
+    super.dispose();
+  }
+
+  void _onRun() {
+    if (_formKey.currentState!.validate()) {
+      final config = _controllers.map((table, operations) {
+        return MapEntry(table, operations.map((op, controller) {
+          return MapEntry(op, int.tryParse(controller.text) ?? 0);
+        }));
+      });
+      Navigator.of(context).pop(config);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Configure Concurrency Test'),
+      content: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: _controllers.entries.map((tableEntry) {
+              return _buildTableSection(tableEntry.key, tableEntry.value);
+            }).toList(),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _onRun,
+          child: const Text('Run Test'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTableSection(
+      String title, Map<String, TextEditingController> controllers) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${title[0].toUpperCase()}${title.substring(1)}',
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
+          const SizedBox(height: 8),
+          _buildOperationRow('Inserts', controllers['insert']!),
+          _buildOperationRow('Reads', controllers['read']!),
+          _buildOperationRow('Updates', controllers['update']!),
+          _buildOperationRow('Deletes', controllers['delete']!),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOperationRow(String label, TextEditingController controller) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        children: [
+          Expanded(flex: 2, child: Text(label)),
+          Expanded(
+            flex: 3,
+            child: TextFormField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                contentPadding:
+                    EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              ),
+              validator: (value) {
+                if (value == null || value.isEmpty) {
+                  return 'Required';
+                }
+                if (int.tryParse(value) == null) {
+                  return 'Invalid';
+                }
+                return null;
+              },
             ),
           ),
         ],

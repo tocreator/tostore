@@ -18,8 +18,9 @@ class DatabaseTester {
     log.add('✅ PASS: $message', LogType.info);
   }
 
-  void _failTest(String message) {
+  bool _failTest(String message) {
     log.add('❌ FAIL: $message', LogType.error);
+    return false;
   }
 
   /// Performs a deep comparison of two objects.
@@ -81,7 +82,10 @@ class DatabaseTester {
           'test': _testAdvancedQueriesAndEdgeCases
         },
         {'name': 'Count Verification', 'test': _testCountVerification},
-        {'name': 'Concurrency Stress Test', 'test': _testConcurrency},
+        {
+          'name': 'Concurrency Stress Test',
+          'test': () => runConfigurableConcurrencyTest(_baseConcurrencyConfig)
+        },
       ];
 
       for (var i = 0; i < tests.length; i++) {
@@ -131,12 +135,38 @@ class DatabaseTester {
     return allTestsPassed;
   }
 
+  static const Map<String, Map<String, int>> _baseConcurrencyConfig = {
+    'users': {
+      'insert': 100,
+      'read': 100,
+      'update': 50,
+      'delete': 50,
+    },
+    'posts': {
+      'insert': 100,
+      'read': 100,
+      'update': 50,
+      'delete': 50,
+    },
+    'comments': {
+      'insert': 200,
+      'read': 100,
+      'update': 50,
+      'delete': 50,
+    },
+  };
+
   /// CRITICAL TEST: Verifies that clearing a table or deleting all records works as expected.
   /// If this fails, the database state is considered unreliable for other tests.
   Future<bool> _testClearAndDeleteAll() async {
     log.add('--- Testing: Clear Table and Delete All ---', LogType.debug);
     bool isTestPassed = true;
     try {
+      // Ensure a clean slate before this critical test, preventing state leakage from previous runs.
+      await db.clear('users');
+      await db.clear('posts');
+      await db.clear('comments');
+
       // 1. Test db.clear()
       await db.batchInsert('users', [
         {'username': 'clear_user_1', 'email': 'cu1@test.com'},
@@ -510,128 +540,198 @@ class DatabaseTester {
     return isTestPassed;
   }
 
-  /// Tests concurrent reads and writes across multiple tables to check for race conditions and performance.
-  Future<bool> _testConcurrency() async {
-    log.add('--- Testing: Concurrency Stress Test ---', LogType.debug);
+  /// Runs a configurable concurrency test based on user input.
+  Future<bool> runConfigurableConcurrencyTest(
+      Map<String, Map<String, int>> config) async {
+    log.add('--- Testing: Configurable Concurrency Stress Test ---',
+        LogType.debug);
+    _updateLastOperation('Starting Configurable Concurrency Test...');
     bool isTestPassed = true;
-    const int userWrites = 100;
-    const int postWritesPerUser = 0;
-    const int reads = 100;
-    const int deletes = 10;
-    const int updates = 10;
-
     final stopwatch = Stopwatch()..start();
 
     try {
       await db.clear('users');
       await db.clear('posts');
-
-      // Stage 1: Concurrently insert users to create a base dataset
-      final userFutures = <Future<DbResult>>[];
-      for (int i = 0; i < userWrites; i++) {
-        userFutures.add(db.insert('users', {
-          'username': 'concurrent_user_$i',
-          'email': 'concurrent_$i@test.com',
-          'age': 20 + i,
-        }));
-      }
-      final userInsertResults = await Future.wait(userFutures, eagerError: false);
-      
-      final successfulUsers = <Map<String, dynamic>>[];
-      for (int i = 0; i < userInsertResults.length; i++) {
-          final result = userInsertResults[i];
-          if (result.isSuccess && result.successKeys.isNotEmpty) {
-              successfulUsers.add({'id': result.successKeys.first, 'username': 'concurrent_user_$i'});
-          }
-      }
-
-      if (successfulUsers.length != userWrites) {
-          log.add('Warning: Only ${successfulUsers.length}/$userWrites users were created successfully in setup.', LogType.warn);
-      }
-      if (successfulUsers.isEmpty) {
-          _failTest('Could not create any users for concurrency test.');
-          return false;
-      }
-      
-      // Stage 2: Prepare a mix of concurrent operations
-      final operations = <Future>[];
+      await db.clear('comments');
       final random = Random();
+      final operations = <Future>[];
 
-      // Add Post writes
-      for (final user in successfulUsers) {
-        for (int j = 0; j < postWritesPerUser; j++) {
-          operations.add(db.insert('posts', {
-            'title': 'Post $j for user ${user['id']}',
-            'user_id': user['id'],
-            'content': '...'
-          }));
+      // Helper to prepare base data and generate operations
+      Future<List<Map<String, dynamic>>> prepareAndGenerateOpsForTable({
+        required String tableName,
+        required Map<String, int> tableConfig,
+        required ({Future<DbResult> future, Map<String, dynamic> data}) Function(int i) insertGenerator,
+        required Map<String, dynamic> updateData,
+        String idField = 'id',
+        String nameField = 'id',
+      }) async {
+        final updateCount = tableConfig['update']!;
+        final deleteCount = tableConfig['delete']!;
+        final baseCount = updateCount + deleteCount;
+
+        _updateLastOperation('Preparing $baseCount base records for $tableName...');
+        
+        final baseItems = <Map<String, dynamic>>[];
+        if (baseCount > 0) {
+            final insertsToRun = <int, Map<String,dynamic>>{};
+            final insertFutures = List.generate(baseCount, (i) {
+                final gen = insertGenerator(i);
+                insertsToRun[gen.future.hashCode] = gen.data;
+                return gen.future;
+            });
+            
+            // Batch execute the creation of base data to avoid UI jank
+            const batchSize = 1000;
+            for (int i = 0; i < insertFutures.length; i += batchSize) {
+                final end = (i + batchSize > insertFutures.length) ? insertFutures.length : i + batchSize;
+                _updateLastOperation('Preparing base for $tableName: ${i + 1}-$end of $baseCount');
+                final batch = insertFutures.sublist(i, end);
+                final results = await Future.wait(batch, eagerError: true);
+                
+                for (final r in results) {
+                    if (r.isSuccess && r.successKeys.isNotEmpty) {
+                        final originalData = insertsToRun[r.hashCode];
+                        final Map<String, dynamic> newItem = {'id': r.successKeys.first};
+                        if (originalData != null && originalData.containsKey(nameField)) {
+                          newItem[nameField] = originalData[nameField];
+                        }
+                        baseItems.add(newItem);
+                    }
+                }
+                await Future.delayed(Duration.zero); // Yield to the event loop
+            }
+            log.add('Created ${baseItems.length}/$baseCount base records for $tableName.', LogType.info);
         }
-      }
 
-      // Add Reads
-      for (int i = 0; i < reads; i++) {
-        final userToRead = successfulUsers[random.nextInt(successfulUsers.length)];
-        operations.add(db.query('users').where('username', '=', userToRead['username']).first());
+
+        if (baseItems.isEmpty && baseCount > 0) {
+            _failTest('Failed to create base data for $tableName, cannot proceed with updates/deletes.');
+        } else {
+            final itemsToUpdate = baseItems.take(updateCount).toList();
+            final itemsToDelete = baseItems.skip(updateCount).take(deleteCount).toList();
+
+            // Add Updates
+            for (final item in itemsToUpdate) {
+                operations.add(db.update(tableName, updateData).where(idField, '=', item[idField]));
+            }
+
+            // Add Deletes
+            for (final item in itemsToDelete) {
+                operations.add(db.delete(tableName).where(idField, '=', item[idField]));
+            }
+        }
+        
+        // Add Reads
+        final readCount = tableConfig['read']!;
+        if (baseItems.isNotEmpty) {
+            for (var i = 0; i < readCount; i++) {
+                final item = baseItems[random.nextInt(baseItems.length)];
+                operations.add(db.query(tableName).where(idField, '=', item[idField]).first());
+            }
+        }
+
+        // Add new Inserts
+        final insertCount = tableConfig['insert']!;
+        for (var i = 0; i < insertCount; i++) {
+            operations.add(insertGenerator(baseCount + i).future);
+        }
+
+        return baseItems;
       }
       
-      // Add Deletes
-      final usersToDelete = List<Map<String, dynamic>>.from(successfulUsers)..shuffle(random);
-      final deletedUsernames = <String>{};
-      for (int i = 0; i < deletes && i < usersToDelete.length; i++) {
-        final username = usersToDelete[i]['username'] as String;
-        operations.add(db.delete('users').where('username', '=', username));
-        deletedUsernames.add(username);
-      }
+      // Stage 1: Prepare Users
+      final baseUsers = await prepareAndGenerateOpsForTable(
+        tableName: 'users',
+        tableConfig: config['users']!,
+        insertGenerator: (i) {
+            final data = {
+                'username': 'cc_user_$i',
+                'email': 'cc_user_$i@test.com',
+                'age': 20 + i,
+            };
+            return (future: db.insert('users', data), data: data);
+        },
+        updateData: {'age': 999},
+        nameField: 'username',
+      );
 
-      // Add Updates
-      final usersToUpdate = usersToDelete.where((u) => !deletedUsernames.contains(u['username'])).toList();
-      for (int i = 0; i < updates && i < usersToUpdate.length; i++) {
-        operations.add(db.update('users', {'age': 99}).where('username', '=', usersToUpdate[i]['username']));
-      }
+      // Stage 2: Prepare Posts
+      final basePosts = await prepareAndGenerateOpsForTable(
+        tableName: 'posts',
+        tableConfig: config['posts']!,
+        insertGenerator: (i) {
+           final user = baseUsers[random.nextInt(baseUsers.length)];
+           final data = {'title': 'Post $i', 'user_id': user['id']};
+           return (future: db.insert('posts', data), data: data);
+        },
+        updateData: {'content': 'updated post content'},
+      );
 
+      // Stage 3: Prepare Comments
+       final baseComments = await prepareAndGenerateOpsForTable(
+        tableName: 'comments',
+        tableConfig: config['comments']!,
+        insertGenerator: (i) {
+           final user = baseUsers[random.nextInt(baseUsers.length)];
+           final post = basePosts[random.nextInt(basePosts.length)];
+           final data = {'content': 'Comment $i', 'user_id': user['id'], 'post_id': post['id']};
+           return (future: db.insert('comments', data), data: data);
+        },
+        updateData: {'content': 'updated comment content'},
+      );
+
+      // Stage 4: Execute all operations concurrently
+      _updateLastOperation('Executing ${operations.length} mixed operations concurrently...');
       log.add('Executing ${operations.length} mixed operations concurrently...', LogType.info);
-      
-      // Execute all mixed operations
-      final operationResults = await Future.wait(operations, eagerError: false);
+      operations.shuffle(random);
+
+      const batchSize = 1000;
+      for (int i = 0; i < operations.length; i += batchSize) {
+        final end = (i + batchSize > operations.length) ? operations.length : i + batchSize;
+        final batch = operations.sublist(i, end);
+        _updateLastOperation('Running batch ${i ~/ batchSize + 1}/${(operations.length / batchSize).ceil()}...');
+        await Future.wait(batch, eagerError: false);
+        await Future.delayed(Duration.zero); // Yield to the event loop
+      }
+
       stopwatch.stop();
-      log.add(
-          'Concurrency test with ${operations.length} operations finished in ${stopwatch.elapsedMilliseconds}ms.',
-          LogType.info);
-
-      // Stage 3: Verification
-      final unhandledErrors = operationResults.where((r) => r is Exception || r is Error).toList();
-       if (unhandledErrors.isNotEmpty) {
-        isTestPassed = false;
-        _failTest('Concurrency test threw ${unhandledErrors.length} unexpected exceptions. First one: ${unhandledErrors.first}');
-        return false; // Critical failure
-      }
+     
+      // Stage 5: Verification
+      _updateLastOperation('Stage 5: Verifying results...');
       
-      final finalUserCount = await db.query('users').count();
-      isTestPassed &= _expect('Final user count should match writes minus deletes', finalUserCount, successfulUsers.length - deletedUsernames.length);
-      
-      final finalPostCount = await db.query('posts').count();
-      // Since there is no cascade delete, all posts from successfully created users should remain.
-      isTestPassed &= _expect('Final post count should match successful user writes', finalPostCount, successfulUsers.length * postWritesPerUser);
+      final userConfig = config['users']!;
+      final postConfig = config['posts']!;
+      final commentConfig = config['comments']!;
 
-      // Verify an update
-      if (updates > 0) {
-        final updatedUser = await db.query('users').where('username', '=', usersToUpdate.first['username']).first();
-         if (updatedUser != null) {
-          isTestPassed &= _expect('An updated user should have the new age', updatedUser['age'], 99);
-        } else if (successfulUsers.length - deletedUsernames.length > 0){
-          // It's possible the user we chose to check was one of the few that failed to update,
-          // but if other users still exist, this is a failure.
-           _failTest('Could not find user that should have been updated.');
-           isTestPassed = false;
-        }
+      int calculateExpectedCount(List<Map<String, dynamic>> baseItems, Map<String, int> config) {
+        final updateCount = config['update']!;
+        final deleteCount = config['delete']!;
+        // The number of items that were actually scheduled for deletion.
+        final actualDeletes = min(deleteCount, max(0, baseItems.length - updateCount));
+        return baseItems.length + config['insert']! - actualDeletes;
       }
+
+      final expectedUserCount = calculateExpectedCount(baseUsers, userConfig);
+      final expectedPostCount = calculateExpectedCount(basePosts, postConfig);
+      final expectedCommentCount = calculateExpectedCount(baseComments, commentConfig);
+
+      isTestPassed &= _expect('Final user count should be correct', await db.query('users').count(), expectedUserCount);
+      isTestPassed &= _expect('Final post count should be correct', await db.query('posts').count(), expectedPostCount);
+      isTestPassed &= _expect('Final comment count should be correct', await db.query('comments').count(), expectedCommentCount);
 
     } catch (e, s) {
       isTestPassed = false;
-      _failTest('Exception in _testConcurrency: $e\n$s');
+      _failTest('Exception in runConfigurableConcurrencyTest: $e\n$s');
     } finally {
-        stopwatch.stop();
+      stopwatch.stop();
+      _updateLastOperation('Cleaning up test data...');
+      await db.clear('users');
+      await db.clear('posts');
+      await db.clear('comments');
+      log.add('Test data cleaned up.', LogType.info);
+      log.add('Concurrency test finished in ${stopwatch.elapsedMilliseconds}ms.', LogType.info);
     }
+    _updateLastOperation(isTestPassed ? '✅ Concurrency Test Passed' : '❌ Concurrency Test Failed');
     return isTestPassed;
   }
 }
