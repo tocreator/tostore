@@ -722,10 +722,6 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Update request stats
     _updateRequestStats(count);
 
-    final operationId = '${tableName}_id_get';
-    try {
-      await _lockManager.acquireExclusiveLock(operationId, 'id_get');
-
       // Ensure ID pool exists
       if (!_idPools.containsKey(tableName)) {
         _idPools[tableName] = Queue<String>();
@@ -806,9 +802,6 @@ class TimeBasedIdGenerator implements IdGenerator {
       }
 
       return result;
-    } finally {
-      _lockManager.releaseExclusiveLock(operationId, 'id_get');
-    }
   }
 
   /// Update request stats

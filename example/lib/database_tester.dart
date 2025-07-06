@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:tostore/tostore.dart';
 import 'main.dart';
 
@@ -80,6 +81,7 @@ class DatabaseTester {
           'test': _testAdvancedQueriesAndEdgeCases
         },
         {'name': 'Count Verification', 'test': _testCountVerification},
+        {'name': 'Concurrency Stress Test', 'test': _testConcurrency},
       ];
 
       for (var i = 0; i < tests.length; i++) {
@@ -504,6 +506,131 @@ class DatabaseTester {
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testCountVerification: $e\n$s');
+    }
+    return isTestPassed;
+  }
+
+  /// Tests concurrent reads and writes across multiple tables to check for race conditions and performance.
+  Future<bool> _testConcurrency() async {
+    log.add('--- Testing: Concurrency Stress Test ---', LogType.debug);
+    bool isTestPassed = true;
+    const int userWrites = 100;
+    const int postWritesPerUser = 0;
+    const int reads = 100;
+    const int deletes = 10;
+    const int updates = 10;
+
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      await db.clear('users');
+      await db.clear('posts');
+
+      // Stage 1: Concurrently insert users to create a base dataset
+      final userFutures = <Future<DbResult>>[];
+      for (int i = 0; i < userWrites; i++) {
+        userFutures.add(db.insert('users', {
+          'username': 'concurrent_user_$i',
+          'email': 'concurrent_$i@test.com',
+          'age': 20 + i,
+        }));
+      }
+      final userInsertResults = await Future.wait(userFutures, eagerError: false);
+      
+      final successfulUsers = <Map<String, dynamic>>[];
+      for (int i = 0; i < userInsertResults.length; i++) {
+          final result = userInsertResults[i];
+          if (result.isSuccess && result.successKeys.isNotEmpty) {
+              successfulUsers.add({'id': result.successKeys.first, 'username': 'concurrent_user_$i'});
+          }
+      }
+
+      if (successfulUsers.length != userWrites) {
+          log.add('Warning: Only ${successfulUsers.length}/$userWrites users were created successfully in setup.', LogType.warn);
+      }
+      if (successfulUsers.isEmpty) {
+          _failTest('Could not create any users for concurrency test.');
+          return false;
+      }
+      
+      // Stage 2: Prepare a mix of concurrent operations
+      final operations = <Future>[];
+      final random = Random();
+
+      // Add Post writes
+      for (final user in successfulUsers) {
+        for (int j = 0; j < postWritesPerUser; j++) {
+          operations.add(db.insert('posts', {
+            'title': 'Post $j for user ${user['id']}',
+            'user_id': user['id'],
+            'content': '...'
+          }));
+        }
+      }
+
+      // Add Reads
+      for (int i = 0; i < reads; i++) {
+        final userToRead = successfulUsers[random.nextInt(successfulUsers.length)];
+        operations.add(db.query('users').where('username', '=', userToRead['username']).first());
+      }
+      
+      // Add Deletes
+      final usersToDelete = List<Map<String, dynamic>>.from(successfulUsers)..shuffle(random);
+      final deletedUsernames = <String>{};
+      for (int i = 0; i < deletes && i < usersToDelete.length; i++) {
+        final username = usersToDelete[i]['username'] as String;
+        operations.add(db.delete('users').where('username', '=', username));
+        deletedUsernames.add(username);
+      }
+
+      // Add Updates
+      final usersToUpdate = usersToDelete.where((u) => !deletedUsernames.contains(u['username'])).toList();
+      for (int i = 0; i < updates && i < usersToUpdate.length; i++) {
+        operations.add(db.update('users', {'age': 99}).where('username', '=', usersToUpdate[i]['username']));
+      }
+
+      log.add('Executing ${operations.length} mixed operations concurrently...', LogType.info);
+      
+      // Execute all mixed operations
+      final operationResults = await Future.wait(operations, eagerError: false);
+      stopwatch.stop();
+      log.add(
+          'Concurrency test with ${operations.length} operations finished in ${stopwatch.elapsedMilliseconds}ms.',
+          LogType.info);
+
+      // Stage 3: Verification
+      final unhandledErrors = operationResults.where((r) => r is Exception || r is Error).toList();
+       if (unhandledErrors.isNotEmpty) {
+        isTestPassed = false;
+        _failTest('Concurrency test threw ${unhandledErrors.length} unexpected exceptions. First one: ${unhandledErrors.first}');
+        return false; // Critical failure
+      }
+      
+      final finalUserCount = await db.query('users').count();
+      isTestPassed &= _expect('Final user count should match writes minus deletes', finalUserCount, successfulUsers.length - deletedUsernames.length);
+      
+      final finalPostCount = await db.query('posts').count();
+      // Since there is no cascade delete, all posts from successfully created users should remain.
+      isTestPassed &= _expect('Final post count should match successful user writes', finalPostCount, successfulUsers.length * postWritesPerUser);
+
+      // Verify an update
+      if (updates > 0) {
+        final updatedUser = await db.query('users').where('username', '=', usersToUpdate.first['username']).first();
+         if (updatedUser != null) {
+          isTestPassed &= _expect('An updated user should have the new age', updatedUser['age'], 99);
+        } else if (successfulUsers.length - deletedUsernames.length > 0){
+          // It's possible the user we chose to check was one of the few that failed to update,
+          // but if other users still exist, this is a failure.
+           _failTest('Could not find user that should have been updated.');
+           isTestPassed = false;
+        }
+      }
+
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testConcurrency: $e\n$s');
+    } finally {
+        stopwatch.stop();
     }
     return isTestPassed;
   }

@@ -367,6 +367,9 @@ class TableDataManager {
 
   /// Get next auto-increment ID
   Future<String> getNextId(String tableName) async {
+    final lockKey = 'id_gen_$tableName';
+    final operationId = 'get_next_id_${DateTime.now().millisecondsSinceEpoch}';
+    await _dataStore.lockManager!.acquireExclusiveLock(lockKey, operationId);
     try {
       // Get table schema
       final schema = await _dataStore.getTableSchema(tableName);
@@ -404,11 +407,17 @@ class TableDataManager {
       Logger.error('Failed to get next ID: $e',
           label: 'TableDataManager.getNextId');
       return '';
+    } finally {
+      _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId);
     }
   }
 
   /// Get batch of IDs (used for optimizing bulk insert scenarios)
   Future<List<String>> getBatchIds(String tableName, int count) async {
+    final lockKey = 'id_gen_$tableName';
+    final operationId =
+        'get_batch_ids_${DateTime.now().millisecondsSinceEpoch}';
+    await _dataStore.lockManager!.acquireExclusiveLock(lockKey, operationId);
     try {
       if (count <= 0) return [];
 
@@ -444,6 +453,8 @@ class TableDataManager {
       Logger.error('Failed to get batch of IDs: $e',
           label: 'TableDataManager.getBatchIds');
       return [];
+    } finally {
+      _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId);
     }
   }
 

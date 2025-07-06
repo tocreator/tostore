@@ -1795,10 +1795,63 @@ class DataStoreImpl {
       }
 
       final primaryKey = schema.primaryKey;
+      final recordsToProcess = List<Map<String, dynamic>>.from(records);
       final validRecords = <Map<String, dynamic>>[];
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
+
+      // Batch assign primary keys if needed, to improve performance.
+      if (schema.primaryKeyConfig.type != PrimaryKeyType.none) {
+        final recordsNeedingPk =
+            recordsToProcess.where((r) => r[primaryKey] == null).toList();
+
+        if (recordsNeedingPk.isNotEmpty) {
+          final newIds = await tableDataManager.getBatchIds(
+              tableName, recordsNeedingPk.length);
+
+          if (newIds.length != recordsNeedingPk.length) {
+            // Primary key generation failed for some/all records.
+            if (!allowPartialErrors) {
+              // Fail the entire batch.
+              final allKeys = records
+                  .map((r) => r[primaryKey]?.toString())
+                  .where((k) => k != null && k.isNotEmpty)
+                  .map((k) => k!)
+                  .toList();
+              return DbResult.error(
+                type: ResultType.dbError,
+                message:
+                    'Failed to generate enough primary keys for batch insert',
+                failedKeys: allKeys,
+              );
+            } else {
+              // Mark records that needed a key as invalid and remove them from processing.
+              for (final record in recordsNeedingPk) {
+                invalidRecords.add(record);
+                // These records don't have a PK, so nothing to add to failedKeys yet.
+              }
+              recordsToProcess.removeWhere((r) => r[primaryKey] == null);
+            }
+          } else {
+            // Key generation succeeded, assign keys.
+            for (var i = 0; i < recordsNeedingPk.length; i++) {
+              recordsNeedingPk[i][primaryKey] = newIds[i];
+            }
+          }
+        }
+      }
+
+      // If all records were filtered out due to PK generation failure and partial errors are allowed,
+      // we can end early without starting a transaction.
+      if (recordsToProcess.isEmpty) {
+        return DbResult.error(
+          type: ResultType.dbError,
+          message:
+              'All ${invalidRecords.length} records failed during primary key generation.',
+          // failedKeys is empty because these records never received a key.
+        );
+      }
 
       // Begin a single transaction for the entire batch
       final transaction = await _transactionManager!.beginTransaction();
@@ -1807,10 +1860,11 @@ class DataStoreImpl {
         // Process records in smaller batches to maintain memory efficiency
         const int batchSize = 1000;
 
-        for (int i = 0; i < records.length; i += batchSize) {
-          final int end =
-              (i + batchSize < records.length) ? i + batchSize : records.length;
-          final currentBatch = records.sublist(i, end);
+        for (int i = 0; i < recordsToProcess.length; i += batchSize) {
+          final int end = (i + batchSize < recordsToProcess.length)
+              ? i + batchSize
+              : recordsToProcess.length;
+          final currentBatch = recordsToProcess.sublist(i, end);
 
           // Process each record in the current batch
           for (var record in currentBatch) {

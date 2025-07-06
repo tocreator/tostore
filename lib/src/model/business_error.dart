@@ -19,6 +19,10 @@ enum BusinessErrorType {
   migrationError,
   versionError,
   backupError,
+
+  // db error
+  dbError, // db error
+  primaryKeyError, // primary key error
 }
 
 /// business error
