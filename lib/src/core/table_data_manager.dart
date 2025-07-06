@@ -738,10 +738,25 @@ class TableDataManager {
       );
       return;
     }
+
+    final existingEntry = tableQueue[recordId];
+    BufferOperationType finalOperation;
+    if (isUpdate) {
+      if (existingEntry != null &&
+          existingEntry.operation == BufferOperationType.insert) {
+        // If the record is already in the buffer as an insert,
+        // then an update to it should also be considered an insert of the updated data.
+        finalOperation = BufferOperationType.insert;
+      } else {
+        finalOperation = BufferOperationType.update;
+      }
+    } else {
+      finalOperation = BufferOperationType.insert;
+    }
+
     tableQueue[recordId] = BufferEntry(
       data: data,
-      operation:
-          isUpdate ? BufferOperationType.update : BufferOperationType.insert,
+      operation: finalOperation,
       timestamp: DateTime.now(),
     );
 
@@ -777,10 +792,18 @@ class TableDataManager {
       }
 
       // if record is already in write buffer, remove it, because it is not written to file, no need to add to delete buffer
-      if (_writeBuffer.containsKey(tableName) &&
-          _writeBuffer[tableName]!.containsKey(recordId)) {
-        _writeBuffer[tableName]!.remove(recordId);
-        continue;
+      final writeQueue = _writeBuffer[tableName];
+      if (writeQueue != null && writeQueue.containsKey(recordId)) {
+        final entry = writeQueue[recordId]!;
+        // It's in the write buffer. We must remove it from there.
+        writeQueue.remove(recordId);
+
+        if (entry.operation == BufferOperationType.insert) {
+          // The record was not on disk. Removing from write buffer is sufficient.
+          continue;
+        }
+        // If it was an update, the original record is on disk,
+        // so we must proceed to add a delete operation to the delete buffer.
       }
 
       // Store in delete buffer
