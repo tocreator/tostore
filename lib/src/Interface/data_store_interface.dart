@@ -104,5 +104,8 @@ abstract class DataStoreInterface {
   Future<void> deleteDatabase({String? dbPath, String? dbName});
 
   /// Get information about the current space
-  Future<SpaceInfo> getSpaceInfo();
+  Future<SpaceInfo> getSpaceInfo({bool useCache = true});
+
+  /// Delete a space
+  Future<void> deleteSpace(String spaceName);
 }

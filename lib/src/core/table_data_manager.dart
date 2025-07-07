@@ -2370,6 +2370,7 @@ class TableDataManager {
   }
 
   /// Process table partitions with multiple operations at once
+  /// Note: This method is used to directly modify partition data, if you need to read data while ensuring partition order, please use ParallelProcessor.execute
   Future<void> processTablePartitions({
     required String tableName,
     required Future<List<Map<String, dynamic>>> Function(

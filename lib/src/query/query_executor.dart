@@ -10,6 +10,7 @@ import 'query_cache.dart';
 import 'query_condition.dart';
 import 'query_plan.dart';
 import '../handler/value_comparator.dart';
+import '../handler/parallel_processor.dart';
 
 /// query executor
 class QueryExecutor {
@@ -76,32 +77,15 @@ class QueryExecutor {
                 Map<String, dynamic>.from(record);
           }
 
-          // Process records in write queue that match the condition
-          final pendingData =
-              _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-          if (condition != null) {
-            for (var record in pendingData.entries.toList()) {
-              if (condition.matches(record.value.data)) {
-                resultMap[record.value.data[primaryKey].toString()] =
-                    Map<String, dynamic>.from(record.value.data);
-              }
-            }
-          } else {
-            // Add all pending records
-            for (var record in pendingData.entries.toList()) {
-              resultMap[record.value.data[primaryKey].toString()] =
-                  Map<String, dynamic>.from(record.value.data);
-            }
-          }
-
           // convert back to list
           final updatedResults = resultMap.values.toList();
           // apply sort and pagination
           if (orderBy != null) {
             _applySort(updatedResults, orderBy);
           }
-          final filteredResults =
-              await _filterPendingDeletes(tableName, updatedResults);
+          final filteredResults = await _filterPendingBuffer(
+              tableName, updatedResults, condition,
+              applyWriteBuffer: true);
           // query cache is already the correct return result, no need to paginate again
           return _paginateResults(filteredResults, limit, offset);
         }
@@ -171,10 +155,6 @@ class QueryExecutor {
           // Update access time
           _dataStore.dataCacheManager.recordTableAccess(tableName);
 
-          if (results.isNotEmpty) {
-            results = await _filterPendingDeletes(tableName, results);
-          }
-
           // if not primary key query, cache it
           if (shouldUseQueryCache && !isPrimaryKeyQuery) {
             if (await _dataStore.dataCacheManager
@@ -213,7 +193,9 @@ class QueryExecutor {
       }
 
       // 5. apply pagination and return results
-      final filteredResults = await _filterPendingDeletes(tableName, results);
+      final filteredResults = await _filterPendingBuffer(
+          tableName, results, condition,
+          applyWriteBuffer: true);
 
       // 6. Cache results if query cache is enabled
       if (shouldUseQueryCache) {
@@ -806,77 +788,58 @@ class QueryExecutor {
       if (targetPartitions.isNotEmpty) {
         // Check for early return in case of exact primary key match
         final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
+        final controller = ParallelController();
 
-        // Efficiently process target partitions
-        await _dataStore.tableDataManager.processTablePartitions(
-          tableName: tableName,
-          onlyRead: true,
-          targetPartitions: targetPartitions, // Use target partitions list
-          processFunction: (records, partitionIndex, controller) async {
+        final tasks = targetPartitions.map((partitionIndex) {
+          return () async {
             if (controller.isStopped) {
-              return records;
+              return <Map<String, dynamic>>[];
             }
+            // Read records from the partition
+            final records = await _dataStore.tableDataManager
+                .readRecordsFromPartition(
+                    tableName, isGlobal, partitionIndex, primaryKey);
 
+            final partitionResults = <Map<String, dynamic>>[];
             if (condition != null) {
               // Apply filter conditions
               for (var record in records) {
-                // Skip deleted records
                 if (isDeletedRecord(record)) continue;
 
                 if (condition.matches(record)) {
-                  resultMap[record[primaryKey].toString()] = record;
+                  partitionResults.add(record);
 
-                  // If exact primary key match is found, stop all partition processing
+                  // If an exact primary key match is found, stop processing.
                   if (exactPkMatch != null &&
                       ValueComparator.compare(
                               record[primaryKey], exactPkMatch) ==
                           0) {
                     controller.stop();
-                    return records;
+                    break;
                   }
                 }
               }
             } else {
-              // No filter conditions, add all records
+              // No filter conditions, add all records from the partition
               for (var record in records) {
-                // Skip deleted records
                 if (isDeletedRecord(record)) continue;
-
-                resultMap[record[primaryKey].toString()] = record;
+                partitionResults.add(record);
               }
             }
+            return partitionResults;
+          };
+        }).toList();
 
-            return records;
-          },
-        );
+        final resultsFromPartitions =
+            await ParallelProcessor.execute<List<Map<String, dynamic>>>(tasks,
+                controller: controller,
+                label: 'QueryExecutor._performTableScan.optimized');
 
-        // Process records in write queue that match the condition
-        final pendingData =
-            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-
-        // If exact primary key match, check if there is an updated record in the write buffer
-        if (exactPkMatch != null &&
-            pendingData.containsKey(exactPkMatch.toString())) {
-          final pendingRecord = pendingData[exactPkMatch.toString()];
-          if (pendingRecord != null &&
-              (condition == null || condition.matches(pendingRecord.data))) {
-            // Replace or add the record in the write buffer to the result
-            resultMap[exactPkMatch.toString()] =
-                Map<String, dynamic>.from(pendingRecord.data);
-          }
-        } else if (condition != null) {
-          for (var record in pendingData.entries.toList()) {
-            if (condition.matches(record.value.data)) {
-              resultMap[record.value.data[primaryKey].toString()] =
-                  Map<String, dynamic>.from(record.value.data);
-            }
-          }
-        } else {
-          // Add all pending records
-          for (var record in pendingData.entries.toList()) {
-            resultMap[record.value.data[primaryKey].toString()] =
-                Map<String, dynamic>.from(record.value.data);
-          }
+        // By processing results in order, we maintain the natural data order.
+        final orderedResults =
+            resultsFromPartitions.expand((e) => e ?? []).toList();
+        for (final record in orderedResults) {
+          resultMap[record[primaryKey].toString()] = record;
         }
 
         // If full table scan with no filter conditions, and record count within limit, mark as full table data
@@ -893,44 +856,42 @@ class QueryExecutor {
         fileMeta.totalRecords > 0 &&
         fileMeta.partitions!.isNotEmpty) {
       try {
-        // Use parallel processing
-        await _dataStore.tableDataManager.processTablePartitions(
-          tableName: tableName,
-          onlyRead: true,
-          maxConcurrent: _dataStore.config.maxConcurrent,
-          processFunction: (records, partitionIndex, controller) async {
+        final partitionIndexes =
+            fileMeta.partitions!.map((p) => p.index).toList()..sort();
+        final tasks = partitionIndexes.map((partitionIndex) {
+          return () async {
+            final records =
+                await _dataStore.tableDataManager.readRecordsFromPartition(
+              tableName,
+              isGlobal,
+              partitionIndex,
+              primaryKey,
+            );
+            final partitionResults = <Map<String, dynamic>>[];
             for (var record in records) {
-              // Skip deleted records
               if (isDeletedRecord(record)) continue;
-
               if (condition == null || condition.matches(record)) {
-                resultMap[record[primaryKey].toString()] = record;
+                partitionResults.add(record);
               }
             }
-            return records;
-          },
+            return partitionResults;
+          };
+        }).toList();
+
+        final resultsFromPartitions =
+            await ParallelProcessor.execute<List<Map<String, dynamic>>>(
+          tasks,
+          concurrency: _dataStore.config.maxConcurrent,
+          label: 'QueryExecutor._performTableScan.full',
         );
+        final orderedResults =
+            resultsFromPartitions.expand((e) => e ?? []).toList();
+        for (final record in orderedResults) {
+          resultMap[record[primaryKey].toString()] = record;
+        }
       } catch (e) {
         Logger.error('Error during parallel table scan: $e',
             label: 'QueryExecutor._performTableScan');
-      }
-    }
-
-    // Process records in write queue that match the condition
-    final pendingData =
-        _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-    if (condition != null) {
-      for (var record in pendingData.entries.toList()) {
-        if (condition.matches(record.value.data)) {
-          resultMap[record.value.data[primaryKey].toString()] =
-              Map<String, dynamic>.from(record.value.data);
-        }
-      }
-    } else {
-      // Add all pending records
-      for (var record in pendingData.entries.toList()) {
-        resultMap[record.value.data[primaryKey].toString()] =
-            Map<String, dynamic>.from(record.value.data);
       }
     }
 
@@ -1142,19 +1103,6 @@ class QueryExecutor {
           fileMeta);
 
       if (targetPartitions.isEmpty) {
-        // If no suitable partitions are found, check the write buffer
-        final pendingData =
-            _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-        final pendingRecord = pendingData[pkValue.toString()];
-
-        if (pendingRecord != null) {
-          // If the write buffer exists and satisfies all conditions
-          if (queryCondition == null ||
-              queryCondition.matches(pendingRecord.data)) {
-            return [Map<String, dynamic>.from(pendingRecord.data)];
-          }
-        }
-
         // No records found
         return [];
       }
@@ -1189,20 +1137,6 @@ class QueryExecutor {
           return records;
         },
       );
-
-      // Check the write buffer to see if there are any updated records
-      final pendingData =
-          _dataStore.tableDataManager.writeBuffer[tableName] ?? {};
-      final pendingRecord = pendingData[pkValue.toString()];
-
-      if (pendingRecord != null) {
-        // If the write buffer exists and satisfies all conditions
-        if (queryCondition == null ||
-            queryCondition.matches(pendingRecord.data)) {
-          resultMap[pkValue.toString()] =
-              Map<String, dynamic>.from(pendingRecord.data);
-        }
-      }
 
       return resultMap.values.toList();
     } catch (e) {
@@ -1482,37 +1416,72 @@ class QueryExecutor {
     }
   }
 
-  /// filter out records that are pending deletion
-  Future<List<Map<String, dynamic>>> _filterPendingDeletes(
-      String tableName, List<Map<String, dynamic>> results) async {
-    if (results.isEmpty) {
-      return results;
-    }
-
-    // Get pending deletions from the delete buffer
-    final pendingDeleteKeys =
-        _dataStore.tableDataManager.getPendingDeletePrimaryKeys(tableName);
-
-    if (pendingDeleteKeys.isEmpty) {
-      return results;
-    }
-
-    // Get the primary key for the table to identify records
+  /// filter out records that are pending buffer
+  Future<List<Map<String, dynamic>>> _filterPendingBuffer(String tableName,
+      List<Map<String, dynamic>> results, QueryCondition? condition,
+      {bool applyWriteBuffer = false}) async {
+    // Get the primary key for the table to identify records.
     final schema = await _dataStore.getTableSchema(tableName);
     if (schema == null) {
-      // Cannot filter without schema, so return original results as a fallback
       Logger.warn(
-          'Could not filter pending deletes for table $tableName because schema was not found.',
-          label: 'QueryExecutor._filterPendingDeletes');
+          'Could not filter pending buffer for table $tableName because schema was not found.',
+          label: 'QueryExecutor._filterPendingBuffer');
       return results;
     }
     final primaryKey = schema.primaryKey;
 
-    // Remove records from the results if their primary key is in the pending deletion set
-    return results.where((record) {
+    final pendingDeleteKeys =
+        _dataStore.tableDataManager.getPendingDeletePrimaryKeys(tableName);
+    final pendingWrites = _dataStore.tableDataManager.writeBuffer[tableName];
+
+    // Early exit if there's nothing to do from buffers.
+    if (results.isEmpty &&
+        pendingDeleteKeys.isEmpty &&
+        (!applyWriteBuffer || pendingWrites == null || pendingWrites.isEmpty)) {
+      return results;
+    }
+
+    // Using a map is efficient for merging and filtering.
+    final resultMap = <String, Map<String, dynamic>>{};
+
+    // 1. Populate with initial results.
+    for (final record in results) {
       final pkValue = record[primaryKey]?.toString();
-      return pkValue == null || !pendingDeleteKeys.contains(pkValue);
-    }).toList();
+      if (pkValue != null) {
+        resultMap[pkValue] = record;
+      }
+    }
+
+    // 2. Apply pending writes if requested. This adds new records or updates existing ones.
+    if (applyWriteBuffer && pendingWrites != null && pendingWrites.isNotEmpty) {
+      for (final entry in pendingWrites.values) {
+        final record = entry.data;
+        // A record in the write buffer must be considered.
+        // If a condition is provided, it must match.
+        if (condition == null || condition.matches(record)) {
+          final pkValue = record[primaryKey]?.toString();
+          if (pkValue != null) {
+            resultMap[pkValue] = record;
+          }
+        }
+      }
+    }
+
+    // 3. Apply pending deletions.
+    // For efficiency, we choose the smaller collection to iterate over.
+    if (pendingDeleteKeys.isNotEmpty) {
+      if (resultMap.length > pendingDeleteKeys.length) {
+        // If the result map is larger, it's faster to iterate the smaller delete set.
+        for (final key in pendingDeleteKeys) {
+          resultMap.remove(key);
+        }
+      } else {
+        // If the delete set is larger or equal, it's faster to iterate the map.
+        resultMap.removeWhere((key, value) => pendingDeleteKeys.contains(key));
+      }
+    }
+
+    return resultMap.values.toList();
   }
 }
 

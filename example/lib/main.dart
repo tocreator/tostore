@@ -365,37 +365,42 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         child: Stack(
           children: [
             // Main Content
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _buildViewToggle(),
-                Expanded(
-                  child: _isInitializing
-                      ? _buildInitializingView()
-                      : PageView(
-                          controller: _pageViewController,
-                          onPageChanged: (index) {
-                            final newView = AppView.values[index];
-                            if (_selectedView != newView) {
-                            setState(() {
-                                _selectedView = newView;
-                              });
-                              // If switching to Data View, always refresh the data
-                              // to ensure it's not stale after benchmark tests.
-                              if (newView == AppView.dataView) {
-                                _fetchTableData(resetPage: true);
-                              }
-                            }
-                          },
-                          children: [
-                            _buildDataView(),
-                            _buildBenchmarkView(),
-                          ],
-                        ),
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 1200),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _buildViewToggle(),
+                    Expanded(
+                      child: _isInitializing
+                          ? _buildInitializingView()
+                          : PageView(
+                              controller: _pageViewController,
+                              onPageChanged: (index) {
+                                final newView = AppView.values[index];
+                                if (_selectedView != newView) {
+                                  setState(() {
+                                    _selectedView = newView;
+                                  });
+                                  // If switching to Data View, always refresh the data
+                                  // to ensure it's not stale after benchmark tests.
+                                  if (newView == AppView.dataView) {
+                                    _fetchTableData(resetPage: true);
+                                  }
+                                }
+                              },
+                              children: [
+                                _buildDataView(),
+                                _buildBenchmarkView(),
+                              ],
+                            ),
+                    ),
+                    // This space is a buffer for the collapsed log panel handle
+                    const SizedBox(height: 60),
+                  ],
                 ),
-                // This space is a buffer for the collapsed log panel handle
-                const SizedBox(height: 60),
-              ],
+              ),
             ),
             // Draggable Log Panel
             _buildResizableLogPanel(),
@@ -521,24 +526,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              DropdownButton<String>(
-                  value: _selectedSpace,
-                  items: _spaceNames.map((String spaceName) {
-                    return DropdownMenuItem<String>(
-                      value: spaceName,
-                      child: Text(spaceName, overflow: TextOverflow.ellipsis),
-                    );
-                  }).toList(),
-                  onChanged: (String? newSpace) async {
-                    if (newSpace != null && newSpace != _selectedSpace) {
-                      await widget.example.db.switchSpace(spaceName: newSpace);
-                      setState(() {
-                        _selectedSpace = newSpace;
-                      });
-                      await _fetchTableData(resetPage: true);
-                    }
-                  },
-                ),
               // Table Selector Dropdown
               DropdownButton<String>(
                 value: _selectedTable,
@@ -557,7 +544,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   }
                 },
               ),
-              Text('$_totalRecords Records',
+              Text(
+                  '$_totalRecords Records ($_selectedSpace)', // Show current space
                   style: Theme.of(context).textTheme.bodyMedium),
             ],
           ),
@@ -845,191 +833,201 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 ],
               ),
             ),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              alignment: WrapAlignment.center,
-              children: [
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                      text: 'Clear Table',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () async {
-                              setState(() {
-                                _isTesting = true;
-                                _lastOperationInfo = 'Clearing tables...';
-                              });
-                              try {
-                                final elapsed =
-                                    await widget.example.clearExamples();
-                                if (mounted) {
-                                  _updateOperationInfo(
-                                      'Clear Table: ${elapsed}ms');
-                                  _fetchTableData(resetPage: true);
-                                }
-                              } finally {
-                                if (mounted) {
-                                  setState(() {
-                                    _isTesting = false;
-                                  });
-                                }
-                              }
-                            }),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                      text: 'Query',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () async {
-                              setState(() {
-                                _isTesting = true;
-                                _lastOperationInfo = 'Querying...';
-                              });
-                              try {
-                                final elapsed =
-                                    await widget.example.queryExamples();
-                                if (mounted) {
-                                  _updateOperationInfo('Query: ${elapsed}ms');
-                                }
-                              } finally {
-                                if (mounted) {
-                                  setState(() {
-                                    _isTesting = false;
-                                  });
-                                }
-                              }
-                            }),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                      text: 'Batch Add 10k',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () async {
-                              setState(() {
-                                _isTesting = true;
-                                _lastOperationInfo = 'Batch Adding...';
-                              });
-                              try {
-                                final elapsed =
-                                    await widget.example.addExamples();
-                                if (mounted) {
-                                  _updateOperationInfo(
-                                      'Batch Add 10k: ${elapsed}ms');
-                                  _fetchTableData(resetPage: true);
-                                }
-                              } finally {
-                                if (mounted) {
-                                  setState(() {
-                                    _isTesting = false;
-                                  });
-                                }
-                              }
-                            }),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                      text: 'Slow Add 10k',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () async {
-                              setState(() {
-                                _isTesting = true;
-                                _lastOperationInfo = 'Slow Adding...';
-                              });
-                              try {
-                                final elapsed =
-                                    await widget.example.addExamplesOneByOne();
-                                if (mounted) {
-                                  _updateOperationInfo(
-                                      'Slow Add 10k: ${elapsed}ms');
-                                  _fetchTableData(resetPage: true);
-                                }
-                              } finally {
-                                if (mounted) {
-                                  setState(() {
-                                    _isTesting = false;
-                                  });
-                                }
-                              }
-                            }),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                      text: 'Delete Many',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () async {
-                              setState(() {
-                                _isTesting = true;
-                                _lastOperationInfo = 'Deleting...';
-                              });
-                              try {
-                                final elapsed =
-                                    await widget.example.deleteExamples();
-                                if (mounted) {
-                                  _updateOperationInfo(
-                                      'Delete Many: ${elapsed}ms');
-                                  _fetchTableData(resetPage: true);
-                                }
-                              } finally {
-                                if (mounted) {
-                                  setState(() {
-                                    _isTesting = false;
-                                  });
-                                }
-                              }
-                            }),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                    text: 'Concurrency Test',
-                    onPressed: !_isDbInitialized || _isTesting
-                        ? null
-                        : _showConcurrencyTestDialog,
-                  ),
-                ),
-                SizedBox(
-                  width: MediaQuery.of(context).size.width / 2 - 22,
-                  child: _buildActionButton(
-                    text: 'Run All Tests',
-                    onPressed: !_isDbInitialized || _isTesting
-                        ? null
-                        : () async {
-                            setState(() {
-                              _isTesting = true;
-                            });
-                            try {
-                              final tester = DatabaseTester(
-                                widget.example.db,
-                                logService,
-                                _updateOperationInfo,
-                                (isSuppressing) {
-                                  _suppressSpecificWarnings = isSuppressing;
-                                },
-                              );
-                              await tester.runAllTests();
-                            } finally {
-                              if (mounted) {
+            LayoutBuilder(builder: (context, constraints) {
+              final double buttonWidth;
+              // On very narrow screens, use one column. Otherwise, use two.
+              if (constraints.maxWidth < 360) {
+                buttonWidth = constraints.maxWidth;
+              } else {
+                buttonWidth = (constraints.maxWidth - 12) / 2; // 12 is spacing
+              }
+
+              return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                alignment: WrapAlignment.center,
+                children: [
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                        text: 'Clear Table',
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () async {
                                 setState(() {
-                                  _isTesting = false;
+                                  _isTesting = true;
+                                  _lastOperationInfo = 'Clearing tables...';
                                 });
-                              }
-                               _fetchTableData(resetPage: true);
-                            }
-                          },
+                                try {
+                                  final elapsed =
+                                      await widget.example.clearExamples();
+                                  if (mounted) {
+                                    _updateOperationInfo(
+                                        'Clear Table: ${elapsed}ms');
+                                    _fetchTableData(resetPage: true);
+                                  }
+                                } finally {
+                                  if (mounted) {
+                                    setState(() {
+                                      _isTesting = false;
+                                    });
+                                  }
+                                }
+                              }),
                   ),
-                ),
-              ],
-            ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                        text: 'Query',
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () async {
+                                setState(() {
+                                  _isTesting = true;
+                                  _lastOperationInfo = 'Querying...';
+                                });
+                                try {
+                                  final elapsed =
+                                      await widget.example.queryExamples();
+                                  if (mounted) {
+                                    _updateOperationInfo('Query: ${elapsed}ms');
+                                  }
+                                } finally {
+                                  if (mounted) {
+                                    setState(() {
+                                      _isTesting = false;
+                                    });
+                                  }
+                                }
+                              }),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                        text: 'Batch Add 10k',
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () async {
+                                setState(() {
+                                  _isTesting = true;
+                                  _lastOperationInfo = 'Batch Adding...';
+                                });
+                                try {
+                                  final elapsed =
+                                      await widget.example.addExamples();
+                                  if (mounted) {
+                                    _updateOperationInfo(
+                                        'Batch Add 10k: ${elapsed}ms');
+                                    _fetchTableData(resetPage: true);
+                                  }
+                                } finally {
+                                  if (mounted) {
+                                    setState(() {
+                                      _isTesting = false;
+                                    });
+                                  }
+                                }
+                              }),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                        text: 'Slow Add 10k',
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () async {
+                                setState(() {
+                                  _isTesting = true;
+                                  _lastOperationInfo = 'Slow Adding...';
+                                });
+                                try {
+                                  final elapsed = await widget.example
+                                      .addExamplesOneByOne();
+                                  if (mounted) {
+                                    _updateOperationInfo(
+                                        'Slow Add 10k: ${elapsed}ms');
+                                    _fetchTableData(resetPage: true);
+                                  }
+                                } finally {
+                                  if (mounted) {
+                                    setState(() {
+                                      _isTesting = false;
+                                    });
+                                  }
+                                }
+                              }),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                        text: 'Delete Many',
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () async {
+                                setState(() {
+                                  _isTesting = true;
+                                  _lastOperationInfo = 'Deleting...';
+                                });
+                                try {
+                                  final elapsed =
+                                      await widget.example.deleteExamples();
+                                  if (mounted) {
+                                    _updateOperationInfo(
+                                        'Delete Many: ${elapsed}ms');
+                                    _fetchTableData(resetPage: true);
+                                  }
+                                } finally {
+                                  if (mounted) {
+                                    setState(() {
+                                      _isTesting = false;
+                                    });
+                                  }
+                                }
+                              }),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                      text: 'Concurrency Test',
+                      onPressed: !_isDbInitialized || _isTesting
+                          ? null
+                          : _showConcurrencyTestDialog,
+                    ),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: _buildActionButton(
+                      text: 'Run All Tests',
+                      onPressed: !_isDbInitialized || _isTesting
+                          ? null
+                          : () async {
+                              setState(() {
+                                _isTesting = true;
+                              });
+                              try {
+                                final tester = DatabaseTester(
+                                  widget.example.db,
+                                  logService,
+                                  _updateOperationInfo,
+                                  (isSuppressing) {
+                                    _suppressSpecificWarnings = isSuppressing;
+                                  },
+                                );
+                                await tester.runAllTests();
+                              } finally {
+                                if (mounted) {
+                                  setState(() {
+                                    _isTesting = false;
+                                  });
+                                }
+                                _fetchTableData(resetPage: true);
+                              }
+                            },
+                    ),
+                  ),
+                ],
+              );
+            }),
           ],
         ),
       ),
@@ -1304,6 +1302,18 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   PopupMenuButton<String> _buildMoreActionsButton() {
     return PopupMenuButton<String>(
       onSelected: (value) async {
+        if (value.startsWith('switch_space_')) {
+          final newSpace = value.substring('switch_space_'.length);
+          if (newSpace != _selectedSpace) {
+            await widget.example.db.switchSpace(spaceName: newSpace);
+            setState(() {
+              _selectedSpace = newSpace;
+            });
+            await _fetchTableData(resetPage: true);
+          }
+          return;
+        }
+
         switch (value) {
           case 'clear_all_tables':
             setState(() {
@@ -1333,6 +1343,18 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           value: 'clear_all_tables',
           child: Text('Clear All Tables'),
           ),
+          const PopupMenuDivider(),
+          const PopupMenuItem<String>(
+            enabled: false,
+            child: Text('Switch Space'),
+          ),
+          ..._spaceNames.map((spaceName) {
+            return CheckedPopupMenuItem<String>(
+              value: 'switch_space_$spaceName',
+              checked: _selectedSpace == spaceName,
+              child: Text(spaceName),
+            );
+          }),
         ];
       },
     );
@@ -1422,7 +1444,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         ),
       );
 
-      await _fetchTableData(); // Refresh the view
+      await _fetchTableData(resetPage: true); // Refresh the view and go to page 1
     }
   }
 

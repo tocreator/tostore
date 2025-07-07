@@ -54,6 +54,7 @@ class DataStoreImpl {
   final List<TableSchema> _schemas;
 
   bool _baseInitialized = false;
+  String? _dbName;
 
   bool get isInitialized => _isInitialized;
   final bool isMigrationInstance;
@@ -176,6 +177,8 @@ class DataStoreImpl {
     if (_initializing || _isInitialized) {
       return;
     }
+
+    _dbName = dbName;
 
     _initCompleter = Completer<void>();
 
@@ -314,7 +317,10 @@ class DataStoreImpl {
         logLevel: _config!.logLevel,
       );
 
-      dbPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
+      if (dbName != null) {
+        _dbName = dbName;
+      }
+      dbPath = await getDatabasePath(dbPath: dbPath, dbName: _dbName);
 
       // Now, update the config with the final path.
       _config = _config!.copyWith(dbPath: dbPath);
@@ -1962,9 +1968,8 @@ class DataStoreImpl {
         });
 
         // Invalidate query caches for all newly inserted valid records
-        // Use a non-blocking future to avoid delaying the response
-        Future(() => dataCacheManager.invalidateAffectedQueries(tableName,
-            records: validRecords));
+        await dataCacheManager.invalidateAffectedQueries(tableName,
+            records: validRecords);
 
         // Return result
         if (invalidRecords.isEmpty) {
@@ -3014,22 +3019,24 @@ class DataStoreImpl {
   }
 
   /// Get information about the current space
-  Future<SpaceInfo> getSpaceInfo() async {
+  Future<SpaceInfo> getSpaceInfo({bool useCache = true}) async {
     try {
       // Get space configuration
-      final config = await getSpaceConfig();
+      var config = await getSpaceConfig();
       // Get only user-created tables by using onlyUserTables=true
       final allTables =
           await schemaManager?.listAllTables(onlyUserTables: true) ?? [];
 
-      // Check if statistics are stale (older than 1 hour)
+      // Check if statistics are stale (older than 1 hour) or if cache is disabled
       final currentTime = DateTime.now();
       final lastStatsTime = config?.lastStatisticsTime ?? DateTime(2000);
       final statsDuration = currentTime.difference(lastStatsTime);
 
-      if (statsDuration.inHours > 1) {
-        // Schedule statistics recalculation without waiting for it to complete
-        tableDataManager.recalculateAllStatistics();
+      if (!useCache || statsDuration.inHours > 1) {
+        // Schedule statistics recalculation and wait for it to complete
+        await tableDataManager.recalculateAllStatistics();
+        // Reload the space config from file to get the updated stats
+        config = await getSpaceConfig();
       }
 
       // Get only tables that exist in the current space
@@ -3054,6 +3061,59 @@ class DataStoreImpl {
     } catch (e) {
       Logger.error('Failed to get space info: $e',
           label: 'DataStoreImpl.getSpaceInfo');
+      rethrow;
+    }
+  }
+
+  /// Delete a space
+  /// [spaceName] Space name to delete
+  Future<void> deleteSpace(String spaceName) async {
+    await ensureInitialized();
+
+    if (spaceName == 'default') {
+      Logger.warn(
+        'Cannot delete the default space',
+        label: 'DataStore.deleteSpace',
+      );
+      return;
+    }
+
+    if (spaceName == _currentSpaceName) {
+      Logger.warn(
+        'Cannot delete the currently active space. Please switch to another space before deleting.',
+        label: 'DataStore.deleteSpace',
+      );
+      return;
+    }
+
+    try {
+      final globalConfig = await getGlobalConfig();
+      if (globalConfig == null ||
+          !globalConfig.spaceNames.contains(spaceName)) {
+        Logger.warn('Space $spaceName does not exist, no need to delete.',
+            label: 'DataStore.deleteSpace');
+        return;
+      }
+
+      // 1. Get the path for the space
+      final spacePath = pathManager.getSpacePath();
+
+      // 2. Delete the space directory
+      if (await storage.existsDirectory(spacePath)) {
+        await storage.deleteDirectory(spacePath);
+      }
+
+      // 3. Remove the space from GlobalConfig
+      final updatedSpaces = Set<String>.from(globalConfig.spaceNames)
+        ..remove(spaceName);
+      final updatedConfig = globalConfig.copyWith(spaceNames: updatedSpaces);
+      await saveGlobalConfig(updatedConfig);
+
+      Logger.info('Space $spaceName has been successfully deleted.',
+          label: 'DataStore.deleteSpace');
+    } catch (e) {
+      Logger.error('Failed to delete space $spaceName: $e',
+          label: 'DataStore.deleteSpace');
       rethrow;
     }
   }

@@ -4091,8 +4091,30 @@ class IndexManager {
 
     try {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
+      final keysToSearch = keys.toSet();
 
-      // 1. Check cache first - if fully loaded, perform search in memory.
+      // Search write buffer first, as it contains the most recent, not-yet-persisted data.
+      if (_writeBuffer.containsKey(cacheKey)) {
+        final buffer = _writeBuffer[cacheKey]!;
+        for (final entry in buffer.values) {
+          if (keysToSearch.contains(entry.indexEntry.indexKey)) {
+            final key = entry.indexEntry.indexKey;
+            final pointer = entry.indexEntry.recordPointer.toString();
+            final entryUniqueKey =
+                IndexBufferEntry.createUniqueKey(key, pointer);
+
+            // Ensure the entry isn't pending deletion.
+            if (_deleteBuffer.containsKey(cacheKey) &&
+                _deleteBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
+              continue;
+            }
+
+            allResults.putIfAbsent(key, () => []).add(pointer);
+          }
+        }
+      }
+
+      // 1. Check cache first - if fully loaded, perform search in memory and merge.
       if (_indexCache.containsKey(cacheKey) &&
           _indexFullyCached[cacheKey] == true) {
         _updateIndexAccessWeight(cacheKey);
@@ -4104,12 +4126,17 @@ class IndexManager {
             ? ValueComparator.getPrimaryKeyComparator(pkType)
             : ValueComparator.compare;
 
-        // Add async yield to avoid UI jank
         int processedCount = 0;
         for (final key in keys) {
           final results = await btree.search(key, comparator: comparator);
           if (results.isNotEmpty) {
-            allResults[key] = results;
+            // Merge results, avoiding duplicates.
+            final existingPointers = allResults.putIfAbsent(key, () => []);
+            for (final res in results) {
+              if (!existingPointers.contains(res)) {
+                existingPointers.add(res);
+              }
+            }
           }
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
@@ -4123,7 +4150,7 @@ class IndexManager {
 
       final meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) {
-        return allResults; // No index, no results.
+        return allResults; // No index meta, return buffer results.
       }
 
       final tableSchema = await _dataStore.getTableSchema(tableName);
@@ -4232,7 +4259,13 @@ class IndexManager {
       for (final result in resultsFromPartitions) {
         if (result != null) {
           result.found.forEach((key, value) {
-            allResults.putIfAbsent(key, () => []).addAll(value);
+            // Merge results, avoiding duplicates.
+            final existingPointers = allResults.putIfAbsent(key, () => []);
+            for (final v in value) {
+              if (!existingPointers.contains(v)) {
+                existingPointers.add(v);
+              }
+            }
           });
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
@@ -4247,7 +4280,7 @@ class IndexManager {
     } catch (e) {
       Logger.error('Failed to batch search index $tableName.$indexName: $e',
           label: 'IndexManager.batchSearchIndex');
-      return allResults;
+      return allResults; // Return whatever was found, even on error.
     }
   }
 }

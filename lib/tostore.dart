@@ -594,12 +594,26 @@ class ToStore implements DataStoreInterface {
 
   /// Get information about the current space
   /// Returns detailed information about the current working space
+  /// [useCache] Whether to use cached data. Defaults to true. Set to false to get the latest data.
   ///
   /// 获取当前空间的信息
   /// 返回当前工作空间的详细信息
+  /// [useCache] 是否使用缓存数据，默认为true。设置为false可获取最新数据。
   @override
-  Future<SpaceInfo> getSpaceInfo() async {
-    return await _impl.getSpaceInfo();
+  Future<SpaceInfo> getSpaceInfo({bool useCache = true}) async {
+    return await _impl.getSpaceInfo(useCache: useCache);
+  }
+
+  /// Delete a space
+  /// [spaceName] Space name to delete
+  /// Cannot delete the default space or the currently active space
+  ///
+  /// 删除空间
+  /// [spaceName] 要删除的空间名称
+  /// 不能删除默认空间或当前活动空间
+  @override
+  Future<void> deleteSpace(String spaceName) async {
+    return await _impl.deleteSpace(spaceName);
   }
 
   /// @nodoc
