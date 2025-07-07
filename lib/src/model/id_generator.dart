@@ -722,86 +722,86 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Update request stats
     _updateRequestStats(count);
 
-      // Ensure ID pool exists
-      if (!_idPools.containsKey(tableName)) {
-        _idPools[tableName] = Queue<String>();
+    // Ensure ID pool exists
+    if (!_idPools.containsKey(tableName)) {
+      _idPools[tableName] = Queue<String>();
+    }
+
+    // Prepare result list
+    final result = <String>[];
+
+    // Check existing IDs in pool
+    if (_idPools[tableName]!.isNotEmpty) {
+      // Update last use time
+      _idPoolLastUpdateTime[tableName] = DateTime.now();
+
+      // Get IDs from pool until demand is met or pool is empty
+      while (result.length < count && _idPools[tableName]!.isNotEmpty) {
+        result.add(_idPools[tableName]!.removeFirst());
       }
 
-      // Prepare result list
-      final result = <String>[];
+      // If enough IDs are retrieved, return directly
+      if (result.length == count) {
+        return result;
+      }
+    }
 
-      // Check existing IDs in pool
-      if (_idPools[tableName]!.isNotEmpty) {
-        // Update last use time
-        _idPoolLastUpdateTime[tableName] = DateTime.now();
+    // Here indicates pool ID is insufficient, need to synchronize waiting for refill
 
-        // Get IDs from pool until demand is met or pool is empty
-        while (result.length < count && _idPools[tableName]!.isNotEmpty) {
+    // Get effective recent request count
+    final effectiveRecentTotal =
+        recentTotal > 0 ? recentTotal : _getRecentRequestCount();
+    // Calculate expected pool size
+    final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
+
+    // Calculate the number of IDs needed
+    final targetSize = expectedPoolSize + (count - result.length);
+
+    // Calculate reasonable timeout time - base time 5 seconds + 5 seconds per 1000 IDs
+    final remainingCount = count - result.length;
+    final timeout = Duration(
+      seconds: 5 + ((remainingCount ~/ 1000) * 5),
+    );
+    // Record start time
+    final startTime = DateTime.now();
+    final endTime = startTime.add(timeout);
+
+    try {
+      // Start asynchronous pool refill, no waiting
+      // This will start ID generation process in the background
+      _refillIdPool(targetSize, effectiveRecentTotal);
+
+      // Get remaining required IDs from pool with timeout check
+      while (result.length < count) {
+        // Timeout check: If it has exceeded the set time, exit loop
+        if (DateTime.now().isAfter(endTime)) {
+          Logger.warn(
+              'Get ID timeout: Table=$tableName, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds',
+              label: 'TimeBasedIdGenerator.getId');
+          break; // Exit loop, return retrieved IDs
+        }
+        // Directly get latest queue state from _idPools
+        if (_idPools[tableName]?.isNotEmpty ?? false) {
           result.add(_idPools[tableName]!.removeFirst());
-        }
-
-        // If enough IDs are retrieved, return directly
-        if (result.length == count) {
-          return result;
+        } else {
+          // Briefly wait to yield CPU, avoid tight loop
+          await Future.delayed(const Duration(milliseconds: 10));
         }
       }
+    } catch (e) {
+      Logger.error('ID pool fill or get failed: $e',
+          label: 'TimeBasedIdGenerator.getId');
+    }
 
-      // Here indicates pool ID is insufficient, need to synchronize waiting for refill
+    // If no ID is retrieved, throw exception
+    if (result.isEmpty) {
+      throw Exception(
+          'Unable to generate ID: Pool is empty and fill timeout. Table=$tableName, Request=$count, '
+          'Fill in=${_idGenerationInProgress[tableName] ?? false}, '
+          'Current pool size=${_idPools[tableName]?.length ?? 0}');
+    }
 
-      // Get effective recent request count
-      final effectiveRecentTotal =
-          recentTotal > 0 ? recentTotal : _getRecentRequestCount();
-      // Calculate expected pool size
-      final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
-
-      // Calculate the number of IDs needed
-      final targetSize = expectedPoolSize + (count - result.length);
-
-      // Calculate reasonable timeout time - base time 5 seconds + 5 seconds per 1000 IDs
-      final remainingCount = count - result.length;
-      final timeout = Duration(
-        seconds: 5 + ((remainingCount ~/ 1000) * 5),
-      );
-      // Record start time
-      final startTime = DateTime.now();
-      final endTime = startTime.add(timeout);
-
-      try {
-        // Start asynchronous pool refill, no waiting
-        // This will start ID generation process in the background
-        _refillIdPool(targetSize, effectiveRecentTotal);
-
-        // Get remaining required IDs from pool with timeout check
-        while (result.length < count) {
-          // Timeout check: If it has exceeded the set time, exit loop
-          if (DateTime.now().isAfter(endTime)) {
-            Logger.warn(
-                'Get ID timeout: Table=$tableName, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds',
-                label: 'TimeBasedIdGenerator.getId');
-            break; // Exit loop, return retrieved IDs
-          }
-          // Directly get latest queue state from _idPools
-          if (_idPools[tableName]?.isNotEmpty ?? false) {
-            result.add(_idPools[tableName]!.removeFirst());
-          } else {
-            // Briefly wait to yield CPU, avoid tight loop
-            await Future.delayed(const Duration(milliseconds: 10));
-          }
-        }
-      } catch (e) {
-        Logger.error('ID pool fill or get failed: $e',
-            label: 'TimeBasedIdGenerator.getId');
-      }
-
-      // If no ID is retrieved, throw exception
-      if (result.isEmpty) {
-        throw Exception(
-            'Unable to generate ID: Pool is empty and fill timeout. Table=$tableName, Request=$count, '
-            'Fill in=${_idGenerationInProgress[tableName] ?? false}, '
-            'Current pool size=${_idPools[tableName]?.length ?? 0}');
-      }
-
-      return result;
+    return result;
   }
 
   /// Update request stats

@@ -44,4 +44,4 @@ class LogService {
   }
 }
 
-final logService = LogService(); 
+final logService = LogService();

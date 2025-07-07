@@ -558,50 +558,50 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             alignment: WrapAlignment.end,
             spacing: 8.0,
             runSpacing: 8.0,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _isDataLoading ? null : _showAddDataDialog,
-                  icon: const Icon(Icons.add, size: 16),
-                  label: const Text('Add'),
-                  style: ElevatedButton.styleFrom(
-                    padding:
+            children: [
+              ElevatedButton.icon(
+                onPressed: _isDataLoading ? null : _showAddDataDialog,
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('Add'),
+                style: ElevatedButton.styleFrom(
+                  padding:
                       const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                    backgroundColor: const Color.fromARGB(255, 10, 150, 210),
-                    foregroundColor: Colors.white,
-                    textStyle: const TextStyle(fontSize: 16),
-                  ),
+                  backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+                  foregroundColor: Colors.white,
+                  textStyle: const TextStyle(fontSize: 16),
                 ),
-                ElevatedButton.icon(
-                  onPressed: _selectedRows.isEmpty || _isDataLoading
-                      ? null
-                      : _showBatchUpdateDialog,
-                  icon: const Icon(Icons.edit, size: 16),
-                  label: const Text('Modify'),
-                  style: ElevatedButton.styleFrom(
-                    padding:
+              ),
+              ElevatedButton.icon(
+                onPressed: _selectedRows.isEmpty || _isDataLoading
+                    ? null
+                    : _showBatchUpdateDialog,
+                icon: const Icon(Icons.edit, size: 16),
+                label: const Text('Modify'),
+                style: ElevatedButton.styleFrom(
+                  padding:
                       const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                    backgroundColor:
-                        _selectedRows.isEmpty ? Colors.grey : Colors.green,
-                    foregroundColor: Colors.white,
-                    textStyle: const TextStyle(fontSize: 16),
-                  ),
+                  backgroundColor:
+                      _selectedRows.isEmpty ? Colors.grey : Colors.green,
+                  foregroundColor: Colors.white,
+                  textStyle: const TextStyle(fontSize: 16),
                 ),
-                ElevatedButton.icon(
-                  onPressed: _selectedRows.isEmpty || _isDataLoading
-                      ? null
-                      : _confirmDeleteSelected,
-                  icon: const Icon(Icons.delete, size: 16),
-                  label: Text('Del(${_selectedRows.length})'),
-                  style: ElevatedButton.styleFrom(
-                    padding:
+              ),
+              ElevatedButton.icon(
+                onPressed: _selectedRows.isEmpty || _isDataLoading
+                    ? null
+                    : _confirmDeleteSelected,
+                icon: const Icon(Icons.delete, size: 16),
+                label: Text('Del(${_selectedRows.length})'),
+                style: ElevatedButton.styleFrom(
+                  padding:
                       const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                    backgroundColor:
-                        _selectedRows.isEmpty ? Colors.grey : Colors.red,
-                    foregroundColor: Colors.white,
-                    textStyle: const TextStyle(fontSize: 16),
-                  ),
+                  backgroundColor:
+                      _selectedRows.isEmpty ? Colors.grey : Colors.red,
+                  foregroundColor: Colors.white,
+                  textStyle: const TextStyle(fontSize: 16),
                 ),
-              ],
+              ),
+            ],
           )
         ],
       ),
@@ -987,15 +987,15 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 height: totalHeaderHeight,
                 child: GestureDetector(
                   onDoubleTap: () {
-                      if (_logPanelController.isAttached) {
+                    if (_logPanelController.isAttached) {
                       final bool isExpanded = _logPanelController.size > 0.15;
-                        _logPanelController.animateTo(
-                          isExpanded ? 0.1 : 0.8,
-                          duration: const Duration(milliseconds: 300),
-                          curve: Curves.easeOut,
-                        );
-                      }
-                    },
+                      _logPanelController.animateTo(
+                        isExpanded ? 0.1 : 0.8,
+                        duration: const Duration(milliseconds: 300),
+                        curve: Curves.easeOut,
+                      );
+                    }
+                  },
                   child: Container(
                     color: Theme.of(context).colorScheme.surface,
                     child: Column(
@@ -1010,7 +1010,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                 child: Container(
                                   width: 40,
                                   height: 5,
-                                  margin: const EdgeInsets.symmetric(vertical: 8),
+                                  margin:
+                                      const EdgeInsets.symmetric(vertical: 8),
                                   decoration: BoxDecoration(
                                     color: Colors.grey.shade300,
                                     borderRadius: BorderRadius.circular(10),
@@ -1028,33 +1029,33 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                               fontWeight: FontWeight.bold,
                                               fontSize: 16)),
                                       const Spacer(),
-              IconButton(
-                icon: const Icon(Icons.arrow_upward),
-                tooltip: 'Scroll to Top',
+                                      IconButton(
+                                        icon: const Icon(Icons.arrow_upward),
+                                        tooltip: 'Scroll to Top',
                                         onPressed: _logCanScrollUp
                                             ? _logScrollToTop
                                             : null,
-              ),
-              IconButton(
-                icon: const Icon(Icons.arrow_downward),
-                tooltip: 'Scroll to Bottom',
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.arrow_downward),
+                                        tooltip: 'Scroll to Bottom',
                                         onPressed: _logCanScrollDown
                                             ? _logScrollToBottom
                                             : null,
-              ),
-              IconButton(
+                                      ),
+                                      IconButton(
                                         icon: const Icon(Icons.copy_outlined,
                                             size: 20),
-                tooltip: 'Copy Visible Logs',
-                onPressed: () {
+                                        tooltip: 'Copy Visible Logs',
+                                        onPressed: () {
                                           // Copy logic...
-                },
-              ),
-              IconButton(
-                icon: const Icon(
-                  Icons.cleaning_services_rounded,
+                                        },
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(
+                                            Icons.cleaning_services_rounded,
                                             size: 20),
-                tooltip: 'Clear Logs',
+                                        tooltip: 'Clear Logs',
                                         onPressed: logService.clear,
                                       ),
                                       AnimatedBuilder(
@@ -1069,7 +1070,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                             tooltip: isExpanded
                                                 ? 'Collapse Logs'
                                                 : 'Expand Logs',
-                onPressed: () {
+                                            onPressed: () {
                                               _logPanelController.animateTo(
                                                 isExpanded ? 0.1 : 0.8,
                                                 duration: const Duration(
@@ -1078,11 +1079,11 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                               );
                                             },
                                           );
-                },
-              ),
-            ],
-          ),
-        ),
+                                        },
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               ),
                               const Divider(height: 1),
                             ],
@@ -1094,79 +1095,86 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                             height: searchAndFilterHeight,
                             child: Padding(
                               padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: _searchController,
-                    decoration: InputDecoration(
-                      hintText: 'Search in logs...',
-                      prefixIcon: const Icon(Icons.search),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  TextField(
+                                    controller: _searchController,
+                                    decoration: InputDecoration(
+                                      hintText: 'Search in logs...',
+                                      prefixIcon: const Icon(Icons.search),
                                       suffixIcon:
                                           _searchController.text.isNotEmpty
-                          ? IconButton(
-                              icon: const Icon(Icons.clear),
-                              onPressed: () {
-                                _searchController.clear();
-                              },
-                            )
-                          : null,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
+                                              ? IconButton(
+                                                  icon: const Icon(Icons.clear),
+                                                  onPressed: () {
+                                                    _searchController.clear();
+                                                  },
+                                                )
+                                              : null,
+                                      border: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      enabledBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(8),
                                         borderSide: BorderSide(
                                             color: Colors.grey.shade300,
                                             width: 0.8),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 8),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  ValueListenableBuilder<List<LogEntry>>(
-                    valueListenable: logService.logs,
-                    builder: (context, logs, child) {
+                                      ),
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                              horizontal: 12, vertical: 8),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 14),
+                                  ValueListenableBuilder<List<LogEntry>>(
+                                    valueListenable: logService.logs,
+                                    builder: (context, logs, child) {
                                       // Counts...
-                      final allCount = logs.length;
-                      final infoCount = logs
+                                      final allCount = logs.length;
+                                      final infoCount = logs
                                           .where(
                                               (log) => log.type == LogType.info)
-                          .length;
-                      final debugCount = logs
-                                          .where(
-                                              (log) => log.type == LogType.debug)
-                          .length;
-                      final warnCount = logs
+                                          .length;
+                                      final debugCount = logs
+                                          .where((log) =>
+                                              log.type == LogType.debug)
+                                          .length;
+                                      final warnCount = logs
                                           .where(
                                               (log) => log.type == LogType.warn)
-                          .length;
-                      final errorCount = logs
-                                          .where(
-                                              (log) => log.type == LogType.error)
-                          .length;
+                                          .length;
+                                      final errorCount = logs
+                                          .where((log) =>
+                                              log.type == LogType.error)
+                                          .length;
 
-                      return Wrap(
-                        spacing: 8.0,
-                        runSpacing: 8.0,
-                        alignment: WrapAlignment.start,
-                        children: [
-                          _buildFilterButton(
+                                      return Wrap(
+                                        spacing: 8.0,
+                                        runSpacing: 8.0,
+                                        alignment: WrapAlignment.start,
+                                        children: [
+                                          _buildFilterButton(
                                               'All', null, allCount, context),
-                                          _buildFilterButton('Info', LogType.info,
-                                              infoCount, context),
-                                          _buildFilterButton('Debug',
-                                              LogType.debug, debugCount, context),
-                                          _buildFilterButton('Warn', LogType.warn,
-                                              warnCount, context),
-                                          _buildFilterButton('Error',
-                                              LogType.error, errorCount, context),
-                        ],
-                      );
-                    },
-                  ),
-                ],
+                                          _buildFilterButton('Info',
+                                              LogType.info, infoCount, context),
+                                          _buildFilterButton(
+                                              'Debug',
+                                              LogType.debug,
+                                              debugCount,
+                                              context),
+                                          _buildFilterButton('Warn',
+                                              LogType.warn, warnCount, context),
+                                          _buildFilterButton(
+                                              'Error',
+                                              LogType.error,
+                                              errorCount,
+                                              context),
+                                        ],
+                                      );
+                                    },
+                                  ),
+                                ],
                               ),
                             ),
                           ),
@@ -1221,11 +1229,11 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                       },
                       childCount: filteredLogs.length,
                     ),
-              ),
-            );
-          },
-        ),
-      ],
+                  ),
+                );
+              },
+            ),
+          ],
         );
       },
     );
@@ -1272,8 +1280,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       itemBuilder: (BuildContext context) {
         return [
           const PopupMenuItem<String>(
-          value: 'clear_all_tables',
-          child: Text('Clear All Tables'),
+            value: 'clear_all_tables',
+            child: Text('Clear All Tables'),
           ),
           const PopupMenuDivider(),
           const PopupMenuItem<String>(
@@ -1376,7 +1384,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         ),
       );
 
-      await _fetchTableData(resetPage: true); // Refresh the view and go to page 1
+      await _fetchTableData(
+          resetPage: true); // Refresh the view and go to page 1
     }
   }
 
@@ -2080,4 +2089,3 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
     );
   }
 }
-

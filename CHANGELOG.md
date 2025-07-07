@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.5
+
+### Added
+- Added `DataType.json` to support JSON and Map data types.
+- Added benchmark tests to simulate production environments with hundreds of thousands of concurrent operations (insert, update, delete, query) across multiple tables. This enables one-click validation of all database APIs and functional integrity, enhancing reliability.
+- Added a data view for a more direct and intuitive data manipulation experience.
+
+### Changed
+- Optimized space management.
+
 ## 2.1.4
 
 ### Added

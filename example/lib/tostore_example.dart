@@ -472,7 +472,8 @@ class TostoreExample {
     await db.clear('comments');
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('Table "users", "posts" and "comments" cleared in ${elapsed}ms');
+    logService
+        .add('Table "users", "posts" and "comments" cleared in ${elapsed}ms');
     return elapsed;
   }
 
@@ -610,4 +611,4 @@ class TostoreExample {
     logService.add('query count: $queryCount');
     return elapsed;
   }
-} 
+}
