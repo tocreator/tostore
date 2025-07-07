@@ -555,7 +555,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
           // Action Buttons
           Wrap(
-            alignment: WrapAlignment.end,
+            alignment: WrapAlignment.center,
             spacing: 8.0,
             runSpacing: 8.0,
             children: [
@@ -565,10 +565,12 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 label: const Text('Add'),
                 style: ElevatedButton.styleFrom(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                   backgroundColor: const Color.fromARGB(255, 10, 150, 210),
                   foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 16),
+                  textStyle: const TextStyle(fontSize: 14),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
                 ),
               ),
               ElevatedButton.icon(
@@ -579,11 +581,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 label: const Text('Modify'),
                 style: ElevatedButton.styleFrom(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                   backgroundColor:
                       _selectedRows.isEmpty ? Colors.grey : Colors.green,
                   foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 16),
+                  textStyle: const TextStyle(fontSize: 14),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
                 ),
               ),
               ElevatedButton.icon(
@@ -594,11 +598,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 label: Text('Del(${_selectedRows.length})'),
                 style: ElevatedButton.styleFrom(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                   backgroundColor:
                       _selectedRows.isEmpty ? Colors.grey : Colors.red,
                   foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 16),
+                  textStyle: const TextStyle(fontSize: 14),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
                 ),
               ),
             ],
@@ -676,29 +682,34 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
   Widget _buildPaginationControls() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+      padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
       child: Wrap(
         alignment: WrapAlignment.center,
         crossAxisAlignment: WrapCrossAlignment.center,
-        spacing: 4.0, // Add some space between items
-        runSpacing: 8.0, // Add space for wrapped lines
+        spacing: 2.0, // Reduced space between items
+        runSpacing: 8.0,
         children: [
           IconButton(
             icon: const Icon(Icons.first_page),
             tooltip: 'First Page',
             onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
           ),
           IconButton(
             icon: const Icon(Icons.chevron_left),
             tooltip: 'Previous Page',
             onPressed:
                 _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
           ),
           Row(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               const Text('Page'),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4), // Reduced space
               SizedBox(
                 width: 50,
                 child: TextField(
@@ -709,8 +720,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   decoration: const InputDecoration(
                     isDense: true,
                     border: OutlineInputBorder(),
-                    contentPadding:
-                        EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 8),
                   ),
                   onSubmitted: (value) {
                     final page = int.tryParse(value);
@@ -720,7 +730,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   },
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4), // Reduced space
               Text('of $_totalPages'),
             ],
           ),
@@ -730,6 +740,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             onPressed: _currentPage < _totalPages
                 ? () => _goToPage(_currentPage + 1)
                 : null,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
           ),
           IconButton(
             icon: const Icon(Icons.last_page),
@@ -737,6 +749,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             onPressed: _currentPage < _totalPages
                 ? () => _goToPage(_totalPages)
                 : null,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
           ),
         ],
       ),
