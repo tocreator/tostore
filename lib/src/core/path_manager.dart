@@ -210,12 +210,6 @@ class PathManager {
     return pathJoin(tablePath, 'stats.json');
   }
 
-  /// get transaction log file path
-  Future<String> getTransactionLogPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
-    return pathJoin(tablePath, 'transaction.log');
-  }
-
   //==================================
   // cache path methods (sync methods)
   //==================================

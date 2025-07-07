@@ -3606,7 +3606,7 @@ class TableDataManager {
       final sortedPartitionIndexes = recordsToCreateIndex.keys.toList()..sort();
 
       // performance optimization: batch process index creation
-      const int indexBatchSize = 500;
+      final int indexBatchSize = _dataStore.config.maxBatchSize ~/ 2;
 
       for (final partitionIndex in sortedPartitionIndexes) {
         final recordsForIndex = recordsToCreateIndex[partitionIndex]!;
@@ -3639,14 +3639,17 @@ class TableDataManager {
                   'Failed to update record index: $e, record: ${record[primaryKey]}',
                   label: 'TableDataManager._asyncCreateIndexes');
             }
+
+            // yield to the event loop after processing each batch to keep the UI responsive.
+            if (j % 100 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
 
           offset += batch.length;
 
           // Yield to the event loop after processing each batch to keep the UI responsive.
-          if (i + indexBatchSize < recordsForIndex.length) {
-            await Future.delayed(Duration.zero);
-          }
+          await Future.delayed(Duration.zero);
         }
       }
     } catch (e) {

@@ -1231,6 +1231,7 @@ class BPlusTree {
 
     // Find and delete key or value in leaf node
     if (currentNode != null) {
+      bool found = false;
       for (int i = 0; i < currentNode.keys.length; i++) {
         if (_compareKeys(key, currentNode.keys[i], comparator: comparator) ==
             0) {
@@ -1265,8 +1266,13 @@ class BPlusTree {
             currentNode.values.removeAt(i);
             deleted = true;
           }
+          found = true;
           break;
         }
+      }
+
+      if (!found) {
+        return false;
       }
     }
 

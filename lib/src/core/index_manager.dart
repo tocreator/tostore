@@ -547,110 +547,115 @@ class IndexManager {
       if (entriesToDelete.isEmpty) return;
 
       final indexMeta = await _getIndexMeta(tableName, indexName);
-      if (indexMeta == null) return;
-
-      final isUniqueIndex = indexName == 'pk_$tableName' ||
-          indexMeta.isUnique ||
-          indexName.startsWith('uniq_');
-
-      // If the number of partitions is 0, there are no index files present
-      if (indexMeta.partitions.isEmpty) return;
-
-      // Create a mutable copy of the key list for concurrency security
-      final keysToDelete = List<String>.from(entriesToDelete.keys);
-
-      // A specific resource name for locking the keysToDelete list for this operation.
-      final listLockResource = 'internal:keysToDelete:$tableName:$indexName';
-
-      // Collect updated partition metadata
-      final List<IndexPartitionMeta> updatedPartitions = [];
-
-      final tasks = <Future<void> Function()>[];
-
-      // Process each partition concurrently
-      for (final partition in indexMeta.partitions) {
-        tasks.add(() async {
-          if (isUniqueIndex && keysToDelete.isEmpty) {
-            return;
-          }
-          try {
-            final localKeysToProcess = List<String>.from(keysToDelete);
-            if (localKeysToProcess.isEmpty) return;
-
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
-
-            if (!await _dataStore.storage.existsFile(partitionPath)) {
-              return;
-            }
-
-            final content =
-                await _dataStore.storage.readAsString(partitionPath);
-            if (content == null || content.isEmpty) {
-              return;
-            }
-
-            final request = IndexDeleteRequest(
-                content: content,
-                checksum: partition.checksum,
-                isUnique: isUniqueIndex,
-                keysToProcess: localKeysToProcess,
-                entriesToDelete: Map.fromEntries(entriesToDelete.entries
-                    .where((e) => localKeysToProcess.contains(e.key))));
-
-            // Run CPU-intensive operations in isolate
-            // Only use isolate if the content is large enough to justify the overhead
-            final useIsolate =
-                content.length > 500 * 1024 || localKeysToProcess.length > 1000;
-            final result = await ComputeManager.run(processIndexDelete, request,
-                useIsolate: useIsolate);
-
-            // Process result back in main thread
-            if (result.isModified) {
-              // IO operation: Write file (keep in main thread)
-              await _dataStore.storage
-                  .writeAsString(partitionPath, result.newContent);
-
-              // Update partition metadata
-              final updatedPartition = partition.copyWith(
-                fileSizeInBytes: result.newContent.length,
-                bTreeSize: result.newContent.length,
-                entries: result.entryCount,
-                timestamps: Timestamps(
-                  created: partition.timestamps.created,
-                  modified: DateTime.now(),
-                ),
-                checksum: result.checksum,
-              );
-
-              // Add to updated partitions list, not update metadata immediately
-              updatedPartitions.add(updatedPartition);
-            }
-
-            if (isUniqueIndex && result.processedKeys.isNotEmpty) {
-              final opId =
-                  'op-del-keys-${DateTime.now().microsecondsSinceEpoch}';
-              try {
-                await _dataStore.lockManager
-                    ?.acquireExclusiveLock(listLockResource, opId);
-                keysToDelete
-                    .removeWhere((k) => result.processedKeys.contains(k));
-              } finally {
-                _dataStore.lockManager
-                    ?.releaseExclusiveLock(listLockResource, opId);
-              }
-            }
-          } catch (e, stack) {
-            Logger.error(
-                'Failed to process partition for delete entries: $e\n$stack',
-                label: 'IndexManager._processDeleteEntries');
-          }
-        });
+      if (indexMeta == null || indexMeta.partitions.isEmpty) {
+        return;
       }
 
-      await ParallelProcessor.execute<void>(tasks,
-          label: 'IndexManager._processDeleteEntries',
-          timeout: ParallelProcessor.noTimeout);
+      final isUniqueIndex = indexName == 'pk_$tableName' || indexMeta.isUnique;
+
+      // Group entries by the partition they are expected to be in.
+      final Map<int, Map<String, IndexBufferEntry>> partitionedDeletes = {};
+      final Map<String, IndexBufferEntry> fallbackDeletes = {};
+
+      if (indexMeta.isOrdered == true) {
+        int processedCount = 0;
+        for (final entry in entriesToDelete.entries) {
+          final indexKey = entry.value.indexEntry.indexKey;
+          final partitionIndex = indexMeta.findPartitionForKey(indexKey);
+
+          if (partitionIndex != -1) {
+            partitionedDeletes.putIfAbsent(
+                partitionIndex, () => {})[entry.key] = entry.value;
+          } else {
+            // Key not found in any partition range, needs fallback scan.
+            fallbackDeletes[entry.key] = entry.value;
+          }
+          processedCount++;
+          if (processedCount % 500 == 0) {
+            await Future.delayed(Duration.zero);
+          }
+        }
+      } else {
+        // If the index is not ordered, we must check all partitions for all keys.
+        fallbackDeletes.addAll(entriesToDelete);
+      }
+
+      final List<IndexPartitionMeta> updatedPartitions = [];
+      final tasks = <Future<void> Function()>[];
+      final partitionMap = {for (var p in indexMeta.partitions) p.index: p};
+
+      // --- Process deletes for keys found in specific partitions (ordered indexes) ---
+      for (final job in partitionedDeletes.entries) {
+        final partitionIndex = job.key;
+        final entriesForPartition = job.value;
+        final partition = partitionMap[partitionIndex];
+
+        if (partition == null || entriesForPartition.isEmpty) continue;
+
+        tasks.add(() => _performDeleteOnPartition(
+              tableName,
+              indexName,
+              partition,
+              entriesForPartition,
+              isUniqueIndex,
+              updatedPartitions,
+            ));
+      }
+
+      // Execute tasks for ordered hits first.
+      if (tasks.isNotEmpty) {
+        await ParallelProcessor.execute<void>(tasks,
+            label: 'IndexManager._processDeleteEntries.ordered_hits');
+        tasks.clear();
+      }
+
+      // --- Process fallback deletes (for non-ordered indexes or unmapped keys) ---
+      if (fallbackDeletes.isNotEmpty) {
+        final keysToDelete = List<String>.from(fallbackDeletes.keys);
+        final listLockResource = 'internal:keysToDelete:$tableName:$indexName';
+
+        if (isUniqueIndex) {
+          final controller = ParallelController();
+          final uniqueFallbackTasks = <Future<void> Function()>[];
+          for (final partition in indexMeta.partitions) {
+            uniqueFallbackTasks.add(() => _performDeleteOnPartition(
+                  tableName,
+                  indexName,
+                  partition,
+                  fallbackDeletes,
+                  true, // isUniqueIndex
+                  updatedPartitions,
+                  sharedKeysToDelete: keysToDelete,
+                  lockResource: listLockResource,
+                  controller: controller,
+                ));
+          }
+          if (uniqueFallbackTasks.isNotEmpty) {
+            await ParallelProcessor.execute<void>(uniqueFallbackTasks,
+                label: 'IndexManager._processDeleteEntries.unique_fallback',
+                controller: controller,
+                timeout: ParallelProcessor.noTimeout);
+          }
+        } else {
+          // For non-unique indexes, we must check all partitions.
+          final nonUniqueFallbackTasks = <Future<void> Function()>[];
+          for (final partition in indexMeta.partitions) {
+            nonUniqueFallbackTasks.add(() => _performDeleteOnPartition(
+                  tableName,
+                  indexName,
+                  partition,
+                  fallbackDeletes,
+                  false, // isUniqueIndex
+                  updatedPartitions,
+                ));
+          }
+          if (nonUniqueFallbackTasks.isNotEmpty) {
+            await ParallelProcessor.execute<void>(nonUniqueFallbackTasks,
+                label: 'IndexManager._processDeleteEntries.non_unique_fallback',
+                timeout: ParallelProcessor.noTimeout);
+          }
+        }
+      }
 
       // After all partitions are processed, update the main metadata
       if (updatedPartitions.isNotEmpty) {
@@ -700,6 +705,101 @@ class IndexManager {
     } catch (e, stack) {
       Logger.error('Failed to process delete entries: $e\n$stack',
           label: 'IndexManager._processDeleteEntries');
+    }
+  }
+
+  /// Performs the actual deletion logic for a single partition.
+  Future<void> _performDeleteOnPartition(
+    String tableName,
+    String indexName,
+    IndexPartitionMeta partition,
+    Map<String, IndexBufferEntry> entriesToDelete,
+    bool isUniqueIndex,
+    List<IndexPartitionMeta> updatedPartitions, {
+    List<String>? sharedKeysToDelete,
+    String? lockResource,
+    ParallelController? controller,
+  }) async {
+    // If using a shared list of keys for a unique index, check if it's already empty.
+    if ((isUniqueIndex &&
+            sharedKeysToDelete != null &&
+            sharedKeysToDelete.isEmpty) ||
+        controller?.isStopped == true) {
+      return;
+    }
+
+    try {
+      final keysForThisTask =
+          sharedKeysToDelete ?? entriesToDelete.keys.toList();
+      if (keysForThisTask.isEmpty) return;
+
+      final partitionPath = await _dataStore.pathManager
+          .getIndexPartitionPath(tableName, indexName, partition.index);
+
+      if (!await _dataStore.storage.existsFile(partitionPath)) {
+        return;
+      }
+
+      final content = await _dataStore.storage.readAsString(partitionPath);
+      if (content == null || content.isEmpty) {
+        return;
+      }
+
+      // Filter the full `entriesToDelete` map to only include keys relevant for this task.
+      final relevantEntries = Map.fromEntries(entriesToDelete.entries
+          .where((e) => keysForThisTask.contains(e.key)));
+
+      final request = IndexDeleteRequest(
+          content: content,
+          checksum: partition.checksum,
+          isUnique: isUniqueIndex,
+          keysToProcess: keysForThisTask,
+          entriesToDelete: relevantEntries);
+
+      final useIsolate =
+          content.length > 50 * 1024 || keysForThisTask.length > 100;
+      final result = await ComputeManager.run(processIndexDelete, request,
+          useIsolate: useIsolate);
+
+      if (result.isModified) {
+        await _dataStore.storage
+            .writeAsString(partitionPath, result.newContent);
+
+        final updatedPartition = partition.copyWith(
+          fileSizeInBytes: result.newContent.length,
+          bTreeSize: result.newContent.length,
+          entries: result.entryCount,
+          timestamps: Timestamps(
+            created: partition.timestamps.created,
+            modified: DateTime.now(),
+          ),
+          checksum: result.checksum,
+        );
+        updatedPartitions.add(updatedPartition);
+      }
+
+      // If a shared key list was used (for unique indexes), remove the processed keys.
+      if (isUniqueIndex &&
+          result.processedKeys.isNotEmpty &&
+          sharedKeysToDelete != null &&
+          lockResource != null) {
+        final opId = 'op-del-keys-${DateTime.now().microsecondsSinceEpoch}';
+        try {
+          await _dataStore.lockManager
+              ?.acquireExclusiveLock(lockResource, opId);
+          sharedKeysToDelete
+              .removeWhere((k) => result.processedKeys.contains(k));
+          // If all keys are processed, stop other parallel tasks.
+          if (sharedKeysToDelete.isEmpty && controller != null) {
+            controller.stop();
+          }
+        } finally {
+          _dataStore.lockManager?.releaseExclusiveLock(lockResource, opId);
+        }
+      }
+    } catch (e, stack) {
+      Logger.error('Failed to process partition for delete entries: $e\n$stack',
+          label: 'IndexManager._performDeleteOnPartition');
     }
   }
 
@@ -899,8 +999,9 @@ class IndexManager {
                         );
                         return await ComputeManager.run(
                             processIndexPartition, request,
-                            useIsolate: (job.existingContent?.length ?? 0) >
-                                500 * 1024);
+                            useIsolate: ((job.existingContent?.length ?? 0) >
+                                    56 * 1024 ||
+                                job.entries.length > 100));
                       } catch (e, stack) {
                         Logger.error(
                             'Error preparing or running compute job for partition ${job.partitionIndex}: $e\n$stack',
@@ -1785,29 +1886,15 @@ class IndexManager {
           }
         }
 
-        if (index.fields.length == 1) {
-          // Single field index
-          final fieldName = index.fields[0];
-          final fieldValue = record[fieldName];
+        // update index，composite index and single field index
+        final compositeKey = _createIndexKey(record, index.fields);
+        if (compositeKey != null) {
+          await _addToInsertBuffer(
+              tableName, indexName, compositeKey, recordId);
 
-          if (fieldValue != null) {
-            await _addToInsertBuffer(
-                tableName, indexName, fieldValue, recordId);
-
-            // Record processed field indexes
-            processedFieldIndexes.add(fieldName);
-          }
-        } else {
-          // Composite index
-          final compositeKey = _createIndexKey(record, index.fields);
-          if (compositeKey != null) {
-            await _addToInsertBuffer(
-                tableName, indexName, compositeKey, recordId);
-
-            // Record processed composite index fields
-            for (final field in index.fields) {
-              processedFieldIndexes.add(field);
-            }
+          // Record processed composite index fields
+          for (final field in index.fields) {
+            processedFieldIndexes.add(field);
           }
         }
       }
@@ -2896,7 +2983,7 @@ class IndexManager {
         }
 
         processedCount++;
-        if (processedCount % 500 == 0) {
+        if (processedCount % 50 == 0) {
           await Future.delayed(Duration.zero);
         }
       }

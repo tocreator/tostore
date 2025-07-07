@@ -221,21 +221,6 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     // Get the specific comparator for the key type.
     final comparator = ValueComparator.getFieldComparator(request.keyType);
 
-    // Verify checksum if provided
-    if (request.checksum != null &&
-        !_verifyChecksum(request.content, request.checksum!)) {
-      Logger.warn('Checksum verification failed for index delete operation',
-          label: 'processIndexDelete');
-      // Return empty result if checksum verification fails
-      return IndexDeleteResult(
-        isModified: false,
-        newContent: request.content,
-        entryCount: 0,
-        processedKeys: [],
-        checksum: request.checksum ?? '',
-      );
-    }
-
     // Initialize B+ tree from content
     BPlusTree btree;
     try {
@@ -329,13 +314,6 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
       checksum: actualChecksum,
     );
   }
-}
-
-/// Verify content checksum
-bool _verifyChecksum(String content, String checksum) {
-  if (checksum.isEmpty) return true; // Empty checksum is considered valid
-  final calculatedChecksum = _calculateChecksum(content);
-  return calculatedChecksum == checksum;
 }
 
 /// Calculate content checksum

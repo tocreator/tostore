@@ -327,10 +327,10 @@ class DataStoreImpl {
       ParallelProcessor.setConfig(
         concurrency: _config!.maxConcurrent,
         // Calculate a dynamic timeout based on max partition size.
-        // Formula: 5 seconds base + 1 second per 128KB.
+        // Formula: 30 seconds base + 1 second per 100KB.
         timeout: Duration(
             seconds:
-                10 + (_config!.maxPartitionFileSize / (128 * 1024)).ceil()),
+                30 + (_config!.maxPartitionFileSize / (100 * 1024)).ceil()),
       );
 
       // Ensure _currentSpaceName is synchronized with config.spaceName

@@ -986,139 +986,168 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       valueListenable: logService.logs,
       builder: (context, logs, child) {
         final bool hasLogs = logs.isNotEmpty;
-        // Define heights for different parts of the header.
         const double handleAndTitleHeight = 60.0;
-        const double searchAndFilterHeight = 120.0;
-        final totalHeaderHeight =
-            handleAndTitleHeight + (hasLogs ? searchAndFilterHeight : 0);
 
-        return CustomScrollView(
-          controller: scrollController,
-          slivers: [
-            SliverPersistentHeader(
-              pinned: true,
-              delegate: _LogPanelHeaderDelegate(
-                height: totalHeaderHeight,
-                child: GestureDetector(
-                  onDoubleTap: () {
-                    if (_logPanelController.isAttached) {
-                      final bool isExpanded = _logPanelController.size > 0.15;
-                      _logPanelController.animateTo(
-                        isExpanded ? 0.1 : 0.8,
-                        duration: const Duration(milliseconds: 300),
-                        curve: Curves.easeOut,
-                      );
-                    }
-                  },
-                  child: Container(
-                    color: Theme.of(context).colorScheme.surface,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // Drag Handle and Title Row
-                        SizedBox(
-                          height: handleAndTitleHeight,
-                          child: Column(
-                            children: [
-                              Center(
-                                child: Container(
-                                  width: 40,
-                                  height: 5,
-                                  margin:
-                                      const EdgeInsets.symmetric(vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: Colors.grey.shade300,
-                                    borderRadius: BorderRadius.circular(10),
+        // Use a LayoutBuilder to dynamically calculate the header height
+        // based on whether the search/filter section is visible.
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            // Create a text painter to measure text height for an accurate calculation.
+            final textPainter = TextPainter(
+              text: const TextSpan(text: 'Filter'),
+              textDirection: TextDirection.ltr,
+            )..layout();
+
+            // Estimate heights for various components.
+            const double textFieldHeight =
+                50.0; // Approx height of the TextField
+            const double paddingAndSpacing = 30.0; // Combined vertical padding
+            final double buttonHeight =
+                textPainter.height * 2.5; // Estimated height for filter buttons
+            final double buttonsSectionHeight =
+                (constraints.maxWidth < 350) ? buttonHeight * 2 : buttonHeight;
+
+            final searchAndFilterHeight =
+                textFieldHeight + paddingAndSpacing + buttonsSectionHeight;
+
+            final totalHeaderHeight =
+                handleAndTitleHeight + (hasLogs ? searchAndFilterHeight : 0);
+
+            return CustomScrollView(
+              controller: scrollController,
+              slivers: [
+                SliverPersistentHeader(
+                  pinned: true,
+                  delegate: _LogPanelHeaderDelegate(
+                    height: totalHeaderHeight,
+                    child: GestureDetector(
+                      onDoubleTap: () {
+                        if (_logPanelController.isAttached) {
+                          final bool isExpanded =
+                              _logPanelController.size > 0.15;
+                          _logPanelController.animateTo(
+                            isExpanded ? 0.1 : 0.8,
+                            duration: const Duration(milliseconds: 300),
+                            curve: Curves.easeOut,
+                          );
+                        }
+                      },
+                      child: Container(
+                        color: Theme.of(context).colorScheme.surface,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            // Drag Handle and Title Row
+                            SizedBox(
+                              height: handleAndTitleHeight,
+                              child: Column(
+                                children: [
+                                  Center(
+                                    child: Container(
+                                      width: 40,
+                                      height: 5,
+                                      margin: const EdgeInsets.symmetric(
+                                          vertical: 8),
+                                      decoration: BoxDecoration(
+                                        color: Colors.grey.shade300,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                    ),
                                   ),
-                                ),
-                              ),
-                              Expanded(
-                                child: Padding(
-                                  padding:
-                                      const EdgeInsets.fromLTRB(16.0, 0, 4, 0),
-                                  child: Row(
-                                    children: [
-                                      const Text('Logs',
-                                          style: TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 16)),
-                                      const Spacer(),
-                                      IconButton(
-                                        icon: const Icon(Icons.arrow_upward),
-                                        tooltip: 'Scroll to Top',
-                                        onPressed: _logCanScrollUp
-                                            ? _logScrollToTop
-                                            : null,
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(Icons.arrow_downward),
-                                        tooltip: 'Scroll to Bottom',
-                                        onPressed: _logCanScrollDown
-                                            ? _logScrollToBottom
-                                            : null,
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(Icons.copy_outlined,
-                                            size: 20),
-                                        tooltip: 'Copy Visible Logs',
-                                        onPressed: () {
-                                          // Copy logic...
-                                        },
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(
-                                            Icons.cleaning_services_rounded,
-                                            size: 20),
-                                        tooltip: 'Clear Logs',
-                                        onPressed: logService.clear,
-                                      ),
-                                      AnimatedBuilder(
-                                        animation: _logPanelController,
-                                        builder: (context, child) {
-                                          final bool isExpanded =
-                                              _logPanelController.size > 0.15;
-                                          return IconButton(
-                                            icon: Icon(isExpanded
-                                                ? Icons.keyboard_arrow_down
-                                                : Icons.keyboard_arrow_up),
-                                            tooltip: isExpanded
-                                                ? 'Collapse Logs'
-                                                : 'Expand Logs',
+                                  Expanded(
+                                    child: Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                          16.0, 0, 4, 0),
+                                      child: Row(
+                                        children: [
+                                          const Text('Logs',
+                                              style: TextStyle(
+                                                  fontWeight: FontWeight.bold,
+                                                  fontSize: 16)),
+                                          const Spacer(),
+                                          IconButton(
+                                            icon:
+                                                const Icon(Icons.arrow_upward),
+                                            tooltip: 'Scroll to Top',
+                                            onPressed: _logCanScrollUp
+                                                ? _logScrollToTop
+                                                : null,
+                                          ),
+                                          IconButton(
+                                            icon: const Icon(
+                                                Icons.arrow_downward),
+                                            tooltip: 'Scroll to Bottom',
+                                            onPressed: _logCanScrollDown
+                                                ? _logScrollToBottom
+                                                : null,
+                                          ),
+                                          IconButton(
+                                            icon: const Icon(
+                                                Icons.copy_outlined,
+                                                size: 20),
+                                            tooltip: 'Copy Visible Logs',
                                             onPressed: () {
-                                              _logPanelController.animateTo(
-                                                isExpanded ? 0.1 : 0.8,
-                                                duration: const Duration(
-                                                    milliseconds: 300),
-                                                curve: Curves.easeOut,
+                                              // Copy logic...
+                                            },
+                                          ),
+                                          IconButton(
+                                            icon: const Icon(
+                                                Icons.cleaning_services_rounded,
+                                                size: 20),
+                                            tooltip: 'Clear Logs',
+                                            onPressed: logService.clear,
+                                          ),
+                                          AnimatedBuilder(
+                                            animation: _logPanelController,
+                                            builder: (context, child) {
+                                              final bool isExpanded =
+                                                  _logPanelController.size >
+                                                      0.15;
+                                              return IconButton(
+                                                icon: Icon(isExpanded
+                                                    ? Icons.keyboard_arrow_down
+                                                    : Icons.keyboard_arrow_up),
+                                                tooltip: isExpanded
+                                                    ? 'Collapse Logs'
+                                                    : 'Expand Logs',
+                                                onPressed: () {
+                                                  _logPanelController.animateTo(
+                                                    isExpanded ? 0.1 : 0.8,
+                                                    duration: const Duration(
+                                                        milliseconds: 300),
+                                                    curve: Curves.easeOut,
+                                                  );
+                                                },
                                               );
                                             },
-                                          );
-                                        },
+                                          ),
+                                        ],
                                       ),
-                                    ],
+                                    ),
                                   ),
-                                ),
+                                  const Divider(height: 1),
+                                ],
                               ),
-                              const Divider(height: 1),
-                            ],
-                          ),
-                        ),
-                        // Search and Filter section (conditionally shown)
-                        if (hasLogs)
-                          SizedBox(
-                            height: searchAndFilterHeight,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  TextField(
-                                    controller: _searchController,
-                                    decoration: InputDecoration(
-                                      hintText: 'Search in logs...',
-                                      prefixIcon: const Icon(Icons.search),
-                                      suffixIcon:
-                                          _searchController.text.isNotEmpty
+                            ),
+                            // Search and Filter section (conditionally shown)
+                            if (hasLogs)
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 16.0),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceEvenly,
+                                    children: [
+                                      TextField(
+                                        controller: _searchController,
+                                        decoration: InputDecoration(
+                                          hintText: 'Search in logs...',
+                                          prefixIcon: const Icon(Icons.search),
+                                          suffixIcon: _searchController
+                                                  .text.isNotEmpty
                                               ? IconButton(
                                                   icon: const Icon(Icons.clear),
                                                   onPressed: () {
@@ -1126,128 +1155,138 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                                   },
                                                 )
                                               : null,
-                                      border: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(8),
+                                          border: OutlineInputBorder(
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                          ),
+                                          enabledBorder: OutlineInputBorder(
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                            borderSide: BorderSide(
+                                                color: Colors.grey.shade300,
+                                                width: 0.8),
+                                          ),
+                                          contentPadding:
+                                              const EdgeInsets.symmetric(
+                                                  horizontal: 12, vertical: 8),
+                                        ),
                                       ),
-                                      enabledBorder: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(8),
-                                        borderSide: BorderSide(
-                                            color: Colors.grey.shade300,
-                                            width: 0.8),
-                                      ),
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                              horizontal: 12, vertical: 8),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 14),
-                                  ValueListenableBuilder<List<LogEntry>>(
-                                    valueListenable: logService.logs,
-                                    builder: (context, logs, child) {
-                                      // Counts...
-                                      final allCount = logs.length;
-                                      final infoCount = logs
-                                          .where(
-                                              (log) => log.type == LogType.info)
-                                          .length;
-                                      final debugCount = logs
-                                          .where((log) =>
-                                              log.type == LogType.debug)
-                                          .length;
-                                      final warnCount = logs
-                                          .where(
-                                              (log) => log.type == LogType.warn)
-                                          .length;
-                                      final errorCount = logs
-                                          .where((log) =>
-                                              log.type == LogType.error)
-                                          .length;
+                                      ValueListenableBuilder<List<LogEntry>>(
+                                        valueListenable: logService.logs,
+                                        builder: (context, logs, child) {
+                                          // Counts...
+                                          final allCount = logs.length;
+                                          final infoCount = logs
+                                              .where((log) =>
+                                                  log.type == LogType.info)
+                                              .length;
+                                          final debugCount = logs
+                                              .where((log) =>
+                                                  log.type == LogType.debug)
+                                              .length;
+                                          final warnCount = logs
+                                              .where((log) =>
+                                                  log.type == LogType.warn)
+                                              .length;
+                                          final errorCount = logs
+                                              .where((log) =>
+                                                  log.type == LogType.error)
+                                              .length;
 
-                                      return Wrap(
-                                        spacing: 8.0,
-                                        runSpacing: 8.0,
-                                        alignment: WrapAlignment.start,
-                                        children: [
-                                          _buildFilterButton(
-                                              'All', null, allCount, context),
-                                          _buildFilterButton('Info',
-                                              LogType.info, infoCount, context),
-                                          _buildFilterButton(
-                                              'Debug',
-                                              LogType.debug,
-                                              debugCount,
-                                              context),
-                                          _buildFilterButton('Warn',
-                                              LogType.warn, warnCount, context),
-                                          _buildFilterButton(
-                                              'Error',
-                                              LogType.error,
-                                              errorCount,
-                                              context),
-                                        ],
-                                      );
-                                    },
+                                          return Wrap(
+                                            spacing: 8.0,
+                                            runSpacing: 8.0,
+                                            alignment: WrapAlignment.start,
+                                            children: [
+                                              _buildFilterButton('All', null,
+                                                  allCount, context),
+                                              _buildFilterButton(
+                                                  'Info',
+                                                  LogType.info,
+                                                  infoCount,
+                                                  context),
+                                              _buildFilterButton(
+                                                  'Debug',
+                                                  LogType.debug,
+                                                  debugCount,
+                                                  context),
+                                              _buildFilterButton(
+                                                  'Warn',
+                                                  LogType.warn,
+                                                  warnCount,
+                                                  context),
+                                              _buildFilterButton(
+                                                  'Error',
+                                                  LogType.error,
+                                                  errorCount,
+                                                  context),
+                                            ],
+                                          );
+                                        },
+                                      ),
+                                    ],
                                   ),
-                                ],
+                                ),
                               ),
-                            ),
-                          ),
-                      ],
+                          ],
+                        ),
+                      ),
                     ),
                   ),
                 ),
-              ),
-            ),
-            ValueListenableBuilder<List<LogEntry>>(
-              valueListenable: logService.logs,
-              builder: (context, logs, child) {
-                // ... (filtering logic remains the same)
-                final filteredByType = _selectedLogType == null
-                    ? logs
-                    : logs
-                        .where((log) => log.type == _selectedLogType)
-                        .toList();
-                final searchText = _searchController.text.toLowerCase();
-                final filteredLogs = searchText.isEmpty
-                    ? filteredByType
-                    : filteredByType
-                        .where((log) =>
-                            log.message.toLowerCase().contains(searchText))
-                        .toList();
+                ValueListenableBuilder<List<LogEntry>>(
+                  valueListenable: logService.logs,
+                  builder: (context, logs, child) {
+                    // ... (filtering logic remains the same)
+                    final filteredByType = _selectedLogType == null
+                        ? logs
+                        : logs
+                            .where((log) => log.type == _selectedLogType)
+                            .toList();
+                    final searchText = _searchController.text.toLowerCase();
+                    final filteredLogs = searchText.isEmpty
+                        ? filteredByType
+                        : filteredByType
+                            .where((log) =>
+                                log.message.toLowerCase().contains(searchText))
+                            .toList();
 
-                if (filteredLogs.isEmpty) {
-                  return const SliverToBoxAdapter(
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(vertical: 48),
-                      child: Center(child: Text('No logs to display.')),
-                    ),
-                  );
-                }
-                return SliverPadding(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 16.0, vertical: 16.0),
-                  sliver: SliverList(
-                    delegate: SliverChildBuilderDelegate(
-                      (context, index) {
-                        final logEntry = filteredLogs[index];
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4.0),
-                          child: Text(
-                            logEntry.message,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: _getLogColor(logEntry.type),
-                            ),
-                          ),
-                        );
-                      },
-                      childCount: filteredLogs.length,
-                    ),
-                  ),
-                );
-              },
-            ),
-          ],
+                    if (filteredLogs.isEmpty) {
+                      return const SliverToBoxAdapter(
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(vertical: 48),
+                          child: Center(child: Text('No logs to display.')),
+                        ),
+                      );
+                    }
+                    return SliverPadding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16.0, vertical: 16.0),
+                      sliver: SliverList(
+                        delegate: SliverChildBuilderDelegate(
+                          (context, index) {
+                            final logEntry = filteredLogs[index];
+                            return Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 4.0),
+                              child: Text(
+                                logEntry.message,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: _getLogColor(logEntry.type),
+                                ),
+                              ),
+                            );
+                          },
+                          childCount: filteredLogs.length,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ],
+            );
+          },
         );
       },
     );
