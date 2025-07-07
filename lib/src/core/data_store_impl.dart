@@ -26,7 +26,6 @@ import '../model/table_info.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
-import 'transaction_manager.dart';
 import 'migration_manager.dart';
 import 'integrity_checker.dart';
 import 'storage_adapter.dart';
@@ -65,7 +64,6 @@ class DataStoreImpl {
   String _currentSpaceName = 'default';
   DataStoreConfig? _config;
 
-  TransactionManager? _transactionManager;
   IndexManager? _indexManager;
   QueryOptimizer? _queryOptimizer;
   QueryExecutor? _queryExecutor;
@@ -358,7 +356,6 @@ class DataStoreImpl {
       await _keyManager!.initialize();
 
       directoryManager = DirectoryManager(this);
-      _transactionManager = TransactionManager(this);
       _indexManager = IndexManager(this);
       _tableDataManager = TableDataManager(this);
       migrationManager = MigrationManager(this);
@@ -546,13 +543,11 @@ class DataStoreImpl {
       // Release all managers
       _indexManager?.dispose();
       dataCacheManager.clear();
-      await _transactionManager?.commit(null);
 
       // Clean up memory manager resources
       _memoryManager?.dispose();
 
       // Clear instance variables
-      _transactionManager = null;
       _queryOptimizer = null;
       _indexManager = null;
       _queryExecutor = null;
@@ -705,12 +700,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // 1. Begin transaction
-    final transaction = await _transactionManager!.beginTransaction();
     Map<String, dynamic>? validData;
 
     try {
-      // 2. Data validation
+      // 1. Data validation
       final schema = await getTableSchema(tableName);
       if (schema == null) {
         Logger.error('Table $tableName does not exist',
@@ -728,7 +721,7 @@ class DataStoreImpl {
         );
       }
 
-      // 3. Unique check
+      // 2. Unique check
       if (await _indexManager?.checkUniqueConstraints(tableName, validData) ==
           false) {
         // For primary key conflicts, try to update the maximum ID value to avoid assigning the same ID in the future
@@ -750,15 +743,12 @@ class DataStoreImpl {
         );
       }
 
-      // 4. Update cache
+      // 3. Update cache
       dataCacheManager.addCachedRecord(tableName, validData);
 
-      // 5. Add to write queue (insert operation)
+      // 4. Add to write queue (insert operation)
       await tableDataManager.addToWriteBuffer(tableName, validData,
           isUpdate: false);
-
-      // 6. Commit transaction
-      await _transactionManager!.commit(transaction);
 
       // Invalidate query caches that might be affected by the new record
       await dataCacheManager
@@ -774,9 +764,6 @@ class DataStoreImpl {
       Logger.error('Insert failed: $e', label: 'DataStore.insert');
 
       try {
-        // Rollback transaction
-        await _transactionManager!.rollback(transaction);
-
         // Clear cache
         final schema = await getTableSchema(tableName);
         final primaryKeyValue = validData != null && schema != null
@@ -1159,8 +1146,6 @@ class DataStoreImpl {
       );
     }
 
-    final transaction = await _transactionManager!.beginTransaction();
-
     try {
       // validate data
       final schema = await getTableSchema(tableName);
@@ -1282,9 +1267,6 @@ class DataStoreImpl {
         successKeys.add(recordKey);
       }
 
-      // commit transaction
-      await _transactionManager!.commit(transaction);
-
       // If there are both successful and failed records
       if (successKeys.isNotEmpty && failedKeys.isNotEmpty) {
         return DbResult.batch(
@@ -1301,7 +1283,6 @@ class DataStoreImpl {
       }
     } catch (e) {
       Logger.error('Update failed: $e', label: 'DataStore-update');
-      await _transactionManager!.rollback(transaction);
       return DbResult.error(
         type: ResultType.dbError,
         message: 'Update failed: $e',
@@ -1317,8 +1298,6 @@ class DataStoreImpl {
       Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
       return;
     }
-    final transaction = await _transactionManager!.beginTransaction();
-
     try {
       //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
       await tableDataManager.clearTable(tableName);
@@ -1328,11 +1307,8 @@ class DataStoreImpl {
 
       //   clear application layer cache
       await dataCacheManager.invalidateCache(tableName, isFullTableCache: true);
-
-      await _transactionManager!.commit(transaction);
     } catch (e) {
       Logger.info('Clear table failed: $e', label: 'DataStore-clear');
-      await _transactionManager!.rollback(transaction);
       rethrow;
     }
   }
@@ -1380,8 +1356,6 @@ class DataStoreImpl {
         }
       }
     }
-
-    final transaction = await _transactionManager!.beginTransaction();
 
     try {
       // Get table file metadata to make an informed decision on the deletion strategy
@@ -1495,7 +1469,6 @@ class DataStoreImpl {
         // Update indexes - still necessary to keep indexes in sync
         await _indexManager?.batchDeleteFromIndexes(tableName, recordsToDelete);
 
-        await _transactionManager!.commit(transaction);
         return DbResult.success(
           successKeys: successKeys,
           message: 'Successfully deleted ${successKeys.length} records',
@@ -1592,7 +1565,6 @@ class DataStoreImpl {
             processFunction: processFunction,
           );
 
-          await _transactionManager!.commit(transaction);
           return DbResult.success(
             successKeys: deletedKeys,
             message:
@@ -1605,7 +1577,6 @@ class DataStoreImpl {
       }
     } catch (e) {
       Logger.error('Delete failed: $e', label: 'DataStore-delete');
-      await _transactionManager!.rollback(transaction);
       // Clear cache, ensure data consistency
       return DbResult.error(
         type: ResultType.dbError,
@@ -1858,9 +1829,6 @@ class DataStoreImpl {
         );
       }
 
-      // Begin a single transaction for the entire batch
-      final transaction = await _transactionManager!.beginTransaction();
-
       try {
         // Process records in smaller batches to maintain memory efficiency
         const int batchSize = 1000;
@@ -1923,7 +1891,6 @@ class DataStoreImpl {
 
               if (!allowPartialErrors) {
                 // If not allowing partial errors, rollback and return error
-                await _transactionManager!.rollback(transaction);
                 return DbResult.error(
                   type: ResultType.dbError,
                   message: 'Error processing record: $e',
@@ -1939,7 +1906,6 @@ class DataStoreImpl {
 
         // If no valid records and not allowing partial errors, return error
         if (validRecords.isEmpty) {
-          await _transactionManager!.rollback(transaction);
           return DbResult.error(
             type: ResultType.validationFailed,
             message: 'All data validation failed',
@@ -1949,7 +1915,6 @@ class DataStoreImpl {
 
         // If not allowing partial errors and some records failed, return error
         if (!allowPartialErrors && invalidRecords.isNotEmpty) {
-          await _transactionManager!.rollback(transaction);
           return DbResult.error(
             type: ResultType.validationFailed,
             message:
@@ -1957,15 +1922,6 @@ class DataStoreImpl {
             failedKeys: failedKeys,
           );
         }
-
-        // Commit the transaction to ensure all data is written
-        await _transactionManager!.commit(transaction);
-
-        // Async log transaction
-        _logTransactionAsync('batchInsert', tableName, {
-          'count': validRecords.length,
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
-        });
 
         // Invalidate query caches for all newly inserted valid records
         await dataCacheManager.invalidateAffectedQueries(tableName,
@@ -1987,7 +1943,6 @@ class DataStoreImpl {
         }
       } catch (e) {
         // Rollback transaction on error
-        await _transactionManager!.rollback(transaction);
         rethrow;
       }
     } catch (e) {
@@ -2014,18 +1969,6 @@ class DataStoreImpl {
         failedKeys: failedKeys,
       );
     }
-  }
-
-  /// Async log transaction
-  void _logTransactionAsync(String operation, String tableName, dynamic data) {
-    Future(() async {
-      try {
-        await _transactionManager?.logOperation(operation, tableName, data);
-      } catch (e) {
-        Logger.error('Async log transaction failed: $e',
-            label: 'DataStore-batchInsert');
-      }
-    });
   }
 
   /// load data from specified path

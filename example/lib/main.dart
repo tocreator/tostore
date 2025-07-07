@@ -478,6 +478,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             );
           },
           borderRadius: BorderRadius.circular(8),
+          selectedColor: Colors.black,
+          fillColor: const Color.fromARGB(255, 211, 235, 245),
           children: const [
             Padding(
               padding: EdgeInsets.symmetric(horizontal: 16),
@@ -494,28 +496,28 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   }
 
   Widget _buildDataView() {
-    return _isDataLoading
-        ? const Center(child: CircularProgressIndicator())
-        : Column(
-            children: [
-              // Header with record count and actions
-              _buildDataHeader(),
-              const Divider(),
-              // Data Table
-              if (_tableData.isEmpty)
-                const Expanded(
-                  child: Center(
-                    child: Text('No records found.'),
-                  ),
-                )
-              else
-              _buildDataTable(),
-              // Pagination Controls
-              _buildPaginationControls(),
-              // Add padding at the bottom to avoid being obscured by the log panel
-              const SizedBox(height: 20),
-            ],
-          );
+    return Column(
+      children: [
+        // Header with record count and actions
+        _buildDataHeader(),
+        const Divider(),
+        // Data Table
+        if (_isDataLoading)
+          const Expanded(child: Center(child: CircularProgressIndicator()))
+        else if (_tableData.isEmpty)
+          const Expanded(
+            child: Center(
+              child: Text('No records found.'),
+            ),
+          )
+        else
+          _buildDataTable(),
+        // Pagination Controls
+        _buildPaginationControls(),
+        // Add padding at the bottom to avoid being obscured by the log panel
+        const SizedBox(height: 20),
+      ],
+    );
   }
 
   Widget _buildDataHeader() {
@@ -675,51 +677,63 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   Widget _buildPaginationControls() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+      child: Wrap(
+        alignment: WrapAlignment.center,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 4.0, // Add some space between items
+        runSpacing: 8.0, // Add space for wrapped lines
         children: [
           IconButton(
             icon: const Icon(Icons.first_page),
+            tooltip: 'First Page',
             onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
           ),
           IconButton(
             icon: const Icon(Icons.chevron_left),
+            tooltip: 'Previous Page',
             onPressed:
                 _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
           ),
-          const SizedBox(width: 16),
-          const Text('Page'),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 50,
-            child: TextField(
-              controller: _pageInputController,
-              textAlign: TextAlign.center,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: const InputDecoration(
-                isDense: true,
-                border: OutlineInputBorder(),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Page'),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 50,
+                child: TextField(
+                  controller: _pageInputController,
+                  textAlign: TextAlign.center,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    contentPadding:
+                        EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  ),
+                  onSubmitted: (value) {
+                    final page = int.tryParse(value);
+                    if (page != null) {
+                      _goToPage(page);
+                    }
+                  },
+                ),
               ),
-              onSubmitted: (value) {
-                final page = int.tryParse(value);
-                if (page != null) {
-                  _goToPage(page);
-                }
-              },
-            ),
+              const SizedBox(width: 8),
+              Text('of $_totalPages'),
+            ],
           ),
-          const SizedBox(width: 8),
-          Text('of $_totalPages'),
-          const SizedBox(width: 16),
           IconButton(
             icon: const Icon(Icons.chevron_right),
+            tooltip: 'Next Page',
             onPressed: _currentPage < _totalPages
                 ? () => _goToPage(_currentPage + 1)
                 : null,
           ),
           IconButton(
             icon: const Icon(Icons.last_page),
+            tooltip: 'Last Page',
             onPressed: _currentPage < _totalPages
                 ? () => _goToPage(_totalPages)
                 : null,
@@ -850,60 +864,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   SizedBox(
                     width: buttonWidth,
                     child: _buildActionButton(
-                        text: 'Clear Table',
-                        onPressed: !_isDbInitialized || _isTesting
-                            ? null
-                            : () async {
-                                setState(() {
-                                  _isTesting = true;
-                                  _lastOperationInfo = 'Clearing tables...';
-                                });
-                                try {
-                                  final elapsed =
-                                      await widget.example.clearExamples();
-                                  if (mounted) {
-                                    _updateOperationInfo(
-                                        'Clear Table: ${elapsed}ms');
-                                    _fetchTableData(resetPage: true);
-                                  }
-                                } finally {
-                                  if (mounted) {
-                                    setState(() {
-                                      _isTesting = false;
-                                    });
-                                  }
-                                }
-                              }),
-                  ),
-                  SizedBox(
-                    width: buttonWidth,
-                    child: _buildActionButton(
-                        text: 'Query',
-                        onPressed: !_isDbInitialized || _isTesting
-                            ? null
-                            : () async {
-                                setState(() {
-                                  _isTesting = true;
-                                  _lastOperationInfo = 'Querying...';
-                                });
-                                try {
-                                  final elapsed =
-                                      await widget.example.queryExamples();
-                                  if (mounted) {
-                                    _updateOperationInfo('Query: ${elapsed}ms');
-                                  }
-                                } finally {
-                                  if (mounted) {
-                                    setState(() {
-                                      _isTesting = false;
-                                    });
-                                  }
-                                }
-                              }),
-                  ),
-                  SizedBox(
-                    width: buttonWidth,
-                    child: _buildActionButton(
                         text: 'Batch Add 10k',
                         onPressed: !_isDbInitialized || _isTesting
                             ? null
@@ -946,34 +906,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                   if (mounted) {
                                     _updateOperationInfo(
                                         'Slow Add 10k: ${elapsed}ms');
-                                    _fetchTableData(resetPage: true);
-                                  }
-                                } finally {
-                                  if (mounted) {
-                                    setState(() {
-                                      _isTesting = false;
-                                    });
-                                  }
-                                }
-                              }),
-                  ),
-                  SizedBox(
-                    width: buttonWidth,
-                    child: _buildActionButton(
-                        text: 'Delete Many',
-                        onPressed: !_isDbInitialized || _isTesting
-                            ? null
-                            : () async {
-                                setState(() {
-                                  _isTesting = true;
-                                  _lastOperationInfo = 'Deleting...';
-                                });
-                                try {
-                                  final elapsed =
-                                      await widget.example.deleteExamples();
-                                  if (mounted) {
-                                    _updateOperationInfo(
-                                        'Delete Many: ${elapsed}ms');
                                     _fetchTableData(resetPage: true);
                                   }
                                 } finally {
