@@ -274,8 +274,14 @@ class PlatformHandlerImpl implements PlatformInterface {
       }
       return cachePath.path;
     } catch (e) {
-      // Fallback to temporary directory
-      final tempDir = await Directory.systemTemp.createTemp('common');
+      Logger.error(
+          'Failed to determine the standard application data directory. Falling back to a temporary directory which may be cleared by the operating system, leading to data loss upon restart. For Flutter applications, ensure `WidgetsFlutterBinding.ensureInitialized()` is called at the start of your main() function. In other environments, this may indicate a permissions or platform configuration issue.',
+          label: 'PlatformHandlerImpl.getPathApp');
+      final tempPath = path.join(Directory.systemTemp.path, 'local_storage', 'common');
+      final tempDir = Directory(tempPath);
+      if (!await tempDir.exists()) {
+        await tempDir.create(recursive: true);
+      }
       return tempDir.path;
     }
   }
