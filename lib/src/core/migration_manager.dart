@@ -689,6 +689,10 @@ class MigrationManager {
     TableSchema oldSchema,
     TableSchema newSchema,
   ) {
+    if (oldSchema.isGlobal != newSchema.isGlobal) {
+      throw Exception(
+          'Changing the "isGlobal" property for an existing table (${newSchema.name}) is not supported. This operation requires complex data migration between spaces and the global scope, which must be handled manually.');
+    }
     final operations = <MigrationOperation>[];
 
     // Check field changes
@@ -812,6 +816,11 @@ class MigrationManager {
         (f) => f.name == newField.name,
       );
       if (_isFieldModified(oldField, newField)) {
+        // Add check for dangerous type conversions before adding the operation
+        if (oldField.type != newField.type) {
+          _preventDangerousTypeConversion(oldField, newField);
+        }
+
         Logger.info(
           'Table ${newSchema.name}, field ${newField.name} has been modified',
           label: 'MigrationManager._compareSchemas',
@@ -1137,6 +1146,53 @@ class MigrationManager {
     }
   }
 
+  /// Prevents unsafe data type conversions during schema migration.
+  void _preventDangerousTypeConversion(
+      FieldSchema oldField, FieldSchema newField) {
+    final oldType = oldField.type;
+    final newType = newField.type;
+    bool isDangerous = false;
+    String reason = '';
+
+    // General rule: Converting from a less restrictive type to a more restrictive one is dangerous.
+    // e.g., Text -> Integer, Blob -> Anything, Vector -> Anything (except itself)
+
+    if (newType == DataType.integer ||
+        newType == DataType.double ||
+        newType == DataType.bigInt ||
+        newType == DataType.datetime) {
+      if (oldType == DataType.text ||
+          oldType == DataType.blob ||
+          oldType == DataType.vector ||
+          oldType == DataType.json ||
+          oldType == DataType.array) {
+        isDangerous = true;
+        reason = 'cannot be reliably converted to a numeric or date type.';
+      }
+    }
+
+    // Changing from a vector to anything else is dangerous because embeddings would be lost.
+    if (oldType == DataType.vector && newType != DataType.vector) {
+      isDangerous = true;
+      reason = 'would discard all existing vector embedding data.';
+    }
+
+    // Changing from blob, json, or array to an incompatible type is dangerous.
+    if ((oldType == DataType.blob ||
+            oldType == DataType.json ||
+            oldType == DataType.array) &&
+        (newType != oldType && newType != DataType.text)) {
+      isDangerous = true;
+      reason =
+          'is a complex type and cannot be safely converted to the target type.';
+    }
+
+    if (isDangerous) {
+      throw Exception(
+          'Unsupported data type change for field "${newField.name}" from ${oldType.name} to ${newType.name}. This conversion is unsafe because existing data $reason This could lead to data loss or migration failure. Please handle this migration manually by creating a new field and migrating the data yourself.');
+    }
+  }
+
   /// Check if field is modified
   bool _isFieldModified(FieldSchema oldField, FieldSchema newField) {
     // check if default value is equal, special handling for datetime type
@@ -1154,6 +1210,16 @@ class MigrationManager {
 
       // other types, default value different consider as not equal
       return false;
+    }
+
+    // Check for vector config changes, as this would invalidate existing vector data.
+    if (jsonEncode(oldField.vectorConfig?.toJson()) !=
+        jsonEncode(newField.vectorConfig?.toJson())) {
+      Logger.warn(
+        'Detected a change in vectorConfig for field "${newField.name}". This is considered a breaking change.',
+        label: 'MigrationManager._isFieldModified',
+      );
+      return true;
     }
 
     // check if field is modified

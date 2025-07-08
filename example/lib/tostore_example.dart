@@ -1,4 +1,5 @@
 import 'package:tostore/tostore.dart';
+import 'dart:math';
 
 import 'service/log_service.dart';
 
@@ -28,12 +29,12 @@ class TostoreExample {
           fields: [
             FieldSchema(name: 'username', type: DataType.text, nullable: false),
             FieldSchema(name: 'email', type: DataType.text, nullable: false),
-            FieldSchema(name: 'last_login', type: DataType.datetime),
+            FieldSchema(name: 'last_login', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
             FieldSchema(
                 name: 'is_active', type: DataType.boolean, defaultValue: true),
-            FieldSchema(name: 'age', type: DataType.integer),
+            FieldSchema(name: 'age', type: DataType.integer, defaultValue: 18),
             FieldSchema(name: 'tags', type: DataType.text),
-            FieldSchema(name: 'type', type: DataType.text),
+            FieldSchema(name: 'type', type: DataType.text, defaultValue: 'user'),
             FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 10),
           ],
           indexes: [
@@ -54,7 +55,7 @@ class TostoreExample {
             FieldSchema(name: 'content', type: DataType.text),
             FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
-            FieldSchema(name: 'created_at', type: DataType.datetime),
+            FieldSchema(name: 'created_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
             FieldSchema(
                 name: 'is_published',
                 type: DataType.boolean,
@@ -76,7 +77,7 @@ class TostoreExample {
             FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
             FieldSchema(name: 'content', type: DataType.text, nullable: false),
-            FieldSchema(name: 'created_at', type: DataType.datetime),
+            FieldSchema(name: 'created_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
           ],
           indexes: [
             IndexSchema(fields: ['post_id']),
@@ -94,7 +95,7 @@ class TostoreExample {
                 nullable: false,
                 unique: true),
             FieldSchema(name: 'value', type: DataType.text),
-            FieldSchema(name: 'updated_at', type: DataType.datetime),
+            FieldSchema(name: 'updated_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
           ],
           indexes: [
             IndexSchema(fields: ['key'], unique: true),
@@ -524,31 +525,107 @@ class TostoreExample {
     }
   }
 
-  Future<int> addExamples() async {
-    await db.clear('users');
-    logService.add('Preparing 10,000 records for batch insert...');
-    Stopwatch stopwatch = Stopwatch()..start();
+  /// Generates a single mock data record based on a table's schema.
+  ///
+  Map<String, dynamic> _generateRecord(TableSchema schema, int index) {
+    final record = <String, dynamic>{};
+    final random = Random();
 
-    // batch insert, 1000 records per batch
-    const int batchSize = 1000;
-    const int totalRecords = 10000;
+    for (final field in schema.fields) {
+      // We don't generate data for the primary key if it's auto-incrementing.
+      // The database will handle it.
+      if (field.name == schema.primaryKeyConfig.name) {
+        continue;
+      }
 
-    for (int start = 0; start < totalRecords; start += batchSize) {
-      final int end =
-          (start + batchSize < totalRecords) ? start + batchSize : totalRecords;
+      // Generate data based on field name patterns for more realistic mock data
+      if (field.name.contains('email')) {
+        record[field.name] = 'user_$index@example.com';
+        continue;
+      }
+      if (field.name.contains('name') || field.name.contains('title')) {
+        record[field.name] =
+            '${field.name}_$index';
+        continue;
+      }
+      if (field.name.contains('content') ||
+          field.name.contains('description')) {
+        record[field.name] =
+            'This is the content for ${schema.name} record $index';
+        continue;
+      }
+      if (field.name.contains('age')) {
+        record[field.name] = random.nextInt(100);
+        continue;
+      }
+
+      // Generate data based on field type
+      switch (field.type) {
+        case DataType.text:
+          record[field.name] = '${field.name}_$index';
+          break;
+        case DataType.bigInt:
+        case DataType.integer:
+          record[field.name] = random.nextInt(10000);
+          break;
+        case DataType.double:
+          record[field.name] = random.nextDouble() * 1000;
+          break;
+        case DataType.boolean:
+          record[field.name] = random.nextBool();
+          break;
+        case DataType.datetime:
+          break;
+        case DataType.vector:
+        // Skip vector for now as it requires specific dimensions
+        case DataType.blob:
+        // Skip blob for mock data generation
+        case DataType.array:
+        // Skip array for mock data generation
+        case DataType.json:
+        // Skip json for mock data generation
+          break;
+      }
+    }
+    return record;
+  }
+
+  /// Adds a specified number of example records to a given table using batch inserts.
+  Future<int> addExamples(String tableName, int count, int startIndex) async {
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add(
+          'Cannot add examples: Schema for table "$tableName" not found.',
+          LogType.error);
+      return -1;
+    }
+    final stopwatch = Stopwatch()..start();
+
+    // batch insert, 2000 records per batch
+    const int batchSize = 2000;
+
+    for (int batchStart = 0; batchStart < count; batchStart += batchSize) {
+      final int batchEnd = (batchStart + batchSize < count)
+          ? batchStart + batchSize
+          : count;
       // prepare records for current batch
-      final users = <Map<String, dynamic>>[];
-      for (var i = start; i < end; i++) {
-        users.add({
-          'username': 'user_$i',
-          'email': 'user_$i@example.com',
-          'tags': '4f4h3fd4fi33JlIDN2lh3777',
-          'is_active': i > 5,
-        });
+      final records = <Map<String, dynamic>>[];
+      for (var i = batchStart; i < batchEnd; i++) {
+        // The global unique index is startIndex + i + 1
+        records.add(_generateRecord(schema, startIndex + i + 1));
+        if (i % 100 == 0) {
+          // Yield more sparingly to improve performance while keeping UI responsive
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // batch insert current batch
-      await db.batchInsert('users', users);
+      final result = await db.batchInsert(tableName, records);
+      if (!result.isSuccess) {
+        logService.add(
+            'Batch insert failed: ${result.message}', LogType.error);
+        return -1; // Indicate failure
+      }
 
       // yield to event loop, keep UI responsive
       await Future.delayed(Duration.zero);
@@ -556,24 +633,34 @@ class TostoreExample {
 
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('insert time: ${elapsed}ms');
+    logService
+        .add('Batch insert $count records into "$tableName" time: ${elapsed}ms');
 
-    final queryResult = await db.query('users').count();
-    logService.add('query count: $queryResult');
+    final queryResult = await db.query(tableName).count();
+    logService.add('query current table "$tableName" count: $queryResult');
     return elapsed;
   }
 
-  Future<int> addExamplesOneByOne() async {
-    await db.clear('users');
-    logService.add('Starting to add 10,000 records one by one...');
+  /// Adds a specified number of example records to a given table one by one.
+  Future<int> addExamplesOneByOne(
+      String tableName, int count, int startIndex) async {
+    logService
+        .add('Starting to add $count records to "$tableName" one by one...');
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add(
+          'Cannot add examples: Schema for table "$tableName" not found.',
+          LogType.error);
+      return -1;
+    }
     final stopwatch = Stopwatch()..start();
-    for (var i = 0; i < 10000; i++) {
-      await db.insert('users', {
-        'username': 'user_$i',
-        'email': 'user_$i@example.com',
-        'tags': '4f4h3fd4fi33JlIDN2lh3777',
-        'is_active': i > 5,
-      });
+    for (var i = 0; i < count; i++) {
+      // The global unique index is startIndex + i + 1
+      final result = await db.insert(
+          tableName, _generateRecord(schema, startIndex + i + 1));
+      if (!result.isSuccess) {
+        return -1; // Indicate failure
+      }
       // Yield to the event loop to prevent UI freezing
       if (i % 100 == 0) {
         // Yield more sparingly to improve performance while keeping UI responsive
@@ -582,8 +669,9 @@ class TostoreExample {
     }
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
-    logService.add('Finished adding 10k records one-by-one in ${elapsed}ms');
-    final queryResult = await db.query('users').count();
+    logService.add(
+        'Finished adding $count records to "$tableName" one-by-one in ${elapsed}ms');
+    final queryResult = await db.query(tableName).count();
     logService.add('query count: $queryResult');
     return elapsed;
   }

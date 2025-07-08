@@ -590,7 +590,7 @@ class DatabaseTester {
           });
 
           // Batch execute the creation of base data to avoid UI jank
-          const batchSize = 1000;
+          const batchSize = 250;
           for (int i = 0; i < insertFutures.length; i += batchSize) {
             final end = (i + batchSize > insertFutures.length)
                 ? insertFutures.length
@@ -713,7 +713,7 @@ class DatabaseTester {
           LogType.info);
       operations.shuffle(random);
 
-      const batchSize = 1000;
+      const batchSize = 250;
       for (int i = 0; i < operations.length; i += batchSize) {
         final end = (i + batchSize > operations.length)
             ? operations.length

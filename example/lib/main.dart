@@ -607,6 +607,40 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   visualDensity: VisualDensity.compact,
                 ),
               ),
+              PopupMenuButton<String>(
+                onSelected: (value) {
+                  if (value == 'custom_delete') {
+                    _showCustomDeleteDialog();
+                  } else if (value == 'clear_current_table') {
+                    _confirmClearCurrentTable();
+                  }
+                },
+                itemBuilder: (context) => [
+                  const PopupMenuItem(
+                    value: 'custom_delete',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete_sweep, size: 18),
+                        SizedBox(width: 8),
+                        Text('Custom Delete'),
+                      ],
+                    ),
+                  ),
+                  const PopupMenuDivider(),
+                  const PopupMenuItem(
+                    value: 'clear_current_table',
+                    child: Row(
+                      children: [
+                        Icon(Icons.cleaning_services_rounded, size: 18),
+                        SizedBox(width: 8),
+                        Text('Clear Table'),
+                      ],
+                    ),
+                  ),
+                ],
+                icon: const Icon(Icons.more_horiz_outlined),
+                tooltip: 'Advanced Actions',
+              ),
             ],
           )
         ],
@@ -875,62 +909,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 runSpacing: 12,
                 alignment: WrapAlignment.center,
                 children: [
-                  SizedBox(
-                    width: buttonWidth,
-                    child: _buildActionButton(
-                        text: 'Batch Add 10k',
-                        onPressed: !_isDbInitialized || _isTesting
-                            ? null
-                            : () async {
-                                setState(() {
-                                  _isTesting = true;
-                                  _lastOperationInfo = 'Batch Adding...';
-                                });
-                                try {
-                                  final elapsed =
-                                      await widget.example.addExamples();
-                                  if (mounted) {
-                                    _updateOperationInfo(
-                                        'Batch Add 10k: ${elapsed}ms');
-                                    _fetchTableData(resetPage: true);
-                                  }
-                                } finally {
-                                  if (mounted) {
-                                    setState(() {
-                                      _isTesting = false;
-                                    });
-                                  }
-                                }
-                              }),
-                  ),
-                  SizedBox(
-                    width: buttonWidth,
-                    child: _buildActionButton(
-                        text: 'Slow Add 10k',
-                        onPressed: !_isDbInitialized || _isTesting
-                            ? null
-                            : () async {
-                                setState(() {
-                                  _isTesting = true;
-                                  _lastOperationInfo = 'Slow Adding...';
-                                });
-                                try {
-                                  final elapsed = await widget.example
-                                      .addExamplesOneByOne();
-                                  if (mounted) {
-                                    _updateOperationInfo(
-                                        'Slow Add 10k: ${elapsed}ms');
-                                    _fetchTableData(resetPage: true);
-                                  }
-                                } finally {
-                                  if (mounted) {
-                                    setState(() {
-                                      _isTesting = false;
-                                    });
-                                  }
-                                }
-                              }),
-                  ),
                   SizedBox(
                     width: buttonWidth,
                     child: _buildActionButton(
@@ -1388,55 +1366,70 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   }
 
   Future<void> _showAddDataDialog() async {
-    final count = await showDialog<int>(
+    final result = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (context) =>
           AddDataDialog(defaultCount: _totalRecords == 0 ? 10000 : 500),
     );
 
-    if (count != null && count > 0) {
+    if (result != null) {
+      final count = result['count'] as int;
+      final method = result['method'] as InsertMethod;
+
+      if (count <= 0) return;
+
       setState(() {
+        _isTesting = true; // Use the benchmark view's testing flag
         _isDataLoading = true;
-        _lastOperationInfo = 'Adding $count records...';
+        _lastOperationInfo =
+            'Adding $count records (${method == InsertMethod.batch ? 'batch' : 'one-by-one'})...';
       });
 
-      final stopwatch = Stopwatch()..start();
+      // 1. Fetch the latest record count directly from the database to ensure accuracy.
+      final currentTotal =
+          await widget.example.db.query(_selectedTable).count();
+      int elapsed = -1;
+
       try {
-        if (_selectedTable == 'users') {
-          // Specific generator for users table
-          final users = <Map<String, dynamic>>[];
-          for (var i = 0; i < count; i++) {
-            final uniqueId = _totalRecords + i;
-            users.add({
-              'username': 'user_$uniqueId',
-              'email': 'user_$uniqueId@example.com',
-              'tags': 'generated,bulk',
-              'is_active': true,
-              'age': 20 + (i % 50),
-            });
-          }
-          await widget.example.db.batchInsert('users', users);
+        if (method == InsertMethod.batch) {
+          // Use the existing benchmark logic for batch adding
+          elapsed = await widget.example
+              .addExamples(_selectedTable, count, currentTotal);
         } else {
-          // Generic handler for other tables (can be expanded)
-          logService.add(
-              'Add data logic for "$_selectedTable" is not implemented yet.',
-              LogType.warn);
+          // Use the existing benchmark logic for one-by-one adding
+          elapsed = await widget.example
+              .addExamplesOneByOne(_selectedTable, count, currentTotal);
         }
       } catch (e, s) {
         logService.add('Failed to add data: $e', LogType.error);
         logService.add('Stacktrace: $s', LogType.error);
+        // 'elapsed' remains -1, indicating failure.
       }
-      stopwatch.stop();
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-              'Added $count records in ${stopwatch.elapsedMilliseconds}ms'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
 
+      // 2. Show a user-friendly SnackBar based on the operation result.
+      if (elapsed >= 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Added $count records in ${elapsed}ms'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to add data. Please check logs for details.'),
+            duration: Duration(seconds: 4),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+
+      setState(() {
+        _isTesting = false;
+      });
       await _fetchTableData(
           resetPage: true); // Refresh the view and go to page 1
     }
@@ -1622,6 +1615,122 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
       _selectedRows.clear();
       await _fetchTableData();
+    }
+  }
+
+  Future<void> _showCustomDeleteDialog() async {
+    final schema = await widget.example.db.getTableSchema(_selectedTable);
+    if (schema == null) {
+      logService.add(
+          'Cannot perform custom delete: Schema not found for $_selectedTable.',
+          LogType.warn);
+      return;
+    }
+    if (!mounted) return;
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => CustomDeleteDialog(schema: schema),
+    );
+
+    if (result != null) {
+      final field = result['field'] as String;
+      final op = result['operator'] as String;
+      final value = result['value'];
+
+      if (value == null) {
+        logService.add('Invalid value for custom delete.', LogType.warn);
+        return;
+      }
+      if (!mounted) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Confirm Custom Deletion'),
+          content: Text(
+              'Are you sure you want to delete all records from "$_selectedTable" where $field $op $value? This action cannot be undone.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style: TextButton.styleFrom(foregroundColor: Colors.red),
+              child: const Text('Delete'),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmed ?? false) {
+        setState(() {
+          _isDataLoading = true;
+          _lastOperationInfo = 'Deleting records where $field $op $value...';
+        });
+
+        try {
+          final result = await widget.example.db
+              .delete(_selectedTable)
+              .where(field, op, value);
+
+          logService.add(
+              'Custom delete affected ${result.successCount} record(s).',
+              result.isSuccess ? LogType.info : LogType.warn);
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                    '${result.successCount} record(s) deleted successfully.'),
+              ),
+            );
+          }
+        } catch (e, s) {
+          logService.add('Failed to perform custom delete: $e', LogType.error);
+          logService.add('Stacktrace: $s', LogType.error);
+        }
+
+        await _fetchTableData(resetPage: true);
+      }
+    }
+  }
+
+  Future<void> _confirmClearCurrentTable() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirm Clear Table'),
+        content: const Text(
+          'Are you sure you want to clear the current table?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed ?? false) {
+      setState(() {
+        _isDataLoading = true;
+        _lastOperationInfo = 'Clearing current table...';
+      });
+
+      try {
+        await widget.example.db.clear(_selectedTable);
+        logService.add('Cleared table $_selectedTable.', LogType.info);
+      } catch (e, s) {
+        logService.add('Failed to clear table: $e', LogType.error);
+        logService.add('Stacktrace: $s', LogType.error);
+      }
+      await _fetchTableData(resetPage: true);
     }
   }
 }
@@ -1819,6 +1928,8 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
   }
 }
 
+enum InsertMethod { batch, oneByOne }
+
 /// A dialog for adding a specific number of records.
 class AddDataDialog extends StatefulWidget {
   final int defaultCount;
@@ -1830,6 +1941,7 @@ class AddDataDialog extends StatefulWidget {
 
 class _AddDataDialogState extends State<AddDataDialog> {
   late final TextEditingController _controller;
+  InsertMethod _method = InsertMethod.batch;
 
   @override
   void initState() {
@@ -1846,7 +1958,7 @@ class _AddDataDialogState extends State<AddDataDialog> {
   void _onAdd() {
     final count = int.tryParse(_controller.text);
     if (count != null && count > 0) {
-      Navigator.of(context).pop(count);
+      Navigator.of(context).pop({'count': count, 'method': _method});
     } else {
       // Show an error or just ignore
     }
@@ -1856,15 +1968,42 @@ class _AddDataDialogState extends State<AddDataDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Add Test Data'),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        keyboardType: TextInputType.number,
-        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-        decoration: const InputDecoration(
-          labelText: 'Number of records to add',
-          border: OutlineInputBorder(),
-        ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: const InputDecoration(
+              labelText: 'Number of records to add',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 20),
+          const Text('Insertion Method'),
+          RadioListTile<InsertMethod>(
+            title: const Text('Batch Insert'),
+            value: InsertMethod.batch,
+            groupValue: _method,
+            onChanged: (InsertMethod? value) {
+              setState(() {
+                _method = value!;
+              });
+            },
+          ),
+          RadioListTile<InsertMethod>(
+            title: const Text('Insert One by One'),
+            value: InsertMethod.oneByOne,
+            groupValue: _method,
+            onChanged: (InsertMethod? value) {
+              setState(() {
+                _method = value!;
+              });
+            },
+          ),
+        ],
       ),
       actions: [
         TextButton(
@@ -2137,6 +2276,184 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
         ElevatedButton(
           onPressed: _updatableFields.isEmpty ? null : _onSave,
           child: const Text('Update All'),
+        ),
+      ],
+    );
+  }
+}
+
+class CustomDeleteDialog extends StatefulWidget {
+  final TableSchema schema;
+
+  const CustomDeleteDialog({super.key, required this.schema});
+
+  @override
+  State<CustomDeleteDialog> createState() => _CustomDeleteDialogState();
+}
+
+class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
+  final _formKey = GlobalKey<FormState>();
+  String? _selectedField;
+  String _selectedOperator = '>';
+  final _valueController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedField = widget.schema.primaryKeyConfig.name;
+  }
+
+  @override
+  void dispose() {
+    _valueController.dispose();
+    super.dispose();
+  }
+
+  void _onConfirm() {
+    if (_formKey.currentState!.validate()) {
+      final fieldSchema = _getSelectedFieldSchema();
+      if (fieldSchema == null) return;
+
+      final convertedValue =
+          _convertValue(_valueController.text, fieldSchema.type);
+
+      Navigator.of(context).pop({
+        'field': _selectedField,
+        'operator': _selectedOperator,
+        'value': convertedValue,
+      });
+    }
+  }
+
+  FieldSchema? _getSelectedFieldSchema() {
+    if (_selectedField == widget.schema.primaryKeyConfig.name) {
+      // Create a pseudo-schema for the primary key for type conversion
+      return FieldSchema(name: _selectedField!, type: DataType.integer);
+    }
+    return widget.schema.fields.firstWhere((f) => f.name == _selectedField);
+  }
+
+  dynamic _convertValue(String? value, DataType type) {
+    if (value == null || value.isEmpty || value.toLowerCase() == 'null') {
+      return null;
+    }
+    switch (type) {
+      case DataType.integer:
+        return int.tryParse(value);
+      case DataType.double:
+        return double.tryParse(value);
+      case DataType.boolean:
+        return value.toLowerCase() == 'true' || value == '1';
+      default:
+        return value;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final allFields = [
+      widget.schema.primaryKeyConfig.name,
+      ...widget.schema.fields.map((f) => f.name)
+    ];
+
+    final selectedFieldSchema = _getSelectedFieldSchema();
+    final isNumeric = selectedFieldSchema?.type == DataType.integer ||
+        selectedFieldSchema?.type == DataType.double;
+
+    return AlertDialog(
+      title: const Text('Custom Delete'),
+      content: Form(
+        key: _formKey,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Delete records based on the following condition:'),
+            const SizedBox(height: 24),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  flex: 4,
+                  child: DropdownButtonFormField<String>(
+                    value: _selectedField,
+                    items: allFields
+                        .map((field) =>
+                            DropdownMenuItem(value: field, child: Text(field)))
+                        .toList(),
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() {
+                          _selectedField = value;
+                          // Reset value when field changes
+                          _valueController.clear();
+                        });
+                      }
+                    },
+                    decoration: const InputDecoration(
+                      labelText: 'Field',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 2,
+                  child: DropdownButtonFormField<String>(
+                    value: _selectedOperator,
+                    items: ['>', '>=', '<', '<=', '=', '!=']
+                        .map((op) =>
+                            DropdownMenuItem(value: op, child: Text(op)))
+                        .toList(),
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() {
+                          _selectedOperator = value;
+                        });
+                      }
+                    },
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            TextFormField(
+              controller: _valueController,
+              autofocus: true,
+              keyboardType:
+                  isNumeric ? TextInputType.number : TextInputType.text,
+              inputFormatters:
+                  isNumeric ? [FilteringTextInputFormatter.digitsOnly] : [],
+              decoration: const InputDecoration(
+                labelText: 'Value',
+                border: OutlineInputBorder(),
+              ),
+              validator: (value) {
+                if (value == null || value.isEmpty) {
+                  return 'Required';
+                }
+                if (isNumeric && int.tryParse(value) == null) {
+                  return 'Invalid number';
+                }
+                // Add more validation for other types if needed
+                return null;
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _onConfirm,
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+          child: const Text('Delete', style: TextStyle(color: Colors.white)),
         ),
       ],
     );
