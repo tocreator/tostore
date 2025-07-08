@@ -106,6 +106,9 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   bool _logCanScrollUp = false;
   bool _logCanScrollDown = false;
 
+  // New state for active filters
+  List<Map<String, dynamic>> _activeFilters = [];
+
   @override
   void initState() {
     super.initState();
@@ -500,7 +503,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       children: [
         // Header with record count and actions
         _buildDataHeader(),
-        const Divider(),
+        _buildActiveFiltersDisplay(),
+        const Divider(height: 1),
         // Data Table
         if (_isDataLoading)
           const Expanded(child: Center(child: CircularProgressIndicator()))
@@ -608,8 +612,15 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 ),
               ),
               PopupMenuButton<String>(
+                icon: Icon(
+                  Icons.more_horiz_outlined,
+                  color: _activeFilters.isEmpty ? null : Colors.orange.shade700,
+                ),
+                tooltip: 'Advanced Actions',
                 onSelected: (value) {
-                  if (value == 'custom_delete') {
+                  if (value == 'filter') {
+                    _showFilterDialog();
+                  } else if (value == 'custom_delete') {
                     _showCustomDeleteDialog();
                   } else if (value == 'clear_current_table') {
                     _confirmClearCurrentTable();
@@ -617,10 +628,21 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 },
                 itemBuilder: (context) => [
                   const PopupMenuItem(
+                    value: 'filter',
+                    child: Row(
+                      children: [
+                        Icon(Icons.search, size: 18),
+                        SizedBox(width: 8),
+                        Text('Filter Data'),
+                      ],
+                    ),
+                  ),
+                  const PopupMenuDivider(),
+                  const PopupMenuItem(
                     value: 'custom_delete',
                     child: Row(
                       children: [
-                        Icon(Icons.delete_sweep, size: 18),
+                        Icon(Icons.delete_forever_sharp, size: 18),
                         SizedBox(width: 8),
                         Text('Custom Delete'),
                       ],
@@ -638,11 +660,55 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                     ),
                   ),
                 ],
-                icon: const Icon(Icons.more_horiz_outlined),
-                tooltip: 'Advanced Actions',
               ),
             ],
           )
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActiveFiltersDisplay() {
+    if (_activeFilters.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 8, 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Expanded(
+            child: Wrap(
+              spacing: 6.0,
+              runSpacing: 6.0,
+              children: _activeFilters.map((filter) {
+                return Chip(
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  padding: const EdgeInsets.all(4),
+                  label: Text(
+                      "'${filter['field']}' ${filter['operator']} '${filter['value']}'"),
+                  deleteIcon: const Icon(Icons.close, size: 14),
+                  onDeleted: () {
+                    setState(() {
+                      _activeFilters.remove(filter);
+                    });
+                    _fetchTableData(resetPage: true);
+                  },
+                );
+              }).toList(),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Clear All Filters',
+            icon: const Icon(Icons.close_outlined, color: Colors.redAccent),
+            onPressed: () {
+              setState(() {
+                _activeFilters.clear();
+              });
+              _fetchTableData(resetPage: true);
+            },
+          ),
         ],
       ),
     );
@@ -826,9 +892,21 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         _tableColumns = [];
         _primaryKey = 'key';
       }
+      // Base queries for data and count
+      var dataQuery = widget.example.db.query(_selectedTable);
+      var countQuery = widget.example.db.query(_selectedTable);
+
+      // Apply active filters to both queries
+      for (final filter in _activeFilters) {
+        final field = filter['field'] as String;
+        final op = filter['operator'] as String;
+        final value = filter['value'];
+        dataQuery = dataQuery.where(field, op, value);
+        countQuery = countQuery.where(field, op, value);
+      }
 
       // Get total count for pagination
-      _totalRecords = await widget.example.db.query(_selectedTable).count();
+      _totalRecords = await countQuery.count();
       _totalPages = (_totalRecords / _pageSize).ceil();
       if (_totalPages == 0) _totalPages = 1;
 
@@ -838,8 +916,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       }
 
       // Get paginated data
-      final result = await widget.example.db
-          .query(_selectedTable)
+      final result = await dataQuery
           .limit(_pageSize)
           .offset((_currentPage - 1) * _pageSize);
 
@@ -1695,6 +1772,31 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     }
   }
 
+  Future<void> _showFilterDialog() async {
+    final schema = await widget.example.db.getTableSchema(_selectedTable);
+    if (schema == null) {
+      logService.add(
+          'Cannot filter: Schema not found for $_selectedTable.', LogType.warn);
+      return;
+    }
+
+    if (!mounted) return;
+    final newFilters = await showDialog<List<Map<String, dynamic>>>(
+      context: context,
+      builder: (context) => FilterDialog(
+        schema: schema,
+        existingFilters: _activeFilters,
+      ),
+    );
+
+    if (newFilters != null) {
+      setState(() {
+        _activeFilters = newFilters;
+      });
+      _fetchTableData(resetPage: true);
+    }
+  }
+
   Future<void> _confirmClearCurrentTable() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -2238,9 +2340,11 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
                       );
                     }).toList(),
                     onChanged: (value) {
-                      setState(() {
-                        _selectedField = value;
-                      });
+                      if (value != null) {
+                        setState(() {
+                          _selectedField = value;
+                        });
+                      }
                     },
                     decoration: const InputDecoration(
                       labelText: 'Field to Update',
@@ -2458,4 +2562,250 @@ class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
       ],
     );
   }
+}
+
+class FilterDialog extends StatefulWidget {
+  final TableSchema schema;
+  final List<Map<String, dynamic>> existingFilters;
+
+  const FilterDialog(
+      {super.key, required this.schema, required this.existingFilters});
+
+  @override
+  State<FilterDialog> createState() => _FilterDialogState();
+}
+
+class _FilterDialogState extends State<FilterDialog> {
+  late List<_FilterCondition> _filters;
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _filters = widget.existingFilters.map((f) {
+      return _FilterCondition(
+        field: f['field'],
+        operator: f['operator'],
+        valueController: TextEditingController(text: '${f['value']}'),
+      );
+    }).toList();
+
+    if (_filters.isEmpty) {
+      _filters.add(
+        _FilterCondition(
+          field: _getAvailableFields().first,
+          operator: '=',
+          valueController: TextEditingController(),
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final filter in _filters) {
+      filter.valueController.dispose();
+    }
+    super.dispose();
+  }
+
+  void _addFilter() {
+    setState(() {
+      _filters.add(_FilterCondition(
+        field: _getAvailableFields().first,
+        operator: '=',
+        valueController: TextEditingController(),
+      ));
+    });
+  }
+
+  void _removeFilter(int index) {
+    setState(() {
+      _filters.removeAt(index);
+    });
+  }
+
+  List<String> _getAvailableFields() {
+    final pkName = widget.schema.primaryKeyConfig.name;
+    final fieldNames = widget.schema.fields.map((f) => f.name).toSet();
+    fieldNames.add(pkName);
+    return fieldNames.toList()..sort();
+  }
+
+  void _onApply() {
+    if (_formKey.currentState!.validate()) {
+      final newFilters = _filters.map((f) {
+        final fieldSchema = _getFieldSchema(f.field);
+        return {
+          'field': f.field,
+          'operator': f.operator,
+          'value': _convertValue(
+              f.valueController.text, fieldSchema?.type ?? DataType.text),
+        };
+      }).toList();
+      Navigator.of(context).pop(newFilters);
+    }
+  }
+
+  FieldSchema? _getFieldSchema(String fieldName) {
+    if (fieldName == widget.schema.primaryKeyConfig.name) {
+      // Create a pseudo-schema for the primary key for type conversion
+      return FieldSchema(name: fieldName, type: DataType.integer);
+    }
+    try {
+      return widget.schema.fields.firstWhere((f) => f.name == fieldName);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  dynamic _convertValue(String? value, DataType type) {
+    if (value == null || value.isEmpty || value.toLowerCase() == 'null') {
+      return null;
+    }
+    switch (type) {
+      case DataType.integer:
+        return int.tryParse(value);
+      case DataType.double:
+        return double.tryParse(value);
+      case DataType.boolean:
+        return value.toLowerCase() == 'true' || value == '1';
+      default:
+        return value;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final availableFields = _getAvailableFields();
+    return AlertDialog(
+      title: const Text('Set Filter Conditions'),
+      content: Form(
+        key: _formKey,
+        child: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Expanded(
+                child: _filters.isEmpty
+                    ? const Center(
+                        child: Text('No filters. Add one below.'),
+                      )
+                    : ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _filters.length,
+                        itemBuilder: (context, index) {
+                          final filter = _filters[index];
+                          return _buildFilterRow(
+                              filter, index, availableFields);
+                        },
+                      ),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: _addFilter,
+                icon: const Icon(Icons.add),
+                label: const Text('Add Condition'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _onApply,
+          child: const Text('Apply Filters'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFilterRow(
+      _FilterCondition filter, int index, List<String> availableFields) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Column(
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: 5,
+                child: DropdownButtonFormField<String>(
+                  value: filter.field,
+                  items: availableFields
+                      .map((f) => DropdownMenuItem(value: f, child: Text(f)))
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setState(() {
+                        filter.field = value;
+                      });
+                    }
+                  },
+                  decoration: const InputDecoration(
+                      border: OutlineInputBorder(), labelText: 'Field'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 3,
+                child: DropdownButtonFormField<String>(
+                  value: filter.operator,
+                  items: ['=', '!=', '>', '>=', '<', '<=', 'LIKE']
+                      .map((op) => DropdownMenuItem(value: op, child: Text(op)))
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setState(() {
+                        filter.operator = value;
+                      });
+                    }
+                  },
+                  decoration:
+                      const InputDecoration(border: OutlineInputBorder()),
+                ),
+              ),
+              IconButton(
+                icon:
+                    const Icon(Icons.remove_circle_outline, color: Colors.red),
+                onPressed: () => _removeFilter(index),
+              )
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextFormField(
+            controller: filter.valueController,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'Value',
+            ),
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return 'Required';
+              }
+              return null;
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FilterCondition {
+  String field;
+  String operator;
+  TextEditingController valueController;
+
+  _FilterCondition({
+    required this.field,
+    required this.operator,
+    required this.valueController,
+  });
 }
