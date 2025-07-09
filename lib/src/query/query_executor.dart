@@ -910,6 +910,51 @@ class QueryExecutor {
     return resultMap.values.toList();
   }
 
+  /// Helper class to represent a parsed query range.
+  _QueryRange _parsePkRange(dynamic pkCondition) {
+    final range = _QueryRange();
+
+    if (pkCondition is Map) {
+      // Equality
+      if (pkCondition.containsKey('=')) {
+        range.min = range.max = pkCondition['='];
+        range.includeMin = range.includeMax = true;
+        return range;
+      }
+
+      // Range operators
+      if (pkCondition.containsKey('>')) {
+        range.min = pkCondition['>'];
+        range.includeMin = false;
+      } else if (pkCondition.containsKey('>=')) {
+        range.min = pkCondition['>='];
+        range.includeMin = true;
+      }
+
+      if (pkCondition.containsKey('<')) {
+        range.max = pkCondition['<'];
+        range.includeMax = false;
+      } else if (pkCondition.containsKey('<=')) {
+        range.max = pkCondition['<='];
+        range.includeMax = true;
+      }
+
+      // Between operator
+      if (pkCondition.containsKey('BETWEEN')) {
+        final between = pkCondition['BETWEEN'] as Map;
+        range.min = between['start'];
+        range.max = between['end'];
+        range.includeMin = range.includeMax = true; // BETWEEN is inclusive
+      }
+    } else {
+      // Direct value match, e.g., where('id', 123)
+      range.min = range.max = pkCondition;
+      range.includeMin = range.includeMax = true;
+    }
+
+    return range;
+  }
+
   /// Determine which partitions to load based on query conditions
   Future<List<int>> _getTargetPartitions(
     String tableName,
@@ -925,111 +970,124 @@ class QueryExecutor {
       return fileMeta.partitions?.map((c) => c.index).toList() ?? [];
     }
 
-    // Check if conditions include primary key constraints
-    dynamic pkMin, pkMax;
-    bool hasPkRange = false;
+    // This function only prunes partitions based on the primary key.
+    // If there's no condition on the PK, we must scan all partitions.
+    if (!conditions.containsKey(primaryKey)) {
+      return fileMeta.partitions!.map((c) => c.index).toList()..sort();
+    }
 
-    // Check for direct primary key match or ranges
-    if (conditions.containsKey(primaryKey)) {
-      final pkCondition = conditions[primaryKey];
+    final pkCondition = conditions[primaryKey];
 
-      if (pkCondition is Map) {
-        // Check for operators like >, >=, <, <=, BETWEEN
-        if (pkCondition.containsKey('>') || pkCondition.containsKey('>=')) {
-          pkMin = pkCondition['>'] ?? pkCondition['>='];
-          hasPkRange = true;
-        }
+    // Handle the 'IN' operator as a special case first.
+    if (pkCondition is Map && pkCondition.containsKey('IN')) {
+      final inValues = pkCondition['IN'] as List?;
+      if (inValues == null || inValues.isEmpty) {
+        return [];
+      }
+      final targetPartitions = <int>{};
+      int processedCount = 0;
 
-        if (pkCondition.containsKey('<') || pkCondition.containsKey('<=')) {
-          pkMax = pkCondition['<'] ?? pkCondition['<='];
-          hasPkRange = true;
-        }
-
-        if (pkCondition.containsKey('BETWEEN')) {
-          final between = pkCondition['BETWEEN'] as Map;
-          pkMin = between['start'];
-          pkMax = between['end'];
-          hasPkRange = true;
-        }
-
-        // Check for exact match (=)
-        if (pkCondition.containsKey('=')) {
-          pkMin = pkMax = pkCondition['='];
-          hasPkRange = true;
-        }
-
-        // Check for IN operator
-        if (pkCondition.containsKey('IN')) {
-          // For IN operator, we need to find the partitions containing any of the values
-          final inValues = pkCondition['IN'] as List;
-          if (inValues.isNotEmpty) {
-            final targetPartitions = <int>{};
-
-            for (var value in inValues) {
-              for (var partition in fileMeta.partitions!) {
-                if (_isValueInRange(
-                    value, partition.minPrimaryKey, partition.maxPrimaryKey)) {
-                  targetPartitions.add(partition.index);
-                }
-              }
+      // For each value in the IN list, find which partitions could contain it.
+      for (var value in inValues) {
+        // Optimization: If partitions are ordered, use binary search for each value.
+        if (fileMeta.isOrdered == true) {
+          final partitionIndex =
+              _findPartitionWithBinarySearch(fileMeta.partitions!, value);
+          if (partitionIndex != null) {
+            targetPartitions.add(partitionIndex);
+          }
+        } else {
+          // Unordered, have to check all partitions for each value.
+          for (var partition in fileMeta.partitions!) {
+            if (_isValueInRange(
+                value, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+              targetPartitions.add(partition.index);
             }
-
-            return targetPartitions.toList()..sort();
           }
         }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
+      }
+      return targetPartitions.toList()..sort();
+    }
+
+    // For all other operators (=, >, <, BETWEEN), parse them into a single range.
+    final queryRange = _parsePkRange(pkCondition);
+
+    final targetPartitions = <int>[];
+
+    // If this is an exact match on an ordered table, use binary search for a fast path.
+    if (fileMeta.isOrdered == true &&
+        queryRange.min != null &&
+        queryRange.min == queryRange.max) {
+      final partitionIndex =
+          _findPartitionWithBinarySearch(fileMeta.partitions!, queryRange.min);
+      if (partitionIndex != null) {
+        return [partitionIndex];
       } else {
-        // Direct value match
-        pkMin = pkMax = pkCondition;
-        hasPkRange = true;
+        // if binary search fails, it means the key is not in any partition range.
+        return [];
       }
     }
 
-    if (hasPkRange) {
-      // Find partitions within the range
-      final targetPartitions = <int>[];
+    int processedCount = 0;
+    // For range queries or non-ordered tables, iterate through partitions to find overlaps.
+    for (var partition in fileMeta.partitions!) {
+      final pMin = partition.minPrimaryKey;
+      final pMax = partition.maxPrimaryKey;
 
-      // Optimization: For exact primary key match and ordered partitions, use binary search
-      if (fileMeta.isOrdered == true && pkMin == pkMax) {
-        // For exact primary key match, use binary search
-        final partitionIndex =
-            _findPartitionWithBinarySearch(fileMeta.partitions!, pkMin);
-        if (partitionIndex != null) {
-          targetPartitions.add(partitionIndex);
-          return targetPartitions; // Early return with found partition
+      // If a partition has no min/max key info, we must include it as a precaution.
+      if (pMin == null || pMax == null) {
+        targetPartitions.add(partition.index);
+        continue;
+      }
+
+      // Logic to check if the query range [queryRange.min, queryRange.max] overlaps with the partition range [pMin, pMax].
+      // There is NO overlap if (partition ends before query begins) OR (partition begins after query ends).
+
+      // Condition 1: Partition ends before query begins.
+      // e.g., partition is [5, 10] and query is (> 10) or (>= 11)
+      bool partitionEndsBeforeQueryStarts = false;
+      if (queryRange.min != null) {
+        final cmp = _compareValues(pMax, queryRange.min);
+        if (cmp < 0) {
+          // pMax < queryRange.min
+          partitionEndsBeforeQueryStarts = true;
+        }
+        if (cmp == 0 && !queryRange.includeMin) {
+          // pMax == queryRange.min, but query is exclusive (e.g., >)
+          partitionEndsBeforeQueryStarts = true;
         }
       }
 
-      // Standard linear search for ranges or when binary search found nothing
-      for (var partition in fileMeta.partitions!) {
-        // If min/max are not set, consider the partition
-        if (partition.minPrimaryKey == null ||
-            partition.maxPrimaryKey == null) {
-          targetPartitions.add(partition.index);
-          continue;
+      // Condition 2: Partition begins after query ends.
+      // e.g., partition is [20, 30] and query is (< 20) or (<= 19)
+      bool partitionStartsAfterQueryEnds = false;
+      if (queryRange.max != null) {
+        final cmp = _compareValues(pMin, queryRange.max);
+        if (cmp > 0) {
+          // pMin > queryRange.max
+          partitionStartsAfterQueryEnds = true;
         }
-
-        bool include = true;
-
-        // Check if partition's range overlaps with query range
-        if (pkMin != null) {
-          include = _compareValues(partition.maxPrimaryKey, pkMin) >= 0;
-        }
-
-        if (include && pkMax != null) {
-          include = _compareValues(partition.minPrimaryKey, pkMax) <= 0;
-        }
-
-        if (include) {
-          targetPartitions.add(partition.index);
+        if (cmp == 0 && !queryRange.includeMax) {
+          // pMin == queryRange.max, but query is exclusive (e.g., <)
+          partitionStartsAfterQueryEnds = true;
         }
       }
 
-      return targetPartitions..sort();
+      // If there is no gap between the ranges, it's an overlap.
+      if (!(partitionEndsBeforeQueryStarts || partitionStartsAfterQueryEnds)) {
+        targetPartitions.add(partition.index);
+      }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
-    // If no primary key constraints, but we have conditions on other fields,
-    // we need to check all partitions
-    return fileMeta.partitions!.map((c) => c.index).toList()..sort();
+    return targetPartitions..sort();
   }
 
   /// Check if a value is within a range (inclusive)
@@ -1075,9 +1133,9 @@ class QueryExecutor {
       }
 
       final primaryKey = schema.primaryKey;
-      final pkValue = conditions[primaryKey];
+      final pkConditionValue = conditions[primaryKey];
 
-      if (pkValue == null) {
+      if (pkConditionValue == null) {
         // If there is no primary key value, fall back to table scan
         return _performTableScan(tableName, queryCondition);
       }
@@ -1092,12 +1150,17 @@ class QueryExecutor {
         return _performTableScan(tableName, queryCondition);
       }
 
+      // Optimization: Check if this is an exact-match ('=') query.
+      // This allows us to stop scanning as soon as we find the unique record.
+      final bool isExactMatch =
+          pkConditionValue is Map && pkConditionValue.containsKey('=');
+
       // Reuse _getTargetPartitions for better consistency and to handle all query types (=, IN, BETWEEN, etc.)
       final targetPartitions = await _getTargetPartitions(
           tableName,
           schema.isGlobal,
           {
-            primaryKey: conditions[primaryKey]
+            primaryKey: pkConditionValue
           }, // Only pass the primary key condition
           primaryKey,
           fileMeta);
@@ -1123,12 +1186,15 @@ class QueryExecutor {
             // Skip deleted records
             if (isDeletedRecord(record)) continue;
 
-            //  Primary key exact match
-            if (ValueComparator.compare(record[primaryKey], pkValue) == 0) {
-              // If the record satisfies all query conditions
-              if (queryCondition == null || queryCondition.matches(record)) {
-                resultMap[record[primaryKey].toString()] = record;
-                // Terminate all partition processing immediately after finding a matching record
+            // CRITICAL: The `queryCondition.matches` method checks the *full* query,
+            // including the primary key condition (e.g., '>', '<', 'BETWEEN') AND
+            // any other conditions on other fields (e.g., AND status = 'active').
+            // This single line correctly handles all operators.
+            if (queryCondition == null || queryCondition.matches(record)) {
+              resultMap[record[primaryKey].toString()] = record;
+
+              // If it was an exact match, we've found our unique record, so we can stop all further scanning.
+              if (isExactMatch) {
                 controller.stop();
                 return records;
               }
@@ -1483,6 +1549,14 @@ class QueryExecutor {
 
     return resultMap.values.toList();
   }
+}
+
+/// Helper class for QueryExecutor to manage parsed ranges.
+class _QueryRange {
+  dynamic min;
+  dynamic max;
+  bool includeMin = true;
+  bool includeMax = true;
 }
 
 /// query range

@@ -1,5 +1,6 @@
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
+import '../model/table_schema.dart';
 import '../model/join_clause.dart';
 import 'query_plan.dart';
 
@@ -77,20 +78,25 @@ class QueryOptimizer {
         return _createTableScanPlan(tableName, where, orderBy);
       }
 
-      // For primary key queries, use a dedicated primary key scan operation to directly locate the partition file
+      // For primary key queries, decide between a direct primary key scan (for ordered tables)
+      // or an index scan on the primary key index (for non-ordered tables).
       if (where.containsKey(schema.primaryKey)) {
-        // Check if it is an exact match for the primary key
-        final pkValue = where[schema.primaryKey];
-        if (pkValue is Map && pkValue.containsKey('=')) {
-          // Exact match primary key query (e.g.: id = 123), use primaryKeyScan
+        final fileMeta =
+            await _dataStore.tableDataManager.getTableFileMeta(tableName);
+
+        // If the table data is physically ordered by the primary key, a primaryKeyScan is most efficient
+        // as it can directly seek to the right data partition(s).
+        if (fileMeta?.isOrdered == true) {
           return QueryPlan([
             QueryOperation(
               type: QueryOperationType.primaryKeyScan,
-              value: {schema.primaryKey: pkValue['=']},
+              // Pass the specific primary key condition to the executor.
+              value: {schema.primaryKey: where[schema.primaryKey]},
             ),
           ]);
         } else {
-          // Range query or other complex primary key queries, still use index scan
+          // If the table data is not ordered, we must use the primary key's B+Tree index,
+          // which is always ordered, to find the record pointers efficiently.
           return QueryPlan([
             QueryOperation(
               type: QueryOperationType.indexScan,
@@ -102,17 +108,34 @@ class QueryOptimizer {
       }
 
       // try to use other indexes
+      IndexSchema? bestIndex;
+      int longestMatch = 0;
+
       for (var index in schema.indexes) {
-        // check if all index fields are in query condition
-        if (index.fields.every((col) => where.containsKey(col))) {
-          return QueryPlan([
-            QueryOperation(
-              type: QueryOperationType.indexScan,
-              indexName: index.actualIndexName,
-              value: where,
-            ),
-          ]);
+        int currentMatch = 0;
+        for (var field in index.fields) {
+          if (where.containsKey(field)) {
+            currentMatch++;
+          } else {
+            break; // Break as soon as a field in the index is not in the where clause
+          }
         }
+
+        if (currentMatch > longestMatch) {
+          longestMatch = currentMatch;
+          bestIndex = index;
+        }
+      }
+
+      // If a suitable index is found, use index scan
+      if (bestIndex != null) {
+        return QueryPlan([
+          QueryOperation(
+            type: QueryOperationType.indexScan,
+            indexName: bestIndex.actualIndexName,
+            value: where,
+          ),
+        ]);
       }
 
       // if there is no available index, use full table scan

@@ -3949,6 +3949,20 @@ class IndexManager {
         return IndexSearchResult(pointersByPartition: grouped);
       }
 
+      // For some operators, a full table scan is more efficient than an index scan.
+      final op = condition.operator.toUpperCase();
+      if (op == 'LIKE' && condition.value is String) {
+        final value = condition.value as String;
+        // Non-prefix LIKE queries (e.g., '%val' or '%val%') cannot use the B-Tree efficiently
+        // and would result in a full index scan. In this case, a table scan is likely faster.
+        if (value.startsWith('%')) {
+          return IndexSearchResult.tableScan();
+        }
+      } else if (op == 'NOT LIKE' || op == '!=' || op == '<>') {
+        // Negative conditions are not selective and should use a table scan.
+        return IndexSearchResult.tableScan();
+      }
+
       // 1. Metadata, Schema, and Comparator setup
       IndexMeta? meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) {
@@ -3969,7 +3983,6 @@ class IndexManager {
       final tableSchema = await _dataStore.getTableSchema(tableName);
       if (tableSchema == null) return IndexSearchResult.tableScan();
 
-      ComparatorFunction comparator = ValueComparator.compare;
       dynamic startValue = condition.value;
       dynamic endValue = condition.endValue;
 
@@ -3980,67 +3993,46 @@ class IndexManager {
         switch (condition.operator.toUpperCase()) {
           // Use toUpperCase to ensure operator is case insensitive
           case '=':
-            pointers = await btree.search(startValue, comparator: comparator);
+            pointers = await btree.search(startValue);
             break;
           case '>':
-            pointers = await btree.searchRange(startValue, null,
-                includeStart: false, comparator: comparator);
+            pointers =
+                await btree.searchRange(startValue, null, includeStart: false);
             break;
           case '>=':
-            pointers = await btree.searchRange(startValue, null,
-                includeStart: true, comparator: comparator);
+            pointers =
+                await btree.searchRange(startValue, null, includeStart: true);
             break;
           case '<':
-            pointers = await btree.searchRange(null, startValue,
-                includeEnd: false, comparator: comparator);
+            pointers =
+                await btree.searchRange(null, startValue, includeEnd: false);
             break;
           case '<=':
-            pointers = await btree.searchRange(null, startValue,
-                includeEnd: true, comparator: comparator);
+            pointers =
+                await btree.searchRange(null, startValue, includeEnd: true);
             break;
           case 'BETWEEN':
-            pointers = await btree.searchRange(13, 16, comparator: comparator);
+            pointers = await btree.searchRange(startValue, endValue);
             break;
           case 'LIKE':
             if (startValue is String) {
-              if (startValue.endsWith('%') && !startValue.startsWith('%')) {
+              // A LIKE query can only be optimized into a B+Tree range scan if it's a simple prefix search,
+              // meaning it ends with '%' and has no other wildcards ('_' or '%') anywhere else.
+              final bool isSimplePrefixSearch = startValue.endsWith('%') &&
+                  !startValue
+                      .substring(0, startValue.length - 1)
+                      .contains('%') &&
+                  !startValue.substring(0, startValue.length - 1).contains('_');
+
+              if (isSimplePrefixSearch) {
+                // It's a simple prefix, so we can use a fast range scan.
                 final prefix = startValue.substring(0, startValue.length - 1);
-
-                pointers = await btree.searchRange(prefix, null,
-                    includeStart: true, comparator: (a, b) {
-                  if (a == null || b == null) return 0;
-                  String aStr = a.toString();
-                  String bStr = b.toString();
-
-                  // If b is our prefix, check if a starts with b
-                  if (bStr == prefix) {
-                    return aStr.startsWith(bStr) ? 0 : 1;
-                  }
-
-                  return ValueComparator.compare(a, b);
-                });
-
-                if (pointers.isNotEmpty) {
-                  final filtered = <dynamic>[];
-
-                  // Add async yield to avoid UI jank
-                  int processedCount = 0;
-                  for (final pointer in pointers) {
-                    final storeIndex =
-                        StoreIndex.fromString(pointer.toString());
-                    if (storeIndex != null) {
-                      filtered.add(pointer);
-                    }
-
-                    // Yield to the event loop to prevent UI jank if there are many indexes.
-                    processedCount++;
-                    if (processedCount % 500 == 0) {
-                      await Future.delayed(Duration.zero);
-                    }
-                  }
-                  pointers = filtered;
-                }
+                final endPrefix = '$prefix\uffff';
+                pointers = await btree.searchRange(prefix, endPrefix,
+                    includeStart: true, includeEnd: true);
               } else {
+                // For any other LIKE pattern (e.g., '%val', '%val%', 'v_lue%'),
+                // we must fall back to a full scan of the index leaf nodes.
                 pointers = await btree.scanAndMatch(startValue);
               }
             }
@@ -4206,16 +4198,9 @@ class IndexManager {
           _indexFullyCached[cacheKey] == true) {
         _updateIndexAccessWeight(cacheKey);
         final btree = _indexCache[cacheKey]!;
-        final tableSchema = await _dataStore.getTableSchema(tableName);
-        final isPk = indexName == 'pk_$tableName';
-        final pkType = tableSchema?.primaryKeyConfig.type;
-        final comparator = isPk && pkType != null
-            ? ValueComparator.getPrimaryKeyComparator(pkType)
-            : ValueComparator.compare;
-
         int processedCount = 0;
         for (final key in keys) {
-          final results = await btree.search(key, comparator: comparator);
+          final results = await btree.search(key);
           if (results.isNotEmpty) {
             // Merge results, avoiding duplicates.
             final existingPointers = allResults.putIfAbsent(key, () => []);

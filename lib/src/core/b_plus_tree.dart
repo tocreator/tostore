@@ -926,6 +926,10 @@ class BPlusTree {
     }
 
     if (key1 is String && key2 is String) {
+      final lengthCompare = key1.length.compareTo(key2.length);
+      if (lengthCompare != 0) {
+        return lengthCompare;
+      }
       return key1.compareTo(key2);
     }
 

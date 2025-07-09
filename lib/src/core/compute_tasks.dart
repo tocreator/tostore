@@ -172,8 +172,7 @@ Future<IndexProcessingResult> processIndexPartition(
     for (final bufferEntry in request.entries) {
       try {
         final entry = bufferEntry.indexEntry;
-        await btree.insert(entry.indexKey, entry.recordPointer.toString(),
-            comparator: comparator);
+        await btree.insert(entry.indexKey, entry.recordPointer.toString());
       } catch (insertError) {
         failedCount++;
         Logger.warn('Failed to insert entry: $insertError',
@@ -264,8 +263,7 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         final recordPointer = indexEntry.indexEntry.recordPointer.toString();
 
         // Delete the index entry
-        if (await btree.delete(actualIndexKey, recordPointer,
-            comparator: comparator)) {
+        if (await btree.delete(actualIndexKey, recordPointer)) {
           isModified = true;
           processedKeys.add(compositeKey);
         }
@@ -2229,7 +2227,7 @@ Future<List<dynamic>> searchIndexPartitionTask(
     final comparator = ValueComparator.getFieldComparator(request.keyType);
     final btree = await BPlusTree.fromString(request.content,
         isUnique: request.isUnique, comparator: comparator);
-    return await btree.search(request.key, comparator: comparator);
+    return await btree.search(request.key);
   } catch (e) {
     Logger.error('Failed to search index partition in isolate: $e',
         label: 'searchIndexPartitionTask');
@@ -2269,7 +2267,7 @@ Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
     final btree = await BPlusTree.fromString(request.content,
         isUnique: request.isUnique, comparator: comparator);
     for (final key in request.keys) {
-      final results = await btree.search(key, comparator: comparator);
+      final results = await btree.search(key);
       if (results.isNotEmpty) {
         found[key] = results;
       }

@@ -25,7 +25,7 @@ void main() async {
       // when the DatabaseTester explicitly asks for it.
       if (_suppressSpecificWarnings &&
           type == LogType.warn &&
-          message.contains('cannot be null')) {
+          message.contains('Field email cannot be null')) {
         return; // Suppress expected warning from non-nullable constraint test
       }
       logService.add('[$label] $message', type, true);
