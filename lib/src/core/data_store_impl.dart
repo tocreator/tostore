@@ -875,66 +875,7 @@ class DataStoreImpl {
         if (field.name == primaryKey) {
           continue;
         }
-
-        if (!data.containsKey(field.name)) {
-          // get default value
-          final defaultVal = field.getDefaultValue();
-          if (defaultVal == null) {
-            // if field is not nullable and has no default value
-            if (!field.nullable) {
-              Logger.warn(
-                'Field ${field.name} cannot be null and has no default value',
-                label: 'DataStore._validateAndProcessData',
-              );
-              return null;
-            } else {
-              // allow null, set to null
-              result[field.name] = null;
-            }
-          } else {
-            // use converted default value
-            result[field.name] = defaultVal;
-          }
-        } else {
-          final value = data[field.name];
-
-          // check non-null constraint
-          if (!field.nullable && value == null) {
-            Logger.warn(
-              'Field ${field.name} cannot be null',
-              label: 'DataStore._validateAndProcessData',
-            );
-            return null;
-          }
-
-          // if value is not null, try to convert type
-          if (value != null) {
-            if (field.isValidDataType(value, field.type)) {
-              result[field.name] = value; // type match, use directly
-            } else {
-              try {
-                // try to convert type
-                final convertedValue = field.convertValue(value);
-                if (convertedValue == null) {
-                  Logger.warn(
-                    'Failed to convert value for field ${field.name}: $value to ${field.type}',
-                    label: 'DataStore._validateAndProcessData',
-                  );
-                  return null;
-                }
-                result[field.name] = convertedValue;
-              } catch (e) {
-                Logger.warn(
-                  'Failed to convert value for field ${field.name}: $value to ${field.type}: $e',
-                  label: 'DataStore._validateAndProcessData',
-                );
-                return null;
-              }
-            }
-          } else {
-            result[field.name] = null;
-          }
-        }
+        result[field.name] = field.convertValue(data[field.name]);
       }
 
       // 3. validate data using schema constraints and apply constraints if needed
@@ -948,22 +889,12 @@ class DataStoreImpl {
         return null;
       }
 
-      return _prepareDataForStorage(validatedResult);
+      return validatedResult;
     } catch (e) {
       Logger.error('Data validation failed: $e',
           label: 'DataStore-_validateAndProcessData');
       return null;
     }
-  }
-
-  /// Convert data for storage
-  Map<String, dynamic> _prepareDataForStorage(Map<String, dynamic> data) {
-    return data.map((key, value) {
-      if (value is DateTime) {
-        return MapEntry(key, value.toIso8601String());
-      }
-      return MapEntry(key, value);
-    });
   }
 
   /// Execute query
@@ -1075,32 +1006,7 @@ class DataStoreImpl {
           return null;
         }
 
-        // If value is not null, validate and convert type
-        if (value != null) {
-          if (field.isValidDataType(value, field.type)) {
-            result[field.name] = value;
-          } else {
-            try {
-              final convertedValue = field.convertValue(value);
-              if (convertedValue == null) {
-                Logger.warn(
-                  'Failed to convert value for field ${field.name}: $value to ${field.type}',
-                  label: 'DataStore._validateAndProcessUpdateData',
-                );
-                return null;
-              }
-              result[field.name] = convertedValue;
-            } catch (e) {
-              Logger.warn(
-                'Failed to convert value for field ${field.name}: $value to ${field.type}: $e',
-                label: 'DataStore._validateAndProcessUpdateData',
-              );
-              return null;
-            }
-          }
-        } else {
-          result[field.name] = null;
-        }
+        result[field.name] = field.convertValue(value);
 
         // Check max length constraint
         if (result[field.name] != null && field.maxLength != null) {
@@ -1113,7 +1019,7 @@ class DataStoreImpl {
         }
       }
 
-      return _prepareDataForStorage(result);
+      return result;
     } catch (e) {
       Logger.error('Update data validation failed: $e',
           label: 'DataStore._validateAndProcessUpdateData');

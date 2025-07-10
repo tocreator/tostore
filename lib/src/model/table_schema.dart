@@ -712,11 +712,6 @@ class FieldSchema {
       return _convertValueInternal(defaultValue);
     }
 
-    // handle not nullable constraint
-    if (!nullable) {
-      return null;
-    }
-
     // allow null and no default value, return null
     return null;
   }
@@ -789,8 +784,10 @@ class FieldSchema {
         }
         return null;
       case DataType.text:
-        if (value is String) return value;
-        if (value is DateTime) {
+        String? rawString;
+        if (value is String) {
+          rawString = value;
+        } else if (value is DateTime) {
           try {
             return value.toIso8601String();
           } catch (e) {
@@ -800,11 +797,20 @@ class FieldSchema {
             );
             return null;
           }
+        } else {
+          rawString = value?.toString();
         }
-        if (value is BigInt) {
-          return value.toString();
+
+        if (rawString == null) return null;
+
+        final trimmed = rawString.trim();
+        if (trimmed.length >= 2) {
+          if ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+              (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+            return trimmed.substring(1, trimmed.length - 1);
+          }
         }
-        return value?.toString();
+        return trimmed;
       case DataType.blob:
         if (value is Uint8List) return value;
         if (value is String) {
