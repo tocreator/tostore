@@ -241,24 +241,34 @@ class PartitionInfo {
   String toString() => 'PartitionInfo(path: $path, meta: $meta, data: $data)';
 }
 
+/// Partition metadata
 class PartitionMeta {
-  // The version of the partition meta
+
+  /// version
   final int version;
-  // The index of the partition in the file
+
+  /// partition index
   final int index;
-  // The number of records stored in this partition file
+
+  /// the number of records stored in this partition file
   final int totalRecords;
-  // Size of the data portion of the partition (in bytes)
+
+  /// Size of the data portion of the partition (in bytes)
   final int fileSizeInBytes;
-  // The minimum primary key value in this partition
+
+  /// The minimum primary key value in this partition
   final dynamic minPrimaryKey;
-  // The maximum primary key value in this partition
+
+  /// The maximum primary key value in this partition
   final dynamic maxPrimaryKey;
-  // Optional checksum for verifying data integrity
+
+  /// Optional checksum for verifying data integrity
   final String? checksum;
-  // Timestamps for the partition: created, modified, and accessed (if needed) encapsulated in Timestamps
+
+  /// Timestamps for the partition: created, modified, and accessed (if needed) encapsulated in Timestamps
   final Timestamps timestamps;
-  // The parent path of the partition
+
+  /// The parent path of the partition
   final String parentPath;
 
   PartitionMeta({

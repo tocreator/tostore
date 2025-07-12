@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/encoder_config.dart';
+
 /// Data encoding is efficient and fast, slightly slower than regular UTF-8 encoding
 /// Protects data privacy by preventing casual viewing of data files
 class EncoderHandler {
@@ -8,10 +10,10 @@ class EncoderHandler {
   static const int _encodingVersion = 1;
 
   // is encoding enabled
-  static bool _enableEncoding = true;
+  static bool _enableEncoding = false;
 
   // is obfuscation enabled
-  static bool _enableObfuscation = true;
+  static bool _enableObfuscation = false;
 
   /// set encoding config
   static void setEncodingConfig({
@@ -63,10 +65,16 @@ class EncoderHandler {
   static final List<int> _utf8PrefixBytes = utf8.encode(_encodeUtf8Prefix);
   static final List<int> _rawPrefixBytes = utf8.encode(_encodeRawPrefix);
 
-  // New: Fallback key provider callback. Given a keyId, returns the corresponding key if available.
-  static Future<List<int>?> Function(int keyId)? fallbackKeyProvider;
+  // Fallback keys, mapping keyId to the key.
+  static Map<int, List<int>>? _fallbackKeys;
 
   static int _currentKeyId = 0;
+
+  /// Sets the fallback keys. This is used to provide older keys for decoding data
+  /// that might have been encrypted with a previous key.
+  static void setFallbackKeys(Map<int, List<int>>? keys) {
+    _fallbackKeys = keys;
+  }
 
   static void setCurrentKey(String key, int keyId) {
     _activeKey = generateKey(key);
@@ -162,8 +170,8 @@ class EncoderHandler {
 
           // If an expected keyId is provided and doesn't match header keyId, try to retrieve the proper key
           if (headerKeyId != (keyId ?? _currentKeyId)) {
-            if (fallbackKeyProvider != null) {
-              key = await fallbackKeyProvider!(headerKeyId) ?? key;
+            if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
+              key = _fallbackKeys![headerKeyId] ?? key;
             }
           }
 
@@ -245,8 +253,8 @@ class EncoderHandler {
 
         // If header keyId does not match the provided keyId, try to retrieve the proper key
         if (headerKeyId != usedKeyId) {
-          if (fallbackKeyProvider != null) {
-            usedKey = await fallbackKeyProvider!(headerKeyId) ?? usedKey;
+          if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
+            usedKey = _fallbackKeys![headerKeyId] ?? usedKey;
           }
         }
 
@@ -396,27 +404,25 @@ class EncoderHandler {
   }
 
   /// Get current complete encoding state, for isolate thread passing
-  static Map<String, dynamic> getCurrentEncodingState() {
-    return {
-      'enableEncoding': _enableEncoding,
-      'enableObfuscation': _enableObfuscation,
-      'activeKey': List<int>.from(_activeKey),
-      'keyId': _currentKeyId,
-    };
+  static EncoderConfig getCurrentEncodingState() {
+    return EncoderConfig(
+      enableEncoding: _enableEncoding,
+      enableObfuscation: _enableObfuscation,
+      activeKey: List<int>.from(_activeKey),
+      keyId: _currentKeyId,
+      fallbackKeys: _fallbackKeys,
+    );
   }
 
   /// set complete encoding state, for isolate thread passing
-  static void setEncodingState(Map<String, dynamic> state) {
-    if (state['enableEncoding'] != null) {
-      _enableEncoding = state['enableEncoding'];
+  static void setEncodingState(EncoderConfig config) {
+    _enableEncoding = config.enableEncoding;
+    _enableObfuscation = config.enableObfuscation;
+    _activeKey = List<int>.from(config.activeKey);
+    _currentKeyId = config.keyId;
+    if (config.fallbackKeys != null) {
+      _fallbackKeys = Map<int, List<int>>.from(config.fallbackKeys!);
     }
-    if (state['enableObfuscation'] != null) {
-      _enableObfuscation = state['enableObfuscation'];
-    }
-    if (state['activeKey'] != null) {
-      _activeKey = List<int>.from(state['activeKey']);
-    }
-    if (state['keyId'] != null) _currentKeyId = state['keyId'];
   }
 
   /// Check if encoding is enabled

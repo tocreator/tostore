@@ -5,8 +5,8 @@ import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import '../model/file_info.dart';
+import 'data_compressor.dart';
 
 /// data integrity checker
 class IntegrityChecker {
@@ -91,39 +91,47 @@ class IntegrityChecker {
       if (fileMeta != null && fileMeta.partitions != null) {
         // check each partition
         for (var partition in fileMeta.partitions!) {
-          if (partition.checksum == null) {
-            Logger.error('Partition missing checksum',
+          final storedChecksum = partition.checksum;
+
+          // A valid checksum must exist and be an 8-character hex string.
+          if (storedChecksum == null ||
+              storedChecksum.length != 8 ||
+              int.tryParse(storedChecksum, radix: 16) == null) {
+            Logger.error(
+                'Partition ${partition.index} has a missing or malformed checksum. Validation failed.',
                 label: 'IntegrityChecker.checkDataConsistency');
-            return false;
+            return false; // Fail validation
           }
 
           try {
-            // use readRecordsFromPartition to read partition records
+            // 1. Use the canonical method to read the raw records list.
             final records = await _dataStore.tableDataManager
                 .readRecordsFromPartition(
                     tableName, isGlobal, partition.index, primaryKey);
 
+            // An empty partition should have 0 records. A mismatch is an error.
             if (records.isEmpty && partition.totalRecords > 0) {
-              Logger.error('Failed to read partition records',
+              Logger.error(
+                  'Partition ${partition.index} is empty but metadata reports ${partition.totalRecords} records.',
                   label: 'IntegrityChecker.checkDataConsistency');
               return false;
             }
 
-            // use the same way as TableDataManager to calculate checksum
-            final allRecordsData =
-                Uint8List.fromList(utf8.encode(jsonEncode(records)));
-            final actualChecksum =
-                _dataStore.calculateChecksum(allRecordsData).toString();
+            // 2. Calculate the checksum based on the raw records, mirroring the write process.
+            final recordsJsonString = jsonEncode(records);
+            final calculatedChecksum = DataCompressor()
+                .getChecksumStringFromString(recordsJsonString);
 
-            // compare with stored checksum
-            if (actualChecksum != partition.checksum) {
+            // 3. Compare with the stored checksum.
+            if (calculatedChecksum != storedChecksum) {
               Logger.error(
-                  'Checksum mismatch: Expected[${partition.checksum}], Actual[$actualChecksum]',
+                  'Checksum mismatch for partition ${partition.index}: Expected[$storedChecksum], Actual[$calculatedChecksum]',
                   label: 'IntegrityChecker.checkDataConsistency');
               return false;
             }
           } catch (e) {
-            Logger.error('Checksum calculation failed: $e',
+            Logger.error(
+                'Checksum validation failed for partition ${partition.index} with exception: $e',
                 label: 'IntegrityChecker.checkDataConsistency');
             return false;
           }

@@ -16,7 +16,6 @@ import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import 'data_cache_manager.dart';
-import 'data_compressor.dart';
 import '../model/data_store_config.dart';
 import 'memory_manager.dart';
 import 'table_data_manager.dart';
@@ -929,11 +928,6 @@ class DataStoreImpl {
         [];
   }
 
-  /// calculate checksum
-  String calculateChecksum(Uint8List data) {
-    final compressor = DataCompressor();
-    return compressor.calculateChecksum(data).toString();
-  }
 
   /// backup data and return backup path
   Future<String> backup({bool compress = true}) async {

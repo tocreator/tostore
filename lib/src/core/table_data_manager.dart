@@ -31,6 +31,13 @@ class TableDataManager {
   final Map<String, Map<String, BufferEntry>> _deleteBuffer = {};
   Map<String, Map<String, BufferEntry>> get deleteBuffer => _deleteBuffer;
 
+  // A temporary buffer for updates that occur while a full table cache is being loaded.
+  // Map<tableName, { 'writes': Map<recordId, BufferEntry>, 'deletes': Map<recordId, BufferEntry> }>
+  final Map<String, Map<String, Map<String, BufferEntry>>> _pendingCacheUpdates = {};
+
+  // A set of tables that are currently being loaded into the cache.
+  final Set<String> _cachingTables = {};
+
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
 
@@ -763,6 +770,16 @@ class TableDataManager {
 
     // Record data change, need to update statistics
     _needSaveStats = true;
+
+    // If the table is currently being cached, also add this update to a temporary buffer.
+    if (_cachingTables.contains(tableName)) {
+      final pendingUpdates = _pendingCacheUpdates.putIfAbsent(tableName, () => {'writes': {}, 'deletes': {}});
+      pendingUpdates['writes']![recordId] = BufferEntry(
+        data: data,
+        operation: isUpdate ? BufferOperationType.update : BufferOperationType.insert,
+        timestamp: DateTime.now(),
+      );
+    }
   }
 
   /// Add records to delete buffer - for batch deleting
@@ -780,6 +797,21 @@ class TableDataManager {
 
     final primaryKey = schema.primaryKey;
     final tableQueue = _deleteBuffer.putIfAbsent(tableName, () => {});
+
+    // If the table is being cached, also record these deletions.
+    if (_cachingTables.contains(tableName)) {
+      final pendingUpdates = _pendingCacheUpdates.putIfAbsent(tableName, () => {'writes': {}, 'deletes': {}});
+      for (final record in records) {
+        final recordId = record[primaryKey]?.toString();
+        if (recordId != null) {
+          pendingUpdates['deletes']![recordId] = BufferEntry(
+            operation: BufferOperationType.delete,
+            data: record,
+            timestamp: DateTime.now(),
+          );
+        }
+      }
+    }
 
     // Process each record
     for (final record in records) {
@@ -1516,12 +1548,7 @@ class TableDataManager {
               created: timeStamp,
               modified: timeStamp,
             ),
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
-            encoderState: (encryptionKey == null && encryptionKeyId == null)
-                ? EncoderHandler.getCurrentEncodingState()
-                : null,
+            encoderState: EncoderHandler.getCurrentEncodingState(),
           ),
           useIsolate: records.length > 500);
 
@@ -2561,12 +2588,7 @@ class TableDataManager {
           decodePartitionData,
           DecodePartitionRequest(
             bytes: bytes,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            // Only pass encoderState when no specific encryption key/keyId provided (avoid conflicts with migration data)
-            encoderState: (encryptionKey == null && encryptionKeyId == null)
-                ? EncoderHandler.getCurrentEncodingState()
-                : null,
+            encoderState: EncoderHandler.getCurrentEncodingState(),
           ),
           useIsolate: bytes.length >
               500 * 1024 // only use isolate if data size is larger than 500KB
@@ -3728,6 +3750,29 @@ class TableDataManager {
           label: 'TableDataManager.getRecordsByPointers');
       return [];
     }
+  }
+
+  /// Begins the process of caching a table, initializing a temporary buffer for concurrent updates.
+  /// It also captures the current state of write/delete buffers to be applied as a delta.
+  void startCachingTable(String tableName) {
+    _cachingTables.add(tableName);
+    final pendingUpdates = _pendingCacheUpdates.putIfAbsent(tableName, () => {'writes': {}, 'deletes': {}});
+
+    // Capture the current state of the main buffers.
+    final currentWrites = _writeBuffer[tableName];
+    if (currentWrites != null) {
+      pendingUpdates['writes']!.addAll(currentWrites);
+    }
+    final currentDeletes = _deleteBuffer[tableName];
+    if (currentDeletes != null) {
+      pendingUpdates['deletes']!.addAll(currentDeletes);
+    }
+  }
+
+  /// Completes the caching process for a table and returns the collected updates.
+  Map<String, Map<String, BufferEntry>>? finishCachingTable(String tableName) {
+    _cachingTables.remove(tableName);
+    return _pendingCacheUpdates.remove(tableName);
   }
 }
 

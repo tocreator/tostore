@@ -20,6 +20,7 @@ import 'memory_manager.dart';
 import '../handler/parallel_processor.dart';
 import '../model/system_table.dart';
 import '../query/query_condition.dart';
+import 'data_compressor.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -1780,9 +1781,7 @@ class IndexManager {
 
   /// Calculate content checksum
   String _calculateChecksum(String content) {
-    // Use simple hash value as checksum
-    final hash = content.hashCode;
-    return hash.toRadixString(16).padLeft(8, '0');
+    return DataCompressor().getChecksumStringFromString(content);
   }
 
   /// Unified index metadata update method

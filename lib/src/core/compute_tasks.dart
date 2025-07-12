@@ -13,6 +13,8 @@ import '../handler/encoder.dart';
 import '../handler/value_matcher.dart';
 import '../handler/logger.dart';
 import 'table_data_manager.dart';
+import '../model/encoder_config.dart';
+import 'data_compressor.dart';
 
 /// Helper class for organizing parallel write jobs.
 class PartitionWriteJob {
@@ -237,7 +239,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
           label: 'processIndexDelete');
       // Return unmodified content as fallback
       // Always calculate fresh checksum from content
-      final freshChecksum = _calculateChecksum(request.content);
+      final freshChecksum =
+          DataCompressor().getChecksumStringFromString(request.content);
       return IndexDeleteResult(
         isModified: false,
         newContent: request.content,
@@ -292,7 +295,7 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     }
 
     // Calculate checksum from the new content, always use the latest content
-    final newChecksum = _calculateChecksum(newContent);
+    final newChecksum = DataCompressor().getChecksumStringFromString(newContent);
 
     // Return the results with the newly calculated checksum
     return IndexDeleteResult(
@@ -307,7 +310,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
         label: 'processIndexDelete');
     // Return unmodified content as fallback
     // Always calculate checksum from current content to ensure consistency
-    final actualChecksum = _calculateChecksum(request.content);
+    final actualChecksum =
+        DataCompressor().getChecksumStringFromString(request.content);
     return IndexDeleteResult(
       isModified: false,
       newContent: request.content,
@@ -318,31 +322,16 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
   }
 }
 
-/// Calculate content checksum
-String _calculateChecksum(String content) {
-  // Use simple hash value as checksum
-  final hash = content.hashCode;
-  return hash.toRadixString(16).padLeft(8, '0');
-}
-
 /// Request data for decoding partition data in an isolate.
 class DecodePartitionRequest {
   /// The bytes to decode
   final Uint8List bytes;
 
-  /// Optional custom encryption key
-  final List<int>? encryptionKey;
-
-  /// Optional encryption key ID
-  final int? encryptionKeyId;
-
   /// Optional encoder state for isolate execution
-  final Map<String, dynamic>? encoderState;
+  final EncoderConfig? encoderState;
 
   DecodePartitionRequest({
     required this.bytes,
-    this.encryptionKey,
-    this.encryptionKeyId,
     this.encoderState,
   });
 }
@@ -373,14 +362,8 @@ class EncodePartitionRequest {
   /// The timestamps
   final Timestamps timestamps;
 
-  /// Optional custom encryption key
-  final List<int>? encryptionKey;
-
-  /// Optional encryption key ID
-  final int? encryptionKeyId;
-
   /// Optional encoder state for isolate execution
-  final Map<String, dynamic>? encoderState;
+  final EncoderConfig? encoderState;
 
   EncodePartitionRequest({
     required this.records,
@@ -391,8 +374,6 @@ class EncodePartitionRequest {
     required this.partitionPath,
     required this.parentPath,
     required this.timestamps,
-    this.encryptionKey,
-    this.encryptionKeyId,
     this.encoderState,
   });
 }
@@ -516,18 +497,13 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
     DecodePartitionRequest request) async {
   try {
     // if encoder state is provided, apply it
-    // ONLY apply encoder state if no specific encryption key/keyId is provided
-    if (request.encoderState != null &&
-        request.encryptionKey == null &&
-        request.encryptionKeyId == null) {
+    if (request.encoderState != null) {
       EncoderHandler.setEncodingState(request.encoderState!);
     }
 
     // decode data
     final decodedString = await EncoderHandler.decode(
       request.bytes,
-      customKey: request.encryptionKey,
-      keyId: request.encryptionKeyId,
     );
 
     if (decodedString.isEmpty) {
@@ -563,10 +539,7 @@ Future<EncodedPartitionResult> encodePartitionData(
     EncodePartitionRequest request) async {
   try {
     // if encoder state is provided, apply it
-    // ONLY apply encoder state if no specific encryption key/keyId is provided
-    if (request.encoderState != null &&
-        request.encryptionKey == null &&
-        request.encryptionKeyId == null) {
+    if (request.encoderState != null) {
       EncoderHandler.setEncodingState(request.encoderState!);
     }
 
@@ -574,21 +547,12 @@ Future<EncodedPartitionResult> encodePartitionData(
     final nonDeletedRecords =
         request.records.where((r) => !isDeletedRecord(r)).toList();
 
-    // calculate partition checksum
-    Uint8List allRecordsData;
-    String partitionChecksum;
-    try {
-      allRecordsData =
-          Uint8List.fromList(utf8.encode(jsonEncode(request.records)));
-      partitionChecksum = allRecordsData.hashCode.toString();
-    } catch (jsonError) {
-      Logger.error('Failed to encode records to JSON: $jsonError',
-          label: 'encodePartitionData');
-      // Create a fallback checksum
-      partitionChecksum = DateTime.now().microsecondsSinceEpoch.toString();
-    }
+    // 1. Calculate the checksum based *only* on the records data.
+    final recordsJsonString = jsonEncode(request.records);
+    final partitionChecksum =
+        DataCompressor().getChecksumStringFromString(recordsJsonString);
 
-    // create partition meta
+    // 2. Create partition meta with the calculated checksum.
     final partitionMeta = PartitionMeta(
       version: 1,
       index: request.partitionIndex,
@@ -601,26 +565,23 @@ Future<EncodedPartitionResult> encodePartitionData(
       parentPath: request.parentPath,
     );
 
-    // create partition info
+    // 3. Create partition info object to be stored.
     final partitionInfo = PartitionInfo(
       path: request.partitionPath,
       meta: partitionMeta,
       data: request.records,
     );
 
-    // encode data
+    // 4. Encode the final object for storage.
     Uint8List encodedData;
     try {
       encodedData = EncoderHandler.encode(
         jsonEncode(partitionInfo.toJson()),
-        customKey: request.encryptionKey,
-        keyId: request.encryptionKeyId,
       );
     } catch (encodeError) {
       Logger.error('Failed to encode partition info: $encodeError',
           label: 'encodePartitionData');
-      // Create empty data as fallback
-      encodedData = Uint8List(0);
+      encodedData = Uint8List(0); // Create empty data as fallback
     }
 
     // update size and return result

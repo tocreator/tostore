@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:typed_data';
+import 'package:archive/archive.dart';
 
 /// data compressor
 class DataCompressor {
@@ -43,13 +45,21 @@ class DataCompressor {
     return Uint8List.fromList(result);
   }
 
-  /// calculate checksum (using simple addition checksum)
+  /// calculate checksum
   int calculateChecksum(Uint8List data) {
-    int sum = 0;
-    for (var byte in data) {
-      sum = (sum + byte) & 0xFF;
-    }
-    return sum;
+    return getCrc32(data);
+  }
+
+  /// Calculate CRC32 checksum from bytes and return as a hex string.
+  String getChecksumStringFromBytes(Uint8List bytes) {
+    final checksum = calculateChecksum(bytes);
+    return checksum.toRadixString(16).padLeft(8, '0');
+  }
+
+  /// Calculate CRC32 checksum from a string and return as a hex string.
+  String getChecksumStringFromString(String content) {
+    final bytes = utf8.encode(content);
+    return getChecksumStringFromBytes(bytes);
   }
 }
 
