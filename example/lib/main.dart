@@ -25,7 +25,8 @@ void main() async {
       // when the DatabaseTester explicitly asks for it.
       if (_suppressSpecificWarnings &&
           type == LogType.warn &&
-          message.contains('Field email is required but not provided')) {
+          (message.contains('Field email is required but not provided') ||
+              message.contains('Data validation failed for table users'))) {
         return; // Suppress expected warning from non-nullable constraint test
       }
       logService.add('[$label] $message', type, true);
@@ -545,6 +546,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                   if (newTable != null && newTable != _selectedTable) {
                     setState(() {
                       _selectedTable = newTable;
+                      _activeFilters.clear();
                     });
                     _fetchTableData(resetPage: true);
                   }
@@ -1356,6 +1358,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             await widget.example.db.switchSpace(spaceName: newSpace);
             setState(() {
               _selectedSpace = newSpace;
+              _activeFilters.clear();
             });
             await _fetchTableData(resetPage: true);
           }
@@ -1877,22 +1880,22 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
 
   final _controllers = {
     'users': {
-      'insert': TextEditingController(text: '500'),
-      'read': TextEditingController(text: '500'),
-      'update': TextEditingController(text: '50'),
-      'delete': TextEditingController(text: '50'),
+      'insert': TextEditingController(text: '1000'),
+      'read': TextEditingController(text: '1000'),
+      'update': TextEditingController(text: '500'),
+      'delete': TextEditingController(text: '500'),
     },
     'posts': {
-      'insert': TextEditingController(text: '500'),
-      'read': TextEditingController(text: '500'),
-      'update': TextEditingController(text: '50'),
-      'delete': TextEditingController(text: '50'),
+      'insert': TextEditingController(text: '1000'),
+      'read': TextEditingController(text: '1000'),
+      'update': TextEditingController(text: '500'),
+      'delete': TextEditingController(text: '500'),
     },
     'comments': {
-      'insert': TextEditingController(text: '500'),
-      'read': TextEditingController(text: '500'),
-      'update': TextEditingController(text: '50'),
-      'delete': TextEditingController(text: '50'),
+      'insert': TextEditingController(text: '1000'),
+      'read': TextEditingController(text: '1000'),
+      'update': TextEditingController(text: '500'),
+      'delete': TextEditingController(text: '500'),
     },
   };
 
@@ -2502,10 +2505,10 @@ class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  flex: 2,
+                  flex: 3,
                   child: DropdownButtonFormField<String>(
                     value: _selectedOperator,
-                    items: ['>', '>=', '<', '<=', '=', '!=']
+                    items: ['>', '>=', '<', '<=', '=', '!=', 'LIKE']
                         .map((op) =>
                             DropdownMenuItem(value: op, child: Text(op)))
                         .toList(),
@@ -2728,47 +2731,79 @@ class _FilterDialogState extends State<FilterDialog> {
   Widget _buildFilterRow(
       _FilterCondition filter, int index, List<String> availableFields) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      padding: const EdgeInsets.symmetric(
+        vertical: 8.0,
+      ),
       child: Column(
         children: [
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
-                flex: 5,
-                child: DropdownButtonFormField<String>(
-                  value: filter.field,
-                  items: availableFields
-                      .map((f) => DropdownMenuItem(value: f, child: Text(f)))
-                      .toList(),
-                  onChanged: (value) {
-                    if (value != null) {
-                      setState(() {
-                        filter.field = value;
-                      });
-                    }
-                  },
-                  decoration: const InputDecoration(
-                      border: OutlineInputBorder(), labelText: 'Field'),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      flex: 5,
+                      child: DropdownButtonFormField<String>(
+                        value: filter.field,
+                        items: availableFields
+                            .map((f) =>
+                                DropdownMenuItem(value: f, child: Text(f)))
+                            .toList(),
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() {
+                              filter.field = value;
+                            });
+                          }
+                        },
+                        decoration: const InputDecoration(
+                            border: OutlineInputBorder(), labelText: 'Field'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      flex: 3,
+                      child: DropdownButtonFormField<String>(
+                        value: filter.operator,
+                        items: ['=', '!=', '>', '>=', '<', '<=', 'LIKE']
+                            .map((op) =>
+                                DropdownMenuItem(value: op, child: Text(op)))
+                            .toList(),
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() {
+                              filter.operator = value;
+                            });
+                          }
+                        },
+                        decoration:
+                            const InputDecoration(border: OutlineInputBorder()),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 8),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
               Expanded(
-                flex: 3,
-                child: DropdownButtonFormField<String>(
-                  value: filter.operator,
-                  items: ['=', '!=', '>', '>=', '<', '<=', 'LIKE']
-                      .map((op) => DropdownMenuItem(value: op, child: Text(op)))
-                      .toList(),
-                  onChanged: (value) {
-                    if (value != null) {
-                      setState(() {
-                        filter.operator = value;
-                      });
+                flex: 5,
+                child: TextFormField(
+                  controller: filter.valueController,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    labelText: 'Value',
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return 'Required';
                     }
+                    return null;
                   },
-                  decoration:
-                      const InputDecoration(border: OutlineInputBorder()),
                 ),
               ),
               IconButton(
@@ -2777,20 +2812,6 @@ class _FilterDialogState extends State<FilterDialog> {
                 onPressed: () => _removeFilter(index),
               )
             ],
-          ),
-          const SizedBox(height: 8),
-          TextFormField(
-            controller: filter.valueController,
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-              labelText: 'Value',
-            ),
-            validator: (value) {
-              if (value == null || value.isEmpty) {
-                return 'Required';
-              }
-              return null;
-            },
           ),
         ],
       ),

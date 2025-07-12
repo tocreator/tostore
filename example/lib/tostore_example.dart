@@ -29,12 +29,16 @@ class TostoreExample {
           fields: [
             FieldSchema(name: 'username', type: DataType.text, nullable: false),
             FieldSchema(name: 'email', type: DataType.text, nullable: false),
-            FieldSchema(name: 'last_login', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
+            FieldSchema(
+                name: 'last_login',
+                type: DataType.datetime,
+                defaultValueType: DefaultValueType.currentTimestamp),
             FieldSchema(
                 name: 'is_active', type: DataType.boolean, defaultValue: true),
             FieldSchema(name: 'age', type: DataType.integer, defaultValue: 18),
             FieldSchema(name: 'tags', type: DataType.text),
-            FieldSchema(name: 'type', type: DataType.text, defaultValue: 'user'),
+            FieldSchema(
+                name: 'type', type: DataType.text, defaultValue: 'user'),
             FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 10),
           ],
           indexes: [
@@ -55,7 +59,10 @@ class TostoreExample {
             FieldSchema(name: 'content', type: DataType.text),
             FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
-            FieldSchema(name: 'created_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
+            FieldSchema(
+                name: 'created_at',
+                type: DataType.datetime,
+                defaultValueType: DefaultValueType.currentTimestamp),
             FieldSchema(
                 name: 'is_published',
                 type: DataType.boolean,
@@ -77,7 +84,10 @@ class TostoreExample {
             FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
             FieldSchema(name: 'content', type: DataType.text, nullable: false),
-            FieldSchema(name: 'created_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
+            FieldSchema(
+                name: 'created_at',
+                type: DataType.datetime,
+                defaultValueType: DefaultValueType.currentTimestamp),
           ],
           indexes: [
             IndexSchema(fields: ['post_id']),
@@ -95,7 +105,10 @@ class TostoreExample {
                 nullable: false,
                 unique: true),
             FieldSchema(name: 'value', type: DataType.text),
-            FieldSchema(name: 'updated_at', type: DataType.datetime, defaultValueType: DefaultValueType.currentTimestamp),
+            FieldSchema(
+                name: 'updated_at',
+                type: DataType.datetime,
+                defaultValueType: DefaultValueType.currentTimestamp),
           ],
           indexes: [
             IndexSchema(fields: ['key'], unique: true),
@@ -544,8 +557,7 @@ class TostoreExample {
         continue;
       }
       if (field.name.contains('name') || field.name.contains('title')) {
-        record[field.name] =
-            '${field.name}_$index';
+        record[field.name] = '${field.name}_$index';
         continue;
       }
       if (field.name.contains('content') ||
@@ -583,7 +595,7 @@ class TostoreExample {
         case DataType.array:
         // Skip array for mock data generation
         case DataType.json:
-        // Skip json for mock data generation
+          // Skip json for mock data generation
           break;
       }
     }
@@ -605,9 +617,8 @@ class TostoreExample {
     const int batchSize = 2000;
 
     for (int batchStart = 0; batchStart < count; batchStart += batchSize) {
-      final int batchEnd = (batchStart + batchSize < count)
-          ? batchStart + batchSize
-          : count;
+      final int batchEnd =
+          (batchStart + batchSize < count) ? batchStart + batchSize : count;
       // prepare records for current batch
       final records = <Map<String, dynamic>>[];
       for (var i = batchStart; i < batchEnd; i++) {
@@ -622,8 +633,7 @@ class TostoreExample {
       // batch insert current batch
       final result = await db.batchInsert(tableName, records);
       if (!result.isSuccess) {
-        logService.add(
-            'Batch insert failed: ${result.message}', LogType.error);
+        logService.add('Batch insert failed: ${result.message}', LogType.error);
         return -1; // Indicate failure
       }
 
@@ -633,8 +643,8 @@ class TostoreExample {
 
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
-    logService
-        .add('Batch insert $count records into "$tableName" time: ${elapsed}ms');
+    logService.add(
+        'Batch insert $count records into "$tableName" time: ${elapsed}ms');
 
     final queryResult = await db.query(tableName).count();
     logService.add('query current table "$tableName" count: $queryResult');

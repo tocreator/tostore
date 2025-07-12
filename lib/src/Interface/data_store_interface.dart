@@ -44,13 +44,13 @@ abstract class DataStoreInterface {
   DeleteBuilder delete(String tableName);
 
   /// set key-value pair
-  Future<bool> setValue(String key, dynamic value, {bool isGlobal = false});
+  Future<DbResult> setValue(String key, dynamic value, {bool isGlobal = false});
 
   /// get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false});
 
   /// remove key-value pair
-  Future<bool> removeValue(String key, {bool isGlobal = false});
+  Future<DbResult> removeValue(String key, {bool isGlobal = false});
 
   /// create table
   Future<void> createTable(TableSchema schema);

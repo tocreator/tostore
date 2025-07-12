@@ -29,56 +29,41 @@ class _IsolatePool {
   final Map<int, double> _avgTaskTime =
       {}; // track the average task execution time for each isolate
   bool _isInitialized = false;
-  bool _isPrewarmed = false;
 
   /// initialize the isolate pool
   Future<void> _ensureInitialized() async {
     if (!_isInitialized) {
-      // pre-create the isolate pool
-      final futures = <Future>[];
+      // Pre-create and pre-warm isolates sequentially to avoid UI jank.
       for (int i = 0; i < _maxPoolSize; i++) {
-        futures.add(_createIsolate(i));
-        _taskCount[i] = 0;
-        _avgTaskTime[i] = 0;
-        // Yield to the event loop after initiating each isolate creation.
-        // This prevents blocking the main thread during startup, especially when creating multiple isolates.
-        await Future.delayed(Duration.zero);
+        // Check if an isolate at this index has already been created to avoid redundancy.
+        if (!_isolates.containsKey(i)) {
+          await _createIsolate(i);
+          _taskCount[i] = 0;
+          _avgTaskTime[i] = 0;
+          // Pre-warm this specific isolate.
+          await _prewarmIsolate(i);
+          // Yield to the event loop to allow UI to remain responsive.
+          await Future.delayed(Duration.zero);
+        }
       }
-
-      // wait for all isolates to be initialized
-      await Future.wait(futures);
       _isInitialized = true;
-
-      // pre-warm the isolate pool
-      if (!_isPrewarmed) {
-        await _prewarmIsolates();
-      }
     }
   }
 
-  /// pre-warm all isolates to reduce the initial latency
-  Future<void> _prewarmIsolates() async {
-    if (_isPrewarmed) return;
+  /// pre-warm a specific isolate to reduce initial latency
+  Future<void> _prewarmIsolate(int id) async {
+    // Create a task and add it to the specific isolate's queue.
+    // Using a timer to keep stats consistent, although not strictly needed for warmup.
+    final timer = Stopwatch();
+    final task = _IsolateTask<int>(_warmupTask, 1, timer: timer);
+    _taskQueues[id]!.add(task);
 
-    // a simple warmup function
-    Future<int> warmupFunc(int x) async {
-      // perform some simple calculations to ensure the isolate is fully initialized
-      int result = 0;
-      for (int i = 0; i < 100; i++) {
-        result += i;
-      }
-      return result;
+    if (_isIdle[id]!) {
+      _processNextTask(id);
     }
 
-    // send a warmup task to each isolate
-    final futures = <Future>[];
-    for (int i = 0; i < _maxPoolSize; i++) {
-      futures.add(execute(warmupFunc, 1));
-    }
-
-    // wait for all warmup tasks to complete
-    await Future.wait(futures);
-    _isPrewarmed = true;
+    // Wait for the warmup task to complete.
+    await task.completer.future;
   }
 
   /// create a new isolate
@@ -234,8 +219,17 @@ class _IsolatePool {
     _taskCount.clear();
     _avgTaskTime.clear();
     _isInitialized = false;
-    _isPrewarmed = false;
   }
+}
+
+/// Top-level function for pre-warming isolates.
+int _warmupTask(int value) {
+  // Perform some simple calculations to ensure the isolate is fully initialized.
+  int result = 0;
+  for (int i = 0; i < 1000; i++) {
+    result += i * value;
+  }
+  return result;
 }
 
 /// isolate worker entry point

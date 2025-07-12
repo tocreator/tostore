@@ -1,4 +1,4 @@
-import '../handler/value_comparator.dart';
+import '../handler/value_matcher.dart';
 
 /// file info model
 class FileInfo {
@@ -829,14 +829,14 @@ class IndexMeta {
 
   /// Find the appropriate partition for a key using binary search
   /// Returns the index of the partition that may contain the key, or -1 if not found
-  int findPartitionForKey(dynamic key) {
+  int findPartitionForKey(dynamic key, MatcherFunction pkMatcher) {
     if (isOrdered == null || isOrdered == false) return -1;
     if (partitions.isEmpty) return -1;
 
     // Fast path for single partition
     if (partitions.length == 1) {
       final partition = partitions[0];
-      if (_isKeyInRange(key, partition.minKey, partition.maxKey)) {
+      if (_isKeyInRange(key, partition.minKey, partition.maxKey, pkMatcher)) {
         return 0;
       }
       return -1;
@@ -851,7 +851,7 @@ class IndexMeta {
       final partition = partitions[mid];
 
       // Check if key is within this partition's range
-      if (_isKeyInRange(key, partition.minKey, partition.maxKey)) {
+      if (_isKeyInRange(key, partition.minKey, partition.maxKey, pkMatcher)) {
         return mid;
       }
 
@@ -862,7 +862,7 @@ class IndexMeta {
       }
 
       // Determine which half to search
-      if (_compareKeys(key, partition.minKey) < 0) {
+      if (_compareKeys(key, partition.minKey, pkMatcher) < 0) {
         // Key is smaller than the min of this partition, search left half
         high = mid - 1;
       } else {
@@ -876,7 +876,8 @@ class IndexMeta {
 
   /// Find partitions that may intersect with a key range using binary search
   /// Returns a list of partition indices that may contain keys in the range
-  List<int> findPartitionsForKeyRange(dynamic startKey, dynamic endKey) {
+  List<int> findPartitionsForKeyRange(
+      dynamic startKey, dynamic endKey, MatcherFunction pkMatcher) {
     if (isOrdered == null || isOrdered == false) {
       // If not ordered, return all partitions
       return List.generate(partitions.length, (i) => i);
@@ -888,8 +889,8 @@ class IndexMeta {
 
     // Handle single partition case efficiently
     if (partitions.length == 1) {
-      if (_doRangesOverlap(
-          startKey, endKey, partitions[0].minKey, partitions[0].maxKey)) {
+      if (_doRangesOverlap(startKey, endKey, partitions[0].minKey,
+          partitions[0].maxKey, pkMatcher)) {
         result.add(0);
       }
       return result;
@@ -910,7 +911,7 @@ class IndexMeta {
         break;
       }
 
-      if (_compareKeys(endKey, partition.minKey) >= 0) {
+      if (_compareKeys(endKey, partition.minKey, pkMatcher) >= 0) {
         // This partition or higher ones could be relevant
         firstPotentialIndex = mid;
         high = mid - 1;
@@ -927,12 +928,12 @@ class IndexMeta {
       // If current partition's min is beyond end key, we're done
       if (startKey != null &&
           partition.minKey != null &&
-          _compareKeys(startKey, partition.maxKey) > 0) {
+          _compareKeys(startKey, partition.maxKey, pkMatcher) > 0) {
         break;
       }
 
       if (_doRangesOverlap(
-          startKey, endKey, partition.minKey, partition.maxKey)) {
+          startKey, endKey, partition.minKey, partition.maxKey, pkMatcher)) {
         result.add(i);
       }
     }
@@ -941,31 +942,32 @@ class IndexMeta {
   }
 
   /// Helper function to determine if a key is within a range
-  bool _isKeyInRange(dynamic key, dynamic minKey, dynamic maxKey) {
+  bool _isKeyInRange(
+      dynamic key, dynamic minKey, dynamic maxKey, MatcherFunction matcher) {
     if (key == null) return false;
     if (minKey == null && maxKey == null) return true;
-    if (minKey == null) return _compareKeys(key, maxKey) <= 0;
-    if (maxKey == null) return _compareKeys(key, minKey) >= 0;
+    if (minKey == null) return matcher(key, maxKey) <= 0;
+    if (maxKey == null) return matcher(key, minKey) >= 0;
 
-    return _compareKeys(key, minKey) >= 0 && _compareKeys(key, maxKey) <= 0;
+    return matcher(key, minKey) >= 0 && matcher(key, maxKey) <= 0;
   }
 
   /// Helper function to check if two ranges overlap
-  bool _doRangesOverlap(
-      dynamic start1, dynamic end1, dynamic start2, dynamic end2) {
+  bool _doRangesOverlap(dynamic start1, dynamic end1, dynamic start2,
+      dynamic end2, MatcherFunction matcher) {
     // Handle null cases conservatively - assume possible overlap
     if (start1 == null || end1 == null || start2 == null || end2 == null) {
       return true;
     }
 
     // Ranges overlap if one range doesn't entirely precede the other
-    return !(_compareKeys(end1, start2) < 0 || _compareKeys(start1, end2) > 0);
+    return !(matcher(end1, start2) < 0 || matcher(start1, end2) > 0);
   }
 
-  /// Helper function to compare two keys using ValueComparator
-  int _compareKeys(dynamic a, dynamic b) {
-    // Use ValueComparator to compare keys, ensuring proper handling of various key types (base62, bigint, string, etc.)
-    return ValueComparator.compare(a, b);
+  /// Helper function to compare two keys using a specific matcher
+  int _compareKeys(dynamic a, dynamic b, MatcherFunction matcher) {
+    // Use the provided matcher to compare keys
+    return matcher(a, b);
   }
 
   @override

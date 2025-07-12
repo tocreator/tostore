@@ -3,6 +3,8 @@ import 'dart:typed_data';
 import 'dart:convert';
 import '../handler/logger.dart';
 import '../handler/sha256.dart';
+import '../handler/value_matcher.dart';
+import 'business_error.dart';
 
 /// table schema
 class TableSchema {
@@ -318,6 +320,26 @@ class TableSchema {
     }
   }
 
+  /// Get MatcherType for primary key
+  MatcherType getPrimaryKeyMatcherType() {
+    return primaryKeyConfig.getMatcherType();
+  }
+
+  /// Get MatcherType for a field
+  MatcherType getFieldMatcherType(String fieldName) {
+    if (fieldName == primaryKey) {
+      return getPrimaryKeyMatcherType();
+    }
+    try {
+      final field = fields.firstWhere((f) => f.name == fieldName);
+      return field.getMatcherType();
+    } catch (e) {
+      Logger.warn('Field $fieldName not found, using unsupported matcher',
+          label: 'TableSchema.getFieldMatcherType');
+      return MatcherType.unsupported;
+    }
+  }
+
   /// Check if primary key is ordered type
   bool isPrimaryKeyOrdered() {
     try {
@@ -540,6 +562,29 @@ class TableSchema {
     buffer.addByte((value >> 16) & 0xFF);
     buffer.addByte((value >> 8) & 0xFF);
     buffer.addByte(value & 0xFF);
+  }
+
+  MatcherType getMatcherTypeForIndex(String indexName) {
+    if (indexName == 'pk_$name') {
+      return getPrimaryKeyMatcherType();
+    }
+    final index = indexes.firstWhere((i) => i.actualIndexName == indexName,
+        orElse: () => const IndexSchema(fields: []));
+    if (index.fields.isNotEmpty) {
+      if (index.fields.length > 1) {
+        return MatcherType.text; // Composite keys are strings
+      }
+      if (index.fields.length == 1) {
+        return getFieldMatcherType(index.fields.first);
+      }
+    }
+
+    // could be an auto-unique index
+    if (indexName.startsWith('uniq_')) {
+      final fieldName = indexName.substring(5);
+      return getFieldMatcherType(fieldName);
+    }
+    return MatcherType.unsupported;
   }
 }
 
@@ -803,14 +848,7 @@ class FieldSchema {
 
         if (rawString == null) return null;
 
-        final trimmed = rawString.trim();
-        if (trimmed.length >= 2) {
-          if ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-              (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-            return trimmed.substring(1, trimmed.length - 1);
-          }
-        }
-        return trimmed;
+        return rawString.trim();
       case DataType.blob:
         if (value is Uint8List) return value;
         if (value is String) {
@@ -1026,6 +1064,28 @@ class FieldSchema {
             value is Uint8List;
       case DataType.json:
         return value is Map;
+    }
+  }
+
+  /// Get matcher type for field
+  MatcherType getMatcherType() {
+    switch (type) {
+      case DataType.integer:
+        return nullable ? MatcherType.integerNullable : MatcherType.integer;
+      case DataType.bigInt:
+        return nullable ? MatcherType.bigIntNullable : MatcherType.bigInt;
+      case DataType.double:
+        return nullable ? MatcherType.doubleNullable : MatcherType.double;
+      case DataType.text:
+        return nullable ? MatcherType.textNullable : MatcherType.text;
+      case DataType.boolean:
+        return nullable ? MatcherType.booleanNullable : MatcherType.boolean;
+      case DataType.datetime:
+        return nullable ? MatcherType.datetimeNullable : MatcherType.datetime;
+      case DataType.blob:
+        return nullable ? MatcherType.blobNullable : MatcherType.blob;
+      default:
+        return MatcherType.unsupported;
     }
   }
 }
@@ -1251,10 +1311,43 @@ class PrimaryKeyConfig {
     );
   }
 
+  /// Get matcher type for primary key
+  MatcherType getMatcherType() {
+    switch (type) {
+      case PrimaryKeyType.sequential:
+      case PrimaryKeyType.timestampBased:
+      case PrimaryKeyType.datePrefixed:
+        return MatcherType.pkNumericString;
+      case PrimaryKeyType.shortCode:
+        return MatcherType.pkShortCodeString;
+      default:
+        if (isOrdered == true) {
+          return MatcherType.pkShortCodeString;
+        }
+        return MatcherType.pkString; // default
+    }
+  }
+
   /// Get default data type for primary key
   DataType getDefaultDataType() {
     // All primary key types use text type
     return DataType.text;
+  }
+
+  /// Convert value to primary key type
+  dynamic convertPrimaryKey(dynamic value) {
+    if (value == null) return null;
+    if (value is String) {
+      return value;
+    }
+    try {
+      return value.toString();
+    } catch (e) {
+      throw BusinessError(
+        'Failed to convert value to primary key type: $value',
+        type: BusinessErrorType.invalidData,
+      );
+    }
   }
 
   Map<String, dynamic> toJson() {

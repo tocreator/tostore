@@ -5,6 +5,7 @@ import '../../tostore.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../handler/encoder.dart';
+import '../handler/value_matcher.dart';
 import '../model/buffer_entry.dart';
 import 'data_store_impl.dart';
 import '../model/store_index.dart';
@@ -12,7 +13,6 @@ import '../model/file_info.dart';
 import '../handler/platform_handler.dart';
 import 'crontab_manager.dart';
 import '../model/id_generator.dart';
-import '../handler/value_comparator.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import '../model/system_table.dart';
@@ -355,7 +355,8 @@ class TableDataManager {
       String currentMaxIdStr = currentMaxId.toString();
 
       // Compare current value with max value
-      if (_compareNumericStrings(idStr, currentMaxIdStr) > 0) {
+      final matcher = ValueMatcher.getMatcher(MatcherType.pkNumericString);
+      if (matcher(idStr, currentMaxIdStr) > 0) {
         _maxIds[tableName] = idStr;
         _maxIdsDirty[tableName] = true;
       }
@@ -1382,6 +1383,7 @@ class TableDataManager {
     String primaryKey,
     List<PartitionMeta>? existingPartitions, {
     required BufferOperationType operationType,
+    required MatcherType pkMatcherType,
     List<int>? encryptionKey,
     int? encryptionKeyId,
   }) async {
@@ -1449,6 +1451,7 @@ class TableDataManager {
             records:
                 records, // pass all records, internal will filter deleted records
             primaryKey: primaryKey,
+            pkMatcherType: pkMatcherType,
             partitionIndex: partitionIndex,
             existingPartitions: existingPartitions,
           );
@@ -1831,6 +1834,8 @@ class TableDataManager {
             fileMeta.partitions!.isNotEmpty) {
           // find max id from partition meta
           dynamic maxId;
+          final pkMatcher =
+              ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
           for (final partition in fileMeta.partitions!) {
             // get max id from partition meta
@@ -1841,7 +1846,7 @@ class TableDataManager {
                 maxId = partitionMaxId;
               } else {
                 // use general compare method to compare values
-                if (_compareValues(partitionMaxId, maxId) > 0) {
+                if (pkMatcher(partitionMaxId, maxId) > 0) {
                   maxId = partitionMaxId;
                 }
               }
@@ -1911,6 +1916,8 @@ class TableDataManager {
   Future<void> handlePrimaryKeyConflict(
       String tableName, dynamic conflictId) async {
     try {
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) return;
       // check if id value is loaded
       if (!_maxIds.containsKey(tableName)) {
         // if not loaded, initialize auto increment id first
@@ -1922,7 +1929,9 @@ class TableDataManager {
       if (currentMaxId == null) return;
 
       // use general compare method to compare id
-      final compareResult = _compareValues(conflictId, currentMaxId);
+      final pkMatcher =
+          ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+      final compareResult = pkMatcher(conflictId, currentMaxId);
 
       // only update when conflict id is greater than or equal to current max id
       if (compareResult >= 0) {
@@ -2053,6 +2062,8 @@ class TableDataManager {
         } else {
           // check partition ordered
           final partitions = meta.partitions!;
+          final pkMatcher =
+              ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
           for (int i = 1; i < partitions.length; i++) {
             final prevPartition = partitions[i - 1];
             final currentPartition = partitions[i];
@@ -2060,7 +2071,7 @@ class TableDataManager {
             // if max value of previous partition is greater than or equal to min value of current partition, then non-ordered
             if (prevPartition.maxPrimaryKey != null &&
                 currentPartition.minPrimaryKey != null) {
-              final comparison = _compareValues(
+              final comparison = pkMatcher(
                   prevPartition.maxPrimaryKey, currentPartition.minPrimaryKey);
 
               if (comparison >= 0) {
@@ -2191,6 +2202,7 @@ class TableDataManager {
 
       // if primary key is not provided, try to get it from schema file
       String? effectivePrimaryKey = primaryKey;
+      TableSchema? schema;
       if (effectivePrimaryKey == null) {
         final schemaPath = pathJoin(tablePath, 'schema', 'schema.json');
         if (await _dataStore.storage.existsFile(schemaPath)) {
@@ -2198,7 +2210,7 @@ class TableDataManager {
               await _dataStore.storage.readAsString(schemaPath);
           if (schemaContent != null) {
             try {
-              final schema = TableSchema.fromJson(jsonDecode(schemaContent));
+              schema = TableSchema.fromJson(jsonDecode(schemaContent));
               effectivePrimaryKey = schema.primaryKey;
             } catch (e) {
               Logger.error('Failed to parse schema: $e',
@@ -2229,10 +2241,14 @@ class TableDataManager {
             List<PartitionMeta> partitionsToProcess;
 
             // if there is primary key and target key, try to optimize partition search
-            if (effectivePrimaryKey != null && targetKey != null) {
+            if (effectivePrimaryKey != null &&
+                targetKey != null &&
+                schema != null) {
+              final pkMatcher =
+                  ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
               // try to find partitions that might contain target key
               partitionsToProcess = await _findPotentialPartitionsForKey(
-                  fileMeta.partitions!, targetKey);
+                  fileMeta.partitions!, targetKey, pkMatcher);
 
               if (partitionsToProcess.isEmpty) {
                 // if no partitions found, log warning and return
@@ -2296,7 +2312,9 @@ class TableDataManager {
 
   /// find partitions that might contain target key
   Future<List<PartitionMeta>> _findPotentialPartitionsForKey(
-      List<PartitionMeta> partitions, String targetKey) async {
+      List<PartitionMeta> partitions,
+      String targetKey,
+      MatcherFunction matcher) async {
     final result = <PartitionMeta>[];
 
     // Use a standard for-loop for efficiency and safety with async gaps.
@@ -2305,11 +2323,8 @@ class TableDataManager {
       // If partition has primary key range info, check if target key is in range
       if (partition.minPrimaryKey != null && partition.maxPrimaryKey != null) {
         // Use ValueComparator to check if target key is in range
-        if (ValueComparator.isInRange(
-          targetKey,
-          partition.minPrimaryKey,
-          partition.maxPrimaryKey,
-        )) {
+        if (matcher(targetKey, partition.minPrimaryKey) >= 0 &&
+            matcher(targetKey, partition.maxPrimaryKey) <= 0) {
           result.add(partition);
         }
       } else {
@@ -2455,6 +2470,7 @@ class TableDataManager {
             primaryKey,
             fileMeta.partitions!,
             operationType: BufferOperationType.update,
+            pkMatcherType: schema.getPrimaryKeyMatcherType(),
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
@@ -2501,26 +2517,16 @@ class TableDataManager {
     _centralClient = client;
   }
 
-  /// value comparison for sorting and range checking
-  int _compareValues(dynamic a, dynamic b) {
-    return ValueComparator.compare(a, b);
-  }
-
   /// check if string is pure numeric string
   bool _isNumericString(String? str) {
     if (str == null || str.isEmpty) return false;
-    return ValueComparator.isNumericString(str);
+    return RegExp(r'^\d+$').hasMatch(str);
   }
 
   /// check if string is shortCode format (mixed alphanumeric short code)
   bool _isShortCodeFormat(String? str) {
     if (str == null || str.isEmpty) return false;
-    return ValueComparator.isShortCodeFormat(str);
-  }
-
-  /// compare two numeric strings
-  int _compareNumericStrings(String a, String b) {
-    return ValueComparator.compareNumericStrings(a, b);
+    return RegExp(r'^[0-9A-Za-z]+$').hasMatch(str);
   }
 
   /// Read records from partition
@@ -2577,9 +2583,16 @@ class TableDataManager {
             return [record];
           }
 
+          final schema = await _dataStore.getTableSchema(tableName);
+          if (schema == null) {
+            return [];
+          }
+          final matcher =
+              ValueMatcher.getMatcher(schema.getFieldMatcherType(fieldName));
+
           // if expected value and field are provided, verify if the record matches
           if (record.containsKey(fieldName) &&
-              ValueComparator.compare(record[fieldName], expectedValue) == 0) {
+              matcher(record[fieldName], expectedValue) == 0) {
             // record matches, return directly
             return [record];
           } else if (record.isNotEmpty) {
@@ -2595,9 +2608,7 @@ class TableDataManager {
             final currentRecord = decodedData[i];
             if (currentRecord.isNotEmpty &&
                 currentRecord.containsKey(fieldName) &&
-                ValueComparator.compare(
-                        currentRecord[fieldName], expectedValue) ==
-                    0) {
+                matcher(currentRecord[fieldName], expectedValue) == 0) {
               // found matching record, update index
               if (i != recordIndex) {
                 // try to update index (here only add log, actual index update needs to call index manager)
@@ -2694,6 +2705,8 @@ class TableDataManager {
     }
     final isGlobal = schema.isGlobal;
     final primaryKey = schema.primaryKey;
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
     // get table meta
     FileMeta? fileMeta = await getTableFileMeta(tableName);
@@ -2766,9 +2779,10 @@ class TableDataManager {
               allRecords,
               primaryKey,
               existingPartitions,
+              operationType: BufferOperationType.insert,
+              pkMatcherType: schema.getPrimaryKeyMatcherType(),
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
-              operationType: BufferOperationType.insert,
             );
           };
         }).toList();
@@ -2815,8 +2829,8 @@ class TableDataManager {
               partition.maxPrimaryKey != null) {
             // Check if any records may be in this partition range
             for (final pk in recordsByPk.keys) {
-              if (ValueComparator.isInRange(
-                  pk, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+              if (ValueMatcher.isInRange(pk, partition.minPrimaryKey,
+                  partition.maxPrimaryKey, pkMatcher)) {
                 partitionsToProcess.add(partition);
                 break;
               }
@@ -2902,9 +2916,10 @@ class TableDataManager {
                   resultRecords,
                   primaryKey,
                   existingPartitions,
+                  operationType: BufferOperationType.update,
+                  pkMatcherType: schema.getPrimaryKeyMatcherType(),
                   encryptionKey: encryptionKey,
                   encryptionKeyId: encryptionKeyId,
-                  operationType: BufferOperationType.update,
                 );
               }
             }
@@ -2975,9 +2990,10 @@ class TableDataManager {
                 recordsForPartition,
                 primaryKey,
                 [], // key: empty existing partitions list, because it's a full rewrite
+                operationType: BufferOperationType.rewrite,
+                pkMatcherType: schema.getPrimaryKeyMatcherType(),
                 encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-                operationType: BufferOperationType.rewrite);
+                encryptionKeyId: encryptionKeyId);
           };
         }).toList();
         final partitionResults =
@@ -3331,6 +3347,7 @@ class TableDataManager {
             primaryKey,
             [], // No existing partitions for target table
             operationType: BufferOperationType.rewrite,
+            pkMatcherType: sourceSchema.getPrimaryKeyMatcherType(),
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );

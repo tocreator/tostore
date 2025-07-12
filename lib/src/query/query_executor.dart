@@ -6,11 +6,12 @@ import '../model/index_search.dart';
 import '../model/store_index.dart';
 import '../model/file_info.dart';
 import '../model/join_clause.dart';
+import '../model/table_schema.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
 import 'query_plan.dart';
-import '../handler/value_comparator.dart';
 import '../handler/parallel_processor.dart';
+import '../handler/value_matcher.dart';
 
 /// query executor
 class QueryExecutor {
@@ -35,12 +36,41 @@ class QueryExecutor {
     Duration? queryCacheExpiry,
   }) async {
     try {
+      final schemas = <String, TableSchema>{};
+      ConditionRecordMatcher? matcher;
+      final schema = await _dataStore.getTableSchema(tableName);
+      if (schema == null) {
+        Logger.error('Table $tableName not found, cannot execute query.',
+            label: 'QueryExecutor.execute');
+        return [];
+      }
+      schemas[tableName] = schema;
+
+      if (condition != null && !condition.isEmpty) {
+        if (joins != null && joins.isNotEmpty) {
+          for (final join in joins) {
+            if (schemas.containsKey(join.table)) continue;
+            final joinSchema = await _dataStore.getTableSchema(join.table);
+            if (joinSchema != null) {
+              schemas[join.table] = joinSchema;
+            } else {
+              Logger.warn('Schema for joined table ${join.table} not found.',
+                  label: 'QueryExecutor.execute');
+            }
+          }
+        }
+        // Normalize condition values before preparing the matcher or executing the plan.
+        condition.normalize(schemas, tableName);
+
+        matcher = ConditionRecordMatcher.prepare(condition, schemas, tableName);
+      }
+
       // Don't use cache when there are join queries
       if (joins != null && joins.isNotEmpty) {
-        final results =
-            await _executeQueryPlan(plan, tableName, condition, joins);
+        final results = await _executeQueryPlan(
+            plan, tableName, condition, joins, schemas, matcher);
         if (orderBy != null) {
-          _applySort(results, orderBy);
+          _applySort(results, orderBy, schemas, tableName);
         }
         return _paginateResults(results, limit, offset);
       }
@@ -63,17 +93,10 @@ class QueryExecutor {
         /// 1、 try query cache
         final queryResult = _dataStore.dataCacheManager.getQuery(cacheKey);
         if (queryResult != null) {
-          // get table schema to get primary key field
-          final schema = await _dataStore.getTableSchema(tableName);
-          if (schema == null) {
-            return [];
-          }
-          final primaryKey = schema.primaryKey;
-
           // convert cache result to Map to update
           final resultMap = <String, Map<String, dynamic>>{};
           for (var record in queryResult) {
-            resultMap[record[primaryKey].toString()] =
+            resultMap[record[schema.primaryKey].toString()] =
                 Map<String, dynamic>.from(record);
           }
 
@@ -81,10 +104,10 @@ class QueryExecutor {
           final updatedResults = resultMap.values.toList();
           // apply sort and pagination
           if (orderBy != null) {
-            _applySort(updatedResults, orderBy);
+            _applySort(updatedResults, orderBy, schemas, tableName);
           }
           final filteredResults = await _filterPendingBuffer(
-              tableName, updatedResults, condition,
+              tableName, updatedResults, matcher,
               applyWriteBuffer: true);
           // query cache is already the correct return result, no need to paginate again
           return _paginateResults(filteredResults, limit, offset);
@@ -104,13 +127,10 @@ class QueryExecutor {
         if (isFullCache || isSpecificQuery) {
           var results = cache;
 
-          // Get table schema, used to get primary key field name
-          final schema = await _dataStore.getTableSchema(tableName);
-
           bool isPrimaryKeyQuery = false;
 
           // Check if it is a primary key query, can use O(1) complexity query optimization
-          if (condition != null && schema != null) {
+          if (condition != null) {
             final conditions = condition.build();
 
             if (conditions.containsKey(schema.primaryKey)) {
@@ -143,13 +163,14 @@ class QueryExecutor {
             }
           }
 
-          if (condition != null) {
-            results =
-                results.where((record) => condition.matches(record)).toList();
+          if (matcher != null) {
+            results = results.where((record) {
+              return matcher!.matches(record);
+            }).toList();
           }
 
           if (orderBy != null) {
-            _applySort(results, orderBy);
+            _applySort(results, orderBy, schemas, tableName);
           }
 
           // Update access time
@@ -184,17 +205,17 @@ class QueryExecutor {
       }
 
       // 3. execute actual query
-      final results =
-          await _executeQueryPlan(plan, tableName, condition, joins);
+      final results = await _executeQueryPlan(
+          plan, tableName, condition, joins, schemas, matcher);
 
       // 4. apply sort
       if (orderBy != null) {
-        _applySort(results, orderBy);
+        _applySort(results, orderBy, schemas, tableName);
       }
 
       // 5. apply pagination and return results
       final filteredResults = await _filterPendingBuffer(
-          tableName, results, condition,
+          tableName, results, matcher,
           applyWriteBuffer: true);
 
       // 6. Cache results if query cache is enabled
@@ -236,6 +257,8 @@ class QueryExecutor {
     String tableName,
     QueryCondition? condition,
     List<JoinClause>? joins,
+    Map<String, TableSchema> schemas,
+    ConditionRecordMatcher? matcher,
   ) async {
     List<Map<String, dynamic>> results = [];
     // Save original conditions to apply after JOIN
@@ -251,14 +274,7 @@ class QueryExecutor {
               _extractTableConditions(remainingConditions, tableName);
           // Create temporary QueryCondition for main table query
           if (mainTableConditions.isNotEmpty) {
-            // Create QueryCondition and add conditions
-            final mainTableQueryCondition = QueryCondition();
-            for (var entry in mainTableConditions.entries) {
-              _addConditionToQuery(
-                  mainTableQueryCondition, entry.key, entry.value);
-            }
-            results =
-                await _performTableScan(tableName, mainTableQueryCondition);
+            results = await _performTableScan(tableName, matcher);
             // Remove already applied conditions from remaining conditions
             for (var field in mainTableConditions.keys) {
               if (field.startsWith('$tableName.')) {
@@ -276,7 +292,7 @@ class QueryExecutor {
             tableName,
             operation.indexName!,
             operation.value as Map<String, dynamic>,
-            condition, // Use complete conditions, will handle internally
+            matcher, // Use complete conditions, will handle internally
           );
           break;
 
@@ -285,7 +301,7 @@ class QueryExecutor {
           results = await _performPrimaryKeyScan(
             tableName,
             operation.value as Map<String, dynamic>,
-            condition,
+            matcher,
           );
           break;
 
@@ -304,9 +320,11 @@ class QueryExecutor {
 
         case QueryOperationType.filter:
           // Apply filter conditions to query results
-          results = results
-              .where((record) => condition?.matches(record) ?? false)
-              .toList();
+          if (matcher != null) {
+            results = results.where((record) {
+              return matcher.matches(record);
+            }).toList();
+          }
           break;
 
         case QueryOperationType.sort:
@@ -342,7 +360,8 @@ class QueryExecutor {
           }
 
           // Use ValueComparator for sorting
-          ValueComparator.sortMapList(results, sortFields, sortDirections);
+          ValueMatcher.sortMapList(
+              results, sortFields, sortDirections, schemas, tableName);
           break;
 
         case QueryOperationType.join:
@@ -354,6 +373,8 @@ class QueryExecutor {
             joinInfo['operator'] as String,
             joinInfo['secondKey'] as String,
             joinInfo['type'] as String,
+            schemas,
+            tableName,
           );
           results = joinedResults;
 
@@ -364,9 +385,11 @@ class QueryExecutor {
 
           // Apply joined table conditions
           if (joinTableConditions.isNotEmpty) {
-            results = results
-                .where((record) => condition?.matches(record) ?? false)
-                .toList();
+            if (matcher != null) {
+              results = results.where((record) {
+                return matcher.matches(record);
+              }).toList();
+            }
 
             // Remove applied conditions from remaining conditions
             for (var field in joinTableConditions.keys) {
@@ -381,9 +404,11 @@ class QueryExecutor {
 
     // Apply any remaining conditions (may be cross-table or unhandled conditions)
     if (remainingConditions.isNotEmpty) {
-      results = results
-          .where((record) => condition?.matches(record) ?? false)
-          .toList();
+      if (matcher != null) {
+        results = results.where((record) {
+          return matcher.matches(record);
+        }).toList();
+      }
     }
 
     return results;
@@ -417,22 +442,6 @@ class QueryExecutor {
     return result;
   }
 
-  /// Helper to add a condition to QueryCondition
-  void _addConditionToQuery(
-      QueryCondition queryCondition, String field, dynamic value) {
-    if (value is Map) {
-      // Process operators
-      for (var opEntry in value.entries) {
-        final operator = opEntry.key;
-        final compareValue = opEntry.value;
-        queryCondition.where(field, operator, compareValue);
-      }
-    } else {
-      // Simple equality
-      queryCondition.where(field, '=', value);
-    }
-  }
-
   /// Execute table join operation
   Future<List<Map<String, dynamic>>> _performJoin(
     List<Map<String, dynamic>> leftRecords,
@@ -441,6 +450,8 @@ class QueryExecutor {
     String operator,
     String rightKey,
     String joinType,
+    Map<String, TableSchema> schemas,
+    String mainTableName,
   ) async {
     // Get all records from the right table
     final rightRecords = await _performTableScan(rightTableName, null);
@@ -460,7 +471,13 @@ class QueryExecutor {
           // Find all matching right table records
           final matchingRightRecords = rightRecords
               .where((rightRecord) => _matchJoinCondition(
-                  leftRecord, rightRecord, leftKey, operator, rightKey))
+                  leftRecord,
+                  rightRecord,
+                  leftKey,
+                  operator,
+                  rightKey,
+                  schemas,
+                  mainTableName))
               .toList();
 
           // Only add result if matches found
@@ -505,7 +522,13 @@ class QueryExecutor {
           // Find all matching right table records
           final matchingRightRecords = rightRecords
               .where((rightRecord) => _matchJoinCondition(
-                  leftRecord, rightRecord, leftKey, operator, rightKey))
+                  leftRecord,
+                  rightRecord,
+                  leftKey,
+                  operator,
+                  rightKey,
+                  schemas,
+                  mainTableName))
               .toList();
 
           if (matchingRightRecords.isNotEmpty) {
@@ -584,7 +607,13 @@ class QueryExecutor {
           // Find all matching left table records
           final matchingLeftRecords = leftRecords
               .where((leftRecord) => _matchJoinCondition(
-                  leftRecord, rightRecord, leftKey, operator, rightKey))
+                  leftRecord,
+                  rightRecord,
+                  leftKey,
+                  operator,
+                  rightKey,
+                  schemas,
+                  mainTableName))
               .toList();
 
           if (matchingLeftRecords.isNotEmpty) {
@@ -666,65 +695,54 @@ class QueryExecutor {
     String leftKey,
     String operator,
     String rightKey,
+    Map<String, TableSchema> schemas,
+    String mainTableName,
   ) {
     // Handle fields with table names (like 'users.id')
-    String leftFieldName = leftKey;
-    String leftTableName = '';
-    if (leftKey.contains('.')) {
-      final parts = leftKey.split('.');
-      leftTableName = parts[0];
-      leftFieldName = parts[1];
+    final leftFieldName =
+        leftKey.contains('.') ? leftKey.split('.').last : leftKey;
+
+    final leftSchema = ConditionRecordMatcher.getSchemaForField(
+        leftKey, schemas, mainTableName);
+    if (leftSchema == null) {
+      Logger.warn('Could not find schema for join key $leftKey',
+          label: 'QueryExecutor._matchJoinCondition');
+      return false;
     }
 
-    String rightFieldName = rightKey;
-    String rightTableName = '';
-    if (rightKey.contains('.')) {
-      final parts = rightKey.split('.');
-      rightTableName = parts[0];
-      rightFieldName = parts[1];
-    }
+    final matcher =
+        ValueMatcher.getMatcher(leftSchema.getFieldMatcherType(leftFieldName));
 
     // Try to get left value: first check for complete table name prefix field, then check for non-prefixed field
-    dynamic leftValue;
-    final leftPrefixedKey = '$leftTableName.$leftFieldName';
-    if (leftRecord.containsKey(leftPrefixedKey)) {
-      leftValue = leftRecord[leftPrefixedKey];
-    } else {
-      leftValue = leftRecord[leftFieldName];
+    dynamic leftValue =
+        ConditionRecordMatcher.getFieldValue(leftRecord, leftKey);
+    // Try to get right value: first check for complete table name prefix field, then check for non-prefixed field
+    dynamic rightValue =
+        ConditionRecordMatcher.getFieldValue(rightRecord, rightKey);
+    if (leftValue == null || rightValue == null) {
+      // If either is null, only '=' or '!=' can be true
+      if (operator == '=') return leftValue == rightValue;
+      if (operator == '!=' || operator == '<>') return leftValue != rightValue;
+      return false;
     }
 
-    // Try to get right value: first check for complete table name prefix field, then check for non-prefixed field
-    dynamic rightValue;
-    final rightPrefixedKey = '$rightTableName.$rightFieldName';
-    if (rightRecord.containsKey(rightPrefixedKey)) {
-      rightValue = rightRecord[rightPrefixedKey];
-    } else {
-      rightValue = rightRecord[rightFieldName];
-    }
+    final comparison = matcher(leftValue, rightValue);
 
     // Handle different operators
     switch (operator) {
       case '=':
-        return ValueComparator.compare(leftValue, rightValue) == 0;
+        return comparison == 0;
       case '<':
-        return leftValue != null &&
-            rightValue != null &&
-            ValueComparator.compare(leftValue, rightValue) < 0;
+        return comparison < 0;
       case '>':
-        return leftValue != null &&
-            rightValue != null &&
-            ValueComparator.compare(leftValue, rightValue) > 0;
+        return comparison > 0;
       case '<=':
-        return leftValue != null &&
-            rightValue != null &&
-            ValueComparator.compare(leftValue, rightValue) <= 0;
+        return comparison <= 0;
       case '>=':
-        return leftValue != null &&
-            rightValue != null &&
-            ValueComparator.compare(leftValue, rightValue) >= 0;
+        return comparison >= 0;
       case '!=':
       case '<>':
-        return ValueComparator.compare(leftValue, rightValue) != 0;
+        return comparison != 0;
       default:
         return false;
     }
@@ -733,7 +751,7 @@ class QueryExecutor {
   /// perform table scan with optimized partition loading
   Future<List<Map<String, dynamic>>> _performTableScan(
     String tableName,
-    QueryCondition? condition,
+    ConditionRecordMatcher? matcher,
   ) async {
     final schema = await _dataStore.getTableSchema(tableName);
     if (schema == null) {
@@ -752,9 +770,10 @@ class QueryExecutor {
         if (cacheTime != null &&
             !_dataStore.tableDataManager.isFileModified(tableName, cacheTime)) {
           var results = cache;
-          if (condition != null) {
-            results =
-                results.where((record) => condition.matches(record)).toList();
+          if (matcher != null) {
+            results = results.where((record) {
+              return matcher.matches(record);
+            }).toList();
           }
           return results;
         }
@@ -773,11 +792,11 @@ class QueryExecutor {
         fileMeta.partitions == null ||
         fileMeta.partitions!.isEmpty) {
       // Empty or new table, directly mark as full table cache (if no filter conditions)
-      shouldMarkAsFullTableCache = condition == null;
+      shouldMarkAsFullTableCache = matcher == null;
     }
     // 3. If partitioned storage is used
     else if (fileMeta.partitions!.isNotEmpty) {
-      final conditions = condition?.build();
+      final conditions = matcher?.condition.build();
       final targetPartitions = await _getTargetPartitions(
           tableName, isGlobal, conditions, primaryKey, fileMeta);
 
@@ -789,6 +808,8 @@ class QueryExecutor {
         // Check for early return in case of exact primary key match
         final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
         final controller = ParallelController();
+        final pkMatcher =
+            ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
         final tasks = targetPartitions.map((partitionIndex) {
           return () async {
@@ -801,19 +822,17 @@ class QueryExecutor {
                     tableName, isGlobal, partitionIndex, primaryKey);
 
             final partitionResults = <Map<String, dynamic>>[];
-            if (condition != null) {
+            if (matcher != null) {
               // Apply filter conditions
               for (var record in records) {
                 if (isDeletedRecord(record)) continue;
 
-                if (condition.matches(record)) {
+                if (matcher.matches(record)) {
                   partitionResults.add(record);
 
                   // If an exact primary key match is found, stop processing.
                   if (exactPkMatch != null &&
-                      ValueComparator.compare(
-                              record[primaryKey], exactPkMatch) ==
-                          0) {
+                      pkMatcher(record[primaryKey], exactPkMatch) == 0) {
                     controller.stop();
                     break;
                   }
@@ -843,7 +862,7 @@ class QueryExecutor {
         }
 
         // If full table scan with no filter conditions, and record count within limit, mark as full table data
-        if (scanAllPartitions && condition == null) {
+        if (scanAllPartitions && matcher == null) {
           shouldMarkAsFullTableCache = true;
         }
 
@@ -870,7 +889,7 @@ class QueryExecutor {
             final partitionResults = <Map<String, dynamic>>[];
             for (var record in records) {
               if (isDeletedRecord(record)) continue;
-              if (condition == null || condition.matches(record)) {
+              if (matcher == null || matcher.matches(record)) {
                 partitionResults.add(record);
               }
             }
@@ -970,6 +989,13 @@ class QueryExecutor {
       return fileMeta.partitions?.map((c) => c.index).toList() ?? [];
     }
 
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      return fileMeta.partitions?.map((c) => c.index).toList() ?? [];
+    }
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+
     // This function only prunes partitions based on the primary key.
     // If there's no condition on the PK, we must scan all partitions.
     if (!conditions.containsKey(primaryKey)) {
@@ -991,16 +1017,16 @@ class QueryExecutor {
       for (var value in inValues) {
         // Optimization: If partitions are ordered, use binary search for each value.
         if (fileMeta.isOrdered == true) {
-          final partitionIndex =
-              _findPartitionWithBinarySearch(fileMeta.partitions!, value);
+          final partitionIndex = _findPartitionWithBinarySearch(
+              fileMeta.partitions!, value, pkMatcher);
           if (partitionIndex != null) {
             targetPartitions.add(partitionIndex);
           }
         } else {
           // Unordered, have to check all partitions for each value.
           for (var partition in fileMeta.partitions!) {
-            if (_isValueInRange(
-                value, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+            if (_isValueInRange(value, partition.minPrimaryKey,
+                partition.maxPrimaryKey, pkMatcher)) {
               targetPartitions.add(partition.index);
             }
           }
@@ -1022,8 +1048,8 @@ class QueryExecutor {
     if (fileMeta.isOrdered == true &&
         queryRange.min != null &&
         queryRange.min == queryRange.max) {
-      final partitionIndex =
-          _findPartitionWithBinarySearch(fileMeta.partitions!, queryRange.min);
+      final partitionIndex = _findPartitionWithBinarySearch(
+          fileMeta.partitions!, queryRange.min, pkMatcher);
       if (partitionIndex != null) {
         return [partitionIndex];
       } else {
@@ -1051,7 +1077,7 @@ class QueryExecutor {
       // e.g., partition is [5, 10] and query is (> 10) or (>= 11)
       bool partitionEndsBeforeQueryStarts = false;
       if (queryRange.min != null) {
-        final cmp = _compareValues(pMax, queryRange.min);
+        final cmp = pkMatcher(pMax, queryRange.min);
         if (cmp < 0) {
           // pMax < queryRange.min
           partitionEndsBeforeQueryStarts = true;
@@ -1066,7 +1092,7 @@ class QueryExecutor {
       // e.g., partition is [20, 30] and query is (< 20) or (<= 19)
       bool partitionStartsAfterQueryEnds = false;
       if (queryRange.max != null) {
-        final cmp = _compareValues(pMin, queryRange.max);
+        final cmp = pkMatcher(pMin, queryRange.max);
         if (cmp > 0) {
           // pMin > queryRange.max
           partitionStartsAfterQueryEnds = true;
@@ -1091,9 +1117,10 @@ class QueryExecutor {
   }
 
   /// Check if a value is within a range (inclusive)
-  bool _isValueInRange(dynamic value, dynamic min, dynamic max) {
-    if (min == null || max == null) return true;
-    return _compareValues(value, min) >= 0 && _compareValues(value, max) <= 0;
+  bool _isValueInRange(
+      dynamic value, dynamic min, dynamic max, MatcherFunction matcher) {
+    if (min == null || max == null || value == null) return true;
+    return matcher(value, min) >= 0 && matcher(value, max) <= 0;
   }
 
   /// Get exact primary key value if condition has a direct equality match
@@ -1123,7 +1150,7 @@ class QueryExecutor {
   Future<List<Map<String, dynamic>>> _performPrimaryKeyScan(
     String tableName,
     Map<String, dynamic> conditions,
-    QueryCondition? queryCondition,
+    ConditionRecordMatcher? matcher,
   ) async {
     try {
       // Get table structure information
@@ -1137,7 +1164,7 @@ class QueryExecutor {
 
       if (pkConditionValue == null) {
         // If there is no primary key value, fall back to table scan
-        return _performTableScan(tableName, queryCondition);
+        return _performTableScan(tableName, matcher);
       }
 
       // Get table file metadata
@@ -1147,7 +1174,7 @@ class QueryExecutor {
           fileMeta.partitions == null ||
           fileMeta.partitions!.isEmpty) {
         // If there is no partition information, fall back to table scan
-        return _performTableScan(tableName, queryCondition);
+        return _performTableScan(tableName, matcher);
       }
 
       // Optimization: Check if this is an exact-match ('=') query.
@@ -1159,9 +1186,7 @@ class QueryExecutor {
       final targetPartitions = await _getTargetPartitions(
           tableName,
           schema.isGlobal,
-          {
-            primaryKey: pkConditionValue
-          }, // Only pass the primary key condition
+          {primaryKey: pkConditionValue}, // Only pass the primary key condition
           primaryKey,
           fileMeta);
 
@@ -1186,11 +1211,11 @@ class QueryExecutor {
             // Skip deleted records
             if (isDeletedRecord(record)) continue;
 
-            // CRITICAL: The `queryCondition.matches` method checks the *full* query,
+            // CRITICAL: The `matcher.evaluate` method checks the *full* query,
             // including the primary key condition (e.g., '>', '<', 'BETWEEN') AND
             // any other conditions on other fields (e.g., AND status = 'active').
             // This single line correctly handles all operators.
-            if (queryCondition == null || queryCondition.matches(record)) {
+            if (matcher == null || matcher.matches(record)) {
               resultMap[record[primaryKey].toString()] = record;
 
               // If it was an exact match, we've found our unique record, so we can stop all further scanning.
@@ -1209,7 +1234,7 @@ class QueryExecutor {
       Logger.error('Primary key scan failed: $e',
           label: 'QueryExecutor._performPrimaryKeyScan');
       // When failed, fall back to table scan
-      return _performTableScan(tableName, queryCondition);
+      return _performTableScan(tableName, matcher);
     }
   }
 
@@ -1218,7 +1243,7 @@ class QueryExecutor {
   /// When the number of partitions is large, binary search can reduce the query complexity from O(n) to O(log n)
   /// Return the found partition index, if not found, return null
   int? _findPartitionWithBinarySearch(
-      List<dynamic> partitions, dynamic pkValue) {
+      List<dynamic> partitions, dynamic pkValue, MatcherFunction matcher) {
     if (partitions.isEmpty) return null;
 
     int left = 0;
@@ -1235,12 +1260,12 @@ class QueryExecutor {
 
       // Check if the primary key is within the current partition range
       if (_isValueInRange(
-          pkValue, partition.minPrimaryKey, partition.maxPrimaryKey)) {
+          pkValue, partition.minPrimaryKey, partition.maxPrimaryKey, matcher)) {
         return partition.index;
       }
 
       // Adjust the search range
-      if (_compareValues(pkValue, partition.minPrimaryKey) < 0) {
+      if (matcher(pkValue, partition.minPrimaryKey) < 0) {
         right = mid - 1; // Continue searching on the left
       } else {
         left = mid + 1; // Continue searching on the right
@@ -1255,7 +1280,7 @@ class QueryExecutor {
     String tableName,
     String indexName,
     Map<String, dynamic> conditions,
-    QueryCondition? queryCondition,
+    ConditionRecordMatcher? matcher,
   ) async {
     try {
       final schema = await _dataStore.getTableSchema(tableName);
@@ -1291,7 +1316,7 @@ class QueryExecutor {
       }
       if (searchValue == null) {
         // Fallback to table scan if the condition value for the index is not provided.
-        return _performTableScan(tableName, queryCondition);
+        return _performTableScan(tableName, matcher);
       }
 
       // Convert the raw map condition to a structured IndexCondition
@@ -1309,7 +1334,7 @@ class QueryExecutor {
           tableName, actualIndexName, indexCondition);
 
       if (indexResults.requiresTableScan) {
-        return _performTableScan(tableName, queryCondition);
+        return _performTableScan(tableName, matcher);
       }
 
       if (indexResults.isEmpty) {
@@ -1344,8 +1369,8 @@ class QueryExecutor {
 
         for (final record in records) {
           // The index search is the primary filter.
-          // Further filtering by queryCondition ensures all other `AND` clauses are met.
-          if (queryCondition == null || queryCondition.matches(record)) {
+          // Further filtering by matcher ensures all other `AND` clauses are met.
+          if (matcher == null || matcher.matches(record)) {
             results.add(record);
           }
         }
@@ -1355,17 +1380,13 @@ class QueryExecutor {
     } catch (e) {
       Logger.error('Index scan failed: $e',
           label: 'QueryExecutor._performIndexScan');
-      return _performTableScan(tableName, queryCondition);
+      return _performTableScan(tableName, matcher);
     }
   }
 
-  /// safe value comparison
-  int _compareValues(dynamic a, dynamic b) {
-    return ValueComparator.compare(a, b);
-  }
-
   /// apply sort
-  void _applySort(List<Map<String, dynamic>> data, List<String> orderBy) {
+  void _applySort(List<Map<String, dynamic>> data, List<String> orderBy,
+      Map<String, TableSchema> schemas, String tableName) {
     try {
       // Create sort directions list with same length as orderBy, default all to ascending (true)
       final List<bool> sortDirections = List.filled(orderBy.length, true);
@@ -1396,7 +1417,8 @@ class QueryExecutor {
       }
 
       // Use correct parameters to call sortMapList
-      ValueComparator.sortMapList(data, sortFields, sortDirections);
+      ValueMatcher.sortMapList(
+          data, sortFields, sortDirections, schemas, tableName);
     } catch (e) {
       Logger.error('Sort failed: $e', label: "QueryExecutor-_applySort");
       throw StateError('Error applying sort: ${e.toString()}');
@@ -1484,7 +1506,7 @@ class QueryExecutor {
 
   /// filter out records that are pending buffer
   Future<List<Map<String, dynamic>>> _filterPendingBuffer(String tableName,
-      List<Map<String, dynamic>> results, QueryCondition? condition,
+      List<Map<String, dynamic>> results, ConditionRecordMatcher? matcher,
       {bool applyWriteBuffer = false}) async {
     // Get the primary key for the table to identify records.
     final schema = await _dataStore.getTableSchema(tableName);
@@ -1524,7 +1546,7 @@ class QueryExecutor {
         final record = entry.data;
         // A record in the write buffer must be considered.
         // If a condition is provided, it must match.
-        if (condition == null || condition.matches(record)) {
+        if (matcher == null || matcher.matches(record)) {
           final pkValue = record[primaryKey]?.toString();
           if (pkValue != null) {
             resultMap[pkValue] = record;

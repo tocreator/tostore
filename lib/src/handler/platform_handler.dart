@@ -85,9 +85,9 @@ class PlatformHandler {
     if (isMobile) {
       // Adjust concurrency based on memory for mobile devices
       final memGB = await getSystemMemoryGB();
-      if (memGB < 2.0) return 2; // Low memory devices
-      if (memGB < 4.0) return 3; // Medium memory devices
-      return 4; // High memory devices
+      if (memGB < 2.0) return 1; // Low memory devices
+      if (memGB < 4.0) return 2; // Medium memory devices
+      return 3; // High memory devices
     }
 
     // Optimize concurrency based on memory and CPU for desktop devices
@@ -102,7 +102,10 @@ class PlatformHandler {
   /// Recommended IO concurrency (synchronous version)
   static int get recommendedConcurrency {
     if (isWeb) return 2;
-    if (isMobile) return 3;
+    if (isMobile) {
+      // For mobile, be more conservative. Use half the cores, but at least 1 and at most 3.
+      return (processorCores / 2).round().clamp(1, 3);
+    }
     return processorCores.clamp(
         2, 8); // Maximum 8 concurrent operations for desktop
   }

@@ -349,7 +349,7 @@ class ToStore implements DataStoreInterface {
   /// [value] 值
   /// [isGlobal] 是否为全局键值对，默认false
   @override
-  Future<bool> setValue(String key, dynamic value,
+  Future<DbResult> setValue(String key, dynamic value,
       {bool isGlobal = false}) async {
     return await _impl.setValue(key, value, isGlobal: isGlobal);
   }
@@ -374,7 +374,7 @@ class ToStore implements DataStoreInterface {
   /// [key] 键
   /// [isGlobal] 是否为全局键值对，默认false
   @override
-  Future<bool> removeValue(String key, {bool isGlobal = false}) async {
+  Future<DbResult> removeValue(String key, {bool isGlobal = false}) async {
     return await _impl.removeValue(key, isGlobal: isGlobal);
   }
 

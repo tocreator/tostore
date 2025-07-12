@@ -6,7 +6,6 @@ import 'backup_manager.dart';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../handler/value_comparator.dart';
 import '../model/business_error.dart';
 import '../model/db_result.dart';
 import '../model/file_info.dart';
@@ -39,6 +38,7 @@ import 'old_structure_migration_handler.dart';
 import 'directory_manager.dart';
 import '../model/space_info.dart';
 import '../handler/parallel_processor.dart';
+import '../handler/value_matcher.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -867,7 +867,8 @@ class DataStoreImpl {
             schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
           tableDataManager.updateMaxIdInMemory(tableName, providedId);
         }
-        result[primaryKey] = providedId;
+        result[primaryKey] =
+            schema.primaryKeyConfig.convertPrimaryKey(providedId);
       }
 
       // 2. fill default value and null value
@@ -1282,6 +1283,10 @@ class DataStoreImpl {
         );
       }
 
+      final schemas = {tableName: schema};
+      final matcher =
+          ConditionRecordMatcher.prepare(condition, schemas, tableName);
+
       final primaryKey = schema.primaryKey;
       final writeQueue = tableDataManager.writeBuffer[tableName];
 
@@ -1413,7 +1418,7 @@ class DataStoreImpl {
               // skip if already deleted record
               if (isDeletedRecord(record)) continue;
 
-              final matches = condition.matches(record);
+              final matches = matcher.matches(record);
               if (matches) {
                 // Apply limit before processing the record for deletion
                 if (limit != null && totalDeleted >= limit) {
@@ -2190,7 +2195,7 @@ class DataStoreImpl {
   }
 
   /// Set key-value pair
-  Future<bool> setValue(String key, dynamic value,
+  Future<DbResult> setValue(String key, dynamic value,
       {bool isGlobal = false}) async {
     await ensureInitialized();
 
@@ -2209,7 +2214,7 @@ class DataStoreImpl {
 
       if (existing.isEmpty) {
         final result = await insert(tableName, data);
-        return result.isSuccess;
+        return result;
       } else {
         // Build update condition
         final condition = QueryCondition()..where('key', '=', key);
@@ -2218,12 +2223,16 @@ class DataStoreImpl {
           data,
           condition,
         );
-        return result.isSuccess;
+        return result;
       }
     } catch (e) {
       Logger.error('Set key-value pair failed: $e',
           label: 'DataStore.setValue');
-      return false;
+      return DbResult.error(
+        type: ResultType.dbError,
+        message: 'Set key-value pair failed: $e',
+        failedKeys: [key],
+      );
     }
   }
 
@@ -2234,25 +2243,36 @@ class DataStoreImpl {
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final result =
         await executeQuery(tableName, QueryCondition()..where('key', '=', key));
-    if (result.isEmpty) return null;
+    if (result.isEmpty) {
+      return null;
+    }
+
+    final rawValue = result.first['value'];
+    if (rawValue == null) {
+      return null;
+    }
 
     try {
-      return jsonDecode(result.first['value']);
+      // Try to parse as JSON first
+      return jsonDecode(rawValue);
     } catch (e) {
-      Logger.error('Parse key-value failed: $e', label: 'DataStore.getValue');
-      return null;
+      // If it fails, it's likely a plain string that was stored directly, not as JSON.
+      // We return the raw string value for backward compatibility.
+      Logger.warn(
+          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`. Error: $e',
+          label: 'DataStore.getValue');
+      return rawValue;
     }
   }
 
   /// Remove key-value pair
-  Future<bool> removeValue(String key, {bool isGlobal = false}) async {
+  Future<DbResult> removeValue(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     // Build delete condition
     final condition = QueryCondition()..where('key', '=', key);
-    await deleteInternal(tableName, condition);
-    return true;
+    return await deleteInternal(tableName, condition);
   }
 
   /// Get cache stats
@@ -2831,11 +2851,16 @@ class DataStoreImpl {
 
       // Only find the last non-empty partition (usually contains the maximum primary key value)
       PartitionMeta? lastPartition;
+      int processedCount = 0;
       for (final partition in fileMeta.partitions!) {
         if (partition.totalRecords > 0 && partition.maxPrimaryKey != null) {
           if (lastPartition == null || partition.index > lastPartition.index) {
             lastPartition = partition;
           }
+        }
+        processedCount++;
+        if (processedCount % 150 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
@@ -2844,8 +2869,24 @@ class DataStoreImpl {
       }
 
       // Compare new ID with maximum ID
+      final schema = await getTableSchema(tableName);
+      if (schema == null) {
+        return true; // Should not happen
+      }
+      final pkMatcher =
+          ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+
+      // Convert newId to the correct type before comparison.
+      final pkFieldSchema = FieldSchema(
+          name: schema.primaryKey,
+          type: schema.primaryKeyConfig.getDefaultDataType());
+      final convertedNewId = pkFieldSchema.convertValue(newId);
+      if (convertedNewId == null) {
+        return true; // Cannot compare, assume valid to be safe.
+      }
+
       int compareResult =
-          ValueComparator.compare(newId, lastPartition.maxPrimaryKey);
+          pkMatcher(convertedNewId, lastPartition.maxPrimaryKey);
 
       // Determine if strict incremental ordering is required based on primary key type
       switch (type) {
@@ -2995,24 +3036,33 @@ class DataStoreImpl {
         return;
       }
 
+      final schemas = {tableName: schema};
+      final matcher = condition != null
+          ? ConditionRecordMatcher.prepare(condition, schemas, tableName)
+          : null;
+
       // Stream all records from table using the existing tableDataManager method
       final recordStream = tableDataManager.streamRecords(tableName);
 
-      // Stream and filter records one by one
-      await for (final record in recordStream) {
-        // Apply filters if condition is provided
-        if (condition != null && !condition.isEmpty) {
-          if (!condition.matches(record)) {
-            continue; // Skip non-matching records
+      try {
+        await for (final record in recordStream) {
+          // Apply filters if condition is provided
+          if (matcher != null) {
+            if (!matcher.matches(record)) {
+              continue; // Skip non-matching records
+            }
           }
+          yield selectFields(record, selectedFields);
         }
-
-        // Apply field selection (projection) and yield the record
-        yield selectFields(record, selectedFields);
+      } catch (e) {
+        Logger.error('Error streaming records: $e',
+            label: 'DataStoreImpl.streamRecords');
+        rethrow;
       }
     } catch (e) {
       Logger.error('Error streaming records: $e',
           label: 'DataStoreImpl.streamRecords');
+      rethrow;
     }
   }
 

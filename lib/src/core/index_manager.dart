@@ -2,12 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import '../handler/value_matcher.dart';
 import '../model/index_search.dart';
 import 'compute_manager.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
 import '../handler/platform_handler.dart';
-import '../handler/value_comparator.dart';
 import '../model/file_info.dart';
 import '../model/store_index.dart';
 import '../model/table_schema.dart';
@@ -551,6 +551,11 @@ class IndexManager {
         return;
       }
 
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema == null) return;
+      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
+      final matcher = ValueMatcher.getMatcher(matcherType);
+
       final isUniqueIndex = indexName == 'pk_$tableName' || indexMeta.isUnique;
 
       // Group entries by the partition they are expected to be in.
@@ -561,7 +566,8 @@ class IndexManager {
         int processedCount = 0;
         for (final entry in entriesToDelete.entries) {
           final indexKey = entry.value.indexEntry.indexKey;
-          final partitionIndex = indexMeta.findPartitionForKey(indexKey);
+          final partitionIndex =
+              indexMeta.findPartitionForKey(indexKey, matcher);
 
           if (partitionIndex != -1) {
             partitionedDeletes.putIfAbsent(
@@ -599,6 +605,7 @@ class IndexManager {
               entriesForPartition,
               isUniqueIndex,
               updatedPartitions,
+              matcherType,
             ));
       }
 
@@ -625,6 +632,7 @@ class IndexManager {
                   fallbackDeletes,
                   true, // isUniqueIndex
                   updatedPartitions,
+                  matcherType,
                   sharedKeysToDelete: keysToDelete,
                   lockResource: listLockResource,
                   controller: controller,
@@ -647,6 +655,7 @@ class IndexManager {
                   fallbackDeletes,
                   false, // isUniqueIndex
                   updatedPartitions,
+                  matcherType,
                 ));
           }
           if (nonUniqueFallbackTasks.isNotEmpty) {
@@ -715,7 +724,8 @@ class IndexManager {
     IndexPartitionMeta partition,
     Map<String, IndexBufferEntry> entriesToDelete,
     bool isUniqueIndex,
-    List<IndexPartitionMeta> updatedPartitions, {
+    List<IndexPartitionMeta> updatedPartitions,
+    MatcherType matcherType, {
     List<String>? sharedKeysToDelete,
     String? lockResource,
     ParallelController? controller,
@@ -754,7 +764,8 @@ class IndexManager {
           checksum: partition.checksum,
           isUnique: isUniqueIndex,
           keysToProcess: keysForThisTask,
-          entriesToDelete: relevantEntries);
+          entriesToDelete: relevantEntries,
+          matcherType: matcherType);
 
       final useIsolate =
           content.length > 50 * 1024 || keysForThisTask.length > 100;
@@ -834,12 +845,25 @@ class IndexManager {
             await _dataStore.lockManager
                 ?.acquireExclusiveLock(lockResource, operationId);
 
+            final tableSchema = await _dataStore.getTableSchema(tableName);
+            if (tableSchema == null) {
+              _indexWriting[key] = false;
+              _dataStore.lockManager
+                  ?.releaseExclusiveLock(lockResource, operationId);
+              return;
+            }
+
             // Get index metadata
             final indexMeta = await _getIndexMeta(tableName, indexName);
             if (indexMeta == null) {
               _indexWriting[key] = false;
+              _dataStore.lockManager
+                  ?.releaseExclusiveLock(lockResource, operationId);
               return;
             }
+
+            final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
+            final matcher = ValueMatcher.getMatcher(matcherType);
 
             // Check if there's any data to process
             bool hasInserts =
@@ -849,6 +873,8 @@ class IndexManager {
 
             if (!hasInserts && !hasDeletes) {
               _indexWriting[key] = false;
+              _dataStore.lockManager
+                  ?.releaseExclusiveLock(lockResource, operationId);
               return;
             }
 
@@ -902,12 +928,10 @@ class IndexManager {
                     // Track min/max keys for primary key index when table is ordered
                     if (isPrimaryKeyIndex && isTableOrdered) {
                       final currentKey = entry.indexEntry.indexKey;
-                      if (minKey == null ||
-                          ValueComparator.compare(currentKey, minKey) < 0) {
+                      if (minKey == null || matcher(currentKey, minKey) < 0) {
                         minKey = currentKey;
                       }
-                      if (maxKey == null ||
-                          ValueComparator.compare(currentKey, maxKey) > 0) {
+                      if (maxKey == null || matcher(currentKey, maxKey) > 0) {
                         maxKey = currentKey;
                       }
                     }
@@ -996,6 +1020,7 @@ class IndexManager {
                           entries: job.entries,
                           existingPartitionContent: job.existingContent,
                           isUnique: indexMeta.isUnique,
+                          matcherType: matcherType,
                         );
                         return await ComputeManager.run(
                             processIndexPartition, request,
@@ -1058,9 +1083,7 @@ class IndexManager {
                           if (job.minKey != null) {
                             // If there was no original range, or if the new minimum key is smaller than the original one
                             if (finalMinKey == null ||
-                                ValueComparator.compare(
-                                        job.minKey, finalMinKey) <
-                                    0) {
+                                matcher(job.minKey, finalMinKey) < 0) {
                               finalMinKey = job.minKey;
                             }
                           }
@@ -1068,9 +1091,7 @@ class IndexManager {
                           if (job.maxKey != null) {
                             // If there was no original range, or if the new maximum key is larger than the original one
                             if (finalMaxKey == null ||
-                                ValueComparator.compare(
-                                        job.maxKey, finalMaxKey) >
-                                    0) {
+                                matcher(job.maxKey, finalMaxKey) > 0) {
                               finalMaxKey = job.maxKey;
                             }
                           }
@@ -1501,8 +1522,13 @@ class IndexManager {
   }
 
   /// Load a selective index from file (only specific partition)
-  Future<BPlusTree?> _loadSelectiveIndex(String tableName, String indexName,
-      IndexMeta meta, int partitionIndex) async {
+  Future<BPlusTree?> _loadSelectiveIndex(
+      String tableName,
+      String indexName,
+      IndexMeta meta,
+      int partitionIndex,
+      MatcherFunction comparator,
+      MatcherType matcherType) async {
     try {
       // Get the specific partition
       final partition = meta.partitions[partitionIndex];
@@ -1510,17 +1536,19 @@ class IndexManager {
           .getIndexPartitionPath(tableName, indexName, partition.index);
 
       if (!await _dataStore.storage.existsFile(partitionPath)) {
-        return BPlusTree(isUnique: meta.isUnique);
+        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
       }
 
       final content = await _dataStore.storage.readAsString(partitionPath);
       if (content == null || content.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique);
+        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
       }
 
       // Build the B+ tree from the single partition content in a background isolate.
       final request = BuildTreeRequest(
-          partitionsContent: [content], isUnique: meta.isUnique);
+          partitionsContent: [content],
+          isUnique: meta.isUnique,
+          matcherType: matcherType);
 
       final btree = await ComputeManager.run(
         buildTreeTask,
@@ -1559,8 +1587,12 @@ class IndexManager {
 
   /// Find partitions that may contain keys in a range
   /// Returns list of partition indexes
-  Future<List<int>> findPartitionsForKeyRange(String tableName,
-      String indexName, dynamic startKey, dynamic endKey) async {
+  Future<List<int>> findPartitionsForKeyRange(
+      String tableName,
+      String indexName,
+      dynamic startKey,
+      dynamic endKey,
+      MatcherFunction comparator) async {
     try {
       final meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) return [];
@@ -1569,7 +1601,8 @@ class IndexManager {
       if (meta.isOrdered == true) {
         try {
           // use IndexMeta method to find partitions
-          final partitions = meta.findPartitionsForKeyRange(startKey, endKey);
+          final partitions =
+              meta.findPartitionsForKeyRange(startKey, endKey, comparator);
 
           // if found partitions, return result
           if (partitions.isNotEmpty) {
@@ -1615,6 +1648,10 @@ class IndexManager {
       // Get metadata
       final meta = await _getIndexMeta(tableName, indexName);
       if (meta == null) return null;
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema == null) return null;
+      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
+      final comparator = ValueMatcher.getMatcher(matcherType);
 
       // 1. Read all required partition files in parallel.
       final tasks = <Future<String?> Function()>[];
@@ -1650,12 +1687,14 @@ class IndexManager {
           .toList();
 
       if (validContents.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique);
+        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
       }
 
       // 2. Build the B+ tree from contents in a background isolate.
       final request = BuildTreeRequest(
-          partitionsContent: validContents, isUnique: meta.isUnique);
+          partitionsContent: validContents,
+          isUnique: meta.isUnique,
+          matcherType: matcherType);
 
       final btree = await ComputeManager.run(
         buildTreeTask,
@@ -1682,7 +1721,11 @@ class IndexManager {
 
   /// Load index from file
   Future<BPlusTree?> _loadIndexFromFile(
-      String tableName, String indexName, IndexMeta meta) async {
+      String tableName,
+      String indexName,
+      IndexMeta meta,
+      MatcherFunction comparator,
+      MatcherType matcherType) async {
     try {
       // 1. Read all partition files in parallel.
       final tasks = <Future<String?> Function()>[];
@@ -1712,12 +1755,14 @@ class IndexManager {
           .toList();
 
       if (validContents.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique);
+        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
       }
 
       // 2. Build the B+ tree from contents in a background isolate.
       final request = BuildTreeRequest(
-          partitionsContent: validContents, isUnique: meta.isUnique);
+          partitionsContent: validContents,
+          isUnique: meta.isUnique,
+          matcherType: matcherType);
 
       final btree = await ComputeManager.run(
         buildTreeTask,
@@ -1880,7 +1925,10 @@ class IndexManager {
               final index = _indexCache[cacheKey]!;
               if (!index.isUnique) {
                 // Re-create the index with the unique flag
-                _indexCache[cacheKey] = BPlusTree(isUnique: true);
+                _indexCache[cacheKey] = BPlusTree(
+                    isUnique: true,
+                    comparator: ValueMatcher.getMatcher(
+                        schema.getMatcherTypeForIndex(indexName)));
               }
             }
           }
@@ -2769,6 +2817,7 @@ class IndexManager {
     required Future<bool> Function(
             String partitionPath, IndexPartitionMeta meta, BPlusTree btree)
         processor,
+    required MatcherFunction comparator,
     bool updateMetadata = true,
   }) async {
     try {
@@ -2811,6 +2860,7 @@ class IndexManager {
         final btree = await BPlusTree.fromString(
           content,
           isUnique: meta.isUnique,
+          comparator: comparator,
         );
 
         // Process this partition using the callback
@@ -3847,8 +3897,18 @@ class IndexManager {
         return;
       }
 
+      final tableSchema = await _dataStore.getTableSchema(tableName);
+      if (tableSchema == null) {
+        Logger.warn('Table schema not found for $tableName',
+            label: 'IndexManager._detectAndUpdateIndexOrder');
+        return;
+      }
+      final MatcherFunction matcher =
+          ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
+
       // for large index, use sampling detection
-      final isOrdered = _checkPartitionsOrderBySampling(meta.partitions);
+      final isOrdered =
+          _checkPartitionsOrderBySampling(meta.partitions, matcher);
 
       // update meta
       final updatedMeta = meta.copyWith(isOrdered: isOrdered);
@@ -3864,7 +3924,8 @@ class IndexManager {
   }
 
   /// check partitions order by sampling
-  bool _checkPartitionsOrderBySampling(List<IndexPartitionMeta> partitions) {
+  bool _checkPartitionsOrderBySampling(
+      List<IndexPartitionMeta> partitions, MatcherFunction matcher) {
     if (partitions.isEmpty || partitions.length == 1) return true;
 
     // sample detection, check at most 10 uniformly distributed samples
@@ -3886,7 +3947,7 @@ class IndexManager {
 
       // check if current partition min key is greater than or equal to last partition max key
       if (lastMaxKey != null && partition.minKey != null) {
-        if (ValueComparator.compare(partition.minKey, lastMaxKey) < 0) {
+        if (matcher(partition.minKey, lastMaxKey) < 0) {
           // range overlap, not ordered
           return false;
         }
@@ -3982,6 +4043,8 @@ class IndexManager {
 
       final tableSchema = await _dataStore.getTableSchema(tableName);
       if (tableSchema == null) return IndexSearchResult.tableScan();
+      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
+      final matcher = ValueMatcher.getMatcher(matcherType);
 
       dynamic startValue = condition.value;
       dynamic endValue = condition.endValue;
@@ -4071,7 +4134,8 @@ class IndexManager {
 
       // 3. Decide on loading strategy
       if (_shouldFullCacheIndex(tableName, indexName, meta)) {
-        final btree = await _loadIndexFromFile(tableName, indexName, meta);
+        final btree = await _loadIndexFromFile(
+            tableName, indexName, meta, matcher, matcherType);
         if (btree == null) return IndexSearchResult.tableScan();
         _updateIndexAccessWeight(cacheKey);
         _indexCache[cacheKey] = btree;
@@ -4112,19 +4176,19 @@ class IndexManager {
       if (meta.isOrdered == true) {
         if (condition.operator == '=') {
           // Optimization for equality check on an ordered index
-          final partitionIndex = meta.findPartitionForKey(startValue);
+          final partitionIndex = meta.findPartitionForKey(startValue, matcher);
           partitionIndices = partitionIndex != -1 ? [partitionIndex] : [];
         } else if (isPrefixSearch) {
           // Optimization for "LIKE 'prefix%'" on an ordered index
           final prefix =
               condition.value.substring(0, condition.value.length - 1);
           partitionIndices = await findPartitionsForKeyRange(
-              tableName, indexName, prefix, null);
+              tableName, indexName, prefix, null, matcher);
         } else if (['>', '>=', '<', '<=', 'BETWEEN']
             .contains(condition.operator)) {
           // Optimization for range queries on an ordered index
           partitionIndices = await findPartitionsForKeyRange(
-              tableName, indexName, startValue, endValue);
+              tableName, indexName, startValue, endValue, matcher);
         } else {
           // Fallback for other operators on an ordered index (e.g., LIKE '%value%')
           partitionIndices = meta.partitions.map((p) => p.index).toList();
@@ -4138,7 +4202,7 @@ class IndexManager {
       for (int i = 0; i < partitionIndices.length; i++) {
         final partitionIndex = partitionIndices[i];
         final btree = await _loadSelectiveIndex(
-            tableName, indexName, meta, partitionIndex);
+            tableName, indexName, meta, partitionIndex, matcher, matcherType);
         if (btree == null) continue;
 
         final pointers = await performBTreeSearchAndGroup(btree);
@@ -4226,7 +4290,11 @@ class IndexManager {
       }
 
       final tableSchema = await _dataStore.getTableSchema(tableName);
-      final isPk = indexName == 'pk_$tableName';
+      if (tableSchema == null) {
+        return allResults;
+      }
+      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
+      final matcher = ValueMatcher.getMatcher(matcherType);
 
       // Group keys by the partition they should reside in.
       final Map<int, List<dynamic>> partitionJobs = {};
@@ -4236,7 +4304,7 @@ class IndexManager {
         // Add async yield to avoid UI jank
         int processedCount = 0;
         for (final key in keys) {
-          final partitionIndex = meta.findPartitionForKey(key);
+          final partitionIndex = meta.findPartitionForKey(key, matcher);
           if (partitionIndex != -1) {
             partitionJobs.putIfAbsent(partitionIndex, () => []).add(key);
           }
@@ -4286,18 +4354,11 @@ class IndexManager {
               return BatchSearchTaskResult(found: {});
             }
 
-            DataType? dataType;
-            if (tableSchema != null && !isPk && meta.fields.isNotEmpty) {
-              final fieldSchema = tableSchema.fields
-                  .firstWhere((f) => f.name == meta.fields.first);
-              dataType = fieldSchema.type;
-            }
-
             final request = BatchSearchTaskRequest(
               content: content,
               keys: keysForPartition,
               isUnique: meta.isUnique,
-              keyType: dataType,
+              matcherType: matcherType,
             );
 
             return await ComputeManager.run(

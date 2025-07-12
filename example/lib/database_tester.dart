@@ -303,10 +303,12 @@ class DatabaseTester {
 
       isTestPassed &=
           _expect('Join should return 1 result', result.data.length, 1);
-      isTestPassed &= _expect('Join should return correct title',
-          result.data.first['title'], 'Join Post');
-      isTestPassed &= _expect('Join should return correct username',
-          result.data.first['username'], 'join_user');
+      if (result.data.isNotEmpty) {
+        isTestPassed &= _expect('Join should return correct title',
+            result.data.first['title'], 'Join Post');
+        isTestPassed &= _expect('Join should return correct username',
+            result.data.first['username'], 'join_user');
+      }
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testJoinQueries: $e\n$s');
@@ -406,19 +408,29 @@ class DatabaseTester {
         },
       ]);
 
-      // Test 1: Natural String Sort Comparison
-      final userNamesAsc = (await db.query('users').orderByAsc('username'))
+      // Test 1: Primary Key Sort Comparison
+      // Test 1a: Ascending sort
+      final userIdsAsc = (await db.query('users').orderByAsc('id'))
           .data
-          .map((u) => u['username'])
+          .map((u) => u['id'])
           .toList();
-      isTestPassed &= _expect('Natural sort order', userNamesAsc,
-          ['user_1', 'user_2', 'user_3', 'user_10', 'user_20']);
 
-      // Test 2: String Range Queries (with natural sort)
-      final usersGreaterThan2 =
-          (await db.query('users').where('username', '>', 'user_2')).length;
-      isTestPassed &= _expect('Query "username > user_2"', usersGreaterThan2,
-          3); // user_3, user_10, user_20
+      isTestPassed &= _expect('Primary key ascending sort order', userIdsAsc,
+          ['1', '2', '3', '10', '20']);
+
+      // Test 1b: Descending sort
+      final userIdsDesc = (await db.query('users').orderByDesc('id'))
+          .data
+          .map((u) => u['id'])
+          .toList();
+      isTestPassed &= _expect('Primary key descending sort order', userIdsDesc,
+          ['20', '10', '3', '2', '1']);
+
+      // Test 2: Primary Key Range Queries
+      final usersIdGreaterThan2 =
+          (await db.query('users').where('id', '>', 2)).length;
+      isTestPassed &=
+          _expect('Query "id > 2"', usersIdGreaterThan2, 3); // ids 3, 10, 20
 
       // Test 3: Quoted vs. Unquoted Numeric Queries
       isTestPassed &= _expect('Query age = 20 (numeric)',
@@ -548,12 +560,24 @@ class DatabaseTester {
 
   /// Runs a configurable concurrency test based on user input.
   Future<bool> runConfigurableConcurrencyTest(
-      Map<String, Map<String, int>> config) async {
+      Map<String, Map<String, int>> config,
+      {int verificationSampleSize = 10}) async {
     log.add(
         '--- Testing: Configurable Concurrency Stress Test ---', LogType.debug);
     _updateLastOperation('Starting Configurable Concurrency Test...');
     bool isTestPassed = true;
     final stopwatch = Stopwatch()..start();
+
+    // Data stores for verification
+    final insertedUsers = <Map<String, dynamic>>[];
+    final updatedUsers = <Map<String, dynamic>>[];
+    final deletedUsers = <Map<String, dynamic>>[];
+    final insertedPosts = <Map<String, dynamic>>[];
+    final updatedPosts = <Map<String, dynamic>>[];
+    final deletedPosts = <Map<String, dynamic>>[];
+    final insertedComments = <Map<String, dynamic>>[];
+    final updatedComments = <Map<String, dynamic>>[];
+    final deletedComments = <Map<String, dynamic>>[];
 
     try {
       await db.clear('users');
@@ -570,6 +594,9 @@ class DatabaseTester {
                 Function(int i)
             insertGenerator,
         required Map<String, dynamic> updateData,
+        required List<Map<String, dynamic>> itemsToInsert,
+        required List<Map<String, dynamic>> itemsToUpdate,
+        required List<Map<String, dynamic>> itemsToDelete,
         String idField = 'id',
         String nameField = 'id',
       }) async {
@@ -590,7 +617,7 @@ class DatabaseTester {
           });
 
           // Batch execute the creation of base data to avoid UI jank
-          const batchSize = 250;
+          const batchSize = 50;
           for (int i = 0; i < insertFutures.length; i += batchSize) {
             final end = (i + batchSize > insertFutures.length)
                 ? insertFutures.length
@@ -624,19 +651,26 @@ class DatabaseTester {
           _failTest(
               'Failed to create base data for $tableName, cannot proceed with updates/deletes.');
         } else {
-          final itemsToUpdate = baseItems.take(updateCount).toList();
-          final itemsToDelete =
+          final itemsToUpdateLocal = baseItems.take(updateCount).toList();
+          itemsToUpdate.addAll(itemsToUpdateLocal);
+
+          final itemsToDeleteLocal =
               baseItems.skip(updateCount).take(deleteCount).toList();
+          itemsToDelete.addAll(itemsToDeleteLocal);
 
           // Add Updates
-          for (final item in itemsToUpdate) {
+          for (var i = 0; i < itemsToUpdateLocal.length; i++) {
+            final item = itemsToUpdateLocal[i];
             operations.add(db
                 .update(tableName, updateData)
                 .where(idField, '=', item[idField]));
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
 
           // Add Deletes
-          for (final item in itemsToDelete) {
+          for (final item in itemsToDeleteLocal) {
             operations
                 .add(db.delete(tableName).where(idField, '=', item[idField]));
           }
@@ -649,13 +683,21 @@ class DatabaseTester {
             final item = baseItems[random.nextInt(baseItems.length)];
             operations.add(
                 db.query(tableName).where(idField, '=', item[idField]).first());
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
         }
 
         // Add new Inserts
         final insertCount = tableConfig['insert'] ?? 0;
         for (var i = 0; i < insertCount; i++) {
-          operations.add(insertGenerator(baseCount + i).future);
+          final gen = insertGenerator(baseCount + i);
+          operations.add(gen.future);
+          itemsToInsert.add(gen.data);
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
 
         return baseItems;
@@ -665,6 +707,9 @@ class DatabaseTester {
       final baseUsers = await prepareAndGenerateOpsForTable(
         tableName: 'users',
         tableConfig: config['users']!,
+        itemsToInsert: insertedUsers,
+        itemsToUpdate: updatedUsers,
+        itemsToDelete: deletedUsers,
         insertGenerator: (i) {
           final data = {
             'username': 'cc_user_$i',
@@ -681,6 +726,9 @@ class DatabaseTester {
       final basePosts = await prepareAndGenerateOpsForTable(
         tableName: 'posts',
         tableConfig: config['posts']!,
+        itemsToInsert: insertedPosts,
+        itemsToUpdate: updatedPosts,
+        itemsToDelete: deletedPosts,
         insertGenerator: (i) {
           final user = baseUsers[random.nextInt(baseUsers.length)];
           final data = {'title': 'Post $i', 'user_id': user['id']};
@@ -693,6 +741,9 @@ class DatabaseTester {
       final baseComments = await prepareAndGenerateOpsForTable(
         tableName: 'comments',
         tableConfig: config['comments']!,
+        itemsToInsert: insertedComments,
+        itemsToUpdate: updatedComments,
+        itemsToDelete: deletedComments,
         insertGenerator: (i) {
           final user = baseUsers[random.nextInt(baseUsers.length)];
           final post = basePosts[random.nextInt(basePosts.length)];
@@ -713,7 +764,7 @@ class DatabaseTester {
           LogType.info);
       operations.shuffle(random);
 
-      const batchSize = 250;
+      const batchSize = 100;
       for (int i = 0; i < operations.length; i += batchSize) {
         final end = (i + batchSize > operations.length)
             ? operations.length
@@ -750,6 +801,140 @@ class DatabaseTester {
       final expectedCommentCount =
           calculateExpectedCount(baseComments, commentConfig);
 
+      // --- Data Integrity Verification ---
+      List<T> getHeadTailSample<T>(List<T> list) {
+        final sampleSize = verificationSampleSize;
+        if (list.isEmpty || list.length <= sampleSize) {
+          return list;
+        }
+        final half = (sampleSize / 2).ceil();
+        final head = list.sublist(0, half);
+        final tail = list.sublist(list.length - half);
+        return {...head, ...tail}.toList();
+      }
+
+      _updateLastOperation('Verifying data integrity for users...');
+      // Verify updated users still exist and have the correct data.
+      final updatedUserSample = getHeadTailSample(updatedUsers);
+      final updatedUserIds = updatedUserSample.map((u) => u['id']).toList();
+      if (updatedUserIds.isNotEmpty) {
+        final result = await db.query('users').whereIn('id', updatedUserIds);
+        isTestPassed &= _expect(
+            'All updated users in sample must exist after test',
+            result.length,
+            updatedUserIds.length);
+        for (final user in result.data) {
+          isTestPassed &= _expect('User ${user['id']} age should be updated',
+              user['age'], 999);
+        }
+      }
+
+      // Verify deleted users are gone.
+      final deletedUserSample = getHeadTailSample(deletedUsers);
+      final deletedUserIds = deletedUserSample.map((u) => u['id']).toList();
+      if (deletedUserIds.isNotEmpty) {
+        final result = await db.query('users').whereIn('id', deletedUserIds);
+        isTestPassed &= _expect(
+            'Deleted users in sample should not be found', result.length, 0);
+      }
+
+      // Verify newly inserted users exist.
+      final insertedUserSample = getHeadTailSample(insertedUsers);
+      final insertedUsernames =
+          insertedUserSample.map((u) => u['username'] as String).toList();
+      if (insertedUsernames.isNotEmpty) {
+        final result =
+            await db.query('users').whereIn('username', insertedUsernames);
+        isTestPassed &= _expect(
+            'All newly inserted users in sample should be found',
+            result.length,
+            insertedUsernames.length);
+      }
+
+      _updateLastOperation('Verifying data integrity for posts...');
+      // Verify updated posts
+      final updatedPostSample = getHeadTailSample(updatedPosts);
+      final updatedPostIds = updatedPostSample.map((p) => p['id']).toList();
+      if (updatedPostIds.isNotEmpty) {
+        final result = await db.query('posts').whereIn('id', updatedPostIds);
+        isTestPassed &= _expect(
+            'All updated posts in sample must exist after test',
+            result.length,
+            updatedPostIds.length);
+        for (final post in result.data) {
+          isTestPassed &= _expect('Post ${post['id']} content should be updated',
+              post['content'], 'updated post content');
+        }
+      }
+
+      // Verify deleted posts
+      final deletedPostSample = getHeadTailSample(deletedPosts);
+      final deletedPostIds = deletedPostSample.map((p) => p['id']).toList();
+      if (deletedPostIds.isNotEmpty) {
+        isTestPassed &= _expect(
+            'Deleted posts in sample should not be found',
+            (await db.query('posts').whereIn('id', deletedPostIds)).length,
+            0);
+      }
+
+      // Verify inserted posts
+      final insertedPostSample = getHeadTailSample(insertedPosts);
+      final insertedPostTitles =
+          insertedPostSample.map((p) => p['title'] as String).toList();
+      if (insertedPostTitles.isNotEmpty) {
+        isTestPassed &= _expect(
+            'All newly inserted posts in sample should be found',
+            (await db.query('posts').whereIn('title', insertedPostTitles))
+                .length,
+            insertedPostTitles.length);
+      }
+
+      _updateLastOperation('Verifying data integrity for comments...');
+      // Verify updated comments
+      final updatedCommentSample = getHeadTailSample(updatedComments);
+      final updatedCommentIds = updatedCommentSample.map((c) => c['id']).toList();
+      if (updatedCommentIds.isNotEmpty) {
+        final result =
+            await db.query('comments').whereIn('id', updatedCommentIds);
+        isTestPassed &= _expect(
+            'All updated comments in sample must exist after test',
+            result.length,
+            updatedCommentIds.length);
+        for (final comment in result.data) {
+          isTestPassed &= _expect(
+              'Comment ${comment['id']} content should be updated',
+              comment['content'],
+              'updated comment content');
+        }
+      }
+
+      // Verify deleted comments
+      final deletedCommentSample = getHeadTailSample(deletedComments);
+      final deletedCommentIds = deletedCommentSample.map((c) => c['id']).toList();
+      if (deletedCommentIds.isNotEmpty) {
+        isTestPassed &= _expect(
+            'Deleted comments in sample should not be found',
+            (await db.query('comments').whereIn('id', deletedCommentIds))
+                .length,
+            0);
+      }
+
+      // Verify inserted comments
+      final insertedCommentSample = getHeadTailSample(insertedComments);
+      final insertedCommentContents =
+          insertedCommentSample.map((c) => c['content'] as String).toList();
+      if (insertedCommentContents.isNotEmpty) {
+        isTestPassed &= _expect(
+            'All newly inserted comments in sample should be found',
+            (await db
+                    .query('comments')
+                    .whereIn('content', insertedCommentContents))
+                .length,
+            insertedCommentContents.length);
+      }
+
+      // --- Final Count Verification ---
+      _updateLastOperation('Verifying final record counts...');
       isTestPassed &= _expect('Final user count should be correct',
           await db.query('users').count(), expectedUserCount);
       isTestPassed &= _expect('Final post count should be correct',

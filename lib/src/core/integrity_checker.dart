@@ -1,3 +1,4 @@
+import '../handler/value_matcher.dart';
 import 'data_store_impl.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
@@ -56,7 +57,12 @@ class IntegrityChecker {
       // check each index file
       for (var index in schema.indexes) {
         // validate index content
-        if (!await _validateIndex(tableName, index, dataPath)) {
+        if (!await _validateIndex(
+            tableName,
+            index,
+            dataPath,
+            ValueMatcher.getMatcher(
+                schema.getMatcherTypeForIndex(index.actualIndexName)))) {
           return false;
         }
       }
@@ -293,6 +299,7 @@ class IntegrityChecker {
     String tableName,
     IndexSchema index,
     String dataPath,
+    MatcherFunction comparator,
   ) async {
     try {
       final uniqueKeys = <String>{};
@@ -323,6 +330,7 @@ class IntegrityChecker {
           totalIndexEntries += meta.entries;
           return true; // Continue processing all partitions
         },
+        comparator: comparator,
         updateMetadata:
             false, // Read-only operation, no need to update metadata
       );

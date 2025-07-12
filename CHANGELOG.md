@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.6
+
+### Changed
+- Refactored the value matching engine for more precise and efficient algorithm implementation.
+- Adjusted the return type of `setValue` to `DbResult` for a more consistent and informative result model.
+- Optimized `compute` performance by refining task distribution and resource management.
+- Fine-tuned the query optimizer for better execution plan generation and improved query performance.
+- Enhanced benchmark tests and data view.
+
 ## 2.1.5
 
 ### Added

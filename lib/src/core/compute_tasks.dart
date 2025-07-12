@@ -10,7 +10,7 @@ import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../model/migration_task.dart';
 import '../handler/encoder.dart';
-import '../handler/value_comparator.dart';
+import '../handler/value_matcher.dart';
 import '../handler/logger.dart';
 import 'table_data_manager.dart';
 
@@ -41,13 +41,13 @@ class IndexProcessingRequest {
   final bool isUnique;
 
   /// The data type of the index key, for optimized comparison.
-  final DataType? keyType;
+  final MatcherType matcherType;
 
   IndexProcessingRequest({
     required this.entries,
     this.existingPartitionContent,
     required this.isUnique,
-    this.keyType,
+    required this.matcherType,
   });
 }
 
@@ -69,7 +69,7 @@ class IndexDeleteRequest {
   final Map<String, IndexBufferEntry> entriesToDelete;
 
   /// The data type of the index key, for optimized comparison.
-  final DataType? keyType;
+  final MatcherType matcherType;
 
   IndexDeleteRequest({
     required this.content,
@@ -77,7 +77,7 @@ class IndexDeleteRequest {
     required this.isUnique,
     required this.keysToProcess,
     required this.entriesToDelete,
-    this.keyType,
+    required this.matcherType,
   });
 }
 
@@ -135,31 +135,35 @@ class IndexProcessingResult {
   bool get isFailed => serializedBTree.isEmpty && newSize == 0;
 }
 
-/// A top-level function designed to be run in a separate isolate.
-///
-/// This function takes an [IndexProcessingRequest], processes the index entries
-/// by inserting them into a B+ tree, and returns an [IndexProcessingResult].
+/// Builds a B+ tree from a string representation or creates a new one.
+Future<BPlusTree> _buildBTree(
+    String? content, bool isUnique, MatcherFunction comparator) async {
+  if (content != null && content.isNotEmpty) {
+    return await BPlusTree.fromString(
+      content,
+      isUnique: isUnique,
+      comparator: comparator,
+    );
+  } else {
+    return BPlusTree(
+      isUnique: isUnique,
+      comparator: comparator,
+    );
+  }
+}
+
+/// A top-level function for processing index writes in a separate isolate.
 Future<IndexProcessingResult> processIndexPartition(
     IndexProcessingRequest request) async {
   try {
     // Get the specific comparator for the key type.
-    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final comparator = ValueMatcher.getMatcher(request.matcherType);
 
     // Initialize B+ tree, either from existing content or as a new tree.
     BPlusTree btree;
     try {
-      if (request.existingPartitionContent != null &&
-          request.existingPartitionContent!.isNotEmpty) {
-        btree = await BPlusTree.fromString(
-          request.existingPartitionContent!,
-          isUnique: request.isUnique,
-          comparator: comparator,
-        );
-      } else {
-        btree = BPlusTree(
-          isUnique: request.isUnique,
-        );
-      }
+      btree = await _buildBTree(
+          request.existingPartitionContent, request.isUnique, comparator);
     } catch (treeInitError) {
       Logger.error('Failed to initialize B+ tree: $treeInitError',
           label: 'processIndexPartition');
@@ -218,7 +222,7 @@ Future<IndexProcessingResult> processIndexPartition(
 Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
   try {
     // Get the specific comparator for the key type.
-    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final comparator = ValueMatcher.getMatcher(request.matcherType);
 
     // Initialize B+ tree from content
     BPlusTree btree;
@@ -419,6 +423,9 @@ class PartitionRangeAnalysisRequest {
   /// The primary key field name
   final String primaryKey;
 
+  /// The matcher type for the primary key.
+  final MatcherType pkMatcherType;
+
   /// The partition index (optional)
   final int partitionIndex;
 
@@ -428,6 +435,7 @@ class PartitionRangeAnalysisRequest {
   PartitionRangeAnalysisRequest({
     required this.records,
     required this.primaryKey,
+    required this.pkMatcherType,
     this.partitionIndex = 0,
     this.existingPartitions,
   });
@@ -655,6 +663,7 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
     if (request.records.isEmpty) {
       return PartitionRangeAnalysisResult(recordCount: 0);
     }
+    final pkMatcher = ValueMatcher.getMatcher(request.pkMatcherType);
 
     // calculate non-deleted record count without creating new list
     int nonEmptyCount = 0;
@@ -695,8 +704,8 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
         final pk = record[primaryKey];
         if (pk != null) {
           try {
-            if (_compareKeyValues(pk, minPk) < 0) minPk = pk;
-            if (_compareKeyValues(pk, maxPk) > 0) maxPk = pk;
+            if (pkMatcher(pk, minPk) < 0) minPk = pk;
+            if (pkMatcher(pk, maxPk) > 0) maxPk = pk;
             nonEmptyCount++;
           } catch (compareError) {
             // If comparison fails for a specific record, log and continue
@@ -742,8 +751,8 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       if (existingPartition != null && existingPartition.totalRecords > 0) {
         try {
           // If new data range is completely separated from existing range, mark as non-ordered
-          if (_compareKeyValues(minPk, existingPartition.maxPrimaryKey) > 0 ||
-              _compareKeyValues(maxPk, existingPartition.minPrimaryKey) < 0) {
+          if (pkMatcher(minPk, existingPartition.maxPrimaryKey) > 0 ||
+              pkMatcher(maxPk, existingPartition.minPrimaryKey) < 0) {
             isOrdered = false;
           }
         } catch (compareError) {
@@ -760,13 +769,13 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
         try {
           // If current partition index is greater than max index partition
           if (request.partitionIndex > maxIdxPartition.index) {
-            if (_compareKeyValues(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
+            if (pkMatcher(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
               isOrdered = false;
             }
           }
           // If current partition index is less than max index partition
           else if (request.partitionIndex < maxIdxPartition.index) {
-            if (_compareKeyValues(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
+            if (pkMatcher(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
               isOrdered = false;
             }
           }
@@ -797,17 +806,6 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       recordCount: 0,
       isOrdered: false, // conservative approach on error
     );
-  }
-}
-
-/// Primary key value comparison function
-int _compareKeyValues(dynamic a, dynamic b) {
-  try {
-    return ValueComparator.compare(a, b);
-  } catch (e) {
-    Logger.warn('Value comparison error: $e', label: '_compareKeyValues');
-    // Default comparison fallback
-    return a.toString().compareTo(b.toString());
   }
 }
 
@@ -2166,13 +2164,18 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 class BuildTreeRequest {
   final List<String> partitionsContent;
   final bool isUnique;
+  final MatcherType matcherType;
 
-  BuildTreeRequest({required this.partitionsContent, required this.isUnique});
+  BuildTreeRequest(
+      {required this.partitionsContent,
+      required this.isUnique,
+      required this.matcherType});
 }
 
 /// A top-level function to build a B+ tree from multiple partition contents.
 Future<BPlusTree> buildTreeTask(BuildTreeRequest request) async {
-  final bTree = BPlusTree(isUnique: request.isUnique);
+  final comparator = ValueMatcher.getMatcher(request.matcherType);
+  final bTree = BPlusTree(isUnique: request.isUnique, comparator: comparator);
 
   for (final content in request.partitionsContent) {
     if (content.isEmpty) continue;
@@ -2196,7 +2199,7 @@ Map<dynamic, List<dynamic>> _parseBTreeData(String content) {
     if (parts.length >= 2) {
       final key = BPlusTree.deserializeValue(parts[0]);
       final values = BPlusTree.deserializeValues(parts[1]);
-      result[key] = values;
+      result.putIfAbsent(key, () => []).addAll(values);
     }
   });
 
@@ -2208,13 +2211,13 @@ class SearchTaskRequest {
   final String content;
   final dynamic key;
   final bool isUnique;
-  final DataType? keyType;
+  final MatcherType matcherType;
 
   SearchTaskRequest(
       {required this.content,
       required this.key,
       required this.isUnique,
-      this.keyType});
+      required this.matcherType});
 }
 
 /// A top-level function to search a single index partition in an isolate.
@@ -2224,7 +2227,7 @@ Future<List<dynamic>> searchIndexPartitionTask(
     if (request.content.isEmpty) {
       return [];
     }
-    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final comparator = ValueMatcher.getMatcher(request.matcherType);
     final btree = await BPlusTree.fromString(request.content,
         isUnique: request.isUnique, comparator: comparator);
     return await btree.search(request.key);
@@ -2240,13 +2243,13 @@ class BatchSearchTaskRequest {
   final String content;
   final List<dynamic> keys;
   final bool isUnique;
-  final DataType? keyType;
+  final MatcherType matcherType;
 
   BatchSearchTaskRequest(
       {required this.content,
       required this.keys,
       required this.isUnique,
-      this.keyType});
+      required this.matcherType});
 }
 
 /// Result from batch searching an index partition.
@@ -2263,7 +2266,7 @@ Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
     if (request.content.isEmpty || request.keys.isEmpty) {
       return BatchSearchTaskResult(found: found);
     }
-    final comparator = ValueComparator.getFieldComparator(request.keyType);
+    final comparator = ValueMatcher.getMatcher(request.matcherType);
     final btree = await BPlusTree.fromString(request.content,
         isUnique: request.isUnique, comparator: comparator);
     for (final key in request.keys) {

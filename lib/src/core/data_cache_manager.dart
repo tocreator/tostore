@@ -9,8 +9,8 @@ import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'dart:convert';
 import 'memory_manager.dart';
-import '../handler/value_comparator.dart';
 import 'dart:async';
+import '../handler/value_matcher.dart';
 
 /// Data cache manager
 class DataCacheManager {
@@ -464,6 +464,14 @@ class DataCacheManager {
       final tableDependency = _tableDependencies[tableName];
       if (tableDependency != null) {
         final pkString = primaryKeyValue.toString();
+        int processedCount = 0;
+
+        final schema = await _dataStore.getTableSchema(tableName);
+        if (schema == null) {
+          Logger.error('Table schema not found for table $tableName',
+              label: 'DataCacheManager.updateQueryCacheForRecord');
+          return;
+        }
 
         for (var cacheKeyStr in tableDependency.keys.toList()) {
           final queryInfo = tableDependency[cacheKeyStr];
@@ -485,18 +493,32 @@ class DataCacheManager {
                   found = true;
                   break;
                 }
+                if (i % 50 == 0) {
+                  await Future.delayed(Duration.zero);
+                }
               }
 
               // If it is a full table cache but the record is not found, it may need to be added to the result
               if (!found && queryInfo.isFullTableCache) {
                 // Check if the updated record matches the query condition
-                if (queryInfo.queryKey.condition.matches(updatedRecord)) {
+
+                final matcher = queryInfo.queryKey.condition.isEmpty
+                    ? null
+                    : ConditionRecordMatcher.prepare(
+                        queryInfo.queryKey.condition,
+                        {tableName: schema},
+                        tableName);
+                if (matcher?.matches(updatedRecord) ?? true) {
                   cachedResults.add(Map<String, dynamic>.from(updatedRecord));
                   // Remember to update the resultKeys collection
                   queryInfo.resultKeys.add(pkString);
                 }
               }
             }
+          }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
       }
@@ -633,6 +655,13 @@ class DataCacheManager {
     int totalChecks = 0;
     int processedCount = 0;
 
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      Logger.error('Table schema not found for table $tableName',
+          label: 'DataCacheManager._performFineGrainedInvalidation');
+      return;
+    }
+
     // Use a copy of the keys to prevent modification during iteration issues.
     for (final key in tableDependency.keys.toList()) {
       if (keysToRemove.contains(key)) continue;
@@ -660,13 +689,18 @@ class DataCacheManager {
         }
       }
 
+      final matcher = queryInfo.queryKey.condition.isEmpty
+          ? null
+          : ConditionRecordMatcher.prepare(
+              queryInfo.queryKey.condition, {tableName: schema}, tableName);
       // Condition-based check: if any of the affected records match the query condition, invalidate the cache.
       if (records != null && records.isNotEmpty) {
         for (final recordData in records) {
           if (performCalibration) {
             totalChecks++; // Increment for each check
           }
-          if (queryInfo.queryKey.condition.matches(recordData)) {
+
+          if (matcher?.matches(recordData) ?? true) {
             keysToRemove.add(key);
             break; // One match is enough to invalidate this query.
           }
@@ -850,13 +884,16 @@ class DataCacheManager {
 
       // 3. Update cache metadata and add new records. `addRecords` will correctly
       //    update the internal `totalCacheSize` of the tableCache instance.
-      tableCache.isFullTableCache = needCacheFullTableCache;
       tableCache.cacheTime = now;
       tableCache.lastAccessed = now;
       if (records.isNotEmpty) {
         await tableCache.addRecords(records,
             cacheType: RecordCacheType.runtime);
       }
+
+      // **CRITICAL**: Set the full table cache flag only AFTER all records have been added.
+      // This prevents a race condition where a query might see a partially populated "full" cache.
+      tableCache.isFullTableCache = needCacheFullTableCache;
 
       // 4. Atomically update the global cache size.
       // The change is simply the difference between the new and old size of the table's cache.
@@ -1111,13 +1148,33 @@ class DataCacheManager {
 
     final result = <Map<String, dynamic>>[];
     int processedCount = 0;
+    final tableSchema = await _dataStore.getTableSchema(tableName);
+    if (tableSchema == null) return [];
+    final matcher =
+        ValueMatcher.getMatcher(tableSchema.getFieldMatcherType(fieldName));
+
+    // Convert the query value to the correct type before matching.
+    FieldSchema? fieldSchema;
+    if (fieldName == tableSchema.primaryKey) {
+      fieldSchema = FieldSchema(
+          name: fieldName,
+          type: tableSchema.primaryKeyConfig.getDefaultDataType());
+    } else {
+      try {
+        fieldSchema =
+            tableSchema.fields.firstWhere((f) => f.name == fieldName);
+      } catch (_) {
+        // Field not found, proceed without conversion.
+      }
+    }
+    final convertedValue = fieldSchema?.convertValue(fieldValue) ?? fieldValue;
 
     // Use the efficient key-collection pattern
     for (final key in cache.recordsMap.keys.toList()) {
       final recordCache = cache.recordsMap[key];
       if (recordCache == null) continue;
       final record = recordCache.record;
-      if (ValueComparator.compare(record[fieldName], fieldValue) == 0) {
+      if (matcher(record[fieldName], convertedValue) == 0) {
         result.add(Map<String, dynamic>.from(record));
         recordCache.recordAccess();
       }

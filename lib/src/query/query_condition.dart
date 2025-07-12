@@ -1,13 +1,13 @@
-import '../core/table_data_manager.dart';
-import '../handler/logger.dart';
-import '../handler/value_comparator.dart';
+import '../handler/value_matcher.dart';
+import '../model/table_schema.dart';
 
 /// Query Condition Builder
 class QueryCondition {
   // Condition tree root node
-  final _ConditionNode _root = _ConditionNode(type: _NodeType.and);
+  final ConditionNode _root = ConditionNode(type: NodeType.and);
   // Current active node (for building conditions)
-  _ConditionNode _current;
+  ConditionNode _current;
+  bool _isNormalized = false;
 
   // Order by, limit, offset related properties
   List<String>? _orderBy;
@@ -15,9 +15,12 @@ class QueryCondition {
   int? _offset;
 
   /// Create a new query condition builder
-  QueryCondition() : _current = _ConditionNode(type: _NodeType.and) {
+  QueryCondition() : _current = ConditionNode(type: NodeType.and) {
     _root.children.add(_current);
   }
+
+  /// Expose the root for external evaluators
+  ConditionNode get rootNode => _root;
 
   /// Create a copy of a query condition
   QueryCondition clone() {
@@ -31,6 +34,7 @@ class QueryCondition {
     for (var child in _root.children) {
       copy._root.children.add(child.clone());
     }
+    copy._isNormalized = _isNormalized;
 
     // Set the current node to the corresponding node in the copied tree
     if (_current == _root) {
@@ -50,8 +54,8 @@ class QueryCondition {
   }
 
   /// Find the corresponding node in two trees
-  _ConditionNode? _findCorrespondingNode(
-      _ConditionNode newRoot, _ConditionNode oldRoot, _ConditionNode target) {
+  ConditionNode? _findCorrespondingNode(
+      ConditionNode newRoot, ConditionNode oldRoot, ConditionNode target) {
     if (oldRoot == target) {
       return newRoot;
     }
@@ -74,19 +78,18 @@ class QueryCondition {
     final condition = _buildCondition(field, operator, value);
 
     // If the current node is an AND node, add a new leaf node as a child
-    if (_current.type == _NodeType.and) {
-      final leafNode =
-          _ConditionNode(type: _NodeType.leaf, condition: condition);
+    if (_current.type == NodeType.and) {
+      final leafNode = ConditionNode(type: NodeType.leaf, condition: condition);
       _current.children.add(leafNode);
     }
     // If the current node is an OR node, special handling is needed to maintain correct grouping
-    else if (_current.type == _NodeType.or) {
+    else if (_current.type == NodeType.or) {
       // Create a new AND node under the OR node
-      final andNode = _ConditionNode(type: _NodeType.and);
+      final andNode = ConditionNode(type: NodeType.and);
 
       // If the last child node of the OR node is a leaf node, it can be merged with the new condition into an AND node
       if (_current.children.isNotEmpty &&
-          _current.children.last.type == _NodeType.leaf) {
+          _current.children.last.type == NodeType.leaf) {
         // Remove the last leaf node
         final lastLeaf = _current.children.removeLast();
 
@@ -95,7 +98,7 @@ class QueryCondition {
 
         // Add the new condition as a leaf node
         final leafNode =
-            _ConditionNode(type: _NodeType.leaf, condition: condition);
+            ConditionNode(type: NodeType.leaf, condition: condition);
         andNode.children.add(leafNode);
 
         // Add the AND node to the OR node
@@ -106,18 +109,18 @@ class QueryCondition {
       } else {
         // If the last child node is not a leaf node or has no children, add a new leaf node directly
         final leafNode =
-            _ConditionNode(type: _NodeType.leaf, condition: condition);
+            ConditionNode(type: NodeType.leaf, condition: condition);
         _current.children.add(leafNode);
       }
     }
     // If the current node is a leaf node, create a new AND node as a parent
-    else if (_current.type == _NodeType.leaf) {
+    else if (_current.type == NodeType.leaf) {
       // Find the parent node of the leaf node
       final parent = _findParent(_root, _current);
 
       if (parent != null) {
         // Create a new AND node
-        final andNode = _ConditionNode(type: _NodeType.and);
+        final andNode = ConditionNode(type: NodeType.and);
 
         // Replace the current leaf node with the AND node
         final index = parent.children.indexOf(_current);
@@ -125,7 +128,7 @@ class QueryCondition {
 
         // Add
         final newLeaf =
-            _ConditionNode(type: _NodeType.leaf, condition: condition);
+            ConditionNode(type: NodeType.leaf, condition: condition);
         andNode.children.add(newLeaf);
 
         // Update the current node to the AND node
@@ -137,7 +140,7 @@ class QueryCondition {
   }
 
   /// Find the parent node of a node
-  _ConditionNode? _findParent(_ConditionNode root, _ConditionNode target) {
+  ConditionNode? _findParent(ConditionNode root, ConditionNode target) {
     for (var child in root.children) {
       if (child == target) {
         return root;
@@ -155,20 +158,20 @@ class QueryCondition {
   /// Start an OR condition
   QueryCondition or() {
     // If the current node is already an OR node, keep using that node
-    if (_current.type == _NodeType.or) {
+    if (_current.type == NodeType.or) {
       return this;
     }
 
     // If the current node is a leaf node
-    if (_current.type == _NodeType.leaf) {
+    if (_current.type == NodeType.leaf) {
       // Find the parent node of the current node
       final parent = _findParent(_root, _current);
 
       if (parent != null) {
         // If the parent node is an AND node, we need to create a new OR node
-        if (parent.type == _NodeType.and) {
+        if (parent.type == NodeType.and) {
           // Create a new OR node
-          final orNode = _ConditionNode(type: _NodeType.or);
+          final orNode = ConditionNode(type: NodeType.or);
 
           // Remove the current leaf node from the parent node
           final index = parent.children.indexOf(_current);
@@ -186,22 +189,22 @@ class QueryCondition {
           }
         }
         // If the parent node is an OR node, we don't need to create a new OR node
-        else if (parent.type == _NodeType.or) {
+        else if (parent.type == NodeType.or) {
           // Update the current node to the parent OR node
           _current = parent;
         }
       }
     }
     // If the current node is an AND node
-    else if (_current.type == _NodeType.and) {
+    else if (_current.type == NodeType.and) {
       // Find the parent node of the current AND node
       final parent = _findParent(_root, _current);
 
       if (parent != null) {
         // If the parent node is an AND node
-        if (parent.type == _NodeType.and) {
+        if (parent.type == NodeType.and) {
           // Create a new OR node
-          final orNode = _ConditionNode(type: _NodeType.or);
+          final orNode = ConditionNode(type: NodeType.or);
 
           // Remove the current AND node from the parent node
           final index = parent.children.indexOf(_current);
@@ -219,7 +222,7 @@ class QueryCondition {
           }
         }
         // If the parent node is an OR node
-        else if (parent.type == _NodeType.or) {
+        else if (parent.type == NodeType.or) {
           // Update the current node to the parent OR node
           _current = parent;
         }
@@ -227,7 +230,7 @@ class QueryCondition {
       // If there is no parent node (the current node is the root node)
       else if (_current == _root) {
         // Create a new OR node
-        final orNode = _ConditionNode(type: _NodeType.or);
+        final orNode = ConditionNode(type: NodeType.or);
 
         // Move all child nodes to the OR node
         orNode.children.addAll(_current.children);
@@ -262,13 +265,13 @@ class QueryCondition {
     }
 
     // If the current node is an OR node, special handling is needed
-    if (_current.type == _NodeType.or) {
+    if (_current.type == NodeType.or) {
       // Create a new AND node
-      final andNode = _ConditionNode(type: _NodeType.and);
+      final andNode = ConditionNode(type: NodeType.and);
 
       // Add the conditions of other to the AND node
       if (otherRoot.children.length == 1 &&
-          otherRoot.children[0].type == _NodeType.and) {
+          otherRoot.children[0].type == NodeType.and) {
         // If other is a single AND node, use its children directly
         andNode.children.addAll(otherRoot.children[0].children);
       } else {
@@ -286,8 +289,8 @@ class QueryCondition {
     }
 
     // If the current node is a leaf node, create a new AND node
-    if (_current.type == _NodeType.leaf) {
-      final andNode = _ConditionNode(type: _NodeType.and);
+    if (_current.type == NodeType.leaf) {
+      final andNode = ConditionNode(type: NodeType.and);
 
       // Find the parent node of the current node
       final parent = _findParent(_root, _current);
@@ -310,7 +313,7 @@ class QueryCondition {
     // Add the conditions of other as a whole as a child node
     // This ensures that the entire condition structure of other is treated as a single "bracket"
     if (otherRoot.children.length == 1 &&
-        otherRoot.children[0].type == _NodeType.and) {
+        otherRoot.children[0].type == NodeType.and) {
       // If other is a single AND node, its children can be added directly to avoid unnecessary nesting
       for (var child in otherRoot.children[0].children) {
         _current.children.add(child);
@@ -331,7 +334,7 @@ class QueryCondition {
     or();
 
     // If the current node is an OR node
-    if (_current.type == _NodeType.or) {
+    if (_current.type == NodeType.or) {
       // Directly access the root node structure of other
       final otherRoot = other._root;
 
@@ -347,7 +350,7 @@ class QueryCondition {
       // Theoretically, this should not be reached, because or() should ensure that the current node is an OR node
       // But for safety, add a backup logic
 
-      final orNode = _ConditionNode(type: _NodeType.or);
+      final orNode = ConditionNode(type: NodeType.or);
 
       // Add the current node as a child of the OR node
       orNode.children.add(_current);
@@ -376,7 +379,7 @@ class QueryCondition {
   }
 
   /// Optimize the condition tree
-  void _optimizeTree(_ConditionNode node) {
+  void _optimizeTree(ConditionNode node) {
     // First recursively optimize all child nodes
     for (int i = 0; i < node.children.length; i++) {
       _optimizeTree(node.children[i]);
@@ -384,14 +387,14 @@ class QueryCondition {
 
     // Remove empty AND/OR nodes
     node.children.removeWhere((child) =>
-        (child.type == _NodeType.and || child.type == _NodeType.or) &&
+        (child.type == NodeType.and || child.type == NodeType.or) &&
         child.children.isEmpty);
 
     // Merge same type parent and child nodes
     // For example, if an AND node has only one AND child node, the child's children can be moved directly to the parent node
     if (node.children.length == 1 &&
         node.children[0].type == node.type &&
-        node.type != _NodeType.leaf) {
+        node.type != NodeType.leaf) {
       final child = node.children[0];
       node.children.clear();
       node.children.addAll(child.children);
@@ -399,9 +402,9 @@ class QueryCondition {
   }
 
   /// Convert the node to a condition structure
-  Map<String, dynamic> _nodeToCondition(_ConditionNode node) {
+  Map<String, dynamic> _nodeToCondition(ConditionNode node) {
     // Handle leaf nodes
-    if (node.type == _NodeType.leaf) {
+    if (node.type == NodeType.leaf) {
       return node.condition;
     }
 
@@ -422,9 +425,9 @@ class QueryCondition {
     }
 
     // Create a condition structure based on the node type
-    if (node.type == _NodeType.and) {
+    if (node.type == NodeType.and) {
       return {'AND': childConditions};
-    } else if (node.type == _NodeType.or) {
+    } else if (node.type == NodeType.or) {
       return {'OR': childConditions};
     }
 
@@ -482,267 +485,8 @@ class QueryCondition {
   bool get isEmpty {
     return _root.children.isEmpty ||
         (_root.children.length == 1 &&
-            _root.children[0].type != _NodeType.leaf &&
+            _root.children[0].type != NodeType.leaf &&
             _root.children[0].children.isEmpty);
-  }
-
-  /// Check if the record matches the condition
-  bool matches(Map<String, dynamic> record) {
-    try {
-      // Always filter out deleted records first
-      if (isDeletedRecord(record)) {
-        return false;
-      }
-
-      // If there is no condition, match all records (except deleted ones)
-      if (isEmpty) {
-        return true;
-      }
-
-      // Directly use the condition tree for matching, rather than building an intermediate condition Map
-      return _matchNode(_root, record);
-    } catch (e) {
-      Logger.error('condition matching failed: $e',
-          label: 'QueryCondition.matches');
-      return false;
-    }
-  }
-
-  /// Match the node and its children
-  bool _matchNode(_ConditionNode node, Map<String, dynamic> record) {
-    // Handle leaf nodes
-    if (node.type == _NodeType.leaf) {
-      return _matchAllConditions(record, node.condition);
-    }
-
-    // Handle custom function nodes
-    if (node.type == _NodeType.custom) {
-      if (node.customMatcher != null) {
-        return node.customMatcher!(record);
-      }
-      return false;
-    }
-
-    // If the node has no children, match all records
-    if (node.children.isEmpty) {
-      return true;
-    }
-
-    // Handle AND nodes
-    if (node.type == _NodeType.and) {
-      // All child nodes must match
-      for (var child in node.children) {
-        if (!_matchNode(child, record)) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Handle OR nodes
-    if (node.type == _NodeType.or) {
-      // Any child node matches
-      for (var child in node.children) {
-        if (_matchNode(child, record)) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    // Default case (should not reach here)
-    return false;
-  }
-
-  /// Match all conditions
-  bool _matchAllConditions(
-      Map<String, dynamic> record, Map<String, dynamic> conditions) {
-    // Handle special AND/OR conditions
-    if (conditions.containsKey('AND')) {
-      final andConditions = conditions['AND'] as List;
-      return andConditions.every((condition) =>
-          _matchAllConditions(record, condition as Map<String, dynamic>));
-    }
-
-    if (conditions.containsKey('OR')) {
-      final orConditions = conditions['OR'] as List;
-      return orConditions.any((condition) =>
-          _matchAllConditions(record, condition as Map<String, dynamic>));
-    }
-
-    // Handle normal field conditions
-    for (var entry in conditions.entries) {
-      final field = entry.key;
-      final value = entry.value;
-
-      // Handle fields with table name prefixes (e.g. 'users.id')
-      dynamic fieldValue;
-      if (field.contains('.')) {
-        // First try to match fields with prefixes directly
-        if (record.containsKey(field)) {
-          fieldValue = record[field];
-        } else {
-          // Try
-          final parts = field.split('.');
-          final underscoreField = '${parts[0]}_${parts[1]}';
-          if (record.containsKey(underscoreField)) {
-            fieldValue = record[underscoreField];
-          } else {
-            // If not found, try to get the field value without prefix
-            final fieldName = parts[1];
-            fieldValue = record[fieldName];
-          }
-        }
-      } else {
-        // Normal field without table name prefix
-        fieldValue = record[field];
-      }
-
-      // Handle the special case where the field does not exist
-      if (fieldValue == null && !record.containsKey(field)) {
-        // Special case: IS NULL condition
-        if (value is Map &&
-            (value.containsKey('IS') || value.containsKey('IS NOT'))) {
-          if ((value.containsKey('IS') && value['IS'] == null) ||
-              (value.containsKey('IS NOT') && value['IS NOT'] != null)) {
-            continue; // If the field does not exist, the IS NULL condition is satisfied
-          }
-        }
-
-        // Check if any variant with table prefix exists
-        bool prefixFound = false;
-        for (String key in record.keys) {
-          if (key.contains('.') && key.endsWith('.$field')) {
-            fieldValue = record[key];
-            prefixFound = true;
-            break;
-          } else if (key.contains('_') && key.endsWith('_$field')) {
-            fieldValue = record[key];
-            prefixFound = true;
-            break;
-          }
-        }
-
-        if (!prefixFound) {
-          return false; // The field does not exist
-        }
-      }
-
-      if (!_matchSingleCondition(fieldValue, value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /// Match a single condition
-  bool _matchSingleCondition(dynamic value, dynamic condition) {
-    if (condition == null) return value == null;
-
-    if (condition is Map) {
-      // Handle operator conditions
-      bool matchedAny = false;
-      for (var entry in condition.entries) {
-        final operator = entry.key;
-        final compareValue = entry.value;
-
-        bool matches = false;
-        switch (operator) {
-          case '=':
-            // Use ValueComparator for intelligent type comparison
-            matches = ValueComparator.compare(value, compareValue) == 0;
-            break;
-          case '!=':
-          case '<>':
-            // Use ValueComparator for inequality comparison
-            matches = ValueComparator.compare(value, compareValue) != 0;
-            break;
-          case '>':
-            matches = value != null &&
-                ValueComparator.compare(value, compareValue) > 0;
-            break;
-          case '>=':
-            matches = value != null &&
-                ValueComparator.compare(value, compareValue) >= 0;
-            break;
-          case '<':
-            matches = value != null &&
-                ValueComparator.compare(value, compareValue) < 0;
-            break;
-          case '<=':
-            matches = value != null &&
-                ValueComparator.compare(value, compareValue) <= 0;
-            break;
-          case 'IN':
-            if (compareValue is! List) return false;
-            // Use ValueComparator to enhance the IN operator
-            if (value == null) return false;
-
-            // Check if any value in the list equals the field value
-            for (var item in compareValue) {
-              if (ValueComparator.compare(value, item) == 0) {
-                matches = true;
-                break;
-              }
-            }
-            break;
-          case 'NOT IN':
-            if (compareValue is! List) return false;
-            // Use ValueComparator to enhance the NOT IN operator
-            if (value == null) return true; // NULL NOT IN any list is true
-
-            matches = true; // Assume true until proven false
-
-            // Check if any value in the list equals the field value
-            for (var item in compareValue) {
-              if (ValueComparator.compare(value, item) == 0) {
-                matches = false;
-                break;
-              }
-            }
-            break;
-          case 'BETWEEN':
-            if (compareValue is! Map ||
-                !compareValue.containsKey('start') ||
-                !compareValue.containsKey('end')) {
-              return false;
-            }
-            matches = value != null &&
-                ValueComparator.compare(value, compareValue['start']) >= 0 &&
-                ValueComparator.compare(value, compareValue['end']) <= 0;
-            break;
-          case 'LIKE':
-            if (value == null || compareValue is! String) return false;
-            matches =
-                ValueComparator.matchesPattern(value.toString(), compareValue);
-            break;
-          case 'NOT LIKE':
-            if (value == null || compareValue is! String) return false;
-            matches =
-                !ValueComparator.matchesPattern(value.toString(), compareValue);
-            break;
-          case 'IS':
-            matches = value == null;
-            break;
-          case 'IS NOT':
-            matches = value != null;
-            break;
-          default:
-            Logger.error('Unknown operator: $operator',
-                label: 'QueryCondition._matchSingleCondition');
-            return false;
-        }
-
-        if (matches) {
-          matchedAny = true;
-          break;
-        }
-      }
-      return matchedAny;
-    }
-
-    // Use ValueComparator for simple equality conditions
-    return ValueComparator.compare(value, condition) == 0;
   }
 
   /// orWhere condition - add OR logic
@@ -822,17 +566,17 @@ class QueryCondition {
 
   /// Add a custom condition using a user-provided function
   QueryCondition whereCustom(bool Function(Map<String, dynamic>) record) {
-    final customNode = _ConditionNode(
-      type: _NodeType.custom,
+    final customNode = ConditionNode(
+      type: NodeType.custom,
       customMatcher: record,
     );
 
     // If the current node is an AND node, add the custom node as a child
-    if (_current.type == _NodeType.and) {
+    if (_current.type == NodeType.and) {
       _current.children.add(customNode);
     }
     // If the current node is an OR node
-    else if (_current.type == _NodeType.or) {
+    else if (_current.type == NodeType.or) {
       _current.children.add(customNode);
     }
     // If the current node is a leaf or custom node, create a new AND node as a parent
@@ -842,7 +586,7 @@ class QueryCondition {
 
       if (parent != null) {
         // Create a new AND node
-        final andNode = _ConditionNode(type: _NodeType.and);
+        final andNode = ConditionNode(type: NodeType.and);
 
         // Replace the current node with the AND node
         final index = parent.children.indexOf(_current);
@@ -911,57 +655,91 @@ class QueryCondition {
       setOffset(_offset!);
     }
   }
-}
 
-/// Node type enumeration
-enum _NodeType {
-  /// Leaf node, contains actual conditions
-  leaf,
+  /// Normalizes all values in the condition tree according to the table schemas.
+  void normalize(Map<String, TableSchema> schemas, String mainTableName) {
+    if (isEmpty || _isNormalized) return;
+    _isNormalized = true;
+    _normalizeNode(_root, schemas, mainTableName);
+  }
 
-  /// AND operator node
-  and,
+  void _normalizeNode(ConditionNode node, Map<String, TableSchema> schemas, String mainTableName) {
+    if (node.type == NodeType.leaf && node.condition.isNotEmpty) {
+      node.condition = _normalizeConditionMap(node.condition, schemas, mainTableName);
+    } else {
+      for (final child in node.children) {
+        _normalizeNode(child, schemas, mainTableName);
+      }
+    }
+  }
 
-  /// OR operator node
-  or,
+  Map<String, dynamic> _normalizeConditionMap(Map<String, dynamic> conditionMap, Map<String, TableSchema> schemas, String mainTableName) {
+    final newMap = <String, dynamic>{};
+    conditionMap.forEach((key, value) {
+      if (key == 'AND' || key == 'OR') {
+        if (value is List) {
+          newMap[key] = value
+              .map((e) => _normalizeConditionMap(e as Map<String, dynamic>, schemas, mainTableName))
+              .toList();
+        } else {
+          newMap[key] = value;
+        }
+      } else {
+        // This is a field condition
+        final fieldSchema = _getFieldSchema(key, schemas, mainTableName);
+        if (fieldSchema != null) {
+          newMap[key] = _convertConditionValue(value, fieldSchema);
+        } else {
+          newMap[key] = value; // Keep original if no schema found
+        }
+      }
+    });
+    return newMap;
+  }
 
-  /// Custom function node
-  custom
-}
+  dynamic _convertConditionValue(dynamic value, FieldSchema fieldSchema) {
+    if (value is Map) {
+      // It's an operator map like {'>': 10} or {'BETWEEN': {'start': 1, 'end': 5}}
+      final newMap = <String, dynamic>{};
+      value.forEach((op, opValue) {
+        if (op.toUpperCase() == 'BETWEEN' && opValue is Map) {
+          newMap[op] = {
+            'start': fieldSchema.convertValue(opValue['start']),
+            'end': fieldSchema.convertValue(opValue['end']),
+          };
+        } else if (op.toUpperCase() == 'IN' || op.toUpperCase() == 'NOT IN') {
+          if (opValue is List) {
+            newMap[op] = opValue.map((v) => fieldSchema.convertValue(v)).toList();
+          } else {
+            newMap[op] = opValue;
+          }
+        }
+        else {
+          newMap[op] = fieldSchema.convertValue(opValue);
+        }
+      });
+      return newMap;
+    } else {
+      // It's a direct equality value, e.g., where('name', 'John')
+      return fieldSchema.convertValue(value);
+    }
+  }
 
-/// Condition node class
-class _ConditionNode {
-  /// Node type
-  _NodeType type;
+   FieldSchema? _getFieldSchema(String field, Map<String, TableSchema> schemas, String mainTableName) {
+    final tableName = field.contains('.') ? field.split('.').first : mainTableName;
+    final schema = schemas[tableName];
+    if (schema == null) return null;
 
-  /// Condition content (only valid for leaf nodes)
-  Map<String, dynamic> condition;
+    final fieldName = field.contains('.') ? field.split('.').last : field;
 
-  /// Custom matcher function (only valid for custom nodes)
-  bool Function(Map<String, dynamic>)? customMatcher;
-
-  /// Child node list
-  List<_ConditionNode> children;
-
-  /// Create a condition node
-  _ConditionNode({
-    required this.type,
-    this.condition = const {},
-    this.customMatcher,
-  }) : children = [];
-
-  /// Create a deep copy of the node
-  _ConditionNode clone() {
-    final copy = _ConditionNode(
-      type: type,
-      condition: Map.from(condition),
-      customMatcher: customMatcher,
-    );
-
-    // Recursively clone all child nodes
-    for (final child in children) {
-      copy.children.add(child.clone());
+    if (fieldName == schema.primaryKey) {
+      return FieldSchema(name: schema.primaryKey, type: schema.primaryKeyConfig.getDefaultDataType());
     }
 
-    return copy;
+    try {
+      return schema.fields.firstWhere((f) => f.name == fieldName);
+    } catch (_) {
+      return null;
+    }
   }
 }
