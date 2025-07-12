@@ -279,7 +279,6 @@ class DataStoreImpl {
     if (kIsWeb) {
       return baseDir;
     }
-
     // Other platforms: app path/baseDir
     final appPath = await getPathApp();
     return pathJoin(appPath, baseDir);
@@ -927,7 +926,6 @@ class DataStoreImpl {
         ) ??
         [];
   }
-
 
   /// backup data and return backup path
   Future<String> backup({bool compress = true}) async {
@@ -1934,18 +1932,11 @@ class DataStoreImpl {
 
           // Load all records
           if (await tableDataManager.allowFullTableCache(tableName)) {
-            // Use executeQuery to get a consistent snapshot, as it correctly
-            // handles merging write buffers and filtering delete buffers.
-            final records = await executeQuery(tableName, QueryCondition());
-
-            await dataCacheManager.cacheEntireTable(
-              tableName,
-              schema.primaryKey,
-              records,
-            );
+            await executeQuery(tableName, QueryCondition());
           }
+
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
-          await Future.delayed(Duration.zero);
+          await Future.delayed(const Duration(milliseconds: 5));
         } catch (e, stackTrace) {
           Logger.error('Load table data failed: $tableName, error: $e',
               label: 'DataStore._executePrewarm');

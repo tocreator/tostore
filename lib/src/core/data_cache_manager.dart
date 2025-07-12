@@ -528,6 +528,16 @@ class DataCacheManager {
     }
   }
 
+  /// Remove table cache for primary key
+  void removeTableCacheForPrimaryKey(String tableName, String primaryKeyValue) {
+    final cache = tableCaches[tableName];
+    if (cache == null) return;
+    final removed = cache.recordsMap.remove(primaryKeyValue);
+    if (removed != null) {
+      cache.removeRecordAndUpdateStats(removed);
+    }
+  }
+
   /// Invalidate multiple records from the cache for a specific table.
   /// [primaryKeyValues] is a list of primary key values to invalidate.
   /// [records] contains the data of the records being invalidated, used for accurate query cache invalidation.

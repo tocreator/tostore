@@ -243,7 +243,6 @@ class PartitionInfo {
 
 /// Partition metadata
 class PartitionMeta {
-
   /// version
   final int version;
 

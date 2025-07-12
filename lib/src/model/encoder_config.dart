@@ -1,5 +1,3 @@
-
-
 class EncoderConfig {
   final bool enableEncoding;
   final bool enableObfuscation;
@@ -46,4 +44,4 @@ class EncoderConfig {
       fallbackKeys: fallbackKeys,
     );
   }
-} 
+}

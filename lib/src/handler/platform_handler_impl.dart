@@ -19,6 +19,9 @@ class PlatformHandlerImpl implements PlatformInterface {
   static bool? _cachedIsLinux;
   static bool? _cachedIsServerEnvironment;
 
+  // path provider cache
+  static String? _cachedAppPath;
+
   // Processor info cache - these remain constant within the application lifecycle
   static int? _cachedProcessorCores;
   static DateTime? _lastProcessorCheck;
@@ -266,13 +269,17 @@ class PlatformHandlerImpl implements PlatformInterface {
   /// Get app save directory, for data, config, etc.
   @override
   Future<String> getPathApp() async {
+    if (_cachedAppPath != null) {
+      return _cachedAppPath!;
+    }
     try {
       final docDir = await getApplicationDocumentsDirectory();
       final cachePath = Directory(path.join(docDir.path, 'common'));
-      if (!cachePath.existsSync()) {
-        cachePath.create();
+      if (!await cachePath.exists()) {
+        await cachePath.create(recursive: true);
       }
-      return cachePath.path;
+      _cachedAppPath = cachePath.path;
+      return _cachedAppPath!;
     } catch (e) {
       Logger.error(
           'Failed to determine the standard application data directory. Falling back to a temporary directory which may be cleared by the operating system, leading to data loss upon restart. For Flutter applications, ensure `WidgetsFlutterBinding.ensureInitialized()` is called at the start of your main() function. In other environments, this may indicate a permissions or platform configuration issue.',
@@ -283,7 +290,8 @@ class PlatformHandlerImpl implements PlatformInterface {
       if (!await tempDir.exists()) {
         await tempDir.create(recursive: true);
       }
-      return tempDir.path;
+      _cachedAppPath = tempDir.path;
+      return _cachedAppPath!;
     }
   }
 

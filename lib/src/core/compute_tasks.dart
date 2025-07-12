@@ -295,7 +295,8 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
     }
 
     // Calculate checksum from the new content, always use the latest content
-    final newChecksum = DataCompressor().getChecksumStringFromString(newContent);
+    final newChecksum =
+        DataCompressor().getChecksumStringFromString(newContent);
 
     // Return the results with the newly calculated checksum
     return IndexDeleteResult(

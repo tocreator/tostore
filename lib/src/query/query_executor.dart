@@ -2,6 +2,7 @@ import '../core/table_data_manager.dart';
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
+import '../model/buffer_entry.dart';
 import '../model/index_search.dart';
 import '../model/store_index.dart';
 import '../model/file_info.dart';
@@ -748,20 +749,12 @@ class QueryExecutor {
     }
   }
 
-  /// perform table scan with optimized partition loading
-  Future<List<Map<String, dynamic>>> _performTableScan(
+  /// Attempts to retrieve results from a fully cached table.
+  /// Returns the results if the table is fully cached, otherwise returns null.
+  Future<List<Map<String, dynamic>>?> _tryGetFromFullTableCache(
     String tableName,
     ConditionRecordMatcher? matcher,
   ) async {
-    final schema = await _dataStore.getTableSchema(tableName);
-    if (schema == null) {
-      return [];
-    }
-    final primaryKey = schema.primaryKey;
-    final isGlobal = schema.isGlobal;
-    bool shouldMarkAsFullTableCache = false;
-
-    // 1. check if there is full table cache
     if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
       final cache = _dataStore.dataCacheManager.getEntireTable(tableName);
       if (cache != null) {
@@ -779,70 +772,168 @@ class QueryExecutor {
         }
       }
     }
+    return null;
+  }
 
-    // Result map
-    final resultMap = <String, Map<String, dynamic>>{};
+  /// perform table scan with optimized partition loading
+  Future<List<Map<String, dynamic>>> _performTableScan(
+    String tableName,
+    ConditionRecordMatcher? matcher,
+  ) async {
+    final schema = await _dataStore.getTableSchema(tableName);
+    if (schema == null) {
+      return [];
+    }
 
-    // 2. Get file meta to check for partitions
+    // 1. Check for an existing, valid full cache.
+    final cachedResults = await _tryGetFromFullTableCache(tableName, matcher);
+    if (cachedResults != null) {
+      return cachedResults;
+    }
+
+    // 2. Check if another thread is performing a full load. If so, wait.
+    if (_dataStore.tableDataManager.isTableInFullLoad(tableName)) {
+      final bool cacheWasPopulated =
+          await _dataStore.tableDataManager.awaitFullTableLoad(tableName);
+
+      // After waiting, if the leader successfully populated the cache, try reading from it.
+      if (cacheWasPopulated) {
+        final postWaitResults =
+            await _tryGetFromFullTableCache(tableName, matcher);
+        if (postWaitResults != null) {
+          return postWaitResults;
+        }
+      }
+      // If the cache was NOT populated by the leader, we must perform our own scan.
+      // We fall through to the main logic below.
+    }
+
+    final primaryKey = schema.primaryKey;
+    final isGlobal = schema.isGlobal;
     final fileMeta =
         await _dataStore.tableDataManager.getTableFileMeta(tableName);
 
-    // If file metadata doesn't exist, empty table or new table, can be marked as full table data
+    // 3. Handle case where table has no data/partitions.
     if (fileMeta == null ||
         fileMeta.partitions == null ||
         fileMeta.partitions!.isEmpty) {
-      // Empty or new table, directly mark as full table cache (if no filter conditions)
-      shouldMarkAsFullTableCache = matcher == null;
+      // An empty table is considered "fully scanned". Attempt to cache this result.
+      final bool canCache =
+          await _dataStore.tableDataManager.allowFullTableCache(tableName);
+      if (canCache) {
+        _dataStore.tableDataManager.snapshotBuffersForFullLoad(tableName);
+        try {
+          // Cache the empty result and mark as fully cached.
+          await _dataStore.dataCacheManager.cacheEntireTable(
+              tableName, primaryKey, [],
+              isFullTableCache: true);
+          // There are no staged changes to merge, but we must clear the snapshot.
+          _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
+        } finally {
+          _dataStore.tableDataManager.completeFullLoad(tableName, true);
+        }
+      }
+      return []; // Return empty result.
     }
-    // 3. If partitioned storage is used
-    else if (fileMeta.partitions!.isNotEmpty) {
-      final conditions = matcher?.condition.build();
-      final targetPartitions = await _getTargetPartitions(
-          tableName, isGlobal, conditions, primaryKey, fileMeta);
 
-      // Determine if we need to scan all partitions (equivalent to full table scan)
-      bool scanAllPartitions =
-          targetPartitions.length == fileMeta.partitions!.length;
+    // 4. Determine if this query constitutes a full scan by checking partitions.
+    final conditions = matcher?.condition.build();
+    final targetPartitions = await _getTargetPartitions(
+        tableName, isGlobal, conditions, primaryKey, fileMeta);
 
+    final isFullScanIntent =
+        targetPartitions.length == fileMeta.partitions!.length;
+
+    // 5. Decide if this query should become the leader for caching.
+    final bool canCacheFullTable =
+        await _dataStore.tableDataManager.allowFullTableCache(tableName);
+    final bool shouldBecomeLeader = isFullScanIntent && canCacheFullTable;
+
+    // 6. If we become the leader, signal it so others will wait.
+    if (shouldBecomeLeader) {
+      _dataStore.tableDataManager.snapshotBuffersForFullLoad(tableName);
+    }
+
+    bool wasFullTableScan = false;
+    try {
+      final resultMap = <String, Map<String, dynamic>>{};
+      final controller = ParallelController();
+
+      // 7. Execute the scan over the target partitions.
       if (targetPartitions.isNotEmpty) {
-        // Check for early return in case of exact primary key match
+        // --- Start: Early Exit Optimization ---
+        String? earlyExitField;
+        dynamic earlyExitValue;
+        MatcherFunction? earlyExitMatcher;
+
         final exactPkMatch = _getExactPrimaryKeyValue(conditions, primaryKey);
-        final controller = ParallelController();
-        final pkMatcher =
-            ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+        if (exactPkMatch != null) {
+          earlyExitField = primaryKey;
+          earlyExitValue = exactPkMatch;
+          earlyExitMatcher =
+              ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+        } else if (conditions != null) {
+          for (final field in schema.fields) {
+            if (field.unique && conditions.containsKey(field.name)) {
+              final fieldCondition = conditions[field.name];
+              if (fieldCondition is Map && fieldCondition.containsKey('=')) {
+                earlyExitField = field.name;
+                earlyExitValue = fieldCondition['='];
+                earlyExitMatcher =
+                    ValueMatcher.getMatcher(field.getMatcherType());
+                break;
+              }
+            }
+          }
+
+          // If no direct unique field was found, check for unique indexes.
+          if (earlyExitField == null) {
+            for (final index in schema.indexes) {
+              // The optimization only applies to single-field unique indexes.
+              if (index.unique && index.fields.length == 1) {
+                final fieldName = index.fields.first;
+                if (conditions.containsKey(fieldName)) {
+                  final fieldCondition = conditions[fieldName];
+                  if (fieldCondition is Map &&
+                      fieldCondition.containsKey('=')) {
+                    earlyExitField = fieldName;
+                    earlyExitValue = fieldCondition['='];
+                    final field = schema.fields.firstWhere(
+                        (f) => f.name == fieldName,
+                        orElse: () => throw Exception(
+                            'Field $fieldName from index not found in schema'));
+                    earlyExitMatcher =
+                        ValueMatcher.getMatcher(field.getMatcherType());
+                    break; // Found a usable unique index, stop searching.
+                  }
+                }
+              }
+            }
+          }
+        }
+        // --- End: Early Exit Optimization ---
 
         final tasks = targetPartitions.map((partitionIndex) {
           return () async {
             if (controller.isStopped) {
               return <Map<String, dynamic>>[];
             }
-            // Read records from the partition
             final records = await _dataStore.tableDataManager
                 .readRecordsFromPartition(
                     tableName, isGlobal, partitionIndex, primaryKey);
 
             final partitionResults = <Map<String, dynamic>>[];
-            if (matcher != null) {
-              // Apply filter conditions
-              for (var record in records) {
-                if (isDeletedRecord(record)) continue;
-
-                if (matcher.matches(record)) {
-                  partitionResults.add(record);
-
-                  // If an exact primary key match is found, stop processing.
-                  if (exactPkMatch != null &&
-                      pkMatcher(record[primaryKey], exactPkMatch) == 0) {
-                    controller.stop();
-                    break;
-                  }
-                }
-              }
-            } else {
-              // No filter conditions, add all records from the partition
-              for (var record in records) {
-                if (isDeletedRecord(record)) continue;
+            for (var record in records) {
+              if (isDeletedRecord(record)) continue;
+              if (matcher == null || matcher.matches(record)) {
                 partitionResults.add(record);
+                // Early exit optimization for PK or Unique Key match
+                if (earlyExitField != null &&
+                    earlyExitMatcher!(record[earlyExitField], earlyExitValue) ==
+                        0) {
+                  controller.stop();
+                  break;
+                }
               }
             }
             return partitionResults;
@@ -854,80 +945,61 @@ class QueryExecutor {
                 controller: controller,
                 label: 'QueryExecutor._performTableScan.optimized');
 
-        // By processing results in order, we maintain the natural data order.
-        final orderedResults =
-            resultsFromPartitions.expand((e) => e ?? []).toList();
-        for (final record in orderedResults) {
-          resultMap[record[primaryKey].toString()] = record;
+        for (final recordList in resultsFromPartitions) {
+          for (final record in recordList ?? []) {
+            resultMap[record[primaryKey].toString()] = record;
+          }
         }
-
-        // If full table scan with no filter conditions, and record count within limit, mark as full table data
-        if (scanAllPartitions && matcher == null) {
-          shouldMarkAsFullTableCache = true;
-        }
-
-        return resultMap.values.toList();
       }
-    }
 
-    // If the above optimization path is not available, use parallel processing instead of stream processing
-    if (fileMeta != null &&
-        fileMeta.totalRecords > 0 &&
-        fileMeta.partitions!.isNotEmpty) {
-      try {
-        final partitionIndexes =
-            fileMeta.partitions!.map((p) => p.index).toList()..sort();
-        final tasks = partitionIndexes.map((partitionIndex) {
-          return () async {
-            final records =
-                await _dataStore.tableDataManager.readRecordsFromPartition(
-              tableName,
-              isGlobal,
-              partitionIndex,
-              primaryKey,
-            );
-            final partitionResults = <Map<String, dynamic>>[];
-            for (var record in records) {
-              if (isDeletedRecord(record)) continue;
-              if (matcher == null || matcher.matches(record)) {
-                partitionResults.add(record);
-              }
+      // 8. Determine if a full scan was actually completed.
+      wasFullTableScan = isFullScanIntent && !controller.isStopped;
+
+      // 9. If we were the leader, handle caching.
+      if (shouldBecomeLeader) {
+        if (wasFullTableScan) {
+          // We successfully did a full scan, so cache the results.
+          await _dataStore.dataCacheManager.cacheEntireTable(
+            tableName,
+            primaryKey,
+            resultMap.values.toList(),
+            isFullTableCache: false, // Don't mark as full yet
+          );
+
+          // Merge changes that happened during the scan.
+          final stagedChanges =
+              _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
+
+          for (final entry in stagedChanges.writes.values) {
+            final record = entry.data;
+            if (entry.operation == BufferOperationType.insert) {
+              _dataStore.dataCacheManager.addCachedRecord(tableName, record);
+            } else if (entry.operation == BufferOperationType.update) {
+              _dataStore.dataCacheManager.updateCachedRecord(tableName, record);
             }
-            return partitionResults;
-          };
-        }).toList();
+          }
 
-        final resultsFromPartitions =
-            await ParallelProcessor.execute<List<Map<String, dynamic>>>(
-          tasks,
-          concurrency: _dataStore.config.maxConcurrent,
-          label: 'QueryExecutor._performTableScan.full',
-        );
-        final orderedResults =
-            resultsFromPartitions.expand((e) => e ?? []).toList();
-        for (final record in orderedResults) {
-          resultMap[record[primaryKey].toString()] = record;
+          for (final key in stagedChanges.deletes) {
+            _dataStore.dataCacheManager
+                .removeTableCacheForPrimaryKey(tableName, key);
+          }
+
+          // Now mark the cache as full and valid.
+          await _dataStore.dataCacheManager.setFullTableCache(tableName, true);
+        } else {
+          // We were the leader, but we didn't do a full scan (e.g., early exit).
+          // Do not cache. Just clean up the staging buffers.
+          _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
         }
-      } catch (e) {
-        Logger.error('Error during parallel table scan: $e',
-            label: 'QueryExecutor._performTableScan');
       }
-
-    }
-
-    // Cache entire table if we should mark as full table cache
-    if (shouldMarkAsFullTableCache) {
-      // Determine if full table caching is allowed
-      if (await _dataStore.tableDataManager.allowFullTableCache(tableName)) {
-        await _dataStore.dataCacheManager.cacheEntireTable(
-          tableName,
-          primaryKey,
-          resultMap.values.toList(),
-        );
+      return resultMap.values.toList();
+    } finally {
+      // 10. If we were the leader, signal completion and success status.
+      if (shouldBecomeLeader) {
+        _dataStore.tableDataManager
+            .completeFullLoad(tableName, wasFullTableScan);
       }
     }
-
-    return resultMap.values.toList();
   }
 
   /// Helper class to represent a parsed query range.
@@ -1589,4 +1661,3 @@ class QueryRange {
 
   QueryRange(this.start, this.end);
 }
-

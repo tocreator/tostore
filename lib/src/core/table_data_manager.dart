@@ -31,6 +31,13 @@ class TableDataManager {
   final Map<String, Map<String, BufferEntry>> _deleteBuffer = {};
   Map<String, Map<String, BufferEntry>> get deleteBuffer => _deleteBuffer;
 
+  // Staging buffers for full table loads
+  final Map<String, Map<String, BufferEntry>> _stagingWriteBuffer = {};
+  final Map<String, Set<String>> _stagingDeleteKeys = {};
+
+  // A set to track which tables are currently being loaded into the cache.
+  final Map<String, Completer<bool>> _fullLoadCompleters = {};
+
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
 
@@ -761,6 +768,12 @@ class TableDataManager {
       timestamp: DateTime.now(),
     );
 
+    // Also add to staging buffer if a full load is in progress
+    if (isTableInFullLoad(tableName)) {
+      _stagingWriteBuffer.putIfAbsent(tableName, () => {})[recordId] =
+          tableQueue[recordId]!;
+    }
+
     // Record data change, need to update statistics
     _needSaveStats = true;
   }
@@ -813,6 +826,11 @@ class TableDataManager {
         data: record,
         timestamp: DateTime.now(),
       );
+
+      // Also add to staging delete keys if a full load is in progress
+      if (isTableInFullLoad(tableName)) {
+        _stagingDeleteKeys.putIfAbsent(tableName, () => {}).add(recordId);
+      }
     }
 
     // Record data change, need to update statistics
@@ -1091,6 +1109,10 @@ class TableDataManager {
 
     // Finally flush max IDs
     await flushMaxIds();
+
+    // Clear staging buffers as well, as they should be consistent with main buffers
+    _stagingWriteBuffer.clear();
+    _stagingDeleteKeys.clear();
   }
 
   /// get total table count
@@ -1202,12 +1224,13 @@ class TableDataManager {
       }
 
       final totalSize = _dataStore.dataCacheManager.getCurrentRecordCacheSize();
+      final tableFileSize = await getTableFileSize(tableName);
 
       // Get record cache size using MemoryManager
       final recordCacheSize =
           _dataStore.memoryManager?.getRecordCacheSize() ?? 10000000;
       // Check if file size exceeds limit
-      return recordCacheSize * 0.9 > totalSize;
+      return recordCacheSize * 0.9 > (totalSize + tableFileSize);
     } catch (e) {
       Logger.error('Failed to check if allow full table cache: $e',
           label: 'TableDataManager.allowFullTableCache');
@@ -3178,6 +3201,8 @@ class TableDataManager {
       // 1. clean write and delete buffers
       _writeBuffer.remove(tableName);
       _deleteBuffer.remove(tableName);
+      _stagingWriteBuffer.remove(tableName);
+      _stagingDeleteKeys.remove(tableName);
 
       // 2. directly delete the entire partition directory
       try {
@@ -3719,6 +3744,47 @@ class TableDataManager {
       return [];
     }
   }
+
+  /// Check if a table is currently in the process of a full load.
+  bool isTableInFullLoad(String tableName) {
+    return _fullLoadCompleters.containsKey(tableName);
+  }
+
+  /// Begins the full load process for a table by snapshotting current buffers.
+  void snapshotBuffersForFullLoad(String tableName) {
+    if (isTableInFullLoad(tableName)) {
+      // Already in progress, no need to snapshot again.
+      return;
+    }
+    _fullLoadCompleters[tableName] = Completer<bool>();
+    _stagingWriteBuffer[tableName] =
+        Map<String, BufferEntry>.from(_writeBuffer[tableName] ?? {});
+    _stagingDeleteKeys[tableName] = getPendingDeletePrimaryKeys(tableName);
+  }
+
+  /// Completes the full load process and returns the staged changes.
+  StagedChanges getAndClearStagedChanges(String tableName) {
+    final writes = _stagingWriteBuffer.remove(tableName) ?? {};
+    final deletes = _stagingDeleteKeys.remove(tableName) ?? {};
+    return StagedChanges(writes, deletes);
+  }
+
+  /// Marks the full load process as complete, releasing any waiters.
+  void completeFullLoad(String tableName, bool success) {
+    _fullLoadCompleters[tableName]?.complete(success);
+    _fullLoadCompleters.remove(tableName);
+  }
+
+  /// Wait for a full table load to complete.
+  Future<bool> awaitFullTableLoad(String tableName) async {
+    final completer = _fullLoadCompleters[tableName];
+    if (completer != null) {
+      return await completer.future;
+    }
+    // If there's no completer, it means the load finished between the check and the await.
+    // Returning false is safe, as it will trigger a re-check of the cache or a new scan.
+    return false;
+  }
 }
 
 /// Check if a record is a deleted record (marked with _deleted_:true flag)
@@ -3730,4 +3796,11 @@ bool isDeletedRecord(Map<String, dynamic> record) {
 
   // For backward compatibility: empty object is also considered a deleted record
   return record.isEmpty;
+}
+
+class StagedChanges {
+  final Map<String, BufferEntry> writes;
+  final Set<String> deletes;
+
+  StagedChanges(this.writes, this.deletes);
 }

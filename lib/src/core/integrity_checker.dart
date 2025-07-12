@@ -119,8 +119,8 @@ class IntegrityChecker {
 
             // 2. Calculate the checksum based on the raw records, mirroring the write process.
             final recordsJsonString = jsonEncode(records);
-            final calculatedChecksum = DataCompressor()
-                .getChecksumStringFromString(recordsJsonString);
+            final calculatedChecksum =
+                DataCompressor().getChecksumStringFromString(recordsJsonString);
 
             // 3. Compare with the stored checksum.
             if (calculatedChecksum != storedChecksum) {
