@@ -663,9 +663,11 @@ class QueryCondition {
     _normalizeNode(_root, schemas, mainTableName);
   }
 
-  void _normalizeNode(ConditionNode node, Map<String, TableSchema> schemas, String mainTableName) {
+  void _normalizeNode(ConditionNode node, Map<String, TableSchema> schemas,
+      String mainTableName) {
     if (node.type == NodeType.leaf && node.condition.isNotEmpty) {
-      node.condition = _normalizeConditionMap(node.condition, schemas, mainTableName);
+      node.condition =
+          _normalizeConditionMap(node.condition, schemas, mainTableName);
     } else {
       for (final child in node.children) {
         _normalizeNode(child, schemas, mainTableName);
@@ -673,13 +675,15 @@ class QueryCondition {
     }
   }
 
-  Map<String, dynamic> _normalizeConditionMap(Map<String, dynamic> conditionMap, Map<String, TableSchema> schemas, String mainTableName) {
+  Map<String, dynamic> _normalizeConditionMap(Map<String, dynamic> conditionMap,
+      Map<String, TableSchema> schemas, String mainTableName) {
     final newMap = <String, dynamic>{};
     conditionMap.forEach((key, value) {
       if (key == 'AND' || key == 'OR') {
         if (value is List) {
           newMap[key] = value
-              .map((e) => _normalizeConditionMap(e as Map<String, dynamic>, schemas, mainTableName))
+              .map((e) => _normalizeConditionMap(
+                  e as Map<String, dynamic>, schemas, mainTableName))
               .toList();
         } else {
           newMap[key] = value;
@@ -709,12 +713,12 @@ class QueryCondition {
           };
         } else if (op.toUpperCase() == 'IN' || op.toUpperCase() == 'NOT IN') {
           if (opValue is List) {
-            newMap[op] = opValue.map((v) => fieldSchema.convertValue(v)).toList();
+            newMap[op] =
+                opValue.map((v) => fieldSchema.convertValue(v)).toList();
           } else {
             newMap[op] = opValue;
           }
-        }
-        else {
+        } else {
           newMap[op] = fieldSchema.convertValue(opValue);
         }
       });
@@ -725,15 +729,19 @@ class QueryCondition {
     }
   }
 
-   FieldSchema? _getFieldSchema(String field, Map<String, TableSchema> schemas, String mainTableName) {
-    final tableName = field.contains('.') ? field.split('.').first : mainTableName;
+  FieldSchema? _getFieldSchema(
+      String field, Map<String, TableSchema> schemas, String mainTableName) {
+    final tableName =
+        field.contains('.') ? field.split('.').first : mainTableName;
     final schema = schemas[tableName];
     if (schema == null) return null;
 
     final fieldName = field.contains('.') ? field.split('.').last : field;
 
     if (fieldName == schema.primaryKey) {
-      return FieldSchema(name: schema.primaryKey, type: schema.primaryKeyConfig.getDefaultDataType());
+      return FieldSchema(
+          name: schema.primaryKey,
+          type: schema.primaryKeyConfig.getDefaultDataType());
     }
 
     try {

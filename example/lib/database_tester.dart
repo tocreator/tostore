@@ -824,8 +824,8 @@ class DatabaseTester {
             result.length,
             updatedUserIds.length);
         for (final user in result.data) {
-          isTestPassed &= _expect('User ${user['id']} age should be updated',
-              user['age'], 999);
+          isTestPassed &= _expect(
+              'User ${user['id']} age should be updated', user['age'], 999);
         }
       }
 
@@ -862,8 +862,10 @@ class DatabaseTester {
             result.length,
             updatedPostIds.length);
         for (final post in result.data) {
-          isTestPassed &= _expect('Post ${post['id']} content should be updated',
-              post['content'], 'updated post content');
+          isTestPassed &= _expect(
+              'Post ${post['id']} content should be updated',
+              post['content'],
+              'updated post content');
         }
       }
 
@@ -871,10 +873,8 @@ class DatabaseTester {
       final deletedPostSample = getHeadTailSample(deletedPosts);
       final deletedPostIds = deletedPostSample.map((p) => p['id']).toList();
       if (deletedPostIds.isNotEmpty) {
-        isTestPassed &= _expect(
-            'Deleted posts in sample should not be found',
-            (await db.query('posts').whereIn('id', deletedPostIds)).length,
-            0);
+        isTestPassed &= _expect('Deleted posts in sample should not be found',
+            (await db.query('posts').whereIn('id', deletedPostIds)).length, 0);
       }
 
       // Verify inserted posts
@@ -892,7 +892,8 @@ class DatabaseTester {
       _updateLastOperation('Verifying data integrity for comments...');
       // Verify updated comments
       final updatedCommentSample = getHeadTailSample(updatedComments);
-      final updatedCommentIds = updatedCommentSample.map((c) => c['id']).toList();
+      final updatedCommentIds =
+          updatedCommentSample.map((c) => c['id']).toList();
       if (updatedCommentIds.isNotEmpty) {
         final result =
             await db.query('comments').whereIn('id', updatedCommentIds);
@@ -910,7 +911,8 @@ class DatabaseTester {
 
       // Verify deleted comments
       final deletedCommentSample = getHeadTailSample(deletedComments);
-      final deletedCommentIds = deletedCommentSample.map((c) => c['id']).toList();
+      final deletedCommentIds =
+          deletedCommentSample.map((c) => c['id']).toList();
       if (deletedCommentIds.isNotEmpty) {
         isTestPassed &= _expect(
             'Deleted comments in sample should not be found',

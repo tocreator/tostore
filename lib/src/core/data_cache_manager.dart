@@ -1161,8 +1161,7 @@ class DataCacheManager {
           type: tableSchema.primaryKeyConfig.getDefaultDataType());
     } else {
       try {
-        fieldSchema =
-            tableSchema.fields.firstWhere((f) => f.name == fieldName);
+        fieldSchema = tableSchema.fields.firstWhere((f) => f.name == fieldName);
       } catch (_) {
         // Field not found, proceed without conversion.
       }
