@@ -912,6 +912,7 @@ class QueryExecutor {
         Logger.error('Error during parallel table scan: $e',
             label: 'QueryExecutor._performTableScan');
       }
+
     }
 
     // Cache entire table if we should mark as full table cache
@@ -1588,3 +1589,4 @@ class QueryRange {
 
   QueryRange(this.start, this.end);
 }
+
