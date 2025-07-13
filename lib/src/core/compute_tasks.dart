@@ -713,8 +713,10 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       if (existingPartition != null && existingPartition.totalRecords > 0) {
         try {
           // If new data range is completely separated from existing range, mark as non-ordered
-          if (pkMatcher(minPk, existingPartition.maxPrimaryKey) > 0 ||
-              pkMatcher(maxPk, existingPartition.minPrimaryKey) < 0) {
+          if (existingPartition.maxPrimaryKey != null &&
+              existingPartition.minPrimaryKey != null &&
+              (pkMatcher(minPk, existingPartition.maxPrimaryKey!) > 0 ||
+                  pkMatcher(maxPk, existingPartition.minPrimaryKey!) < 0)) {
             isOrdered = false;
           }
         } catch (compareError) {
@@ -731,13 +733,15 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
         try {
           // If current partition index is greater than max index partition
           if (request.partitionIndex > maxIdxPartition.index) {
-            if (pkMatcher(minPk, maxIdxPartition.maxPrimaryKey) <= 0) {
+            if (maxIdxPartition.maxPrimaryKey != null &&
+                pkMatcher(minPk, maxIdxPartition.maxPrimaryKey!) <= 0) {
               isOrdered = false;
             }
           }
           // If current partition index is less than max index partition
           else if (request.partitionIndex < maxIdxPartition.index) {
-            if (pkMatcher(maxPk, maxIdxPartition.minPrimaryKey) >= 0) {
+            if (maxIdxPartition.minPrimaryKey != null &&
+                pkMatcher(maxPk, maxIdxPartition.minPrimaryKey!) >= 0) {
               isOrdered = false;
             }
           }

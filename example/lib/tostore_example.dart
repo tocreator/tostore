@@ -603,13 +603,24 @@ class TostoreExample {
   }
 
   /// Adds a specified number of example records to a given table using batch inserts.
-  Future<int> addExamples(String tableName, int count, int startIndex) async {
+  Future<int> addExamples(String tableName, int count) async {
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
       logService.add(
           'Cannot add examples: Schema for table "$tableName" not found.',
           LogType.error);
       return -1;
+    }
+
+    // Find the current maximum ID to determine the starting index
+    final lastResult =
+        await db.query(tableName).orderByDesc('id').select(['id']).limit(1);
+    int startIndex = 0;
+    if (lastResult.data.isNotEmpty) {
+      final lastId = lastResult.data.first['id'];
+      if (lastId != null) {
+        startIndex = int.tryParse(lastId.toString()) ?? 0;
+      }
     }
     final stopwatch = Stopwatch()..start();
 
@@ -652,8 +663,7 @@ class TostoreExample {
   }
 
   /// Adds a specified number of example records to a given table one by one.
-  Future<int> addExamplesOneByOne(
-      String tableName, int count, int startIndex) async {
+  Future<int> addExamplesOneByOne(String tableName, int count) async {
     logService
         .add('Starting to add $count records to "$tableName" one by one...');
     final schema = await db.getTableSchema(tableName);
@@ -663,7 +673,19 @@ class TostoreExample {
           LogType.error);
       return -1;
     }
+
+    // Find the current maximum ID to determine the starting index
+    final lastResult =
+        await db.query(tableName).orderByDesc('id').select(['id']).limit(1);
+    int startIndex = 0;
+    if (lastResult.data.isNotEmpty) {
+      final lastId = lastResult.data.first['id'];
+      if (lastId != null) {
+        startIndex = int.tryParse(lastId.toString()) ?? 0;
+      }
+    }
     final stopwatch = Stopwatch()..start();
+
     for (var i = 0; i < count; i++) {
       // The global unique index is startIndex + i + 1
       final result = await db.insert(

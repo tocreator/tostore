@@ -1169,10 +1169,9 @@ class IndexManager {
 
             // --- 2. Process Deletes Sequentially ---
             if (hasDeletes) {
-              final deleteBuffer = _deleteBuffer[key]!;
-              _deleteBuffer.remove(key); // Clear buffer immediately
+              final deleteBuffer = _deleteBuffer.remove(key);
 
-              if (deleteBuffer.isNotEmpty) {
+              if (deleteBuffer != null && deleteBuffer.isNotEmpty) {
                 await _processDeleteEntries(tableName, indexName, deleteBuffer);
               }
             }

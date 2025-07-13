@@ -107,6 +107,10 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   bool _logCanScrollUp = false;
   bool _logCanScrollDown = false;
 
+  // New state for sorting
+  String? _sortColumn;
+  bool _sortAscending = true;
+
   // New state for active filters
   List<Map<String, dynamic>> _activeFilters = [];
 
@@ -132,6 +136,87 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     _pageViewController.dispose();
     _pageInputController.dispose();
     super.dispose();
+  }
+
+  Future<void> _fetchTableData({bool resetPage = false}) async {
+    if (!_isDbInitialized) return;
+
+    setState(() {
+      _isDataLoading = true;
+      if (resetPage) {
+        _currentPage = 1;
+        _selectedRows.clear();
+        _sortColumn = null; // Reset sort on page reset
+      }
+    });
+
+    try {
+      // Get schema to find columns and PK
+      final schema = await widget.example.db.getTableSchema(_selectedTable);
+      if (schema != null) {
+        _tableColumns = schema.fields.map((f) => f.name).toList();
+        _primaryKey = schema.primaryKeyConfig.name;
+        if (!_tableColumns.contains(_primaryKey)) {
+          _tableColumns.insert(0, _primaryKey!);
+        }
+      } else {
+        // Fallback for tables without explicit schema (like kv store)
+        _tableColumns = [];
+        _primaryKey = 'key';
+      }
+      // Base queries for data and count
+      var dataQuery = widget.example.db.query(_selectedTable);
+      var countQuery = widget.example.db.query(_selectedTable);
+
+      // Apply active filters to both queries
+      for (final filter in _activeFilters) {
+        final field = filter['field'] as String;
+        final op = filter['operator'] as String;
+        final value = filter['value'];
+        dataQuery = dataQuery.where(field, op, value);
+        countQuery = countQuery.where(field, op, value);
+      }
+
+      // Apply sorting to the data query
+      if (_sortColumn != null) {
+        if (_sortAscending) {
+          dataQuery = dataQuery.orderByAsc(_sortColumn!);
+        } else {
+          dataQuery = dataQuery.orderByDesc(_sortColumn!);
+        }
+      }
+
+      // Get total count for pagination
+      _totalRecords = await countQuery.count();
+      _totalPages = (_totalRecords / _pageSize).ceil();
+      if (_totalPages == 0) _totalPages = 1;
+
+      // Clamp the current page to the new total, in case records were deleted.
+      if (_currentPage > _totalPages) {
+        _currentPage = _totalPages;
+      }
+
+      // Get paginated data
+      final result = await dataQuery
+          .limit(_pageSize)
+          .offset((_currentPage - 1) * _pageSize);
+
+      setState(() {
+        _tableData = result.data;
+        // if columns were not determined by schema, infer from first record
+        if (_tableColumns.isEmpty && _tableData.isNotEmpty) {
+          _tableColumns = _tableData.first.keys.toList();
+        }
+      });
+    } catch (e, s) {
+      logService.add('Error fetching table data: $e', LogType.error);
+      logService.add('Stacktrace: $s', LogType.error);
+    } finally {
+      setState(() {
+        _isDataLoading = false;
+        _pageInputController.text = _currentPage.toString();
+      });
+    }
   }
 
   void _onLogsChanged() {
@@ -633,7 +718,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                     value: 'filter',
                     child: Row(
                       children: [
-                        Icon(Icons.search, size: 18),
+                        Icon(Icons.filter_alt_outlined, size: 18),
                         SizedBox(width: 8),
                         Text('Filter Data'),
                       ],
@@ -644,7 +729,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                     value: 'custom_delete',
                     child: Row(
                       children: [
-                        Icon(Icons.delete_forever_sharp, size: 18),
+                        Icon(Icons.playlist_remove, size: 18),
                         SizedBox(width: 8),
                         Text('Custom Delete'),
                       ],
@@ -727,10 +812,36 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: DataTable(
+              sortColumnIndex: _sortColumn == null
+                  ? null
+                  : _tableColumns.indexOf(_sortColumn!),
+              sortAscending: _sortAscending,
               showCheckboxColumn: _primaryKey != null,
               columns: [
                 for (final colName in _tableColumns)
-                  DataColumn(label: Text(colName)),
+                  DataColumn(
+                    label: Text(colName),
+                    onSort: (columnIndex, ascending) {
+                      setState(() {
+                        // If the same column is clicked again, toggle through states:
+                        // asc -> desc -> no sort
+                        if (_sortColumn == _tableColumns[columnIndex]) {
+                          if (_sortAscending) {
+                            // Currently asc, switch to desc
+                            _sortAscending = false;
+                          } else {
+                            // Currently desc, switch to no sort
+                            _sortColumn = null;
+                          }
+                        } else {
+                          // New column clicked, start with ascending
+                          _sortColumn = _tableColumns[columnIndex];
+                          _sortAscending = true;
+                        }
+                      });
+                      _fetchTableData();
+                    },
+                  ),
               ],
               rows: _tableData.map((row) {
                 final pkValue = _primaryKey != null ? row[_primaryKey] : null;
@@ -869,77 +980,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     }
   }
 
-  Future<void> _fetchTableData({bool resetPage = false}) async {
-    if (!_isDbInitialized) return;
-
-    setState(() {
-      _isDataLoading = true;
-      if (resetPage) {
-        _currentPage = 1;
-        _selectedRows.clear();
-      }
-    });
-
-    try {
-      // Get schema to find columns and PK
-      final schema = await widget.example.db.getTableSchema(_selectedTable);
-      if (schema != null) {
-        _tableColumns = schema.fields.map((f) => f.name).toList();
-        _primaryKey = schema.primaryKeyConfig.name;
-        if (!_tableColumns.contains(_primaryKey)) {
-          _tableColumns.insert(0, _primaryKey!);
-        }
-      } else {
-        // Fallback for tables without explicit schema (like kv store)
-        _tableColumns = [];
-        _primaryKey = 'key';
-      }
-      // Base queries for data and count
-      var dataQuery = widget.example.db.query(_selectedTable);
-      var countQuery = widget.example.db.query(_selectedTable);
-
-      // Apply active filters to both queries
-      for (final filter in _activeFilters) {
-        final field = filter['field'] as String;
-        final op = filter['operator'] as String;
-        final value = filter['value'];
-        dataQuery = dataQuery.where(field, op, value);
-        countQuery = countQuery.where(field, op, value);
-      }
-
-      // Get total count for pagination
-      _totalRecords = await countQuery.count();
-      _totalPages = (_totalRecords / _pageSize).ceil();
-      if (_totalPages == 0) _totalPages = 1;
-
-      // Clamp the current page to the new total, in case records were deleted.
-      if (_currentPage > _totalPages) {
-        _currentPage = _totalPages;
-      }
-
-      // Get paginated data
-      final result = await dataQuery
-          .limit(_pageSize)
-          .offset((_currentPage - 1) * _pageSize);
-
-      setState(() {
-        _tableData = result.data;
-        // if columns were not determined by schema, infer from first record
-        if (_tableColumns.isEmpty && _tableData.isNotEmpty) {
-          _tableColumns = _tableData.first.keys.toList();
-        }
-      });
-    } catch (e, s) {
-      logService.add('Error fetching table data: $e', LogType.error);
-      logService.add('Stacktrace: $s', LogType.error);
-    } finally {
-      setState(() {
-        _isDataLoading = false;
-        _pageInputController.text = _currentPage.toString();
-      });
-    }
-  }
-
   Widget _buildBenchmarkView() {
     return SingleChildScrollView(
       child: Padding(
@@ -994,7 +1034,10 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                       text: 'Concurrency Test',
                       onPressed: !_isDbInitialized || _isTesting
                           ? null
-                          : _showConcurrencyTestDialog,
+                          : () {
+                              _checkAndExpandLogPanel();
+                              _showConcurrencyTestDialog();
+                            },
                     ),
                   ),
                   SizedBox(
@@ -1004,6 +1047,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                       onPressed: !_isDbInitialized || _isTesting
                           ? null
                           : () async {
+                              _checkAndExpandLogPanel();
                               setState(() {
                                 _isTesting = true;
                               });
@@ -1465,20 +1509,16 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
             'Adding $count records (${method == InsertMethod.batch ? 'batch' : 'one-by-one'})...';
       });
 
-      // 1. Fetch the latest record count directly from the database to ensure accuracy.
-      final currentTotal =
-          await widget.example.db.query(_selectedTable).count();
       int elapsed = -1;
 
       try {
         if (method == InsertMethod.batch) {
           // Use the existing benchmark logic for batch adding
-          elapsed = await widget.example
-              .addExamples(_selectedTable, count, currentTotal);
+          elapsed = await widget.example.addExamples(_selectedTable, count);
         } else {
           // Use the existing benchmark logic for one-by-one adding
-          elapsed = await widget.example
-              .addExamplesOneByOne(_selectedTable, count, currentTotal);
+          elapsed =
+              await widget.example.addExamplesOneByOne(_selectedTable, count);
         }
       } catch (e, s) {
         logService.add('Failed to add data: $e', LogType.error);
@@ -1488,7 +1528,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
 
       if (!mounted) return;
 
-      // 2. Show a user-friendly SnackBar based on the operation result.
+      // Show a user-friendly SnackBar based on the operation result.
       if (elapsed >= 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1836,6 +1876,21 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         logService.add('Stacktrace: $s', LogType.error);
       }
       await _fetchTableData(resetPage: true);
+    }
+  }
+
+  void _checkAndExpandLogPanel() {
+    // Threshold is slightly larger than minChildSize to handle tolerances
+    // and minor user dragging.
+    if (_logPanelController.isAttached && _logPanelController.size < 0.15) {
+      // Animate to a size that's large enough to be useful but leaves
+      // top controls visible. The max is 0.8.
+      const targetSize = 0.7;
+      _logPanelController.animateTo(
+        targetSize,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
     }
   }
 }
