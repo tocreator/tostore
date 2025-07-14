@@ -1680,14 +1680,10 @@ class QueryExecutor {
     final resultMap = <String, Map<String, dynamic>>{};
 
     // 1. Populate with initial results.
-    for (var i = 0; i < results.length; i++) {
-      final record = results[i];
+    for (final record in results) {
       final pkValue = record[primaryKey]?.toString();
       if (pkValue != null) {
         resultMap[pkValue] = record;
-      }
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
       }
     }
 
@@ -1716,13 +1712,8 @@ class QueryExecutor {
     if (pendingDeleteKeys.isNotEmpty) {
       if (resultMap.length > pendingDeleteKeys.length) {
         // If the result map is larger, it's faster to iterate the smaller delete set.
-        int processedCount = 0;
         for (final key in pendingDeleteKeys) {
           resultMap.remove(key);
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
-          }
         }
       } else {
         // If the delete set is larger or equal, it's faster to iterate the map.
