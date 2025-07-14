@@ -950,18 +950,25 @@ class QueryExecutor {
             for (var i = 0; i < records.length; i++) {
               final record = records[i];
               if (isDeletedRecord(record)) continue;
+              if (i % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
+
+              // Optimization: If we're looking for a specific unique key, check it first.
+              // If it doesn't match, we can skip the more expensive full matcher.
+              if (earlyExitField != null &&
+                  earlyExitMatcher!(record[earlyExitField], earlyExitValue) !=
+                      0) {
+                continue;
+              }
+
               if (matcher == null || matcher.matches(record)) {
                 partitionResults.add(record);
                 // Early exit optimization for PK or Unique Key match
-                if (earlyExitField != null &&
-                    earlyExitMatcher!(record[earlyExitField], earlyExitValue) ==
-                        0) {
+                if (earlyExitField != null) {
                   controller.stop();
                   break;
                 }
-              }
-              if (i % 50 == 0) {
-                await Future.delayed(Duration.zero);
               }
             }
             return partitionResults;
