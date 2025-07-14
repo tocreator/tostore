@@ -1158,7 +1158,7 @@ class IndexManager {
                           'Error creating partition metadata: $e\n$stack',
                           label: 'IndexManager._processBatchIndexWrites');
                     }
-                      await Future.delayed(Duration.zero);
+                    await Future.delayed(Duration.zero);
                   }
                 }
 
@@ -1706,7 +1706,7 @@ class IndexManager {
             return null;
           }
         });
-          await Future.delayed(Duration.zero);
+        await Future.delayed(Duration.zero);
       }
 
       final partitionContents = await ParallelProcessor.execute<String?>(tasks,
@@ -2445,7 +2445,7 @@ class IndexManager {
       }
 
       // Batch update write buffer
-       processedCount = 0;
+      processedCount = 0;
       for (final entry in indexUpdates.entries) {
         final indexName = entry.key;
         final updates = entry.value;
@@ -3805,7 +3805,7 @@ class IndexManager {
           // Remove processed partition data from memory
           partitionIndexData.remove(partitionId);
 
-            await Future.delayed(Duration.zero);
+          await Future.delayed(Duration.zero);
         }
 
         // Get current buffer size
@@ -3977,8 +3977,8 @@ class IndexManager {
           ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
 
       // for large index, use sampling detection
-      final isOrdered = await _checkPartitionsOrderBySampling(
-          meta.partitions, matcher);
+      final isOrdered =
+          await _checkPartitionsOrderBySampling(meta.partitions, matcher);
 
       // update meta
       final updatedMeta = meta.copyWith(isOrdered: isOrdered);

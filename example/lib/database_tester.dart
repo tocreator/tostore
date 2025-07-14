@@ -676,7 +676,8 @@ class DatabaseTester {
           // Add Deletes
           for (int i = 0; i < itemsToDeleteLocal.length; i++) {
             final item = itemsToDeleteLocal[i];
-            operations.add(db.delete(tableName).where(idField, '=', item[idField]));
+            operations
+                .add(db.delete(tableName).where(idField, '=', item[idField]));
             if (i % 50 == 0) {
               await Future.delayed(Duration.zero);
             }

@@ -180,7 +180,7 @@ class TableDataManager {
       // Process buckets from oldest to newest
       final sortedBuckets = buckets.keys.toList()..sort();
 
-       processedCount = 0;
+      processedCount = 0;
       for (final bucketKey in sortedBuckets) {
         final tablesInBucket = buckets[bucketKey]!;
 
