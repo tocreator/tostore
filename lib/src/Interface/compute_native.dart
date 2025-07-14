@@ -22,48 +22,62 @@ class _IsolatePool {
   final int _maxPoolSize = PlatformHandler.recommendedConcurrency;
   final Map<int, Isolate> _isolates = {};
   final Map<int, SendPort> _sendPorts = {};
-  final Map<int, Queue<_IsolateTask>> _taskQueues = {};
+  final Queue<_IsolateTask> _globalTaskQueue = Queue<_IsolateTask>();
+  final Map<int, _IsolateTask?> _activeTasks = {};
   final Map<int, bool> _isIdle = {};
+  int _nextIsolateId = 0;
   final Map<int, int> _taskCount =
       {}; // track the number of tasks processed by each isolate
   final Map<int, double> _avgTaskTime =
       {}; // track the average task execution time for each isolate
   bool _isInitialized = false;
+  Completer<void>? _initCompleter;
 
   /// initialize the isolate pool
   Future<void> _ensureInitialized() async {
-    if (!_isInitialized) {
-      // Pre-create and pre-warm isolates sequentially to avoid UI jank.
-      for (int i = 0; i < _maxPoolSize; i++) {
-        // Check if an isolate at this index has already been created to avoid redundancy.
-        if (!_isolates.containsKey(i)) {
-          await _createIsolate(i);
-          _taskCount[i] = 0;
-          _avgTaskTime[i] = 0;
-          // Pre-warm this specific isolate.
-          await _prewarmIsolate(i);
-          // Yield to the event loop to allow UI to remain responsive.
-          await Future.delayed(Duration.zero);
-        }
+    if (_isInitialized) return;
+    if (_initCompleter != null) {
+      return _initCompleter!.future;
+    }
+
+    _initCompleter = Completer<void>();
+
+    try {
+      final timer = Stopwatch()..start();
+
+      // Create the first isolate to be ready quickly.
+      if (_maxPoolSize > 0) {
+        await _createIsolate(0);
       }
+
       _isInitialized = true;
+
+      // Lazily create the rest of the isolates in the background without waiting.
+      _createRemainingIsolatesInBackground();
+
+      timer.stop();
+      _initCompleter!.complete();
+    } catch (e, st) {
+      _initCompleter!.completeError(e, st);
+      // On failure, allow re-initialization.
+      _initCompleter = null;
+      _isInitialized = false;
     }
   }
 
-  /// pre-warm a specific isolate to reduce initial latency
-  Future<void> _prewarmIsolate(int id) async {
-    // Create a task and add it to the specific isolate's queue.
-    // Using a timer to keep stats consistent, although not strictly needed for warmup.
-    final timer = Stopwatch();
-    final task = _IsolateTask<int>(_warmupTask, 1, timer: timer);
-    _taskQueues[id]!.add(task);
-
-    if (_isIdle[id]!) {
-      _processNextTask(id);
+  /// Create remaining isolates in the background to avoid blocking startup.
+  void _createRemainingIsolatesInBackground() {
+    // Start from the second isolate.
+    for (int i = 1; i < _maxPoolSize; i++) {
+      // Create remaining isolates concurrently without an artificial delay
+      // to handle initial task bursts more effectively.
+      (() async {
+        if (!_isolates.containsKey(i)) {
+          await _createIsolate(i);
+          _dispatchTask(); // Try to give the new isolate work immediately.
+        }
+      })();
     }
-
-    // Wait for the warmup task to complete.
-    await task.completer.future;
   }
 
   /// create a new isolate
@@ -79,8 +93,9 @@ class _IsolatePool {
       errorsAreFatal: false,
     );
 
-    _taskQueues[id] = Queue<_IsolateTask>();
     _isIdle[id] = true;
+    _taskCount[id] = 0;
+    _avgTaskTime[id] = 0.0;
 
     // listen for messages from the isolate
     receivePort.listen((message) {
@@ -99,26 +114,23 @@ class _IsolatePool {
 
   /// handle the task result from the isolate
   void _handleTaskResult(int isolateId, Map result) {
-    if (_taskQueues[isolateId]!.isNotEmpty) {
-      final task = _taskQueues[isolateId]!.removeFirst();
+    final task = _activeTasks.remove(isolateId);
+    if (task == null) return;
 
-      // update performance statistics
-      if (task.timer != null) {
-        final taskTime = task.timer!.elapsedMilliseconds.toDouble();
-        _updateTaskStats(isolateId, taskTime);
-      }
-
-      if (result.containsKey('error')) {
-        task.completer.completeError(result['error'], result['stackTrace']);
-      } else {
-        task.completer.complete(result['result']);
-      }
-
-      // reduce unnecessary microtask queue pressure
-      Future.microtask(() {
-        _processNextTask(isolateId);
-      });
+    // update performance statistics
+    if (task.timer != null) {
+      final taskTime = task.timer!.elapsedMilliseconds.toDouble();
+      _updateTaskStats(isolateId, taskTime);
     }
+
+    if (result.containsKey('error')) {
+      task.completer.completeError(result['error'], result['stackTrace']);
+    } else {
+      task.completer.complete(result['result']);
+    }
+
+    _isIdle[isolateId] = true;
+    _dispatchTask(); // Isolate is free, try to process next task from global queue.
   }
 
   /// update task statistics
@@ -137,74 +149,69 @@ class _IsolatePool {
     _taskCount[isolateId] = currentCount + 1;
   }
 
-  /// process the next task in the queue
-  void _processNextTask(int isolateId) {
-    if (_taskQueues[isolateId]!.isNotEmpty) {
-      final nextTask = _taskQueues[isolateId]!.first;
-      _isIdle[isolateId] = false;
+  /// Finds an idle isolate and dispatches a task from the global queue to it.
+  void _dispatchTask() {
+    if (_globalTaskQueue.isNotEmpty) {
+      final idleIsolateId = _findIdleIsolate();
+      if (idleIsolateId != null) {
+        final task = _globalTaskQueue.removeFirst();
+        _activeTasks[idleIsolateId] = task;
+        _isIdle[idleIsolateId] = false;
+        // start the timer
+        if (task.timer != null) {
+          task.timer!.start();
+        }
 
-      // start the timer
-      if (nextTask.timer != null) {
-        nextTask.timer!.start();
+        // send a new task to the isolate
+        _sendPorts[idleIsolateId]!.send({
+          'function': task.function,
+          'message': task.message,
+          'taskId': _taskCount[idleIsolateId], // add task ID for debugging
+        });
       }
-
-      // send a new task to the isolate
-      _sendPorts[isolateId]!.send({
-        'function': nextTask.function,
-        'message': nextTask.message,
-        'taskId': _taskCount[isolateId], // add task ID for debugging
-      });
-    } else {
-      _isIdle[isolateId] = true;
     }
   }
 
   /// execute a task, select the optimal isolate based on performance data
   Future<R> execute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
-    await _ensureInitialized();
+    // If the pool isn't initialized yet, run the first task(s) on the main thread
+    // to avoid startup latency. Kick off initialization in the background for subsequent tasks.
+    if (!_isInitialized) {
+      // Don't await this. Let it run in the background.
+      _ensureInitialized();
+      // Execute the function directly on the main thread for immediate responsiveness.
+      return function(message);
+    }
 
-    // find the optimal isolate instance
-    int targetId = _findOptimalIsolate();
+    // If we are here, the pool is initialized, so we can proceed with dispatching to an isolate.
+    // This await ensures that if initialization is in progress, we wait for it to complete.
+    await _ensureInitialized();
 
     // timer for performance analysis
     final timer = Stopwatch();
 
     // create a task and add it to the queue
     final task = _IsolateTask<R>(function, message, timer: timer);
-    _taskQueues[targetId]!.add(task);
-
-    // if the isolate is idle, process the task immediately
-    if (_isIdle[targetId]!) {
-      _processNextTask(targetId);
-    }
+    _globalTaskQueue.add(task);
+    _dispatchTask(); // Try to dispatch immediately.
 
     return task.completer.future;
   }
 
-  /// find the optimal isolate instance, considering queue length and historical task processing time
-  int _findOptimalIsolate() {
-    // if there is only one isolate, return immediately
-    if (_maxPoolSize == 1) return 0;
+  /// Finds an idle isolate using a round-robin strategy to ensure fair distribution.
+  int? _findIdleIsolate() {
+    // Check all available isolates, starting from the next one in the rotation.
+    for (int i = 0; i < _maxPoolSize; i++) {
+      final int isolateId = (_nextIsolateId + i) % _maxPoolSize;
 
-    double minScore = double.infinity;
-    int targetId = 0;
-
-    // consider queue length and average task processing time
-    for (int id = 0; id < _maxPoolSize; id++) {
-      final queueLength = _taskQueues[id]!.length;
-      final avgTime = _avgTaskTime[id]!;
-
-      // use weighted scoring based on queue length and average execution time
-      // the weighting factor can be adjusted based on the application
-      double score = (queueLength * 1.5) + (avgTime / 50.0);
-
-      if (score < minScore) {
-        minScore = score;
-        targetId = id;
+      // We can only use isolates that are fully initialized (have a sendPort).
+      if (_sendPorts.containsKey(isolateId) && _isIdle[isolateId] == true) {
+        // Found an idle isolate. Update the starting point for the next search.
+        _nextIsolateId = (isolateId + 1) % _maxPoolSize;
+        return isolateId;
       }
     }
-
-    return targetId;
+    return null;
   }
 
   /// Close all isolates
@@ -214,22 +221,15 @@ class _IsolatePool {
     }
     _isolates.clear();
     _sendPorts.clear();
-    _taskQueues.clear();
+    _globalTaskQueue.clear();
+    _activeTasks.clear();
     _isIdle.clear();
     _taskCount.clear();
     _avgTaskTime.clear();
     _isInitialized = false;
+    _initCompleter = null;
+    _nextIsolateId = 0;
   }
-}
-
-/// Top-level function for pre-warming isolates.
-int _warmupTask(int value) {
-  // Perform some simple calculations to ensure the isolate is fully initialized.
-  int result = 0;
-  for (int i = 0; i < 1000; i++) {
-    result += i * value;
-  }
-  return result;
 }
 
 /// isolate worker entry point
@@ -271,6 +271,6 @@ Future<R> compute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
 
 /// Pre-warms the isolate pool to reduce latency on the first compute call.
 Future<void> prewarm() async {
-  // this will initialize and pre-warm all isolates in the pool
+  // this will initialize and kick off the pre-warming of all isolates in the pool
   await _isolatePool._ensureInitialized();
 }

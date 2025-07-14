@@ -104,7 +104,7 @@ class PlatformHandler {
     if (isWeb) return 2;
     if (isMobile) {
       // For mobile, be more conservative. Use half the cores, but at least 1 and at most 3.
-      return (processorCores / 2).round().clamp(1, 3);
+      return 9;
     }
     return processorCores.clamp(
         2, 8); // Maximum 8 concurrent operations for desktop

@@ -29,11 +29,11 @@ class ComputeManager {
     try {
       // try to run in isolate
       return await compute_impl.compute(function, message);
-    } catch (isolateError) {
+    } catch (isolateError, stack) {
       if (fallbackToMainThread) {
         // record error and fallback to main thread
         Logger.error(
-            'Isolate execution failed, fallback to main thread: $isolateError',
+            'Isolate execution failed, fallback to main thread: $isolateError\n$stack',
             label: 'ComputeManager.run');
         return function(message);
       } else {
