@@ -175,7 +175,12 @@ Future<IndexProcessingResult> processIndexPartition(
     // Insert each entry into the B+ tree.
     // This is the main CPU-intensive part.
     int failedCount = 0;
+    int processedCount = 0;
     for (final bufferEntry in request.entries) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       try {
         final entry = bufferEntry.indexEntry;
         await btree.insert(entry.indexKey, entry.recordPointer.toString());
@@ -255,9 +260,14 @@ Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
 
     // Track which keys were processed
     final processedKeys = <String>[];
+    int processedCount = 0;
 
     // Process each key to delete
     for (final compositeKey in request.keysToProcess) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       try {
         // Get index entry
         final indexEntry = request.entriesToDelete[compositeKey];
@@ -634,9 +644,14 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
     dynamic minPk;
     dynamic maxPk;
     String primaryKey = request.primaryKey;
+    int processedCount = 0;
 
     // traverse once to find first non-deleted record and initialize minPk/maxPk
     for (final record in request.records) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       if (!isDeletedRecord(record) && record.containsKey(primaryKey)) {
         final pk = record[primaryKey];
         if (pk != null) {
@@ -658,7 +673,9 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
     // continue to traverse remaining records, find min/max values and count
     for (int i = 0; i < request.records.length; i++) {
       final record = request.records[i];
-
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       // skip already processed first record and invalid records
       if (i == 0 && nonEmptyCount == 1) continue;
 
@@ -688,9 +705,13 @@ Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
       PartitionMeta? maxIdxPartition;
       // 2. Find the partition itself for comparing internal ordered
       PartitionMeta? existingPartition;
-
+      int processedCount = 0;
       // Single traversal to find required partitions
       for (var partition in request.existingPartitions!) {
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
         // Skip empty partition
         if (partition.totalRecords <= 0 ||
             partition.minPrimaryKey == null ||
@@ -859,9 +880,13 @@ Future<PartitionAssignmentResult> assignRecordsToPartitions(
         totalDataSize = 100 * records.length;
       }
     }
-
+    int processedCount = 0;
     // process records in order, assign all records to partitions
     for (var record in records) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       int recordSize;
       try {
         // calculate record size
@@ -1954,6 +1979,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
+          if (i % 200 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       } else {
         // Regular generation method: consider step and sequence number limit
@@ -1968,6 +1996,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
+          if (i % 500 == 0) {
+            await Future.delayed(Duration.zero);
+          }
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -2032,6 +2063,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
+          if (i % 200 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       } else {
         // Regular generation method
@@ -2046,6 +2080,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
+          if (i % 500 == 0) {
+            await Future.delayed(Duration.zero);
+          }
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -2087,6 +2124,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
+          if (i % 200 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       }
 
@@ -2143,12 +2183,17 @@ Future<BPlusTree> buildTreeTask(BuildTreeRequest request) async {
   final comparator = ValueMatcher.getMatcher(request.matcherType);
   final bTree = BPlusTree(isUnique: request.isUnique, comparator: comparator);
 
+  int processedCount = 0;
   for (final content in request.partitionsContent) {
     if (content.isEmpty) continue;
 
     final data = _parseBTreeData(content);
     for (final entry in data.entries) {
       for (final value in entry.value) {
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
         await bTree.insert(entry.key, value);
       }
     }
@@ -2235,7 +2280,12 @@ Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
     final comparator = ValueMatcher.getMatcher(request.matcherType);
     final btree = await BPlusTree.fromString(request.content,
         isUnique: request.isUnique, comparator: comparator);
+    int processedCount = 0;
     for (final key in request.keys) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       final results = await btree.search(key);
       if (results.isNotEmpty) {
         found[key] = results;

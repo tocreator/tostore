@@ -627,7 +627,8 @@ class DatabaseTester {
             final batch = insertFutures.sublist(i, end);
             final results = await Future.wait(batch, eagerError: true);
 
-            for (final r in results) {
+            for (int j = 0; j < results.length; j++) {
+              final r = results[j];
               if (r.isSuccess && r.successKeys.isNotEmpty) {
                 final originalData = insertsToRun[r.hashCode];
                 final Map<String, dynamic> newItem = {
@@ -638,6 +639,9 @@ class DatabaseTester {
                   newItem[nameField] = originalData[nameField];
                 }
                 baseItems.add(newItem);
+              }
+              if (j % 50 == 0) {
+                await Future.delayed(Duration.zero);
               }
             }
             await Future.delayed(Duration.zero); // Yield to the event loop
@@ -670,9 +674,12 @@ class DatabaseTester {
           }
 
           // Add Deletes
-          for (final item in itemsToDeleteLocal) {
-            operations
-                .add(db.delete(tableName).where(idField, '=', item[idField]));
+          for (int i = 0; i < itemsToDeleteLocal.length; i++) {
+            final item = itemsToDeleteLocal[i];
+            operations.add(db.delete(tableName).where(idField, '=', item[idField]));
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
         }
 

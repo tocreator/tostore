@@ -311,7 +311,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         });
         // Fetch data if the data view is active
         if (_selectedView == AppView.dataView) {
-          await _fetchTableData(resetPage: true);
+          // await _fetchTableData(resetPage: true);
         }
       }
     } catch (e, s) {

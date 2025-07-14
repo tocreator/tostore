@@ -71,7 +71,7 @@ class QueryExecutor {
         final results = await _executeQueryPlan(
             plan, tableName, condition, joins, schemas, matcher);
         if (orderBy != null) {
-          _applySort(results, orderBy, schemas, tableName);
+          await _applySort(results, orderBy, schemas, tableName);
         }
         return _paginateResults(results, limit, offset);
       }
@@ -105,7 +105,7 @@ class QueryExecutor {
           final updatedResults = resultMap.values.toList();
           // apply sort and pagination
           if (orderBy != null) {
-            _applySort(updatedResults, orderBy, schemas, tableName);
+            await _applySort(updatedResults, orderBy, schemas, tableName);
           }
           final filteredResults = await _filterPendingBuffer(
               tableName, updatedResults, matcher,
@@ -156,7 +156,7 @@ class QueryExecutor {
                     ?.map((e) => e.toString())
                     .toList();
                 if (pkValues != null && pkValues.isNotEmpty) {
-                  results = _dataStore.dataCacheManager
+                  results = await _dataStore.dataCacheManager
                       .getRecordsByPrimaryKeys(tableName, pkValues);
                   isPrimaryKeyQuery = results.isNotEmpty;
                 }
@@ -171,7 +171,7 @@ class QueryExecutor {
           }
 
           if (orderBy != null) {
-            _applySort(results, orderBy, schemas, tableName);
+            await _applySort(results, orderBy, schemas, tableName);
           }
 
           // Update access time
@@ -211,7 +211,7 @@ class QueryExecutor {
 
       // 4. apply sort
       if (orderBy != null) {
-        _applySort(results, orderBy, schemas, tableName);
+        await _applySort(results, orderBy, schemas, tableName);
       }
 
       // 5. apply pagination and return results
@@ -468,7 +468,8 @@ class QueryExecutor {
     switch (joinType) {
       case 'inner':
         // Inner join: only return records matching in both tables
-        for (var leftRecord in leftRecords) {
+        for (var i = 0; i < leftRecords.length; i++) {
+          final leftRecord = leftRecords[i];
           // Find all matching right table records
           final matchingRightRecords = rightRecords
               .where((rightRecord) => _matchJoinCondition(
@@ -482,7 +483,8 @@ class QueryExecutor {
               .toList();
 
           // Only add result if matches found
-          for (var rightRecord in matchingRightRecords) {
+          for (var i = 0; i < matchingRightRecords.length; i++) {
+            final rightRecord = matchingRightRecords[i];
             // Create new record for consistency
             final joinedRecord = <String, dynamic>{};
 
@@ -514,12 +516,16 @@ class QueryExecutor {
 
             resultRecords.add(joinedRecord);
           }
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
         break;
 
       case 'left':
         // Left join: returns all records from left table, even if there are no matches in right table
-        for (var leftRecord in leftRecords) {
+        for (var i = 0; i < leftRecords.length; i++) {
+          final leftRecord = leftRecords[i];
           // Find all matching right table records
           final matchingRightRecords = rightRecords
               .where((rightRecord) => _matchJoinCondition(
@@ -534,7 +540,8 @@ class QueryExecutor {
 
           if (matchingRightRecords.isNotEmpty) {
             // Has matches, add all matching records
-            for (var rightRecord in matchingRightRecords) {
+            for (var i = 0; i < matchingRightRecords.length; i++) {
+              final rightRecord = matchingRightRecords[i];
               // Create new record
               final joinedRecord = <String, dynamic>{};
 
@@ -564,6 +571,9 @@ class QueryExecutor {
               }
 
               resultRecords.add(joinedRecord);
+              if (i % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
           } else {
             // No matches, add left record and fill right table fields with null
@@ -599,12 +609,16 @@ class QueryExecutor {
 
             resultRecords.add(joinedRecord);
           }
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
         break;
 
       case 'right':
         // Right join: returns all records from right table, even if there are no matches in left table
-        for (var rightRecord in rightRecords) {
+        for (var i = 0; i < rightRecords.length; i++) {
+          final rightRecord = rightRecords[i];
           // Find all matching left table records
           final matchingLeftRecords = leftRecords
               .where((leftRecord) => _matchJoinCondition(
@@ -619,7 +633,8 @@ class QueryExecutor {
 
           if (matchingLeftRecords.isNotEmpty) {
             // Has matches, add all matching records
-            for (var leftRecord in matchingLeftRecords) {
+            for (var i = 0; i < matchingLeftRecords.length; i++) {
+              final leftRecord = matchingLeftRecords[i];
               // Create new record
               final joinedRecord = <String, dynamic>{};
 
@@ -649,6 +664,9 @@ class QueryExecutor {
               }
 
               resultRecords.add(joinedRecord);
+              if (i % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
           } else {
             // No matches, create empty left table record
@@ -681,6 +699,12 @@ class QueryExecutor {
             }
 
             resultRecords.add(joinedRecord);
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
+          }
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         break;
@@ -923,7 +947,8 @@ class QueryExecutor {
                     tableName, isGlobal, partitionIndex, primaryKey);
 
             final partitionResults = <Map<String, dynamic>>[];
-            for (var record in records) {
+            for (var i = 0; i < records.length; i++) {
+              final record = records[i];
               if (isDeletedRecord(record)) continue;
               if (matcher == null || matcher.matches(record)) {
                 partitionResults.add(record);
@@ -935,6 +960,9 @@ class QueryExecutor {
                   break;
                 }
               }
+              if (i % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
             return partitionResults;
           };
@@ -945,9 +973,14 @@ class QueryExecutor {
                 controller: controller,
                 label: 'QueryExecutor._performTableScan.optimized');
 
+        int processedCount = 0;
         for (final recordList in resultsFromPartitions) {
           for (final record in recordList ?? []) {
             resultMap[record[primaryKey].toString()] = record;
+          }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
       }
@@ -970,6 +1003,7 @@ class QueryExecutor {
           final stagedChanges =
               _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
 
+          int processedCount = 0;
           for (final entry in stagedChanges.writes.values) {
             final record = entry.data;
             if (entry.operation == BufferOperationType.insert) {
@@ -977,11 +1011,20 @@ class QueryExecutor {
             } else if (entry.operation == BufferOperationType.update) {
               _dataStore.dataCacheManager.updateCachedRecord(tableName, record);
             }
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
 
+          int deleteProcessedCount = 0;
           for (final key in stagedChanges.deletes) {
             _dataStore.dataCacheManager
                 .removeTableCacheForPrimaryKey(tableName, key);
+            deleteProcessedCount++;
+            if (deleteProcessedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
 
           // Now mark the cache as full and valid.
@@ -1090,17 +1133,22 @@ class QueryExecutor {
       for (var value in inValues) {
         // Optimization: If partitions are ordered, use binary search for each value.
         if (fileMeta.isOrdered == true) {
-          final partitionIndex = _findPartitionWithBinarySearch(
+          final partitionIndex = await _findPartitionWithBinarySearch(
               fileMeta.partitions!, value, pkMatcher);
           if (partitionIndex != null) {
             targetPartitions.add(partitionIndex);
           }
         } else {
           // Unordered, have to check all partitions for each value.
+          int partitionProcessedCount = 0;
           for (var partition in fileMeta.partitions!) {
             if (_isValueInRange(value, partition.minPrimaryKey,
                 partition.maxPrimaryKey, pkMatcher)) {
               targetPartitions.add(partition.index);
+            }
+            partitionProcessedCount++;
+            if (partitionProcessedCount % 100 == 0) {
+              await Future.delayed(Duration.zero);
             }
           }
         }
@@ -1121,7 +1169,7 @@ class QueryExecutor {
     if (fileMeta.isOrdered == true &&
         queryRange.min != null &&
         queryRange.min == queryRange.max) {
-      final partitionIndex = _findPartitionWithBinarySearch(
+      final partitionIndex = await _findPartitionWithBinarySearch(
           fileMeta.partitions!, queryRange.min, pkMatcher);
       if (partitionIndex != null) {
         return [partitionIndex];
@@ -1280,7 +1328,8 @@ class QueryExecutor {
           if (controller.isStopped) {
             return records;
           }
-          for (var record in records) {
+          for (var i = 0; i < records.length; i++) {
+            final record = records[i];
             // Skip deleted records
             if (isDeletedRecord(record)) continue;
 
@@ -1296,6 +1345,9 @@ class QueryExecutor {
                 controller.stop();
                 return records;
               }
+            }
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
             }
           }
           return records;
@@ -1315,8 +1367,8 @@ class QueryExecutor {
   ///
   /// When the number of partitions is large, binary search can reduce the query complexity from O(n) to O(log n)
   /// Return the found partition index, if not found, return null
-  int? _findPartitionWithBinarySearch(
-      List<dynamic> partitions, dynamic pkValue, MatcherFunction matcher) {
+  Future<int?> _findPartitionWithBinarySearch(List<dynamic> partitions,
+      dynamic pkValue, MatcherFunction matcher) async {
     if (partitions.isEmpty) return null;
 
     int left = 0;
@@ -1342,6 +1394,9 @@ class QueryExecutor {
         right = mid - 1; // Continue searching on the left
       } else {
         left = mid + 1; // Continue searching on the right
+      }
+      if (mid % 50 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 
@@ -1425,6 +1480,7 @@ class QueryExecutor {
       final results = <Map<String, dynamic>>[];
 
       // Process each partition's results in batch
+      int processedCount = 0;
       for (final entry in pointersByPartition.entries) {
         final partitionId = entry.key;
         final pointers = entry.value;
@@ -1440,12 +1496,20 @@ class QueryExecutor {
         final records = await _dataStore.tableDataManager
             .getRecordsByPointers(tableName, partitionId, storeIndexes);
 
-        for (final record in records) {
+        for (var i = 0; i < records.length; i++) {
+          final record = records[i];
           // The index search is the primary filter.
           // Further filtering by matcher ensures all other `AND` clauses are met.
           if (matcher == null || matcher.matches(record)) {
             results.add(record);
           }
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
+        }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
@@ -1458,8 +1522,8 @@ class QueryExecutor {
   }
 
   /// apply sort
-  void _applySort(List<Map<String, dynamic>> data, List<String> orderBy,
-      Map<String, TableSchema> schemas, String tableName) {
+  Future<void> _applySort(List<Map<String, dynamic>> data, List<String> orderBy,
+      Map<String, TableSchema> schemas, String tableName) async {
     try {
       // Create sort directions list with same length as orderBy, default all to ascending (true)
       final List<bool> sortDirections = List.filled(orderBy.length, true);
@@ -1486,6 +1550,9 @@ class QueryExecutor {
         } else {
           // No special marker, use original field name, default ascending
           sortFields[i] = field;
+        }
+        if (i % 50 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
@@ -1606,15 +1673,20 @@ class QueryExecutor {
     final resultMap = <String, Map<String, dynamic>>{};
 
     // 1. Populate with initial results.
-    for (final record in results) {
+    for (var i = 0; i < results.length; i++) {
+      final record = results[i];
       final pkValue = record[primaryKey]?.toString();
       if (pkValue != null) {
         resultMap[pkValue] = record;
+      }
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 
     // 2. Apply pending writes if requested. This adds new records or updates existing ones.
     if (applyWriteBuffer && pendingWrites != null && pendingWrites.isNotEmpty) {
+      int processedCount = 0;
       for (final entry in pendingWrites.values) {
         final record = entry.data;
         // A record in the write buffer must be considered.
@@ -1625,6 +1697,10 @@ class QueryExecutor {
             resultMap[pkValue] = record;
           }
         }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
     }
 
@@ -1633,8 +1709,13 @@ class QueryExecutor {
     if (pendingDeleteKeys.isNotEmpty) {
       if (resultMap.length > pendingDeleteKeys.length) {
         // If the result map is larger, it's faster to iterate the smaller delete set.
+        int processedCount = 0;
         for (final key in pendingDeleteKeys) {
           resultMap.remove(key);
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
       } else {
         // If the delete set is larger or equal, it's faster to iterate the map.

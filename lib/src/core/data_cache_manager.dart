@@ -551,10 +551,14 @@ class DataCacheManager {
       final tableCache = tableCaches[tableName];
       if (tableCache != null) {
         // Now, remove the records from the cache.
-        for (final pkValue in primaryKeyValues) {
+        for (var i = 0; i < primaryKeyValues.length; i++) {
+          final pkValue = primaryKeyValues[i];
           final removed = tableCache.recordsMap.remove(pkValue);
           if (removed != null) {
             tableCache.removeRecordAndUpdateStats(removed);
+          }
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
       }
@@ -724,9 +728,13 @@ class DataCacheManager {
       }
     }
 
-    for (var key in keysToRemove) {
+    for (var i = 0; i < keysToRemove.length; i++) {
+      final key = keysToRemove.elementAt(i);
       _queryCache.invalidate(key);
       tableDependency.remove(key);
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     if (tableDependency.isEmpty) {
@@ -758,7 +766,7 @@ class DataCacheManager {
 
   /// Clean up all queries related to a specific table
   Future<void> _cleanupAllTableRelatedQueries(String tableName) async {
-    _cleanupFullTableQueriesOnly(tableName);
+    await _cleanupFullTableQueriesOnly(tableName);
 
     final keysToRemove = <String>[];
     final allQueryKeys = _queryCache.cache.keys.toList();
@@ -769,26 +777,31 @@ class DataCacheManager {
         keysToRemove.add(key);
       }
       processedCount++;
-      if (processedCount % 500 == 0) {
+      if (processedCount % 50 == 0) {
         // Yield to event loop to avoid blocking UI
         await Future.delayed(Duration.zero);
       }
     }
 
-    for (var key in keysToRemove) {
+    for (var i = 0; i < keysToRemove.length; i++) {
+      final key = keysToRemove.elementAt(i);
       _queryCache.invalidate(key);
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     _tableDependencies.remove(tableName);
   }
 
   /// Clean up all queries related to a specific table
-  void _cleanupFullTableQueriesOnly(String tableName) {
+  Future<void> _cleanupFullTableQueriesOnly(String tableName) async {
     final tableDependency = _tableDependencies[tableName];
     if (tableDependency == null) return;
 
     // List of keys to clean up
     final keysToRemove = <String>[];
+    int processedCount = 0;
 
     // Check each query, only clean up full table cache queries
     for (var cacheKeyStr in tableDependency.keys.toList()) {
@@ -805,12 +818,20 @@ class DataCacheManager {
           queryInfo.queryKey.condition.build().isEmpty) {
         keysToRemove.add(cacheKeyStr);
       }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     // Remove related query cache
-    for (var key in keysToRemove) {
+    for (var i = 0; i < keysToRemove.length; i++) {
+      final key = keysToRemove.elementAt(i);
       _queryCache.invalidate(key);
       tableDependency.remove(key);
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     // If there are no related queries, clean up dependencies
@@ -1132,16 +1153,21 @@ class DataCacheManager {
   }
 
   /// Get records by multiple primary keys
-  List<Map<String, dynamic>> getRecordsByPrimaryKeys(
-      String tableName, List<String> pkValues) {
+  Future<List<Map<String, dynamic>>> getRecordsByPrimaryKeys(
+      String tableName, List<String> pkValues) async {
     final cache = tableCaches[tableName];
     if (cache == null) return [];
 
     final results = <Map<String, dynamic>>[];
+    int processedCount = 0;
     for (final pkValue in pkValues) {
       final record = cache.getRecord(pkValue);
       if (record != null) {
         results.add(record.record);
+      }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
     return results;
@@ -1227,14 +1253,19 @@ class DataCacheManager {
           keysToRemove.add(key);
         }
         processedCount++;
-        if (processedCount % 500 == 0) {
+        if (processedCount % 50 == 0) {
           // Yield to event loop to avoid blocking UI
           await Future.delayed(Duration.zero);
         }
       }
 
+      processedCount = 0;
       for (var key in keysToRemove) {
         _queryCache.invalidate(key);
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // 3. Clear schema cache
@@ -1375,6 +1406,7 @@ class DataCacheManager {
     final keysToRemove = <String>{};
     final allEntries = _queryCache.cache.entries.toList();
 
+    int processedCount = 0;
     for (final entry in allEntries) {
       try {
         final keyMap = jsonDecode(entry.key) as Map<String, dynamic>;
@@ -1385,10 +1417,19 @@ class DataCacheManager {
         // If key is malformed, assume it's an auto-cache and remove it for safety.
         keysToRemove.add(entry.key);
       }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
+    processedCount = 0;
     for (final key in keysToRemove) {
       _queryCache.invalidate(key);
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     // Also clean up _tableDependencies for the removed keys

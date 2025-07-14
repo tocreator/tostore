@@ -267,7 +267,7 @@ class IndexManager {
 
         // Add to appropriate bucket
         buckets.putIfAbsent(bucketKey, () => <String>[]).add(indexName);
-        if (i % 500 == 0) {
+        if (i % 50 == 0) {
           await Future.delayed(Duration.zero);
         }
       }
@@ -293,7 +293,7 @@ class IndexManager {
 
             removedSize += metaSize;
           }
-          if (i % 500 == 0) {
+          if (i % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -353,25 +353,35 @@ class IndexManager {
   }
 
   /// Check all buffer sizes
-  void _checkBufferSizes() {
+  Future<void> _checkBufferSizes() async {
     bool hasLargeBuffer = false;
     List<String> keysToProcess = [];
 
     // Check insert buffer
+    int processedCount = 0;
     for (final key in _writeBuffer.keys) {
       if (_writeBuffer[key] != null &&
           _writeBuffer[key]!.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
       }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     // Check delete buffer
+    processedCount = 0;
     for (final key in _deleteBuffer.keys) {
       if (_deleteBuffer[key] != null &&
           _deleteBuffer[key]!.length >= _fastProcessThreshold) {
         hasLargeBuffer = true;
         keysToProcess.add(key);
+      }
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 
@@ -578,7 +588,7 @@ class IndexManager {
             fallbackDeletes[entry.key] = entry.value;
           }
           processedCount++;
-          if (processedCount % 500 == 0) {
+          if (processedCount % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -592,6 +602,7 @@ class IndexManager {
       final partitionMap = {for (var p in indexMeta.partitions) p.index: p};
 
       // --- Process deletes for keys found in specific partitions (ordered indexes) ---
+      int processedCount = 0;
       for (final job in partitionedDeletes.entries) {
         final partitionIndex = job.key;
         final entriesForPartition = job.value;
@@ -608,6 +619,10 @@ class IndexManager {
               updatedPartitions,
               matcherType,
             ));
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Execute tasks for ordered hits first.
@@ -625,6 +640,7 @@ class IndexManager {
         if (isUniqueIndex) {
           final controller = ParallelController();
           final uniqueFallbackTasks = <Future<void> Function()>[];
+          int processedCount = 0;
           for (final partition in indexMeta.partitions) {
             uniqueFallbackTasks.add(() => _performDeleteOnPartition(
                   tableName,
@@ -638,6 +654,10 @@ class IndexManager {
                   lockResource: listLockResource,
                   controller: controller,
                 ));
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
           if (uniqueFallbackTasks.isNotEmpty) {
             await ParallelProcessor.execute<void>(uniqueFallbackTasks,
@@ -648,6 +668,7 @@ class IndexManager {
         } else {
           // For non-unique indexes, we must check all partitions.
           final nonUniqueFallbackTasks = <Future<void> Function()>[];
+          int processedCount = 0;
           for (final partition in indexMeta.partitions) {
             nonUniqueFallbackTasks.add(() => _performDeleteOnPartition(
                   tableName,
@@ -658,6 +679,10 @@ class IndexManager {
                   updatedPartitions,
                   matcherType,
                 ));
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
           if (nonUniqueFallbackTasks.isNotEmpty) {
             await ParallelProcessor.execute<void>(nonUniqueFallbackTasks,
@@ -964,7 +989,7 @@ class IndexManager {
                     currentSize += estimatedEntrySize;
 
                     processedCount++;
-                    if (processedCount % 500 == 0) {
+                    if (processedCount % 50 == 0) {
                       await Future.delayed(Duration.zero);
                     }
                   } catch (e) {
@@ -1036,6 +1061,7 @@ class IndexManager {
                       }
                     }(); // Immediately invoke the async closure
                     computeFutures.add(future);
+                    await Future.delayed(Duration.zero);
                   }
 
                   // Step 2 (for batch): Await all compute tasks to finish.
@@ -1132,6 +1158,7 @@ class IndexManager {
                           'Error creating partition metadata: $e\n$stack',
                           label: 'IndexManager._processBatchIndexWrites');
                     }
+                      await Future.delayed(Duration.zero);
                   }
                 }
 
@@ -1280,7 +1307,7 @@ class IndexManager {
   }
 
   /// Update index access weight
-  void _updateIndexAccessWeight(String cacheKey) {
+  Future<void> _updateIndexAccessWeight(String cacheKey) async {
     try {
       final now = DateTime.now();
       final currentDate = DateTime(now.year, now.month, now.day);
@@ -1328,7 +1355,7 @@ class IndexManager {
       _indexAccessWeights[cacheKey] = weights;
 
       // Check if cache needs to be cleaned
-      _checkAndCleanupCache();
+      await _checkAndCleanupCache();
     } catch (e) {
       // Weight update exception
       Logger.error('Failed to update index access weight: $e',
@@ -1337,7 +1364,7 @@ class IndexManager {
   }
 
   /// Check and clean cache
-  void _checkAndCleanupCache() {
+  Future<void> _checkAndCleanupCache() async {
     try {
       final cacheSize = _indexCache.length;
 
@@ -1375,6 +1402,9 @@ class IndexManager {
         _indexFullyCached.remove(key);
         _indexAccessWeights.remove(key);
         removed++;
+        if (removed % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       Logger.debug('Cleaned $removed low weight index caches',
@@ -1641,7 +1671,7 @@ class IndexManager {
       // If index is fully cached, just return the cached instance
       if (_indexCache.containsKey(cacheKey) &&
           _indexFullyCached[cacheKey] == true) {
-        _updateIndexAccessWeight(cacheKey);
+        await _updateIndexAccessWeight(cacheKey);
         return _indexCache[cacheKey];
       }
 
@@ -1676,6 +1706,7 @@ class IndexManager {
             return null;
           }
         });
+          await Future.delayed(Duration.zero);
       }
 
       final partitionContents = await ParallelProcessor.execute<String?>(tasks,
@@ -1708,7 +1739,7 @@ class IndexManager {
         // Worth caching, but not marked as fully cached
         _indexCache[cacheKey] = btree;
         _indexFullyCached[cacheKey] = false;
-        _updateIndexAccessWeight(cacheKey);
+        await _updateIndexAccessWeight(cacheKey);
       }
 
       return btree;
@@ -1745,6 +1776,7 @@ class IndexManager {
             return null;
           }
         });
+        await Future.delayed(Duration.zero);
       }
       final partitionContents = await ParallelProcessor.execute<String?>(tasks,
           label: 'IndexManager._loadIndexFromFile.read');
@@ -2362,6 +2394,7 @@ class IndexManager {
       }
 
       // Process each record
+      int processedCount = 0;
       for (final record in records) {
         final primaryValue = record[primaryKey];
         if (primaryValue == null) continue;
@@ -2405,9 +2438,14 @@ class IndexManager {
             }
           }
         }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Batch update write buffer
+       processedCount = 0;
       for (final entry in indexUpdates.entries) {
         final indexName = entry.key;
         final updates = entry.value;
@@ -2447,6 +2485,10 @@ class IndexManager {
 
             // Add to buffer
             _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
           }
         }
         _indexLastWriteTime[cacheKey] = DateTime.now();
@@ -2455,12 +2497,17 @@ class IndexManager {
         if (_indexCache.containsKey(cacheKey)) {
           final btree = _indexCache[cacheKey]!;
 
+          int insertProcessedCount = 0;
           for (final keyEntry in updates.entries) {
             final key = keyEntry.key;
             final values = keyEntry.value;
 
             for (final value in values) {
               await btree.insert(key, value);
+              insertProcessedCount++;
+              if (insertProcessedCount % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
           }
         }
@@ -2837,7 +2884,12 @@ class IndexManager {
       bool anyPartitionProcessed = false;
 
       // Process each partition one by one
+      int processedCount = 0;
       for (final partition in meta.partitions) {
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
         final partitionPath = await _dataStore.pathManager
             .getIndexPartitionPath(tableName, indexName, partition.index);
 
@@ -3453,6 +3505,7 @@ class IndexManager {
         final meta = await _getIndexMeta(tableName, indexName);
         if (meta != null) {
           // delete all partition files
+          int processedCount = 0;
           for (final partition in meta.partitions) {
             try {
               final partitionPath = await _dataStore.pathManager
@@ -3460,6 +3513,10 @@ class IndexManager {
 
               if (await _dataStore.storage.existsFile(partitionPath)) {
                 await _dataStore.storage.deleteFile(partitionPath);
+              }
+              processedCount++;
+              if (processedCount % 50 == 0) {
+                await Future.delayed(Duration.zero);
               }
             } catch (e) {
               Logger.error('Failed to delete index partition file: $e',
@@ -3665,11 +3722,16 @@ class IndexManager {
       final processedPartitions = <int>{};
 
       // Count total entries in write buffer for this table
-      int getTableWriteBufferSize() {
+      Future<int> getTableWriteBufferSize() async {
         int size = 0;
+        int processedCount = 0;
         for (final key in _writeBuffer.keys) {
           if (key.startsWith('$tableName:') && _writeBuffer[key] != null) {
             size += _writeBuffer[key]!.length;
+          }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         return size;
@@ -3715,6 +3777,7 @@ class IndexManager {
         // Sort partitions for ordered processing
         final sortedPartitions = processedPartitions.toList()..sort();
 
+        int processedCount = 0;
         for (final partitionId in sortedPartitions) {
           final partitionData = partitionIndexData[partitionId];
           if (partitionData == null) continue;
@@ -3731,16 +3794,22 @@ class IndexManager {
               for (final pointer in pointers) {
                 await _addToInsertBuffer(
                     tableName, indexName, indexKey, pointer);
+                processedCount++;
+                if (processedCount % 50 == 0) {
+                  await Future.delayed(Duration.zero);
+                }
               }
             }
           }
 
           // Remove processed partition data from memory
           partitionIndexData.remove(partitionId);
+
+            await Future.delayed(Duration.zero);
         }
 
         // Get current buffer size
-        final currentBufferSize = getTableWriteBufferSize();
+        final currentBufferSize = await getTableWriteBufferSize();
 
         // Check if buffer size exceeds threshold
         if (currentBufferSize > dynamicThreshold) {
@@ -3831,6 +3900,9 @@ class IndexManager {
               }
 
               recordCount++;
+              if (recordCount % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
 
             // Mark this partition as processed
@@ -3844,7 +3916,7 @@ class IndexManager {
             if (currentPartitionCount >= maxConcurrent ||
                 recordCountThreshold) {
               // Check if write buffer is getting too large
-              final currentBufferSize = getTableWriteBufferSize();
+              final currentBufferSize = await getTableWriteBufferSize();
 
               // If buffer is already approaching threshold, process now
               if (currentBufferSize > dynamicThreshold * 0.7) {
@@ -3905,8 +3977,8 @@ class IndexManager {
           ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
 
       // for large index, use sampling detection
-      final isOrdered =
-          _checkPartitionsOrderBySampling(meta.partitions, matcher);
+      final isOrdered = await _checkPartitionsOrderBySampling(
+          meta.partitions, matcher);
 
       // update meta
       final updatedMeta = meta.copyWith(isOrdered: isOrdered);
@@ -3922,8 +3994,8 @@ class IndexManager {
   }
 
   /// check partitions order by sampling
-  bool _checkPartitionsOrderBySampling(
-      List<IndexPartitionMeta> partitions, MatcherFunction matcher) {
+  Future<bool> _checkPartitionsOrderBySampling(
+      List<IndexPartitionMeta> partitions, MatcherFunction matcher) async {
     if (partitions.isEmpty || partitions.length == 1) return true;
 
     // sample detection, check at most 10 uniformly distributed samples
@@ -3956,6 +4028,11 @@ class IndexManager {
 
       // update lastMaxKey
       lastMaxKey = partition.maxKey;
+
+      // yield to the event loop
+      if (i % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     return true;
@@ -4001,7 +4078,7 @@ class IndexManager {
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
-          if (processedCount % 500 == 0) {
+          if (processedCount % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -4113,7 +4190,7 @@ class IndexManager {
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
-          if (processedCount % 500 == 0) {
+          if (processedCount % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -4124,7 +4201,7 @@ class IndexManager {
       final cacheKey = _getIndexCacheKey(tableName, indexName);
       if (_indexCache.containsKey(cacheKey) &&
           _indexFullyCached[cacheKey] == true) {
-        _updateIndexAccessWeight(cacheKey);
+        await _updateIndexAccessWeight(cacheKey);
         final btree = _indexCache[cacheKey]!;
         final pointers = await performBTreeSearchAndGroup(btree);
         return IndexSearchResult(pointersByPartition: pointers);
@@ -4135,7 +4212,7 @@ class IndexManager {
         final btree = await _loadIndexFromFile(
             tableName, indexName, meta, matcher, matcherType);
         if (btree == null) return IndexSearchResult.tableScan();
-        _updateIndexAccessWeight(cacheKey);
+        await _updateIndexAccessWeight(cacheKey);
         _indexCache[cacheKey] = btree;
         _indexFullyCached[cacheKey] = true;
         _indexSizeCache[cacheKey] = _estimateIndexSize(btree);
@@ -4209,7 +4286,7 @@ class IndexManager {
         }
 
         // Yield to the event loop to prevent UI jank if there are many indexes.
-        if (i % 5 == 4) {
+        if (i % 50 == 0) {
           await Future.delayed(Duration.zero);
         }
       }
@@ -4237,6 +4314,7 @@ class IndexManager {
       // Search write buffer first, as it contains the most recent, not-yet-persisted data.
       if (_writeBuffer.containsKey(cacheKey)) {
         final buffer = _writeBuffer[cacheKey]!;
+        int processedCount = 0;
         for (final entry in buffer.values) {
           if (keysToSearch.contains(entry.indexEntry.indexKey)) {
             final key = entry.indexEntry.indexKey;
@@ -4253,12 +4331,17 @@ class IndexManager {
             allResults.putIfAbsent(key, () => []).add(pointer);
           }
         }
+
+        // yield to the event loop
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // 1. Check cache first - if fully loaded, perform search in memory and merge.
       if (_indexCache.containsKey(cacheKey) &&
           _indexFullyCached[cacheKey] == true) {
-        _updateIndexAccessWeight(cacheKey);
+        await _updateIndexAccessWeight(cacheKey);
         final btree = _indexCache[cacheKey]!;
         int processedCount = 0;
         for (final key in keys) {
@@ -4275,7 +4358,7 @@ class IndexManager {
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
-          if (processedCount % 20 == 0) {
+          if (processedCount % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -4310,7 +4393,7 @@ class IndexManager {
 
           // Yield to the event loop to prevent UI jank if there are many indexes.
           processedCount++;
-          if (processedCount % 20 == 0) {
+          if (processedCount % 50 == 0) {
             await Future.delayed(Duration.zero);
           }
         }

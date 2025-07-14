@@ -126,7 +126,7 @@ class TableDataManager {
   }
 
   /// Clean up table metadata cache
-  void _cleanupTableMetaCache() {
+  Future<void> _cleanupTableMetaCache() async {
     try {
       if (_fileMetaCache.isEmpty) return;
 
@@ -153,6 +153,7 @@ class TableDataManager {
 
       // Single pass to categorize entries into time buckets
       // Use epoch hours as bucket keys (rough time division)
+      int processedCount = 0;
       for (final entry in _fileMetaCache.entries) {
         final tableName = entry.key;
 
@@ -169,11 +170,17 @@ class TableDataManager {
 
         // Add to appropriate bucket
         buckets.putIfAbsent(bucketKey, () => <String>[]).add(tableName);
+
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Process buckets from oldest to newest
       final sortedBuckets = buckets.keys.toList()..sort();
 
+       processedCount = 0;
       for (final bucketKey in sortedBuckets) {
         final tablesInBucket = buckets[bucketKey]!;
 
@@ -190,6 +197,11 @@ class TableDataManager {
             _lastModifiedTimes.remove(tableName);
 
             removedSize += metaSize;
+          }
+
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
 
@@ -286,6 +298,7 @@ class TableDataManager {
         label: 'TableDataManager._calculateTableStatistics',
       );
 
+      int processedCount = 0;
       // Iterate through the results to calculate statistics
       for (final meta in metaList) {
         if (meta != null) {
@@ -296,6 +309,10 @@ class TableDataManager {
           if (meta.partitions != null) {
             for (final partition in meta.partitions!) {
               totalSize += partition.fileSizeInBytes;
+              processedCount++;
+              if (processedCount % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
             }
           }
         }
@@ -534,6 +551,7 @@ class TableDataManager {
       int totalRecords = 0;
       final maxBatchSize = _dataStore.config.maxBatchSize;
 
+      int processedCount = 0;
       for (final entry in _writeBuffer.entries) {
         final queueSize = entry.value.length;
         totalRecords += queueSize;
@@ -547,13 +565,18 @@ class TableDataManager {
           needsImmediateWrite = true;
           break;
         }
+
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Condition 1b: Check delete queue size
       int largestDeleteQueueSize = 0;
       String? largestDeleteQueueTable;
       int totalDeleteRecords = 0;
-
+      processedCount = 0;
       for (final entry in _deleteBuffer.entries) {
         final queueSize = entry.value.length;
         totalDeleteRecords += queueSize;
@@ -566,6 +589,11 @@ class TableDataManager {
         if (queueSize >= _maxBufferSize) {
           needsImmediateWrite = true;
           break;
+        }
+
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
         }
       }
 
@@ -644,6 +672,7 @@ class TableDataManager {
   /// Flush max IDs to disk
   Future<void> flushMaxIds() async {
     try {
+      int processedCount = 0;
       for (var entry in _maxIdsDirty.entries) {
         if (!entry.value) continue;
 
@@ -657,6 +686,11 @@ class TableDataManager {
 
         await _dataStore.storage.writeAsString(maxIdPath, maxId.toString());
         _maxIdsDirty[tableName] = false;
+
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
     } catch (e) {
       Logger.error(
@@ -795,6 +829,7 @@ class TableDataManager {
     final tableQueue = _deleteBuffer.putIfAbsent(tableName, () => {});
 
     // Process each record
+    int processedCount = 0;
     for (final record in records) {
       final recordId = record[primaryKey]?.toString();
       if (recordId == null) {
@@ -818,6 +853,10 @@ class TableDataManager {
         }
         // If it was an update, the original record is on disk,
         // so we must proceed to add a delete operation to the delete buffer.
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // Store in delete buffer
@@ -887,6 +926,7 @@ class TableDataManager {
           ? _writeBuffer[tableName]!.keys.toList()
           : <String>[];
       final initialQueueSize = allKeys.length;
+      int processedCount = 0;
 
       // Process the static list of keys in batches.
       for (int i = 0; i < initialQueueSize; i += maxBatchSize) {
@@ -917,6 +957,10 @@ class TableDataManager {
             } else {
               insertRecords.add(data);
             }
+          }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
         // If the table buffer in the main map becomes empty, remove it.
@@ -1183,6 +1227,9 @@ class TableDataManager {
         if (entry.operation == BufferOperationType.insert) {
           pendingInsertCount++;
         }
+        if (pendingInsertCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
     }
 
@@ -1297,7 +1344,7 @@ class TableDataManager {
             _dataStore.memoryManager?.getTableMetaCacheSize() ?? 10000;
         if (_currentTableMetaCacheSize + metaSize > metaCacheLimit * 0.9) {
           // If exceeds limit, trigger metadata cache cleanup
-          _cleanupTableMetaCache();
+          await _cleanupTableMetaCache();
         }
 
         // Cache the meta for future use
@@ -1336,8 +1383,12 @@ class TableDataManager {
         meta.partitions!.isNotEmpty) {
       int totalRecords = 0;
       int totalSize = 0;
-
+      int processedCount = 0;
       for (var partition in meta.partitions!) {
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
         if (partition.totalRecords > 0) {
           totalRecords += partition.totalRecords;
           totalSize += partition.fileSizeInBytes;
@@ -1455,11 +1506,16 @@ class TableDataManager {
           operationType == BufferOperationType.delete) {
         // for update and delete operation, get range from existing partitions
         if (existingPartitions != null) {
+          int processedCount = 0;
           for (final partition in existingPartitions) {
             if (partition.index == partitionIndex) {
               minPk = partition.minPrimaryKey;
               maxPk = partition.maxPrimaryKey;
               break;
+            }
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
             }
           }
         }
@@ -1485,7 +1541,7 @@ class TableDataManager {
             rangeResult = await ComputeManager.run(
                 analyzePartitionKeyRange, request,
                 useIsolate: records.length > 500 ||
-                    (existingPartitions?.length ?? 0) > 1000);
+                    (existingPartitions?.length ?? 0) > 100);
           } catch (computeError) {
             Logger.error(
                 'Error running analyzePartitionKeyRange in ComputeManager: $computeError',
@@ -1541,7 +1597,7 @@ class TableDataManager {
             ),
             encoderState: EncoderHandler.getCurrentEncodingState(),
           ),
-          useIsolate: records.length > 500);
+          useIsolate: records.length > 100);
 
       final encodedData = encodeResult.encodedData;
       final updatedPartitionMeta = encodeResult.partitionMeta;
@@ -1615,7 +1671,12 @@ class TableDataManager {
           useExistingPartitions) {
         // find the last non-empty partition as starting partition
         PartitionMeta? lastPartition;
+        int processedCount = 0;
         for (var partition in fileMeta.partitions!) {
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
           if (partition.totalRecords > 0) {
             if (lastPartition == null ||
                 partition.index > lastPartition.index) {
@@ -1809,6 +1870,7 @@ class TableDataManager {
   /// check if need to fetch new id range
   Future<void> _checkIdFetch() async {
     try {
+      int processedCount = 0;
       for (final entry in _idGenerators.entries) {
         final tableName = entry.key;
         final generator = entry.value;
@@ -1822,6 +1884,10 @@ class TableDataManager {
               'Failed to get new id range for table $tableName: $e',
               label: 'TableDataManager._checkIdFetch',
             );
+          }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
         }
       }
@@ -1855,6 +1921,7 @@ class TableDataManager {
           final pkMatcher =
               ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
+          int processedCount = 0;
           for (final partition in fileMeta.partitions!) {
             // get max id from partition meta
             final partitionMaxId = partition.maxPrimaryKey;
@@ -1868,6 +1935,11 @@ class TableDataManager {
                   maxId = partitionMaxId;
                 }
               }
+            }
+
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
             }
           }
 
@@ -2099,7 +2171,7 @@ class TableDataManager {
             }
 
             // Periodically yield to prevent blocking the UI thread
-            if (i % 200 == 0) {
+            if (i % 100 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
@@ -2349,7 +2421,7 @@ class TableDataManager {
         // If partition has no range info, assume it needs processing
         result.add(partition);
       }
-      if ((i + 1) % 200 == 0) {
+      if (i % 100 == 0) {
         await Future.delayed(Duration.zero);
       }
     }
@@ -2582,7 +2654,7 @@ class TableDataManager {
             encoderState: EncoderHandler.getCurrentEncodingState(),
           ),
           useIsolate: bytes.length >
-              500 * 1024 // only use isolate if data size is larger than 500KB
+              50 * 1024 // only use isolate if data size is larger than 50KB
           );
 
       // if request specific record (by index position)
@@ -2668,7 +2740,7 @@ class TableDataManager {
               // return found matching record
               return [currentRecord];
             }
-            if (i % 500 == 0) {
+            if (i % 50 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
@@ -2825,16 +2897,21 @@ class TableDataManager {
         final List<PartitionMeta> allPartitionMetas = [];
 
         // create efficient lookup index
+        int processedCount = 0;
         for (final record in records) {
           final pk = record[primaryKey]?.toString() ?? '';
           if (pk.isNotEmpty) {
             recordsByPk[pk] = record;
           }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
 
         // Identify which partitions might contain records
         final partitionsToProcess = <PartitionMeta>[];
-        int partitionCheckCount = 0;
+        int checkCount = 0;
         // Use a standard for-loop for efficiency and safety with async gaps.
         for (int i = 0; i < existingPartitions.length; i++) {
           final partition = existingPartitions[i];
@@ -2842,6 +2919,10 @@ class TableDataManager {
               partition.maxPrimaryKey != null) {
             // Check if any records may be in this partition range
             for (final pk in recordsByPk.keys) {
+              checkCount++;
+              if (checkCount % 50 == 0) {
+                await Future.delayed(Duration.zero);
+              }
               if (ValueMatcher.isInRange(pk, partition.minPrimaryKey,
                   partition.maxPrimaryKey, pkMatcher)) {
                 partitionsToProcess.add(partition);
@@ -2855,10 +2936,6 @@ class TableDataManager {
 
           // Yield to the event loop periodically to avoid blocking the UI thread
           // when checking a large number of partitions.
-          partitionCheckCount++;
-          if (partitionCheckCount % 200 == 0) {
-            await Future.delayed(Duration.zero);
-          }
         }
 
         final tasks = partitionsToProcess.map((partition) {
@@ -2883,7 +2960,7 @@ class TableDataManager {
                   modified = true;
                   processedKeysInPartition.add(pk);
                 }
-                if (i % 500 == 0) {
+                if (i % 50 == 0) {
                   await Future.delayed(Duration.zero);
                 }
               }
@@ -2898,7 +2975,7 @@ class TableDataManager {
                   modified = true;
                   processedKeysInPartition.add(pk);
                 }
-                if (i % 500 == 0) {
+                if (i % 50 == 0) {
                   await Future.delayed(Duration.zero);
                 }
               }
@@ -3037,7 +3114,7 @@ class TableDataManager {
                 await _dataStore.storage.deleteFile(partitionPath);
               }
             }
-            if ((i + 1) % 50 == 0) {
+            if (i % 50 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
@@ -3090,6 +3167,7 @@ class TableDataManager {
       };
 
       // process new partition meta, update or add to Map
+      int processedCount = 0;
       for (var meta in partitionMetas) {
         // only add non-empty partition to table meta
         if (meta.totalRecords > 0) {
@@ -3098,16 +3176,25 @@ class TableDataManager {
           // if partition is empty, remove from Map
           partitionsMap.remove(meta.index);
         }
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // calculate total stats from ALL partitions after processing updates
       int totalRecords = 0;
       int totalSize = 0;
+      processedCount = 0;
 
       // now calculate totals from all remaining partitions
       for (var partition in partitionsMap.values) {
         totalRecords += partition.totalRecords as int;
         totalSize += partition.fileSizeInBytes as int;
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
       }
 
       // convert Map to List<PartitionMeta> with consistent ordering by partition index
@@ -3673,7 +3760,7 @@ class TableDataManager {
             }
 
             // yield to the event loop after processing each batch to keep the UI responsive.
-            if (j % 100 == 0) {
+            if (j % 50 == 0) {
               await Future.delayed(Duration.zero);
             }
           }

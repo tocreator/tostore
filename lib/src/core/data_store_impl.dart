@@ -1078,9 +1078,14 @@ class DataStoreImpl {
       final primaryKey = schema.primaryKey;
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
+      int processedCount = 0;
 
       // check unique constraints
       for (var record in records) {
+        processedCount++;
+        if (processedCount % 50 == 0) {
+          await Future.delayed(Duration.zero);
+        }
         final recordKey = record[primaryKey]?.toString() ?? '';
         if (recordKey.isEmpty) {
           continue; // Skip records without primary key
@@ -1350,7 +1355,8 @@ class DataStoreImpl {
         // Collect successful primary keys
         final List<String> successKeys = [];
 
-        for (var record in recordsToDelete) {
+        for (var i = 0; i < recordsToDelete.length; i++) {
+          final record = recordsToDelete[i];
           final pkValue = record[primaryKey]?.toString();
           if (pkValue == null) {
             continue;
@@ -1360,6 +1366,10 @@ class DataStoreImpl {
 
           // Remove from write queue if it exists there (for insert/update operations that haven't been flushed)
           writeQueue?.remove(pkValue);
+          // Periodically yield to prevent blocking the UI thread
+          if (i % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
         }
 
         // Remove from record cache
@@ -1441,6 +1451,10 @@ class DataStoreImpl {
               } else {
                 // has non-deleted records
                 allDeleted = false;
+              }
+              // Periodically yield to prevent blocking the UI thread
+              if (i % 50 == 0) {
+                await Future.delayed(Duration.zero);
               }
             }
 
@@ -1735,6 +1749,7 @@ class DataStoreImpl {
       try {
         // Process records in smaller batches to maintain memory efficiency
         const int batchSize = 1000;
+        int processedCount = 0;
 
         for (int i = 0; i < recordsToProcess.length; i += batchSize) {
           final int end = (i + batchSize < recordsToProcess.length)
@@ -1744,6 +1759,10 @@ class DataStoreImpl {
 
           // Process each record in the current batch
           for (var record in currentBatch) {
+            processedCount++;
+            if (processedCount % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
             try {
               // Validate and process data
               final validData =
@@ -1960,7 +1979,12 @@ class DataStoreImpl {
     final globalTables = <String>[];
     final normalTables = <String>[];
 
+    int processedCount = 0;
     for (final tableName in allTables) {
+      processedCount++;
+      if (processedCount % 50 == 0) {
+        await Future.delayed(Duration.zero);
+      }
       // Check if it's a global table
       final isGlobal = await schemaManager?.isTableGlobal(tableName) ?? false;
       if (isGlobal) {
@@ -2631,58 +2655,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Get all space names
-  Future<Set<String>> getAllSpaceNames() async {
-    try {
-      // First load global configuration
-      final globalConfig = await getGlobalConfig();
-      if (globalConfig != null && globalConfig.spaceNames.isNotEmpty) {
-        return globalConfig.spaceNames;
-      }
-
-      // If no configuration record, get from file system
-      final spacesPath = pathJoin(config.dbPath!, 'spaces');
-      final spaceNames = <String>{};
-
-      try {
-        if (await storage.existsDirectory(spacesPath)) {
-          // Use non-recursive mode to get direct subdirectories
-          final entries =
-              await storage.listDirectory(spacesPath, recursive: false);
-
-          for (final entry in entries) {
-            if (await storage.existsDirectory(entry)) {
-              // Extract directory name
-              final name = entry.split('/').last.split('\\').last;
-              if (name != '.' && name != '..') {
-                spaceNames.add(name);
-              }
-            }
-          }
-        }
-      } catch (e) {
-        Logger.error('Failed to read space directory: $e',
-            label: 'DataStoreImpl.getAllSpaceNames');
-      }
-
-      // If spaces were found, update global configuration
-      if (spaceNames.isNotEmpty) {
-        // Ensure default space is included
-        if (!spaceNames.contains('default')) {
-          spaceNames.add('default');
-        }
-        final newConfig = GlobalConfig(spaceNames: spaceNames);
-        await saveGlobalConfig(newConfig);
-      }
-
-      return spaceNames.isEmpty ? {'default'} : spaceNames;
-    } catch (e) {
-      Logger.error('Failed to get all space names: $e',
-          label: 'DataStoreImpl.getAllSpaceNames');
-      return {'default'};
-    }
-  }
-
   /// Add space to global configuration
   Future<void> addSpaceToGlobalConfig(String spaceName) async {
     try {
@@ -2844,7 +2816,7 @@ class DataStoreImpl {
           }
         }
         processedCount++;
-        if (processedCount % 150 == 0) {
+        if (processedCount % 50 == 0) {
           await Future.delayed(Duration.zero);
         }
       }

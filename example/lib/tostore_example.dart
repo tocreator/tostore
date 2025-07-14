@@ -635,7 +635,7 @@ class TostoreExample {
       for (var i = batchStart; i < batchEnd; i++) {
         // The global unique index is startIndex + i + 1
         records.add(_generateRecord(schema, startIndex + i + 1));
-        if (i % 100 == 0) {
+        if (i % 50 == 0) {
           // Yield more sparingly to improve performance while keeping UI responsive
           await Future.delayed(Duration.zero);
         }
@@ -694,7 +694,7 @@ class TostoreExample {
         return -1; // Indicate failure
       }
       // Yield to the event loop to prevent UI freezing
-      if (i % 100 == 0) {
+      if (i % 50 == 0) {
         // Yield more sparingly to improve performance while keeping UI responsive
         await Future.delayed(Duration.zero);
       }
