@@ -5,9 +5,7 @@ import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../model/table_statistics.dart';
 import '../query/query_cache.dart';
-import '../query/query_condition.dart';
 import 'crontab_manager.dart';
-import 'dart:convert';
 import 'memory_manager.dart';
 import 'dart:async';
 import '../handler/value_matcher.dart';
@@ -38,24 +36,6 @@ class DataCacheManager {
 
   // Space switching status flag
   bool _isSwitchingSpace = false;
-
-  // threshold-based auto-disable
-  bool _autoQueryCacheDisabled = false;
-  bool get isAutoCacheDisabled => _autoQueryCacheDisabled;
-
-  // A simple set for getQuery to quickly check if a table's cache is locked for reading.
-  final Set<String> _lockedTablesWithQuery = <String>{};
-  // A reference counter to track the number of concurrent background invalidation
-  // jobs running for a specific table. The read lock is only released when this hits zero.
-  final Map<String, int> _invalidationRefCounts = {};
-
-  // --- Self-Calibrating Performance Model ---
-  // The average time it takes to perform a single condition check.
-  // This value is learned and updated at runtime.
-  // Initialized to a reasonable default (e.g., 50 microseconds).
-  Duration _averageCheckDuration = const Duration(microseconds: 50);
-  // A counter to stabilize the initial average calculations.
-  int _calibrationSamples = 0;
 
   DataCacheManager(this._dataStore)
       : _queryCache = QueryCache(
@@ -307,14 +287,6 @@ class DataCacheManager {
         return;
       }
 
-      // Determine if it is a user-managed cache once
-      bool isUserManaged = key.isUserManaged;
-
-      // If auto-caching is disabled, do not cache non-user-managed queries
-      if (_autoQueryCacheDisabled && !isUserManaged) {
-        return;
-      }
-
       // Query results are stored only once in _queryCache
       await _queryCache.put(
         cacheKey,
@@ -345,13 +317,7 @@ class DataCacheManager {
                   primaryKeyField: primaryKey,
                   results: results,
                   isFullTableCache: isFullTableQuery,
-                  isUserManaged: isUserManaged,
                 ));
-      }
-      // Check threshold after adding
-      final threshold = _dataStore.config.queryCacheCountThreshold;
-      if (threshold != null && !isUserManaged && _queryCache.size > threshold) {
-        await _disableAndCleanupAutoQueryCache();
       }
     } catch (e) {
       Logger.error('Cache query results failed: $e',
@@ -361,24 +327,17 @@ class DataCacheManager {
 
   /// Get cached query results
   List<Map<String, dynamic>>? getQuery(QueryCacheKey key) {
-    final tableName = key.tableName;
-
-    // If the table's cache is actively being cleaned in the background,
-    // we must bypass the cache to guarantee consistency.
-    if (_lockedTablesWithQuery.contains(tableName)) {
-      return null;
-    }
-
     final results = _queryCache.get(key.toString());
     return results;
   }
 
   /// Invalidate specific query by cache key
-  /// Returns the number of entries removed (0 or 1)
-  Future<int> invalidateQuery(String tableName, String cacheKey) async {
+  /// Returns true if the operation completes without error, false otherwise.
+  Future<bool> invalidateQuery(String tableName, String cacheKey) async {
     try {
-      // Query cache always tries to clean up, even if the table dependency does not exist
-      int removed = await _queryCache.invalidateQuery(cacheKey);
+      // Attempt to invalidate the query from the primary cache.
+      // We don't need the return value here because "not found" is a success case.
+      await _queryCache.invalidateQuery(cacheKey);
 
       // If the table dependency exists, also clean it up
       final tableDependency = _tableDependencies[tableName];
@@ -393,39 +352,11 @@ class DataCacheManager {
         }
       }
 
-      return removed;
+      return true;
     } catch (e) {
       Logger.error('Failed to invalidate query: $e',
           label: 'DataCacheManager.invalidateQuery');
-      return 0;
-    }
-  }
-
-  /// used to quickly clear the query cache corresponding to a specific primary key
-  Future<void> invalidateRecordByPrimaryKey(
-      String tableName, dynamic primaryKeyValue) async {
-    try {
-      // get the table structure to get the primary key field name
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) return;
-      final primaryKeyField = schema.primaryKey;
-
-      // build the primary key equal query condition
-      final condition =
-          QueryCondition().where(primaryKeyField, '=', primaryKeyValue);
-      final cacheKey = QueryCacheKey(
-        tableName: tableName,
-        condition: condition,
-      ).toString();
-
-      // directly try to clear this specific cache
-      _queryCache.invalidate(cacheKey);
-
-      // remove from table dependency
-      _tableDependencies[tableName]?.remove(cacheKey);
-    } catch (e) {
-      Logger.error('Failed to invalidate record by primary key: $e',
-          label: 'DataCacheManager.invalidateRecordByPrimaryKey');
+      return false;
     }
   }
 
@@ -540,14 +471,14 @@ class DataCacheManager {
 
   /// Invalidate multiple records from the cache for a specific table.
   /// [primaryKeyValues] is a list of primary key values to invalidate.
-  /// [records] contains the data of the records being invalidated, used for accurate query cache invalidation.
+  /// [records] contains the data of the records being invalidated
   Future<void> invalidateRecords(
     String tableName,
     List<String> primaryKeyValues,
     List<Map<String, dynamic>> records,
   ) async {
     try {
-      // 1. Invalidate records from the TableCache
+      // Invalidate records from the TableCache
       final tableCache = tableCaches[tableName];
       if (tableCache != null) {
         // Now, remove the records from the cache.
@@ -562,281 +493,11 @@ class DataCacheManager {
           }
         }
       }
-
-      await invalidateAffectedQueries(
-        tableName,
-        records: records,
-        primaryKeyValues: primaryKeyValues.toSet(),
-      );
     } catch (e) {
       Logger.error(
         'Failed to invalidate records: $e',
         label: 'DataCacheManager.invalidateRecords',
       );
-    }
-  }
-
-  /// Unified method for cleaning up query caches based on affected records (for insertion, update, deletion).
-  /// [records] is used for condition matching.
-  /// [primaryKeyValues] is used for fast path invalidation based on result keys.
-  /// At least one of them should be provided.
-  Future<void> invalidateAffectedQueries(
-    String tableName, {
-    List<Map<String, dynamic>>? records,
-    Set<String>? primaryKeyValues,
-  }) async {
-    // if query caching is disabled.
-    if (_dataStore.config.shouldEnableQueryCache == false ||
-        _autoQueryCacheDisabled) {
-      return;
-    }
-
-    // A request with no specifics is a signal to clear all query caches for the table.
-    if ((records == null || records.isEmpty) &&
-        (primaryKeyValues == null || primaryKeyValues.isEmpty)) {
-      await _cleanupAllTableRelatedQueries(tableName);
-      return;
-    }
-
-    final tableDependency = _tableDependencies[tableName];
-    if (tableDependency == null || tableDependency.isEmpty) return;
-
-    // --- Adaptive, Self-Calibrating Decision Logic ---
-    final int changeCount = records?.length ?? 0;
-    final int tableCacheCount = tableDependency.length;
-
-    // 1. Calculate the projected number of computationally expensive checks.
-    final int projectedChecks = tableCacheCount * changeCount;
-
-    // 2. Predict the total duration based on the learned average check time.
-    final Duration estimatedDuration = _averageCheckDuration * projectedChecks;
-
-    // 3. Compare with a real-time threshold.
-    if (estimatedDuration > const Duration(milliseconds: 200)) {
-      // **High-Cost Operation: Use Reference-Counted Background Invalidation**
-
-      // 1. Acquire lock and increment the reference counter.
-      _lockedTablesWithQuery.add(tableName);
-      _invalidationRefCounts.update(tableName, (count) => count + 1,
-          ifAbsent: () => 1);
-
-      // 2. Launch the fine-grained cleanup in a non-blocking background task.
-      // We ALWAYS launch a new task to handle the new data.
-      Future(() async {
-        try {
-          await _performFineGrainedInvalidation(
-              tableName, tableDependency, records, primaryKeyValues,
-              performCalibration: false);
-        } catch (e) {
-          Logger.error(
-              'Background cache invalidation for table $tableName failed: $e',
-              label: 'DataCacheManager.invalidateAffectedQueries');
-        } finally {
-          // 3. Decrement the reference counter and release the lock ONLY if it's the last job.
-          final currentCount = _invalidationRefCounts[tableName];
-          if (currentCount != null) {
-            if (currentCount <= 1) {
-              // This is the last worker, release the lock fully.
-              _invalidationRefCounts.remove(tableName);
-              _lockedTablesWithQuery.remove(tableName);
-            } else {
-              // Other workers are still running. Just decrement the count.
-              _invalidationRefCounts[tableName] = currentCount - 1;
-            }
-          }
-        }
-      });
-    } else {
-      // **Low-Cost Operation: Perform Invalidation Synchronously and Calibrate**
-      await _performFineGrainedInvalidation(
-          tableName, tableDependency, records, primaryKeyValues,
-          performCalibration: true);
-    }
-  }
-
-  /// Performs the actual logic of iterating through and removing affected query caches.
-  /// This can be called synchronously for low-cost operations or in the background for high-cost ones.
-  Future<void> _performFineGrainedInvalidation(
-    String tableName,
-    Map<String, _QueryInfo> tableDependency,
-    List<Map<String, dynamic>>? records,
-    Set<String>? primaryKeyValues, {
-    required bool performCalibration,
-  }) async {
-    final stopwatch = performCalibration ? (Stopwatch()..start()) : null;
-
-    final keysToRemove = <String>{};
-    int totalChecks = 0;
-    int processedCount = 0;
-
-    final schema = await _dataStore.getTableSchema(tableName);
-    if (schema == null) {
-      Logger.error('Table schema not found for table $tableName',
-          label: 'DataCacheManager._performFineGrainedInvalidation');
-      return;
-    }
-
-    // Use a copy of the keys to prevent modification during iteration issues.
-    for (final key in tableDependency.keys.toList()) {
-      if (keysToRemove.contains(key)) continue;
-
-      final queryInfo = tableDependency[key];
-      if (queryInfo == null || queryInfo.isUserManaged) continue;
-
-      if (queryInfo.isFullTableCache) {
-        keysToRemove.add(key);
-        continue;
-      }
-
-      // Fast-path check: if the query result contains any of the affected primary keys, invalidate directly.
-      if (primaryKeyValues != null && primaryKeyValues.isNotEmpty) {
-        bool hasIntersection = false;
-        for (final resultKey in queryInfo.resultKeys) {
-          if (primaryKeyValues.contains(resultKey)) {
-            hasIntersection = true;
-            break;
-          }
-        }
-        if (hasIntersection) {
-          keysToRemove.add(key);
-          continue;
-        }
-      }
-
-      final matcher = queryInfo.queryKey.condition.isEmpty
-          ? null
-          : ConditionRecordMatcher.prepare(
-              queryInfo.queryKey.condition, {tableName: schema}, tableName);
-      // Condition-based check: if any of the affected records match the query condition, invalidate the cache.
-      if (records != null && records.isNotEmpty) {
-        for (final recordData in records) {
-          if (performCalibration) {
-            totalChecks++; // Increment for each check
-          }
-
-          if (matcher?.matches(recordData) ?? true) {
-            keysToRemove.add(key);
-            break; // One match is enough to invalidate this query.
-          }
-        }
-      }
-
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        // Yield to event loop to avoid blocking UI
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    for (var i = 0; i < keysToRemove.length; i++) {
-      final key = keysToRemove.elementAt(i);
-      _queryCache.invalidate(key);
-      tableDependency.remove(key);
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    if (tableDependency.isEmpty) {
-      _tableDependencies.remove(tableName);
-    }
-
-    if (performCalibration && stopwatch != null && totalChecks > 0) {
-      stopwatch.stop();
-      // --- Self-Calibration Logic ---
-      final currentDuration = stopwatch.elapsed;
-      final avgForThisRun = currentDuration ~/ totalChecks;
-      final newAvgMicros = avgForThisRun.inMicroseconds;
-
-      // Use a moving average to smooth out the value and adapt over time.
-      // Give more weight to the new value initially to converge faster.
-      final weight = (_calibrationSamples < 10) ? 0.5 : 0.1;
-      final oldAvgMicros = _averageCheckDuration.inMicroseconds;
-
-      _averageCheckDuration = Duration(
-          microseconds:
-              (oldAvgMicros * (1 - weight) + newAvgMicros * weight).round());
-
-      if (_calibrationSamples < 100) {
-        // Cap the sample count
-        _calibrationSamples++;
-      }
-    }
-  }
-
-  /// Clean up all queries related to a specific table
-  Future<void> _cleanupAllTableRelatedQueries(String tableName) async {
-    await _cleanupFullTableQueriesOnly(tableName);
-
-    final keysToRemove = <String>[];
-    final allQueryKeys = _queryCache.cache.keys.toList();
-    int processedCount = 0;
-    for (final key in allQueryKeys) {
-      final query = _queryCache.cache[key];
-      if (query != null && query.tableName == tableName) {
-        keysToRemove.add(key);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        // Yield to event loop to avoid blocking UI
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    for (var i = 0; i < keysToRemove.length; i++) {
-      final key = keysToRemove.elementAt(i);
-      _queryCache.invalidate(key);
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    _tableDependencies.remove(tableName);
-  }
-
-  /// Clean up all queries related to a specific table
-  Future<void> _cleanupFullTableQueriesOnly(String tableName) async {
-    final tableDependency = _tableDependencies[tableName];
-    if (tableDependency == null) return;
-
-    // List of keys to clean up
-    final keysToRemove = <String>[];
-    int processedCount = 0;
-
-    // Check each query, only clean up full table cache queries
-    for (var cacheKeyStr in tableDependency.keys.toList()) {
-      final queryInfo = tableDependency[cacheKeyStr];
-      if (queryInfo == null) continue;
-
-      // skip user-managed caches, these caches need to be manually invalidated by the user
-      if (queryInfo.isUserManaged) {
-        continue; // skip user-managed caches
-      }
-
-      // Full table cache or query with empty condition
-      if (queryInfo.isFullTableCache ||
-          queryInfo.queryKey.condition.build().isEmpty) {
-        keysToRemove.add(cacheKeyStr);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    // Remove related query cache
-    for (var i = 0; i < keysToRemove.length; i++) {
-      final key = keysToRemove.elementAt(i);
-      _queryCache.invalidate(key);
-      tableDependency.remove(key);
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    // If there are no related queries, clean up dependencies
-    if (tableDependency.isEmpty) {
-      _tableDependencies.remove(tableName);
     }
   }
 
@@ -1372,11 +1033,6 @@ class DataCacheManager {
   Future<bool> shouldCacheQuery({
     required List<Map<String, dynamic>> results,
   }) async {
-    // Check runtime and global configs for auto-caching
-    if (_autoQueryCacheDisabled || !_dataStore.config.shouldEnableQueryCache) {
-      return false; // Auto-caching is disabled
-    }
-
     // Check result size to avoid caching excessively large results
     final queryCacheSizeLimit =
         _dataStore.memoryManager?.getQueryCacheSize() ?? 10000;
@@ -1396,54 +1052,6 @@ class DataCacheManager {
 
     return true;
   }
-
-  /// Disables automatic query caching and cleans up all auto-generated caches.
-  /// This is triggered when the number of query caches exceeds the configured threshold.
-  Future<void> _disableAndCleanupAutoQueryCache() async {
-    if (_autoQueryCacheDisabled) return; // Only run once
-
-    _autoQueryCacheDisabled = true;
-    final keysToRemove = <String>{};
-    final allEntries = _queryCache.cache.entries.toList();
-
-    int processedCount = 0;
-    for (final entry in allEntries) {
-      try {
-        final keyMap = jsonDecode(entry.key) as Map<String, dynamic>;
-        if (keyMap['isUserManaged'] != true) {
-          keysToRemove.add(entry.key);
-        }
-      } catch (e) {
-        // If key is malformed, assume it's an auto-cache and remove it for safety.
-        keysToRemove.add(entry.key);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    processedCount = 0;
-    for (final key in keysToRemove) {
-      _queryCache.invalidate(key);
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    // Also clean up _tableDependencies for the removed keys
-    final Set<String> removedKeysSet = keysToRemove.toSet();
-    _tableDependencies.forEach((tableName, queryMap) {
-      queryMap.removeWhere((key, queryInfo) => removedKeysSet.contains(key));
-    });
-    // Clean up any tables that no longer have dependencies
-    _tableDependencies.removeWhere((key, value) => value.isEmpty);
-
-    Logger.info(
-        'Cleaned up ${keysToRemove.length} auto-generated query caches.',
-        label: 'DataCacheManager');
-  }
 }
 
 /// Query info, contains query conditions, primary key field name and only primary key values of results
@@ -1453,14 +1061,12 @@ class _QueryInfo {
   final Set<String>
       resultKeys; // Only store primary key values of query results, not complete record content
   final bool isFullTableCache; // Whether it is a full table cache
-  final bool isUserManaged; // Whether it is user-managed cache
 
   _QueryInfo({
     required this.queryKey,
     required this.primaryKeyField,
     required List<Map<String, dynamic>> results,
     this.isFullTableCache = false,
-    this.isUserManaged = false,
   }) : resultKeys = results
             .map((record) => record[primaryKeyField]?.toString() ?? '')
             .where((key) => key.isNotEmpty)

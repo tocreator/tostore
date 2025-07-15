@@ -69,7 +69,7 @@ class BackupManager {
 
       if (fullBackup) {
         // Full backup: copy the entire database directory (excluding backups dir)
-        final dbRootDir = _dataStore.config.dbPath!;
+        final dbRootDir = _dataStore.instancePath!;
         final dirItems = await _dataStore.storage.listDirectory(dbRootDir);
 
         for (String itemPath in dirItems) {
@@ -344,7 +344,7 @@ class BackupManager {
       final metadata = await readBackupMetadata(backupPath);
       final isFullBackup = metadata['type'] == 'full';
 
-      final dbRootDir = _dataStore.config.dbPath!;
+      final dbRootDir = _dataStore.instancePath!;
 
       if (isFullBackup) {
         await _restoreFullBackup(backupPath, dbRootDir);

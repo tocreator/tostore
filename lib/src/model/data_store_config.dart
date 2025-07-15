@@ -8,6 +8,9 @@ class DataStoreConfig {
   /// database path
   final String? dbPath;
 
+  /// database name, used for quickly creating different database instances
+  final String dbName;
+
   /// current space name
   final String spaceName;
 
@@ -68,22 +71,6 @@ class DataStoreConfig {
   /// Maximum number of tables to process per flush
   final int maxTablesPerFlush;
 
-  /// Enable query caching
-  /// null: automatic (enabled on web/mobile/desktop, disabled on server)
-  /// true: force enable query cache
-  /// false: force disable query cache
-  final bool? enableQueryCache;
-
-  /// Maximum query cache expiry time
-  /// null: no expiry (cache entries remain until manually cleared or evicted)
-  /// other: duration after which cache entries are considered stale
-  final Duration? queryCacheExpiryTime;
-
-  /// The threshold for the number of query caches. When this value is exceeded,
-  /// automatic query caching will be disabled to avoid performance degradation.
-  /// User-managed caches will not be affected. Set to null to disable this feature.
-  final int? queryCacheCountThreshold;
-
   /// Memory threshold in MB for all caches combined
   /// If null, system will automatically determine appropriate value based on available memory
   final int? memoryThresholdInMB;
@@ -96,6 +83,7 @@ class DataStoreConfig {
 
   DataStoreConfig({
     this.dbPath,
+    this.dbName = 'default',
     this.spaceName = 'default',
     this.compressionLevel = 6,
     this.transactionTimeout = const Duration(minutes: 5),
@@ -115,12 +103,9 @@ class DataStoreConfig {
     DistributedNodeConfig? distributedNodeConfig,
     int? maxBatchSize,
     int? maxTablesPerFlush,
-    bool? enableQueryCache,
-    this.queryCacheExpiryTime,
     this.memoryThresholdInMB,
     this.enablePrewarmCache,
     int? prewarmThresholdMB,
-    this.queryCacheCountThreshold = 2000,
   })  : maxPartitionFileSize =
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         maxConcurrent = maxConcurrent ?? _getDefaultMaxConcurrent(),
@@ -128,20 +113,8 @@ class DataStoreConfig {
             distributedNodeConfig ?? const DistributedNodeConfig(),
         maxBatchSize = maxBatchSize ?? _getDefaultBatchSize(),
         maxTablesPerFlush = maxTablesPerFlush ?? _getDefaultTablesPerFlush(),
-        enableQueryCache = enableQueryCache ?? _getDefaultQueryCacheEnabled(),
         prewarmThresholdMB =
             prewarmThresholdMB ?? _getDefaultPrewarmThreshold();
-
-  /// Determine if query cache should be enabled by default
-  static bool _getDefaultQueryCacheEnabled() {
-    // default enabled on web/mobile/desktop, disabled on server environment
-    return !PlatformHandler.isServerEnvironment;
-  }
-
-  /// Determine if query cache should be enabled by default based on platform
-  /// Returns true for client platforms, false for server platforms
-  bool get shouldEnableQueryCache =>
-      enableQueryCache ?? _getDefaultQueryCacheEnabled();
 
   /// get default partition file size limit, based on platform
   static int _getDefaultMaxPartitionFileSize() {
@@ -230,7 +203,8 @@ class DataStoreConfig {
   /// from json create config
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
     return DataStoreConfig(
-      dbPath: json['dbPath'] as String,
+      dbPath: json['dbPath'] as String?,
+      dbName: json['dbName'] as String? ?? 'default',
       spaceName: json['spaceName'] as String? ?? 'default',
       compressionLevel: json['compressionLevel'] as int? ?? 6,
       transactionTimeout:
@@ -258,15 +232,9 @@ class DataStoreConfig {
           : const DistributedNodeConfig(),
       maxBatchSize: json['maxBatchSize'] as int?,
       maxTablesPerFlush: json['maxTablesPerFlush'] as int?,
-      enableQueryCache: json['enableQueryCache'] as bool?,
-      queryCacheExpiryTime: json['queryCacheExpiryTime'] != null
-          ? Duration(milliseconds: json['queryCacheExpiryTime'] as int)
-          : null,
       memoryThresholdInMB: json['memoryThresholdInMB'] as int?,
       enablePrewarmCache: json['enablePrewarmCache'] as bool?,
       prewarmThresholdMB: json['prewarmThresholdMB'] as int? ?? 10,
-      queryCacheCountThreshold:
-          json['queryCacheCountThreshold'] as int? ?? 2000,
     );
   }
 
@@ -274,6 +242,7 @@ class DataStoreConfig {
   Map<String, dynamic> toJson() {
     return {
       'dbPath': dbPath,
+      'dbName': dbName,
       'spaceName': spaceName,
       'compressionLevel': compressionLevel,
       'transactionTimeout': transactionTimeout.inMilliseconds,
@@ -293,18 +262,16 @@ class DataStoreConfig {
       'distributedNodeConfig': distributedNodeConfig.toJson(),
       'maxBatchSize': maxBatchSize,
       'maxTablesPerFlush': maxTablesPerFlush,
-      'enableQueryCache': enableQueryCache,
-      'queryCacheExpiryTime': queryCacheExpiryTime?.inMilliseconds,
       'memoryThresholdInMB': memoryThresholdInMB,
       'enablePrewarmCache': enablePrewarmCache,
       'prewarmThresholdMB': prewarmThresholdMB,
-      'queryCacheCountThreshold': queryCacheCountThreshold,
     };
   }
 
   /// create new config instance
   DataStoreConfig copyWith({
     String? dbPath,
+    String? dbName,
     String? spaceName,
     int? compressionLevel,
     Duration? transactionTimeout,
@@ -324,15 +291,13 @@ class DataStoreConfig {
     DistributedNodeConfig? distributedNodeConfig,
     int? maxBatchSize,
     int? maxTablesPerFlush,
-    bool? enableQueryCache,
-    Duration? queryCacheExpiryTime,
     int? memoryThresholdInMB,
     bool? enablePrewarmCache,
     int? prewarmThresholdMB,
-    int? queryCacheCountThreshold,
   }) {
     return DataStoreConfig(
       dbPath: dbPath ?? this.dbPath,
+      dbName: dbName ?? this.dbName,
       spaceName: spaceName ?? this.spaceName,
       compressionLevel: compressionLevel ?? this.compressionLevel,
       transactionTimeout: transactionTimeout ?? this.transactionTimeout,
@@ -354,13 +319,9 @@ class DataStoreConfig {
           distributedNodeConfig ?? this.distributedNodeConfig,
       maxBatchSize: maxBatchSize ?? this.maxBatchSize,
       maxTablesPerFlush: maxTablesPerFlush ?? this.maxTablesPerFlush,
-      enableQueryCache: enableQueryCache ?? this.enableQueryCache,
-      queryCacheExpiryTime: queryCacheExpiryTime ?? this.queryCacheExpiryTime,
       memoryThresholdInMB: memoryThresholdInMB ?? this.memoryThresholdInMB,
       enablePrewarmCache: enablePrewarmCache ?? this.enablePrewarmCache,
       prewarmThresholdMB: prewarmThresholdMB ?? this.prewarmThresholdMB,
-      queryCacheCountThreshold:
-          queryCacheCountThreshold ?? this.queryCacheCountThreshold,
     );
   }
 }

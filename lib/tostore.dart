@@ -56,7 +56,7 @@ import 'src/chain/stream_query_builder.dart';
 class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
   /// [dbPath] Database path (optional, excluding filename)
-  /// [dbName] Database name for quickly creating different database instances (will be stored in db/dbName/)
+  /// [dbName] Database name for quickly creating different database instances (will be stored in dbPath/dbName/)
   /// [config] Database configuration
   /// [schemas] Database table schemas, Designed for mobile application scenarios, auto upgrade
   /// [onConfigure] Callback when configuring database
@@ -64,9 +64,9 @@ class ToStore implements DataStoreInterface {
   /// [onOpen] Callback when database is opened
   ///
   /// 以数据库路径的不同创建独立的实例
-  /// [dbPath] 数据库路径，可选，不含文件名
-  /// [dbName] 数据库名称，用于快速创建不同的数据库实例（数据库目录/dbName/）
-  /// [config] 数据库配置
+  /// [dbPath] 数据库的根路径，可选。如果未提供，则使用应用程序的默认目录。
+  /// [dbName] 数据库名称，用于在dbPath下创建独立的数据库实例目录（如 'dbPath/dbName/'）。默认为 'default'。
+  /// [config] 数据库配置。dbPath和dbName参数会覆盖此配置中的同名值。
   /// [schemas] 数据库表结构定义，适用移动应用场景，自动化升级
   /// [onConfigure] 数据库配置时的回调
   /// [onCreate] 数据库首次创建时的回调
@@ -80,7 +80,9 @@ class ToStore implements DataStoreInterface {
     Future<void> Function(ToStore db)? onCreate,
     Future<void> Function(ToStore db)? onOpen,
   }) {
-    String instanceKey = '$dbPath-${dbName ?? 'default'}';
+    final effectiveDbPath = dbPath ?? config?.dbPath;
+    final effectiveDbName = dbName ?? config?.dbName ?? 'default';
+    String instanceKey = '$effectiveDbPath-$effectiveDbName';
 
     if (!_instances.containsKey(instanceKey)) {
       final impl = DataStoreImpl(
@@ -497,6 +499,11 @@ class ToStore implements DataStoreInterface {
   Future<int> getVersion() async {
     return await _impl.getVersion();
   }
+
+  /// Get the final storage path of the database instance.
+  ///
+  /// 获取数据库实例最终存储目录的完整路径。
+  String? get instancePath => _impl.instancePath;
 
   /// Set database version number
   /// [version] New version number to set

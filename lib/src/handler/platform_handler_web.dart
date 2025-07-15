@@ -4,7 +4,6 @@ import 'package:archive/archive.dart';
 import '../Interface/platform_interface.dart';
 import '../handler/logger.dart';
 import '../core/storage_adapter.dart';
-import '../model/data_store_config.dart';
 
 /// Web platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
@@ -62,7 +61,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<String> createTempDirectory(String prefix) async {
     try {
-      final storage = StorageAdapter(DataStoreConfig(dbPath: '/'));
+      final storage = StorageAdapter();
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final counter = _tempCounter++;
 
@@ -90,7 +89,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<void> deleteDirectory(String path, {bool recursive = true}) async {
     try {
-      final storage = StorageAdapter(DataStoreConfig(dbPath: '/'));
+      final storage = StorageAdapter();
 
       // actually delete directory
       if (await storage.existsDirectory(path)) {
@@ -110,7 +109,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   Future<void> compressDirectory(String sourceDir, String targetZip) async {
     try {
       final archive = Archive();
-      final storage = StorageAdapter(DataStoreConfig(dbPath: '/'));
+      final storage = StorageAdapter();
 
       // check if source directory exists
       if (!await storage.existsDirectory(sourceDir)) {
@@ -166,7 +165,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<void> extractZip(String zipPath, String targetDir) async {
     try {
-      final storage = StorageAdapter(DataStoreConfig(dbPath: '/'));
+      final storage = StorageAdapter();
 
       // ensure target directory exists
       await storage.ensureDirectoryExists(targetDir);
@@ -219,7 +218,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<bool> verifyZipFile(String zipPath, {String? requiredFile}) async {
     try {
-      final storage = StorageAdapter(DataStoreConfig(dbPath: '/'));
+      final storage = StorageAdapter();
 
       // Check if file exists
       if (!await storage.existsFile(zipPath)) {

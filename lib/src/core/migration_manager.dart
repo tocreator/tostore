@@ -1441,6 +1441,7 @@ class MigrationManager {
         // create migration instance for specific space
         final migrationInstance = DataStoreImpl(
             dbPath: _dataStore.config.dbPath,
+            dbName: _dataStore.config.dbName,
             config: _dataStore.config.copyWith(spaceName: space),
             isMigrationInstance: true);
         await migrationInstance.initialize();

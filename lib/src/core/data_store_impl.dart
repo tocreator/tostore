@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
 import 'lock_manager.dart';
 import 'backup_manager.dart';
 import '../handler/chacha20_poly1305.dart';
@@ -53,6 +52,13 @@ class DataStoreImpl {
 
   bool _baseInitialized = false;
   String? _dbName;
+  String? _dbPath;
+
+  /// The final, resolved path to the database instance directory.
+  String? _instancePath;
+
+  /// The final, resolved path to the database instance directory.
+  String? get instancePath => _instancePath;
 
   bool get isInitialized => _isInitialized;
   final bool isMigrationInstance;
@@ -127,7 +133,10 @@ class DataStoreImpl {
     Future<void> Function(DataStoreImpl db)? onOpen,
     isMigrationInstance = false,
   }) {
-    final key = dbPath ?? 'default';
+    final effectiveDbPath = dbPath ?? config?.dbPath;
+    final effectiveDbName = dbName ?? config?.dbName ?? 'default';
+    final key = '$effectiveDbPath-$effectiveDbName';
+
     if (!_instances.containsKey(key) && !isMigrationInstance) {
       final instance = DataStoreImpl._internal(
         key,
@@ -138,7 +147,7 @@ class DataStoreImpl {
         isMigrationInstance,
       );
       _instances[key] = instance;
-      instance._startInitialize(dbPath, dbName, config);
+      instance._startInitialize(effectiveDbPath, effectiveDbName, config);
     }
     // If it's a migration instance, always create a new instance, don't use existing instances
     if (isMigrationInstance) {
@@ -150,10 +159,7 @@ class DataStoreImpl {
         onOpen,
         isMigrationInstance,
       );
-      if (config != null) {
-        instance._currentSpaceName = config.spaceName;
-      }
-      instance._startInitialize(dbPath, dbName, config);
+      instance._startInitialize(effectiveDbPath, effectiveDbName, config);
       return instance;
     }
     return _instances[key]!;
@@ -174,8 +180,9 @@ class DataStoreImpl {
     if (_initializing || _isInitialized) {
       return;
     }
-
     _dbName = dbName;
+    _dbPath = dbPath;
+    _config = config ?? DataStoreConfig();
 
     _initCompleter = Completer<void>();
 
@@ -260,28 +267,27 @@ class DataStoreImpl {
 
   /// Get database path
   Future<String> getDatabasePath({String? dbPath, String? dbName}) async {
-    final baseDir = pathJoin('db', dbName ?? 'default');
-    String? rootPath;
-
-    if (dbPath != null) {
+    if (dbPath == null && dbName == null && instancePath != null) {
+      return instancePath!;
+    }
+    String rootPath;
+    final effectiveDbName = dbName ?? _dbName ?? 'default';
+    if (dbPath != null && dbPath.isNotEmpty) {
       rootPath = dbPath;
-    } else if (_config != null) {
-      rootPath = _config?.dbPath;
+    } else if (_dbPath != null && _dbPath!.isNotEmpty) {
+      rootPath = _dbPath!;
+    } else {
+      rootPath = await getPathApp();
     }
 
-    if (rootPath != null) {
-      if (rootPath.startsWith(baseDir) || rootPath.endsWith(baseDir)) {
-        return rootPath;
-      }
-      return pathJoin(rootPath, baseDir);
+    // Normalize path separators for cross-platform consistency.
+    rootPath = rootPath.replaceAll(r'\', '/');
+    // Remove any trailing slashes to prevent duplication.
+    while (rootPath.endsWith('/')) {
+      rootPath = rootPath.substring(0, rootPath.length - 1);
     }
 
-    if (kIsWeb) {
-      return baseDir;
-    }
-    // Other platforms: app path/baseDir
-    final appPath = await getPathApp();
-    return pathJoin(appPath, baseDir);
+    return pathJoin(rootPath, 'db', effectiveDbName);
   }
 
   /// Initialize storage engine
@@ -292,7 +298,10 @@ class DataStoreImpl {
       return true;
     }
 
-    if (_isInitialized && dbPath == _config?.dbPath && config == _config) {
+    if (_isInitialized &&
+        dbPath == _dbPath &&
+        dbName == _dbName &&
+        config == _config) {
       return true;
     }
 
@@ -303,9 +312,25 @@ class DataStoreImpl {
         await close();
       }
 
-      // First, set up the configuration so that logging is enabled immediately.
-      // This ensures that any errors during path resolution are also captured.
-      _config = config ?? DataStoreConfig();
+      if (config != null) {
+        _config = config;
+        if (_config?.dbPath != null) {
+          _dbPath = _config?.dbPath;
+        }
+        if (_config?.dbName != 'default') {
+          _dbName = _config?.dbName;
+        }
+      }
+
+      if (dbPath != null) {
+        _dbPath = dbPath;
+      }
+      if (dbName != null) {
+        _dbName = dbName;
+      }
+
+      _config ??= DataStoreConfig();
+      _dbName ??= _config?.dbName;
 
       // Apply log configuration as early as possible.
       LogConfig.setConfig(
@@ -313,13 +338,11 @@ class DataStoreImpl {
         logLevel: _config!.logLevel,
       );
 
-      if (dbName != null) {
-        _dbName = dbName;
-      }
-      dbPath = await getDatabasePath(dbPath: dbPath, dbName: _dbName);
+      // Resolve the final database path
+      _instancePath = await getDatabasePath(dbPath: _dbPath, dbName: _dbName);
 
-      // Now, update the config with the final path.
-      _config = _config!.copyWith(dbPath: dbPath);
+      _config =
+          _config!.copyWith(dbPath: _dbPath, dbName: _dbName ?? config?.dbName);
 
       // Configure the global parallel processor with sensible defaults
       ParallelProcessor.setConfig(
@@ -334,7 +357,7 @@ class DataStoreImpl {
       // Ensure _currentSpaceName is synchronized with config.spaceName
       _currentSpaceName = _config!.spaceName;
 
-      storage = StorageAdapter(_config!);
+      storage = StorageAdapter();
       lockManager = LockManager();
 
       schemaManager = SchemaManager(this);
@@ -747,10 +770,6 @@ class DataStoreImpl {
       // 4. Add to write queue (insert operation)
       await tableDataManager.addToWriteBuffer(tableName, validData,
           isUpdate: false);
-
-      // Invalidate query caches that might be affected by the new record
-      await dataCacheManager
-          .invalidateAffectedQueries(tableName, records: [validData]);
 
       // Return string type primary key value
       final primaryKeyValue = validData[schema.primaryKey];
@@ -1845,10 +1864,6 @@ class DataStoreImpl {
           );
         }
 
-        // Invalidate query caches for all newly inserted valid records
-        await dataCacheManager.invalidateAffectedQueries(tableName,
-            records: validRecords);
-
         // Return result
         if (invalidRecords.isEmpty) {
           return DbResult.success(
@@ -2131,7 +2146,7 @@ class DataStoreImpl {
       // Reinitialize database
       _isInitialized = false;
       _baseInitialized = false;
-      await initialize(dbPath: _config?.dbPath, config: _config);
+      await initialize();
 
       // Add new space to GlobalConfig
       final globalConfig = await getGlobalConfig();

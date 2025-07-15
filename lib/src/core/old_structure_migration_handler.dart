@@ -24,7 +24,8 @@ class OldStructureMigrationHandler {
   /// Check if old structure migration is needed
   /// If the version file exists in the root directory, it indicates an old structure database that needs migration
   Future<bool> needsMigration() async {
-    final versionPath = pathJoin(_dataStore.config.dbPath!, 'version');
+    final versionPath = pathJoin(
+        _dataStore.config.dbPath ?? _dataStore.instancePath!, 'version');
     final exists = await _storage.existsFile(versionPath);
     return exists; // if version file exists, it indicates that the database needs migration
   }
@@ -50,15 +51,18 @@ class OldStructureMigrationHandler {
         // create a migration instance for a specific space
         final migrationInstance = DataStoreImpl(
             dbPath: _dataStore.config.dbPath,
+            dbName: _dataStore.config.dbName,
             config: _dataStore.config.copyWith(spaceName: spaceName),
             isMigrationInstance: true);
         await migrationInstance.initialize();
 
         // check if old structure directory exists
-        final oldGlobalPath =
-            pathJoin(migrationInstance.config.dbPath!, 'global');
-        final oldBasesPath =
-            pathJoin(migrationInstance.config.dbPath!, 'bases');
+        final oldGlobalPath = pathJoin(
+            migrationInstance.config.dbPath ?? migrationInstance.instancePath!,
+            'global');
+        final oldBasesPath = pathJoin(
+            migrationInstance.config.dbPath ?? migrationInstance.instancePath!,
+            'bases');
         final oldBasePath = pathJoin(oldBasesPath, spaceName);
 
         bool hasOldStructure = false;
@@ -90,7 +94,8 @@ class OldStructureMigrationHandler {
       }
 
       // after all spaces migration completed, delete version file
-      final versionPath = pathJoin(_dataStore.config.dbPath!, 'version');
+      final versionPath = pathJoin(
+          _dataStore.config.dbPath ?? _dataStore.instancePath!, 'version');
       if (await _storage.existsFile(versionPath)) {
         await _storage.deleteFile(versionPath);
       }
@@ -115,7 +120,8 @@ class OldStructureMigrationHandler {
       }
 
       // if no global config exists, get space names from old directory structure
-      final oldBasesPath = pathJoin(_dataStore.config.dbPath!, 'bases');
+      final oldBasesPath = pathJoin(
+          _dataStore.config.dbPath ?? _dataStore.instancePath!, 'bases');
       if (await _storage.existsDirectory(oldBasesPath)) {
         final spaces = await _storage.listDirectory(oldBasesPath);
         // extract space names from path

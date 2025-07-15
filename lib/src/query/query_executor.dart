@@ -77,9 +77,7 @@ class QueryExecutor {
       }
 
       // Determine if query cache should be used
-      bool shouldUseQueryCache = enableQueryCache ??
-          (_dataStore.config.shouldEnableQueryCache &&
-              !_dataStore.dataCacheManager.isAutoCacheDisabled);
+      bool shouldUseQueryCache = enableQueryCache ?? false;
 
       if (shouldUseQueryCache) {
         final cacheKey = QueryCacheKey(
@@ -88,7 +86,6 @@ class QueryExecutor {
           orderBy: orderBy,
           limit: limit,
           offset: offset,
-          isUserManaged: enableQueryCache == true,
         );
 
         /// 1、 try query cache
@@ -188,7 +185,6 @@ class QueryExecutor {
                 orderBy: orderBy,
                 limit: limit,
                 offset: offset,
-                isUserManaged: enableQueryCache == true,
               );
 
               await _dataStore.dataCacheManager.cacheQuery(
@@ -230,7 +226,6 @@ class QueryExecutor {
             orderBy: orderBy,
             limit: limit,
             offset: offset,
-            isUserManaged: enableQueryCache == true,
           );
 
           await _dataStore.dataCacheManager.cacheQuery(

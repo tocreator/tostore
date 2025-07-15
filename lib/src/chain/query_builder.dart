@@ -90,38 +90,30 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return this;
   }
 
-  /// Clear the query cache for the current query condition
-  /// Returns the number of cache entries removed
-  Future<int> clearQueryCache() async {
+  /// Clear the query cache for the current query condition.
+  ///
+  /// Returns `true` if the operation completes successfully (meaning the cache
+  /// is clear, regardless of whether it was present before).
+  /// Returns `false` only if an error occurred during the process.
+  Future<bool> clearQueryCache() async {
     await $db.ensureInitialized();
     final cacheManager = $db.dataCacheManager;
 
-    // Number of removed cache entries
-    int totalRemoved = 0;
+    // Build cache key to ensure correct matching
+    final cacheKey = QueryCacheKey(
+      tableName: $tableName,
+      condition: queryCondition,
+      orderBy: $orderBy,
+      limit: $limit,
+      offset: $offset,
+      joins: _joins,
+    );
 
-    // Try to clean up both user-managed and system-generated caches
-    for (bool isUserManaged in [true, false]) {
-      // Build cache key to ensure correct matching
-      final cacheKey = QueryCacheKey(
-        tableName: $tableName,
-        condition: queryCondition,
-        orderBy: $orderBy,
-        limit: $limit,
-        offset: $offset,
-        joins: _joins,
-        isUserManaged: isUserManaged,
-      );
+    // Get cache key string
+    final cacheKeyString = cacheKey.toString();
 
-      // Get cache key string
-      final cacheKeyString = cacheKey.toString();
-
-      // Clean up specific query cache
-      final removedCount =
-          await cacheManager.invalidateQuery($tableName, cacheKeyString);
-      totalRemoved += removedCount;
-    }
-
-    return totalRemoved;
+    // Clean up specific query cache
+    return await cacheManager.invalidateQuery($tableName, cacheKeyString);
   }
 
   /// get first record

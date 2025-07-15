@@ -123,17 +123,17 @@ class QueryCache {
   }
 
   /// invalidate a specific query
-  /// returns 1 if removed, 0 if not found
-  Future<int> invalidateQuery(String queryKey) async {
+  /// returns true if removed, false if not found
+  Future<bool> invalidateQuery(String queryKey) async {
     if (_cache.containsKey(queryKey)) {
       // Subtract removed cache size
       _totalCacheSize -=
           (TableCache.estimateRecordsSize(_cache[queryKey]!.results) + 100);
 
       _cache.remove(queryKey);
-      return 1;
+      return true;
     }
-    return 0;
+    return false;
   }
 
   /// clear all cache
@@ -312,11 +312,6 @@ class QueryCacheKey {
   final int? offset;
   final List<JoinClause>? joins;
 
-  /// whether the cache is user-managed
-  /// true: user explicitly created through useQueryCache(), will not expire automatically
-  /// false: system-created cache, will expire automatically when records are modified
-  final bool isUserManaged;
-
   /// Cache the result of toString to avoid repeated calculation
   String? _cachedString;
 
@@ -327,7 +322,6 @@ class QueryCacheKey {
     this.limit,
     this.offset,
     this.joins,
-    this.isUserManaged = false,
   });
 
   @override
@@ -342,7 +336,6 @@ class QueryCacheKey {
       final Map<String, dynamic> keyData = {
         'tableName': tableName,
         'condition': condition.build(),
-        'isUserManaged': isUserManaged,
       };
 
       // Only add non-empty values to reduce complexity
@@ -396,7 +389,6 @@ class QueryCacheKey {
     if (orderBy != null && orderBy!.isNotEmpty) keyData['orderBy'] = orderBy;
     if (limit != null) keyData['limit'] = limit;
     if (offset != null) keyData['offset'] = offset;
-    if (isUserManaged) keyData['isUserManaged'] = true;
 
     if (joins != null && joins!.isNotEmpty) {
       keyData['joins'] = joins!

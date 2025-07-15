@@ -1,5 +1,4 @@
 import 'package:flutter/foundation.dart';
-import '../model/data_store_config.dart';
 import '../Interface/storage_interface.dart';
 import 'lock_manager.dart';
 import 'package:path/path.dart' as path;
@@ -23,7 +22,7 @@ class StorageAdapter implements StorageInterface {
   static const String _listOpPrefix = 'list-';
   static const String _deleteOpPrefix = 'delete-';
 
-  StorageAdapter(DataStoreConfig config)
+  StorageAdapter()
       : _lockManager =
             LockManager(lockTimeout: 300000, enableDeadlockDetection: true) {
     if (kIsWeb) {

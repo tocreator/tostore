@@ -7,12 +7,12 @@ import '../model/file_info.dart';
 /// responsible for all file path related operations, including table paths, index paths, data paths, etc.
 class PathManager {
   final DataStoreImpl dataStore;
-  final DataStoreConfig config;
+  DataStoreConfig get config => dataStore.config;
 
   // table path cache
   final Map<String, String> _tablePathCache = {};
 
-  PathManager(this.dataStore) : config = dataStore.config;
+  PathManager(this.dataStore);
 
   /// clear all cache
   void clearCache() {
@@ -28,34 +28,37 @@ class PathManager {
   // base path methods (sync methods)
   //==================================
 
+  String get _instancePath => dataStore.instancePath!;
+  String get _currentSpaceName => dataStore.currentSpaceName;
+
   /// get space directory path
   String getSpacePath() {
-    return pathJoin(config.dbPath!, 'spaces', config.spaceName);
+    return pathJoin(_instancePath, 'spaces', _currentSpaceName);
   }
 
   /// get global table directory path
   String getGlobalPath() {
-    return pathJoin(config.dbPath!, 'global');
+    return pathJoin(_instancePath, 'global');
   }
 
   /// get schemas directory path (at root level)
   String getSchemasPath() {
-    return pathJoin(config.dbPath!, 'schemas');
+    return pathJoin(_instancePath, 'schemas');
   }
 
   /// get backup directory path
   String getBackupPath() {
-    return pathJoin(config.dbPath!, 'backups');
+    return pathJoin(_instancePath, 'backups');
   }
 
   /// get log directory path
   String getLogPath() {
-    return pathJoin(config.dbPath!, 'logs');
+    return pathJoin(_instancePath, 'logs');
   }
 
   /// get migrations directory path
   String getMigrationsPath() {
-    return pathJoin(config.dbPath!, 'migrations');
+    return pathJoin(_instancePath, 'migrations');
   }
 
   /// get migration meta file path (migration metadata)
@@ -70,12 +73,12 @@ class PathManager {
 
   /// get global config file path
   String getGlobalConfigPath() {
-    return pathJoin(config.dbPath!, 'global_config.json');
+    return pathJoin(_instancePath, 'global_config.json');
   }
 
   /// get space config path
   String getSpaceConfigPath(String spaceName) {
-    return pathJoin(config.dbPath!, 'spaces', spaceName, 'space_config.json');
+    return pathJoin(_instancePath, 'spaces', spaceName, 'space_config.json');
   }
 
   /// get schema meta file path (database schema metadata)
@@ -216,7 +219,7 @@ class PathManager {
 
   /// get cache root path
   String getCacheRootPath() {
-    return pathJoin(config.dbPath!, 'caches');
+    return pathJoin(_instancePath, 'caches');
   }
 
   /// get global cache path
