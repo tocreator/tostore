@@ -974,13 +974,43 @@ class QueryExecutor {
     bool wasFullTableScan = false;
     try {
       final resultMap = <String, Map<String, dynamic>>{};
-      final controller = ParallelController();
-      final recordsNeededForLimit =
-          isOptimizedLimitQuery ? (offset ?? 0) + limit! : -1;
-      int foundRecordsCount = 0;
+      // When using an optimized limit query, we must process partitions sequentially
+      // to ensure the correct order of results, especially for pagination.
+      // Parallel processing could return results from later partitions first.
+      if (isOptimizedLimitQuery) {
+        final recordsNeededForLimit = (offset ?? 0) + limit!;
+        bool limitReached = false;
 
-      // 7. Execute the scan over the target partitions.
-      if (targetPartitions.isNotEmpty) {
+        for (final partitionIndex in targetPartitions) {
+          if (limitReached) {
+            break;
+          }
+
+          final records = await _dataStore.tableDataManager
+              .readRecordsFromPartition(
+                  tableName, isGlobal, partitionIndex, primaryKey);
+
+          final iterableRecords = isOrderByPkDesc ? records.reversed : records;
+          int i = 0;
+          for (final record in iterableRecords) {
+            if (isDeletedRecord(record)) continue;
+            if (i % 50 == 0) {
+              await Future.delayed(Duration.zero);
+            }
+            i++;
+
+            if (matcher == null || matcher.matches(record)) {
+              resultMap[record[primaryKey].toString()] = record;
+              if (resultMap.length >= recordsNeededForLimit) {
+                limitReached = true;
+                break;
+              }
+            }
+          }
+        }
+        wasFullTableScan = false; // It's an optimized, partial scan.
+      } else {
+        final controller = ParallelController();
         // --- Start: Early Exit Optimization ---
         String? earlyExitField;
         dynamic earlyExitValue;
@@ -1043,11 +1073,8 @@ class QueryExecutor {
                     tableName, isGlobal, partitionIndex, primaryKey);
 
             final partitionResults = <Map<String, dynamic>>[];
-            final iterableRecords = (isOptimizedLimitQuery && isOrderByPkDesc)
-                ? records.reversed
-                : records;
             int i = 0;
-            for (final record in iterableRecords) {
+            for (final record in records) {
               // Check again inside the loop for faster exit
               if (controller.isStopped) {
                 break;
@@ -1068,13 +1095,7 @@ class QueryExecutor {
 
               if (matcher == null || matcher.matches(record)) {
                 partitionResults.add(record);
-                if (isOptimizedLimitQuery) {
-                  foundRecordsCount++;
-                  if (foundRecordsCount >= recordsNeededForLimit) {
-                    controller.stop();
-                    break;
-                  }
-                }
+
                 // Early exit optimization for PK or Unique Key match
                 if (earlyExitField != null) {
                   controller.stop();
@@ -1085,13 +1106,11 @@ class QueryExecutor {
             return partitionResults;
           };
         }).toList();
-        Stopwatch stopwatch = Stopwatch()..start();
 
         final resultsFromPartitions =
             await ParallelProcessor.execute<List<Map<String, dynamic>>>(tasks,
                 controller: controller,
-                label: 'QueryExecutor._performTableScan.optimized');
-        stopwatch.stop();
+                label: 'QueryExecutor._performTableScan.nonOptimized');
 
         int processedCount = 0;
         for (final recordList in resultsFromPartitions) {
@@ -1103,10 +1122,10 @@ class QueryExecutor {
             await Future.delayed(Duration.zero);
           }
         }
-      }
 
-      // 8. Determine if a full scan was actually completed.
-      wasFullTableScan = isFullScanIntent && !controller.isStopped;
+        // 8. Determine if a full scan was actually completed.
+        wasFullTableScan = isFullScanIntent && !controller.isStopped;
+      }
 
       // 9. If we were the leader, handle caching.
       if (shouldBecomeLeader) {
