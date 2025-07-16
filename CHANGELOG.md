@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.1.7
+## 2.1.8
 
 ### Removed
 - Removed automatic query cache management. A more efficient caching mechanism is now in place, making it unnecessary for non-large-scale data scenarios.
