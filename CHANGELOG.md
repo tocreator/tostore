@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.7
+
+### Removed
+- Removed automatic query cache management. A more efficient caching mechanism is now in place, making it unnecessary for non-large-scale data scenarios.
+
+### Changed
+- Optimized UI smoothness and responsiveness for large-scale data insertion, deletion, and updates.
+- Improved performance for `limit`, sorting, and pagination.
+
+### Fixed
+- Fixed a path issue that occurred when using a custom `dbName`.
+- Fixed an issue where parallel searches would return prematurely upon finding a result.
+
 ## 2.1.6
 
 ### Changed
