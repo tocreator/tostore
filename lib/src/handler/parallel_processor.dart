@@ -133,14 +133,12 @@ class ParallelProcessor {
 
         final result = await future;
 
-        if (effectiveController.isStopped) {
-          if (!completers[index].isCompleted) {
-            completers[index].complete(null);
-          }
-        } else {
-          if (!completers[index].isCompleted) {
-            completers[index].complete(result);
-          }
+        // A task that completes successfully should always return its result.
+        // The `stop()` call is a signal for the processor to prevent starting
+        // new tasks, but it shouldn't invalidate the work of the task that
+        // has already successfully completed (especially the one that triggered the stop).
+        if (!completers[index].isCompleted) {
+          completers[index].complete(result);
         }
       } catch (e, s) {
         if (e != 'stopped') {
