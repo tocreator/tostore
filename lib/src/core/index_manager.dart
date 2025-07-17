@@ -93,20 +93,21 @@ class IndexManager {
   // Asynchronous write completion event
   final Completer<void> _allWritesCompleted = Completer<void>();
 
-  // Fast processing mode handler
-  void Function()? _fastProcessCallback;
+  // --- Start: Intelligent Polling Logic ---
 
-  // Whether fast processing mode is enabled
-  bool _fastProcessEnabled = false;
+  // Callback for the high-frequency polling timer
+  void Function()? _highFrequencyCallback;
 
-  // Fast processing mode size threshold
-  static const int _fastProcessThreshold = 1000;
+  // Callback for the low-frequency polling timer
+  void Function()? _lowFrequencyCallback;
 
-  // Number of consecutive small buffer checks, used to automatically disable fast mode
-  static const int _maxSmallBufferChecks = 5;
+  // Whether high-frequency mode is active
+  bool _isHighFrequencyModeActive = false;
 
-  // Small buffer check count
-  int _smallBufferCheckCount = 0;
+  // Time when buffers last became empty and no writes were in progress
+  DateTime? _lastIdleTime;
+
+  // --- End: Intelligent Polling Logic ---
 
   // Mark whether the index write buffer is being processed
   bool _isProcessingWriteBuffer = false;
@@ -314,10 +315,12 @@ class IndexManager {
   void _initCronTask() {
     if (_cronInitialized) return;
 
-    // Process index write buffer periodically
-    CrontabManager.addCallback(ExecuteInterval.seconds3, () {
-      _processIndexWriteBuffer();
-    });
+    _lowFrequencyCallback = () => _processIndexWriteBuffer();
+    _highFrequencyCallback = () => _processIndexWriteBuffer();
+
+    // Start with low-frequency polling
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
 
     _cronInitialized = true;
 
@@ -325,77 +328,59 @@ class IndexManager {
     _checkInitialWriteBuffer();
   }
 
-  /// Enable fast processing mode
-  void _enableFastProcessMode() {
-    if (_fastProcessEnabled) return;
+  /// Switch to high-frequency polling mode.
+  void _switchToHighFrequencyMode() {
+    if (_isHighFrequencyModeActive) return;
+    _isHighFrequencyModeActive =
+        true; // Set flag first to prevent race condition
 
-    _fastProcessEnabled = true;
-    _fastProcessCallback = () {
-      _checkBufferSizes();
-    };
-
-    // Add 1 second cycle check
-    CrontabManager.addCallback(ExecuteInterval.seconds1, _fastProcessCallback!);
-
-    Logger.debug('Enabled index fast processing mode',
-        label: 'IndexManager._enableFastProcessMode');
-  }
-
-  /// Disable fast processing mode
-  void _disableFastProcessMode() {
-    if (!_fastProcessEnabled || _fastProcessCallback == null) return;
-
-    // Remove 1 second cycle check
     CrontabManager.removeCallback(
-        ExecuteInterval.seconds1, _fastProcessCallback!);
-    _fastProcessEnabled = false;
-    _fastProcessCallback = null;
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds1, _highFrequencyCallback!);
+
+    _lastIdleTime = null; // Reset idle timer
+    Logger.debug('Switched to high-frequency (1s) index polling.',
+        label: 'IndexManager');
   }
 
-  /// Check all buffer sizes
-  Future<void> _checkBufferSizes() async {
-    bool hasLargeBuffer = false;
-    List<String> keysToProcess = [];
+  /// Switch to low-frequency polling mode.
+  void _switchToLowFrequencyMode() {
+    if (!_isHighFrequencyModeActive) return;
+    _isHighFrequencyModeActive =
+        false; // Set flag first to prevent race condition
 
-    // Check insert buffer
-    int processedCount = 0;
-    for (final key in _writeBuffer.keys) {
-      if (_writeBuffer[key] != null &&
-          _writeBuffer[key]!.length >= _fastProcessThreshold) {
-        hasLargeBuffer = true;
-        keysToProcess.add(key);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
+    CrontabManager.removeCallback(
+        ExecuteInterval.seconds1, _highFrequencyCallback!);
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
 
-    // Check delete buffer
-    processedCount = 0;
-    for (final key in _deleteBuffer.keys) {
-      if (_deleteBuffer[key] != null &&
-          _deleteBuffer[key]!.length >= _fastProcessThreshold) {
-        hasLargeBuffer = true;
-        keysToProcess.add(key);
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
+    Logger.debug(
+        'Switched to low-frequency (3s) index polling due to inactivity.',
+        label: 'IndexManager');
+  }
 
-    // If there is a large buffer, process immediately
-    if (hasLargeBuffer) {
-      _processIndexWriteBuffer(specificKeys: keysToProcess);
-      _smallBufferCheckCount = 0; // Reset counter
+  /// Check buffer status to decide if we should switch polling frequency.
+  void _checkAndSwitchPollingMode() {
+    final bool isIdle = _writeBuffer.isEmpty &&
+        _deleteBuffer.isEmpty &&
+        !_isProcessingWriteBuffer;
+
+    if (_isHighFrequencyModeActive) {
+      if (isIdle) {
+        // Buffers are empty, start the 30-second countdown to switch to low-frequency mode.
+        _lastIdleTime ??= DateTime.now();
+        if (DateTime.now().difference(_lastIdleTime!).inSeconds >= 30) {
+          _switchToLowFrequencyMode();
+        }
+      } else {
+        // Not idle, so reset the timer.
+        _lastIdleTime = null;
+      }
     } else {
-      // If no large buffer is found after multiple consecutive checks, disable fast mode
-      _smallBufferCheckCount++;
-
-      if (_smallBufferCheckCount >= _maxSmallBufferChecks) {
-        _disableFastProcessMode();
-        _smallBufferCheckCount = 0;
+      // We are in low-frequency mode. If we are not idle, we should switch to high-frequency.
+      if (!isIdle) {
+        _switchToHighFrequencyMode();
       }
     }
   }
@@ -433,6 +418,8 @@ class IndexManager {
           !_allWritesCompleted.isCompleted) {
         _allWritesCompleted.complete();
       }
+      // Check if we should switch to low-frequency mode.
+      _checkAndSwitchPollingMode();
       return;
     }
 
@@ -440,6 +427,8 @@ class IndexManager {
       // Set processing flag, only set when not closing
       if (!_isClosing) {
         _isProcessingWriteBuffer = true;
+        // When processing starts, we are not idle, so reset the idle timer.
+        _lastIdleTime = null;
       }
 
       // Track operations to wait for completion when the database is closing
@@ -491,6 +480,7 @@ class IndexManager {
             !_allWritesCompleted.isCompleted) {
           _allWritesCompleted.complete();
         }
+        _checkAndSwitchPollingMode(); // Still check if we should go to low-frequency mode
         return;
       }
 
@@ -526,6 +516,7 @@ class IndexManager {
     } finally {
       if (!_isClosing) {
         _isProcessingWriteBuffer = false;
+        _checkAndSwitchPollingMode();
       }
     }
   }
@@ -535,14 +526,14 @@ class IndexManager {
     final result = <String>{};
 
     // Add keys from insert buffer
-    for (final key in _writeBuffer.keys) {
+    for (final key in _writeBuffer.keys.toList()) {
       if (_writeBuffer[key] != null && _writeBuffer[key]!.isNotEmpty) {
         result.add(key);
       }
     }
 
     // Add keys from delete buffer
-    for (final key in _deleteBuffer.keys) {
+    for (final key in _deleteBuffer.keys.toList()) {
       if (_deleteBuffer[key] != null && _deleteBuffer[key]!.isNotEmpty) {
         result.add(key);
       }
@@ -575,7 +566,7 @@ class IndexManager {
 
       if (indexMeta.isOrdered == true) {
         int processedCount = 0;
-        for (final entry in entriesToDelete.entries) {
+        for (final entry in entriesToDelete.entries.toList()) {
           final indexKey = entry.value.indexEntry.indexKey;
           final partitionIndex =
               indexMeta.findPartitionForKey(indexKey, matcher);
@@ -603,7 +594,7 @@ class IndexManager {
 
       // --- Process deletes for keys found in specific partitions (ordered indexes) ---
       int processedCount = 0;
-      for (final job in partitionedDeletes.entries) {
+      for (final job in partitionedDeletes.entries.toList()) {
         final partitionIndex = job.key;
         final entriesForPartition = job.value;
         final partition = partitionMap[partitionIndex];
@@ -906,10 +897,9 @@ class IndexManager {
 
             // --- 1. Process Inserts Concurrently ---
             if (hasInserts) {
-              final writeBuffer = _writeBuffer[key]!;
+              final writeBuffer = _writeBuffer.remove(key)!;
               final List<IndexBufferEntry> allEntries =
                   writeBuffer.values.toList();
-              writeBuffer.clear(); // Clear buffer immediately
 
               // Check if this is a primary key index and table has ordered flag
               bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
@@ -1227,8 +1217,14 @@ class IndexManager {
   }
 
   void dispose() {
-    // Ensure fast processing mode is disabled
-    _disableFastProcessMode();
+    if (_lowFrequencyCallback != null) {
+      CrontabManager.removeCallback(
+          ExecuteInterval.seconds3, _lowFrequencyCallback!);
+    }
+    if (_highFrequencyCallback != null) {
+      CrontabManager.removeCallback(
+          ExecuteInterval.seconds1, _highFrequencyCallback!);
+    }
 
     // Unregister memory callback
     _dataStore.memoryManager
@@ -2152,8 +2148,10 @@ class IndexManager {
       // Use optimized index building
       await _rebuildTableIndexes(tableName, tableSchema, false, [schema]);
 
-      Logger.info('Created index for $tableName: $indexName',
-          label: 'IndexManager.createIndex');
+      if (!SystemTable.isSystemTable(tableName)) {
+        Logger.info('Created index for $tableName: $indexName',
+            label: 'IndexManager.createIndex');
+      }
     } catch (e, stack) {
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
@@ -3104,9 +3102,6 @@ class IndexManager {
 
     _isClosing = true;
 
-    // Disable fast processing mode when closing
-    _disableFastProcessMode();
-
     // Get the current number of pending index entries
     final pendingEntries = _pendingEntriesCount;
 
@@ -3204,10 +3199,9 @@ class IndexManager {
       // Add to buffer
       _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
 
-      // Check buffer size, enable fast processing mode when buffer reaches threshold
-      if (!_fastProcessEnabled &&
-          _writeBuffer[cacheKey]!.length >= _fastProcessThreshold) {
-        _enableFastProcessMode();
+      // Trigger high-frequency polling if not already active.
+      if (!_isHighFrequencyModeActive) {
+        _switchToHighFrequencyMode();
       }
 
       // Update index cache (if loaded)
@@ -3283,6 +3277,11 @@ class IndexManager {
 
       // Add to buffer
       _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
+
+      // Trigger high-frequency polling if not already active.
+      if (!_isHighFrequencyModeActive) {
+        _switchToHighFrequencyMode();
+      }
 
       // Also remove from memory cache if it exists, but don't wait for it.
       if (_indexCache.containsKey(cacheKey)) {
@@ -3751,7 +3750,7 @@ class IndexManager {
               (availableMemoryMB * 1024 * 1024 * 0.25 / 100).toInt();
 
           // Minimum threshold to ensure reasonable batch size
-          const minThreshold = _fastProcessThreshold;
+          const minThreshold = 1000;
 
           // Calculate a safe threshold, with upper and lower limits
           return maxEntriesInMemory.clamp(minThreshold, minThreshold * 20);
@@ -3759,7 +3758,7 @@ class IndexManager {
           // Fallback to fixed threshold if memory query fails
           Logger.warn('Failed to get available memory, using default threshold',
               label: 'IndexManager._rebuildTableIndexes');
-          return _fastProcessThreshold * 4;
+          return 1000 * 4;
         }
       }
 

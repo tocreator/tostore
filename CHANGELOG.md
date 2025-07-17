@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.1.8
+## 2.1.9
 
 ### Removed
 - Removed automatic query cache management. A more efficient caching mechanism is now in place, making it unnecessary for non-large-scale data scenarios.
@@ -10,10 +10,12 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Optimized UI smoothness and responsiveness for large-scale data insertion, deletion, and updates.
 - Improved performance for `limit`, sorting, and pagination.
+- Feat: Intelligent idle task mechanism for optimized power consumption and data safety on mobile devices.
 
 ### Fixed
 - Fixed a path issue that occurred when using a custom `dbName`.
 - Fixed an issue where parallel searches would return prematurely upon finding a result.
+- Fix: Unsynchronized keys during initialization.
 
 ## 2.1.6
 

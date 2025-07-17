@@ -170,11 +170,12 @@ class EncoderHandler {
 
           // If an expected keyId is provided and doesn't match header keyId, try to retrieve the proper key
           if (headerKeyId != (keyId ?? _currentKeyId)) {
-            if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
+            if (headerKeyId == 0) {
+              key = _defaultXorKey;
+            } else if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
               key = _fallbackKeys![headerKeyId] ?? key;
             }
           }
-
           final restored = _applyXor(dataBytes, key);
           return utf8.decode(restored);
         } else {

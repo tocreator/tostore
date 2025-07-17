@@ -197,7 +197,7 @@ class DataStoreConfig {
       return 64 + (cpuCount * 15);
     }
     // Mobile devices have slower storage and more constrained memory.
-    return 5 + (cpuCount * 5);
+    return 20 + (cpuCount * 10);
   }
 
   /// from json create config

@@ -8,6 +8,7 @@ import 'data_store_impl.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
+import '../model/system_table.dart';
 import 'table_data_manager.dart' show isDeletedRecord;
 
 /// Migration manager for handling database version upgrades
@@ -90,10 +91,12 @@ class MigrationManager {
           // Merge operations
           operations.addAll(schemaOperations);
 
-          Logger.info(
-            'Table [$oldTableName -> ${newSchema.name}] generated ${operations.length} migration operations',
-            label: 'MigrationManager.migrate',
-          );
+          if (!SystemTable.isSystemTable(oldTableName)) {
+            Logger.info(
+              'Table [$oldTableName -> ${newSchema.name}] generated ${operations.length} migration operations',
+              label: 'MigrationManager.migrate',
+            );
+          }
 
           // Create migration task but do not process immediately
           final task = await addMigrationTask(oldTableName, operations,
@@ -132,10 +135,12 @@ class MigrationManager {
             await _dataStore.createTable(schema);
             tablesCreated++;
 
-            Logger.info(
-              'Create new table: ${schema.name}',
-              label: 'MigrationManager.migrate',
-            );
+            if (!SystemTable.isSystemTable(schema.name)) {
+              Logger.info(
+                'Create new table: ${schema.name}',
+                label: 'MigrationManager.migrate',
+              );
+            }
           }
         } catch (e, stack) {
           Logger.error(
@@ -166,10 +171,12 @@ class MigrationManager {
           allTasks.add(task);
           tablesDropped++;
 
-          Logger.info(
-            'Handle table deletion: $tableName',
-            label: 'MigrationManager.migrate',
-          );
+          if (!SystemTable.isSystemTable(tableName)) {
+            Logger.info(
+              'Handle table deletion: $tableName',
+              label: 'MigrationManager.migrate',
+            );
+          }
         } catch (e, stack) {
           Logger.error(
             'Failed to handle table deletion [$tableName]: $e\n$stack',
@@ -268,27 +275,41 @@ class MigrationManager {
 
       // Output detailed results
       if (renamedTables.isNotEmpty) {
-        final renameInfo = renamedTables.entries
-            .map((e) => '${e.key} -> ${e.value.name}')
-            .join(', ');
-        Logger.info(
-          'Final result of table renaming detection: $renameInfo',
-          label: 'MigrationManager._detectRenamedTables',
-        );
+        final userRenamedTables = renamedTables.entries
+            .where((e) => !SystemTable.isSystemTable(e.key));
+        if (userRenamedTables.isNotEmpty) {
+          final renameInfo = userRenamedTables
+              .map((e) => '${e.key} -> ${e.value.name}')
+              .join(', ');
+          Logger.info(
+            'Final result of table renaming detection: $renameInfo',
+            label: 'MigrationManager._detectRenamedTables',
+          );
+        }
       }
 
       if (tablesToCreate.isNotEmpty) {
-        Logger.info(
-          'Tables to be created: ${tablesToCreate.join(', ')}',
-          label: 'MigrationManager._detectRenamedTables',
-        );
+        final userTablesToCreate = tablesToCreate
+            .where((name) => !SystemTable.isSystemTable(name))
+            .toList();
+        if (userTablesToCreate.isNotEmpty) {
+          Logger.info(
+            'Tables to be created: ${userTablesToCreate.join(', ')}',
+            label: 'MigrationManager._detectRenamedTables',
+          );
+        }
       }
 
       if (tablesToDrop.isNotEmpty) {
-        Logger.info(
-          'Tables to be deleted: ${tablesToDrop.join(', ')}',
-          label: 'MigrationManager._detectRenamedTables',
-        );
+        final userTablesToDrop = tablesToDrop
+            .where((name) => !SystemTable.isSystemTable(name))
+            .toList();
+        if (userTablesToDrop.isNotEmpty) {
+          Logger.info(
+            'Tables to be deleted: ${userTablesToDrop.join(', ')}',
+            label: 'MigrationManager._detectRenamedTables',
+          );
+        }
       }
 
       return RenamedTableResult(
@@ -482,10 +503,12 @@ class MigrationManager {
     if (operations.isEmpty) {
       return null;
     } else {
-      Logger.info(
-        'Found ${operations.length} changes for table $tableName',
-        label: 'MigrationManager._migrateExistingTable',
-      );
+      if (!SystemTable.isSystemTable(tableName)) {
+        Logger.info(
+          'Found ${operations.length} changes for table $tableName',
+          label: 'MigrationManager._migrateExistingTable',
+        );
+      }
     }
 
     // Check if there are existing migration tasks for this table
@@ -821,10 +844,12 @@ class MigrationManager {
           _preventDangerousTypeConversion(oldField, newField);
         }
 
-        Logger.info(
-          'Table ${newSchema.name}, field ${newField.name} has been modified',
-          label: 'MigrationManager._compareSchemas',
-        );
+        if (!SystemTable.isSystemTable(newSchema.name)) {
+          Logger.info(
+            'Table ${newSchema.name}, field ${newField.name} has been modified',
+            label: 'MigrationManager._compareSchemas',
+          );
+        }
         operations.add(MigrationOperation(
           type: MigrationType.modifyField,
           fieldUpdate: FieldSchemaUpdate(
@@ -903,10 +928,12 @@ class MigrationManager {
 
     // Handle indexes that need to be removed
     for (var indexToRemove in indexesToRemove) {
-      Logger.info(
-        'Detected index to be removed: ${indexToRemove.actualIndexName}, fields: ${indexToRemove.fields.join(", ")}',
-        label: 'MigrationManager._compareIndexes',
-      );
+      if (!SystemTable.isSystemTable(oldSchema.name)) {
+        Logger.info(
+          'Detected index to be removed: ${indexToRemove.actualIndexName}, fields: ${indexToRemove.fields.join(", ")}',
+          label: 'MigrationManager._compareIndexes',
+        );
+      }
 
       operations.add(MigrationOperation(
         type: MigrationType.removeIndex,
@@ -1378,10 +1405,12 @@ class MigrationManager {
     try {
       // record task start time
       final taskStopwatch = Stopwatch()..start();
-      Logger.info(
-        'Starting migration task execution: ${task.taskId}, table: ${task.tableName}',
-        label: 'MigrationManager._executeMigrationTask',
-      );
+      if (!SystemTable.isSystemTable(task.tableName)) {
+        Logger.info(
+          'Starting migration task execution: ${task.taskId}, table: ${task.tableName}',
+          label: 'MigrationManager._executeMigrationTask',
+        );
+      }
 
       // sort operations, ensure rename field operation is executed after property modification operation
       final sortedOperations = _sortOperations(List.from(task.operations));
@@ -1529,10 +1558,12 @@ class MigrationManager {
           );
           // record partition migration performance data
           final migrationDuration = spaceStopwatch.elapsedMilliseconds;
-          Logger.info(
-            'Table rename batch processing performance: $migrationDuration ms for table $originalTableName -> $currentTableName',
-            label: 'MigrationManager._executeMigrationTask',
-          );
+          if (!SystemTable.isSystemTable(originalTableName)) {
+            Logger.info(
+              'Table rename batch processing performance: $migrationDuration ms for table $originalTableName -> $currentTableName',
+              label: 'MigrationManager._executeMigrationTask',
+            );
+          }
         } else {
           if (needDataMigration) {
             // no rename table operation, directly process data migration
@@ -1602,10 +1633,12 @@ class MigrationManager {
 
       // calculate and print total time
       taskStopwatch.stop();
-      Logger.info(
-        'Migration task [${task.taskId}] completed, total time: ${taskStopwatch.elapsedMilliseconds}ms',
-        label: 'MigrationManager._executeMigrationTask',
-      );
+      if (!SystemTable.isSystemTable(task.tableName)) {
+        Logger.info(
+          'Migration task [${task.taskId}] completed, total time: ${taskStopwatch.elapsedMilliseconds}ms',
+          label: 'MigrationManager._executeMigrationTask',
+        );
+      }
     } catch (e, stack) {
       Logger.error(
         'Execute migration task failed: $e\n$stack',

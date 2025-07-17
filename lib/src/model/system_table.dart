@@ -36,11 +36,11 @@ class SystemTable {
               unique: true),
           const FieldSchema(
               name: 'value', fieldId: 'value', type: DataType.text),
-          FieldSchema(
+          const FieldSchema(
               name: 'updated_at',
               fieldId: 'updated_at',
               type: DataType.datetime,
-              defaultValue: DateTime.now().toIso8601String()),
+              defaultValueType: DefaultValueType.currentTimestamp),
         ],
         indexes: const [
           IndexSchema(fields: ['key'], unique: true),

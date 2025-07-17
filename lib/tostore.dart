@@ -80,7 +80,7 @@ class ToStore implements DataStoreInterface {
     Future<void> Function(ToStore db)? onCreate,
     Future<void> Function(ToStore db)? onOpen,
   }) {
-    final effectiveDbPath = dbPath ?? config?.dbPath;
+    final effectiveDbPath = dbPath ?? config?.dbPath ?? 'default';
     final effectiveDbName = dbName ?? config?.dbName ?? 'default';
     String instanceKey = '$effectiveDbPath-$effectiveDbName';
 

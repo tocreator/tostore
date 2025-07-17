@@ -41,36 +41,39 @@ class KeyManager {
     // Try to get existing space configuration to determine the correct keyId
     SpaceConfig? spaceConfig = await _dataStore.getSpaceConfig();
 
-    // Directly set EncoderHandler's default key to the encodingKey in the configuration
-    if (spaceConfig != null) {
-      try {
-        // Prepare and set fallback keys
-        final fallbackKeys = <int, List<int>>{};
-        final currentDecodedKey = _decodeKey(spaceConfig.current.key);
-        if (currentDecodedKey != null) {
-          fallbackKeys[spaceConfig.current.keyId] = currentDecodedKey;
-        }
-        if (spaceConfig.previous != null &&
-            spaceConfig.previous!.key.isNotEmpty) {
-          final previousDecodedKey = _decodeKey(spaceConfig.previous!.key);
-          if (previousDecodedKey != null) {
-            fallbackKeys[spaceConfig.previous!.keyId] = previousDecodedKey;
-          }
-        }
-        EncoderHandler.setFallbackKeys(fallbackKeys);
-        if (_dataStore.config.enableEncoding &&
-            _dataStore.config.encodingKey.isNotEmpty) {
-          int keyId = 1; // Default value is 1 (first-time initialization)
+    if (spaceConfig == null) {
+      spaceConfig = await createKeySpaceConfig();
+      await _dataStore.saveSpaceConfigToFile(spaceConfig);
+    }
 
-          if (spaceConfig.current.keyId > 0) {
-            // If there's an existing configuration, use the existing keyId
-            keyId = spaceConfig.current.keyId;
-          }
-          EncoderHandler.setCurrentKey(_dataStore.config.encodingKey, keyId);
-        }
-      } catch (e) {
-        Logger.error('Failed to set EncoderHandler key: $e');
+    // Directly set EncoderHandler's default key to the encodingKey in the configuration
+    try {
+      // Prepare and set fallback keys
+      final fallbackKeys = <int, List<int>>{};
+      final currentDecodedKey = _decodeKey(spaceConfig.current.key);
+      if (currentDecodedKey != null) {
+        fallbackKeys[spaceConfig.current.keyId] = currentDecodedKey;
       }
+      if (spaceConfig.previous != null &&
+          spaceConfig.previous!.key.isNotEmpty) {
+        final previousDecodedKey = _decodeKey(spaceConfig.previous!.key);
+        if (previousDecodedKey != null) {
+          fallbackKeys[spaceConfig.previous!.keyId] = previousDecodedKey;
+        }
+      }
+      EncoderHandler.setFallbackKeys(fallbackKeys);
+      if (_dataStore.config.enableEncoding &&
+          _dataStore.config.encodingKey.isNotEmpty) {
+        int keyId = 1; // Default value is 1 (first-time initialization)
+
+        if (spaceConfig.current.keyId > 0) {
+          // If there's an existing configuration, use the existing keyId
+          keyId = spaceConfig.current.keyId;
+        }
+        EncoderHandler.setCurrentKey(_dataStore.config.encodingKey, keyId);
+      }
+    } catch (e) {
+      Logger.error('Failed to set EncoderHandler key: $e');
     }
 
     // trigger key migration
@@ -96,7 +99,7 @@ class KeyManager {
         Logger.info(
             'No encoding key provided; creating space config with an empty key.');
         return SpaceConfig(
-            current: const EncryptionKeyInfo(key: '', keyId: 1),
+            current: const EncryptionKeyInfo(key: '', keyId: 0),
             previous: null,
             version: 0);
       }
@@ -105,7 +108,7 @@ class KeyManager {
           'Failed to create or encrypt key during first-time initialization: $e');
       // Return a default empty config on error to allow the app to proceed.
       return SpaceConfig(
-          current: const EncryptionKeyInfo(key: '', keyId: 1),
+          current: const EncryptionKeyInfo(key: '', keyId: 0),
           previous: null,
           version: 0);
     }
@@ -122,8 +125,6 @@ class KeyManager {
 
     // First-time initialization: if no space config available, store new key as current with keyId 1
     if (spaceConfig == null) {
-      final spaceConfig = await createKeySpaceConfig();
-      await _dataStore.saveSpaceConfigToFile(spaceConfig);
       return;
     }
 

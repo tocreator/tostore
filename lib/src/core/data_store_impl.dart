@@ -135,7 +135,7 @@ class DataStoreImpl {
   }) {
     final effectiveDbPath = dbPath ?? config?.dbPath;
     final effectiveDbName = dbName ?? config?.dbName ?? 'default';
-    final key = '$effectiveDbPath-$effectiveDbName';
+    final key = '${effectiveDbPath ?? 'default'}-$effectiveDbName';
 
     if (!_instances.containsKey(key) && !isMigrationInstance) {
       final instance = DataStoreImpl._internal(

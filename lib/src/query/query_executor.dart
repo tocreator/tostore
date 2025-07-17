@@ -1834,7 +1834,8 @@ class QueryExecutor {
     // 2. Apply pending writes if requested. This adds new records or updates existing ones.
     if (applyWriteBuffer && pendingWrites != null && pendingWrites.isNotEmpty) {
       int processedCount = 0;
-      for (final entry in pendingWrites.values) {
+      final pendingWriteEntries = pendingWrites.values.toList();
+      for (final entry in pendingWriteEntries) {
         final record = entry.data;
         // A record in the write buffer must be considered.
         // If a condition is provided, it must match.

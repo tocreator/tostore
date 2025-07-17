@@ -98,6 +98,13 @@ class TableDataManager {
   // Flag indicating if statistics need to be saved
   bool _needSaveStats = false;
 
+  // --- Start: Intelligent Polling Logic ---
+  void Function()? _highFrequencyCallback;
+  void Function()? _lowFrequencyCallback;
+  bool _isHighFrequencyModeActive = false;
+  DateTime? _lastIdleTime;
+  // --- End: Intelligent Polling Logic ---
+
   int get _effectiveMaxConcurrent {
     // Test environment forced single-threaded
     if (PlatformHandler.isTestEnvironment) return 1;
@@ -154,7 +161,7 @@ class TableDataManager {
       // Single pass to categorize entries into time buckets
       // Use epoch hours as bucket keys (rough time division)
       int processedCount = 0;
-      for (final entry in _fileMetaCache.entries) {
+      for (final entry in _fileMetaCache.entries.toList()) {
         final tableName = entry.key;
 
         // Identify system tables to preserve
@@ -217,9 +224,64 @@ class TableDataManager {
     }
   }
 
+  // --- Start: Intelligent Polling Methods ---
+  void _switchToHighFrequencyMode() {
+    if (_isHighFrequencyModeActive) return;
+    _isHighFrequencyModeActive =
+        true; // Set flag first to prevent race condition
+
+    CrontabManager.removeCallback(
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds1, _highFrequencyCallback!);
+
+    _lastIdleTime = null; // Reset idle timer
+    Logger.debug('Switched to high-frequency (1s) table data polling.',
+        label: 'TableDataManager');
+  }
+
+  void _switchToLowFrequencyMode() {
+    if (!_isHighFrequencyModeActive) return;
+    _isHighFrequencyModeActive =
+        false; // Set flag first to prevent race condition
+
+    CrontabManager.removeCallback(
+        ExecuteInterval.seconds1, _highFrequencyCallback!);
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
+
+    Logger.debug(
+        'Switched to low-frequency (3s) table data polling due to inactivity.',
+        label: 'TableDataManager');
+  }
+
+  void _checkAndSwitchPollingMode() {
+    final bool isIdle =
+        _writeBuffer.isEmpty && _deleteBuffer.isEmpty && !_isWriting;
+
+    if (_isHighFrequencyModeActive) {
+      if (isIdle) {
+        _lastIdleTime ??= DateTime.now();
+        if (DateTime.now().difference(_lastIdleTime!).inSeconds >= 30) {
+          _switchToLowFrequencyMode();
+        }
+      } else {
+        _lastIdleTime = null;
+      }
+    } else {
+      if (!isIdle) {
+        _switchToHighFrequencyMode();
+      }
+    }
+  }
+  // --- End: Intelligent Polling Methods ---
+
   TableDataManager(this._dataStore) {
+    _lowFrequencyCallback = () => _processWriteBuffer();
+    _highFrequencyCallback = () => _processWriteBuffer();
     // Register scheduled task to CrontabManager
-    CrontabManager.addCallback(ExecuteInterval.seconds3, _processWriteBuffer);
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds3, _lowFrequencyCallback!);
 
     // Register memory callbacks
     _registerMemoryCallbacks();
@@ -485,8 +547,15 @@ class TableDataManager {
 
   /// Remove scheduled task when instance is closed
   Future<void> dispose() async {
-    CrontabManager.removeCallback(
-        ExecuteInterval.seconds3, _processWriteBuffer);
+    // Stop all polling timers
+    if (_lowFrequencyCallback != null) {
+      CrontabManager.removeCallback(
+          ExecuteInterval.seconds3, _lowFrequencyCallback!);
+    }
+    if (_highFrequencyCallback != null) {
+      CrontabManager.removeCallback(
+          ExecuteInterval.seconds1, _highFrequencyCallback!);
+    }
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
 
@@ -526,6 +595,8 @@ class TableDataManager {
     } catch (e) {
       Logger.error('Failed to dispose TableDataManager: $e',
           label: 'TableDataManager.dispose');
+    } finally {
+      _isWriting = false;
     }
   }
 
@@ -536,6 +607,7 @@ class TableDataManager {
       await _checkIdFetch();
 
       if (_writeBuffer.isEmpty && _deleteBuffer.isEmpty) {
+        _checkAndSwitchPollingMode();
         return;
       }
 
@@ -552,7 +624,7 @@ class TableDataManager {
       final maxBatchSize = _dataStore.config.maxBatchSize;
 
       int processedCount = 0;
-      for (final entry in _writeBuffer.entries) {
+      for (final entry in _writeBuffer.entries.toList()) {
         final queueSize = entry.value.length;
         totalRecords += queueSize;
 
@@ -577,7 +649,7 @@ class TableDataManager {
       String? largestDeleteQueueTable;
       int totalDeleteRecords = 0;
       processedCount = 0;
-      for (final entry in _deleteBuffer.entries) {
+      for (final entry in _deleteBuffer.entries.toList()) {
         final queueSize = entry.value.length;
         totalDeleteRecords += queueSize;
 
@@ -602,7 +674,7 @@ class TableDataManager {
 
       // Condition 2: Check idle time
       final idleWriteDuration = DateTime.now().difference(_lastWriteTime);
-      if (idleWriteDuration >= const Duration(seconds: 5)) {
+      if (idleWriteDuration >= const Duration(seconds: 3)) {
         needsImmediateWrite = true;
       }
 
@@ -621,6 +693,7 @@ class TableDataManager {
           ((_writeBuffer.isNotEmpty || _deleteBuffer.isNotEmpty)) &&
           !_isWriting) {
         _isWriting = true;
+        _lastIdleTime = null;
         Logger.debug(
             'Starting batch operation, table count: ${_writeBuffer.length} write + ${_deleteBuffer.length} delete, largest write queue: ${largestQueueTable ?? "none"} ($largestQueueSize records), largest delete queue: ${largestDeleteQueueTable ?? "none"} ($largestDeleteQueueSize records), total records: $totalRecords',
             label: 'TableDataManager._processWriteBuffer');
@@ -666,6 +739,9 @@ class TableDataManager {
       Logger.error('Scheduled processing failed: $e\n$stackTrace',
           label: 'TableDataManager._processWriteBuffer');
       _isWriting = false;
+    } finally {
+      _isWriting = false;
+      _checkAndSwitchPollingMode();
     }
   }
 
@@ -673,7 +749,7 @@ class TableDataManager {
   Future<void> flushMaxIds() async {
     try {
       int processedCount = 0;
-      for (var entry in _maxIdsDirty.entries) {
+      for (var entry in _maxIdsDirty.entries.toList()) {
         if (!entry.value) continue;
 
         final tableName = entry.key;
@@ -810,6 +886,10 @@ class TableDataManager {
 
     // Record data change, need to update statistics
     _needSaveStats = true;
+
+    if (!_isHighFrequencyModeActive) {
+      _switchToHighFrequencyMode();
+    }
   }
 
   /// Add records to delete buffer - for batch deleting
@@ -874,6 +954,10 @@ class TableDataManager {
 
     // Record data change, need to update statistics
     _needSaveStats = true;
+
+    if (!_isHighFrequencyModeActive) {
+      _switchToHighFrequencyMode();
+    }
   }
 
   /// Flush single table buffer
@@ -1223,7 +1307,7 @@ class TableDataManager {
     int pendingInsertCount = 0;
     final pendingWrites = _writeBuffer[tableName];
     if (pendingWrites != null) {
-      for (final entry in pendingWrites.values) {
+      for (final entry in pendingWrites.values.toList()) {
         if (entry.operation == BufferOperationType.insert) {
           pendingInsertCount++;
         }
@@ -1871,7 +1955,7 @@ class TableDataManager {
   Future<void> _checkIdFetch() async {
     try {
       int processedCount = 0;
-      for (final entry in _idGenerators.entries) {
+      for (final entry in _idGenerators.entries.toList()) {
         final tableName = entry.key;
         final generator = entry.value;
 
