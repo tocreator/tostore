@@ -374,7 +374,6 @@ class DataStoreImpl {
 
       // Initialize key components sequentially to avoid race conditions during the first run.
       _keyManager = KeyManager(this);
-      await _keyManager!.initialize();
 
       directoryManager = DirectoryManager(this);
       _indexManager = IndexManager(this);
@@ -385,6 +384,7 @@ class DataStoreImpl {
       _queryExecutor = QueryExecutor(this, _indexManager!);
       dataCacheManager = DataCacheManager(this);
 
+      await _keyManager!.initialize();
       _baseInitialized = true;
 
       if (!isMigrationInstance) {
@@ -2141,7 +2141,6 @@ class DataStoreImpl {
       // Clear caches
       await dataCacheManager.onBasePathChanged();
       await indexManager?.onSpacePathChanged();
-      tableDataManager.writeBuffer.clear();
 
       // Reinitialize database
       _isInitialized = false;

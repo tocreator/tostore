@@ -1542,8 +1542,8 @@ class TableDataManager {
     List<PartitionMeta>? existingPartitions, {
     required BufferOperationType operationType,
     required MatcherType pkMatcherType,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
+    List<int>? customKey,
+    int? customKeyId,
   }) async {
     try {
       // if no records, return empty partition meta
@@ -1680,6 +1680,8 @@ class TableDataManager {
               modified: timeStamp,
             ),
             encoderState: EncoderHandler.getCurrentEncodingState(),
+            customKey: customKey,
+            customKeyId: customKeyId,
           ),
           useIsolate: records.length > 100);
 
@@ -2280,7 +2282,7 @@ class TableDataManager {
 
   /// Stream records from a table
   Stream<Map<String, dynamic>> streamRecords(String tableName,
-      {List<int>? encryptionKey, int? encryptionKeyId}) async* {
+      {List<int>? customKey, int? customKeyId}) async* {
     final schema = await _dataStore.getTableSchema(tableName);
     if (schema == null) {
       Logger.error('Failed to get schema for $tableName',
@@ -2307,8 +2309,8 @@ class TableDataManager {
                 isGlobal,
                 p.index,
                 primaryKey,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
+                customKey: customKey,
+                customKeyId: customKeyId,
               ))
           .toList();
 
@@ -2352,8 +2354,8 @@ class TableDataManager {
   /// - targetKey: Optional specific primary key to find
   /// - spaceName: Optional space name, defaults to current instance's space name
   /// - primaryKey: Optional primary key field name, avoids reading from schema
-  /// - encryptionKey: Optional custom encryption key for decoding
-  /// - encryptionKeyId: Optional encryption key ID
+  /// - customKey: Optional custom encryption key for decoding
+  /// - customKeyId: Optional encryption key ID
   Stream<Map<String, dynamic>> streamRecordsFromCustomPath(
       {required String customRootPath,
       required String tableName,
@@ -2361,8 +2363,8 @@ class TableDataManager {
       String? targetKey,
       String? spaceName,
       String? primaryKey,
-      List<int>? encryptionKey,
-      int? encryptionKeyId}) async* {
+      List<int>? customKey,
+      int? customKeyId}) async* {
     try {
       final effectiveSpaceName = spaceName ?? _dataStore.config.spaceName;
 
@@ -2404,7 +2406,7 @@ class TableDataManager {
           // read and decode file meta
           final bytes = await _dataStore.storage.readAsBytes(mainFilePath);
           final decodedString = await EncoderHandler.decode(bytes,
-              customKey: encryptionKey, keyId: encryptionKeyId);
+              customKey: customKey, keyId: customKeyId);
 
           final fileInfo = FileInfo.fromJson(
               jsonDecode(decodedString) as Map<String, dynamic>);
@@ -2454,7 +2456,7 @@ class TableDataManager {
                 final bytes =
                     await _dataStore.storage.readAsBytes(partitionPath);
                 final decodedString = await EncoderHandler.decode(bytes,
-                    customKey: encryptionKey, keyId: encryptionKeyId);
+                    customKey: customKey, keyId: customKeyId);
                 final partitionInfo = PartitionInfo.fromJson(
                     jsonDecode(decodedString) as Map<String, dynamic>);
 
@@ -2523,8 +2525,8 @@ class TableDataManager {
 
   Future<Map<String, dynamic>?> getRecordByPointer(
       String tableName, StoreIndex pointer,
-      {List<int>? encryptionKey,
-      int? encryptionKeyId,
+      {List<int>? customKey,
+      int? customKeyId,
       String? fieldName,
       dynamic expectedValue}) async {
     try {
@@ -2538,8 +2540,8 @@ class TableDataManager {
         pointer.partitionId,
         schema.primaryKey,
         recordIndex: pointer.offset,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
+        customKey: customKey,
+        customKeyId: customKeyId,
         fieldName: fieldName,
         expectedValue: expectedValue,
       );
@@ -2570,8 +2572,8 @@ class TableDataManager {
     bool onlyRead =
         false, // if true, only read records from partitions, do not write records
     int? maxConcurrent,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
+    List<int>? customKey,
+    int? customKeyId,
     List<int>?
         targetPartitions, // Specify the list of partitions to process, if null, process all partitions
     ParallelController? controller,
@@ -2625,7 +2627,7 @@ class TableDataManager {
           // read partition data
           final records = await readRecordsFromPartition(
               tableName, isGlobal, partitionIndex, primaryKey,
-              encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+              customKey: customKey, customKeyId: customKeyId);
 
           // process data
           final processedRecords = await processFunction(
@@ -2645,8 +2647,8 @@ class TableDataManager {
             fileMeta.partitions!,
             operationType: BufferOperationType.update,
             pkMatcherType: schema.getPrimaryKeyMatcherType(),
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
+            customKey: customKey,
+            customKeyId: customKeyId,
           );
 
           // Return the new metadata for this partition.
@@ -2710,8 +2712,8 @@ class TableDataManager {
     int partitionIndex,
     String primaryKey, {
     int? recordIndex,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
+    List<int>? customKey,
+    int? customKeyId,
     String? fieldName,
     dynamic expectedValue,
   }) async {
@@ -2736,6 +2738,8 @@ class TableDataManager {
           DecodePartitionRequest(
             bytes: bytes,
             encoderState: EncoderHandler.getCurrentEncodingState(),
+            customKey: customKey,
+            customKeyId: customKeyId,
           ),
           useIsolate: bytes.length >
               50 * 1024 // only use isolate if data size is larger than 50KB
@@ -2852,8 +2856,8 @@ class TableDataManager {
     required String tableName,
     required List<Map<String, dynamic>> records,
     required BufferOperationType operationType,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
+    List<int>? customKey,
+    int? customKeyId,
     int? concurrency,
   }) async {
     if (tableName.isEmpty) {
@@ -2927,8 +2931,7 @@ class TableDataManager {
             if (partitionExists) {
               allRecords = await readRecordsFromPartition(
                   tableName, isGlobal, partitionIndex, primaryKey,
-                  encryptionKey: encryptionKey,
-                  encryptionKeyId: encryptionKeyId);
+                  customKey: customKey, customKeyId: customKeyId);
             }
 
             // collect records to create index
@@ -2950,8 +2953,8 @@ class TableDataManager {
               existingPartitions,
               operationType: BufferOperationType.insert,
               pkMatcherType: schema.getPrimaryKeyMatcherType(),
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
+              customKey: customKey,
+              customKeyId: customKeyId,
             );
           };
         }).toList();
@@ -3026,7 +3029,7 @@ class TableDataManager {
           return () async {
             final partitionRecords = await readRecordsFromPartition(
                 tableName, isGlobal, partition.index, primaryKey,
-                encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+                customKey: customKey, customKeyId: customKeyId);
 
             bool modified = false;
             List<Map<String, dynamic>> resultRecords;
@@ -3092,8 +3095,8 @@ class TableDataManager {
                   existingPartitions,
                   operationType: BufferOperationType.update,
                   pkMatcherType: schema.getPrimaryKeyMatcherType(),
-                  encryptionKey: encryptionKey,
-                  encryptionKeyId: encryptionKeyId,
+                  customKey: customKey,
+                  customKeyId: customKeyId,
                 );
               }
             }
@@ -3166,8 +3169,8 @@ class TableDataManager {
                 [], // key: empty existing partitions list, because it's a full rewrite
                 operationType: BufferOperationType.rewrite,
                 pkMatcherType: schema.getPrimaryKeyMatcherType(),
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId);
+                customKey: customKey,
+                customKeyId: customKeyId);
           };
         }).toList();
         final partitionResults =
@@ -3493,8 +3496,8 @@ class TableDataManager {
       List<Map<String, dynamic>> records,
       int partitionIndex,
     ) processFunction,
-    List<int>? encryptionKey,
-    int? encryptionKeyId,
+    List<int>? customKey,
+    int? customKeyId,
   }) async {
     try {
       // Get source table meta
@@ -3518,7 +3521,7 @@ class TableDataManager {
           // Read source partition data
           final records = await readRecordsFromPartition(
               sourceTableName, isGlobal, partitionIndex, primaryKey,
-              encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+              customKey: customKey, customKeyId: customKeyId);
 
           // Process data with transformation function
           final processedRecords =
@@ -3534,8 +3537,8 @@ class TableDataManager {
             [], // No existing partitions for target table
             operationType: BufferOperationType.rewrite,
             pkMatcherType: sourceSchema.getPrimaryKeyMatcherType(),
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
+            customKey: customKey,
+            customKeyId: customKeyId,
           );
         };
       });

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.1.9
+## 2.2.0
 
 ### Removed
 - Removed automatic query cache management. A more efficient caching mechanism is now in place, making it unnecessary for non-large-scale data scenarios.
@@ -15,7 +15,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Fixed a path issue that occurred when using a custom `dbName`.
 - Fixed an issue where parallel searches would return prematurely upon finding a result.
-- Fix: Unsynchronized keys during initialization.
+- Fixed an issue where key changes during initialization would not be logged.
 
 ## 2.1.6
 

@@ -341,9 +341,17 @@ class DecodePartitionRequest {
   /// Optional encoder state for isolate execution
   final EncoderConfig? encoderState;
 
+  /// Optional custom key for decoding (for backup/migration scenarios)
+  final List<int>? customKey;
+
+  /// Optional custom keyId for decoding (for backup/migration scenarios)
+  final int? customKeyId;
+
   DecodePartitionRequest({
     required this.bytes,
     this.encoderState,
+    this.customKey,
+    this.customKeyId,
   });
 }
 
@@ -376,6 +384,12 @@ class EncodePartitionRequest {
   /// Optional encoder state for isolate execution
   final EncoderConfig? encoderState;
 
+  /// Optional custom key for encoding (for backup/migration scenarios)
+  final List<int>? customKey;
+
+  /// Optional custom keyId for encoding (for backup/migration scenarios)
+  final int? customKeyId;
+
   EncodePartitionRequest({
     required this.records,
     required this.partitionIndex,
@@ -386,6 +400,8 @@ class EncodePartitionRequest {
     required this.parentPath,
     required this.timestamps,
     this.encoderState,
+    this.customKey,
+    this.customKeyId,
   });
 }
 
@@ -512,9 +528,11 @@ Future<List<Map<String, dynamic>>> decodePartitionData(
       EncoderHandler.setEncodingState(request.encoderState!);
     }
 
-    // decode data
+    // decode data - use custom key/keyId if provided, otherwise use encoder state
     final decodedString = await EncoderHandler.decode(
       request.bytes,
+      customKey: request.customKey,
+      keyId: request.customKeyId,
     );
 
     if (decodedString.isEmpty) {
@@ -588,6 +606,8 @@ Future<EncodedPartitionResult> encodePartitionData(
     try {
       encodedData = EncoderHandler.encode(
         jsonEncode(partitionInfo.toJson()),
+        customKey: request.customKey,
+        keyId: request.customKeyId,
       );
     } catch (encodeError) {
       Logger.error('Failed to encode partition info: $encodeError',
