@@ -957,21 +957,18 @@ class QueryExecutor {
       targetPartitions.sort((a, b) => b.compareTo(a));
     }
 
-    final isFullScanIntent =
-        targetPartitions.length == fileMeta.partitions!.length;
-
     // 5. Decide if this query should become the leader for caching.
     final bool canCacheFullTable =
         await _dataStore.tableDataManager.allowFullTableCache(tableName);
-    final bool shouldBecomeLeader =
-        !isOptimizedLimitQuery && isFullScanIntent && canCacheFullTable;
+    bool wasFullTableScan = !isOptimizedLimitQuery &&
+        targetPartitions.length == fileMeta.partitions!.length &&
+        canCacheFullTable;
 
     // 6. If we become the leader, signal it so others will wait.
-    if (shouldBecomeLeader) {
+    if (wasFullTableScan) {
       _dataStore.tableDataManager.snapshotBuffersForFullLoad(tableName);
     }
 
-    bool wasFullTableScan = false;
     try {
       final resultMap = <String, Map<String, dynamic>>{};
       // When using an optimized limit query, we must process partitions sequentially
@@ -1008,7 +1005,6 @@ class QueryExecutor {
             }
           }
         }
-        wasFullTableScan = false; // It's an optimized, partial scan.
       } else {
         final controller = ParallelController();
         // --- Start: Early Exit Optimization ---
@@ -1090,6 +1086,7 @@ class QueryExecutor {
               if (earlyExitField != null &&
                   earlyExitMatcher!(record[earlyExitField], earlyExitValue) !=
                       0) {
+                wasFullTableScan = false;
                 continue;
               }
 
@@ -1098,9 +1095,12 @@ class QueryExecutor {
 
                 // Early exit optimization for PK or Unique Key match
                 if (earlyExitField != null) {
+                  wasFullTableScan = false;
                   controller.stop();
                   break;
                 }
+              } else {
+                wasFullTableScan = false;
               }
             }
             return partitionResults;
@@ -1123,64 +1123,60 @@ class QueryExecutor {
           }
         }
 
-        // 8. Determine if a full scan was actually completed.
-        wasFullTableScan = isFullScanIntent && !controller.isStopped;
+        // If early exit happened, not all records were processed
+        if (controller.isStopped) {
+          wasFullTableScan = false;
+        }
       }
 
       // 9. If we were the leader, handle caching.
-      if (shouldBecomeLeader) {
-        if (wasFullTableScan) {
-          // We successfully did a full scan, so cache the results.
-          await _dataStore.dataCacheManager.cacheEntireTable(
-            tableName,
-            primaryKey,
-            resultMap.values.toList(),
-            isFullTableCache: false, // Don't mark as full yet
-          );
+      if (wasFullTableScan) {
+        await _dataStore.dataCacheManager.cacheEntireTable(
+          tableName,
+          primaryKey,
+          resultMap.values.toList(),
+          isFullTableCache: false, // Don't mark as full yet
+        );
 
-          // Merge changes that happened during the scan.
-          final stagedChanges =
-              _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
+        // Merge changes that happened during the scan.
+        final stagedChanges =
+            _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
 
-          int processedCount = 0;
-          for (final entry in stagedChanges.writes.values) {
-            final record = entry.data;
-            if (entry.operation == BufferOperationType.insert) {
-              _dataStore.dataCacheManager.addCachedRecord(tableName, record);
-            } else if (entry.operation == BufferOperationType.update) {
-              _dataStore.dataCacheManager.updateCachedRecord(tableName, record);
-            }
-            processedCount++;
-            if (processedCount % 50 == 0) {
-              await Future.delayed(Duration.zero);
-            }
+        int processedCount = 0;
+        for (final entry in stagedChanges.writes.values) {
+          final record = entry.data;
+          if (entry.operation == BufferOperationType.insert) {
+            _dataStore.dataCacheManager.addCachedRecord(tableName, record);
+          } else if (entry.operation == BufferOperationType.update) {
+            _dataStore.dataCacheManager.updateCachedRecord(tableName, record);
           }
-
-          int deleteProcessedCount = 0;
-          for (final key in stagedChanges.deletes) {
-            _dataStore.dataCacheManager
-                .removeTableCacheForPrimaryKey(tableName, key);
-            deleteProcessedCount++;
-            if (deleteProcessedCount % 50 == 0) {
-              await Future.delayed(Duration.zero);
-            }
+          processedCount++;
+          if (processedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
           }
-
-          // Now mark the cache as full and valid.
-          await _dataStore.dataCacheManager.setFullTableCache(tableName, true);
-        } else {
-          // We were the leader, but we didn't do a full scan (e.g., early exit).
-          // Do not cache. Just clean up the staging buffers.
-          _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
         }
+
+        int deleteProcessedCount = 0;
+        for (final key in stagedChanges.deletes) {
+          _dataStore.dataCacheManager
+              .removeTableCacheForPrimaryKey(tableName, key);
+          deleteProcessedCount++;
+          if (deleteProcessedCount % 50 == 0) {
+            await Future.delayed(Duration.zero);
+          }
+        }
+
+        // Now mark the cache as full and valid.
+        await _dataStore.dataCacheManager
+            .setFullTableCache(tableName, wasFullTableScan);
+      } else {
+        // We were the leader, but we didn't do a full scan (e.g., early exit).
+        // Do not cache. Just clean up the staging buffers.
+        _dataStore.tableDataManager.getAndClearStagedChanges(tableName);
       }
       return resultMap.values.toList();
     } finally {
-      // 10. If we were the leader, signal completion and success status.
-      if (shouldBecomeLeader) {
-        _dataStore.tableDataManager
-            .completeFullLoad(tableName, wasFullTableScan);
-      }
+      _dataStore.tableDataManager.completeFullLoad(tableName, wasFullTableScan);
     }
   }
 
