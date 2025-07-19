@@ -208,7 +208,15 @@ class DataStoreImpl {
 
     try {
       final content = await storage.readAsString(spaceFilePath) ?? "";
-      if (content.isEmpty) return null;
+      if (content.isEmpty) {
+        // If SpaceConfig doesn't exist and KeyManager is available, create it
+        if (_keyManager != null) {
+          final spaceConfig = await _keyManager!.createKeySpaceConfig();
+          await saveSpaceConfigToFile(spaceConfig);
+          return spaceConfig;
+        }
+        return null;
+      }
 
       _spaceConfigCache =
           SpaceConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
@@ -366,14 +374,14 @@ class DataStoreImpl {
       // Initialize memory manager
       _memoryManager = MemoryManager();
 
+      // Create key manager instance but don't initialize yet
+      _keyManager = KeyManager(this);
+
       await Future.wait([
         getGlobalConfig(),
         getSpaceConfig(),
         _memoryManager!.initialize(_config!, this),
       ]);
-
-      // Initialize key components sequentially to avoid race conditions during the first run.
-      _keyManager = KeyManager(this);
 
       directoryManager = DirectoryManager(this);
       _indexManager = IndexManager(this);
