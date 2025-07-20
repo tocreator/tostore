@@ -50,7 +50,7 @@ class DataStoreConfig {
   final int maxEntriesPerDir;
 
   /// max partition file size based on platform
-  /// Web: 64KB, Mobile: 256KB, Desktop: 4MB
+  /// Web: 64KB, Mobile: 256KB, Desktop: 4MB, Server: 4-16MB (dynamic)
   final int maxPartitionFileSize;
 
   /// Enable logging
@@ -119,11 +119,20 @@ class DataStoreConfig {
   /// get default partition file size limit, based on platform
   static int _getDefaultMaxPartitionFileSize() {
     if (PlatformHandler.isWeb) {
-      return 64 * 1024; // Web: 64KB
+      return 64 * 1024; // Web: 64KB - Browser memory constraints
     } else if (PlatformHandler.isMobile) {
-      return 256 * 1024; // mobile platform: 256KB
+      return 256 * 1024; // Mobile: 256KB - Balance performance and memory
+    } else if (PlatformHandler.isServerEnvironment) {
+      // Server environment: Dynamic sizing based on CPU cores and memory
+      int cpuCount = PlatformHandler.recommendedConcurrency;
+
+      // Base size 4MB + 1MB per CPU core, capped at 16MB
+      // This optimizes for high-throughput server workloads
+      int serverSize = (4 * 1024 * 1024) + (cpuCount * 1 * 1024 * 1024);
+      return min(serverSize, 16 * 1024 * 1024); // Cap at 16MB
     } else {
-      return 4 * 1024 * 1024; // desktop platform: 4MB
+      // Desktop platform: 4MB
+      return 4 * 1024 * 1024;
     }
   }
 
