@@ -204,7 +204,8 @@ class DataStoreImpl {
       return _spaceConfigCache;
     }
 
-    final spaceFilePath = pathManager.getSpaceConfigPath(_currentSpaceName);
+    final spaceFilePath =
+        pathManager.getSpaceConfigPath(spaceName: _currentSpaceName);
 
     try {
       final content = await storage.readAsString(spaceFilePath) ?? "";
@@ -230,7 +231,8 @@ class DataStoreImpl {
   /// Save space config to file
   Future<void> saveSpaceConfigToFile(SpaceConfig config) async {
     try {
-      final spaceFilePath = pathManager.getSpaceConfigPath(_currentSpaceName);
+      final spaceFilePath =
+          pathManager.getSpaceConfigPath(spaceName: _currentSpaceName);
 
       final content = jsonEncode(config.toJson());
       await storage.writeAsString(spaceFilePath, content);

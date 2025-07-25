@@ -32,8 +32,8 @@ class PathManager {
   String get _currentSpaceName => dataStore.currentSpaceName;
 
   /// get space directory path
-  String getSpacePath() {
-    return pathJoin(_instancePath, 'spaces', _currentSpaceName);
+  String getSpacePath({String? spaceName}) {
+    return pathJoin(_instancePath, 'spaces', spaceName ?? _currentSpaceName);
   }
 
   /// get global table directory path
@@ -77,8 +77,9 @@ class PathManager {
   }
 
   /// get space config path
-  String getSpaceConfigPath(String spaceName) {
-    return pathJoin(_instancePath, 'spaces', spaceName, 'space_config.json');
+  String getSpaceConfigPath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'space_config.json');
   }
 
   /// get schema meta file path (database schema metadata)
@@ -211,6 +212,54 @@ class PathManager {
   Future<String> getStatsPath(String tableName) async {
     final tablePath = await getTablePath(tableName);
     return pathJoin(tablePath, 'stats.json');
+  }
+
+  //==================================
+  // WAL path methods (sync methods)
+  //==================================
+
+  /// get WAL root path for a space
+  String getWalRootPath() {
+    return pathJoin(getSpacePath(), 'wal');
+  }
+
+  /// get main WAL meta file path
+  String getMainWalMetaPath() {
+    return pathJoin(getWalRootPath(), 'wal_meta.json');
+  }
+
+  /// get table WAL root path
+  Future<String> getTableWalRootPath(String tableName) async {
+    final tablePath = await getTablePath(tableName);
+    return pathJoin(tablePath, 'wal');
+  }
+
+  /// get table WAL meta file path
+  Future<String> getTableWalMetaPath(String tableName) async {
+    final walRootPath = await getTableWalRootPath(tableName);
+    return pathJoin(walRootPath, 'wal_meta.json');
+  }
+
+  /// get table WAL partition directory path
+  Future<String> getTableWalPartitionsDirPath(String tableName) async {
+    final walRootPath = await getTableWalRootPath(tableName);
+    return pathJoin(walRootPath, 'partitions');
+  }
+
+  /// get table WAL partition directory path
+  Future<String> getTableWalPartitionDirPath(
+      String tableName, int partitionIndex) async {
+    final walRootPath = await getTableWalPartitionsDirPath(tableName);
+    final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
+    return pathJoin(walRootPath, 'dir_$dirIndex');
+  }
+
+  /// get table WAL partition file path
+  Future<String> getTableWalPartitionPath(
+      String tableName, int partitionIndex) async {
+    final dirPath =
+        await getTableWalPartitionDirPath(tableName, partitionIndex);
+    return pathJoin(dirPath, 'wal_$partitionIndex.log');
   }
 
   //==================================

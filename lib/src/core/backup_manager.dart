@@ -103,7 +103,7 @@ class BackupManager {
 
         // Copy init.json file if it exists
         final initFilePath = _dataStore.pathManager
-            .getSpaceConfigPath(_dataStore.currentSpaceName);
+            .getSpaceConfigPath(spaceName: _dataStore.currentSpaceName);
         if (await _dataStore.storage.existsFile(initFilePath)) {
           final targetPath = pathJoin(backupDir, 'space_config.json');
           await _safeCopyFile(initFilePath, targetPath);
@@ -297,7 +297,7 @@ class BackupManager {
       final backupConfigPath = pathJoin(backupPath, 'space_config.json');
       if (await _dataStore.storage.existsFile(backupConfigPath)) {
         final targetConfigPath = _dataStore.pathManager
-            .getSpaceConfigPath(_dataStore.config.spaceName);
+            .getSpaceConfigPath(spaceName: _dataStore.config.spaceName);
         await _safeCopyFile(backupConfigPath, targetConfigPath);
       }
     } catch (e) {
