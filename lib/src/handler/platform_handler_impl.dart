@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:archive/archive_io.dart';
 import '../Interface/platform_interface.dart';
 import '../handler/logger.dart';
+import 'flutter_check.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
@@ -267,30 +268,109 @@ class PlatformHandlerImpl implements PlatformInterface {
   }
 
   /// Get app save directory, for data, config, etc.
+  /// In a Flutter environment, it uses `path_provider`. In a pure Dart environment,
+  /// it falls back to OS-specific directories.
   @override
   Future<String> getPathApp() async {
     if (_cachedAppPath != null) {
       return _cachedAppPath!;
     }
-    try {
-      final docDir = await getApplicationDocumentsDirectory();
-      final cachePath = Directory(path.join(docDir.path, 'common'));
-      if (!await cachePath.exists()) {
-        await cachePath.create(recursive: true);
+
+    String? appPath;
+    const appName = 'tostore';
+    const dataDirName = 'common';
+
+    // If in a Flutter environment, prioritize path_provider.
+    if (isFlutterEnvironment) {
+      try {
+        final docDir = await getApplicationDocumentsDirectory();
+        appPath = path.join(docDir.path, 'common');
+      } catch (e) {
+        Logger.error(
+            'Flutter environment detected, but path_provider failed. '
+            'Ensure "WidgetsFlutterBinding.ensureInitialized()" is called. Error: $e',
+            label: 'PlatformHandlerImpl.getPathApp');
+        // Fall through to OS-specific logic as a backup.
       }
-      _cachedAppPath = cachePath.path;
-      return _cachedAppPath!;
-    } catch (e) {
-      Logger.error(
-          'Failed to determine the standard application data directory. Falling back to a temporary directory which may be cleared by the operating system, leading to data loss upon restart. For Flutter applications, ensure `WidgetsFlutterBinding.ensureInitialized()` is called at the start of your main() function. In other environments, this may indicate a permissions or platform configuration issue.',
-          label: 'PlatformHandlerImpl.getPathApp');
+    }
+
+    // If not in a Flutter environment or if path_provider failed, use OS-specific paths.
+    if (appPath == null) {
+      String? basePath;
+      try {
+        if (isWindows) {
+          basePath = Platform.environment['APPDATA'];
+          if (basePath != null) {
+            basePath = path.join(basePath, appName);
+          }
+        } else if (isMacOS) {
+          final home = Platform.environment['HOME'];
+          if (home != null) {
+            basePath =
+                path.join(home, 'Library', 'Application Support', appName);
+          }
+        } else if (isLinux) {
+          // Respect XDG Base Directory Specification.
+          final xdgDataHome = Platform.environment['XDG_DATA_HOME'];
+          if (xdgDataHome != null && xdgDataHome.isNotEmpty) {
+            basePath = path.join(xdgDataHome, appName);
+          } else {
+            final home = Platform.environment['HOME'];
+            if (home != null) {
+              basePath = path.join(home, '.local', 'share', appName);
+            }
+          }
+        }
+      } catch (e) {
+        Logger.error('Error getting environment variables for path: $e',
+            label: 'PlatformHandlerImpl.getPathApp');
+      }
+
+      if (basePath != null && basePath.isNotEmpty) {
+        appPath = path.join(basePath, dataDirName);
+      }
+    }
+
+    // If a path was determined, create the directory and cache it.
+    if (appPath != null) {
+      try {
+        final directory = Directory(appPath);
+        if (!await directory.exists()) {
+          await directory.create(recursive: true);
+        }
+        _cachedAppPath = directory.path;
+        return _cachedAppPath!;
+      } catch (e) {
+        Logger.error(
+            'Failed to create application directory at $appPath. Error: $e',
+            label: 'PlatformHandlerImpl.getPathApp');
+        // Fall through to the final fallback.
+      }
+    }
+
+    // Final fallback: use a directory in the system temp folder.
+    Logger.warn(
+        'Could not determine a standard application data directory. Falling back to a temporary directory. Data may be lost on system restart.',
+        label: 'PlatformHandlerImpl.getPathApp');
+    try {
       final tempPath =
-          path.join(Directory.systemTemp.path, 'local_storage', 'common');
+          path.join(Directory.systemTemp.path, appName, dataDirName);
       final tempDir = Directory(tempPath);
       if (!await tempDir.exists()) {
         await tempDir.create(recursive: true);
       }
       _cachedAppPath = tempDir.path;
+      return _cachedAppPath!;
+    } catch (e) {
+      Logger.error('Failed to create temporary directory. Error: $e',
+          label: 'PlatformHandlerImpl.getPathApp');
+      // As an absolute last resort, use a path in the current directory.
+      final fallbackPath = path.join(Directory.current.path, '.tostore_data');
+      final fallbackDir = Directory(fallbackPath);
+      if (!await fallbackDir.exists()) {
+        await fallbackDir.create(recursive: true);
+      }
+      _cachedAppPath = fallbackDir.path;
       return _cachedAppPath!;
     }
   }

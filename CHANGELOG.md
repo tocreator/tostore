@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.2.3
+
+### Changed
+- Optimized storage path acquisition in pure Dart environments (like servers) to be more reliable and efficient.
+
 ## 2.2.2
 
 ### Removed
