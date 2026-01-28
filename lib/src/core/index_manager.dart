@@ -1,1465 +1,525 @@
 import 'dart:async';
+
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
+import '../handler/parallel_processor.dart';
+import '../handler/memcomparable.dart';
 import '../handler/value_matcher.dart';
+import '../model/data_block_entry.dart';
 import '../model/index_search.dart';
-import 'compute_manager.dart';
+import 'package:tostore/src/core/yield_controller.dart';
+
 import '../handler/logger.dart';
 import '../handler/common.dart';
-import '../handler/platform_handler.dart';
-import '../model/file_info.dart';
-import '../model/store_index.dart';
+import '../model/meta_info.dart';
+
+import '../model/unique_violation.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/table_schema.dart';
-import '../model/index_entry.dart';
-import 'crontab_manager.dart';
-import 'b_plus_tree.dart';
 import 'data_store_impl.dart';
-import 'compute_tasks.dart';
-import 'memory_manager.dart';
-import '../handler/parallel_processor.dart';
+
 import '../model/system_table.dart';
-import '../query/query_condition.dart';
-import 'data_compressor.dart';
+import 'table_data_manager.dart';
+import '../model/id_generator.dart';
+import 'tree_cache.dart';
+import '../model/index_entry.dart';
+import 'io_concurrency_planner.dart';
+import 'transaction_context.dart';
+import 'weight_manager.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
 class IndexManager {
   final DataStoreImpl _dataStore;
 
-  // Index cache - table name + index name -> B+ tree index instance
-  final Map<String, BPlusTree> _indexCache = {};
+  // Index Cache
+  // - unique:     Key: [tableName, indexName, ...indexFields]      Value: PK (String)
+  // - non-unique: Key: [tableName, indexName, ...indexFields, pk]  Value: true (bool marker)
+  //
+  // This avoids the old "bucket Set<PK>" read/modify/write amplification for non-unique indexes.
+  late final TreeCache<dynamic> _indexDataCache;
 
-  // Index metadata cache - table name + index name -> index metadata
-  final Map<String, IndexMeta> _indexMetaCache = {};
+  // Comparator Registry: Map<"tableName:indexName", MatcherFunction>
+  final Map<String, MatcherFunction> _comparatorRegistry = {};
 
-  // Index cache status - table name + index name -> whether fully cached
-  final Map<String, bool> _indexFullyCached = {};
+  // Index metadata cache using TreeCache
+  late final TreeCache<IndexMeta> _indexMetaCache;
 
-  // Index access weight - table name + index name -> {weight: weight value, lastAccess: last access time}
-  final Map<String, Map<String, dynamic>> _indexAccessWeights = {};
+  // Loading futures to prevent thundering herd on concurrent meta loads
+  final Map<String, Future<IndexMeta?>> _metaLoadingFutures = {};
 
-  // Index write buffer - table name + index name -> Map<String, IndexBufferEntry>
-  // "tableName:indexName"，"indexKey|recordPointer"
-  final Map<String, Map<String, IndexBufferEntry>> _writeBuffer = {};
-
-  // Index delete buffer - table name + index name -> Map<String, IndexBufferEntry>
-  // "tableName:indexName"，"indexKey|recordPointer"
-  final Map<String, Map<String, IndexBufferEntry>> _deleteBuffer = {};
-
-  // Index writing status - table name + index name -> whether writing
-  final Map<String, bool> _indexWriting = {};
-
-  // Last index write time - table name + index name -> last write time
-  final Map<String, DateTime> _indexLastWriteTime = {};
-
-  // Current index metadata cache total size (bytes)
-  int _currentIndexMetaCacheSize = 0;
-
-  // Current index cache total size (bytes)
-  int _currentIndexCacheSize = 0;
-
-  // Index metadata size cache - cache the size of each index metadata to avoid repeated calculation
-  final Map<String, int> _indexMetaSizeCache = {};
-
-  // Index cache size cache - cache the size of each index to avoid repeated calculation
-  final Map<String, int> _indexSizeCache = {};
-
-  /// Get current index cache size in bytes
-  int getCurrentIndexCacheSize() {
-    return _currentIndexCacheSize;
-  }
-
-  /// Get current index metadata cache size in bytes
-  int getCurrentIndexMetaCacheSize() {
-    return _currentIndexMetaCacheSize;
-  }
-
-  // Whether the cron task has been initialized
-  bool _cronInitialized = false;
-
-  // Whether the database is closing
-  bool _isClosing = false;
-
-  // Number of asynchronous write operations being processed
-  int _pendingWrites = 0;
-
-  // index order last check time mapping (milliseconds timestamp)
-  final Map<String, int> _lastOrderCheckTime = {};
-
-  // Number of pending index entries to process
-  int _pendingEntriesCount = 0;
-
-  // Asynchronous write completion event
-  final Completer<void> _allWritesCompleted = Completer<void>();
-
-  // --- Start: Intelligent Polling Logic ---
-
-  // Callback for the high-frequency polling timer
-  void Function()? _highFrequencyCallback;
-
-  // Callback for the low-frequency polling timer
-  void Function()? _lowFrequencyCallback;
-
-  // Whether high-frequency mode is active
-  bool _isHighFrequencyModeActive = false;
-
-  // Time when buffers last became empty and no writes were in progress
-  DateTime? _lastIdleTime;
-
-  // --- End: Intelligent Polling Logic ---
-
-  // Mark whether the index write buffer is being processed
-  bool _isProcessingWriteBuffer = false;
+  String _getMetaLoadingKey(String tableName, String indexName) =>
+      '$tableName#$indexName';
 
   IndexManager(this._dataStore) {
-    _initCronTask();
-    _registerMemoryCallbacks();
-  }
-
-  /// Register memory callback function
-  void _registerMemoryCallbacks() {
     final memoryManager = _dataStore.memoryManager;
-    if (memoryManager != null) {
-      // Register index cache cleanup callback
-      memoryManager.registerCacheEvictionCallback(
-          CacheType.indexData, _cleanupIndexCache);
+    final indexCacheSize = memoryManager?.getIndexCacheSize() ??
+        100 * 1024 * 1024; // Default 100MB
+    final metaCacheSize =
+        memoryManager?.getMetaCacheSize() ?? 100 * 1024 * 1024; // Default 100MB
+    final indexMetaCacheSize =
+        (metaCacheSize * 0.25).toInt(); // 25% of meta cache
 
-      // Register index metadata cache cleanup callback
-      memoryManager.registerCacheEvictionCallback(
-          CacheType.indexMeta, _cleanupIndexMetaCache);
-    }
+    // Initialize index data cache
+    _indexDataCache = TreeCache<dynamic>(
+      sizeCalculator: _estimateIndexDataSize,
+      maxByteThreshold: (indexCacheSize * 0.70).toInt(),
+      minByteThreshold: 150 * 1024 * 1024,
+      groupDepth: 2,
+      comparatorFactory: _indexComparatorFactory,
+      weightQueryCallback: _queryIndexDataWeight,
+      debugLabel: 'IndexDataCache',
+    );
+
+    _indexMetaCache = TreeCache<IndexMeta>(
+      sizeCalculator: _estimateIndexMetaSize,
+      maxByteThreshold: indexMetaCacheSize,
+      minByteThreshold: 50 * 1024 * 1024,
+      debugLabel: 'IndexMetaCache',
+    );
   }
 
-  /// Clean up index cache by evicting entire indexes based on LRU.
-  Future<void> _cleanupIndexCache() async {
+  /// Query weight for index data cache entry
+  /// Path format: [tableName, indexName, ...indexFields]
+  /// Weight object is the indexName (second element)
+  Future<int?> _queryIndexDataWeight(List<dynamic> path) async {
+    if (path.length < 2) return null;
+    final tableName = path[0]?.toString();
+    final indexName = path[1]?.toString();
+    if (tableName == null ||
+        tableName.isEmpty ||
+        indexName == null ||
+        indexName.isEmpty) {
+      return null;
+    }
+
     try {
-      if (_indexCache.isEmpty) return;
+      final weightManager = _dataStore.weightManager;
+      if (weightManager == null) return null;
 
-      final memoryManager = _dataStore.memoryManager;
-      if (memoryManager == null) return;
-
-      // Determine the target size to bring usage down to 70% of the limit.
-      final cacheLimit = memoryManager.getIndexCacheSize();
-      final targetCacheSize = (cacheLimit * 0.7).toInt();
-
-      if (_currentIndexCacheSize <= targetCacheSize) {
-        return;
-      }
-
-      final bytesToEvict = _currentIndexCacheSize - targetCacheSize;
-      int bytesEvicted = 0;
-
-      // 1. Get all candidate indexes, sorted by last access time (LRU).
-      // Sorting the list of indexes itself should be fast.
-      final evictableIndexes = _indexAccessWeights.entries.toList()
-        ..sort((a, b) {
-          final lastAccessA =
-              a.value['lastAccess'] as DateTime? ?? DateTime(1970);
-          final lastAccessB =
-              b.value['lastAccess'] as DateTime? ?? DateTime(1970);
-          return lastAccessA.compareTo(lastAccessB); // Oldest first
-        });
-
-      final indexesToRemove = <String>[];
-      int processedCount = 0;
-
-      // 2. Identify which entire indexes to evict.
-      for (final entry in evictableIndexes) {
-        if (bytesEvicted >= bytesToEvict) break;
-
-        final key = entry.key;
-        final index = _indexCache[key];
-        if (index != null) {
-          final size = _indexSizeCache[key] ?? _estimateIndexSize(index);
-          bytesEvicted += size;
-          indexesToRemove.add(key);
-        }
-
-        // Yield to the event loop to prevent UI jank if there are many indexes.
-        processedCount++;
-        if (processedCount % 20 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // 3. Perform the actual eviction.
-      for (final key in indexesToRemove) {
-        final index = _indexCache.remove(key);
-        if (index != null) {
-          final size = _indexSizeCache.remove(key) ?? 0;
-          _currentIndexCacheSize -= size;
-          _indexFullyCached.remove(key);
-          _indexAccessWeights.remove(key);
-        }
-
-        // Yield again during removal if the list is very large.
-        processedCount++;
-        if (processedCount % 20 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      if (bytesEvicted > 0) {
-        Logger.debug(
-            'Cache eviction: evicted ${indexesToRemove.length} entire indexes (${(bytesEvicted / 1024).toStringAsFixed(2)} KB) to free up memory.',
-            label: 'IndexManager._cleanupIndexCache');
-      }
+      // Use tableName:indexName as index identifier
+      final indexKey = '$tableName:$indexName';
+      return await weightManager.getWeight(
+        WeightType.indexData,
+        indexKey,
+      );
     } catch (e) {
-      Logger.error('Failed to clean up index cache: $e',
-          label: 'IndexManager._cleanupIndexCache');
+      Logger.warn(
+        'Failed to query index data weight for $tableName:$indexName: $e',
+        label: 'IndexManager._queryIndexDataWeight',
+      );
+      return null;
     }
   }
 
-  /// Clean up index metadata cache
-  Future<void> _cleanupIndexMetaCache() async {
-    try {
-      if (_indexMetaCache.isEmpty) return;
-
-      // Calculate the ratio to be cleared
-      final metaCacheLimit =
-          _dataStore.memoryManager?.getIndexMetaCacheSize() ?? 10000;
-
-      // If the cache is less than the limit, no need to clean up
-      if (_currentIndexMetaCacheSize < metaCacheLimit * 0.9) return;
-
-      // Calculate target size (70% of the limit)
-      final targetSize = (metaCacheLimit * 0.7).toInt();
-      final needToRemoveBytes = _currentIndexMetaCacheSize - targetSize;
-
-      if (needToRemoveBytes <= 0) return;
-
-      // Optimization: use a bucket approach to avoid full sorting
-      // We'll divide time into buckets (e.g., by hour) and process oldest buckets first
-      final buckets = <int, List<String>>{};
-      int removedSize = 0;
-
-      // Critical indexes to preserve (primary key and unique indexes)
-      final criticalIndexes = <String>{};
-
-      // System tables to preserve
-      final systemTables = <String>{};
-
-      // Single pass to categorize entries into time buckets
-      // Use epoch hours as bucket keys (rough time division)
-      // Use a standard indexed for-loop for safety
-      final metaCacheEntries = _indexMetaCache.entries.toList();
-      for (int i = 0; i < metaCacheEntries.length; i++) {
-        final entry = metaCacheEntries[i];
-        final indexName = entry.key;
-        final meta = entry.value;
-
-        // Identify critical indexes to preserve (primary key and unique indexes)
-        if (indexName.startsWith('pk_') || meta.isUnique) {
-          criticalIndexes.add(indexName);
-          continue; // Critical indexes are not put into eviction buckets
-        }
-
-        // Identify system tables to preserve
-        if (SystemTable.isSystemTable(meta.tableName)) {
-          systemTables.add(indexName);
-          continue;
-        }
-
-        // Get last access time, convert to bucket
-        final lastModified = meta.timestamps.modified;
-        // Use hours since epoch as bucket key (coarse-grained time division)
-        final bucketKey = lastModified.millisecondsSinceEpoch ~/ 3600000;
-
-        // Add to appropriate bucket
-        buckets.putIfAbsent(bucketKey, () => <String>[]).add(indexName);
-        if (i % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // Process buckets from oldest to newest
-      final sortedBuckets = buckets.keys.toList()..sort();
-
-      for (final bucketKey in sortedBuckets) {
-        final indexesInBucket = buckets[bucketKey]!;
-        // Use a standard indexed for-loop for safety
-        final indexesToProcess = indexesInBucket.toList();
-        for (int i = 0; i < indexesToProcess.length; i++) {
-          final indexName = indexesToProcess[i];
-          // Skip if we've removed enough already
-          if (removedSize >= needToRemoveBytes) break;
-
-          // Remove this entry if not a system table or a critical index
-          if (!systemTables.contains(indexName) &&
-              !criticalIndexes.contains(indexName)) {
-            final metaSize = _indexMetaSizeCache[indexName] ?? 0;
-            _indexMetaCache.remove(indexName);
-            _indexMetaSizeCache.remove(indexName);
-
-            removedSize += metaSize;
-          }
-          if (i % 50 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-
-        // If we've removed enough, stop processing more buckets
-        if (removedSize >= needToRemoveBytes) break;
-      }
-
-      // Update current cache size
-      _currentIndexMetaCacheSize -= removedSize;
-    } catch (e) {
-      Logger.error('Failed to clean up index metadata cache: $e',
-          label: 'IndexManager._cleanupIndexMetaCache');
-    }
-  }
-
-  /// Initialize cron task
-  void _initCronTask() {
-    if (_cronInitialized) return;
-
-    _lowFrequencyCallback = () => _processIndexWriteBuffer();
-    _highFrequencyCallback = () => _processIndexWriteBuffer();
-
-    // Start with low-frequency polling
-    CrontabManager.addCallback(
-        ExecuteInterval.seconds3, _lowFrequencyCallback!);
-
-    _cronInitialized = true;
-
-    // Check if immediate write buffer processing is needed
-    _checkInitialWriteBuffer();
-  }
-
-  /// Switch to high-frequency polling mode.
-  void _switchToHighFrequencyMode() {
-    if (_isHighFrequencyModeActive) return;
-    _isHighFrequencyModeActive =
-        true; // Set flag first to prevent race condition
-
-    CrontabManager.removeCallback(
-        ExecuteInterval.seconds3, _lowFrequencyCallback!);
-    CrontabManager.addCallback(
-        ExecuteInterval.seconds1, _highFrequencyCallback!);
-
-    _lastIdleTime = null; // Reset idle timer
-    Logger.debug('Switched to high-frequency (1s) index polling.',
-        label: 'IndexManager');
-  }
-
-  /// Switch to low-frequency polling mode.
-  void _switchToLowFrequencyMode() {
-    if (!_isHighFrequencyModeActive) return;
-    _isHighFrequencyModeActive =
-        false; // Set flag first to prevent race condition
-
-    CrontabManager.removeCallback(
-        ExecuteInterval.seconds1, _highFrequencyCallback!);
-    CrontabManager.addCallback(
-        ExecuteInterval.seconds3, _lowFrequencyCallback!);
-
-    Logger.debug(
-        'Switched to low-frequency (3s) index polling due to inactivity.',
-        label: 'IndexManager');
-  }
-
-  /// Check buffer status to decide if we should switch polling frequency.
-  void _checkAndSwitchPollingMode() {
-    final bool isIdle = _writeBuffer.isEmpty &&
-        _deleteBuffer.isEmpty &&
-        !_isProcessingWriteBuffer;
-
-    if (_isHighFrequencyModeActive) {
-      if (isIdle) {
-        // Buffers are empty, start the 30-second countdown to switch to low-frequency mode.
-        _lastIdleTime ??= DateTime.now();
-        if (DateTime.now().difference(_lastIdleTime!).inSeconds >= 30) {
-          _switchToLowFrequencyMode();
-        }
-      } else {
-        // Not idle, so reset the timer.
-        _lastIdleTime = null;
-      }
-    } else {
-      // We are in low-frequency mode. If we are not idle, we should switch to high-frequency.
-      if (!isIdle) {
-        _switchToHighFrequencyMode();
-      }
-    }
-  }
-
-  /// Check initial write buffer, if the index last write time exceeds 3 seconds, trigger write immediately
-  Future<void> _checkInitialWriteBuffer() async {
-    final now = DateTime.now();
-    final keysToProcess = <String>[];
-
-    _indexLastWriteTime.forEach((key, lastWrite) {
-      if (now.difference(lastWrite).inSeconds > 3) {
-        keysToProcess.add(key);
-      }
-    });
-
-    if (keysToProcess.isNotEmpty) {
-      await _processIndexWriteBuffer(specificKeys: keysToProcess);
-    }
-  }
-
-  /// Process index write buffer
-  Future<void> _processIndexWriteBuffer({List<String>? specificKeys}) async {
-    // If already processing, avoid duplicate execution
-    if (!_isClosing && _isProcessingWriteBuffer) {
-      return;
-    }
-
-    // Get keys from both buffers if not specified
-    final keysToProcess = specificKeys ?? _getKeysWithEntries();
-
-    if (keysToProcess.isEmpty) {
-      // If there are no keys to process but in the closing phase, mark all writes as completed
-      if (_isClosing &&
-          _pendingWrites == 0 &&
-          !_allWritesCompleted.isCompleted) {
-        _allWritesCompleted.complete();
-      }
-      // Check if we should switch to low-frequency mode.
-      _checkAndSwitchPollingMode();
-      return;
-    }
-
-    try {
-      // Set processing flag, only set when not closing
-      if (!_isClosing) {
-        _isProcessingWriteBuffer = true;
-        // When processing starts, we are not idle, so reset the idle timer.
-        _lastIdleTime = null;
-      }
-
-      // Track operations to wait for completion when the database is closing
-      _pendingWrites++;
-
-      // Calculate total entries, determine if batch processing is needed
-      int totalEntries = 0;
-      final keysWithEntries = <String>[];
-
-      // Check each key's buffer situation
-      for (final key in keysToProcess) {
-        try {
-          // Check if the buffer has data in either insert or delete buffer
-          int entries = 0;
-
-          // Check insert buffer
-          if (_writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty) {
-            entries += _writeBuffer[key]!.length;
-          }
-
-          // Check delete buffer
-          if (_deleteBuffer.containsKey(key) &&
-              _deleteBuffer[key]!.isNotEmpty) {
-            entries += _deleteBuffer[key]!.length;
-          }
-
-          if (entries > 0) {
-            totalEntries += entries;
-            keysWithEntries.add(key);
-          }
-        } catch (e) {
-          Logger.error('Error checking buffer: $e',
-              label: 'IndexManager._processIndexWriteBuffer');
-        }
-      }
-
-      // Record the current total number of pending entries, only used to estimate when closing
-      _pendingEntriesCount = totalEntries;
-
-      Logger.debug('Total pending index entries: $totalEntries',
-          label: 'IndexManager._processIndexWriteBuffer');
-
-      // If there are no keys to process, return directly
-      if (keysWithEntries.isEmpty) {
-        _pendingWrites--; // Reduce count, because there are no actual operations
-        // If closing phase and no pending writes, mark completed
-        if (_isClosing &&
-            _pendingWrites == 0 &&
-            !_allWritesCompleted.isCompleted) {
-          _allWritesCompleted.complete();
-        }
-        _checkAndSwitchPollingMode(); // Still check if we should go to low-frequency mode
-        return;
-      }
-
-      await _processBatchIndexWrites(keysWithEntries, totalEntries);
-
-      // After processing, reduce count
-      _pendingEntriesCount = max(0, _pendingEntriesCount - totalEntries);
-      _pendingWrites--;
-
-      Logger.debug(
-          'Processing completed, total index entries processed: $totalEntries, remaining pending writes: $_pendingWrites',
-          label: 'IndexManager._processIndexWriteBuffer');
-
-      // Check if it is the last write operation
-      if (_isClosing &&
-          _pendingWrites == 0 &&
-          !_allWritesCompleted.isCompleted) {
-        _allWritesCompleted.complete();
-      }
-    } catch (e) {
-      Logger.error('Failed to process index write buffer: $e',
-          label: 'IndexManager._processIndexWriteBuffer');
-
-      // Even if an error occurs, reduce the count to avoid blocking the closing process
-      _pendingWrites--;
-
-      // Check if it is the last write operation
-      if (_isClosing &&
-          _pendingWrites == 0 &&
-          !_allWritesCompleted.isCompleted) {
-        _allWritesCompleted.complete();
-      }
-    } finally {
-      if (!_isClosing) {
-        _isProcessingWriteBuffer = false;
-        _checkAndSwitchPollingMode();
-      }
-    }
-  }
-
-  /// Helper to get all keys with entries in either buffer
-  List<String> _getKeysWithEntries() {
-    final result = <String>{};
-
-    // Add keys from insert buffer
-    for (final key in _writeBuffer.keys.toList()) {
-      if (_writeBuffer[key] != null && _writeBuffer[key]!.isNotEmpty) {
-        result.add(key);
-      }
-    }
-
-    // Add keys from delete buffer
-    for (final key in _deleteBuffer.keys.toList()) {
-      if (_deleteBuffer[key] != null && _deleteBuffer[key]!.isNotEmpty) {
-        result.add(key);
-      }
-    }
-
-    return result.toList();
-  }
-
-  /// Process delete entries - remove entries from the B+ tree in the file
-  Future<void> _processDeleteEntries(String tableName, String indexName,
-      Map<String, IndexBufferEntry> entriesToDelete) async {
-    try {
-      if (entriesToDelete.isEmpty) return;
-
-      final indexMeta = await _getIndexMeta(tableName, indexName);
-      if (indexMeta == null || indexMeta.partitions.isEmpty) {
-        return;
-      }
-
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) return;
-      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
-      final matcher = ValueMatcher.getMatcher(matcherType);
-
-      final isUniqueIndex = indexName == 'pk_$tableName' || indexMeta.isUnique;
-
-      // Group entries by the partition they are expected to be in.
-      final Map<int, Map<String, IndexBufferEntry>> partitionedDeletes = {};
-      final Map<String, IndexBufferEntry> fallbackDeletes = {};
-
-      if (indexMeta.isOrdered == true) {
-        int processedCount = 0;
-        for (final entry in entriesToDelete.entries.toList()) {
-          final indexKey = entry.value.indexEntry.indexKey;
-          final partitionIndex =
-              indexMeta.findPartitionForKey(indexKey, matcher);
-
-          if (partitionIndex != -1) {
-            partitionedDeletes.putIfAbsent(
-                partitionIndex, () => {})[entry.key] = entry.value;
-          } else {
-            // Key not found in any partition range, needs fallback scan.
-            fallbackDeletes[entry.key] = entry.value;
-          }
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-      } else {
-        // If the index is not ordered, we must check all partitions for all keys.
-        fallbackDeletes.addAll(entriesToDelete);
-      }
-
-      final List<IndexPartitionMeta> updatedPartitions = [];
-      final tasks = <Future<void> Function()>[];
-      final partitionMap = {for (var p in indexMeta.partitions) p.index: p};
-
-      // --- Process deletes for keys found in specific partitions (ordered indexes) ---
-      int processedCount = 0;
-      for (final job in partitionedDeletes.entries.toList()) {
-        final partitionIndex = job.key;
-        final entriesForPartition = job.value;
-        final partition = partitionMap[partitionIndex];
-
-        if (partition == null || entriesForPartition.isEmpty) continue;
-
-        tasks.add(() => _performDeleteOnPartition(
-              tableName,
-              indexName,
-              partition,
-              entriesForPartition,
-              isUniqueIndex,
-              updatedPartitions,
-              matcherType,
-            ));
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // Execute tasks for ordered hits first.
-      if (tasks.isNotEmpty) {
-        await ParallelProcessor.execute<void>(tasks,
-            label: 'IndexManager._processDeleteEntries.ordered_hits');
-        tasks.clear();
-      }
-
-      // --- Process fallback deletes (for non-ordered indexes or unmapped keys) ---
-      if (fallbackDeletes.isNotEmpty) {
-        final keysToDelete = List<String>.from(fallbackDeletes.keys);
-        final listLockResource = 'internal:keysToDelete:$tableName:$indexName';
-
-        if (isUniqueIndex) {
-          final controller = ParallelController();
-          final uniqueFallbackTasks = <Future<void> Function()>[];
-          int processedCount = 0;
-          for (final partition in indexMeta.partitions) {
-            uniqueFallbackTasks.add(() => _performDeleteOnPartition(
-                  tableName,
-                  indexName,
-                  partition,
-                  fallbackDeletes,
-                  true, // isUniqueIndex
-                  updatedPartitions,
-                  matcherType,
-                  sharedKeysToDelete: keysToDelete,
-                  lockResource: listLockResource,
-                  controller: controller,
-                ));
-            processedCount++;
-            if (processedCount % 50 == 0) {
-              await Future.delayed(Duration.zero);
-            }
-          }
-          if (uniqueFallbackTasks.isNotEmpty) {
-            await ParallelProcessor.execute<void>(uniqueFallbackTasks,
-                label: 'IndexManager._processDeleteEntries.unique_fallback',
-                controller: controller,
-                timeout: ParallelProcessor.noTimeout);
-          }
-        } else {
-          // For non-unique indexes, we must check all partitions.
-          final nonUniqueFallbackTasks = <Future<void> Function()>[];
-          int processedCount = 0;
-          for (final partition in indexMeta.partitions) {
-            nonUniqueFallbackTasks.add(() => _performDeleteOnPartition(
-                  tableName,
-                  indexName,
-                  partition,
-                  fallbackDeletes,
-                  false, // isUniqueIndex
-                  updatedPartitions,
-                  matcherType,
-                ));
-            processedCount++;
-            if (processedCount % 50 == 0) {
-              await Future.delayed(Duration.zero);
-            }
-          }
-          if (nonUniqueFallbackTasks.isNotEmpty) {
-            await ParallelProcessor.execute<void>(nonUniqueFallbackTasks,
-                label: 'IndexManager._processDeleteEntries.non_unique_fallback',
-                timeout: ParallelProcessor.noTimeout);
-          }
-        }
-      }
-
-      // After all partitions are processed, update the main metadata
-      if (updatedPartitions.isNotEmpty) {
-        // Create a new partition list, keeping original order
-        final List<IndexPartitionMeta> finalPartitions =
-            List.from(indexMeta.partitions);
-
-        // Use mapping table to record index positions, avoid duplicate lookups
-        final Map<int, int> indexPositionMap = {};
-        for (int i = 0; i < finalPartitions.length; i++) {
-          indexPositionMap[finalPartitions[i].index] = i;
-        }
-
-        // Replace updated partitions in the list, keeping original order
-        for (var updatedPartition in updatedPartitions) {
-          final position = indexPositionMap[updatedPartition.index];
-          if (position != null) {
-            finalPartitions[position] = updatedPartition;
-          }
-        }
-
-        // Create updated main metadata, no need to sort again
-        final totalSize =
-            finalPartitions.fold<int>(0, (sum, p) => sum + p.bTreeSize);
-        final totalEntries =
-            finalPartitions.fold<int>(0, (sum, p) => sum + p.entries);
-        final updatedMeta = indexMeta.copyWith(
-          partitions: finalPartitions,
-          timestamps: Timestamps(
-            created: indexMeta.timestamps.created,
-            modified: DateTime.now(),
-          ),
-          totalSizeInBytes: totalSize,
-          totalEntries: totalEntries,
-        );
-
-        // Update main metadata
-        await _updateIndexMetadata(
-            tableName: tableName,
-            indexName: indexName,
-            updatedMeta: updatedMeta);
-      }
-
-      Logger.debug(
-          'Processed ${entriesToDelete.length} delete entries for $tableName.$indexName',
-          label: 'IndexManager._processDeleteEntries');
-    } catch (e, stack) {
-      Logger.error('Failed to process delete entries: $e\n$stack',
-          label: 'IndexManager._processDeleteEntries');
-    }
-  }
-
-  /// Performs the actual deletion logic for a single partition.
-  Future<void> _performDeleteOnPartition(
-    String tableName,
-    String indexName,
-    IndexPartitionMeta partition,
-    Map<String, IndexBufferEntry> entriesToDelete,
-    bool isUniqueIndex,
-    List<IndexPartitionMeta> updatedPartitions,
-    MatcherType matcherType, {
-    List<String>? sharedKeysToDelete,
-    String? lockResource,
-    ParallelController? controller,
-  }) async {
-    // If using a shared list of keys for a unique index, check if it's already empty.
-    if ((isUniqueIndex &&
-            sharedKeysToDelete != null &&
-            sharedKeysToDelete.isEmpty) ||
-        controller?.isStopped == true) {
-      return;
-    }
-
-    try {
-      final keysForThisTask =
-          sharedKeysToDelete ?? entriesToDelete.keys.toList();
-      if (keysForThisTask.isEmpty) return;
-
-      final partitionPath = await _dataStore.pathManager
-          .getIndexPartitionPath(tableName, indexName, partition.index);
-
-      if (!await _dataStore.storage.existsFile(partitionPath)) {
-        return;
-      }
-
-      final content = await _dataStore.storage.readAsString(partitionPath);
-      if (content == null || content.isEmpty) {
-        return;
-      }
-
-      // Filter the full `entriesToDelete` map to only include keys relevant for this task.
-      final relevantEntries = Map.fromEntries(entriesToDelete.entries
-          .where((e) => keysForThisTask.contains(e.key)));
-
-      final request = IndexDeleteRequest(
-          content: content,
-          checksum: partition.checksum,
-          isUnique: isUniqueIndex,
-          keysToProcess: keysForThisTask,
-          entriesToDelete: relevantEntries,
-          matcherType: matcherType);
-
-      final useIsolate =
-          content.length > 50 * 1024 || keysForThisTask.length > 100;
-      final result = await ComputeManager.run(processIndexDelete, request,
-          useIsolate: useIsolate);
-
-      if (result.isModified) {
-        await _dataStore.storage
-            .writeAsString(partitionPath, result.newContent);
-
-        final updatedPartition = partition.copyWith(
-          fileSizeInBytes: result.newContent.length,
-          bTreeSize: result.newContent.length,
-          entries: result.entryCount,
-          timestamps: Timestamps(
-            created: partition.timestamps.created,
-            modified: DateTime.now(),
-          ),
-          checksum: result.checksum,
-        );
-        updatedPartitions.add(updatedPartition);
-      }
-
-      // If a shared key list was used (for unique indexes), remove the processed keys.
-      if (isUniqueIndex &&
-          result.processedKeys.isNotEmpty &&
-          sharedKeysToDelete != null &&
-          lockResource != null) {
-        final opId = 'op-del-keys-${DateTime.now().microsecondsSinceEpoch}';
-        try {
-          await _dataStore.lockManager
-              ?.acquireExclusiveLock(lockResource, opId);
-          sharedKeysToDelete
-              .removeWhere((k) => result.processedKeys.contains(k));
-          // If all keys are processed, stop other parallel tasks.
-          if (sharedKeysToDelete.isEmpty && controller != null) {
-            controller.stop();
-          }
-        } finally {
-          _dataStore.lockManager?.releaseExclusiveLock(lockResource, opId);
-        }
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to process partition for delete entries: $e\n$stack',
-          label: 'IndexManager._performDeleteOnPartition');
-    }
-  }
-
-  /// Batch process index writes
-  Future<void> _processBatchIndexWrites(
-      List<String> keys, int totalEntries) async {
-    final tasks = <Future<void> Function()>[];
-    for (final key in keys) {
-      tasks.add(() async {
-        if (_indexWriting[key] == true) return;
-
-        try {
-          _indexWriting[key] = true;
-
-          final parts = key.split(':');
-          if (parts.length != 2) {
-            _indexWriting[key] = false;
-            return;
-          }
-
-          final tableName = parts[0];
-          final indexName = parts[1];
-          final maxConcurrent = _dataStore.config.maxConcurrent;
-
-          // Create lock resource identifier for index write operation
-          final lockResource = 'index:$tableName:$indexName';
-          final operationId =
-              'batch_write_index_${DateTime.now().millisecondsSinceEpoch}';
-
-          try {
-            // Acquire exclusive lock to prevent concurrent writes to the same index file
-            await _dataStore.lockManager
-                ?.acquireExclusiveLock(lockResource, operationId);
-
-            final tableSchema = await _dataStore.getTableSchema(tableName);
-            if (tableSchema == null) {
-              _indexWriting[key] = false;
-              _dataStore.lockManager
-                  ?.releaseExclusiveLock(lockResource, operationId);
-              return;
-            }
-
-            // Get index metadata
-            final indexMeta = await _getIndexMeta(tableName, indexName);
-            if (indexMeta == null) {
-              _indexWriting[key] = false;
-              _dataStore.lockManager
-                  ?.releaseExclusiveLock(lockResource, operationId);
-              return;
-            }
-
-            final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
-            final matcher = ValueMatcher.getMatcher(matcherType);
-
-            // Check if there's any data to process
-            bool hasInserts =
-                _writeBuffer.containsKey(key) && _writeBuffer[key]!.isNotEmpty;
-            bool hasDeletes = _deleteBuffer.containsKey(key) &&
-                _deleteBuffer[key]!.isNotEmpty;
-
-            if (!hasInserts && !hasDeletes) {
-              _indexWriting[key] = false;
-              _dataStore.lockManager
-                  ?.releaseExclusiveLock(lockResource, operationId);
-              return;
-            }
-
-            // --- 1. Process Inserts Concurrently ---
-            if (hasInserts) {
-              final writeBuffer = _writeBuffer.remove(key)!;
-              final List<IndexBufferEntry> allEntries =
-                  writeBuffer.values.toList();
-
-              // Check if this is a primary key index and table has ordered flag
-              bool isPrimaryKeyIndex = indexName == 'pk_$tableName';
-              bool isTableOrdered = false;
-
-              // For primary key index, check table metadata ordered flag
-              if (isPrimaryKeyIndex) {
-                try {
-                  final tableMeta = await _dataStore.tableDataManager
-                      .getTableFileMeta(tableName);
-                  isTableOrdered = tableMeta?.isOrdered == true;
-                } catch (e) {
-                  // Ignore error, proceed with default handling
-                }
-              }
-
-              // --- Pre-allocation Step ---
-              final List<PartitionWriteJob> jobs = [];
-              if (allEntries.isNotEmpty) {
-                final maxPartitionFileSize =
-                    _dataStore.config.maxPartitionFileSize;
-                int partitionIndex = indexMeta.partitions.isEmpty
-                    ? 0
-                    : indexMeta.partitions.last.index;
-                int currentSize = indexMeta.partitions.isEmpty
-                    ? 0
-                    : indexMeta.partitions.last.fileSizeInBytes;
-
-                List<IndexBufferEntry> currentJobEntries = [];
-                dynamic minKey, maxKey;
-
-                int processedCount = 0;
-                for (final entry in allEntries) {
-                  try {
-                    final estimatedEntrySize = (entry.indexEntry.indexKey
-                                .toString()
-                                .length +
-                            entry.indexEntry.recordPointer.toString().length +
-                            2)
-                        .toInt();
-
-                    // Track min/max keys for primary key index when table is ordered
-                    if (isPrimaryKeyIndex && isTableOrdered) {
-                      final currentKey = entry.indexEntry.indexKey;
-                      if (minKey == null || matcher(currentKey, minKey) < 0) {
-                        minKey = currentKey;
-                      }
-                      if (maxKey == null || matcher(currentKey, maxKey) > 0) {
-                        maxKey = currentKey;
-                      }
-                    }
-
-                    if (currentSize + estimatedEntrySize >
-                            maxPartitionFileSize &&
-                        currentJobEntries.isNotEmpty) {
-                      // Finalize current job and start a new one
-                      final job = PartitionWriteJob(
-                          partitionIndex: partitionIndex,
-                          entries: currentJobEntries);
-
-                      // Set min/max keys for primary key index when table is ordered
-                      if (isPrimaryKeyIndex && isTableOrdered) {
-                        job.minKey = minKey;
-                        job.maxKey = maxKey;
-                        // Reset for next partition
-                        minKey = null;
-                        maxKey = null;
-                      }
-
-                      jobs.add(job);
-                      partitionIndex++;
-                      currentSize = 0;
-                      currentJobEntries = [];
-                    }
-
-                    currentJobEntries.add(entry);
-                    currentSize += estimatedEntrySize;
-
-                    processedCount++;
-                    if (processedCount % 50 == 0) {
-                      await Future.delayed(Duration.zero);
-                    }
-                  } catch (e) {
-                    Logger.warn('Failed to estimate entry size: $e',
-                        label: 'IndexManager._processBatchIndexWrites');
-                  }
-                }
-
-                // Add the last job
-                if (currentJobEntries.isNotEmpty) {
-                  final job = PartitionWriteJob(
-                      partitionIndex: partitionIndex,
-                      entries: currentJobEntries);
-
-                  // Set min/max keys for primary key index when table is ordered
-                  if (isPrimaryKeyIndex && isTableOrdered) {
-                    job.minKey = minKey;
-                    job.maxKey = maxKey;
-                  }
-
-                  jobs.add(job);
-                }
-              }
-
-              // --- Parallel Execution Step (Optimized) ---
-              if (jobs.isNotEmpty) {
-                final allNewOrUpdatedPartitions = <IndexPartitionMeta>[];
-
-                for (int i = 0; i < jobs.length; i += maxConcurrent) {
-                  final batchJobs =
-                      jobs.sublist(i, min(i + maxConcurrent, jobs.length));
-
-                  // Step 1 (for batch): Concurrently load content and start compute.
-                  // Use a standard for-loop for clearer type inference.
-                  final computeFutures = <Future<IndexProcessingResult>>[];
-                  for (final job in batchJobs) {
-                    final future = () async {
-                      try {
-                        final results = indexMeta.partitions
-                            .where((p) => p.index == job.partitionIndex);
-                        final existingPartition =
-                            results.isEmpty ? null : results.first;
-
-                        if (existingPartition != null) {
-                          final path = await _dataStore.pathManager
-                              .getIndexPartitionPath(
-                                  tableName, indexName, job.partitionIndex);
-                          if (await _dataStore.storage.existsFile(path)) {
-                            job.existingContent =
-                                await _dataStore.storage.readAsString(path);
-                          }
-                        }
-                        final request = IndexProcessingRequest(
-                          entries: job.entries,
-                          existingPartitionContent: job.existingContent,
-                          isUnique: indexMeta.isUnique,
-                          matcherType: matcherType,
-                        );
-                        return await ComputeManager.run(
-                            processIndexPartition, request,
-                            useIsolate: ((job.existingContent?.length ?? 0) >
-                                    56 * 1024 ||
-                                job.entries.length > 100));
-                      } catch (e, stack) {
-                        Logger.error(
-                            'Error preparing or running compute job for partition ${job.partitionIndex}: $e\n$stack',
-                            label: 'IndexManager._processBatchIndexWrites');
-                        return IndexProcessingResult.failed();
-                      }
-                    }(); // Immediately invoke the async closure
-                    computeFutures.add(future);
-                    await Future.delayed(Duration.zero);
-                  }
-
-                  // Step 2 (for batch): Await all compute tasks to finish.
-                  final computeResults = await Future.wait(computeFutures);
-
-                  // Step 3 (for batch): Assign results and concurrently write files.
-                  final writeFutures = <Future>[];
-                  for (int j = 0; j < batchJobs.length; j++) {
-                    try {
-                      final job = batchJobs[j];
-                      final result = computeResults[j];
-                      if (result.isFailed) continue; // Skip failed jobs
-
-                      job.result = result; // Needed for metadata creation below
-
-                      final partitionPath = await _dataStore.pathManager
-                          .getIndexPartitionPath(
-                              tableName, indexName, job.partitionIndex);
-                      writeFutures.add(_dataStore.storage.writeAsString(
-                          partitionPath, result.serializedBTree));
-                    } catch (e, stack) {
-                      Logger.error('Error writing partition file: $e\n$stack',
-                          label: 'IndexManager._processBatchIndexWrites');
-                    }
-                  }
-                  await Future.wait(writeFutures);
-
-                  // Step 4 (for batch): Create metadata for the completed jobs.
-                  for (final job in batchJobs) {
-                    if (job.result == null || job.result!.isFailed) continue;
-                    try {
-                      final checksum =
-                          _calculateChecksum(job.result!.serializedBTree);
-                      final results = indexMeta.partitions
-                          .where((p) => p.index == job.partitionIndex);
-                      final existingPartition =
-                          results.isEmpty ? null : results.first;
-
-                      if (existingPartition != null) {
-                        // Merge old and new key ranges for primary key indexes and ordered tables
-                        dynamic finalMinKey = existingPartition.minKey;
-                        dynamic finalMaxKey = existingPartition.maxKey;
-
-                        if (isPrimaryKeyIndex && isTableOrdered) {
-                          // If there is a newly written key range
-                          if (job.minKey != null) {
-                            // If there was no original range, or if the new minimum key is smaller than the original one
-                            if (finalMinKey == null ||
-                                matcher(job.minKey, finalMinKey) < 0) {
-                              finalMinKey = job.minKey;
-                            }
-                          }
-
-                          if (job.maxKey != null) {
-                            // If there was no original range, or if the new maximum key is larger than the original one
-                            if (finalMaxKey == null ||
-                                matcher(job.maxKey, finalMaxKey) > 0) {
-                              finalMaxKey = job.maxKey;
-                            }
-                          }
-                        }
-
-                        allNewOrUpdatedPartitions
-                            .add(existingPartition.copyWith(
-                          fileSizeInBytes: job.result!.newSize,
-                          bTreeSize: job.result!.newSize,
-                          entries: job.result!.entryCount,
-                          minKey: finalMinKey,
-                          maxKey: finalMaxKey,
-                          timestamps: Timestamps(
-                              created: existingPartition.timestamps.created,
-                              modified: DateTime.now()),
-                          checksum: checksum,
-                        ));
-                      } else {
-                        allNewOrUpdatedPartitions.add(IndexPartitionMeta(
-                          version: 1,
-                          index: job.partitionIndex,
-                          fileSizeInBytes: job.result!.newSize,
-                          minKey:
-                              job.minKey, // Use collected min key if available
-                          maxKey:
-                              job.maxKey, // Use collected max key if available
-                          bTreeSize: job.result!.newSize,
-                          entries: job.result!.entryCount,
-                          timestamps: Timestamps(
-                              created: DateTime.now(),
-                              modified: DateTime.now()),
-                          checksum: checksum,
-                        ));
-                      }
-                    } catch (e, stack) {
-                      Logger.error(
-                          'Error creating partition metadata: $e\n$stack',
-                          label: 'IndexManager._processBatchIndexWrites');
-                    }
-                    await Future.delayed(Duration.zero);
-                  }
-                }
-
-                // --- Final Step: Update metadata once with all changes ---
-                final partitionMap = {
-                  for (var p in indexMeta.partitions) p.index: p
-                };
-                for (var p in allNewOrUpdatedPartitions) {
-                  partitionMap[p.index] = p;
-                }
-                final finalPartitions = partitionMap.values.toList()
-                  ..sort((a, b) => a.index.compareTo(b.index));
-
-                final totalSize =
-                    finalPartitions.fold<int>(0, (sum, p) => sum + p.bTreeSize);
-                final totalEntries =
-                    finalPartitions.fold<int>(0, (sum, p) => sum + p.entries);
-                final updatedMeta = indexMeta.copyWith(
-                  partitions: finalPartitions,
-                  isOrdered: isTableOrdered,
-                  timestamps: Timestamps(
-                      created: indexMeta.timestamps.created,
-                      modified: DateTime.now()),
-                  totalSizeInBytes: totalSize,
-                  totalEntries: totalEntries,
-                );
-
-                // Use unified method to update metadata
-                await _updateIndexMetadata(
-                    tableName: tableName,
-                    indexName: indexName,
-                    updatedMeta: updatedMeta);
-              }
-            }
-
-            // --- 2. Process Deletes Sequentially ---
-            if (hasDeletes) {
-              final deleteBuffer = _deleteBuffer.remove(key);
-
-              if (deleteBuffer != null && deleteBuffer.isNotEmpty) {
-                await _processDeleteEntries(tableName, indexName, deleteBuffer);
-              }
-            }
-
-            // Update last write time
-            _indexLastWriteTime[key] = DateTime.now();
-          } catch (e, stack) {
-            Logger.error('Failed to batch write index: $e\n$stack',
-                label: 'IndexManager._processBatchIndexWrites');
-          } finally {
-            // Release lock resource, whether the operation succeeds or fails
-            _dataStore.lockManager
-                ?.releaseExclusiveLock(lockResource, operationId);
-          }
-        } catch (e, stack) {
-          Logger.error('Failed to batch write index: $e\n$stack',
-              label: 'IndexManager._processBatchIndexWrites');
-        } finally {
-          _indexWriting[key] = false;
-        }
-      });
-    }
-    await ParallelProcessor.execute<void>(tasks,
-        label: 'IndexManager._processBatchIndexWrites',
-        timeout: ParallelProcessor.noTimeout);
-  }
-
-  void dispose() {
-    if (_lowFrequencyCallback != null) {
-      CrontabManager.removeCallback(
-          ExecuteInterval.seconds3, _lowFrequencyCallback!);
-    }
-    if (_highFrequencyCallback != null) {
-      CrontabManager.removeCallback(
-          ExecuteInterval.seconds1, _highFrequencyCallback!);
-    }
-
-    // Unregister memory callback
-    _dataStore.memoryManager
-        ?.unregisterCacheEvictionCallback(CacheType.indexData);
-    _dataStore.memoryManager
-        ?.unregisterCacheEvictionCallback(CacheType.indexMeta);
-
-    _indexCache.clear();
-    _indexMetaCache.clear();
-    _indexFullyCached.clear();
-    _indexAccessWeights.clear();
-    _writeBuffer.clear();
-    _indexWriting.clear();
-    _indexLastWriteTime.clear();
-    _deleteBuffer.clear();
-    _indexMetaSizeCache.clear();
-    _indexSizeCache.clear();
-    _currentIndexMetaCacheSize = 0;
-    _currentIndexCacheSize = 0;
-    _pendingWrites = 0;
-    _pendingEntriesCount = 0;
-    _isClosing = false;
-
-    // Reset completion event
-    if (!_allWritesCompleted.isCompleted) {
-      _allWritesCompleted.complete();
-    }
-  }
-
-  /// Save important data before application exit
-  Future<bool> saveBeforeAppExit() async {
-    try {
-      // Check if there are pending write buffers
-      bool hasChanges = false;
-
-      // Check insert buffer
-      for (final key in _writeBuffer.keys) {
-        if (_writeBuffer[key] != null && _writeBuffer[key]!.isNotEmpty) {
-          hasChanges = true;
-          break;
-        }
-      }
-
-      // Check delete buffer if insert buffer has no changes
-      if (!hasChanges) {
-        for (final key in _deleteBuffer.keys) {
-          if (_deleteBuffer[key] != null && _deleteBuffer[key]!.isNotEmpty) {
-            hasChanges = true;
-            break;
-          }
-        }
-      }
-
-      if (hasChanges) {
-        // Set closing flag, ensure synchronous processing
-        _isClosing = true;
-
-        // Force processing all write buffers
-        await _processIndexWriteBuffer();
-        return true;
-      } else {
-        return false;
-      }
-    } catch (e) {
-      Logger.error('Failed to save before app exit: $e', label: 'IndexManager');
-      return false;
-    } finally {
-      // Reset closing flag
-      _isClosing = false;
-    }
-  }
-
-  /// Get index cache key
-  String _getIndexCacheKey(String tableName, String indexName) {
-    return '$tableName:$indexName';
-  }
-
-  /// Update index access weight
-  Future<void> _updateIndexAccessWeight(String cacheKey) async {
-    try {
-      final now = DateTime.now();
-      final currentDate = DateTime(now.year, now.month, now.day);
-
-      // Initialize or get current weight information
-      final weights = _indexAccessWeights[cacheKey] ??
-          {
-            'weight': 0,
-            'lastAccess': now, // Use current time as initial access time
-            'lastWeightUpdate': currentDate
-          };
-
-      // Update last access time
-      weights['lastAccess'] = now;
-
-      // If it's a new day, update the weight value
-      final lastUpdate =
-          weights['lastWeightUpdate'] as DateTime? ?? DateTime(1970);
-      if (currentDate.isAfter(lastUpdate)) {
-        // Get base weight increment
-        int weightIncrement = 1;
-
-        // Give higher weight to primary and unique indexes
-        final parts = cacheKey.split(':');
-        if (parts.length == 2) {
-          final tableName = parts[0];
-          final indexName = parts[1];
-
-          // Primary key index gets 3x weight
-          if (indexName == 'pk_$tableName') {
-            weightIncrement = 3;
-          }
-          // Unique index gets 2x weight
-          else if (indexName.startsWith('uniq_')) {
-            weightIncrement = 2;
-          }
-        }
-
-        // Apply weight increment
-        weights['weight'] = (weights['weight'] as int? ?? 0) + weightIncrement;
-        weights['lastWeightUpdate'] = currentDate;
-      }
-
-      // Update weight in memory
-      _indexAccessWeights[cacheKey] = weights;
-
-      // Check if cache needs to be cleaned
-      await _checkAndCleanupCache();
-    } catch (e) {
-      // Weight update exception
-      Logger.error('Failed to update index access weight: $e',
-          label: 'IndexManager._updateIndexAccessWeight');
-    }
-  }
-
-  /// Check and clean cache
-  Future<void> _checkAndCleanupCache() async {
-    try {
-      final cacheSize = _indexCache.length;
-
-      // Get index cache size limit using memory manager
-      final memoryManager = _dataStore.memoryManager;
-
-      // Estimate current index cache total size (in bytes)
-      int currentIndexCacheSize = 0;
-      _indexCache.forEach((key, index) {
-        currentIndexCacheSize += _estimateIndexSize(index);
-      });
-
-      final maxSize = memoryManager != null
-          ? memoryManager.getIndexCacheSize() // Limit in bytes
-          : 10000;
-
-      // If current index cache size is less than 90% of the limit, do not clean up
-      if (currentIndexCacheSize <= maxSize * 0.9) return;
-
-      // Need to clean up cache, calculate the ratio to be cleaned up
-      final removeRatio = 1.0 - (maxSize * 0.7 / currentIndexCacheSize);
-      final needToRemove = (cacheSize * removeRatio).ceil();
-
-      // Sort by weight
-      final weightEntries = _indexAccessWeights.entries.toList()
-        ..sort((a, b) =>
-            (a.value['weight'] as int).compareTo(b.value['weight'] as int));
-
-      // Remove index with lowest weight, clean up to less than 70% capacity
-      int removed = 0;
-      for (int i = 0; i < weightEntries.length && removed < needToRemove; i++) {
-        final key = weightEntries[i].key;
-
-        _indexCache.remove(key);
-        _indexFullyCached.remove(key);
-        _indexAccessWeights.remove(key);
-        removed++;
-        if (removed % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      Logger.debug('Cleaned $removed low weight index caches',
-          label: 'IndexManager._checkAndCleanupCache');
-    } catch (e) {
-      Logger.error('Failed to clean index cache: $e',
-          label: 'IndexManager._checkAndCleanupCache');
-    }
-  }
-
-  /// Estimate index size (in bytes)
-  int _estimateIndexSize(BPlusTree index) {
-    // Index base structure size
-    int baseSize = 100;
-
-    // Estimate size based on index entry count and complexity
-    // Each index entry includes key and value list
-    int keyValueSize = 0;
-
-    try {
-      // Get index entry count using count() method
-      keyValueSize = index.count() * 40; // Average 40 bytes per index entry
-    } catch (e) {
-      // If size cannot be accessed, use default estimated value
-      keyValueSize = 1000; // Default assume 25 index entries
-    }
-
-    return baseSize + keyValueSize;
+  /// Estimate size of index data cache entries
+  int _estimateIndexDataSize(dynamic value) {
+    if (value is String) return value.length; // Unique index PK
+    if (value is bool) return 1; // Non-unique marker (PK is in key)
+    return 8; // Fallback
   }
 
   /// Estimate index metadata size (bytes)
   int _estimateIndexMetaSize(IndexMeta meta) {
-    // Base structure size
-    int size = 100;
+    // v2+ IndexMeta is fixed-shape (no partition list / directory mapping).
+    return 220 +
+        meta.name.length * 2 +
+        meta.tableName.length * 2 +
+        meta.fields.length * 20;
+  }
 
-    // Field size
-    size += meta.fields.length * 20;
+  /// Evict index metadata cache
+  Future<void> evictIndexMetaCache(double ratio) async {
+    if (ratio <= 0 || ratio > 1) return;
+    try {
+      await _indexMetaCache.cleanup(removeRatio: ratio);
+      Logger.info(
+        'Evicted ${(ratio * 100).toStringAsFixed(0)}% index meta cache due to memory pressure',
+        label: 'IndexManager.evictIndexMetaCache',
+      );
+    } catch (e) {
+      Logger.error('Failed to evict index meta cache: $e',
+          label: 'IndexManager.evictIndexMetaCache');
+    }
+  }
 
-    // Partition size
-    size += meta.partitions.length * 100; // Each partition is about 100 bytes
+  /// Check if full index cache is available
+  bool hasFullIndexCache(String tableName, String indexName) {
+    return _indexDataCache.isFullyCached([tableName, indexName]);
+  }
 
-    // String size
-    size += meta.name.length * 2;
-    size += meta.tableName.length * 2;
+  /// Estimate full index cache size
+  Future<int> estimateFullIndexCacheSize() async {
+    return _indexDataCache.estimatedTotalSizeBytes;
+  }
 
-    return size;
+  /// Evict all full index caches (for memory pressure)
+  Future<void> evictAllFullIndexCaches() async {
+    _indexDataCache.clear();
+    Logger.info('Evicted all full index data caches', label: 'IndexManager');
+  }
+
+  /// Evict full index caches based on memory pressure and data volume
+  Future<void> handleMemoryPressure() async {
+    // 1. Calculate average table size to see if full caching is sustainable
+    // We use total data size / table count to estimate the average index footprint
+    final totalSize = _dataStore.tableDataManager.getTotalDataSizeBytes();
+    final allTables = await _dataStore.schemaManager?.listAllTables() ?? [];
+    final tableCount = max(1, allTables.length);
+    final avgTableSizeMB = (totalSize / tableCount) / (1024 * 1024);
+
+    final threshold = _dataStore.config.prewarmThresholdMB;
+
+    if (avgTableSizeMB > threshold) {
+      _indexDataCache.clear(); // Clear all
+      Logger.warn(
+          'Average table size too large (${avgTableSizeMB.toStringAsFixed(1)}MB > ${threshold}MB), '
+          'clearing index cache to ensure stability.',
+          label: 'IndexManager.handleMemoryPressure');
+      return;
+    }
+
+    // 2. Partial eviction handled by TreeCache internal mechanism or usage-based cleanup.
+    // We trigger cleanup if needed.
+    if (_indexDataCache.estimatedTotalSizeBytes >
+        _indexDataCache.maxByteThreshold * 0.7) {
+      await _indexDataCache.cleanup();
+    }
+  }
+
+  /// Prewarm full index cache for a table
+  /// Loads all index data for UNIQUE indexes into memory
+  Future<void> prewarmIndexDataCache(String tableName) async {
+    try {
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      if (schema == null) return;
+
+      final indexes = schema.getAllIndexes();
+      if (indexes.isEmpty) return;
+
+      final yieldController =
+          YieldController('IndexManager.prewarmFullIndex', checkInterval: 100);
+
+      // Check memory before starting
+      if (_dataStore.memoryManager?.isLowMemoryMode ?? false) {
+        Logger.warn(
+            'Skipping prewarmFullIndex for $tableName due to low memory',
+            label: 'IndexManager');
+        return;
+      }
+
+      for (final index in indexes) {
+        // Skip vector indexes for full cache
+        if (index.type == IndexType.vector) continue;
+
+        final indexName = index.actualIndexName;
+        // Check availability
+        if (hasFullIndexCache(tableName, indexName)) continue;
+
+        // We need meta to get entries
+        final meta = await getIndexMeta(tableName, indexName);
+        if (meta == null) continue;
+
+        final decodedEntries = await _dataStore.indexTreePartitionManager
+            .getAllDecodedEntries(
+                tableName: tableName, indexName: indexName, meta: meta);
+
+        // Even if empty, we proceed to mark as fully cached below
+
+        if (decodedEntries.isNotEmpty) {
+          for (final entry in decodedEntries) {
+            await yieldController.maybeYield();
+            final compositeKey = [tableName, indexName, ...entry.keyComponents];
+
+            if (index.unique) {
+              _indexDataCache.put(compositeKey, entry.pk,
+                  size: entry.pk.length);
+            } else {
+              // Non-unique: one entry per PK (PK is part of the key)
+              final fullKey = <dynamic>[...compositeKey, entry.pk];
+              _indexDataCache.put(fullKey, true, size: entry.pk.length + 1);
+            }
+          }
+
+          // Mark as fully cached AFTER successful prewarm
+          _indexDataCache.setFullyCached([tableName, indexName], true);
+        } else {
+          // Even if empty, we mark as fully cached so we know we have "all 0 records"
+          _indexDataCache.setFullyCached([tableName, indexName], true);
+        }
+      }
+    } catch (e, s) {
+      Logger.error('Failed to prewarm index cache for $tableName: $e\n$s',
+          label: 'IndexManager.prewarmFullIndex');
+    }
+  }
+
+  /// Pre-initialize full index cache for a new table (empty table is ready by default)
+  void initializeFullIndexCacheForTable(String tableName, TableSchema schema) {
+    // Empty table -> all indexes are effectively fully cached (empty).
+    final indexes = schema.getAllIndexes();
+    for (final index in indexes) {
+      if (index.type == IndexType.vector) continue;
+      _indexDataCache.setFullyCached([tableName, index.actualIndexName], true);
+    }
+  }
+
+  /// Update full index cache based on record changes
+  Future<void> updateFullIndexCache(String tableName, String pk,
+      Map<String, dynamic>? oldData, Map<String, dynamic>? newData,
+      {bool force = false}) async {
+    try {
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      if (schema == null) return;
+      final indexes = schema.getAllIndexes();
+      if (indexes.isEmpty) return;
+
+      for (final index in indexes) {
+        if (index.type == IndexType.vector) continue;
+        final indexName = index.actualIndexName;
+
+        final bool isFullyCached = hasFullIndexCache(tableName, indexName);
+        // Ensure comparator is registered
+        _registerIndexComparator(tableName, indexName, schema);
+
+        // Remove old
+        if (oldData != null) {
+          final fields = <dynamic>[];
+          bool success = true;
+          for (final f in index.fields) {
+            // Check existence first
+            if (!oldData.containsKey(f)) {
+              success = false;
+              break;
+            }
+            // Use raw value
+            fields.add(oldData[f]);
+          }
+
+          if (success) {
+            final compositeKey = <dynamic>[
+              tableName,
+              indexName,
+              ...fields,
+            ]; // Raw Native Keys
+
+            final dynamic removeKey =
+                index.unique ? compositeKey : <dynamic>[...compositeKey, pk];
+            if (isFullyCached ||
+                _indexDataCache.containsKey(removeKey) ||
+                force ||
+                _dataStore.isGlobalPrewarming) {
+              _indexDataCache.remove(removeKey);
+            }
+          }
+        }
+
+        // Add new
+        if (newData != null) {
+          final fields = <dynamic>[];
+          bool success = true;
+          for (final f in index.fields) {
+            final v = newData[f];
+            if (v == null) {
+              success = false;
+              break;
+            }
+            fields.add(v);
+          }
+
+          if (success) {
+            final compositeKey = <dynamic>[tableName, indexName, ...fields];
+
+            if (index.unique) {
+              // Unique: key is index fields; value is PK.
+              if (isFullyCached ||
+                  _indexDataCache.containsKey(compositeKey) ||
+                  force ||
+                  _dataStore.isGlobalPrewarming) {
+                _indexDataCache.put(compositeKey, pk);
+              }
+            } else {
+              // Non-unique: key includes PK; value is a bool marker.
+              final fullKey = <dynamic>[...compositeKey, pk];
+              if (isFullyCached ||
+                  _indexDataCache.containsKey(fullKey) ||
+                  force ||
+                  _dataStore.isGlobalPrewarming) {
+                _indexDataCache.put(fullKey, true, size: pk.length + 1);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      Logger.warn('Failed to update index cache: $e',
+          label: 'IndexManager.updateFullIndexCache');
+    }
+  }
+
+  /// Batch update full index cache for multiple records (optimized for batch operations)
+  /// This method is more efficient than calling updateFullIndexCache multiple times
+  /// because it only fetches the schema once and processes all records together
+  Future<void> batchUpdateFullIndexCache(
+    String tableName,
+    List<Map<String, dynamic>> records, {
+    TableSchema? schemaOverride,
+    bool isInsertOperation = false,
+  }) async {
+    if (records.isEmpty) {
+      return;
+    }
+    try {
+      final schema = schemaOverride ??
+          await _dataStore.schemaManager?.getTableSchema(tableName);
+      if (schema == null) return;
+      final indexes = schema.getAllIndexes();
+      if (indexes.isEmpty) return;
+
+      final primaryKey = schema.primaryKey;
+
+      // Pre-register all comparators to avoid repeated lookups
+      for (final index in indexes) {
+        if (index.type == IndexType.vector) continue;
+        _registerIndexComparator(tableName, index.actualIndexName, schema);
+      }
+
+      // Use YieldController to avoid UI blocking during large batch operations
+      final yieldController =
+          YieldController('IndexManager.batchUpdateFullIndexCache');
+
+      // Process all records in batch
+      for (final index in indexes) {
+        if (index.fields.isEmpty || index.type == IndexType.vector) continue;
+        final indexName = index.actualIndexName;
+
+        _registerIndexComparator(tableName, index.actualIndexName, schema);
+
+        final bool isFullyCached = hasFullIndexCache(tableName, indexName);
+
+        if (!isFullyCached &&
+            isInsertOperation &&
+            !_dataStore.isGlobalPrewarming) {
+          continue;
+        }
+
+        // Direct iterative put for batch update
+        for (final record in records) {
+          await yieldController.maybeYield();
+
+          final pk = record[primaryKey]?.toString();
+          if (pk == null || pk.isEmpty) continue;
+
+          // Extract index field values
+          final fields = <dynamic>[];
+          bool success = true;
+          for (final f in index.fields) {
+            final v = record[f];
+            if (v == null) {
+              success = false;
+              break;
+            }
+            fields.add(v);
+          }
+
+          if (success) {
+            final compositeKey = <dynamic>[tableName, indexName, ...fields];
+
+            if (index.unique) {
+              // Unique: key is index fields; value is PK.
+              if (isFullyCached ||
+                  _indexDataCache.containsKey(compositeKey) ||
+                  _dataStore.isGlobalPrewarming) {
+                _indexDataCache.put(compositeKey, pk, size: pk.length);
+              }
+            } else {
+              // Non-unique: key includes PK; value is a bool marker.
+              final fullKey = <dynamic>[...compositeKey, pk];
+              if (isFullyCached ||
+                  _indexDataCache.containsKey(fullKey) ||
+                  _dataStore.isGlobalPrewarming) {
+                _indexDataCache.put(fullKey, true, size: pk.length + 1);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      Logger.warn('Failed to batch update index cache: $e',
+          label: 'IndexManager.batchUpdateFullIndexCache');
+    }
+  }
+
+  /// Factory to provide comparators for TreeCache based on path
+  Comparator<dynamic> _indexComparatorFactory(List<dynamic> path) {
+    // Path: [tableName, indexName, ...values]
+    if (path.length >= 2) {
+      final tableName = path[0] as String;
+      final indexName = path[1] as String;
+      final matcher = _comparatorRegistry['$tableName:$indexName'];
+      if (matcher != null) {
+        // Return a Comparator wrapper around the MatcherFunction
+        return (a, b) => matcher(a, b);
+      }
+    }
+    return TreeCache.compareNative;
+  }
+
+  /// Register a comparator for a specific index
+  void _registerIndexComparator(
+      String tableName, String indexName, TableSchema schema) {
+    // Only register if not already present
+    if (_comparatorRegistry.containsKey('$tableName:$indexName')) return;
+
+    final indexArgs = schema.indexes.firstWhere(
+        (i) => i.actualIndexName == indexName,
+        orElse: () => IndexSchema(indexName: '', fields: []));
+
+    if (indexArgs.fields.isEmpty) return;
+
+    // Register matcher for the FIRST field.
+    final firstField = indexArgs.fields.first;
+    final mt = schema.getFieldMatcherType(firstField);
+    _comparatorRegistry['$tableName:$indexName'] = ValueMatcher.getMatcher(mt);
   }
 
   /// Get index metadata
-  Future<IndexMeta?> _getIndexMeta(String tableName, String indexName) async {
+  /// First tries to get from cache, if not found, loads from file and caches it
+  Future<IndexMeta?> getIndexMeta(String tableName, String indexName) async {
+    // Try to get from cache first
+    final cached = _indexMetaCache.get([tableName, indexName]);
+    if (cached != null) {
+      return cached;
+    }
+
+    // Check for ongoing load
+    final loadingKey = _getMetaLoadingKey(tableName, indexName);
+    final existingFuture = _metaLoadingFutures[loadingKey];
+    if (existingFuture != null) {
+      return existingFuture;
+    }
+
+    // Load from disk with future tracking
+    final loadFuture = _doLoadIndexMeta(tableName, indexName);
+    _metaLoadingFutures[loadingKey] = loadFuture;
+
     try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Check cache
-      if (_indexMetaCache.containsKey(cacheKey)) {
-        return _indexMetaCache[cacheKey];
+      return await loadFuture;
+    } finally {
+      // Clean up future after completion
+      if (_metaLoadingFutures[loadingKey] == loadFuture) {
+        _metaLoadingFutures.remove(loadingKey);
       }
+    }
+  }
 
-      // Read index metadata from file
+  /// Internal method to perform the actual file load
+  Future<IndexMeta?> _doLoadIndexMeta(
+      String tableName, String indexName) async {
+    try {
+      // Cache miss, load from file
       final metaPath =
           await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
       if (!await _dataStore.storage.existsFile(metaPath)) {
@@ -1475,622 +535,69 @@ class IndexManager {
       final json = jsonDecode(content);
       final meta = IndexMeta.fromJson(json);
 
-      // Estimate metadata size
-      final metaSize = _estimateIndexMetaSize(meta);
-
-      // Check if the metadata cache exceeds the limit
-      final metaCacheLimit =
-          _dataStore.memoryManager?.getIndexMetaCacheSize() ?? 10000;
-      if (_currentIndexMetaCacheSize + metaSize > metaCacheLimit) {
-        // If the limit is exceeded, trigger metadata cache cleaning
-        _cleanupIndexMetaCache();
-      }
-
-      // Update cache
-      _indexMetaCache[cacheKey] = meta;
-      _indexMetaSizeCache[cacheKey] = metaSize;
-      _currentIndexMetaCacheSize += metaSize;
+      // Cache the loaded metadata
+      _indexMetaCache.put([tableName, indexName], meta);
 
       return meta;
     } catch (e) {
       Logger.error('Failed to get index metadata: $e',
-          label: 'IndexManager._getIndexMeta');
+          label: 'IndexManager._doLoadIndexMeta');
       return null;
     }
-  }
-
-  /// Determine if an index should be fully cached
-  bool _shouldFullCacheIndex(
-      String tableName, String indexName, IndexMeta meta) {
-    try {
-      // Always fully cache small indexes
-
-      if (meta.partitions.length < 100) {
-        return true;
-      }
-
-      // Get cache size limit
-      final memoryManager = _dataStore.memoryManager;
-      if (memoryManager == null) {
-        return false; // No memory manager, conservative approach
-      }
-
-      final indexCacheLimit = memoryManager.getIndexCacheSize();
-
-      // Use the accurate current cache size
-      int currentUsage = _currentIndexCacheSize;
-
-      // Estimate size of this index
-      int estimatedIndexSize = meta.totalSizeInBytes;
-
-      // Special handling for important indexes
-      bool isPrimaryKey = indexName == 'pk_$tableName';
-      bool isUniqueIndex = meta.isUnique;
-
-      // If primary key or unique index, check if we're under 90% capacity
-      if ((isPrimaryKey || isUniqueIndex) &&
-          currentUsage + estimatedIndexSize < indexCacheLimit * 0.9) {
-        return true;
-      }
-
-      // If cache is under 80% capacity, allow full caching
-      if (currentUsage + estimatedIndexSize < indexCacheLimit * 0.8) {
-        return true;
-      }
-
-      // Otherwise, don't fully cache
-      return false;
-    } catch (e) {
-      Logger.error('Error determining cache status: $e',
-          label: 'IndexManager._shouldFullCacheIndex');
-      return false; // Conservative approach on error
-    }
-  }
-
-  /// Load a selective index from file (only specific partition)
-  Future<BPlusTree?> _loadSelectiveIndex(
-      String tableName,
-      String indexName,
-      IndexMeta meta,
-      int partitionIndex,
-      MatcherFunction comparator,
-      MatcherType matcherType) async {
-    try {
-      // Get the specific partition
-      final partition = meta.partitions[partitionIndex];
-      final partitionPath = await _dataStore.pathManager
-          .getIndexPartitionPath(tableName, indexName, partition.index);
-
-      if (!await _dataStore.storage.existsFile(partitionPath)) {
-        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
-      }
-
-      final content = await _dataStore.storage.readAsString(partitionPath);
-      if (content == null || content.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
-      }
-
-      // Build the B+ tree from the single partition content in a background isolate.
-      final request = BuildTreeRequest(
-          partitionsContent: [content],
-          isUnique: meta.isUnique,
-          matcherType: matcherType);
-
-      final btree = await ComputeManager.run(
-        buildTreeTask,
-        request,
-        useIsolate: true, // It's a heavy task.
-      );
-
-      return btree;
-    } catch (e) {
-      Logger.error('Failed to load selective index: $e',
-          label: 'IndexManager._loadSelectiveIndex');
-      return null;
-    }
-  }
-
-  /// Check if a table has ordered primary key index
-  /// Used for optimizing range queries
-  Future<bool> isTablePrimaryKeyOrdered(String tableName) async {
-    try {
-      final pkIndexName = 'pk_$tableName';
-      final meta = await _getIndexMeta(tableName, pkIndexName);
-
-      // If metadata exists and isOrdered flag is set
-      if (meta != null) {
-        // Return the value if defined, otherwise default to false
-        return meta.isOrdered ?? false;
-      }
-
-      return false;
-    } catch (e) {
-      Logger.error('Failed to check if primary key is ordered: $e',
-          label: 'IndexManager.isTablePrimaryKeyOrdered');
-      return false;
-    }
-  }
-
-  /// Find partitions that may contain keys in a range
-  /// Returns list of partition indexes
-  Future<List<int>> findPartitionsForKeyRange(
-      String tableName,
-      String indexName,
-      dynamic startKey,
-      dynamic endKey,
-      MatcherFunction comparator) async {
-    try {
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) return [];
-
-      // only use range optimization when index is ordered
-      if (meta.isOrdered == true) {
-        try {
-          // use IndexMeta method to find partitions
-          final partitions =
-              meta.findPartitionsForKeyRange(startKey, endKey, comparator);
-
-          // if found partitions, return result
-          if (partitions.isNotEmpty) {
-            return partitions;
-          }
-
-          // if no partitions found but should have result, maybe order flag is wrong
-          // async detect order, not block current query
-          _detectAndUpdateIndexOrder(tableName, indexName);
-        } catch (e) {
-          Logger.debug(
-              'Range partition finding failed, possibly incorrect order flag: $e',
-              label: 'IndexManager.findPartitionsForKeyRange');
-
-          // async detect order
-          _detectAndUpdateIndexOrder(tableName, indexName);
-        }
-      }
-
-      // if index is not ordered or range query failed, return all partitions
-      return List.generate(meta.partitions.length, (i) => i);
-    } catch (e) {
-      Logger.error('Failed to find partitions for key range: $e',
-          label: 'IndexManager.findPartitionsForKeyRange');
-      return [];
-    }
-  }
-
-  /// Load index entries from specific partitions
-  /// Optimization for range queries - only loads data from relevant partitions
-  Future<BPlusTree?> getPartialIndex(
-      String tableName, String indexName, List<int> partitionIndices) async {
-    try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // If index is fully cached, just return the cached instance
-      if (_indexCache.containsKey(cacheKey) &&
-          _indexFullyCached[cacheKey] == true) {
-        await _updateIndexAccessWeight(cacheKey);
-        return _indexCache[cacheKey];
-      }
-
-      // Get metadata
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) return null;
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) return null;
-      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
-      final comparator = ValueMatcher.getMatcher(matcherType);
-
-      // 1. Read all required partition files in parallel.
-      final tasks = <Future<String?> Function()>[];
-      final partitionMap = {for (var p in meta.partitions) p.index: p};
-
-      for (final partitionIndex in partitionIndices) {
-        final partition = partitionMap[partitionIndex];
-        if (partition == null) continue;
-
-        tasks.add(() async {
-          try {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
-            if (!await _dataStore.storage.existsFile(partitionPath)) {
-              return null;
-            }
-            return await _dataStore.storage.readAsString(partitionPath);
-          } catch (e) {
-            Logger.error(
-                'Failed to read index partition ${partition.index}: $e',
-                label: 'IndexManager.getPartialIndex');
-            return null;
-          }
-        });
-        await Future.delayed(Duration.zero);
-      }
-
-      final partitionContents = await ParallelProcessor.execute<String?>(tasks,
-          label: 'IndexManager.getPartialIndex.read');
-
-      final validContents = partitionContents
-          .whereType<String>()
-          .where((s) => s.isNotEmpty)
-          .toList();
-
-      if (validContents.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
-      }
-
-      // 2. Build the B+ tree from contents in a background isolate.
-      final request = BuildTreeRequest(
-          partitionsContent: validContents,
-          isUnique: meta.isUnique,
-          matcherType: matcherType);
-
-      final btree = await ComputeManager.run(
-        buildTreeTask,
-        request,
-        useIsolate: true, // Heavy task, always use isolate.
-      );
-
-      // If we're loading most partitions, consider caching the tree
-      if (partitionIndices.length > meta.partitions.length * 0.7 &&
-          _shouldFullCacheIndex(tableName, indexName, meta)) {
-        // Worth caching, but not marked as fully cached
-        _indexCache[cacheKey] = btree;
-        _indexFullyCached[cacheKey] = false;
-        await _updateIndexAccessWeight(cacheKey);
-      }
-
-      return btree;
-    } catch (e) {
-      Logger.error('Failed to get partial index: $e',
-          label: 'IndexManager.getPartialIndex');
-      return null;
-    }
-  }
-
-  /// Load index from file
-  Future<BPlusTree?> _loadIndexFromFile(
-      String tableName,
-      String indexName,
-      IndexMeta meta,
-      MatcherFunction comparator,
-      MatcherType matcherType) async {
-    try {
-      // 1. Read all partition files in parallel.
-      final tasks = <Future<String?> Function()>[];
-      for (final partition in meta.partitions) {
-        tasks.add(() async {
-          try {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
-            if (!await _dataStore.storage.existsFile(partitionPath)) {
-              return null;
-            }
-            return await _dataStore.storage.readAsString(partitionPath);
-          } catch (e) {
-            Logger.error(
-                'Failed to read index partition ${partition.index}: $e',
-                label: 'IndexManager._loadIndexFromFile');
-            return null;
-          }
-        });
-        await Future.delayed(Duration.zero);
-      }
-      final partitionContents = await ParallelProcessor.execute<String?>(tasks,
-          label: 'IndexManager._loadIndexFromFile.read');
-
-      final validContents = partitionContents
-          .whereType<String>()
-          .where((s) => s.isNotEmpty)
-          .toList();
-
-      if (validContents.isEmpty) {
-        return BPlusTree(isUnique: meta.isUnique, comparator: comparator);
-      }
-
-      // 2. Build the B+ tree from contents in a background isolate.
-      final request = BuildTreeRequest(
-          partitionsContent: validContents,
-          isUnique: meta.isUnique,
-          matcherType: matcherType);
-
-      final btree = await ComputeManager.run(
-        buildTreeTask,
-        request,
-        useIsolate: true, // Heavy task, always use isolate.
-      );
-
-      return btree;
-    } catch (e) {
-      Logger.error('Failed to load index from file: $e',
-          label: 'IndexManager._loadIndexFromFile');
-      return null;
-    }
-  }
-
-  /// Calculate content checksum
-  String _calculateChecksum(String content) {
-    return DataCompressor().getChecksumStringFromString(content);
   }
 
   /// Unified index metadata update method
   /// @param tableName Table name
   /// @param indexName Index name
-  /// @param updatedMeta Updated metadata, if null, get from memory cache
+  /// @param updatedMeta Updated metadata
   /// @param acquireLock Whether to acquire lock (default is true)
-  /// @param updateCache Whether to update memory cache (default is true)
+  /// @param flush Whether to immediately flush to disk (default is true)
   /// @return Updated index metadata
-  Future<IndexMeta?> _updateIndexMetadata({
+  Future<IndexMeta?> updateIndexMeta({
     required String tableName,
     required String indexName,
     IndexMeta? updatedMeta,
     bool acquireLock = true,
-    bool updateCache = true,
+    bool flush = true,
   }) async {
-    final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-    // If no updated metadata is provided, try to get from cache
-    final meta = updatedMeta ?? _indexMetaCache[cacheKey];
+    final meta = updatedMeta;
     if (meta == null) return null;
 
     // Create lock resource identifier
     final lockResource = 'index_meta:$tableName:$indexName';
-    final operationId = 'update_meta_${DateTime.now().millisecondsSinceEpoch}';
+    final operationId = GlobalIdGenerator.generate('update_meta_');
 
+    bool lockAcquired = false;
     try {
       // Acquire lock (if needed)
       if (acquireLock) {
-        await _dataStore.lockManager
-            ?.acquireExclusiveLock(lockResource, operationId);
+        lockAcquired = await (_dataStore.lockManager
+                ?.acquireExclusiveLock(lockResource, operationId) ??
+            false);
+        if (!lockAcquired) {
+          return null;
+        }
       }
 
       // Update metadata file
       final metaPath =
           await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
       await _dataStore.storage
-          .writeAsString(metaPath, jsonEncode(meta.toJson()));
+          .writeAsString(metaPath, jsonEncode(meta.toJson()), flush: flush);
 
-      // Update cache
-      if (updateCache) {
-        // Get previous metadata size (if exists)
-        final oldSize = _indexMetaSizeCache[cacheKey] ?? 0;
-
-        // Calculate new metadata size
-        final newSize = _estimateIndexMetaSize(meta);
-
-        // Update cache size count
-        if (oldSize > 0) {
-          _currentIndexMetaCacheSize =
-              _currentIndexMetaCacheSize - oldSize + newSize;
-        } else {
-          _currentIndexMetaCacheSize += newSize;
-        }
-
-        // Update cache
-        _indexMetaCache[cacheKey] = meta;
-        _indexMetaSizeCache[cacheKey] = newSize;
-      }
+      // Update cache after successful file write
+      _indexMetaCache.put([tableName, indexName], meta);
 
       return meta;
     } catch (e, stack) {
       Logger.error('Failed to update index metadata: $e\n$stack',
-          label: 'IndexManager._updateIndexMetadata');
+          label: 'IndexManager.updateIndexMeta');
       return null;
     } finally {
       // Release lock (if acquired)
-      if (acquireLock) {
+      if (acquireLock && lockAcquired) {
         _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
       }
-    }
-  }
-
-  /// update index
-  Future<void> updateIndexes(
-    String tableName,
-    Map<String, dynamic> record,
-    StoreIndex pointer,
-  ) async {
-    try {
-      // Get table structure
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      final primaryKey = schema.primaryKey;
-      final primaryValue = record[primaryKey];
-
-      if (primaryValue == null) {
-        Logger.error('Record has no primary key value',
-            label: 'IndexManager.updateIndexes');
-        return;
-      }
-
-      final recordId = pointer.toString();
-
-      // Record processed field indexes to avoid duplicate creation
-      final Set<String> processedFieldIndexes = {};
-
-      // 1. Update primary key index
-      final pkIndexName = 'pk_$tableName';
-      await _addToInsertBuffer(tableName, pkIndexName, primaryValue, recordId);
-      processedFieldIndexes.add(primaryKey);
-
-      // 2. Update normal indexes and unique indexes
-      for (final index in schema.indexes) {
-        final indexName = index.actualIndexName;
-        final isUnique = index.unique;
-
-        // Ensure special handling for unique indexes
-        if (isUnique) {
-          // For unique indexes, possible special handling
-          final meta = await _getIndexMeta(tableName, indexName);
-          if (meta != null && !meta.isUnique) {
-            // If the index is defined as unique but the metadata is not set, update the metadata
-            final updatedMeta = IndexMeta(
-              version: meta.version,
-              name: indexName,
-              tableName: tableName,
-              fields: index.fields,
-              isUnique: true,
-              partitions: meta.partitions,
-              timestamps: meta.timestamps,
-              totalSizeInBytes: meta.totalSizeInBytes,
-              totalEntries: meta.totalEntries,
-            );
-
-            // Update index metadata
-            final metaPath = await _dataStore.pathManager
-                .getIndexMetaPath(tableName, indexName);
-            await _dataStore.storage
-                .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
-
-            // Update cache
-            final cacheKey = _getIndexCacheKey(tableName, indexName);
-            _indexMetaCache[cacheKey] = updatedMeta;
-
-            // If the index is in the cache, ensure the unique flag is correct
-            if (_indexCache.containsKey(cacheKey)) {
-              final index = _indexCache[cacheKey]!;
-              if (!index.isUnique) {
-                // Re-create the index with the unique flag
-                _indexCache[cacheKey] = BPlusTree(
-                    isUnique: true,
-                    comparator: ValueMatcher.getMatcher(
-                        schema.getMatcherTypeForIndex(indexName)));
-              }
-            }
-          }
-        }
-
-        // update index，composite index and single field index
-        final compositeKey = _createIndexKey(record, index.fields);
-        if (compositeKey != null) {
-          await _addToInsertBuffer(
-              tableName, indexName, compositeKey, recordId);
-
-          // Record processed composite index fields
-          for (final field in index.fields) {
-            processedFieldIndexes.add(field);
-          }
-        }
-      }
-
-      // 3. Handle the case where a normal field is set to unique=true but no index is created
-      for (final field in schema.fields) {
-        // Check if the field is set to unique=true
-        if (field.unique) {
-          // Skip if the field has been processed or is the primary key
-          if (processedFieldIndexes.contains(field.name) ||
-              field.name == primaryKey) {
-            continue;
-          }
-
-          // Check if there is an explicit index (for safety)
-          bool hasExplicitIndex = schema.indexes.any((index) =>
-              index.fields.length == 1 && index.fields.first == field.name);
-
-          // If there is no explicit index, create an auto-generated unique index
-          if (!hasExplicitIndex) {
-            final fieldValue = record[field.name];
-            if (fieldValue != null) {
-              // Build unique index name
-              final uniqueIndexName = 'uniq_${field.name}';
-
-              // Automatically create index metadata (if not exists)
-              IndexMeta? meta = await _getIndexMeta(tableName, uniqueIndexName);
-              if (meta == null) {
-                meta = IndexMeta(
-                  version: 1,
-                  name: uniqueIndexName,
-                  tableName: tableName,
-                  fields: [field.name],
-                  isUnique: true,
-                  partitions: [],
-                  timestamps: Timestamps(
-                    created: DateTime.now(),
-                    modified: DateTime.now(),
-                  ),
-                  totalSizeInBytes: 0,
-                  totalEntries: 0,
-                );
-
-                // Write index metadata
-                final metaPath = await _dataStore.pathManager
-                    .getIndexMetaPath(tableName, uniqueIndexName);
-                await _dataStore.storage
-                    .writeAsString(metaPath, jsonEncode(meta.toJson()));
-
-                // Update cache
-                final cacheKey = _getIndexCacheKey(tableName, uniqueIndexName);
-                _indexMetaCache[cacheKey] = meta;
-
-                Logger.debug(
-                  'Auto-created unique index for field ${field.name}: $uniqueIndexName',
-                  label: 'IndexManager.updateIndexes',
-                );
-              }
-
-              // Update unique index
-              await _addToInsertBuffer(
-                  tableName, uniqueIndexName, fieldValue, recordId);
-            }
-          }
-        }
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to update indexes: $e\n$stack',
-          label: 'IndexManager.updateIndexes');
-    }
-  }
-
-  /// Create index key
-  dynamic _createIndexKey(Map<String, dynamic> record, List<String> fields) {
-    if (fields.isEmpty) return null;
-
-    // Single field index
-    if (fields.length == 1) {
-      return record[fields[0]];
-    }
-
-    // Composite index - combine field values
-    final keyParts = <String>[];
-    for (final field in fields) {
-      final value = record[field];
-      if (value == null) return null; // Return null if any field is null
-      keyParts.add(value.toString());
-    }
-
-    return keyParts.join(':');
-  }
-
-  /// force execute all update index
-  Future<void> flushIndexes() async {
-    await _processIndexWriteBuffer();
-  }
-
-  /// create primary index
-  Future<void> createPrimaryIndex(String tableName, String primaryKey) async {
-    try {
-      final indexName = 'pk_$tableName';
-
-      // Check if the index exists
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta != null) {
-        Logger.debug('Primary key index already exists: $indexName',
-            label: 'IndexManager.createPrimaryIndex');
-        return;
-      }
-
-      // Get table schema
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) {
-        return;
-      } else {
-        // Use existing schema to rebuild
-        await _rebuildTableIndexes(tableName, tableSchema, true, []);
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to create primary index: $e\n$stack',
-          label: 'IndexManager.createPrimaryIndex');
-      rethrow;
     }
   }
 
@@ -2100,7 +607,7 @@ class IndexManager {
       final indexName = schema.actualIndexName;
 
       // Check if the index exists
-      final meta = await _getIndexMeta(tableName, indexName);
+      final meta = await getIndexMeta(tableName, indexName);
       if (meta != null) {
         Logger.debug('Index already exists: $indexName',
             label: 'IndexManager.createIndex');
@@ -2108,18 +615,17 @@ class IndexManager {
       }
 
       // Get table structure
-      final tableSchema = await _dataStore.getTableSchema(tableName);
+      final tableSchema =
+          await _dataStore.schemaManager?.getTableSchema(tableName);
       if (tableSchema == null) {
         return;
       }
 
       final primaryKeyName = tableSchema.primaryKey;
       // Check if a redundant primary key index is created
-      if (schema.fields.length == 1 &&
-          schema.fields.first == primaryKeyName &&
-          indexName != 'pk_$tableName') {
+      if (schema.fields.length == 1 && schema.fields.first == primaryKeyName) {
         Logger.warn(
-          'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is automatically indexed as pk_$tableName',
+          'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is already range-partitioned in table data',
           label: 'IndexManager.createIndex',
         );
         return; // Skip creation of redundant primary key index
@@ -2132,7 +638,7 @@ class IndexManager {
 
         // Check if the auto-created unique index exists
         final autoIndexMeta =
-            await _getIndexMeta(tableName, autoUniqueIndexName);
+            await getIndexMeta(tableName, autoUniqueIndexName);
 
         if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
           Logger.warn(
@@ -2146,7 +652,7 @@ class IndexManager {
       }
 
       // Use optimized index building
-      await _rebuildTableIndexes(tableName, tableSchema, false, [schema]);
+      await _rebuildTableIndexes(tableName, tableSchema, [schema]);
 
       if (!SystemTable.isSystemTable(tableName)) {
         Logger.info('Created index for $tableName: $indexName',
@@ -2170,1131 +676,732 @@ class IndexManager {
     }
   }
 
-  /// Delete single record from all indexes
-  /// @param tableName Table name
-  /// @param record Record to delete
-  /// Note: This method requires fetching the StoreIndex associated with the primaryKey
-  Future<void> deleteFromIndexes(
-    String tableName,
-    Map<String, dynamic> record,
-  ) async {
-    try {
-      // Get table structure
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      final primaryKey = schema.primaryKey;
-      final primaryKeyValue = record[primaryKey];
-
-      if (primaryKeyValue == null) {
-        Logger.error('Record has no primary key value',
-            label: 'IndexManager.deleteFromIndexes');
-        return;
-      }
-
-      // Get the StoreIndex by primary key value
-      final storeIndex =
-          await getStoreIndexByPrimaryKey(tableName, primaryKeyValue);
-      if (storeIndex == null) {
-        return;
-      }
-
-      final storeIndexStr = storeIndex.toString();
-
-      // 1. Delete from primary key index
-      final pkIndexName = 'pk_$tableName';
-      await addToDeleteBuffer(
-          tableName, pkIndexName, primaryKeyValue, storeIndexStr);
-
-      // 2. Delete from normal indexes and unique indexes
-      for (final index in schema.indexes) {
-        final indexName = index.actualIndexName;
-
-        if (index.fields.length == 1) {
-          // Single field index
-          final fieldName = index.fields[0];
-          final fieldValue = record[fieldName];
-
-          if (fieldValue != null) {
-            await addToDeleteBuffer(
-                tableName, indexName, fieldValue, storeIndexStr);
-          }
-        } else {
-          // Composite index
-          final compositeKey = _createIndexKey(record, index.fields);
-          if (compositeKey != null) {
-            await addToDeleteBuffer(
-                tableName, indexName, compositeKey, storeIndexStr);
-          }
-        }
-      }
-
-      // 3. Handle special case for unique fields
-      for (final field in schema.fields) {
-        // Check if the field is set to unique=true
-        if (field.unique) {
-          // Check if the field already has a dedicated index
-          bool hasExplicitIndex = schema.indexes.any((index) =>
-              index.fields.length == 1 && index.fields.first == field.name);
-
-          // If there is no explicit index, we need to remove from the auto-created unique index
-          if (!hasExplicitIndex && field.name != primaryKey) {
-            final fieldValue = record[field.name];
-            if (fieldValue != null) {
-              // Build unique index name
-              final uniqueIndexName = 'uniq_${field.name}';
-              await addToDeleteBuffer(
-                  tableName, uniqueIndexName, fieldValue, storeIndexStr);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      Logger.error('Failed to delete record from indexes: $e',
-          label: 'IndexManager.deleteFromIndexes');
-    }
-  }
-
   /// reset all indexes
   Future<void> resetIndexes(String tableName) async {
     try {
       // Get table structure
-      final schema = await _dataStore.getTableSchema(tableName);
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         return;
       }
 
       // Clear index data
-      final indexesToReset = <String>[];
-
-      // 1. Add primary key index
-      indexesToReset.add('pk_$tableName');
-
-      // 2. Add other indexes
-      for (final index in schema.indexes) {
-        indexesToReset.add(index.actualIndexName);
-      }
-
-      for (final field in schema.fields) {
-        // Check unique field auto-created indexes
-        if (field.unique) {
-          final uniqueIndexName = 'uniq_${field.name}';
-          if (!indexesToReset.contains(uniqueIndexName)) {
-            indexesToReset.add(uniqueIndexName);
-          }
-        }
-      }
+      final indexesToReset =
+          schema.getAllIndexes().map((i) => i.actualIndexName).toList();
 
       // Clear index data from memory and files
+      final yieldController = YieldController('IndexManager.resetIndexes');
       for (final indexName in indexesToReset) {
-        // Clear write buffer
-        final cacheKey = _getIndexCacheKey(tableName, indexName);
-        _writeBuffer.remove(cacheKey);
-        _indexCache.remove(cacheKey);
-        _indexFullyCached.remove(cacheKey);
-        _deleteBuffer.remove(cacheKey);
+        // Remove from cache
+        _indexMetaCache.remove([tableName, indexName]);
+        _indexDataCache.remove([tableName, indexName]);
 
-        // Delete index file
-        final meta = await _getIndexMeta(tableName, indexName);
-        if (meta != null) {
-          int partitionCount = 0;
-          for (final partition in meta.partitions.toList()) {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partition.index);
-            await _dataStore.storage.deleteFile(partitionPath);
-
-            partitionCount++;
-            // Add a small delay every 10 partitions to avoid blocking the UI thread
-            if (partitionCount % 10 == 0) {
-              await Future.delayed(Duration.zero);
-            }
+        // v2+ layout: delete entire index directory (fast & deterministic).
+        await yieldController.maybeYield();
+        try {
+          final indexPath =
+              await _dataStore.pathManager.getIndexPath(tableName, indexName);
+          if (await _dataStore.storage.existsDirectory(indexPath)) {
+            await _dataStore.storage.deleteDirectory(indexPath);
           }
-
-          // Update index metadata
-          final updatedMeta = meta.copyWith(
-            partitions: [],
-            timestamps: Timestamps(
-              created: meta.timestamps.created,
-              modified: DateTime.now(),
-            ),
-            totalSizeInBytes: 0,
-            totalEntries: 0,
-          );
-
-          // Write updated index metadata
-          final metaPath = await _dataStore.pathManager
-              .getIndexMetaPath(tableName, indexName);
-          await _dataStore.storage
-              .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
-
-          // Update cache
-          _indexMetaCache[cacheKey] = updatedMeta;
+        } catch (e) {
+          Logger.warn('Failed to delete index directory for $indexName: $e',
+              label: 'IndexManager.resetIndexes');
         }
       }
 
       // Collect all indexes to rebuild
-      final indexesToBuild = <IndexSchema>[];
-
-      // Add all normal indexes
-      indexesToBuild.addAll(schema.indexes);
-
-      // Add unique field indexes if they don't have an explicit index
-      for (final field in schema.fields) {
-        if (field.unique && field.name != schema.primaryKey) {
-          bool hasExplicitIndex = schema.indexes.any((idx) =>
-              idx.fields.length == 1 && idx.fields.first == field.name);
-
-          if (!hasExplicitIndex) {
-            indexesToBuild.add(IndexSchema(
-              fields: [field.name],
-              unique: true,
-            ));
-          }
-        }
-      }
+      final indexesToBuild = schema.getAllIndexes();
 
       // Use optimized batch index building mechanism
-      await _rebuildTableIndexes(tableName, schema, true, indexesToBuild);
+      await _rebuildTableIndexes(tableName, schema, indexesToBuild);
 
       Logger.debug('Reset table indexes completed: $tableName',
           label: 'IndexManager.resetIndexes');
     } catch (e) {
-      Logger.error('Failed to reset table indexes: $e',
+      Logger.error('Failed to reset indexes: $e',
           label: 'IndexManager.resetIndexes');
       rethrow;
     }
   }
 
-  /// batch update indexes
-  Future<void> batchUpdateIndexes(
-    String tableName,
-    List<Map<String, dynamic>> records,
-  ) async {
-    try {
-      // Get table structure
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      final primaryKey = schema.primaryKey;
-
-      // Collect all indexes to be updated
-      final indexUpdates = <String, Map<dynamic, Set<dynamic>>>{};
-
-      // Initialize primary key index
-      final pkIndexName = 'pk_$tableName';
-      indexUpdates[pkIndexName] = {};
-
-      // Initialize other indexes
-      for (final index in schema.indexes) {
-        indexUpdates[index.actualIndexName] = {};
-      }
-
-      // Process each record
-      int processedCount = 0;
-      for (final record in records) {
-        final primaryValue = record[primaryKey];
-        if (primaryValue == null) continue;
-
-        // Get record pointer
-        final storeIndex =
-            await getStoreIndexByPrimaryKey(tableName, primaryValue);
-        if (storeIndex == null) continue;
-
-        final recordId = storeIndex.toString();
-
-        // Update primary key index
-        if (!indexUpdates[pkIndexName]!.containsKey(primaryValue)) {
-          indexUpdates[pkIndexName]![primaryValue] = {};
-        }
-        indexUpdates[pkIndexName]![primaryValue]!.add(recordId);
-
-        // Update other indexes
-        for (final index in schema.indexes) {
-          final indexName = index.actualIndexName;
-
-          if (index.fields.length == 1) {
-            // Single field index
-            final fieldName = index.fields[0];
-            final fieldValue = record[fieldName];
-
-            if (fieldValue != null) {
-              if (!indexUpdates[indexName]!.containsKey(fieldValue)) {
-                indexUpdates[indexName]![fieldValue] = {};
-              }
-              indexUpdates[indexName]![fieldValue]!.add(recordId);
-            }
-          } else {
-            // Composite index
-            final compositeKey = _createIndexKey(record, index.fields);
-            if (compositeKey != null) {
-              if (!indexUpdates[indexName]!.containsKey(compositeKey)) {
-                indexUpdates[indexName]![compositeKey] = {};
-              }
-              indexUpdates[indexName]![compositeKey]!.add(recordId);
-            }
-          }
-        }
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // Batch update write buffer
-      processedCount = 0;
-      for (final entry in indexUpdates.entries) {
-        final indexName = entry.key;
-        final updates = entry.value;
-
-        if (updates.isEmpty) continue;
-
-        final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-        // Initialize write buffer
-        if (!_writeBuffer.containsKey(cacheKey)) {
-          _writeBuffer[cacheKey] = <String, IndexBufferEntry>{};
-        }
-
-        // Merge updates
-        for (final keyEntry in updates.entries) {
-          final indexKey = keyEntry.key;
-          final recordIds = keyEntry.value;
-
-          for (final recordId in recordIds) {
-            final storeIndex = StoreIndex.fromString(recordId);
-            if (storeIndex == null) {
-              Logger.error('Invalid StoreIndex format: $recordId',
-                  label: 'IndexManager.batchUpdateIndexes');
-              continue;
-            }
-
-            // Generate unique key for buffer entry
-            final entryUniqueKey =
-                IndexBufferEntry.createUniqueKey(indexKey, recordId);
-
-            // Create IndexBufferEntry for insertion
-            final bufferEntry = IndexBufferEntry.forInsert(
-              indexKey: indexKey,
-              recordPointer: storeIndex,
-              timestamp: DateTime.now(),
-            );
-
-            // Add to buffer
-            _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
-            processedCount++;
-            if (processedCount % 50 == 0) {
-              await Future.delayed(Duration.zero);
-            }
-          }
-        }
-        _indexLastWriteTime[cacheKey] = DateTime.now();
-
-        // Update memory cache
-        if (_indexCache.containsKey(cacheKey)) {
-          final btree = _indexCache[cacheKey]!;
-
-          int insertProcessedCount = 0;
-          for (final keyEntry in updates.entries) {
-            final key = keyEntry.key;
-            final values = keyEntry.value;
-
-            for (final value in values) {
-              await btree.insert(key, value);
-              insertProcessedCount++;
-              if (insertProcessedCount % 50 == 0) {
-                await Future.delayed(Duration.zero);
-              }
-            }
-          }
-        }
-      }
-
-      Logger.debug(
-          'Batch update indexes completed: $tableName, ${records.length} records',
-          label: 'IndexManager.batchUpdateIndexes');
-    } catch (e) {
-      Logger.error('Failed to batch update indexes: $e',
-          label: 'IndexManager.batchUpdateIndexes');
-    }
-  }
-
   /// Check unique constraints
-  Future<bool> checkUniqueConstraints(
+  /// Returns UniqueViolation if a conflict is found, null otherwise
+  Future<UniqueViolation?> checkUniqueConstraints(
       String tableName, Map<String, dynamic> data,
-      {bool isUpdate = false}) async {
+      {bool isUpdate = false,
+      String? txId,
+      TableSchema? schemaOverride}) async {
     try {
-      final schema = await _dataStore.getTableSchema(tableName);
+      final schema = schemaOverride ??
+          await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        return false;
+        return null;
       }
 
       final primaryKey = schema.primaryKey;
       final primaryValue = data[primaryKey];
 
-      String? selfStoreIndexStr;
-      if (isUpdate && primaryValue != null) {
-        final selfStoreIndex =
-            await getStoreIndexByPrimaryKey(tableName, primaryValue);
-        selfStoreIndexStr = selfStoreIndex?.toString();
+      // Prepare write buffer overlay for fast-path uniqueness in current batch
+      final writeBuf = _dataStore.writeBufferManager;
+      final String? currentTxId =
+          txId ?? TransactionContext.getCurrentTransactionId();
+
+      dynamic valueForFields(List<String> fields) {
+        if (fields.isEmpty) return null;
+        if (fields.length == 1) return data[fields.first];
+        final values = <dynamic>[];
+        for (final f in fields) {
+          final v = data[f];
+          if (v == null) return null;
+          values.add(v);
+        }
+        return values;
       }
 
       // 1. Consolidate all unique constraints to check.
       final constraints = <_UniqueConstraint>[];
 
-      // Add primary key constraint (only for inserts)
+      // Primary key uniqueness (only for inserts).
+      // New architecture: no standalone pk index; validate via table range partition directly.
       if (!isUpdate && primaryValue != null) {
-        constraints.add(_UniqueConstraint(
+        final pkStr = primaryValue.toString();
+        // 0) Fast-path: check pending in-memory reservations (buffer overlay)
+        try {
+          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
+            tableName,
+            'pk',
+            pkStr,
+            pkStr, // Self ID is the PK itself
+            transactionId: currentTxId,
+          );
+          if (conflict) {
+            Logger.warn(
+              "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
+              label: 'IndexManager.checkUniqueConstraints',
+            );
+            return UniqueViolation(
+              tableName: tableName,
+              fields: [primaryKey],
+              value: primaryValue,
+              indexName: 'pk',
+            );
+          }
+        } catch (_) {}
+
+        // 1) Persisted check: use tree-partitioned table data.
+        try {
+          final exists = await _dataStore.tableTreePartitionManager
+              .existsPrimaryKey(tableName, pkStr);
+          if (exists) {
+            Logger.warn(
+              "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
+              label: 'IndexManager.checkUniqueConstraints',
+            );
+            return UniqueViolation(
+              tableName: tableName,
+              fields: [primaryKey],
+              value: primaryValue,
+              indexName: 'pk',
+            );
+          }
+        } catch (e) {
+          Logger.warn(
+            'Primary key unique check failed for pk=$pkStr, error: $e',
+            label: 'IndexManager.checkUniqueConstraints',
+          );
+          // Still treat as violation for safety, but with error info
+          return UniqueViolation(
+            tableName: tableName,
             fields: [primaryKey],
             value: primaryValue,
-            indexName: 'pk_$tableName'));
+            indexName: 'pk',
+          );
+        }
       }
 
       // Add all unique indexes from schema (single and composite)
-      for (final index in schema.indexes) {
-        if (index.unique) {
-          final value = _createIndexKey(data, index.fields);
-          if (value != null) {
-            constraints.add(_UniqueConstraint(
-                fields: index.fields,
-                value: value,
-                indexName: index.actualIndexName));
-          }
-        }
+      for (final index in schema.getAllIndexes()) {
+        if (!index.unique) continue;
+        final v = valueForFields(index.fields);
+        if (v == null) continue;
+
+        // Increment index weight for uniqueness check
+        _dataStore.weightManager?.incrementAccess(
+          WeightType.indexData,
+          '$tableName:${index.actualIndexName}',
+          spaceName: _dataStore.currentSpaceName,
+        );
+
+        constraints.add(_UniqueConstraint(
+          fields: index.fields,
+          value: v,
+          indexName: index.actualIndexName,
+          canonicalKey: schema.createCanonicalIndexKey(index.fields, data),
+        ));
       }
 
-      // Add unique fields that don't have an explicit index
-      final indexedFields = schema.indexes
-          .where((i) => i.fields.length == 1 && i.unique)
-          .map((i) => i.fields.first)
-          .toSet();
-      for (final field in schema.fields) {
-        if (field.unique &&
-            field.name != primaryKey &&
-            !indexedFields.contains(field.name)) {
-          final value = data[field.name];
-          if (value != null) {
-            constraints.add(_UniqueConstraint(
-                fields: [field.name],
-                value: value,
-                indexName: 'uniq_${field.name}'));
-          }
-        }
+      if (constraints.isEmpty) {
+        return null;
       }
 
-      // 2. Iterate and check each constraint.
-      for (final constraint in constraints) {
+      String? selfStoreIndexStr;
+      if (isUpdate && primaryValue != null) {
+        selfStoreIndexStr = primaryValue.toString();
+      }
+
+      // Helper to check buffer for conflicts
+      UniqueViolation? checkInBuffer(_UniqueConstraint constraint,
+          {bool transactionOnly = false}) {
         try {
-          // A. Check the index.
-          final searchResult = await searchIndex(tableName,
-              constraint.indexName, IndexCondition.equals(constraint.value));
-
-          if (searchResult.requiresTableScan) {
-            // B. Index not available, fall back to a direct query via QueryExecutor.
-            // Handle both single and composite keys.
-            final queryCondition = QueryCondition();
-            for (final field in constraint.fields) {
-              queryCondition.where(field, '=', data[field]);
-            }
-
-            final existingRecords = await _dataStore.executeQuery(
-                tableName, queryCondition,
-                limit: 2); // Limit 2 is enough to detect a collision
-
-            if (existingRecords.isNotEmpty) {
-              bool isCollision = false;
-              if (!isUpdate) {
-                // On insert, any result is a violation.
-                isCollision = true;
-              } else {
-                // On update, it's a violation if we find a record that is not the one being updated.
-                if (existingRecords
-                    .any((rec) => rec[primaryKey] != primaryValue)) {
-                  isCollision = true;
-                }
-              }
-
-              if (isCollision) {
-                Logger.warn(
-                    'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (table scan).',
-                    label: 'IndexManager.checkUniqueConstraints');
-                return false;
-              }
-            }
-          } else if (!searchResult.isEmpty) {
-            // C. Index found potential duplicates.
-            final allPointers =
-                searchResult.pointersByPartition.values.expand((p) => p);
-
-            bool isCollision = false;
-            if (!isUpdate) {
-              isCollision = true; // Any found pointer is a collision on insert.
+          final compositeKey = constraint.canonicalKey;
+          if (compositeKey != null) {
+            final selfId = primaryValue?.toString();
+            final bool conflict;
+            if (transactionOnly) {
+              conflict = writeBuf.hasUniqueKeyOwnedByOtherTransaction(
+                tableName,
+                constraint.indexName,
+                compositeKey,
+                selfId,
+                transactionId: currentTxId,
+              );
             } else {
-              // On update, it's a collision if the found pointer is not the record itself.
-              if (selfStoreIndexStr != null) {
-                if (allPointers.any((p) => p != selfStoreIndexStr)) {
-                  isCollision = true;
-                }
-              } else if (allPointers.isNotEmpty) {
-                // Cannot identify self, so any found pointer is a potential collision.
-                isCollision = true;
-              }
+              conflict = writeBuf.hasUniqueKeyOwnedByOther(
+                tableName,
+                constraint.indexName,
+                compositeKey,
+                selfId,
+                transactionId: currentTxId,
+              );
             }
-
-            if (isCollision) {
+            if (conflict) {
               Logger.warn(
-                  'Unique constraint violation on ${constraint.fields.join(', ')} with value "${constraint.value}" (index hit).',
+                  "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (buffer/reservation)",
                   label: 'IndexManager.checkUniqueConstraints');
-              return false;
+              return UniqueViolation(
+                tableName: tableName,
+                fields: constraint.fields,
+                value: constraint.value,
+                indexName: constraint.indexName,
+              );
             }
           }
-        } catch (e, stack) {
-          Logger.error('Failed to check unique constraints: $e\n$stack',
-              label: 'IndexManager.checkUniqueConstraints');
-          return false; // Fail safe.
+        } catch (_) {}
+        return null;
+      }
+
+      // 2. Separate checks into fast-path (in-memory/buffer) and slow-path (disk/index).
+      final constraintsToCheckOnDisk = <_UniqueConstraint>[];
+
+      for (final constraint in constraints) {
+        bool fastPathPassed = false;
+        try {
+          // 0.1 Full Index Cache Check (InMemory)
+          final indexName = constraint.indexName;
+
+          // Check if prefix is fully cached
+          if (_indexDataCache.isFullyCached([tableName, indexName])) {
+            try {
+              final rawVal = constraint.value;
+              final int fieldCount = constraint.fields.length;
+
+              final List<dynamic> vals;
+              if (fieldCount <= 1) {
+                vals = <dynamic>[rawVal];
+              } else if (rawVal is List && rawVal.length == fieldCount) {
+                vals = rawVal;
+              } else {
+                // Defensive fallback (should not happen with canonical key generation).
+                vals = <dynamic>[rawVal];
+              }
+
+              // OPTIMIZATION:
+              // - For fully cached unique indexes, bypass MemComparable encoding
+              // - For INSERT, use containsKey() (fastest bool path)
+              // - For UPDATE, use peek() (no stats update)
+              final compositeKey = [tableName, indexName, ...vals];
+
+              if (!isUpdate) {
+                if (_indexDataCache.containsKey(compositeKey)) {
+                  Logger.warn(
+                      "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (in-memory cache)",
+                      label: 'IndexManager.checkUniqueConstraints');
+                  return UniqueViolation(
+                    tableName: tableName,
+                    fields: constraint.fields,
+                    value: constraint.value,
+                    indexName: constraint.indexName,
+                  );
+                }
+                // Fully cached and key not found.
+                // Only check transaction conflicts if there's an active transaction.
+                // If no transaction, skip buffer check (full cache already validated committed data).
+                if (currentTxId != null) {
+                  final violation =
+                      checkInBuffer(constraint, transactionOnly: true);
+                  if (violation != null) return violation;
+                }
+                fastPathPassed = true;
+              } else {
+                final dynamic existing =
+                    _indexDataCache.get(compositeKey, updateStats: false);
+                if (existing != null) {
+                  final bool isCollision = (existing is! String) ||
+                      selfStoreIndexStr == null ||
+                      existing != selfStoreIndexStr;
+
+                  if (isCollision) {
+                    Logger.warn(
+                        "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (in-memory cache)",
+                        label: 'IndexManager.checkUniqueConstraints');
+                    return UniqueViolation(
+                      tableName: tableName,
+                      fields: constraint.fields,
+                      value: constraint.value,
+                      indexName: constraint.indexName,
+                    );
+                  }
+                  // Hit but no collision -> same record.
+                  fastPathPassed = true;
+                } else {
+                  // Fully cached and key not found.
+                  // Only check transaction conflicts if there's an active transaction.
+                  // If no transaction, skip buffer check (full cache already validated committed data).
+                  if (currentTxId != null) {
+                    final violation =
+                        checkInBuffer(constraint, transactionOnly: true);
+                    if (violation != null) return violation;
+                  }
+                  // Safe: not in cache (committed) and not in transaction (if any)
+                  fastPathPassed = true;
+                }
+              }
+            } catch (e) {
+              // Fallback
+            }
+          }
+
+          if (!fastPathPassed) {
+            // 0. Fast-path: check pending in-memory unique keys first
+            final violation = checkInBuffer(constraint);
+            if (violation != null) return violation;
+
+            // If passed fast path, queue for disk check
+            constraintsToCheckOnDisk.add(constraint);
+          }
+        } catch (e) {
+          Logger.error('Unique check setup failed: $e');
         }
       }
 
-      return true; // All checks passed.
+      if (constraintsToCheckOnDisk.isEmpty) return null;
+
+      // 3. Execute disk checks using existsUniqueKeysBatch (fast BinaryFuseFilter + grouped I/O)
+      try {
+        // Group constraints by index name for batch processing
+        final constraintsByIndex = <String, List<_UniqueConstraint>>{};
+        for (final constraint in constraintsToCheckOnDisk) {
+          constraintsByIndex
+              .putIfAbsent(constraint.indexName, () => [])
+              .add(constraint);
+        }
+
+        // Check each index group
+        for (final entry in constraintsByIndex.entries) {
+          final indexName = entry.key;
+          final indexConstraints = entry.value;
+
+          // Get index metadata
+          final meta = await getIndexMeta(tableName, indexName);
+          if (meta == null || meta.totalEntries <= 0) {
+            // Fallback: index not available, skip (conservative: no violation)
+            continue;
+          }
+
+          // Encode all constraint values to MemComparable keys
+          final keyBytes = <Uint8List>[];
+          final constraintIndices = <int>[];
+          for (int i = 0; i < indexConstraints.length; i++) {
+            final constraint = indexConstraints[i];
+            final comps = <Uint8List>[];
+            bool ok = true;
+            for (final f in constraint.fields) {
+              final v = constraint.value;
+              dynamic fieldVal;
+              if (constraint.fields.length == 1) {
+                fieldVal = v;
+              } else if (v is List && v.length == constraint.fields.length) {
+                fieldVal = v[constraint.fields.indexOf(f)];
+              } else {
+                ok = false;
+                break;
+              }
+              final c = schema.encodeFieldComponentToMemComparable(
+                f,
+                fieldVal,
+                truncateText: false,
+              );
+              if (c == null) {
+                ok = false;
+                break;
+              }
+              comps.add(c);
+            }
+            if (ok && comps.isNotEmpty) {
+              keyBytes.add(MemComparableKey.encodeTuple(comps));
+              constraintIndices.add(i);
+            }
+          }
+
+          if (keyBytes.isEmpty) continue;
+
+          // Batch check existence using BinaryFuseFilter + grouped I/O
+          final exists =
+              await _dataStore.indexTreePartitionManager.existsUniqueKeysBatch(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            uniqueKeys: keyBytes,
+          );
+
+          // Check results
+          for (int j = 0; j < exists.length; j++) {
+            if (!exists[j]) continue;
+            final constraintIdx = constraintIndices[j];
+            if (constraintIdx < 0 || constraintIdx >= indexConstraints.length)
+              continue;
+            final constraint = indexConstraints[constraintIdx];
+
+            // For updates, we need to verify it's not the same record
+            if (isUpdate && selfStoreIndexStr != null) {
+              // Use lookupUniquePrimaryKey to get the actual PK owning this unique key.
+              // If the PK matches the current record's PK, it's not a violation (self-update).
+              try {
+                final existingPk = await _dataStore.indexTreePartitionManager
+                    .lookupUniquePrimaryKey(
+                  tableName: tableName,
+                  indexName: indexName,
+                  meta: meta,
+                  uniqueKey: keyBytes[j],
+                );
+                if (existingPk != null && existingPk == selfStoreIndexStr) {
+                  // Same record, not a violation - skip this constraint
+                  continue;
+                }
+              } catch (e) {
+                Logger.warn(
+                  'Failed to lookup unique PK for update check: $e',
+                  label: 'IndexManager.checkUniqueConstraints',
+                );
+                // On error, conservatively treat as violation
+              }
+            }
+
+            Logger.warn(
+                "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (disk check)",
+                label: 'IndexManager.checkUniqueConstraints');
+            return UniqueViolation(
+              tableName: tableName,
+              fields: constraint.fields,
+              value: constraint.value,
+              indexName: constraint.indexName,
+            );
+          }
+        }
+      } catch (e) {
+        Logger.error('Batch unique constraint disk check failed: $e',
+            label: 'IndexManager.checkUniqueConstraints');
+        rethrow;
+      }
+
+      return null; // No violations found
     } catch (e, stack) {
       Logger.error('Failed to check unique constraints: $e\n$stack',
           label: 'IndexManager.checkUniqueConstraints');
-      return false; // Fail safe.
-    }
-  }
-
-  /// handle Space path changed
-  Future<void> onSpacePathChanged() async {
-    // clear index cache
-    _indexCache.clear();
-    _indexMetaCache.clear();
-    _indexFullyCached.clear();
-    _indexAccessWeights.clear();
-
-    // handle write buffer, only keep global table index
-    final keysToCheck = <String>[..._writeBuffer.keys];
-    final globalKeysToKeep = <String>[];
-
-    int processedCount = 0;
-    // check each index key, determine which is global table
-    for (final key in keysToCheck.toList()) {
-      try {
-        // extract table name from index key (format: tableName:indexName or tableName_indexName)
-        final parts = key.split(':');
-        final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
-
-        // check if table is global table
-        if (await _dataStore.schemaManager?.isTableGlobal(tableName) == true) {
-          globalKeysToKeep.add(key);
-        }
-      } catch (e) {
-        Logger.error('Error checking if index is global: $e',
-            label: 'IndexManager.onSpacePathChanged');
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    // only keep global table write buffer
-    _writeBuffer.removeWhere((key, _) => !globalKeysToKeep.contains(key));
-
-    // same as above, handle delete buffer
-    final deleteKeysToCheck = <String>[..._deleteBuffer.keys];
-    final globalDeleteKeysToKeep = <String>[];
-
-    processedCount = 0;
-    for (final key in deleteKeysToCheck.toList()) {
-      try {
-        final parts = key.split(':');
-        final tableName = parts.length > 1 ? parts[0] : key.split('_')[0];
-        if (await _dataStore.schemaManager?.isTableGlobal(tableName) == true) {
-          globalDeleteKeysToKeep.add(key);
-        }
-      } catch (e) {
-        Logger.error('Error checking if delete index is global: $e',
-            label: 'IndexManager.onSpacePathChanged');
-      }
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
-
-    _deleteBuffer
-        .removeWhere((key, _) => !globalDeleteKeysToKeep.contains(key));
-
-    // clear other related caches
-    _indexWriting.removeWhere((key, _) => !globalKeysToKeep.contains(key));
-    _indexLastWriteTime
-        .removeWhere((key, _) => !globalKeysToKeep.contains(key));
-  }
-
-  /// get total size of all indexes
-  Future<int> getTotalIndexSize() async {
-    int totalSize = 0;
-
-    try {
-      // Get index size from cached metadata
-      int processedCount = 0;
-      for (final meta in _indexMetaCache.values.toList()) {
-        for (final partition in meta.partitions.toList()) {
-          totalSize += partition.fileSizeInBytes;
-        }
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // If cache is empty, scan from file system
-      if (totalSize == 0) {
-        final schemaList =
-            await _dataStore.schemaManager?.getAllTableSchemas() ?? [];
-
-        processedCount = 0;
-        for (final schemaData in schemaList.toList()) {
-          try {
-            final schema = Map<String, dynamic>.from(schemaData);
-            final tableName = schema['name'] as String?;
-
-            if (tableName != null) {
-              final indexDirPath =
-                  await _dataStore.pathManager.getIndexDirPath(tableName);
-
-              if (await _dataStore.storage.existsDirectory(indexDirPath)) {
-                final files =
-                    await _dataStore.storage.listDirectory(indexDirPath);
-
-                int fileCount = 0;
-                for (final filePath in files) {
-                  if (filePath.endsWith('.${FileType.idx.ext}')) {
-                    final size = await _dataStore.storage.getFileSize(filePath);
-                    totalSize += size;
-                  }
-                  fileCount++;
-                  if (fileCount % 100 == 0) {
-                    await Future.delayed(Duration.zero);
-                  }
-                }
-              }
-            }
-          } catch (e) {
-            // Skip invalid schema
-            Logger.error('Failed to process table schema: $e',
-                label: 'IndexManager.getTotalIndexSize');
-          }
-          processedCount++;
-          if (processedCount % 10 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-      }
-
-      return totalSize;
-    } catch (e) {
-      Logger.error('Failed to get total index size: $e',
-          label: 'IndexManager.getTotalIndexSize');
-      return 0;
-    }
-  }
-
-  /// Invalidate index cache
-  void invalidateCache(String tableName, String indexName) {
-    final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-    // Remove index cache
-    _indexCache.remove(cacheKey);
-    _indexFullyCached.remove(cacheKey);
-
-    // Update index metadata cache size
-    final metaSize = _indexMetaSizeCache[cacheKey] ?? 0;
-    if (metaSize > 0) {
-      _currentIndexMetaCacheSize -= metaSize;
-      _indexMetaSizeCache.remove(cacheKey);
-    }
-
-    // Remove index metadata cache
-    _indexMetaCache.remove(cacheKey);
-
-    Logger.debug('Index cache invalidated: $tableName.$indexName',
-        label: 'IndexManager.invalidateCache');
-  }
-
-  /// Get record storage index by primary key
-  Future<StoreIndex?> getStoreIndexByPrimaryKey(
-    String tableName,
-    dynamic primaryKeyValue,
-  ) async {
-    try {
-      final pkIndexName = 'pk_$tableName';
-      final searchResult = await searchIndex(
-          tableName, pkIndexName, IndexCondition.equals(primaryKeyValue));
-
-      if (searchResult.isEmpty || searchResult.requiresTableScan) return null;
-
-      final allPointers =
-          searchResult.pointersByPartition.values.expand((p) => p).toList();
-      if (allPointers.isEmpty) return null;
-
-      return StoreIndex.fromString(allPointers.first.toString());
-    } catch (e) {
-      Logger.error(
-        'Failed to get record storage index by primary key: $e',
-        label: 'IndexManager.getStoreIndexByPrimaryKey',
+      return UniqueViolation(
+        tableName: tableName,
+        fields: const [],
+        value: null,
       );
-      return null;
     }
   }
 
-  /// Process index partitions one by one with callback
-  /// @param tableName Table name
-  /// @param indexName Index name
-  /// @param processor Function to process each partition, returns true to continue processing, false to stop processing more partitions
-  /// @param updateMetadata Whether to update metadata after processing
-  Future<bool> processIndexPartitions(
+  /// Batch unique check for INSERTs.
+  ///
+  /// - Always validates in-memory buffer/transaction conflicts for transactional safety.
+  /// - Uses **full unique index cache** when `_indexDataCache.isFullyCached(...)` is true.
+  ///   When fully cached, only checks transaction conflicts (if any), skipping buffer checks.
+  /// - For non-fully-cached unique indexes, uses **BinaryFuseFilter + grouped point lookups** via
+  ///   `indexTreePartitionManager.existsUniqueKeysBatch` (no `searchIndex`, no PK decoding).
+  /// - For custom primary keys (PrimaryKeyType.none), uses `TableRangePartitionManager.existingPrimaryKeysBatch`.
+  ///
+  /// Returns a list aligned with [records], where each entry is either null (no violation)
+  /// or a [UniqueViolation] describing the first detected conflict for that record.
+  Future<List<UniqueViolation?>> checkUniqueConstraintsBatchForInsert(
     String tableName,
-    String indexName, {
-    required Future<bool> Function(
-            String partitionPath, IndexPartitionMeta meta, BPlusTree btree)
-        processor,
-    required MatcherFunction comparator,
-    bool updateMetadata = true,
+    List<Map<String, dynamic>> records, {
+    TableSchema? schemaOverride,
+    String? transactionId,
   }) async {
-    try {
-      // Get index metadata
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) {
-        Logger.error('Index metadata not found: $tableName.$indexName',
-            label: 'IndexManager.processIndexPartitions');
-        return false;
+    if (records.isEmpty) return const <UniqueViolation?>[];
+
+    final yieldController =
+        YieldController('IndexManager.checkUniqueConstraintsBatchForInsert');
+
+    final schema = schemaOverride ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return List<UniqueViolation?>.filled(records.length, null,
+          growable: false);
+    }
+
+    final primaryKey = schema.primaryKey;
+    final String? txId =
+        transactionId ?? TransactionContext.getCurrentTransactionId();
+    final writeBuf = _dataStore.writeBufferManager;
+    final violations =
+        List<UniqueViolation?>.filled(records.length, null, growable: false);
+
+    // 1) Primary key uniqueness (only for custom PK inserts).
+    if (schema.primaryKeyConfig.type == PrimaryKeyType.none) {
+      final pkList = <String>[];
+      for (int i = 0; i < records.length; i++) {
+        final r = records[i];
+        await yieldController.maybeYield();
+        final pk = r[primaryKey]?.toString();
+        if (pk != null && pk.isNotEmpty) {
+          pkList.add(pk);
+          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
+            tableName,
+            'pk',
+            pk,
+            pk,
+            transactionId: txId,
+          );
+          if (conflict) {
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: [primaryKey],
+              value: pk,
+              indexName: 'pk',
+            );
+          }
+        }
       }
 
-      // If no partitions, nothing to process
-      if (meta.partitions.isEmpty) {
-        return true;
-      }
-
-      // Track modified partitions for metadata update
-      final modifiedPartitions = <IndexPartitionMeta>[];
-      bool anyPartitionProcessed = false;
-
-      // Process each partition one by one
-      int processedCount = 0;
-      for (final partition in meta.partitions) {
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-        final partitionPath = await _dataStore.pathManager
-            .getIndexPartitionPath(tableName, indexName, partition.index);
-
-        if (!await _dataStore.storage.existsFile(partitionPath)) {
-          Logger.warn('Partition file does not exist: $partitionPath',
-              label: 'IndexManager.processIndexPartitions');
-          continue;
-        }
-
-        // Read partition content
-        final content =
-            await _dataStore.storage.readAsString(partitionPath) ?? '';
-        if (content.isEmpty) {
-          continue;
-        }
-
-        // Initialize B+ tree from file content
-        final btree = await BPlusTree.fromString(
-          content,
-          isUnique: meta.isUnique,
-          comparator: comparator,
+      if (pkList.isNotEmpty) {
+        final existing =
+            await _dataStore.tableTreePartitionManager.existingPrimaryKeysBatch(
+          tableName,
+          pkList,
         );
 
-        // Process this partition using the callback
-        final shouldContinue = await processor(partitionPath, partition, btree);
-        anyPartitionProcessed = true;
-
-        // Serialize modified B+ tree back to file if needed
-        final newContent = btree.toStringHandle();
-        if (newContent != content) {
-          // Write back to file
-          await _dataStore.storage.writeAsString(partitionPath, newContent);
-
-          // Calculate new checksum
-          final checksum = _calculateChecksum(newContent);
-
-          // Create updated partition metadata
-          final updatedPartition = partition.copyWith(
-            fileSizeInBytes: newContent.length,
-            bTreeSize: newContent.length,
-            entries: btree.count(),
-            timestamps: Timestamps(
-              created: partition.timestamps.created,
-              modified: DateTime.now(),
-            ),
-            checksum: checksum,
-          );
-
-          // Add to modified partitions list
-          modifiedPartitions.add(updatedPartition);
+        if (existing.isNotEmpty) {
+          for (int i = 0; i < records.length; i++) {
+            await yieldController.maybeYield();
+            if (violations[i] != null) continue;
+            final pk = records[i][primaryKey]?.toString();
+            if (pk == null || pk.isEmpty) continue;
+            if (existing.contains(pk)) {
+              violations[i] = UniqueViolation(
+                tableName: tableName,
+                fields: [primaryKey],
+                value: pk,
+                indexName: 'pk',
+              );
+            }
+          }
         }
+      }
+    }
 
-        // If callback returns false, stop processing more partitions
-        if (!shouldContinue) {
+    // 2) Unique indexes
+    final uniqueIndexes = schema
+        .getAllIndexes()
+        .where((i) => i.unique && i.type != IndexType.vector)
+        .toList(growable: false);
+    if (uniqueIndexes.isEmpty) return violations;
+
+    for (final idx in uniqueIndexes) {
+      // Increment index weight for uniqueness check
+      _dataStore.weightManager?.incrementAccess(
+        WeightType.indexData,
+        '$tableName:${idx.actualIndexName}',
+        spaceName: _dataStore.currentSpaceName,
+      );
+
+      final indexName = idx.actualIndexName;
+      if (indexName.isEmpty) continue;
+
+      // Skip records already known to violate earlier constraints.
+      bool hasCandidate = false;
+      for (int i = 0; i < records.length; i++) {
+        if (violations[i] == null) {
+          hasCandidate = true;
           break;
         }
       }
+      if (!hasCandidate) break;
 
-      // Update index metadata if needed
-      if (updateMetadata && modifiedPartitions.isNotEmpty) {
-        // Create updated partitions list
-        final updatedPartitions = meta.partitions.map((p) {
-          // Find if this partition was modified
-          final modifiedPartition = modifiedPartitions.firstWhere(
-            (mp) => mp.index == p.index,
-            orElse: () => p,
-          );
-          return modifiedPartition;
-        }).toList();
+      // 2.1 Fully cached fast path
+      if (_indexDataCache.isFullyCached([tableName, indexName])) {
+        for (int i = 0; i < records.length; i++) {
+          await yieldController.maybeYield();
+          if (violations[i] != null) continue;
+          final r = records[i];
 
-        // Create updated metadata
-        final updatedMeta = meta.copyWith(
-          partitions: updatedPartitions,
-          timestamps: Timestamps(
-            created: meta.timestamps.created,
-            modified: DateTime.now(),
-          ),
-        );
-
-        // Write updated metadata to file
-        final metaPath =
-            await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
-        await _dataStore.storage
-            .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
-
-        // Update metadata cache
-        final cacheKey = _getIndexCacheKey(tableName, indexName);
-        _indexMetaCache[cacheKey] = updatedMeta;
-
-        // Clear index from memory cache to ensure it's reloaded with latest data next time
-        if (_indexCache.containsKey(cacheKey)) {
-          _indexCache.remove(cacheKey);
-          _indexFullyCached.remove(cacheKey);
-        }
-      }
-
-      return anyPartitionProcessed;
-    } catch (e, stack) {
-      Logger.error('Failed to process index partitions: $e\n$stack',
-          label: 'IndexManager.processIndexPartitions');
-      return false;
-    }
-  }
-
-  /// Batch delete multiple records from all indexes
-  /// @param tableName Table name
-  /// @param records List of records to delete
-  /// Note: For each record, this method fetches the StoreIndex associated with its primaryKey
-  Future<void> batchDeleteFromIndexes(
-    String tableName,
-    List<Map<String, dynamic>> records,
-  ) async {
-    if (records.isEmpty) return;
-
-    try {
-      // Get table schema
-      final schema = await _dataStore.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table schema not found: $tableName',
-            label: 'IndexManager.batchDeleteFromIndexes');
-        return;
-      }
-
-      final primaryKey = schema.primaryKey;
-      final pkIndexName = 'pk_$tableName';
-
-      // Step 1: Batch get all StoreIndex pointers for the primary keys.
-      final primaryKeyValues =
-          records.map((r) => r[primaryKey]).where((k) => k != null).toList();
-
-      if (primaryKeyValues.isEmpty) return;
-
-      final pkPointers =
-          await batchSearchIndex(tableName, pkIndexName, primaryKeyValues);
-
-      // Create a map for quick lookup: primaryKey -> record
-      final recordMap = {
-        for (var r in records)
-          if (r[primaryKey] != null) r[primaryKey]: r
-      };
-
-      // Create a map for quick lookup: primaryKey -> StoreIndex string
-      final Map<dynamic, String> storeIndexMap = {};
-      pkPointers.forEach((key, pointers) {
-        if (pointers.isNotEmpty) {
-          // Assuming primary key is unique, so there's only one pointer.
-          storeIndexMap[key] = pointers.first.toString();
-        }
-      });
-
-      if (storeIndexMap.isEmpty) {
-        return;
-      }
-
-      int processedCount = 0;
-      // Step 2: Efficiently add all entries to the delete buffer.
-      for (final pkEntry in storeIndexMap.entries) {
-        final primaryKeyValue = pkEntry.key;
-        final storeIndexStr = pkEntry.value;
-        final record = recordMap[primaryKeyValue];
-
-        if (record == null) continue;
-
-        // 1. Delete from primary key index
-        await addToDeleteBuffer(
-            tableName, pkIndexName, primaryKeyValue, storeIndexStr);
-
-        // 2. Delete from normal indexes and unique indexes
-        for (final index in schema.indexes) {
-          final indexName = index.actualIndexName;
-          final indexKey = _createIndexKey(record, index.fields);
-          if (indexKey != null) {
-            await addToDeleteBuffer(
-                tableName, indexName, indexKey, storeIndexStr);
-          }
-        }
-
-        // 3. Handle unique fields with auto-generated indexes
-        for (final field in schema.fields) {
-          if (field.unique &&
-              field.name != primaryKey &&
-              !schema.indexes.any((i) =>
-                  i.fields.length == 1 && i.fields.first == field.name)) {
-            final fieldValue = record[field.name];
-            if (fieldValue != null) {
-              final uniqueIndexName = 'uniq_${field.name}';
-              await addToDeleteBuffer(
-                  tableName, uniqueIndexName, fieldValue, storeIndexStr);
+          final fieldVals = <dynamic>[];
+          bool ok = true;
+          for (final f in idx.fields) {
+            final v = r[f];
+            if (v == null) {
+              ok = false;
+              break;
             }
+            fieldVals.add(v);
           }
-        }
+          if (!ok) continue;
 
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      // Force buffer processing if the batch is large
-      if (records.length > 1000) {
-        _processIndexWriteBuffer();
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to batch delete records from indexes: $e\n$stack',
-          label: 'IndexManager.batchDeleteFromIndexes');
-    }
-  }
-
-  /// Set the closing state and wait for all write operations to complete
-  Future<void> prepareForClose() async {
-    if (_isClosing) return; // Avoid repeated calls
-
-    _isClosing = true;
-
-    // Get the current number of pending index entries
-    final pendingEntries = _pendingEntriesCount;
-
-    // If there are no pending writes, complete the Completer early
-    if (_pendingWrites == 0) {
-      if (!_allWritesCompleted.isCompleted) {
-        _allWritesCompleted.complete();
-      }
-      return;
-    }
-
-    // Perform a flush operation once
-    await flushIndexes();
-
-    // If there are pending writes, wait for them to complete
-    if (_pendingWrites > 0 && !_allWritesCompleted.isCompleted) {
-      // Calculate the timeout based on the number of pending index entries
-      // Base 60 seconds, add 60 seconds for each 10000 entries, up to 5 minutes
-      int timeoutSeconds = 60 + (pendingEntries ~/ 10000) * 60;
-      timeoutSeconds = timeoutSeconds.clamp(60, 300);
-
-      try {
-        // Set a timeout to prevent infinite waiting
-        await _allWritesCompleted.future.timeout(
-          Duration(seconds: timeoutSeconds),
-          onTimeout: () {
+          final compositeKey = <dynamic>[tableName, indexName, ...fieldVals];
+          if (_indexDataCache.containsKey(compositeKey)) {
             Logger.warn(
-                'Waiting for index write operation timeout ($timeoutSeconds seconds), force close, remaining pending writes: $_pendingWrites',
-                label: 'IndexManager.prepareForClose');
-            if (!_allWritesCompleted.isCompleted) {
-              _allWritesCompleted.complete();
+                "[Unique Constraint Violation] Table '$tableName' Field(s) [${idx.fields.join(', ')}] already contain value '${fieldVals}' (in-memory cache)",
+                label: 'IndexManager.checkUniqueConstraints');
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: (idx.fields.length == 1) ? fieldVals.first : fieldVals,
+              indexName: indexName,
+            );
+            continue;
+          }
+
+          // Fully cached and key not found in cache.
+          // Only check transaction conflicts if there's an active transaction.
+          // If no transaction, skip (full cache already validated committed data).
+          if (txId != null) {
+            final recordId = r[primaryKey]?.toString();
+            if (recordId != null && recordId.isNotEmpty) {
+              final conflict = writeBuf.hasUniqueKeyOwnedByOtherTransaction(
+                tableName,
+                indexName,
+                compositeKey,
+                recordId,
+                transactionId: txId,
+              );
+              if (conflict) {
+                violations[i] = UniqueViolation(
+                  tableName: tableName,
+                  fields: idx.fields,
+                  value: (idx.fields.length == 1) ? fieldVals.first : fieldVals,
+                  indexName: indexName,
+                );
+              }
             }
-          },
+          }
+        }
+        continue;
+      } else {
+        for (int i = 0; i < records.length; i++) {
+          await yieldController.maybeYield();
+          if (violations[i] != null) continue;
+
+          final r = records[i];
+          final recordId = r[primaryKey]?.toString();
+          if (recordId == null || recordId.isEmpty) continue;
+
+          final canKey = schema.createCanonicalIndexKey(idx.fields, r);
+          if (canKey == null) continue;
+
+          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
+            tableName,
+            indexName,
+            canKey,
+            recordId,
+            transactionId: txId,
+          );
+          if (conflict) {
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: canKey,
+              indexName: indexName,
+            );
+          }
+        }
+      }
+
+      // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
+      final meta = await getIndexMeta(tableName, indexName);
+      if (meta == null || meta.totalEntries <= 0) {
+        // Fallback: without meta we cannot safely batch-check this unique constraint.
+        // Keep null -> caller may choose other strategies. For safety we conservatively
+        // do nothing here (performance-first path).
+        continue;
+      }
+
+      final recordIdxs = <int>[];
+      final keyBytes = <Uint8List>[];
+
+      for (int i = 0; i < records.length; i++) {
+        await yieldController.maybeYield();
+        if (violations[i] != null) continue;
+        final r = records[i];
+
+        final comps = <Uint8List>[];
+        bool ok = true;
+        for (final f in idx.fields) {
+          final v = r[f];
+          if (v == null) {
+            ok = false;
+            break;
+          }
+          final c = schema.encodeFieldComponentToMemComparable(
+            f,
+            v,
+            truncateText: false,
+          );
+          if (c == null) {
+            ok = false;
+            break;
+          }
+          comps.add(c);
+        }
+        if (!ok || comps.isEmpty) continue;
+
+        keyBytes.add(MemComparableKey.encodeTuple(comps));
+        recordIdxs.add(i);
+      }
+
+      if (keyBytes.isEmpty) continue;
+
+      final exists =
+          await _dataStore.indexTreePartitionManager.existsUniqueKeysBatch(
+        tableName: tableName,
+        indexName: indexName,
+        meta: meta,
+        uniqueKeys: keyBytes,
+      );
+
+      for (int j = 0; j < exists.length; j++) {
+        if (!exists[j]) continue;
+        final i = recordIdxs[j];
+        if (i < 0 || i >= violations.length) continue;
+        if (violations[i] != null) continue;
+
+        final r = records[i];
+        final vals = idx.fields.map((f) => r[f]).toList(growable: false);
+        violations[i] = UniqueViolation(
+          tableName: tableName,
+          fields: idx.fields,
+          value: (idx.fields.length == 1) ? vals.first : vals,
+          indexName: indexName,
         );
-      } catch (e) {
-        Logger.error('Error waiting for index write operation to complete: $e',
-            label: 'IndexManager.prepareForClose');
-        if (!_allWritesCompleted.isCompleted) {
-          _allWritesCompleted.complete();
-        }
       }
     }
 
-    Logger.debug('Index manager close preparation completed',
-        label: 'IndexManager.prepareForClose');
-  }
-
-  /// Add index entry to insert buffer
-  /// Add index entry to insert buffer
-  /// @param tableName Table name
-  /// @param indexName Index name
-  /// @param key Index key value
-  /// @param storeIndexStr String representation of StoreIndex pointer to the record
-  Future<void> _addToInsertBuffer(String tableName, String indexName,
-      dynamic key, String storeIndexStr) async {
-    try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Parse StoreIndex from string
-      final storeIndex = StoreIndex.fromString(storeIndexStr);
-      if (storeIndex == null) {
-        Logger.error('Invalid StoreIndex format: $storeIndexStr',
-            label: 'IndexManager._addToInsertBuffer');
-        return;
-      }
-
-      // Generate unique key for buffer entry
-      final entryUniqueKey =
-          IndexBufferEntry.createUniqueKey(key, storeIndexStr);
-
-      // Check if the entry is in delete buffer - if so, cancel out the operations
-      if (_deleteBuffer.containsKey(cacheKey) &&
-          _deleteBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
-        // Entry is in delete buffer, remove it from there instead of adding to insert buffer
-        _deleteBuffer[cacheKey]!.remove(entryUniqueKey);
-
-        // Update last write time
-        _indexLastWriteTime[cacheKey] = DateTime.now();
-
-        return; // Operations cancel out, no need to add to insert buffer
-      }
-
-      // Initialize insert buffer for this table/index if not exists
-      if (!_writeBuffer.containsKey(cacheKey)) {
-        _writeBuffer[cacheKey] = <String, IndexBufferEntry>{};
-      }
-
-      // Create IndexBufferEntry for insertion
-      final bufferEntry = IndexBufferEntry.forInsert(
-        indexKey: key,
-        recordPointer: storeIndex,
-        timestamp: DateTime.now(),
-      );
-
-      // Add to buffer
-      _writeBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
-
-      // Trigger high-frequency polling if not already active.
-      if (!_isHighFrequencyModeActive) {
-        _switchToHighFrequencyMode();
-      }
-
-      // Update index cache (if loaded)
-      if (_indexCache.containsKey(cacheKey)) {
-        try {
-          await _indexCache[cacheKey]!.insert(key, storeIndexStr);
-        } catch (e) {
-          // Cache update error does not affect the main process
-          Logger.warn('Failed to update memory cache: $e',
-              label: 'IndexManager._addToInsertBuffer');
-        }
-      }
-
-      // Record last write time
-      _indexLastWriteTime[cacheKey] = DateTime.now();
-    } catch (e, stack) {
-      Logger.error('Failed to add index entry to insert buffer: $e\n$stack',
-          label: 'IndexManager._addToInsertBuffer');
-    }
-  }
-
-  /// Add index entry to delete buffer
-  /// @param tableName Table name
-  /// @param indexName Index name
-  /// @param key Index key value
-  /// @param storeIndexStr String representation of StoreIndex pointer to the record
-  Future<void> addToDeleteBuffer(String tableName, String indexName,
-      dynamic key, String storeIndexStr) async {
-    try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-
-      // Parse StoreIndex from string
-      final storeIndex = StoreIndex.fromString(storeIndexStr);
-      if (storeIndex == null) {
-        Logger.error('Invalid StoreIndex format: $storeIndexStr',
-            label: 'IndexManager.addToDeleteBuffer');
-        return;
-      }
-
-      // Generate unique key for buffer entry
-      final entryUniqueKey =
-          IndexBufferEntry.createUniqueKey(key, storeIndexStr);
-
-      // Check if the entry is in insert buffer - if so, cancel out the operations
-      if (_writeBuffer.containsKey(cacheKey) &&
-          _writeBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
-        // Entry is in insert buffer, remove it from there instead of adding to delete buffer
-        _writeBuffer[cacheKey]!.remove(entryUniqueKey);
-
-        // Update last write time
-        _indexLastWriteTime[cacheKey] = DateTime.now();
-
-        // Also remove from memory cache if it exists, but don't wait for it.
-        if (_indexCache.containsKey(cacheKey)) {
-          // Fire-and-forget cache update to avoid blocking.
-          _indexCache[cacheKey]!.delete(key, storeIndexStr);
-        }
-
-        return; // Operations cancel out, no need to add to delete buffer
-      }
-
-      // Initialize delete buffer for this table/index if not exists
-      if (!_deleteBuffer.containsKey(cacheKey)) {
-        _deleteBuffer[cacheKey] = <String, IndexBufferEntry>{};
-      }
-
-      // Create IndexBufferEntry for deletion
-      final bufferEntry = IndexBufferEntry.forDelete(
-        indexKey: key,
-        recordPointer: storeIndex,
-        timestamp: DateTime.now(),
-      );
-
-      // Add to buffer
-      _deleteBuffer[cacheKey]![entryUniqueKey] = bufferEntry;
-
-      // Trigger high-frequency polling if not already active.
-      if (!_isHighFrequencyModeActive) {
-        _switchToHighFrequencyMode();
-      }
-
-      // Also remove from memory cache if it exists, but don't wait for it.
-      if (_indexCache.containsKey(cacheKey)) {
-        // Fire-and-forget cache update to avoid blocking.
-        _indexCache[cacheKey]!.delete(key, storeIndexStr);
-      }
-
-      // Record last write time
-      _indexLastWriteTime[cacheKey] = DateTime.now();
-    } catch (e, stack) {
-      Logger.error('Failed to add index entry to delete buffer: $e\n$stack',
-          label: 'IndexManager.addToDeleteBuffer');
-    }
+    return violations;
   }
 
   /// Add index to table
@@ -3304,7 +1411,7 @@ class IndexManager {
   ) async {
     try {
       // get table schema
-      final schema = await _dataStore.getTableSchema(tableName);
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         Logger.error('Failed to add index: table $tableName does not exist',
             label: 'IndexManager.addIndex');
@@ -3312,7 +1419,8 @@ class IndexManager {
       }
 
       // check if index already exists
-      if (schema.indexes
+      if (schema
+          .getAllIndexes()
           .any((i) => i.actualIndexName == index.actualIndexName)) {
         Logger.warn(
           'Index ${index.actualIndexName} already exists in table $tableName',
@@ -3332,7 +1440,7 @@ class IndexManager {
       // update table schema
       final newIndexes = [...schema.indexes, index];
       final newSchema = schema.copyWith(indexes: newIndexes);
-      await _dataStore.updateTableSchema(tableName, newSchema);
+      await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
     } catch (e) {
       Logger.error('Failed to add index: $e', label: 'IndexManager.addIndex');
       rethrow;
@@ -3372,12 +1480,7 @@ class IndexManager {
         throw ArgumentError('index name or field list is required');
       }
 
-      // cannot remove primary key index
-      if (indexName == 'pk_$tableName') {
-        throw Exception('cannot remove primary key index');
-      }
-
-      final schema = await _dataStore.getTableSchema(tableName);
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         Logger.warn('table $tableName does not exist, cannot remove index',
             label: 'IndexManager.removeIndex');
@@ -3390,7 +1493,7 @@ class IndexManager {
       // 1. if index name is provided, try to match by index name
       if (indexName != null) {
         // try to match by index name
-        for (var index in schema.indexes) {
+        for (var index in schema.getAllIndexes()) {
           if (index.indexName == indexName ||
               index.actualIndexName == indexName) {
             targetIndex = index;
@@ -3403,7 +1506,7 @@ class IndexManager {
           // check if it is an auto-generated index name
           final autoGenPattern = RegExp(r'^' + tableName + r'_\w+');
           if (autoGenPattern.hasMatch(indexName)) {
-            for (var index in schema.indexes) {
+            for (var index in schema.getAllIndexes()) {
               if (index.actualIndexName == indexName) {
                 targetIndex = index;
                 break;
@@ -3418,7 +1521,7 @@ class IndexManager {
         // sort fields list to ensure consistency
         final sortedFields = List<String>.from(fields)..sort();
 
-        for (var index in schema.indexes) {
+        for (var index in schema.getAllIndexes()) {
           // sort index fields
           final indexFields = List<String>.from(index.fields)..sort();
 
@@ -3456,7 +1559,7 @@ class IndexManager {
         final newSchema = schema.copyWith(indexes: newIndexes);
 
         // update table schema
-        await _dataStore.updateTableSchema(tableName, newSchema);
+        await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
       }
     } catch (e) {
       Logger.error('Failed to remove index: $e',
@@ -3474,22 +1577,17 @@ class IndexManager {
   ) async {
     // create lock resource for index operation
     final lockResource = 'index:$tableName:$indexName';
-    final operationId = 'delete_index_${DateTime.now().millisecondsSinceEpoch}';
+    final operationId = GlobalIdGenerator.generate('delete_index_');
 
+    bool lockAcquired = false;
     try {
       // get exclusive lock, ensure no other operation is accessing this index
-      await _dataStore.lockManager
-          ?.acquireExclusiveLock(lockResource, operationId);
-
-      // clear memory cache
-      invalidateCache(tableName, indexName);
-
-      // clear write buffer
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      _writeBuffer.remove(cacheKey);
-      _deleteBuffer.remove(cacheKey);
-      _indexWriting.remove(cacheKey);
-      _indexLastWriteTime.remove(cacheKey);
+      lockAcquired = await (_dataStore.lockManager
+              ?.acquireExclusiveLock(lockResource, operationId) ??
+          false);
+      if (!lockAcquired) {
+        return;
+      }
 
       // get index directory path
       final indexDirPath =
@@ -3499,30 +1597,6 @@ class IndexManager {
       // if index specific subdirectory exists, delete the entire subdirectory
       if (await _dataStore.storage.existsDirectory(indexSubDirPath)) {
         await _dataStore.storage.deleteDirectory(indexSubDirPath);
-      } else {
-        // if not using new directory structure, need to find and delete partition files by meta file
-        final meta = await _getIndexMeta(tableName, indexName);
-        if (meta != null) {
-          // delete all partition files
-          int processedCount = 0;
-          for (final partition in meta.partitions) {
-            try {
-              final partitionPath = await _dataStore.pathManager
-                  .getIndexPartitionPath(tableName, indexName, partition.index);
-
-              if (await _dataStore.storage.existsFile(partitionPath)) {
-                await _dataStore.storage.deleteFile(partitionPath);
-              }
-              processedCount++;
-              if (processedCount % 50 == 0) {
-                await Future.delayed(Duration.zero);
-              }
-            } catch (e) {
-              Logger.error('Failed to delete index partition file: $e',
-                  label: 'IndexManager._deleteIndexFiles');
-            }
-          }
-        }
       }
 
       // delete meta file
@@ -3531,13 +1605,19 @@ class IndexManager {
       if (await _dataStore.storage.existsFile(metaPath)) {
         await _dataStore.storage.deleteFile(metaPath);
       }
+
+      // Remove from cache
+      _indexMetaCache.remove([tableName, indexName]);
+      _indexDataCache.remove([tableName, indexName]);
     } catch (e) {
       Logger.error('Failed to delete index file: $e',
           label: 'IndexManager._deleteIndexFiles');
       rethrow;
     } finally {
       // release exclusive lock
-      _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      if (lockAcquired) {
+        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
+      }
     }
   }
 
@@ -3549,391 +1629,59 @@ class IndexManager {
     return setA.difference(setB).isEmpty;
   }
 
-  /// Check and rebuild needed indexes for a table
-  /// @param tableName Table name
-  /// @param tableSchema Table schema
-  Future<void> _checkAndRebuildTableIndexes(
-      String tableName, TableSchema tableSchema) async {
-    try {
-      // Create lock resource identifier
-      final lockResource = 'rebuild_indexes:$tableName';
-      final operationId =
-          'rebuild_indexes_${DateTime.now().millisecondsSinceEpoch}';
-
-      try {
-        // Try to acquire lock
-        final lockAcquired = _dataStore.lockManager
-            ?.tryAcquireExclusiveLock(lockResource, operationId);
-
-        if (lockAcquired == false) {
-          // If lock cannot be acquired, another thread is rebuilding
-          Logger.info(
-              'Another thread is rebuilding indexes for $tableName, skipping',
-              label: 'IndexManager._checkAndRebuildTableIndexes');
-          return;
-        }
-
-        // Check primary key index
-        final pkIndexName = 'pk_$tableName';
-        final pkIndexMeta = await _getIndexMeta(tableName, pkIndexName);
-        final primaryKey = tableSchema.primaryKey;
-
-        // Collect indexes to build
-        final indexesToBuild = <IndexSchema>[];
-        bool needRebuildPrimary = pkIndexMeta == null;
-
-        // Check normal indexes
-        for (final indexSchema in tableSchema.indexes) {
-          final indexName = indexSchema.actualIndexName;
-          final indexMeta = await _getIndexMeta(tableName, indexName);
-
-          if (indexMeta == null) {
-            indexesToBuild.add(indexSchema);
-          }
-        }
-
-        // Check unique field auto-created indexes
-        for (final field in tableSchema.fields) {
-          if (field.unique && field.name != primaryKey) {
-            // Check if an explicit index exists for this field
-            bool hasExplicitIndex = tableSchema.indexes.any((idx) =>
-                idx.fields.length == 1 && idx.fields.first == field.name);
-
-            if (!hasExplicitIndex) {
-              final uniqueIndexName = 'uniq_${field.name}';
-              final indexMeta = await _getIndexMeta(tableName, uniqueIndexName);
-
-              if (indexMeta == null) {
-                // Add to indexes to build
-                indexesToBuild.add(IndexSchema(
-                  fields: [field.name],
-                  unique: true,
-                ));
-              }
-            }
-          }
-        }
-
-        // If all indexes exist, no need to rebuild
-        if (!needRebuildPrimary && indexesToBuild.isEmpty) {
-          return;
-        }
-
-        Logger.info(
-            'Rebuilding indexes for $tableName: primaryKey=$needRebuildPrimary, otherIndexes=${indexesToBuild.length}',
-            label: 'IndexManager._checkAndRebuildTableIndexes');
-
-        // Rebuild all needed indexes at once
-        await _rebuildTableIndexes(
-            tableName, tableSchema, needRebuildPrimary, indexesToBuild);
-      } finally {
-        // Release lock
-        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
-      }
-    } catch (e, stack) {
-      Logger.error('Failed to check and rebuild indexes: $e\n$stack',
-          label: 'IndexManager._checkAndRebuildTableIndexes');
-    }
-  }
-
   /// Rebuild table indexes efficiently
   /// @param tableName Table name
   /// @param tableSchema Table schema
   /// @param rebuildPrimary Whether to rebuild primary key index
   /// @param indexesToBuild List of indexes to build
   Future<void> _rebuildTableIndexes(String tableName, TableSchema tableSchema,
-      bool rebuildPrimary, List<IndexSchema> indexesToBuild) async {
+      List<IndexSchema> indexesToBuild) async {
     try {
       final primaryKey = tableSchema.primaryKey;
 
-      // Create index metadata (if needed)
-      if (rebuildPrimary) {
-        final pkIndexName = 'pk_$tableName';
-
-        // Check if table has ordered flag
-        bool? isOrdered;
-        try {
-          final tableMeta =
-              await _dataStore.tableDataManager.getTableFileMeta(tableName);
-          if (tableMeta?.isOrdered != null) {
-            isOrdered = tableMeta!.isOrdered;
-          }
-        } catch (e) {
-          // Ignore error, proceed with default handling
-        }
-
-        final pkMeta = IndexMeta(
-          version: 1,
-          name: pkIndexName,
-          tableName: tableName,
-          fields: [primaryKey],
-          isUnique: true,
-          partitions: [],
-          isOrdered: isOrdered, // Inherit ordered flag from table metadata
-          timestamps: Timestamps(
-            created: DateTime.now(),
-            modified: DateTime.now(),
-          ),
-          totalSizeInBytes: 0,
-          totalEntries: 0,
-        );
-
-        // Use unified method to update metadata
-        await _updateIndexMetadata(
-            tableName: tableName, indexName: pkIndexName, updatedMeta: pkMeta);
-      }
-
-      // Create metadata for other indexes
       for (final indexSchema in indexesToBuild) {
         final indexName = indexSchema.actualIndexName;
-        final indexMeta = IndexMeta(
-          version: 1,
+        final indexMeta = IndexMeta.createEmpty(
           name: indexName,
           tableName: tableName,
           fields: indexSchema.fields,
           isUnique: indexSchema.unique,
-          partitions: [],
-          timestamps: Timestamps(
-            created: DateTime.now(),
-            modified: DateTime.now(),
-          ),
-          totalSizeInBytes: 0,
-          totalEntries: 0,
         );
-
-        // Use unified method to update metadata
-        await _updateIndexMetadata(
+        await updateIndexMeta(
             tableName: tableName, indexName: indexName, updatedMeta: indexMeta);
       }
 
-      // Store index entries by partition
-      // Map<partitionId, Map<indexName, Map<indexKey, List<recordPointer>>>>
-      final partitionIndexData =
-          <int, Map<String, Map<dynamic, List<String>>>>{};
+      // 2) Scan table partitions and build indexes via applyIndexInserts
+      await _dataStore.tableDataManager.processTablePartitions(
+        tableName: tableName,
+        onlyRead: true,
+        processFunction: (records, partitionIndex, controller) async {
+          // Only write the entire partition at once, avoiding cutting the aligned partition data into multiple pieces and improving throughput.
+          final Map<dynamic, Map<String, dynamic>> newByPk = {};
+          final int maxConcurrency = _dataStore.config.maxConcurrency;
+          final yieldControl =
+              YieldController('IndexManager.processTablePartitions');
 
-      // Maximum concurrent operations
-      final maxConcurrent = _dataStore.config.maxConcurrent;
-
-      // Record count for generating pointers
-      int recordCount = 0;
-
-      // Track which partitions have been processed
-      final processedPartitions = <int>{};
-
-      // Count total entries in write buffer for this table
-      Future<int> getTableWriteBufferSize() async {
-        int size = 0;
-        int processedCount = 0;
-        for (final key in _writeBuffer.keys) {
-          if (key.startsWith('$tableName:') && _writeBuffer[key] != null) {
-            size += _writeBuffer[key]!.length;
+          for (int i = 0; i < records.length; i++) {
+            await yieldControl.maybeYield();
+            final rec = records[i];
+            if (isDeletedRecord(rec)) continue;
+            final pk = rec[primaryKey];
+            if (pk == null) continue;
+            newByPk[pk] = rec;
           }
-          processedCount++;
-          if (processedCount % 50 == 0) {
+
+          if (newByPk.isNotEmpty) {
+            await _dataStore.indexManager?.writeChanges(
+              tableName: tableName,
+              inserts: newByPk.values.toList(growable: false),
+              concurrency: maxConcurrency > 0 ? maxConcurrency : null,
+            );
             await Future.delayed(Duration.zero);
           }
-        }
-        return size;
-      }
-
-      // Calculate dynamic threshold based on available memory
-      // Each index entry is estimated to consume about 100 bytes
-      Future<int> getDynamicThreshold() async {
-        try {
-          // Get available memory in MB
-          final availableMemoryMB =
-              await PlatformHandler.getAvailableSystemMemoryMB();
-
-          // Reserve 25% of available memory for index building
-          // 1MB = 1024*1024 bytes, divide by 100 bytes per entry
-          final maxEntriesInMemory =
-              (availableMemoryMB * 1024 * 1024 * 0.25 / 100).toInt();
-
-          // Minimum threshold to ensure reasonable batch size
-          const minThreshold = 1000;
-
-          // Calculate a safe threshold, with upper and lower limits
-          return maxEntriesInMemory.clamp(minThreshold, minThreshold * 20);
-        } catch (e) {
-          // Fallback to fixed threshold if memory query fails
-          Logger.warn('Failed to get available memory, using default threshold',
-              label: 'IndexManager._rebuildTableIndexes');
-          return 1000 * 4;
-        }
-      }
-
-      // Get initial threshold
-      int dynamicThreshold = await getDynamicThreshold();
-
-      // Process function for submitting a batch of partition index data
-      Future<void> processPartitionBatch() async {
-        if (processedPartitions.isEmpty) return;
-
-        Logger.debug(
-            'Processing index batch for table $tableName, partitions: $processedPartitions',
-            label: 'IndexManager._rebuildTableIndexes');
-
-        // Sort partitions for ordered processing
-        final sortedPartitions = processedPartitions.toList()..sort();
-
-        int processedCount = 0;
-        for (final partitionId in sortedPartitions) {
-          final partitionData = partitionIndexData[partitionId];
-          if (partitionData == null) continue;
-
-          // Process each index in this partition
-          for (final indexName in partitionData.keys) {
-            final indexEntries = partitionData[indexName]!;
-
-            // Add entries to index buffer
-            for (final entry in indexEntries.entries) {
-              final indexKey = entry.key;
-              final pointers = entry.value;
-
-              for (final pointer in pointers) {
-                await _addToInsertBuffer(
-                    tableName, indexName, indexKey, pointer);
-                processedCount++;
-                if (processedCount % 50 == 0) {
-                  await Future.delayed(Duration.zero);
-                }
-              }
-            }
-          }
-
-          // Remove processed partition data from memory
-          partitionIndexData.remove(partitionId);
-
-          await Future.delayed(Duration.zero);
-        }
-
-        // Get current buffer size
-        final currentBufferSize = await getTableWriteBufferSize();
-
-        // Check if buffer size exceeds threshold
-        if (currentBufferSize > dynamicThreshold) {
-          Logger.debug(
-              'Index buffer size ($currentBufferSize) exceeds threshold ($dynamicThreshold), flushing for table $tableName',
-              label: 'IndexManager._rebuildTableIndexes');
-
-          // Flush write buffer
-          await _processIndexWriteBuffer();
-
-          // Sleep for a duration proportional to the buffer size
-          // The larger the buffer, the longer the sleep to allow more time for processing
-          final sleepDuration = Duration(
-              milliseconds: (currentBufferSize / dynamicThreshold * 100)
-                  .clamp(50, 500)
-                  .toInt());
-          await Future.delayed(sleepDuration);
-
-          // Update dynamic threshold after flush
-          dynamicThreshold = await getDynamicThreshold();
-        }
-
-        // Clear processed partitions set
-        processedPartitions.clear();
-      }
-
-      // Scan table data and build all indexes
-      await _dataStore.tableDataManager.processTablePartitions(
-          tableName: tableName,
-          onlyRead: true,
-          maxConcurrent: maxConcurrent,
-          processFunction: (records, partitionIndex, controller) async {
-            // Create index data container for this partition
-            if (!partitionIndexData.containsKey(partitionIndex)) {
-              partitionIndexData[partitionIndex] = {};
-
-              // Primary key index
-              if (rebuildPrimary) {
-                partitionIndexData[partitionIndex]!['pk_$tableName'] = {};
-              }
-
-              // Other indexes
-              for (final indexSchema in indexesToBuild) {
-                partitionIndexData[partitionIndex]![
-                    indexSchema.actualIndexName] = {};
-              }
-            }
-
-            // Process each record
-            for (final record in records) {
-              final primaryKeyValue = record[primaryKey];
-              if (primaryKeyValue == null) {
-                continue;
-              }
-
-              // Create record pointer
-              final pointer = StoreIndex(
-                  offset: recordCount,
-                  partitionId: partitionIndex,
-                  clusterId: _dataStore.config.distributedNodeConfig.clusterId,
-                  nodeId: _dataStore.config.distributedNodeConfig.nodeId);
-
-              final pointerStr = pointer.toString();
-
-              // Add primary key index data
-              if (rebuildPrimary) {
-                final pkData =
-                    partitionIndexData[partitionIndex]!['pk_$tableName']!;
-                if (!pkData.containsKey(primaryKeyValue)) {
-                  pkData[primaryKeyValue] = [];
-                }
-                pkData[primaryKeyValue]!.add(pointerStr);
-              }
-
-              // Add other index data
-              for (final indexSchema in indexesToBuild) {
-                final indexName = indexSchema.actualIndexName;
-                final indexKey = _createIndexKey(record, indexSchema.fields);
-
-                if (indexKey != null) {
-                  final indexData =
-                      partitionIndexData[partitionIndex]![indexName]!;
-                  if (!indexData.containsKey(indexKey)) {
-                    indexData[indexKey] = [];
-                  }
-                  indexData[indexKey]!.add(pointerStr);
-                }
-              }
-
-              recordCount++;
-              if (recordCount % 50 == 0) {
-                await Future.delayed(Duration.zero);
-              }
-            }
-
-            // Mark this partition as processed
-            processedPartitions.add(partitionIndex);
-
-            // Check current buffer size before deciding whether to process or continue
-            final currentPartitionCount = processedPartitions.length;
-            final recordCountThreshold =
-                recordCount % 10000 == 0 && recordCount > 0;
-
-            if (currentPartitionCount >= maxConcurrent ||
-                recordCountThreshold) {
-              // Check if write buffer is getting too large
-              final currentBufferSize = await getTableWriteBufferSize();
-
-              // If buffer is already approaching threshold, process now
-              if (currentBufferSize > dynamicThreshold * 0.7) {
-                await processPartitionBatch();
-              } else {
-                // Otherwise just call without awaiting to avoid blocking
-                processPartitionBatch();
-              }
-            }
-
-            return records; // Return original records, no modification
-          });
-
-      // Process any remaining partition data - make sure to await this call
-      await processPartitionBatch();
-
-      // Final flush of all buffers
-      await _processIndexWriteBuffer();
+          return records;
+        },
+      );
     } catch (e, stack) {
       Logger.error('Failed to rebuild table indexes: $e\n$stack',
           label: 'IndexManager._rebuildTableIndexes');
@@ -3941,100 +1689,238 @@ class IndexManager {
     }
   }
 
-  /// Detect and update index order
-  /// @param tableName table name
-  /// @param indexName index name
-  Future<void> _detectAndUpdateIndexOrder(
-      String tableName, String indexName) async {
-    try {
-      // get index meta
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) return;
-
-      // only process primary key index or index with isOrdered is true
-      if (indexName != 'pk_$tableName' && meta.isOrdered != true) {
-        return;
-      }
-
-      // check last check time, avoid frequent detection
-      final lastCheckTime = _lastOrderCheckTime['$tableName:$indexName'] ?? 0;
-      final now = DateTime.now().millisecondsSinceEpoch;
-      const checkInterval = 1000 * 60 * 60; // 1 hour
-
-      // if last check time is less than 1 hour, skip detection
-      if (now - lastCheckTime < checkInterval) {
-        return;
-      }
-
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) {
-        Logger.warn('Table schema not found for $tableName',
-            label: 'IndexManager._detectAndUpdateIndexOrder');
-        return;
-      }
-      final MatcherFunction matcher =
-          ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
-
-      // for large index, use sampling detection
-      final isOrdered =
-          await _checkPartitionsOrderBySampling(meta.partitions, matcher);
-
-      // update meta
-      final updatedMeta = meta.copyWith(isOrdered: isOrdered);
-      await _updateIndexMetadata(
-          tableName: tableName, indexName: indexName, updatedMeta: updatedMeta);
-
-      // record last check time
-      _lastOrderCheckTime['$tableName:$indexName'] = now;
-    } catch (e, stack) {
-      Logger.error('Failed to detect index order: $e\n$stack',
-          label: 'IndexManager._detectAndUpdateIndexOrder');
+  /// Helper to encode index key from record
+  Uint8List? encodeIndexKeyFromRecord({
+    required TableSchema schema,
+    required IndexMeta meta,
+    required Map<String, dynamic> record,
+    required String pkValue,
+  }) {
+    final fields = meta.fields;
+    final isUnique = meta.isUnique;
+    final truncateText = !isUnique;
+    final comps = <Uint8List>[];
+    for (final f in fields) {
+      final v = record[f];
+      final c = schema.encodeFieldComponentToMemComparable(
+        f,
+        v,
+        truncateText: truncateText,
+      );
+      if (c == null) return null;
+      comps.add(c);
     }
+    if (!isUnique) {
+      comps.add(schema.encodePrimaryKeyComponent(pkValue));
+    }
+    return MemComparableKey.encodeTuple(comps);
   }
 
-  /// check partitions order by sampling
-  Future<bool> _checkPartitionsOrderBySampling(
-      List<IndexPartitionMeta> partitions, MatcherFunction matcher) async {
-    if (partitions.isEmpty || partitions.length == 1) return true;
+  /// Write index changes (inserts, updates, deletes) to index partition files
+  ///
+  /// [skipIndexes] - Optional set of index names to skip processing.
+  /// Used during recovery to skip indexes that have already been fully flushed.
+  Future<void> writeChanges({
+    required String tableName,
+    List<Map<String, dynamic>> inserts = const [],
+    List<IndexRecordUpdate> updates = const [],
+    List<Map<String, dynamic>> deletes = const [],
+    BatchContext? batchContext,
+    int? concurrency,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    Set<String>? skipIndexes,
+  }) async {
+    // Snapshot inputs to allow yielding and avoid concurrent modification
+    final insertsCopy = List<Map<String, dynamic>>.from(inserts);
+    final updatesCopy = List<IndexRecordUpdate>.from(updates);
+    final deletesCopy = List<Map<String, dynamic>>.from(deletes);
+    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) return;
+    final pkName = schema.primaryKey;
 
-    // sample detection, check at most 10 uniformly distributed samples
-    final maxSamples = min(partitions.length, 10);
-    final step = (partitions.length / maxSamples).ceil();
+    // Build index targets: explicit indexes + auto-unique single-field + foreign keys (excluding PK).
+    final targets = schema.getAllIndexes().toList();
 
-    dynamic lastMaxKey;
+    // Skip redundant PK-only indexes (table data is already range-partitioned by PK).
+    targets
+        .removeWhere((i) => i.fields.length == 1 && i.fields.first == pkName);
+    if (targets.isEmpty) return;
 
-    for (int i = 0; i < partitions.length; i += step) {
-      if (i >= partitions.length) break;
+    // Compute per-index deltas.
+    final idxTasks = <Future<void> Function()>[];
+    final bool hasExplicitBudget = (concurrency != null && concurrency > 0);
+    final IndexWriteBudget? budget = hasExplicitBudget
+        ? IoConcurrencyPlanner.planIndexWriteBudget(
+            budgetTokens: concurrency,
+            indexCount: targets.length,
+            // Non-unique indexes are far more likely to touch many partitions; avoid per-index=1.
+            minPartitionTokensPerIndex: targets.any((i) => !i.unique) ? 2 : 1,
+          )
+        : null;
 
-      final partition = partitions[i];
-
-      // first partition, only record max key
-      if (lastMaxKey == null) {
-        lastMaxKey = partition.maxKey;
+    for (final idx in targets) {
+      final indexName = idx.actualIndexName;
+      // Skip indexes that are already fully flushed (used during recovery)
+      if (skipIndexes != null && skipIndexes.contains(indexName)) {
         continue;
       }
-
-      // check if current partition min key is greater than or equal to last partition max key
-      if (lastMaxKey != null && partition.minKey != null) {
-        if (matcher(partition.minKey, lastMaxKey) < 0) {
-          // range overlap, not ordered
-          return false;
+      idxTasks.add(() async {
+        var meta = await getIndexMeta(tableName, indexName);
+        // If index metadata doesn't exist, create it in memory only (avoid extra IO)
+        if (meta == null) {
+          meta = IndexMeta.createEmpty(
+            name: indexName,
+            tableName: tableName,
+            fields: idx.fields,
+            isUnique: idx.unique,
+          );
+          // Only cache in memory, don't write to file yet to avoid extra IO
+          _indexMetaCache.put([tableName, indexName], meta);
         }
-      } else if (partition.minKey == null) {
-        // if min key is null, conservative handling as possible not ordered
-        return false;
-      }
 
-      // update lastMaxKey
-      lastMaxKey = partition.maxKey;
+        final bool isUnique = meta.isUnique;
+        final fields = meta.fields;
 
-      // yield to the event loop
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
+        Uint8List encodeUniquePutValue(String pk) {
+          final b = utf8.encode(pk);
+          final out = Uint8List(1 + b.length);
+          out[0] = 0;
+          out.setRange(1, out.length, b);
+          return out;
+        }
+
+        Uint8List encodeNonUniquePutValue() => Uint8List.fromList(const [0]);
+
+        Uint8List encodeDeleteValue() => Uint8List.fromList(const [1]);
+
+        Uint8List? encodeIdxKey(
+          Map<String, dynamic> record,
+          String pkValue,
+        ) =>
+            encodeIndexKeyFromRecord(
+                schema: schema, meta: meta!, record: record, pkValue: pkValue);
+
+        final deltas = <DataBlockEntry>[];
+
+        // Inserts - snapshot verified by caller? `inserts` is List<Map>
+        // Assuming inserts/updates/deletes are safe to iterate directly if local
+        final yieldControl = YieldController('IndexManager.writeChanges');
+
+        for (final r in insertsCopy) {
+          await yieldControl.maybeYield();
+          final pk = r[pkName]?.toString();
+          if (pk == null || pk.isEmpty) continue;
+          final k = encodeIdxKey(r, pk);
+          if (k == null || k.isEmpty) continue;
+          final v =
+              isUnique ? encodeUniquePutValue(pk) : encodeNonUniquePutValue();
+          deltas.add(DataBlockEntry(k, v));
+        }
+
+        // Deletes (record holds old values)
+        for (final r in deletesCopy) {
+          await yieldControl.maybeYield();
+          final pk = r[pkName]?.toString();
+          if (pk == null || pk.isEmpty) continue;
+          final k = encodeIdxKey(r, pk);
+          if (k == null || k.isEmpty) continue;
+          deltas.add(DataBlockEntry(k, encodeDeleteValue()));
+        }
+
+        // Updates
+        for (final u in updatesCopy) {
+          await yieldControl.maybeYield();
+          final pk = u.primaryKey.toString();
+          if (pk.isEmpty) continue;
+
+          // Reconstruct old record by overlaying oldValues onto newValues.
+          // This assumes missing keys in oldValues are unchanged.
+          final oldValues = u.oldValues;
+          if (oldValues == null) {
+            // Strict mode: cannot safely maintain indexes without old values.
+            throw StateError(
+                'Index update requires oldValues for $tableName.$indexName (pk=$pk)');
+          }
+
+          final oldRecord = Map<String, dynamic>.from(u.newValues);
+          oldRecord.addAll(oldValues);
+          oldRecord[pkName] = pk;
+          final newRecord = Map<String, dynamic>.from(u.newValues);
+          newRecord[pkName] = pk;
+
+          // If no indexed field changed, skip.
+          try {
+            if (!u.affectsIndexedFields(fields.toSet())) continue;
+          } catch (_) {}
+
+          final oldKey = encodeIdxKey(oldRecord, pk);
+          final newKey = encodeIdxKey(newRecord, pk);
+
+          if (oldKey != null &&
+              newKey != null &&
+              MemComparableKey.compare(oldKey, newKey) == 0) {
+            continue;
+          }
+          if (oldKey != null && oldKey.isNotEmpty) {
+            deltas.add(DataBlockEntry(oldKey, encodeDeleteValue()));
+          }
+          if (newKey != null && newKey.isNotEmpty) {
+            final v =
+                isUnique ? encodeUniquePutValue(pk) : encodeNonUniquePutValue();
+            deltas.add(DataBlockEntry(newKey, v));
+          }
+        }
+
+        if (deltas.isEmpty) {
+          return;
+        }
+        await _dataStore.indexTreePartitionManager.writeChanges(
+          tableName: tableName,
+          indexName: indexName,
+          indexMeta: meta,
+          deltas: deltas,
+          batchContext: batchContext,
+          // If caller provided a total token budget, we pass a per-index token cap.
+          // Otherwise, let partition manager auto-acquire based on actual touched partitions.
+          concurrency:
+              hasExplicitBudget ? budget!.partitionTokensPerIndex : null,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+      });
     }
 
-    return true;
+    if (idxTasks.isEmpty) return;
+
+    // Execute per-index tasks. If caller provides a token budget, we use a balanced
+    // index-level concurrency to preserve partition-level parallelism.
+    final int idxLevelConcurrency =
+        hasExplicitBudget ? min(targets.length, budget!.indexConcurrency) : 1;
+
+    // Calculate a dynamic timeout based on writeBatchSize AND maxPartitionFileSize.
+    final int batchSize = _dataStore.config.writeBatchSize;
+    final int maxFileSize = _dataStore.config.maxPartitionFileSize;
+
+    final int batchSeconds = (batchSize / 50).ceil();
+    final int ioSeconds = (maxFileSize / (100 * 1024)).ceil();
+
+    final timeout = Duration(seconds: 30 + batchSeconds + ioSeconds);
+
+    if (InternalConfig.showLoggerInternalLabel) {
+      Logger.debug(
+        'Index persistence: table=$tableName, totalIndexes=${idxTasks.length}, concurrency=$idxLevelConcurrency, timeout=$timeout',
+        label: 'IndexManager',
+      );
+    }
+
+    await ParallelProcessor.execute<void>(
+      idxTasks,
+      concurrency: idxLevelConcurrency,
+      label: 'IndexManager.writeChanges',
+      continueOnError: false,
+      timeout: timeout,
+    );
   }
 
   /// Searches an index using a structured condition, with optimizations for performance and memory.
@@ -4047,454 +1933,862 @@ class IndexManager {
   /// @param indexName The name of the index to search.
   /// @param condition The structured IndexCondition for the search.
   /// @param limit An optional limit on the number of records to return.
+  /// @param offset An optional offset to skip the first N records.
+  /// @param startAfterKey Optional: keyset cursor (exclusive) for the index key bytes.
+  /// @param reverse When true, scan in descending index-key order.
+  /// @param orderBy An optional list of fields to order by.
+  /// @param bypassCache When true, skip in-memory index caches (safer for large-range scans).
   /// @return An IndexSearchResult containing the pointers to matching records.
   Future<IndexSearchResult> searchIndex(
     String tableName,
     String indexName,
     IndexCondition condition, {
     int? limit,
+    int? offset,
+    Uint8List? startAfterKey,
+    bool reverse = false,
+    List<String>? orderBy,
   }) async {
+    // Increment index access weight for caching optimization
+    _dataStore.weightManager?.incrementAccess(
+      WeightType.indexData,
+      '$tableName:$indexName',
+      spaceName: _dataStore.currentSpaceName,
+    );
     try {
-      // Handle 'IN' by decomposing into a batch search first
-      if (condition.operator.toLowerCase() == 'in') {
-        if (condition.value is! List || (condition.value as List).isEmpty) {
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      if (schema == null) return IndexSearchResult.tableScan();
+
+      final meta = await getIndexMeta(tableName, indexName);
+      if (meta == null) return IndexSearchResult.tableScan();
+      if (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull) {
+        return IndexSearchResult.empty();
+      }
+
+      Uint8List upperBoundExclusiveForPrefix(Uint8List prefix) {
+        final out = Uint8List(prefix.length + 1 + 4);
+        out.setRange(0, prefix.length, prefix);
+        out[prefix.length] = 0xFF;
+        return out;
+      }
+
+      final fields = meta.fields;
+      final bool isUnique = meta.isUnique;
+      final bool truncateText = !isUnique;
+
+      List<dynamic>? normalizeValues(dynamic v, int n) {
+        if (n <= 0) return const [];
+        if (n == 1) return <dynamic>[v];
+        if (v is List && v.length == n) return v;
+        return null;
+      }
+
+      Uint8List? encodePrefix(dynamic raw) {
+        final vals = normalizeValues(raw, fields.length);
+        if (vals == null) return null;
+        final comps = <Uint8List>[];
+        for (int i = 0; i < fields.length; i++) {
+          final c = schema.encodeFieldComponentToMemComparable(
+            fields[i],
+            vals[i],
+            truncateText: truncateText,
+          );
+          if (c == null) return null;
+          comps.add(c);
+        }
+        return MemComparableKey.encodeTuple(comps);
+      }
+
+      // Cursor Logic
+      final bool hasCursorKey =
+          startAfterKey != null && startAfterKey.isNotEmpty;
+
+      // Local helper for nextKey (exclusive -> inclusive switch)
+      Uint8List _nextKey(Uint8List key) {
+        final out = Uint8List(key.length + 1);
+        out.setAll(0, key);
+        out[key.length] = 0;
+        return out;
+      }
+
+      final int? effectiveOffset = hasCursorKey ? null : offset;
+
+      // Helper to apply cursor lower bound (Forward scan start)
+      Uint8List applyCursorStart(Uint8List originalStart) {
+        if (!hasCursorKey) return originalStart;
+        if (reverse) return originalStart; // Reverse uses cursor as end bound
+
+        // We want strictly AFTER cursor.
+        // startInclusive = nextKey(cursor).
+        // If cursor >= originalStart, we need to bump originalStart to cursor+1.
+        final cursorNext = _nextKey(startAfterKey);
+        if (originalStart.isEmpty ||
+            MemComparableKey.compare(cursorNext, originalStart) > 0) {
+          return cursorNext;
+        }
+        return originalStart;
+      }
+
+      // Helper to apply cursor upper bound (Reverse scan end)
+      Uint8List applyCursorEnd(Uint8List originalEnd) {
+        if (!hasCursorKey) return originalEnd;
+        if (!reverse) return originalEnd; // Forward uses cursor as start bound
+
+        // Reverse scan: scan < limit.
+        // We want strictly BEFORE cursor.
+        // Limit (exclusive) = cursor.
+        if (originalEnd.isEmpty ||
+            MemComparableKey.compare(startAfterKey, originalEnd) < 0) {
+          return startAfterKey;
+        }
+        return originalEnd;
+      }
+
+      final opUpper = condition.operator.toUpperCase();
+
+      // Cache Check Helper
+      // Returns null if cache not available or not applicable
+      // Returns IndexSearchResult if cache used (empty or populated)
+      Future<IndexSearchResult?> checkCache(
+          dynamic prefix, dynamic start, dynamic end) async {
+        // Equality/Point Lookup
+        if (prefix != null && start == null && end == null) {
+          if (hasCursorKey && isUnique) {
+            return IndexSearchResult.empty();
+          }
+
+          final List<dynamic> comps = prefix is List ? prefix : [prefix];
+          final compositePrefix = <dynamic>[tableName, indexName, ...comps];
+
+          if (isUnique) {
+            final val = _indexDataCache.get(compositePrefix);
+            if (val == null) {
+              if (!_indexDataCache.isFullyCached([tableName, indexName]))
+                return null;
+              return IndexSearchResult.empty();
+            }
+            if (val is String) {
+              return IndexSearchResult(primaryKeys: [val]);
+            }
+            return IndexSearchResult.empty();
+          }
+
+          // Non-unique: one entry per PK (PK is part of the key).
+          if (!_indexDataCache.isFullyCached([tableName, indexName]))
+            return null;
+
+          final results = <String>[];
+          final startKey = <dynamic>[...compositePrefix, ''];
+          final endKey = <dynamic>[...compositePrefix, '\uffff'];
+
+          await _indexDataCache.scanRange(
+            startKey,
+            endKey,
+            reverse: reverse,
+            onEntry: (key, _) {
+              if (key.length <= compositePrefix.length) return true;
+              final pk = key.last?.toString();
+              if (pk != null) results.add(pk);
+              return true;
+            },
+          );
+
+          if (results.isEmpty) return IndexSearchResult.empty();
+          return IndexSearchResult(primaryKeys: results);
+        }
+
+        // Range Search
+        if (!_indexDataCache.isFullyCached([tableName, indexName])) return null;
+
+        if (start != null || end != null) {
+          // Allow one-sided checks
+          final results = <String>[];
+          final prefixKey = [tableName, indexName];
+
+          final List<dynamic> startNative = (start is Uint8List)
+              ? MemComparableKey.decodeTuple(start)
+              : ((start is List) ? start : (start != null ? [start] : []));
+          final List<dynamic> endNative = (end is Uint8List)
+              ? MemComparableKey.decodeTuple(end)
+              : ((end is List) ? end : (end != null ? [end] : []));
+
+          _registerIndexComparator(tableName, indexName, schema);
+          final comparator = _comparatorRegistry['$tableName:$indexName'] ??
+              TreeCache.compareNative;
+
+          int compareKey(
+              List<dynamic> keyPathValues, List<dynamic> boundValues) {
+            for (int i = 0; i < boundValues.length; i++) {
+              if (i >= keyPathValues.length) return -1;
+              int c;
+              if (i == 0) {
+                c = comparator(keyPathValues[i], boundValues[i]);
+              } else {
+                c = TreeCache.compareNative(keyPathValues[i], boundValues[i]);
+              }
+              if (c != 0) return c;
+            }
+            return 0;
+          }
+
+          await _indexDataCache.scanRange(prefixKey, null, reverse: reverse,
+              onEntry: (key, val) {
+            if (key.length < 2 || key[0] != tableName || key[1] != indexName)
+              return false;
+
+            final keyValues = key.sublist(2);
+
+            if (startNative.isNotEmpty) {
+              // For start bound: key >= start
+              final cmp = compareKey(keyValues, startNative);
+              if (cmp < 0) return reverse ? false : true;
+            }
+            if (endNative.isNotEmpty) {
+              // For end bound: key < end
+              final cmp = compareKey(keyValues, endNative);
+              if (cmp >= 0) return reverse ? true : false;
+            }
+
+            if (isUnique) {
+              results.add(val as String);
+            } else {
+              final pk = key.isNotEmpty ? key.last?.toString() : null;
+              if (pk != null) results.add(pk);
+            }
+            return true;
+          });
+
+          return IndexSearchResult(primaryKeys: results);
+        }
+        return null;
+      }
+
+      // Equality
+      if (opUpper == '=') {
+        final List<dynamic>? nativeVal =
+            normalizeValues(condition.value, fields.length);
+        if (nativeVal == null) return IndexSearchResult.empty();
+
+        // Check Cache with Native Key
+        // Equality Cache Optimization:
+        final cacheResult = await checkCache(nativeVal, null, null);
+
+        if (cacheResult != null) {
+          if (!hasCursorKey) {
+            return cacheResult;
+          }
+          // Cache Hit with Cursor: Filter in-memory
+          if (isUnique) {
+            // Unique index result is a single PK.
+          } else {
+            final List<String> cachedPks = cacheResult.primaryKeys;
+
+            final List<String> pks = List.of(cachedPks);
+            // Sort PKs naturally (lexicographical for strings/encoded)
+            pks.sort();
+            if (reverse) {
+              pks.sort((a, b) => b.compareTo(a));
+            }
+
+            final out = <String>[];
+            final localPrefix = encodePrefix(condition.value);
+
+            if (localPrefix != null) {
+              for (final pk in pks) {
+                final encodedRecordKey = schema.encodePrimaryKeyComponent(pk);
+                final fullKey =
+                    Uint8List(localPrefix.length + encodedRecordKey.length);
+                fullKey.setAll(0, localPrefix);
+                fullKey.setAll(localPrefix.length, encodedRecordKey);
+
+                // Comparison
+                bool include = false;
+                if (reverse) {
+                  // strictly BEFORE cursor
+                  if (MemComparableKey.compare(fullKey, startAfterKey) < 0) {
+                    include = true;
+                  }
+                } else {
+                  // strictly AFTER cursor
+                  if (MemComparableKey.compare(fullKey, startAfterKey) > 0) {
+                    include = true;
+                  }
+                }
+                if (include) out.add(pk);
+              }
+              return IndexSearchResult(primaryKeys: out);
+            }
+          }
+        }
+
+        final prefix = encodePrefix(condition.value);
+        if (prefix == null) return IndexSearchResult.empty();
+
+        if (isUnique) {
+          if (hasCursorKey) return IndexSearchResult.empty();
+          final pk =
+              await _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            uniqueKey: prefix,
+          );
+          if (pk == null) return IndexSearchResult.empty();
+
+          // Hotspot populate: Use Native Key (if not disabled)
+          if (!(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+            _indexDataCache.put([tableName, indexName, ...nativeVal], pk);
+          }
+
+          return IndexSearchResult(primaryKeys: <String>[pk]);
+        }
+
+        final end = upperBoundExclusiveForPrefix(prefix);
+        final start = applyCursorStart(prefix);
+        final endEffective = applyCursorEnd(end);
+
+        if (endEffective.isNotEmpty &&
+            MemComparableKey.compare(start, endEffective) >= 0) {
           return IndexSearchResult.empty();
         }
-        final results = await batchSearchIndex(
-            tableName, indexName, condition.value as List);
-        final allPointers = results.values.expand((p) => p).toList();
-        final Map<int, List<String>> grouped = {};
+        final res = await _dataStore.indexTreePartitionManager.searchByKeyRange(
+          tableName: tableName,
+          indexName: indexName,
+          meta: meta,
+          startKeyInclusive: start,
+          endKeyExclusive: endEffective,
+          reverse: reverse,
+          limit: limit,
+          offset: effectiveOffset,
+        );
 
-        // Add async yield to avoid UI jank
-        int processedCount = 0;
-        for (final pointer in allPointers) {
-          final storeIndex = StoreIndex.fromString(pointer.toString());
-          if (storeIndex != null) {
-            grouped
-                .putIfAbsent(storeIndex.partitionId, () => [])
-                .add(pointer.toString());
-          }
-
-          // Yield to the event loop to prevent UI jank if there are many indexes.
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
+        if (!isUnique && limit == null && offset == null && !hasCursorKey) {
+          // Hotspot populate (non-unique): cache one entry per PK.
+          if (!(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+            final prefixKey = <dynamic>[tableName, indexName, ...nativeVal];
+            final yc = YieldController('IndexManager.hotspotPopulateNonUnique');
+            for (final pk in res.primaryKeys) {
+              await yc.maybeYield();
+              _indexDataCache.put(
+                <dynamic>[...prefixKey, pk],
+                true,
+                size: pk.length + 1,
+              );
+            }
           }
         }
-        return IndexSearchResult(pointersByPartition: grouped);
+        return res;
       }
 
-      // For some operators, a full table scan is more efficient than an index scan.
-      final op = condition.operator.toUpperCase();
-      if (op == 'LIKE' && condition.value is String) {
-        final value = condition.value as String;
-        // Non-prefix LIKE queries (e.g., '%val' or '%val%') cannot use the B-Tree efficiently
-        // and would result in a full index scan. In this case, a table scan is likely faster.
-        if (value.startsWith('%')) {
-          return IndexSearchResult.tableScan();
+      // BETWEEN (inclusive).
+      if (opUpper == 'BETWEEN') {
+        final startPrefix = encodePrefix(condition.value);
+        final endPrefix = encodePrefix(condition.endValue);
+        if (startPrefix == null || endPrefix == null)
+          return IndexSearchResult.empty();
+        final endExclusive = upperBoundExclusiveForPrefix(endPrefix);
+        final start = applyCursorStart(startPrefix);
+        final endEffective = applyCursorEnd(endExclusive);
+
+        if (endEffective.isNotEmpty &&
+            MemComparableKey.compare(start, endEffective) >= 0) {
+          return IndexSearchResult.empty();
         }
-      } else if (op == 'NOT LIKE' || op == '!=' || op == '<>') {
-        // Negative conditions are not selective and should use a table scan.
+        return _dataStore.indexTreePartitionManager.searchByKeyRange(
+          tableName: tableName,
+          indexName: indexName,
+          meta: meta,
+          startKeyInclusive: start,
+          endKeyExclusive: endEffective,
+          reverse: reverse,
+          limit: limit,
+          offset: effectiveOffset,
+        );
+      }
+
+      // Range comparisons
+      if (opUpper == '>' ||
+          opUpper == '>=' ||
+          opUpper == '<' ||
+          opUpper == '<=') {
+        // Similar to BETWEEN, skip native cache for complex open ranges for now.
+        // Focus on removing explicit MemComparableKey usages.
+        final prefix = encodePrefix(condition.value);
+        if (prefix == null) return IndexSearchResult.empty();
+
+        Uint8List startBound, endBound;
+        bool isLower = (opUpper == '>' || opUpper == '>=');
+
+        if (isLower) {
+          startBound =
+              (opUpper == '>') ? upperBoundExclusiveForPrefix(prefix) : prefix;
+          endBound = Uint8List(0);
+        } else {
+          startBound = Uint8List(0);
+          endBound =
+              (opUpper == '<=') ? upperBoundExclusiveForPrefix(prefix) : prefix;
+        }
+
+        // Apply cursors
+        final start = applyCursorStart(startBound);
+        final endEffective = applyCursorEnd(endBound);
+
+        if (endEffective.isNotEmpty &&
+            MemComparableKey.compare(start, endEffective) >= 0) {
+          return IndexSearchResult.empty();
+        }
+
+        return _dataStore.indexTreePartitionManager.searchByKeyRange(
+          tableName: tableName,
+          indexName: indexName,
+          meta: meta,
+          startKeyInclusive: start,
+          endKeyExclusive: endEffective,
+          reverse: reverse,
+          limit: limit,
+          offset: effectiveOffset,
+        );
+      }
+
+      // Full Index Scan (SCAN)
+      if (opUpper == 'SCAN') {
+        final start = applyCursorStart(Uint8List(0));
+        final end = applyCursorEnd(Uint8List(0));
+
+        if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+          return IndexSearchResult.empty();
+        }
+
+        if (_indexDataCache.isFullyCached([tableName, indexName])) {
+          return _scanIndexDataFullCache(tableName, indexName,
+              startKeyInclusive: start,
+              endKeyExclusive: end,
+              reverse: reverse,
+              isUnique: isUnique,
+              limit: limit,
+              offset: effectiveOffset,
+              schema: schema);
+        }
+
+        return await _dataStore.indexTreePartitionManager.searchByKeyRange(
+          tableName: tableName,
+          indexName: indexName,
+          meta: meta,
+          startKeyInclusive: start,
+          endKeyExclusive: end,
+          reverse: reverse,
+          limit: limit,
+          offset: effectiveOffset,
+        );
+      }
+
+      if (opUpper == 'LIKE' && condition.value is String) {
+        final pattern = condition.value as String;
+
+        // Find the effective prefix (stop at first wildcard)
+        int wildcardIndex = -1;
+        final firstPercent = pattern.indexOf('%');
+        final firstUnderscore = pattern.indexOf('_');
+
+        if (firstPercent != -1 && firstUnderscore != -1) {
+          wildcardIndex = min(firstPercent, firstUnderscore);
+        } else if (firstPercent != -1) {
+          wildcardIndex = firstPercent;
+        } else {
+          wildcardIndex = firstUnderscore;
+        }
+
+        // If there is ANY valid prefix before the wildcard, we can use it for range scan
+        if (wildcardIndex > 0 || (wildcardIndex == -1 && pattern.isNotEmpty)) {
+          final prefix = (wildcardIndex != -1)
+              ? pattern.substring(0, wildcardIndex)
+              : pattern;
+
+          // Helper to increment the last character of a string to find upper bound
+          String? incrementString(String s) {
+            if (s.isEmpty) return null;
+            final codeUnits = List<int>.from(s.codeUnits);
+            for (int i = codeUnits.length - 1; i >= 0; i--) {
+              if (codeUnits[i] < 0xFFFF) {
+                codeUnits[i]++;
+                return String.fromCharCodes(codeUnits);
+              }
+              codeUnits.removeLast();
+            }
+            return null;
+          }
+
+          final startBytes = encodePrefix(prefix);
+
+          Uint8List? endBytes;
+          if (prefix.isNotEmpty) {
+            final nextPrefix = incrementString(prefix);
+            if (nextPrefix != null) {
+              endBytes = encodePrefix(nextPrefix);
+            }
+          }
+
+          if (startBytes != null) {
+            final start = applyCursorStart(startBytes);
+            // If endBytes is null (meaning prefix empty or overflow), use empty (unbounded)
+            final end = applyCursorEnd(endBytes ?? Uint8List(0));
+
+            // Valid range check
+            if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+              return IndexSearchResult.empty();
+            }
+
+            if (_indexDataCache.isFullyCached([tableName, indexName])) {
+              return _scanIndexDataFullCache(tableName, indexName,
+                  startKeyInclusive: start,
+                  endKeyExclusive: end,
+                  reverse: reverse,
+                  isUnique: isUnique,
+                  limit: limit,
+                  offset: effectiveOffset,
+                  schema: schema);
+            }
+
+            return await _dataStore.indexTreePartitionManager.searchByKeyRange(
+              tableName: tableName,
+              indexName: indexName,
+              meta: meta,
+              startKeyInclusive: start,
+              endKeyExclusive: end,
+              reverse: reverse,
+              limit: limit,
+              offset: effectiveOffset,
+            );
+          }
+        }
         return IndexSearchResult.tableScan();
       }
 
-      // 1. Metadata, Schema, and Comparator setup
-      IndexMeta? meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) {
-        final tableSchemaOnDemand = await _dataStore.getTableSchema(tableName);
-        if (tableSchemaOnDemand != null &&
-            tableSchemaOnDemand.fields.isNotEmpty) {
-          await _checkAndRebuildTableIndexes(tableName, tableSchemaOnDemand);
-          meta = await _getIndexMeta(tableName, indexName); // Try again
-          if (meta == null) {
-            // If still not found after rebuild, fallback to table scan
-            return IndexSearchResult.tableScan();
+      if (opUpper == 'IN' && condition.value is List) {
+        // Prepare (value, prefix) pairs
+        final items = <(dynamic, Uint8List)>[];
+        for (final v in (condition.value as List)) {
+          final prefix = encodePrefix(v);
+          if (prefix != null) {
+            items.add((v, prefix));
           }
-        } else {
-          return IndexSearchResult.tableScan();
         }
-      }
 
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) return IndexSearchResult.tableScan();
-      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
-      final matcher = ValueMatcher.getMatcher(matcherType);
+        // Sort based on index order (forward or reverse)
+        // This ensures meaningful cursor traversal across the IN-list buckets.
+        items.sort((a, b) {
+          final cmp = MemComparableKey.compare(a.$2, b.$2);
+          return reverse ? -cmp : cmp;
+        });
 
-      dynamic startValue = condition.value;
-      dynamic endValue = condition.endValue;
+        // Unique values only (consecutive)
+        if (items.isNotEmpty) {
+          final uniqueItems = <(dynamic, Uint8List)>[];
+          for (int i = 0; i < items.length; i++) {
+            if (i == 0 ||
+                MemComparableKey.compare(items[i].$2, items[i - 1].$2) != 0) {
+              uniqueItems.add(items[i]);
+            }
+          }
+          items.clear();
+          items.addAll(uniqueItems);
+        }
 
-      // A helper function to perform search on a btree instance and group results
-      Future<Map<int, List<String>>> performBTreeSearchAndGroup(
-          BPlusTree btree) async {
-        List<dynamic> pointers = [];
-        switch (condition.operator.toUpperCase()) {
-          // Use toUpperCase to ensure operator is case insensitive
-          case '=':
-            pointers = await btree.search(startValue);
-            break;
-          case '>':
-            pointers =
-                await btree.searchRange(startValue, null, includeStart: false);
-            break;
-          case '>=':
-            pointers =
-                await btree.searchRange(startValue, null, includeStart: true);
-            break;
-          case '<':
-            pointers =
-                await btree.searchRange(null, startValue, includeEnd: false);
-            break;
-          case '<=':
-            pointers =
-                await btree.searchRange(null, startValue, includeEnd: true);
-            break;
-          case 'BETWEEN':
-            pointers = await btree.searchRange(startValue, endValue);
-            break;
-          case 'LIKE':
-            if (startValue is String) {
-              // A LIKE query can only be optimized into a B+Tree range scan if it's a simple prefix search,
-              // meaning it ends with '%' and has no other wildcards ('_' or '%') anywhere else.
-              final bool isSimplePrefixSearch = startValue.endsWith('%') &&
-                  !startValue
-                      .substring(0, startValue.length - 1)
-                      .contains('%') &&
-                  !startValue.substring(0, startValue.length - 1).contains('_');
+        final out = <String>[];
+        final int need = (limit == null) ? -1 : max(0, limit);
+        int remaining = need;
+        final yieldController = YieldController('index_search_in');
 
-              if (isSimplePrefixSearch) {
-                // It's a simple prefix, so we can use a fast range scan.
-                final prefix = startValue.substring(0, startValue.length - 1);
-                final endPrefix = '$prefix\uffff';
-                pointers = await btree.searchRange(prefix, endPrefix,
-                    includeStart: true, includeEnd: true);
-              } else {
-                // For any other LIKE pattern (e.g., '%val', '%val%', 'v_lue%'),
-                // we must fall back to a full scan of the index leaf nodes.
-                pointers = await btree.scanAndMatch(startValue);
+        for (final item in items) {
+          final v = item.$1;
+          final prefix = item.$2;
+
+          await yieldController.maybeYield();
+          if (remaining == 0) break;
+
+          final endBound = upperBoundExclusiveForPrefix(prefix);
+          final start = applyCursorStart(prefix);
+          final end = applyCursorEnd(endBound);
+
+          // If range is invalid (fully behind cursor), skip
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            continue;
+          }
+
+          final List<dynamic>? nativeVal = normalizeValues(v, fields.length);
+          bool usedCache = false;
+
+          // Try Cache with Native Key (ONLY if full bucket scan is requested)
+          // i.e., start == prefix AND end == endBound (no cursor slicing in this bucket)
+          if (nativeVal != null &&
+              MemComparableKey.compare(start, prefix) == 0 &&
+              MemComparableKey.compare(end, endBound) == 0) {
+            final cacheRes = await checkCache(nativeVal, null, null);
+            if (cacheRes != null) {
+              out.addAll(cacheRes.primaryKeys);
+              usedCache = true;
+            }
+          }
+
+          if (!usedCache) {
+            if (isUnique) {
+              // For unique index, if cursor > prefix, 'start' will be > 'prefix', so we skip.
+              if (MemComparableKey.compare(start, prefix) > 0) continue;
+
+              final pk = await _dataStore.indexTreePartitionManager
+                  .lookupUniquePrimaryKey(
+                tableName: tableName,
+                indexName: indexName,
+                meta: meta,
+                uniqueKey: prefix,
+              );
+              if (pk != null) {
+                out.add(pk);
+                if (nativeVal != null) {
+                  final compositeKey = [tableName, indexName, ...nativeVal];
+                  _indexDataCache.put(compositeKey, pk);
+                }
+              }
+            } else {
+              // Range Scan
+              final res =
+                  await _dataStore.indexTreePartitionManager.searchByKeyRange(
+                tableName: tableName,
+                indexName: indexName,
+                meta: meta,
+                startKeyInclusive: start,
+                endKeyExclusive: end,
+                reverse: reverse,
+                limit: remaining > 0 ? remaining : null,
+                offset: null, // Offset is handled globally for IN
+              );
+
+              // Hotspot populate: Populate cache if we did a full bucket scan (no cursor)
+              if (!usedCache &&
+                  nativeVal != null &&
+                  !hasCursorKey &&
+                  !(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+                if (isUnique) {
+                  if (res.primaryKeys.isNotEmpty) {
+                    _indexDataCache.put([tableName, indexName, ...nativeVal],
+                        res.primaryKeys.first);
+                  }
+                } else {
+                  final prefixKey = <dynamic>[
+                    tableName,
+                    indexName,
+                    ...nativeVal
+                  ];
+                  final yc = YieldController(
+                      'IndexManager.hotspotPopulateNonUniqueIn');
+                  for (final pk in res.primaryKeys) {
+                    await yc.maybeYield();
+                    _indexDataCache.put(
+                      <dynamic>[...prefixKey, pk],
+                      true,
+                      size: pk.length + 1,
+                    );
+                  }
+                }
+              }
+
+              out.addAll(res.primaryKeys);
+              if (remaining > 0) {
+                remaining -= res.primaryKeys.length;
+                if (remaining <= 0) break;
               }
             }
-            break;
-        }
-        final Map<int, List<String>> grouped = {};
-
-        // Add async yield to avoid UI jank
-        int processedCount = 0;
-        for (final pointer in pointers) {
-          final storeIndex = StoreIndex.fromString(pointer.toString());
-          if (storeIndex != null) {
-            grouped
-                .putIfAbsent(storeIndex.partitionId, () => [])
-                .add(pointer.toString());
           }
 
-          // Yield to the event loop to prevent UI jank if there are many indexes.
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
+          if (remaining > 0) {
+            remaining = max(0, need - out.length);
           }
         }
-        return grouped;
-      }
 
-      // 2. Cache Check
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      if (_indexCache.containsKey(cacheKey) &&
-          _indexFullyCached[cacheKey] == true) {
-        await _updateIndexAccessWeight(cacheKey);
-        final btree = _indexCache[cacheKey]!;
-        final pointers = await performBTreeSearchAndGroup(btree);
-        return IndexSearchResult(pointersByPartition: pointers);
-      }
-
-      // 3. Decide on loading strategy
-      if (_shouldFullCacheIndex(tableName, indexName, meta)) {
-        final btree = await _loadIndexFromFile(
-            tableName, indexName, meta, matcher, matcherType);
-        if (btree == null) return IndexSearchResult.tableScan();
-        await _updateIndexAccessWeight(cacheKey);
-        _indexCache[cacheKey] = btree;
-        _indexFullyCached[cacheKey] = true;
-        _indexSizeCache[cacheKey] = _estimateIndexSize(btree);
-        _currentIndexCacheSize += _indexSizeCache[cacheKey] ?? 0;
-        final pointers = await performBTreeSearchAndGroup(btree);
-        return IndexSearchResult(pointersByPartition: pointers);
-      }
-
-      // Priority: Check for full table cache.
-      if (await _dataStore.dataCacheManager.isTableFullyCached(tableName)) {
-        return IndexSearchResult.tableScan();
-      }
-
-      // 4. Partition-by-partition search
-      final Map<int, List<String>> allPointersByPartition = {};
-      int totalFound = 0;
-
-      bool addResults(Map<int, List<String>> pointers) {
-        if (pointers.isNotEmpty) {
-          pointers.forEach((partitionId, pointerList) {
-            allPointersByPartition
-                .putIfAbsent(partitionId, () => [])
-                .addAll(pointerList);
-            totalFound += pointerList.length;
-          });
+        // Final Filter
+        List<String> finalPks = out;
+        if (effectiveOffset != null && effectiveOffset > 0) {
+          if (effectiveOffset >= finalPks.length)
+            return IndexSearchResult.empty();
+          finalPks = finalPks.sublist(effectiveOffset);
         }
-        return limit != null && totalFound >= limit;
-      }
-
-      List<int> partitionIndices;
-      bool isPrefixSearch = condition.operator == 'LIKE' &&
-          condition.value is String &&
-          condition.value.endsWith('%') &&
-          !condition.value.startsWith('%');
-
-      if (meta.isOrdered == true) {
-        if (condition.operator == '=') {
-          // Optimization for equality check on an ordered index
-          final partitionIndex = meta.findPartitionForKey(startValue, matcher);
-          partitionIndices = partitionIndex != -1 ? [partitionIndex] : [];
-        } else if (isPrefixSearch) {
-          // Optimization for "LIKE 'prefix%'" on an ordered index
-          final prefix =
-              condition.value.substring(0, condition.value.length - 1);
-          partitionIndices = await findPartitionsForKeyRange(
-              tableName, indexName, prefix, null, matcher);
-        } else if (['>', '>=', '<', '<=', 'BETWEEN']
-            .contains(condition.operator)) {
-          // Optimization for range queries on an ordered index
-          partitionIndices = await findPartitionsForKeyRange(
-              tableName, indexName, startValue, endValue, matcher);
-        } else {
-          // Fallback for other operators on an ordered index (e.g., LIKE '%value%')
-          partitionIndices = meta.partitions.map((p) => p.index).toList();
-        }
-      } else {
-        // For non-ordered indexes, we must scan all partitions
-        partitionIndices = meta.partitions.map((p) => p.index).toList();
-      }
-
-      // Add async yield to avoid UI jank
-      for (int i = 0; i < partitionIndices.length; i++) {
-        final partitionIndex = partitionIndices[i];
-        final btree = await _loadSelectiveIndex(
-            tableName, indexName, meta, partitionIndex, matcher, matcherType);
-        if (btree == null) continue;
-
-        final pointers = await performBTreeSearchAndGroup(btree);
-        if (addResults(pointers)) {
-          break; // Limit reached
+        if (limit != null && finalPks.length > limit) {
+          finalPks = finalPks.sublist(0, limit);
         }
 
-        // Yield to the event loop to prevent UI jank if there are many indexes.
-        if (i % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
+        if (finalPks.isEmpty) return IndexSearchResult.empty();
+        return IndexSearchResult(primaryKeys: finalPks);
       }
 
-      return IndexSearchResult(pointersByPartition: allPointersByPartition);
-    } catch (e, stack) {
-      Logger.error('Failed to search index $tableName.$indexName: $e\n$stack',
+      // LIKE / != / others: fallback to table scan for correctness.
+      return IndexSearchResult.tableScan();
+    } catch (e, s) {
+      Logger.error('searchIndex failed: $e\n$s',
           label: 'IndexManager.searchIndex');
       return IndexSearchResult.tableScan();
     }
   }
 
-  /// Batch search an index for a given list of keys.
-  Future<Map<dynamic, List<dynamic>>> batchSearchIndex(
-      String tableName, String indexName, List<dynamic> keys) async {
-    final Map<dynamic, List<dynamic>> allResults = {};
-    if (keys.isEmpty) {
-      return allResults;
-    }
+  Future<IndexSearchResult> _scanIndexDataFullCache(
+    String tableName,
+    String indexName, {
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    required bool reverse,
+    required bool isUnique,
+    int? limit,
+    int? offset,
+    required TableSchema schema,
+  }) async {
+    // OPTIMIZATION: Decode bounds to seek in TreeCache
+    List<dynamic>? rangeStart;
+    List<dynamic>? rangeEnd;
 
     try {
-      final cacheKey = _getIndexCacheKey(tableName, indexName);
-      final keysToSearch = keys.toSet();
+      if (startKeyInclusive.isNotEmpty) {
+        // Decode start cursor
+        final decoded = MemComparableKey.decodeTuple(startKeyInclusive);
+        rangeStart = [tableName, indexName, ...decoded];
+      }
 
-      // Search write buffer first, as it contains the most recent, not-yet-persisted data.
-      if (_writeBuffer.containsKey(cacheKey)) {
-        final buffer = _writeBuffer[cacheKey]!;
-        int processedCount = 0;
-        for (final entry in buffer.values) {
-          if (keysToSearch.contains(entry.indexEntry.indexKey)) {
-            final key = entry.indexEntry.indexKey;
-            final pointer = entry.indexEntry.recordPointer.toString();
-            final entryUniqueKey =
-                IndexBufferEntry.createUniqueKey(key, pointer);
-
-            // Ensure the entry isn't pending deletion.
-            if (_deleteBuffer.containsKey(cacheKey) &&
-                _deleteBuffer[cacheKey]!.containsKey(entryUniqueKey)) {
-              continue;
-            }
-
-            allResults.putIfAbsent(key, () => []).add(pointer);
-          }
-        }
-
-        // yield to the event loop
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
+      if (endKeyExclusive.isNotEmpty) {
+        final decoded = MemComparableKey.decodeTuple(endKeyExclusive);
+        rangeEnd = [tableName, indexName, ...decoded];
+        if (!isUnique) {
+          // Optimized: Even with truncation, encoded cursor <= real key.
+          // EndKey (Cursor) is Exclusive.
+          // If StartAt = Cursor.
+          // RealKey > Cursor.
+          // RealKey >= StartAt.
+          // Reverse Scan needs items < Cursor.
+          // Since RealKey > Cursor, it is correctly excluded if we seek to Cursor.
+          // Thus, it is safe to use rangeEnd for seeking in reverse mode.
         }
       }
-
-      // 1. Check cache first - if fully loaded, perform search in memory and merge.
-      if (_indexCache.containsKey(cacheKey) &&
-          _indexFullyCached[cacheKey] == true) {
-        await _updateIndexAccessWeight(cacheKey);
-        final btree = _indexCache[cacheKey]!;
-        int processedCount = 0;
-        for (final key in keys) {
-          final results = await btree.search(key);
-          if (results.isNotEmpty) {
-            // Merge results, avoiding duplicates.
-            final existingPointers = allResults.putIfAbsent(key, () => []);
-            for (final res in results) {
-              if (!existingPointers.contains(res)) {
-                existingPointers.add(res);
-              }
-            }
-          }
-
-          // Yield to the event loop to prevent UI jank if there are many indexes.
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-        return allResults;
-      }
-
-      final meta = await _getIndexMeta(tableName, indexName);
-      if (meta == null) {
-        return allResults; // No index meta, return buffer results.
-      }
-
-      final tableSchema = await _dataStore.getTableSchema(tableName);
-      if (tableSchema == null) {
-        return allResults;
-      }
-      final matcherType = tableSchema.getMatcherTypeForIndex(indexName);
-      final matcher = ValueMatcher.getMatcher(matcherType);
-
-      // Group keys by the partition they should reside in.
-      final Map<int, List<dynamic>> partitionJobs = {};
-
-      if (meta.isOrdered == true) {
-        // For ordered indexes, we can find the exact partition for each key.
-        // Add async yield to avoid UI jank
-        int processedCount = 0;
-        for (final key in keys) {
-          final partitionIndex = meta.findPartitionForKey(key, matcher);
-          if (partitionIndex != -1) {
-            partitionJobs.putIfAbsent(partitionIndex, () => []).add(key);
-          }
-          // Note: If key is out of range, it won't be found. This is expected.
-
-          // Yield to the event loop to prevent UI jank if there are many indexes.
-          processedCount++;
-          if (processedCount % 50 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-      } else {
-        // For non-ordered indexes, every key must be checked against every partition.
-        final allPartitions = meta.partitions.map((p) => p.index).toList();
-        for (final partitionIndex in allPartitions) {
-          partitionJobs.putIfAbsent(partitionIndex, () => []).addAll(keys);
-        }
-      }
-
-      if (partitionJobs.isEmpty) {
-        return allResults;
-      }
-
-      // Execute search tasks in parallel for each relevant partition.
-      final tasks = <Future<BatchSearchTaskResult> Function()>[];
-      final partitionMetas = {for (var p in meta.partitions) p.index: p};
-
-      // Add async yield to avoid UI jank
-      int jobCount = 0;
-      for (final jobEntry in partitionJobs.entries) {
-        final partitionIndex = jobEntry.key;
-        final keysForPartition = jobEntry.value;
-        final partitionMeta = partitionMetas[partitionIndex];
-
-        if (partitionMeta == null) continue;
-
-        tasks.add(() async {
-          try {
-            final partitionPath = await _dataStore.pathManager
-                .getIndexPartitionPath(tableName, indexName, partitionIndex);
-            if (!await _dataStore.storage.existsFile(partitionPath)) {
-              return BatchSearchTaskResult(found: {});
-            }
-            final content =
-                await _dataStore.storage.readAsString(partitionPath);
-            if (content == null || content.isEmpty) {
-              return BatchSearchTaskResult(found: {});
-            }
-
-            final request = BatchSearchTaskRequest(
-              content: content,
-              keys: keysForPartition,
-              isUnique: meta.isUnique,
-              matcherType: matcherType,
-            );
-
-            return await ComputeManager.run(
-              batchSearchIndexPartitionTask,
-              request,
-              useIsolate:
-                  content.length > 1024 * 10 || keysForPartition.length > 50,
-            );
-          } catch (e) {
-            Logger.error(
-                'Failed to batch search index partition $partitionIndex: $e',
-                label: 'IndexManager.batchSearchIndex');
-            return BatchSearchTaskResult(found: {});
-          }
-        });
-
-        // Yield to the event loop to prevent UI jank if there are many indexes.
-        jobCount++;
-        if (jobCount % 10 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-
-      final resultsFromPartitions =
-          await ParallelProcessor.execute<BatchSearchTaskResult>(tasks,
-              label: 'IndexManager.batchSearchIndex');
-
-      // Merge results from all partitions.
-      // Add async yield to avoid UI jank
-      int resultCount = 0;
-      for (final result in resultsFromPartitions) {
-        if (result != null) {
-          result.found.forEach((key, value) {
-            // Merge results, avoiding duplicates.
-            final existingPointers = allResults.putIfAbsent(key, () => []);
-            for (final v in value) {
-              if (!existingPointers.contains(v)) {
-                existingPointers.add(v);
-              }
-            }
-          });
-
-          // Yield to the event loop to prevent UI jank if there are many indexes.
-          resultCount++;
-          if (resultCount % 10 == 0) {
-            await Future.delayed(Duration.zero);
-          }
-        }
-      }
-
-      return allResults;
-    } catch (e) {
-      Logger.error('Failed to batch search index $tableName.$indexName: $e',
-          label: 'IndexManager.batchSearchIndex');
-      return allResults; // Return whatever was found, even on error.
+    } catch (_) {
+      rangeStart = null;
+      rangeEnd = null;
     }
+
+    _registerIndexComparator(tableName, indexName, schema);
+
+    int scannedCount = 0;
+    int addedCount = 0;
+
+    final prefixKey = [tableName, indexName];
+    // Safety check on bounds validity vs prefix
+    if (rangeStart != null &&
+        (rangeStart.length < 2 || rangeStart[0] != tableName))
+      rangeStart = null;
+    if (rangeEnd != null && (rangeEnd.length < 2 || rangeEnd[0] != tableName))
+      rangeEnd = null;
+
+    final results = <String>[];
+
+    await _indexDataCache.scanRange(rangeStart ?? prefixKey, rangeEnd,
+        reverse: reverse, onEntry: (key, val) {
+      if (key.length < 2 || key[0] != tableName || key[1] != indexName)
+        return false;
+
+      final keyValues = key.sublist(2); // values + pk?
+
+      if (startKeyInclusive.isNotEmpty || endKeyExclusive.isNotEmpty) {
+        final index =
+            schema.indexes.firstWhere((i) => i.actualIndexName == indexName);
+        final comps = <Uint8List>[];
+        final bool truncateText = !index.unique;
+
+        final int fieldCount = index.fields.length;
+        if (keyValues.length < fieldCount) return true;
+
+        for (int i = 0; i < fieldCount; i++) {
+          final c = schema.encodeFieldComponentToMemComparable(
+              index.fields[i], keyValues[i],
+              truncateText: truncateText);
+          if (c != null) comps.add(c);
+        }
+
+        if (!index.unique) {
+          final pk = keyValues.last;
+          if (pk != null) {
+            comps.add(schema.encodePrimaryKeyComponent(pk.toString()));
+          }
+        }
+
+        final encodedKey = MemComparableKey.encodeTuple(comps);
+
+        if (startKeyInclusive.isNotEmpty) {
+          if (MemComparableKey.compare(encodedKey, startKeyInclusive) < 0) {
+            return reverse ? false : true;
+          }
+        }
+        if (endKeyExclusive.isNotEmpty) {
+          if (MemComparableKey.compare(encodedKey, endKeyExclusive) >= 0) {
+            return reverse ? true : false;
+          }
+        }
+      }
+
+      scannedCount++;
+
+      if (offset != null && scannedCount <= offset) return true;
+
+      String? pk;
+      if (isUnique) {
+        pk = val as String;
+      } else {
+        pk = key.isNotEmpty ? key.last?.toString() : null;
+      }
+
+      if (pk != null) {
+        results.add(pk);
+        addedCount++;
+      }
+
+      if (limit != null && addedCount >= limit) return false;
+
+      return true;
+    });
+
+    return IndexSearchResult(primaryKeys: results);
+  }
+
+  /// Get current index data cache size in bytes (Data Partition + Range Partition Data + B+Tree pages)
+  Future<int> getCurrentIndexDataCacheSize() async {
+    // Include both data cache and page cache (B+Tree pages)
+    final dataCacheSize = _indexDataCache.estimatedTotalSizeBytes;
+    final pageCacheSize =
+        _dataStore.indexTreePartitionManager.getCurrentPageCacheSize();
+    return dataCacheSize + pageCacheSize;
+  }
+
+  /// Get current index metadata cache size in bytes (Schema/Directories)
+  Future<int> getCurrentIndexMetaCacheSize() async {
+    return _indexMetaCache.estimatedTotalSizeBytes;
+  }
+
+  /// Get TOTAL index cache size (Data + Meta)
+  Future<int> getCurrentIndexCacheSize() async {
+    return (await getCurrentIndexMetaCacheSize()) +
+        (await getCurrentIndexDataCacheSize());
+  }
+
+  /// Remove full index cache for a specific table
+  Future<void> removeFullIndexCacheForTable(String tableName) async {
+    _indexDataCache.remove([tableName]);
+  }
+
+  /// Remove index meta cache for table
+  Future<void> removeIndexMetaCacheForTable(String tableName) async {
+    if (tableName.isEmpty) return;
+
+    // Remove from TreeCache using hierarchical prefix
+    _indexMetaCache.remove([tableName]);
+  }
+
+  /// Clear all index metadata cache
+  Future<void> clearIndexMetaCache() async {
+    _indexMetaCache.clear();
   }
 }
 
@@ -4502,10 +2796,13 @@ class _UniqueConstraint {
   final List<String> fields;
   final dynamic value;
   final String indexName;
+  // fast-path canonical key for write buffer check (raw value or List)
+  final dynamic canonicalKey;
 
   _UniqueConstraint({
     required this.fields,
     required this.value,
     required this.indexName,
+    this.canonicalKey,
   });
 }

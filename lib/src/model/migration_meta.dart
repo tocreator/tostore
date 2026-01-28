@@ -1,55 +1,78 @@
+import 'meta_info.dart';
+
 /// migration system meta
 class MigrationMeta {
-  /// current available directory index
-  final int currentDirIndex;
+  /// Directory mapping for migration tasks.
+  /// Maintains taskId -> dirIndex mapping and dirIndex -> fileCount mapping.
+  final DirectoryMappingString directoryMapping;
 
-  /// directory file count statistics {dirIndex: fileCount}
-  final Map<int, int> dirUsage;
+  MigrationMeta({
+    DirectoryMappingString? directoryMapping,
+  }) : directoryMapping = directoryMapping ?? DirectoryMappingString();
 
-  /// task location index {taskId: dirIndex}
-  final Map<String, int> taskIndex;
-
-  const MigrationMeta({
-    required this.currentDirIndex,
-    required this.dirUsage,
-    required this.taskIndex,
-  });
-
-  factory MigrationMeta.initial() => const MigrationMeta(
-        currentDirIndex: 0,
-        dirUsage: {0: 0},
-        taskIndex: {},
+  factory MigrationMeta.initial() => MigrationMeta(
+        directoryMapping: DirectoryMappingString(),
       );
 
   /// get the task directory path
-  String getTaskDir(int dirIndex) => 'migration_$dirIndex';
+  String getTaskDir(int dirIndex) => 'dir_$dirIndex';
 
   /// convert to json
   Map<String, dynamic> toJson() => {
-        'currentDirIndex': currentDirIndex,
-        'dirUsage': Map<String, dynamic>.from(
-            dirUsage.map((k, v) => MapEntry(k.toString(), v))),
-        'taskIndex': Map<String, dynamic>.from(taskIndex),
+        'directoryMapping': directoryMapping.toJson(),
       };
 
   /// create from json
-  factory MigrationMeta.fromJson(Map<String, dynamic> json) => MigrationMeta(
-        currentDirIndex: json['currentDirIndex'] as int,
-        dirUsage: (json['dirUsage'] as Map<dynamic, dynamic>)
-            .map((k, v) => MapEntry(int.parse(k.toString()), v as int)),
-        taskIndex: (json['taskIndex'] as Map<dynamic, dynamic>)
-            .map((k, v) => MapEntry(k as String, v as int)),
+  factory MigrationMeta.fromJson(Map<String, dynamic> json) {
+    // Handle legacy format (v1) for backward compatibility during upgrade
+    if (json.containsKey('dirUsage') || json.containsKey('taskIndex')) {
+      // Legacy format: convert to new format
+      final Map<String, int> idToDir = <String, int>{};
+      final Map<int, int> dirToFileCount = <int, int>{};
+
+      // Convert taskIndex to idToDir
+      if (json['taskIndex'] is Map) {
+        final taskIndex = json['taskIndex'] as Map<dynamic, dynamic>;
+        taskIndex.forEach((key, value) {
+          if (key is String && value is int) {
+            idToDir[key] = value;
+          }
+        });
+      }
+
+      // Convert dirUsage to dirToFileCount
+      if (json['dirUsage'] is Map) {
+        final dirUsage = json['dirUsage'] as Map<dynamic, dynamic>;
+        dirUsage.forEach((key, value) {
+          final idx = int.tryParse(key.toString());
+          if (idx != null && value is int) {
+            dirToFileCount[idx] = value;
+          }
+        });
+      }
+
+      return MigrationMeta(
+        directoryMapping: DirectoryMappingString(
+          idToDir: idToDir,
+          dirToFileCount: dirToFileCount,
+        ),
       );
+    }
+
+    // New format (v2+)
+    return MigrationMeta(
+      directoryMapping: json['directoryMapping'] != null
+          ? DirectoryMappingString.fromJson(
+              json['directoryMapping'] as Map<String, dynamic>)
+          : DirectoryMappingString(),
+    );
+  }
 
   /// create a copy and modify some fields
   MigrationMeta copyWith({
-    int? currentDirIndex,
-    Map<int, int>? dirUsage,
-    Map<String, int>? taskIndex,
+    DirectoryMappingString? directoryMapping,
   }) =>
       MigrationMeta(
-        currentDirIndex: currentDirIndex ?? this.currentDirIndex,
-        dirUsage: dirUsage ?? this.dirUsage,
-        taskIndex: taskIndex ?? this.taskIndex,
+        directoryMapping: directoryMapping ?? this.directoryMapping,
       );
 }

@@ -1,960 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:math';
 
-import 'b_plus_tree.dart';
-import '../model/index_entry.dart';
-import '../model/file_info.dart';
 import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../model/migration_task.dart';
-import '../handler/encoder.dart';
 import '../handler/value_matcher.dart';
 import '../handler/logger.dart';
+import 'btree_page.dart';
 import 'table_data_manager.dart';
+import 'yield_controller.dart';
+import '../handler/wal_encoder.dart';
+import '../handler/encoder.dart';
 import '../model/encoder_config.dart';
-import 'data_compressor.dart';
-
-/// Helper class for organizing parallel write jobs.
-class PartitionWriteJob {
-  final int partitionIndex;
-  final List<IndexBufferEntry> entries;
-  String? existingContent; // Loaded before sending to isolate
-  Future<IndexProcessingResult>? future;
-  IndexProcessingResult? result;
-
-  // For primary key range tracking when table is ordered
-  dynamic minKey;
-  dynamic maxKey;
-
-  PartitionWriteJob({required this.partitionIndex, required this.entries});
-}
-
-/// Request data for processing an index partition in an isolate.
-class IndexProcessingRequest {
-  /// A list of entries (insertions) to be processed for this partition.
-  final List<IndexBufferEntry> entries;
-
-  /// The string content of an existing partition file. Null for new partitions.
-  final String? existingPartitionContent;
-
-  /// Whether the index is unique.
-  final bool isUnique;
-
-  /// The data type of the index key, for optimized comparison.
-  final MatcherType matcherType;
-
-  IndexProcessingRequest({
-    required this.entries,
-    this.existingPartitionContent,
-    required this.isUnique,
-    required this.matcherType,
-  });
-}
-
-/// Request data for processing index deletion in an isolate.
-class IndexDeleteRequest {
-  /// The content of the partition file to process
-  final String content;
-
-  /// The checksum of the partition file (optional)
-  final String? checksum;
-
-  /// Whether the index is unique
-  final bool isUnique;
-
-  /// The keys to process for deletion
-  final List<String> keysToProcess;
-
-  /// The entries to delete mapped by key
-  final Map<String, IndexBufferEntry> entriesToDelete;
-
-  /// The data type of the index key, for optimized comparison.
-  final MatcherType matcherType;
-
-  IndexDeleteRequest({
-    required this.content,
-    this.checksum,
-    required this.isUnique,
-    required this.keysToProcess,
-    required this.entriesToDelete,
-    required this.matcherType,
-  });
-}
-
-/// Result data from processing an index deletion in an isolate.
-class IndexDeleteResult {
-  /// Whether the B+ tree was modified
-  final bool isModified;
-
-  /// The new content of the B+ tree
-  final String newContent;
-
-  /// The number of entries in the B+ tree after processing
-  final int entryCount;
-
-  /// The keys that were successfully processed
-  final List<String> processedKeys;
-
-  /// The checksum of the new content
-  final String checksum;
-
-  IndexDeleteResult({
-    required this.isModified,
-    required this.newContent,
-    required this.entryCount,
-    required this.processedKeys,
-    required this.checksum,
-  });
-}
-
-/// Result data from processing an index partition in an isolate.
-class IndexProcessingResult {
-  /// The serialized B+ tree as a string, ready to be written to a file.
-  final String serializedBTree;
-
-  /// The size of the new serialized B+ tree.
-  final int newSize;
-
-  /// The total number of entries in the B+ tree after processing.
-  final int entryCount;
-
-  IndexProcessingResult({
-    required this.serializedBTree,
-    required this.newSize,
-    required this.entryCount,
-  });
-
-  /// A factory for creating a failed result.
-  factory IndexProcessingResult.failed() => IndexProcessingResult(
-        serializedBTree: '',
-        newSize: 0,
-        entryCount: 0,
-      );
-
-  /// Check if the result indicates a failure.
-  bool get isFailed => serializedBTree.isEmpty && newSize == 0;
-}
-
-/// Builds a B+ tree from a string representation or creates a new one.
-Future<BPlusTree> _buildBTree(
-    String? content, bool isUnique, MatcherFunction comparator) async {
-  if (content != null && content.isNotEmpty) {
-    return await BPlusTree.fromString(
-      content,
-      isUnique: isUnique,
-      comparator: comparator,
-    );
-  } else {
-    return BPlusTree(
-      isUnique: isUnique,
-      comparator: comparator,
-    );
-  }
-}
-
-/// A top-level function for processing index writes in a separate isolate.
-Future<IndexProcessingResult> processIndexPartition(
-    IndexProcessingRequest request) async {
-  try {
-    // Get the specific comparator for the key type.
-    final comparator = ValueMatcher.getMatcher(request.matcherType);
-
-    // Initialize B+ tree, either from existing content or as a new tree.
-    BPlusTree btree;
-    try {
-      btree = await _buildBTree(
-          request.existingPartitionContent, request.isUnique, comparator);
-    } catch (treeInitError) {
-      Logger.error('Failed to initialize B+ tree: $treeInitError',
-          label: 'processIndexPartition');
-      return IndexProcessingResult.failed();
-    }
-
-    // Insert each entry into the B+ tree.
-    // This is the main CPU-intensive part.
-    int failedCount = 0;
-    int processedCount = 0;
-    for (final bufferEntry in request.entries) {
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      try {
-        final entry = bufferEntry.indexEntry;
-        await btree.insert(entry.indexKey, entry.recordPointer.toString());
-      } catch (insertError) {
-        failedCount++;
-        Logger.warn('Failed to insert entry: $insertError',
-            label: 'processIndexPartition');
-        // Continue with next entry
-        continue;
-      }
-    }
-
-    if (failedCount > 0) {
-      Logger.warn(
-          'Failed to insert $failedCount entries out of ${request.entries.length}',
-          label: 'processIndexPartition');
-    }
-
-    // Serialize the final tree to a string.
-    String serialized;
-    try {
-      serialized = btree.toStringHandle();
-    } catch (serializeError) {
-      Logger.error('Failed to serialize B+ tree: $serializeError',
-          label: 'processIndexPartition');
-      return IndexProcessingResult.failed();
-    }
-
-    // Return the results.
-    return IndexProcessingResult(
-      serializedBTree: serialized,
-      newSize: serialized.length,
-      entryCount: btree.count(),
-    );
-  } catch (e) {
-    Logger.error('Failed to process index partition: $e',
-        label: 'processIndexPartition');
-    return IndexProcessingResult.failed();
-  }
-}
-
-/// Process index deletion in an isolate
-///
-/// This function takes an [IndexDeleteRequest], processes the deletion of entries
-/// from a B+ tree, and returns an [IndexDeleteResult].
-Future<IndexDeleteResult> processIndexDelete(IndexDeleteRequest request) async {
-  try {
-    // Get the specific comparator for the key type.
-    final comparator = ValueMatcher.getMatcher(request.matcherType);
-
-    // Initialize B+ tree from content
-    BPlusTree btree;
-    try {
-      btree = await BPlusTree.fromString(
-        request.content,
-        isUnique: request.isUnique,
-        comparator: comparator,
-      );
-    } catch (treeError) {
-      Logger.error('Failed to initialize B+ tree: $treeError',
-          label: 'processIndexDelete');
-      // Return unmodified content as fallback
-      // Always calculate fresh checksum from content
-      final freshChecksum =
-          DataCompressor().getChecksumStringFromString(request.content);
-      return IndexDeleteResult(
-        isModified: false,
-        newContent: request.content,
-        entryCount: 0,
-        processedKeys: [],
-        checksum: freshChecksum,
-      );
-    }
-
-    // Track whether the B+ tree was modified
-    bool isModified = false;
-
-    // Track which keys were processed
-    final processedKeys = <String>[];
-    int processedCount = 0;
-
-    // Process each key to delete
-    for (final compositeKey in request.keysToProcess) {
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      try {
-        // Get index entry
-        final indexEntry = request.entriesToDelete[compositeKey];
-        if (indexEntry == null) {
-          continue;
-        }
-
-        // Get actual index key and record pointer from IndexBufferEntry
-        final actualIndexKey = indexEntry.indexEntry.indexKey;
-        final recordPointer = indexEntry.indexEntry.recordPointer.toString();
-
-        // Delete the index entry
-        if (await btree.delete(actualIndexKey, recordPointer)) {
-          isModified = true;
-          processedKeys.add(compositeKey);
-        }
-      } catch (keyError) {
-        Logger.warn('Failed to process delete for key $compositeKey: $keyError',
-            label: 'processIndexDelete');
-        // Continue with next key
-        continue;
-      }
-    }
-
-    String newContent;
-    try {
-      // Serialize the B+ tree if modified
-      newContent = isModified ? btree.toStringHandle() : request.content;
-    } catch (serializeError) {
-      Logger.error('Failed to serialize B+ tree: $serializeError',
-          label: 'processIndexDelete');
-      // Use original content as fallback
-      newContent = request.content;
-      isModified = false;
-    }
-
-    // Calculate checksum from the new content, always use the latest content
-    final newChecksum =
-        DataCompressor().getChecksumStringFromString(newContent);
-
-    // Return the results with the newly calculated checksum
-    return IndexDeleteResult(
-      isModified: isModified,
-      newContent: newContent,
-      entryCount: btree.count(),
-      processedKeys: processedKeys,
-      checksum: newChecksum,
-    );
-  } catch (e) {
-    Logger.error('Failed to process index delete operation: $e',
-        label: 'processIndexDelete');
-    // Return unmodified content as fallback
-    // Always calculate checksum from current content to ensure consistency
-    final actualChecksum =
-        DataCompressor().getChecksumStringFromString(request.content);
-    return IndexDeleteResult(
-      isModified: false,
-      newContent: request.content,
-      entryCount: 0,
-      processedKeys: [],
-      checksum: actualChecksum,
-    );
-  }
-}
-
-/// Request data for decoding partition data in an isolate.
-class DecodePartitionRequest {
-  /// The bytes to decode
-  final Uint8List bytes;
-
-  /// Optional encoder state for isolate execution
-  final EncoderConfig? encoderState;
-
-  /// Optional custom key for decoding (for backup/migration scenarios)
-  final List<int>? customKey;
-
-  /// Optional custom keyId for decoding (for backup/migration scenarios)
-  final int? customKeyId;
-
-  DecodePartitionRequest({
-    required this.bytes,
-    this.encoderState,
-    this.customKey,
-    this.customKeyId,
-  });
-}
-
-/// Request data for encoding partition data in an isolate.
-class EncodePartitionRequest {
-  /// The records to encode
-  final List<Map<String, dynamic>> records;
-
-  /// The partition index
-  final int partitionIndex;
-
-  /// The primary key field name
-  final String primaryKey;
-
-  /// Optional minimum primary key value
-  final dynamic minPk;
-
-  /// Optional maximum primary key value
-  final dynamic maxPk;
-
-  /// The partition path
-  final String partitionPath;
-
-  /// The parent path
-  final String parentPath;
-
-  /// The timestamps
-  final Timestamps timestamps;
-
-  /// Optional encoder state for isolate execution
-  final EncoderConfig? encoderState;
-
-  /// Optional custom key for encoding (for backup/migration scenarios)
-  final List<int>? customKey;
-
-  /// Optional custom keyId for encoding (for backup/migration scenarios)
-  final int? customKeyId;
-
-  EncodePartitionRequest({
-    required this.records,
-    required this.partitionIndex,
-    required this.primaryKey,
-    this.minPk,
-    this.maxPk,
-    required this.partitionPath,
-    required this.parentPath,
-    required this.timestamps,
-    this.encoderState,
-    this.customKey,
-    this.customKeyId,
-  });
-}
-
-/// Result data from encoding partition data in an isolate.
-class EncodedPartitionResult {
-  /// The encoded data
-  final Uint8List encodedData;
-
-  /// The updated partition meta
-  final PartitionMeta partitionMeta;
-
-  /// The number of non-empty records
-  final int nonEmptyRecordCount;
-
-  EncodedPartitionResult({
-    required this.encodedData,
-    required this.partitionMeta,
-    required this.nonEmptyRecordCount,
-  });
-}
-
-/// Request data for analyzing partition key range in an isolate.
-class PartitionRangeAnalysisRequest {
-  /// The records to analyze
-  final List<Map<String, dynamic>> records;
-
-  /// The primary key field name
-  final String primaryKey;
-
-  /// The matcher type for the primary key.
-  final MatcherType pkMatcherType;
-
-  /// The partition index (optional)
-  final int partitionIndex;
-
-  /// The existing partitions (optional)
-  final List<PartitionMeta>? existingPartitions;
-
-  PartitionRangeAnalysisRequest({
-    required this.records,
-    required this.primaryKey,
-    required this.pkMatcherType,
-    this.partitionIndex = 0,
-    this.existingPartitions,
-  });
-}
-
-/// Result data from analyzing partition key range in an isolate.
-class PartitionRangeAnalysisResult {
-  /// The minimum primary key value
-  final dynamic minPk;
-
-  /// The maximum primary key value
-  final dynamic maxPk;
-
-  /// The total number of records
-  final int recordCount;
-
-  /// Whether the partition order is maintained
-  final bool isOrdered;
-
-  PartitionRangeAnalysisResult({
-    this.minPk,
-    this.maxPk,
-    required this.recordCount,
-    this.isOrdered = true,
-  });
-
-  /// Create a copy with some fields replaced
-  PartitionRangeAnalysisResult copyWith({
-    dynamic minPk,
-    dynamic maxPk,
-    int? recordCount,
-    bool? isOrdered,
-  }) {
-    return PartitionRangeAnalysisResult(
-      minPk: minPk ?? this.minPk,
-      maxPk: maxPk ?? this.maxPk,
-      recordCount: recordCount ?? this.recordCount,
-      isOrdered: isOrdered ?? this.isOrdered,
-    );
-  }
-
-  /// Convert to a map for serialization
-  Map<String, dynamic> toJson() {
-    return {
-      'minPk': minPk,
-      'maxPk': maxPk,
-      'recordCount': recordCount,
-      'isOrdered': isOrdered,
-    };
-  }
-
-  /// Create from a map after deserialization
-  factory PartitionRangeAnalysisResult.fromJson(Map<String, dynamic> json) {
-    try {
-      return PartitionRangeAnalysisResult(
-        minPk: json['minPk'],
-        maxPk: json['maxPk'],
-        recordCount: json['recordCount'] is int
-            ? json['recordCount']
-            : int.tryParse(json['recordCount'].toString()) ?? 0,
-        isOrdered: json['isOrdered'] is bool
-            ? json['isOrdered']
-            : json['isOrdered'].toString().toLowerCase() == 'true',
-      );
-    } catch (e) {
-      Logger.error('Failed to parse PartitionRangeAnalysisResult: $e',
-          label: 'PartitionRangeAnalysisResult.fromJson');
-      return PartitionRangeAnalysisResult(recordCount: 0, isOrdered: false);
-    }
-  }
-}
-
-/// A top-level function designed to be run in a separate isolate.
-///
-/// This function takes a [DecodePartitionRequest], decodes the partition data,
-/// and returns a list of records.
-Future<List<Map<String, dynamic>>> decodePartitionData(
-    DecodePartitionRequest request) async {
-  try {
-    // if encoder state is provided, apply it
-    if (request.encoderState != null) {
-      EncoderHandler.setEncodingState(request.encoderState!);
-    }
-
-    // decode data - use custom key/keyId if provided, otherwise use encoder state
-    final decodedString = await EncoderHandler.decode(
-      request.bytes,
-      customKey: request.customKey,
-      keyId: request.customKeyId,
-    );
-
-    if (decodedString.isEmpty) {
-      Logger.warn('Decoded string is empty', label: 'decodePartitionData');
-      return [];
-    }
-
-    // parse JSON
-    try {
-      final jsonData = jsonDecode(decodedString) as Map<String, dynamic>;
-      final partitionInfo = PartitionInfo.fromJson(jsonData);
-
-      return partitionInfo.data.cast<Map<String, dynamic>>().toList();
-    } catch (jsonError) {
-      Logger.error('Failed to parse JSON data: $jsonError',
-          label: 'decodePartitionData');
-      // Return empty list as fallback instead of throwing exception
-      return [];
-    }
-  } catch (e) {
-    Logger.error('Failed to decode partition data: $e',
-        label: 'decodePartitionData');
-    // Return empty list as fallback instead of throwing exception
-    return [];
-  }
-}
-
-/// A top-level function designed to be run in a separate isolate.
-///
-/// This function takes an [EncodePartitionRequest], encodes the partition data,
-/// and returns an [EncodedPartitionResult].
-Future<EncodedPartitionResult> encodePartitionData(
-    EncodePartitionRequest request) async {
-  try {
-    // if encoder state is provided, apply it
-    if (request.encoderState != null) {
-      EncoderHandler.setEncodingState(request.encoderState!);
-    }
-
-    // count non-empty records
-    final nonDeletedRecords =
-        request.records.where((r) => !isDeletedRecord(r)).toList();
-
-    // 1. Calculate the checksum based *only* on the records data.
-    final recordsJsonString = jsonEncode(request.records);
-    final partitionChecksum =
-        DataCompressor().getChecksumStringFromString(recordsJsonString);
-
-    // 2. Create partition meta with the calculated checksum.
-    final partitionMeta = PartitionMeta(
-      version: 1,
-      index: request.partitionIndex,
-      totalRecords: nonDeletedRecords.length,
-      fileSizeInBytes: 0, // will be updated later
-      minPrimaryKey: request.minPk,
-      maxPrimaryKey: request.maxPk,
-      checksum: partitionChecksum,
-      timestamps: request.timestamps,
-      parentPath: request.parentPath,
-    );
-
-    // 3. Create partition info object to be stored.
-    final partitionInfo = PartitionInfo(
-      path: request.partitionPath,
-      meta: partitionMeta,
-      data: request.records,
-    );
-
-    // 4. Encode the final object for storage.
-    Uint8List encodedData;
-    try {
-      encodedData = EncoderHandler.encode(
-        jsonEncode(partitionInfo.toJson()),
-        customKey: request.customKey,
-        keyId: request.customKeyId,
-      );
-    } catch (encodeError) {
-      Logger.error('Failed to encode partition info: $encodeError',
-          label: 'encodePartitionData');
-      encodedData = Uint8List(0); // Create empty data as fallback
-    }
-
-    // update size and return result
-    return EncodedPartitionResult(
-      encodedData: encodedData,
-      partitionMeta:
-          partitionMeta.copyWith(fileSizeInBytes: encodedData.length),
-      nonEmptyRecordCount: nonDeletedRecords.length,
-    );
-  } catch (e) {
-    Logger.error('Failed to encode partition data: $e',
-        label: 'encodePartitionData');
-    // Return a minimal valid result instead of throwing exception
-    final emptyMeta = PartitionMeta(
-      version: 1,
-      index: request.partitionIndex,
-      totalRecords: 0,
-      fileSizeInBytes: 0,
-      minPrimaryKey: null,
-      maxPrimaryKey: null,
-      checksum: "",
-      timestamps: request.timestamps,
-      parentPath: request.parentPath,
-    );
-    return EncodedPartitionResult(
-      encodedData: Uint8List(0),
-      partitionMeta: emptyMeta,
-      nonEmptyRecordCount: 0,
-    );
-  }
-}
-
-/// A top-level function designed to be run in a separate isolate.
-///
-/// This function takes a [PartitionRangeAnalysisRequest], analyzes the partition key range,
-/// and returns a [PartitionRangeAnalysisResult].
-Future<PartitionRangeAnalysisResult> analyzePartitionKeyRange(
-    PartitionRangeAnalysisRequest request) async {
-  try {
-    if (request.records.isEmpty) {
-      return PartitionRangeAnalysisResult(recordCount: 0);
-    }
-    final pkMatcher = ValueMatcher.getMatcher(request.pkMatcherType);
-
-    // calculate non-deleted record count without creating new list
-    int nonEmptyCount = 0;
-
-    // find first non-deleted record to initialize minPk/maxPk
-    dynamic minPk;
-    dynamic maxPk;
-    String primaryKey = request.primaryKey;
-    int processedCount = 0;
-
-    // traverse once to find first non-deleted record and initialize minPk/maxPk
-    for (final record in request.records) {
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      if (!isDeletedRecord(record) && record.containsKey(primaryKey)) {
-        final pk = record[primaryKey];
-        if (pk != null) {
-          minPk = pk;
-          maxPk = pk;
-          nonEmptyCount++;
-          break;
-        }
-      }
-    }
-
-    // if no valid record found, return early
-    if (minPk == null) {
-      Logger.warn('No valid primary key "$primaryKey" found in records',
-          label: 'analyzePartitionKeyRange');
-      return PartitionRangeAnalysisResult(recordCount: 0);
-    }
-
-    // continue to traverse remaining records, find min/max values and count
-    for (int i = 0; i < request.records.length; i++) {
-      final record = request.records[i];
-      if (i % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      // skip already processed first record and invalid records
-      if (i == 0 && nonEmptyCount == 1) continue;
-
-      if (!isDeletedRecord(record)) {
-        final pk = record[primaryKey];
-        if (pk != null) {
-          try {
-            if (pkMatcher(pk, minPk) < 0) minPk = pk;
-            if (pkMatcher(pk, maxPk) > 0) maxPk = pk;
-            nonEmptyCount++;
-          } catch (compareError) {
-            // If comparison fails for a specific record, log and continue
-            Logger.warn('Failed to compare key values: $compareError, key=$pk',
-                label: 'analyzePartitionKeyRange');
-          }
-        }
-      }
-    }
-
-    // Check partition order when existingPartitions is provided
-    bool isOrdered = true;
-    if (request.existingPartitions != null &&
-        request.existingPartitions!.isNotEmpty &&
-        minPk != null &&
-        maxPk != null) {
-      // 1. Find the existing partition with max index
-      PartitionMeta? maxIdxPartition;
-      // 2. Find the partition itself for comparing internal ordered
-      PartitionMeta? existingPartition;
-      int processedCount = 0;
-      // Single traversal to find required partitions
-      for (var partition in request.existingPartitions!) {
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-        // Skip empty partition
-        if (partition.totalRecords <= 0 ||
-            partition.minPrimaryKey == null ||
-            partition.maxPrimaryKey == null) {
-          continue;
-        }
-
-        // Find current partition
-        if (partition.index == request.partitionIndex) {
-          existingPartition = partition;
-        }
-        // Find the partition with max index
-        else if (maxIdxPartition == null ||
-            partition.index > maxIdxPartition.index) {
-          maxIdxPartition = partition;
-        }
-      }
-
-      // Check 1: Existing partition internal ordered check
-      if (existingPartition != null && existingPartition.totalRecords > 0) {
-        try {
-          // If new data range is completely separated from existing range, mark as non-ordered
-          if (existingPartition.maxPrimaryKey != null &&
-              existingPartition.minPrimaryKey != null &&
-              (pkMatcher(minPk, existingPartition.maxPrimaryKey!) > 0 ||
-                  pkMatcher(maxPk, existingPartition.minPrimaryKey!) < 0)) {
-            isOrdered = false;
-          }
-        } catch (compareError) {
-          Logger.warn(
-              'Failed to compare key values for existing partition: $compareError',
-              label: 'analyzePartitionKeyRange');
-          isOrdered = false; // Conservative approach on comparison error
-        }
-      }
-
-      // Check 2: Relation with max index partition
-      if (maxIdxPartition != null &&
-          maxIdxPartition.index != request.partitionIndex) {
-        try {
-          // If current partition index is greater than max index partition
-          if (request.partitionIndex > maxIdxPartition.index) {
-            if (maxIdxPartition.maxPrimaryKey != null &&
-                pkMatcher(minPk, maxIdxPartition.maxPrimaryKey!) <= 0) {
-              isOrdered = false;
-            }
-          }
-          // If current partition index is less than max index partition
-          else if (request.partitionIndex < maxIdxPartition.index) {
-            if (maxIdxPartition.minPrimaryKey != null &&
-                pkMatcher(maxPk, maxIdxPartition.minPrimaryKey!) >= 0) {
-              isOrdered = false;
-            }
-          }
-        } catch (compareError) {
-          Logger.warn(
-              'Failed to compare key values with max index partition: $compareError',
-              label: 'analyzePartitionKeyRange');
-          isOrdered = false; // Conservative approach on comparison error
-        }
-      }
-    }
-
-    // Ensure the return value is always of type PartitionRangeAnalysisResult
-    final result = PartitionRangeAnalysisResult(
-      minPk: minPk,
-      maxPk: maxPk,
-      recordCount: nonEmptyCount,
-      isOrdered: isOrdered,
-    );
-
-    return result;
-  } catch (e) {
-    Logger.error('Failed to analyze partition key range: $e',
-        label: 'analyzePartitionKeyRange');
-
-    // return safe value when error occurs, avoid traversing again
-    return PartitionRangeAnalysisResult(
-      recordCount: 0,
-      isOrdered: false, // conservative approach on error
-    );
-  }
-}
-
-/// Request data for assigning records to partitions in an isolate.
-class PartitionAssignmentRequest {
-  /// The records to assign
-  final List<Map<String, dynamic>> records;
-
-  /// The partition size limit (bytes)
-  final int partitionSizeLimit;
-
-  /// The current partition index
-  final int currentPartitionIndex;
-
-  /// The current partition used size
-  final int currentPartitionSize;
-
-  PartitionAssignmentRequest({
-    required this.records,
-    required this.partitionSizeLimit,
-    required this.currentPartitionIndex,
-    required this.currentPartitionSize,
-  });
-}
-
-/// Result data from assigning records to partitions in an isolate.
-class PartitionAssignmentResult {
-  /// The records assigned to partitions
-  final Map<int, List<Map<String, dynamic>>> partitionRecords;
-
-  /// The estimated total data size
-  final int estimatedTotalSize;
-
-  /// The average record size
-  final double averageRecordSize;
-
-  PartitionAssignmentResult({
-    required this.partitionRecords,
-    required this.estimatedTotalSize,
-    required this.averageRecordSize,
-  });
-}
-
-/// A top-level function designed to be run in a separate isolate.
-///
-/// This function takes a [PartitionAssignmentRequest], assigns records to partitions,
-/// and returns a [PartitionAssignmentResult].
-Future<PartitionAssignmentResult> assignRecordsToPartitions(
-    PartitionAssignmentRequest request) async {
-  try {
-    final result = <int, List<Map<String, dynamic>>>{};
-    int currentPartitionIndex = request.currentPartitionIndex;
-    int currentPartitionSize = request.currentPartitionSize;
-    final partitionSizeLimit = request.partitionSizeLimit;
-    final records = request.records;
-
-    // estimate average record size
-    int totalDataSize = 0;
-    double averageRecordSize = 0;
-
-    if (records.isNotEmpty) {
-      try {
-        // sample at most 10 records to calculate average size
-        final sampleSize = records.length > 10 ? 10 : records.length;
-        for (int i = 0; i < sampleSize; i++) {
-          try {
-            totalDataSize += jsonEncode(records[i]).length;
-          } catch (jsonError) {
-            Logger.warn(
-                'Failed to encode record for size estimation: $jsonError',
-                label: 'assignRecordsToPartitions');
-            // Use a reasonable default size estimate
-            totalDataSize += 100;
-          }
-        }
-        averageRecordSize = totalDataSize / sampleSize;
-
-        // estimate total data size
-        totalDataSize = (averageRecordSize * records.length).toInt();
-      } catch (estimationError) {
-        Logger.warn('Failed to estimate record sizes: $estimationError',
-            label: 'assignRecordsToPartitions');
-        // Use reasonable defaults
-        averageRecordSize = 100.0;
-        totalDataSize = 100 * records.length;
-      }
-    }
-    int processedCount = 0;
-    // process records in order, assign all records to partitions
-    for (var record in records) {
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      int recordSize;
-      try {
-        // calculate record size
-        recordSize = jsonEncode(record).length;
-      } catch (sizeError) {
-        Logger.warn('Failed to calculate record size: $sizeError',
-            label: 'assignRecordsToPartitions');
-        // Use average size as fallback
-        recordSize = averageRecordSize.toInt();
-      }
-
-      // if current partition is full, create new partition
-      if (currentPartitionSize + recordSize > partitionSizeLimit) {
-        currentPartitionIndex++; // create new partition
-        currentPartitionSize = 0; // reset partition size
-      }
-
-      // update partition size
-      currentPartitionSize += recordSize;
-
-      // add record to corresponding partition
-      if (!result.containsKey(currentPartitionIndex)) {
-        result[currentPartitionIndex] = [];
-      }
-      result[currentPartitionIndex]!.add(record);
-    }
-
-    return PartitionAssignmentResult(
-      partitionRecords: result,
-      estimatedTotalSize: totalDataSize,
-      averageRecordSize: averageRecordSize,
-    );
-  } catch (e) {
-    Logger.error('Failed to assign records to partitions: $e',
-        label: 'assignRecordsToPartitions');
-
-    // Return fallback result instead of throwing exception
-    // Put all records in a single partition
-    final fallbackResult = <int, List<Map<String, dynamic>>>{};
-    fallbackResult[request.currentPartitionIndex] = List.from(request.records);
-
-    return PartitionAssignmentResult(
-      partitionRecords: fallbackResult,
-      estimatedTotalSize: 0,
-      averageRecordSize: 0.0,
-    );
-  }
-}
+import 'dart:typed_data';
 
 /// Table similarity calculation request
 class TableSimilarityRequest {
@@ -976,6 +34,9 @@ class TableSimilarityRequest {
   /// New table count
   final int newTablesCount;
 
+  /// Yield budget in milliseconds
+  final int? yieldDurationMs;
+
   TableSimilarityRequest({
     required this.oldSchema,
     required this.newSchema,
@@ -983,6 +44,7 @@ class TableSimilarityRequest {
     required this.newTableIndex,
     required this.oldTablesCount,
     required this.newTablesCount,
+    this.yieldDurationMs,
   });
 }
 
@@ -1009,8 +71,12 @@ class BatchTableSimilarityRequest {
   /// List of similarity requests to process
   final List<TableSimilarityRequest> requests;
 
+  /// Yield budget in milliseconds
+  final int? yieldDurationMs;
+
   BatchTableSimilarityRequest({
     required this.requests,
+    this.yieldDurationMs,
   });
 }
 
@@ -1085,8 +151,12 @@ class BatchFieldSimilarityRequest {
   /// List of similarity requests to process
   final List<FieldSimilarityRequest> requests;
 
+  /// Yield budget in milliseconds
+  final int? yieldDurationMs;
+
   BatchFieldSimilarityRequest({
     required this.requests,
+    this.yieldDurationMs,
   });
 }
 
@@ -1230,8 +300,13 @@ Future<TableSimilarityResult> calculateTableSimilarity(
 Future<BatchTableSimilarityResult> calculateBatchTableSimilarity(
     BatchTableSimilarityRequest request) async {
   final results = <TableSimilarityResult>[];
+  final yieldController = YieldController(
+      'ComputeTasks.calculateBatchTableSimilarity',
+      checkInterval: 1,
+      budgetMs: request.yieldDurationMs);
 
   for (final req in request.requests) {
+    await yieldController.maybeYield();
     final result = await calculateTableSimilarity(req);
     results.add(result);
   }
@@ -1415,8 +490,13 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(
 Future<BatchFieldSimilarityResult> calculateBatchFieldSimilarity(
     BatchFieldSimilarityRequest request) async {
   final results = <FieldSimilarityResult>[];
+  final yieldController = YieldController(
+      'ComputeTasks.calculateBatchFieldSimilarity',
+      checkInterval: 1,
+      budgetMs: request.yieldDurationMs);
 
   for (final req in request.requests) {
+    await yieldController.maybeYield();
     final result = await calculateFieldSimilarity(req);
     results.add(result);
   }
@@ -1519,10 +599,14 @@ class MigrationRecordProcessRequest {
   /// Old table schema (optional)
   final TableSchema? oldSchema;
 
+  /// Yield budget in milliseconds
+  final int? yieldDurationMs;
+
   MigrationRecordProcessRequest({
     required this.records,
     required this.operations,
     this.oldSchema,
+    this.yieldDurationMs,
   });
 }
 
@@ -1557,49 +641,66 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
 
     var modifiedRecords = List<Map<String, dynamic>>.from(request.records);
 
+    // Create YieldController for async loop processing
+    // Create YieldController for async loop processing
+    final yieldController = YieldController('ProcessMigrationRecords',
+        budgetMs: request.yieldDurationMs);
+
     // Use sorted operations, no need to reorder
     for (var operation in request.operations) {
       switch (operation.type) {
         case MigrationType.addField:
           final field = operation.field!;
-          modifiedRecords = modifiedRecords.map((record) {
+          final newRecords = <Map<String, dynamic>>[];
+          for (var record in modifiedRecords) {
+            await yieldController.maybeYield();
             // Skip processing deleted records
             if (isDeletedRecord(record)) {
-              return record;
+              newRecords.add(record);
+              continue;
             }
             if (!record.containsKey(field.name)) {
               record[field.name] = field.getDefaultValue();
             }
-            return record;
-          }).toList();
+            newRecords.add(record);
+          }
+          modifiedRecords = newRecords;
           break;
 
         case MigrationType.removeField:
           final fieldName = operation.fieldName!;
-          modifiedRecords = modifiedRecords.map((record) {
+          final newRecords = <Map<String, dynamic>>[];
+          for (var record in modifiedRecords) {
+            await yieldController.maybeYield();
             // Skip processing deleted records
             if (isDeletedRecord(record)) {
-              return record;
+              newRecords.add(record);
+              continue;
             }
             record.remove(fieldName);
-            return record;
-          }).toList();
+            newRecords.add(record);
+          }
+          modifiedRecords = newRecords;
           break;
 
         case MigrationType.renameField:
           final oldName = operation.fieldName!;
           final newName = operation.newName!;
-          modifiedRecords = modifiedRecords.map((record) {
+          final newRecords = <Map<String, dynamic>>[];
+          for (var record in modifiedRecords) {
+            await yieldController.maybeYield();
             // Skip processing deleted records
             if (isDeletedRecord(record)) {
-              return record;
+              newRecords.add(record);
+              continue;
             }
             if (record.containsKey(oldName)) {
               record[newName] = record[oldName];
               record.remove(oldName);
             }
-            return record;
-          }).toList();
+            newRecords.add(record);
+          }
+          modifiedRecords = newRecords;
           break;
 
         case MigrationType.modifyField:
@@ -1614,18 +715,22 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
               oldFieldSchema = null;
             }
           }
-          modifiedRecords = modifiedRecords.map((record) {
+          final newRecords = <Map<String, dynamic>>[];
+          for (var record in modifiedRecords) {
+            await yieldController.maybeYield();
             // Skip processing deleted records
             if (isDeletedRecord(record)) {
-              return record;
+              newRecords.add(record);
+              continue;
             }
             if (record.containsKey(fieldUpdate.name)) {
               // Call the method to process field modification, pass old field information
               record = _applyFieldModification(record, fieldUpdate,
                   oldFieldSchema: oldFieldSchema);
             }
-            return record;
-          }).toList();
+            newRecords.add(record);
+          }
+          modifiedRecords = newRecords;
           break;
 
         case MigrationType.addIndex:
@@ -1655,10 +760,13 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
 
             // Process primary key name changes
             if (oldConfig.name != newConfig.name) {
-              modifiedRecords = modifiedRecords.map((record) {
+              final newRecords = <Map<String, dynamic>>[];
+              for (var record in modifiedRecords) {
+                await yieldController.maybeYield();
                 // Skip processing deleted records
                 if (isDeletedRecord(record)) {
-                  return record;
+                  newRecords.add(record);
+                  continue;
                 }
                 if (record.containsKey(oldConfig.name)) {
                   // Copy old primary key field value to new primary key field
@@ -1666,10 +774,29 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
                   // Delete old primary key field
                   record.remove(oldConfig.name);
                 }
-                return record;
-              }).toList();
+                newRecords.add(record);
+              }
+              modifiedRecords = newRecords;
             }
           }
+          break;
+
+        case MigrationType.addForeignKey:
+          // Foreign key addition does not affect record data
+          // Data validation for foreign key constraints is handled at migration execution level
+          // (in MigrationManager._executeSchemaOperation)
+          break;
+
+        case MigrationType.removeForeignKey:
+          // Foreign key removal does not affect record data
+          // It only removes the constraint, existing data remains unchanged
+          break;
+
+        case MigrationType.modifyForeignKey:
+          // Foreign key modification (onDelete, onUpdate, enabled, etc.) does not affect record data
+          // It only changes cascade behavior, existing data remains unchanged
+          // Note: Core definition changes (fields, referencedTable, referencedFields)
+          // are not allowed and will throw exception during schema comparison
           break;
       }
     }
@@ -1856,7 +983,7 @@ class TimeBasedIdGenerateRequest {
   /// Whether to use random step
   final bool useRandomStep;
 
-  /// 高生成模式
+  /// High generation mode
   final bool isHighGeneration;
 
   TimeBasedIdGenerateRequest({
@@ -1972,6 +1099,9 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       nodeIdBig = BigInt.from(1);
     }
 
+    final yieldController =
+        YieldController("_IsolateBase62Encoder.generateTimeBasedIds");
+
     // Select different generation logic based on ID type
     if (request.keyType == PrimaryKeyType.timestampBased ||
         request.keyType == PrimaryKeyType.shortCode) {
@@ -1981,6 +1111,7 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       if (request.isHighGeneration && sequence + request.count <= maxSequence) {
         // Efficient batch generation method
         for (int i = 0; i < request.count; i++) {
+          await yieldController.maybeYield();
           sequence += 1;
 
           // Calculate timestamp ID
@@ -1999,9 +1130,6 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
-          if (i % 200 == 0) {
-            await Future.delayed(Duration.zero);
-          }
         }
       } else {
         // Regular generation method: consider step and sequence number limit
@@ -2016,9 +1144,7 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
-          if (i % 500 == 0) {
-            await Future.delayed(Duration.zero);
-          }
+          await yieldController.maybeYield();
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -2057,6 +1183,7 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       if (request.isHighGeneration && sequence + request.count <= maxSequence) {
         // Efficient batch generation method
         for (int i = 0; i < request.count; i++) {
+          await yieldController.maybeYield();
           sequence += 1;
 
           // Calculate date prefixed ID
@@ -2083,9 +1210,6 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
-          if (i % 200 == 0) {
-            await Future.delayed(Duration.zero);
-          }
         }
       } else {
         // Regular generation method
@@ -2100,9 +1224,7 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
-          if (i % 500 == 0) {
-            await Future.delayed(Duration.zero);
-          }
+          await yieldController.maybeYield();
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -2144,9 +1266,6 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           }
 
           numericIds.add(idValue);
-          if (i % 200 == 0) {
-            await Future.delayed(Duration.zero);
-          }
         }
       }
 
@@ -2198,45 +1317,6 @@ class BuildTreeRequest {
       required this.matcherType});
 }
 
-/// A top-level function to build a B+ tree from multiple partition contents.
-Future<BPlusTree> buildTreeTask(BuildTreeRequest request) async {
-  final comparator = ValueMatcher.getMatcher(request.matcherType);
-  final bTree = BPlusTree(isUnique: request.isUnique, comparator: comparator);
-
-  int processedCount = 0;
-  for (final content in request.partitionsContent) {
-    if (content.isEmpty) continue;
-
-    final data = _parseBTreeData(content);
-    for (final entry in data.entries) {
-      for (final value in entry.value) {
-        processedCount++;
-        if (processedCount % 50 == 0) {
-          await Future.delayed(Duration.zero);
-        }
-        await bTree.insert(entry.key, value);
-      }
-    }
-  }
-  return bTree;
-}
-
-Map<dynamic, List<dynamic>> _parseBTreeData(String content) {
-  final result = <dynamic, List<dynamic>>{};
-  const LineSplitter().convert(content).forEach((line) {
-    if (line.trim().isEmpty) return;
-
-    final parts = line.split('|');
-    if (parts.length >= 2) {
-      final key = BPlusTree.deserializeValue(parts[0]);
-      final values = BPlusTree.deserializeValues(parts[1]);
-      result.putIfAbsent(key, () => []).addAll(values);
-    }
-  });
-
-  return result;
-}
-
 /// Request for searching an index partition.
 class SearchTaskRequest {
   final String content;
@@ -2249,24 +1329,6 @@ class SearchTaskRequest {
       required this.key,
       required this.isUnique,
       required this.matcherType});
-}
-
-/// A top-level function to search a single index partition in an isolate.
-Future<List<dynamic>> searchIndexPartitionTask(
-    SearchTaskRequest request) async {
-  try {
-    if (request.content.isEmpty) {
-      return [];
-    }
-    final comparator = ValueMatcher.getMatcher(request.matcherType);
-    final btree = await BPlusTree.fromString(request.content,
-        isUnique: request.isUnique, comparator: comparator);
-    return await btree.search(request.key);
-  } catch (e) {
-    Logger.error('Failed to search index partition in isolate: $e',
-        label: 'searchIndexPartitionTask');
-    return [];
-  }
 }
 
 /// Request for batch searching an index partition.
@@ -2289,31 +1351,186 @@ class BatchSearchTaskResult {
   BatchSearchTaskResult({required this.found});
 }
 
-/// A top-level function to batch search a single index partition in an isolate.
-Future<BatchSearchTaskResult> batchSearchIndexPartitionTask(
-    BatchSearchTaskRequest request) async {
-  final Map<dynamic, List<dynamic>> found = {};
-  try {
-    if (request.content.isEmpty || request.keys.isEmpty) {
-      return BatchSearchTaskResult(found: found);
-    }
-    final comparator = ValueMatcher.getMatcher(request.matcherType);
-    final btree = await BPlusTree.fromString(request.content,
-        isUnique: request.isUnique, comparator: comparator);
-    int processedCount = 0;
-    for (final key in request.keys) {
-      processedCount++;
-      if (processedCount % 50 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-      final results = await btree.search(key);
-      if (results.isNotEmpty) {
-        found[key] = results;
-      }
-    }
-  } catch (e) {
-    Logger.error('Failed to batch search index partition in isolate: $e',
-        label: 'batchSearchIndexPartitionTask');
+/// Request: find index keys for a batch of record pointers by scanning partition contents.
+class FindKeysByPointersRequest {
+  /// Serialized B+Tree contents of all partitions for an index
+  final List<String> partitionContents;
+
+  /// Target record pointer strings to search for (StoreIndex.toString())
+  final List<String> pointerStrings;
+
+  FindKeysByPointersRequest({
+    required this.partitionContents,
+    required this.pointerStrings,
+  });
+}
+
+/// Request for batch WAL encoding
+class BatchWalEncodeRequest {
+  /// List of raw WAL entries
+  final List<Map<String, dynamic>> entries;
+
+  /// Encoder state configuration
+  final EncoderConfig encoderConfig;
+
+  BatchWalEncodeRequest({
+    required this.entries,
+    required this.encoderConfig,
+  });
+}
+
+/// Result of batch WAL encoding
+class BatchWalEncodeResult {
+  /// Encoded binary data chunks corresponding to input entries
+  final List<Uint8List> encodedChunks;
+
+  BatchWalEncodeResult(this.encodedChunks);
+}
+
+/// Batch encode WAL entries
+Future<BatchWalEncodeResult> batchEncodeWal(
+    BatchWalEncodeRequest request) async {
+  // 1. Sync encoder state
+  EncoderHandler.setEncodingState(request.encoderConfig);
+
+  final results = <Uint8List>[];
+  final yieldController =
+      YieldController('ComputeTasks.batchEncodeWal', checkInterval: 100);
+
+  // 2. Encode each entry
+  for (final entry in request.entries) {
+    await yieldController.maybeYield();
+    // WalEncoder.encodeAsLine checks partition 'p' inside the entry
+    final encoded = WalEncoder.encodeAsLine(entry);
+    results.add(encoded);
   }
-  return BatchSearchTaskResult(found: found);
+
+  return BatchWalEncodeResult(results);
+}
+
+/// One B+Tree page encode unit for isolate/off-main-thread execution.
+///
+/// NOTE:
+/// - This object must remain isolate-sendable (only primitives + typed data).
+/// - Do NOT use `TransferableTypedData` here to keep web / non-isolate platforms compatible.
+final class BTreePageEncodeItem {
+  /// `BTreePageType.index`
+  final int typeIndex;
+  final int partitionNo;
+  final int pageNo;
+
+  /// Plaintext payload bytes (NOT encrypted).
+  final Uint8List payload;
+
+  const BTreePageEncodeItem({
+    required this.typeIndex,
+    required this.partitionNo,
+    required this.pageNo,
+    required this.payload,
+  });
+}
+
+/// Batch request for encoding multiple B+Tree pages.
+final class BatchBTreePageEncodeRequest {
+  final int pageSize;
+
+  /// Null means: DataStoreConfig.encryptionConfig == null → do NOT wrap with EncoderHandler header.
+  final int? encryptionTypeIndex;
+
+  /// Full encoder state so isolates can use the same active key / keyId.
+  final EncoderConfig encoderConfig;
+
+  /// Optional per-call key override (mirrors `BTreePageCodec.encodePayload`).
+  final Uint8List? customKey;
+  final int? customKeyId;
+
+  final List<BTreePageEncodeItem> pages;
+
+  const BatchBTreePageEncodeRequest({
+    required this.pageSize,
+    required this.encryptionTypeIndex,
+    required this.encoderConfig,
+    required this.pages,
+    this.customKey,
+    this.customKeyId,
+  });
+}
+
+/// Batch encode result (aligned with request order).
+final class BatchBTreePageEncodeResult {
+  final List<Uint8List> pageBytes;
+  const BatchBTreePageEncodeResult(this.pageBytes);
+}
+
+/// Batch encode B+Tree pages to fixed-size page bytes.
+///
+/// Heavy CPU work:
+/// - (optional) encryption + header wrapping
+/// - CRC32 over encoded payload
+/// - fixed-size page assembly
+///
+/// Can run on:
+/// - isolate (native) via `ComputeManager.run`
+/// - main isolate (web / no-isolate platforms) via stub compute
+Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
+    BatchBTreePageEncodeRequest request) async {
+  final int pageSize = request.pageSize;
+  if (pageSize <= 0) return const BatchBTreePageEncodeResult(<Uint8List>[]);
+
+  final pages = request.pages;
+  if (pages.isEmpty) return const BatchBTreePageEncodeResult(<Uint8List>[]);
+
+  // Ensure isolate has the same encoder state as main isolate.
+  EncoderHandler.setEncodingState(request.encoderConfig);
+
+  final int? encTypeIndex = request.encryptionTypeIndex;
+  final EncryptionType? encType = encTypeIndex == null
+      ? null
+      : EncryptionTypeExtension.fromInt(encTypeIndex);
+
+  Uint8List aadBytes(int partitionNo, int pageNo, int typeIndex) {
+    final bd = ByteData(9);
+    bd.setInt32(0, partitionNo, Endian.little);
+    bd.setInt32(4, pageNo, Endian.little);
+    bd.setUint8(8, typeIndex);
+    return bd.buffer.asUint8List();
+  }
+
+  final out =
+      List<Uint8List>.filled(pages.length, Uint8List(0), growable: false);
+
+  // Yielding is important when running on platforms without isolates (web).
+  final yieldController = YieldController(
+    'ComputeTasks.batchEncodeBTreePages',
+    checkInterval: 200,
+  );
+
+  for (int i = 0; i < pages.length; i++) {
+    await yieldController.maybeYield();
+    final p = pages[i];
+
+    final Uint8List encodedPayload;
+    if (encType == null) {
+      // No encryption config: keep payload as-is (no header).
+      encodedPayload = p.payload;
+    } else {
+      encodedPayload = EncoderHandler.encodeBytes(
+        p.payload,
+        customKey: request.customKey,
+        keyId: request.customKeyId,
+        encryptionType: encType,
+        aad: aadBytes(p.partitionNo, p.pageNo, p.typeIndex),
+      );
+    }
+
+    final pageBytes = BTreePageIO.buildPageBytes(
+      type: BTreePageType.values[p.typeIndex],
+      encodedPayload: encodedPayload,
+      pageSize: pageSize,
+    );
+
+    out[i] = pageBytes;
+  }
+
+  return BatchBTreePageEncodeResult(out);
 }

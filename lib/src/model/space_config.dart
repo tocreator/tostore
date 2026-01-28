@@ -1,4 +1,5 @@
-import 'file_info.dart';
+import '../handler/common.dart';
+import 'meta_info.dart';
 
 /// The initialization configuration model
 class SpaceConfig {
@@ -8,11 +9,8 @@ class SpaceConfig {
   /// previous encryption key info (if any)
   final EncryptionKeyInfo? previous;
 
-  /// data version
+  /// database version
   final int version;
-
-  /// last index weight process time
-  final DateTime? lastIndexWeightProcessTime;
 
   /// Table directory mapping - Records the directory index where each table is located
   /// Key format is "spaceName:tableName"
@@ -37,15 +35,15 @@ class SpaceConfig {
   SpaceConfig({
     required this.current,
     this.previous,
-    required this.version,
-    this.lastIndexWeightProcessTime,
+    int? version,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
     this.totalTableCount = 0,
     this.totalRecordCount = 0,
     this.totalDataSizeBytes = 0,
     this.lastStatisticsTime,
-  })  : tableDirectoryMap = tableDirectoryMap ?? {},
+  })  : version = version ?? InternalConfig.engineVersion,
+        tableDirectoryMap = tableDirectoryMap ?? {},
         directoryUsageMap = directoryUsageMap ?? {};
 
   factory SpaceConfig.fromJson(Map<String, dynamic> json) {
@@ -56,10 +54,8 @@ class SpaceConfig {
             ? EncryptionKeyInfo.fromJson(
                 json['previous'] as Map<String, dynamic>)
             : null,
-        version: json['version'] as int? ?? 0,
-        lastIndexWeightProcessTime: json['lastIndexWeightProcessTime'] != null
-            ? DateTime.parse(json['lastIndexWeightProcessTime'] as String)
-            : null,
+        version: resolveVersionValue(
+            json['version'], InternalConfig.legacyEngineVersion),
         tableDirectoryMap: json.containsKey('tableDirectoryMap')
             ? (json['tableDirectoryMap'] as Map<String, dynamic>).map(
                 (key, value) => MapEntry(
@@ -86,8 +82,6 @@ class SpaceConfig {
       'current': current.toJson(),
       'previous': previous?.toJson(),
       'version': version,
-      'lastIndexWeightProcessTime':
-          lastIndexWeightProcessTime?.toIso8601String(),
       'tableDirectoryMap':
           tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
       'directoryUsageMap': directoryUsageMap,
@@ -103,9 +97,6 @@ class SpaceConfig {
     EncryptionKeyInfo? current,
     EncryptionKeyInfo? previous,
     int? version,
-    DateTime? lastIndexWeightProcessTime,
-    DateTime? lastCacheWeightProcessTime,
-    DateTime? lastCacheCleanupTime,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
     int? totalTableCount,
@@ -117,8 +108,6 @@ class SpaceConfig {
       current: current ?? this.current,
       previous: previous ?? this.previous,
       version: version ?? this.version,
-      lastIndexWeightProcessTime:
-          lastIndexWeightProcessTime ?? this.lastIndexWeightProcessTime,
       tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
       directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
       totalTableCount: totalTableCount ?? this.totalTableCount,

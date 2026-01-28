@@ -6,6 +6,19 @@ import '../Interface/platform_handler_web.dart'
 class PlatformHandler {
   static final PlatformInterface _instance = PlatformHandlerImpl();
 
+  /// Build mode detection
+  static bool get isRelease => const bool.fromEnvironment('dart.vm.product');
+  static bool get isProfile => const bool.fromEnvironment('dart.vm.profile');
+  static bool get isDebug {
+    var inDebug = false;
+    assert(() {
+      inDebug = true;
+      return true;
+    }());
+    if (isRelease || isProfile) return false;
+    return inDebug;
+  }
+
   /// Whether it's a mobile platform
   static bool get isMobile => _instance.isMobile;
 
@@ -79,35 +92,46 @@ class PlatformHandler {
   static Future<bool> verifyZipFile(String zipPath, {String? requiredFile}) =>
       _instance.verifyZipFile(zipPath, requiredFile: requiredFile);
 
-  /// Recommended IO concurrency (optimized by platform and memory)
-  static Future<int> getRecommendedConcurrency() async {
-    if (isWeb) return 2;
-    if (isMobile) {
-      // Adjust concurrency based on memory for mobile devices
-      final memGB = await getSystemMemoryGB();
-      if (memGB < 2.0) return 1; // Low memory devices
-      if (memGB < 4.0) return 2; // Medium memory devices
-      return 3; // High memory devices
-    }
-
-    // Optimize concurrency based on memory and CPU for desktop devices
-    final memGB = await getSystemMemoryGB();
+  /// Recommended IO concurrency (synchronous version)
+  ///
+  /// Calculates optimal concurrency for I/O-bound tasks (e.g., partition file processing)
+  /// based on CPU cores and platform type. Uses core reservation strategy for servers
+  /// to ensure system stability while maximizing throughput.
+  static int get recommendedConcurrency {
     final cores = processorCores;
 
-    if (memGB < 4.0) return cores.clamp(2, 4); // Low memory devices
-    if (memGB < 8.0) return cores.clamp(2, 6); // Medium memory devices
-    return cores.clamp(2, 8); // High memory devices
-  }
+    if (isServerEnvironment) {
+      // For servers, dynamically reserve cores based on the total number of cores.
+      // This prevents system overload on high-core-count machines.
+      int reservedCores;
+      if (cores <= 10) {
+        reservedCores = 1;
+      } else if (cores <= 15) {
+        reservedCores = 2;
+      } else if (cores <= 30) {
+        reservedCores = 3;
+      } else {
+        reservedCores = 4;
+      }
 
-  /// Recommended IO concurrency (synchronous version)
-  static int get recommendedConcurrency {
-    if (isWeb) return 2;
-    if (isMobile) {
-      // For mobile, be more conservative. Use half the cores, but at least 1 and at most 3.
-      return (processorCores / 2).round().clamp(1, 3);
+      int baseConcurrency = cores - reservedCores;
+
+      // Memory-aware cap: estimate ~80MB per concurrent task
+      // For very high concurrency, we need to consider memory limits
+      return baseConcurrency.clamp(1, 96);
+    } else if (isDesktop) {
+      // For desktops, use half the cores, but at least 2.
+      // Increase max cap to 16 for high-core desktops (e.g., 16-core systems)
+      // This better utilizes modern desktop hardware while still being conservative
+      return (cores / 2).round().clamp(2, 16);
+    } else if (isMobile) {
+      // For mobile, be more conservative: use cores but cap at 4
+      // Mobile devices have limited memory and battery constraints
+      return cores.clamp(1, 4);
+    } else {
+      // For web and unknown platforms, be very conservative
+      return cores.clamp(1, 4);
     }
-    return processorCores.clamp(
-        2, 8); // Maximum 8 concurrent operations for desktop
   }
 
   /// Detect if it's a server environment
@@ -126,5 +150,18 @@ class PlatformHandler {
 
     // Not a clear server environment
     return false;
+  }
+
+  /// Get device hardware signature for enhanced security
+  /// Combines CPU, memory, and platform identifiers
+  /// Used for hardware-bound encryption key derivation
+  static int get deviceFingerprint {
+    return _instance.deviceFingerprint;
+  }
+
+  /// Check if hardware-based key derivation is available
+  /// Returns true if device supports TPM/Secure Enclave
+  static bool get supportsHardwareKeyDerivation {
+    return _instance.supportsHardwareKeyDerivation;
   }
 }

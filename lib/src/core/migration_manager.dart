@@ -2,6 +2,7 @@ import '../handler/logger.dart';
 import '../model/migration_meta.dart';
 import '../model/migration_task.dart';
 import '../model/table_schema.dart';
+import '../model/meta_info.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
@@ -9,7 +10,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 import '../model/system_table.dart';
-import 'table_data_manager.dart' show isDeletedRecord;
+import '../Interface/chain_builder.dart';
 
 /// Migration manager for handling database version upgrades
 ///
@@ -33,6 +34,13 @@ class MigrationManager {
   final List<MigrationTask> _pendingTasks = [];
   // Whether migration tasks are being processed
   bool _isProcessingTasks = false;
+
+  // In-memory cache for migration metadata to avoid frequent file reads
+  MigrationMeta? _migrationMetaCache;
+  // Current directory index cache (derived from directoryMapping)
+  int? _currentDirIndexCache;
+  // Lock for thread-safe access to cache
+  Future<MigrationMeta>? _loadingFuture;
 
   MigrationManager(this._dataStore);
 
@@ -71,7 +79,8 @@ class MigrationManager {
 
         try {
           // Get old table schema
-          final oldSchema = await _dataStore.getTableSchema(oldTableName);
+          final oldSchema =
+              await _dataStore.schemaManager?.getTableSchema(oldTableName);
           if (oldSchema == null) {
             continue;
           }
@@ -349,7 +358,7 @@ class MigrationManager {
         if (existingTableName == newSchema.name) continue;
 
         final existingSchema =
-            await _dataStore.getTableSchema(existingTableName);
+            await _dataStore.schemaManager?.getTableSchema(existingTableName);
         if (existingSchema == null) continue;
 
         // Check if tableId matches
@@ -388,7 +397,7 @@ class MigrationManager {
       // get all old table schemas
       for (final existingTableName in existingTables) {
         final existingSchema =
-            await _dataStore.getTableSchema(existingTableName);
+            await _dataStore.schemaManager?.getTableSchema(existingTableName);
         if (existingSchema == null) continue;
         existingSchemasMap[existingTableName] = existingSchema;
       }
@@ -420,7 +429,7 @@ class MigrationManager {
       }
 
       // max concurrent
-      final maxConcurrent = _dataStore.config.maxConcurrent;
+      final maxConcurrent = _dataStore.config.maxConcurrency;
 
       // batch processing requests
       final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
@@ -491,7 +500,7 @@ class MigrationManager {
   Future<MigrationTask?> _migrateExistingTable(TableSchema newSchema,
       {required int batchSize}) async {
     final tableName = newSchema.name;
-    final oldSchema = await _dataStore.getTableSchema(tableName);
+    final oldSchema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (oldSchema == null) {
       return null;
     }
@@ -519,16 +528,26 @@ class MigrationManager {
     final globalConfig = await _dataStore.getGlobalConfig();
     if (hasPendingTask || (globalConfig?.hasMigrationTask == true)) {
       // If there are pending tasks, check if there are tasks for this table in migration metadata
-      final meta = await _loadMigrationMeta();
+      final meta = await _getOrLoadMigrationMeta();
       final allTaskFound = <String>[];
 
       // Find possible tasks for the same table name
-      for (final entry in meta.taskIndex.entries) {
+      final tasksToRemove = <String>[];
+      for (final entry in meta.directoryMapping.idToDir.entries) {
         try {
           final taskId = entry.key;
           final dirIndex = entry.value;
           final taskPath =
               _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
+
+          // Check if file exists
+          final fileExists = await _dataStore.storage.existsFile(taskPath);
+          if (!fileExists) {
+            // File doesn't exist but mapping has it - mark for cleanup
+            tasksToRemove.add(taskId);
+            continue;
+          }
+
           final content = await _dataStore.storage.readAsString(taskPath);
 
           if (content != null && content.isNotEmpty) {
@@ -537,10 +556,20 @@ class MigrationManager {
                 task.pendingMigrationSpaces.isNotEmpty) {
               allTaskFound.add(taskId);
             }
+          } else {
+            // File exists but is empty - mark for cleanup
+            tasksToRemove.add(taskId);
           }
         } catch (e) {
-          // Ignore file reading errors
+          // File reading error - mark for cleanup
+          final taskId = entry.key;
+          tasksToRemove.add(taskId);
         }
+      }
+
+      // Clean up orphaned mappings if any found
+      if (tasksToRemove.isNotEmpty) {
+        await _cleanupOrphanedMappings(tasksToRemove);
       }
 
       if (allTaskFound.isNotEmpty) {
@@ -564,7 +593,8 @@ class MigrationManager {
       bool startProcessing = true,
       bool allowAfterDataMigration = false}) async {
     try {
-      final oldSchema = await _dataStore.getTableSchema(tableName);
+      final oldSchema =
+          await _dataStore.schemaManager?.getTableSchema(tableName);
       if (oldSchema != null) {
         // Only check for existing tables
         final requiresMigration =
@@ -685,7 +715,8 @@ class MigrationManager {
         break;
 
       case MigrationType.renameTable:
-        final oldSchema = await _dataStore.getTableSchema(tableName);
+        final oldSchema =
+            await _dataStore.schemaManager?.getTableSchema(tableName);
         if (oldSchema == null) {
           return;
         }
@@ -703,6 +734,135 @@ class MigrationManager {
             operation.primaryKeyConfig!,
           );
         }
+        break;
+
+      case MigrationType.addForeignKey:
+        // Add foreign key to table schema
+        final schema =
+            await _dataStore.schemaManager?.getTableSchema(tableName);
+        if (schema == null) {
+          Logger.warn(
+            'Table $tableName does not exist, cannot add foreign key',
+            label: 'MigrationManager._executeSchemaOperation',
+          );
+          break;
+        }
+        // Check if foreign key already exists
+        if (schema.foreignKeys
+            .any((fk) => fk.actualName == operation.foreignKey!.actualName)) {
+          Logger.warn(
+            'Foreign key ${operation.foreignKey!.actualName} already exists in table $tableName',
+            label: 'MigrationManager._executeSchemaOperation',
+          );
+          break;
+        }
+        // Add foreign key to schema
+        final newForeignKeys = [...schema.foreignKeys, operation.foreignKey!];
+        final updatedSchema = schema.copyWith(foreignKeys: newForeignKeys);
+        await _dataStore.schemaManager!
+            .saveTableSchema(tableName, updatedSchema);
+        // Update system table (updateTableSchema will handle it, but we call explicitly for clarity)
+        // Note: updateTableSchema no longer unconditionally calls updateSystemTableForTable
+        // We call it explicitly here after schema update
+        final fkManager = _dataStore.foreignKeyManager;
+        await fkManager?.updateSystemTableForTable(tableName, updatedSchema);
+        // Auto-create index if needed
+        if (operation.foreignKey!.autoCreateIndex) {
+          await fkManager?.createForeignKeyIndexes(tableName);
+        }
+        break;
+
+      case MigrationType.removeForeignKey:
+        // Remove foreign key from table schema
+        final schema =
+            await _dataStore.schemaManager?.getTableSchema(tableName);
+        if (schema == null) {
+          Logger.warn(
+            'Table $tableName does not exist, cannot remove foreign key',
+            label: 'MigrationManager._executeSchemaOperation',
+          );
+          break;
+        }
+
+        // Find the foreign key to be removed
+        final fkToRemove = schema.foreignKeys.firstWhere(
+          (fk) => fk.actualName == operation.foreignKeyName,
+          orElse: () => throw ArgumentError(
+            'Foreign key ${operation.foreignKeyName} not found in table $tableName',
+          ),
+        );
+
+        // Check for orphaned records (records that reference non-existent records)
+        // This is important for data integrity - warn developer about potential issues
+        await _checkOrphanedRecordsBeforeRemovingForeignKey(
+            tableName, fkToRemove);
+
+        // Remove foreign key from schema
+        final newForeignKeys = schema.foreignKeys
+            .where((fk) => fk.actualName != operation.foreignKeyName)
+            .toList();
+        final updatedSchema = schema.copyWith(foreignKeys: newForeignKeys);
+        await _dataStore.schemaManager!
+            .saveTableSchema(tableName, updatedSchema);
+        // Update system table
+        final fkManager = _dataStore.foreignKeyManager;
+        await fkManager?.updateSystemTableForTable(tableName, updatedSchema);
+        break;
+
+      case MigrationType.modifyForeignKey:
+        // Modify foreign key in table schema
+        final schema =
+            await _dataStore.schemaManager?.getTableSchema(tableName);
+        if (schema == null) {
+          Logger.warn(
+            'Table $tableName does not exist, cannot modify foreign key',
+            label: 'MigrationManager._executeSchemaOperation',
+          );
+          break;
+        }
+        // Find the foreign key to modify
+        final fkName =
+            operation.foreignKeyName ?? operation.foreignKey?.actualName;
+        if (fkName == null) {
+          Logger.warn(
+            'Foreign key name not provided for modify operation',
+            label: 'MigrationManager._executeSchemaOperation',
+          );
+          break;
+        }
+
+        final oldFk = schema.foreignKeys.firstWhere(
+          (fk) => fk.actualName == fkName,
+          orElse: () => throw ArgumentError(
+            'Foreign key $fkName not found in table $tableName',
+          ),
+        );
+
+        // Merge old FK with new properties from operation.foreignKey
+        // Only non-core properties (onDelete, onUpdate, enabled, autoCreateIndex, comment) are modified
+        // Core properties (fields, referencedTable, referencedFields) are preserved from old FK
+        final newFk = oldFk.copyWith(
+          onDelete: operation.foreignKey?.onDelete ?? oldFk.onDelete,
+          onUpdate: operation.foreignKey?.onUpdate ?? oldFk.onUpdate,
+          enabled: operation.foreignKey?.enabled ?? oldFk.enabled,
+          autoCreateIndex:
+              operation.foreignKey?.autoCreateIndex ?? oldFk.autoCreateIndex,
+          comment: operation.foreignKey?.comment ?? oldFk.comment,
+        );
+
+        // Find and replace foreign key
+        final newForeignKeys = schema.foreignKeys.map((fk) {
+          if (fk.actualName == fkName) {
+            return newFk;
+          }
+          return fk;
+        }).toList();
+        final updatedSchema = schema.copyWith(foreignKeys: newForeignKeys);
+        await _dataStore.schemaManager!
+            .saveTableSchema(tableName, updatedSchema);
+        // Update system table
+        final fkManager = _dataStore.foreignKeyManager;
+        await fkManager?.updateSystemTableForTable(tableName, updatedSchema);
         break;
     }
   }
@@ -732,6 +892,9 @@ class MigrationManager {
 
     // Check indexes changes
     _compareIndexes(oldSchema, newSchema, operations);
+
+    // Check foreign key changes
+    _compareForeignKeys(oldSchema, newSchema, operations);
 
     return operations;
   }
@@ -973,6 +1136,102 @@ class MigrationManager {
         !_areFieldListsEqual(oldIndex.fields, newIndex.fields);
   }
 
+  /// Compare foreign keys and generate operations
+  ///
+  /// Foreign key change rules:
+  /// - **Allowed to modify**: onDelete, onUpdate, enabled, autoCreateIndex, comment
+  /// - **Not allowed to modify**: fields, referencedTable, referencedFields
+  ///   (These are core definitions. If changed, must remove old FK and add new FK)
+  void _compareForeignKeys(
+    TableSchema oldSchema,
+    TableSchema newSchema,
+    List<MigrationOperation> operations,
+  ) {
+    // First mark all old foreign keys as to be removed
+    final foreignKeysToRemove =
+        List<ForeignKeySchema>.from(oldSchema.foreignKeys);
+
+    // Check for added and modified foreign keys
+    for (var newFk in newSchema.foreignKeys) {
+      // Try to find matching foreign key in old schema by name
+      ForeignKeySchema? matchedOldFk;
+
+      for (var oldFk in oldSchema.foreignKeys) {
+        // Match by actual name (handles auto-generated names)
+        if (oldFk.actualName == newFk.actualName) {
+          matchedOldFk = oldFk;
+          break;
+        }
+      }
+
+      if (matchedOldFk == null) {
+        // No matching old foreign key found, this is a new foreign key
+        operations.add(MigrationOperation(
+          type: MigrationType.addForeignKey,
+          foreignKey: newFk,
+        ));
+      } else {
+        // Found matching old foreign key, remove from to-be-deleted list
+        foreignKeysToRemove.remove(matchedOldFk);
+
+        // Check if modification is needed
+        // Core definitions (fields, referencedTable, referencedFields) cannot be modified
+        // If they change, we must remove old FK and add new FK
+        final coreDefinitionChanged =
+            !_areFieldListsEqual(matchedOldFk.fields, newFk.fields) ||
+                matchedOldFk.referencedTable != newFk.referencedTable ||
+                !_areFieldListsEqual(
+                    matchedOldFk.referencedFields, newFk.referencedFields);
+
+        if (coreDefinitionChanged) {
+          // Core definition changed - this is a breaking change that requires manual handling
+          // Throwing exception to warn developer that this requires data migration
+          throw Exception(
+            'Foreign key core definition change detected for ${matchedOldFk.actualName} in table ${oldSchema.name}. '
+            'Core definitions (fields, referencedTable, referencedFields) cannot be automatically modified. '
+            'This is a breaking change that may cause data inconsistency.\n'
+            'Old definition: fields=${matchedOldFk.fields}, referencedTable=${matchedOldFk.referencedTable}, referencedFields=${matchedOldFk.referencedFields}\n'
+            'New definition: fields=${newFk.fields}, referencedTable=${newFk.referencedTable}, referencedFields=${newFk.referencedFields}\n'
+            'Please handle this manually:\n'
+            '1. Remove the old foreign key: db.schema("${oldSchema.name}").removeForeignKey("${matchedOldFk.actualName}")\n'
+            '2. Ensure data integrity (check for orphaned records, update data if needed)\n'
+            '3. Add the new foreign key: db.schema("${oldSchema.name}").addForeignKey(...)',
+          );
+        } else {
+          // Only non-core properties changed - can modify
+          final needsModification = matchedOldFk.onDelete != newFk.onDelete ||
+              matchedOldFk.onUpdate != newFk.onUpdate ||
+              matchedOldFk.enabled != newFk.enabled ||
+              matchedOldFk.autoCreateIndex != newFk.autoCreateIndex ||
+              matchedOldFk.comment != newFk.comment;
+
+          if (needsModification) {
+            operations.add(MigrationOperation(
+              type: MigrationType.modifyForeignKey,
+              foreignKey: newFk,
+              oldForeignKey: matchedOldFk,
+            ));
+          }
+        }
+      }
+    }
+
+    // Handle foreign keys that need to be removed
+    for (var fkToRemove in foreignKeysToRemove) {
+      if (!SystemTable.isSystemTable(oldSchema.name)) {
+        Logger.info(
+          'Detected foreign key to be removed: ${fkToRemove.actualName}',
+          label: 'MigrationManager._compareForeignKeys',
+        );
+      }
+
+      operations.add(MigrationOperation(
+        type: MigrationType.removeForeignKey,
+        foreignKeyName: fkToRemove.actualName,
+      ));
+    }
+  }
+
   /// Detect renamed fields using strict matching
   void _detectRenamedFields(
     TableSchema oldSchema,
@@ -1107,7 +1366,7 @@ class MigrationManager {
     }
 
     // max concurrent
-    final maxConcurrent = _dataStore.config.maxConcurrent;
+    final maxConcurrent = _dataStore.config.maxConcurrency;
 
     // batch processing requests
     final int batchSize = (similarityRequests.length / maxConcurrent).ceil();
@@ -1264,43 +1523,124 @@ class MigrationManager {
 
   /// Get next directory index for migration tasks
   Future<int> _getNextDirIndex() async {
-    final meta = await _loadMigrationMeta();
-    final currentDirIndex = meta.currentDirIndex;
-    final dirUsage = Map<int, int>.from(meta.dirUsage);
+    final meta = await _getOrLoadMigrationMeta();
+    final mapping = meta.directoryMapping;
+    final maxEntriesPerDir = _dataStore.maxEntriesPerDir;
 
-    final maxEntriesPerDir = _dataStore.config.maxEntriesPerDir;
-    if (dirUsage[currentDirIndex]! >= maxEntriesPerDir) {
+    // Use cached currentDirIndex if available, otherwise calculate
+    int currentDirIndex;
+    if (_currentDirIndexCache != null) {
+      currentDirIndex = _currentDirIndexCache!;
+    } else {
+      // Find current directory index (highest dirIndex with files)
+      currentDirIndex = 0;
+      if (mapping.dirToFileCount.isNotEmpty) {
+        currentDirIndex =
+            mapping.dirToFileCount.keys.reduce((a, b) => a > b ? a : b);
+      }
+      _currentDirIndexCache = currentDirIndex;
+    }
+
+    // Check if current directory is full
+    final currentCount = mapping.getFileCount(currentDirIndex);
+    if (currentCount >= maxEntriesPerDir) {
+      // Allocate new directory
       final newDirIndex = currentDirIndex + 1;
-      dirUsage[newDirIndex] = 0;
+      _currentDirIndexCache = newDirIndex;
       return newDirIndex;
     }
-    dirUsage[currentDirIndex] = dirUsage[currentDirIndex]! + 1;
+
     return currentDirIndex;
   }
 
-  /// Load migration metadata
+  /// Get or load migration metadata from cache or file
+  Future<MigrationMeta> _getOrLoadMigrationMeta() async {
+    // Return cached value if available
+    if (_migrationMetaCache != null) {
+      return _migrationMetaCache!;
+    }
+
+    // Load from file and cache
+    return await _loadMigrationMeta();
+  }
+
+  /// Load migration metadata from file and update cache
   Future<MigrationMeta> _loadMigrationMeta() async {
+    // If already loading, wait for that operation
+    if (_loadingFuture != null) {
+      return await _loadingFuture!;
+    }
+
+    // Start loading operation
+    final loadOp = _performLoadMigrationMeta();
+    _loadingFuture = loadOp;
+
+    try {
+      final result = await loadOp;
+      return result;
+    } finally {
+      // Clear loading future after completion
+      if (identical(_loadingFuture, loadOp)) {
+        _loadingFuture = null;
+      }
+    }
+  }
+
+  /// Perform actual loading of migration metadata
+  Future<MigrationMeta> _performLoadMigrationMeta() async {
+    // Double-check after acquiring lock
+    if (_migrationMetaCache != null) {
+      return _migrationMetaCache!;
+    }
+
     try {
       final metaPath = _dataStore.pathManager.getMigrationMetaPath();
       final metaContent = await _dataStore.storage.readAsString(metaPath);
       if (metaContent != null && metaContent.isNotEmpty) {
-        return MigrationMeta.fromJson(jsonDecode(metaContent));
+        _migrationMetaCache = MigrationMeta.fromJson(jsonDecode(metaContent));
+      } else {
+        _migrationMetaCache = MigrationMeta.initial();
       }
     } catch (e) {
       Logger.warn(
         'Load migration meta failed, use initial: $e',
         label: 'MigrationManager._loadMigrationMeta',
       );
+      _migrationMetaCache = MigrationMeta.initial();
     }
-    return MigrationMeta.initial();
+
+    // Update currentDirIndex cache
+    _updateCurrentDirIndexCache();
+
+    return _migrationMetaCache!;
   }
 
-  /// Save migration metadata
+  /// Update current directory index cache from directoryMapping
+  void _updateCurrentDirIndexCache() {
+    if (_migrationMetaCache == null) {
+      _currentDirIndexCache = null;
+      return;
+    }
+
+    final mapping = _migrationMetaCache!.directoryMapping;
+    if (mapping.dirToFileCount.isNotEmpty) {
+      _currentDirIndexCache =
+          mapping.dirToFileCount.keys.reduce((a, b) => a > b ? a : b);
+    } else {
+      _currentDirIndexCache = 0;
+    }
+  }
+
+  /// Save migration metadata to file and update cache
   Future<void> _saveMigrationMeta(MigrationMeta meta) async {
     try {
       final metaPath = _dataStore.pathManager.getMigrationMetaPath();
       await _dataStore.storage
           .writeAsString(metaPath, jsonEncode(meta.toJson()));
+
+      // Update cache after successful save
+      _migrationMetaCache = meta;
+      _updateCurrentDirIndexCache();
     } catch (e) {
       Logger.warn(
         'Save migration meta failed: $e',
@@ -1315,15 +1655,40 @@ class MigrationManager {
         _dataStore.pathManager.getMigrationTaskPath(task.dirIndex, task.taskId);
     await _dataStore.storage.writeAsString(taskPath, jsonEncode(task.toJson()));
 
-    // update meta data
-    final meta = await _loadMigrationMeta();
-    final updatedMeta = meta.copyWith(
-      currentDirIndex: task.dirIndex,
-      dirUsage: Map<int, int>.from(meta.dirUsage)
-        ..update(task.dirIndex, (value) => value + 1, ifAbsent: () => 1),
-      taskIndex: Map<String, int>.from(meta.taskIndex)
-        ..[task.taskId] = task.dirIndex,
+    // update meta data with directory mapping
+    final meta = await _getOrLoadMigrationMeta();
+    final currentMapping = meta.directoryMapping;
+
+    // Check if task already exists in mapping
+    final existingDirIndex = currentMapping.getDirIndex(task.taskId);
+
+    // Build updated mapping
+    final newIdToDir = Map<String, int>.from(currentMapping.idToDir);
+    newIdToDir[task.taskId] = task.dirIndex;
+
+    final newDirToFileCount = Map<int, int>.from(currentMapping.dirToFileCount);
+
+    // If task was moved from another directory, decrement old directory count
+    if (existingDirIndex != null && existingDirIndex != task.dirIndex) {
+      final oldCount = newDirToFileCount[existingDirIndex] ?? 0;
+      if (oldCount > 1) {
+        newDirToFileCount[existingDirIndex] = oldCount - 1;
+      } else {
+        // Remove directory from mapping when count reaches 0
+        newDirToFileCount.remove(existingDirIndex);
+      }
+    }
+
+    // Increment new directory count
+    final newCount = newDirToFileCount[task.dirIndex] ?? 0;
+    newDirToFileCount[task.dirIndex] = newCount + 1;
+
+    final updatedMapping = DirectoryMappingString(
+      idToDir: newIdToDir,
+      dirToFileCount: newDirToFileCount,
     );
+
+    final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
     await _saveMigrationMeta(updatedMeta);
   }
 
@@ -1415,11 +1780,13 @@ class MigrationManager {
       // sort operations, ensure rename field operation is executed after property modification operation
       final sortedOperations = _sortOperations(List.from(task.operations));
 
-      // save data in write buffer to disk before migration
-      await _dataStore.tableDataManager.flushAllBuffers();
+      // Save all pending data and runtime metadata before migration to ensure consistency.
+      await _dataStore.saveAllCacheBeforeExit();
 
       // clear table record cache
-      await _dataStore.dataCacheManager.invalidateCache(task.tableName);
+      // Don't mark as fully cached since migration preserves data, just invalidates cache
+      await _dataStore.cacheManager
+          .invalidateCache(task.tableName, markAsFullyCached: false);
 
       // update global table structure first
       if (!task.isSchemaUpdated) {
@@ -1456,7 +1823,8 @@ class MigrationManager {
       }
 
       // get old table structure information
-      final oldSchema = await _dataStore.getTableSchema(originalTableName);
+      final oldSchema =
+          await _dataStore.schemaManager?.getTableSchema(originalTableName);
 
       Logger.info(
         'Preparing to migrate data for ${pendingSpaces.length} spaces',
@@ -1523,13 +1891,6 @@ class MigrationManager {
           }
         }
 
-        // Check if should cache table (only when current space and table allow full table cache)
-        bool shouldCache = space == _dataStore.currentSpaceName &&
-            await _dataStore.tableDataManager
-                .allowFullTableCache(currentTableName);
-        final List<Map<String, dynamic>> allMigratedRecords =
-            <Map<String, dynamic>>[];
-
         // Process data migration based on migration type, collect records for cache
         if (renameOp != null && renameOp.newTableName != null) {
           // use high performance batch processing method instead of stream processing
@@ -1542,16 +1903,6 @@ class MigrationManager {
               final modifiedRecords = await _applyMigrationOperations(
                   records, sortedOperations,
                   oldSchema: oldSchema);
-
-              // if need cache, collect records
-              if (shouldCache) {
-                // Filter out deleted records before adding to the collection for caching
-                final filteredRecords = modifiedRecords
-                    .where((r) => !isDeletedRecord(r))
-                    .map((r) => Map<String, dynamic>.from(r))
-                    .toList();
-                allMigratedRecords.addAll(filteredRecords);
-              }
 
               return modifiedRecords;
             },
@@ -1567,38 +1918,18 @@ class MigrationManager {
         } else {
           if (needDataMigration) {
             // no rename table operation, directly process data migration
+            // Use oldSchema to decode old data correctly before applying migration operations
             await migrationInstance.tableDataManager.processTablePartitions(
                 tableName: currentTableName,
+                decodeSchema:
+                    oldSchema, // Critical: use old schema to decode old data
                 processFunction: (records, partitionIndex, controller) async {
                   final migratedRecords = await _applyMigrationOperations(
                       records, sortedOperations,
                       oldSchema: oldSchema);
 
-                  // if need cache, collect records
-                  if (shouldCache) {
-                    // Filter out deleted records before adding to the collection for caching
-                    final filteredRecords = migratedRecords
-                        .where((r) => !isDeletedRecord(r))
-                        .map((r) => Map<String, dynamic>.from(r))
-                        .toList();
-                    allMigratedRecords.addAll(filteredRecords);
-                  }
-
                   return migratedRecords;
                 });
-          }
-        }
-
-        // if collect records, add to cache
-        if (allMigratedRecords.isNotEmpty) {
-          final schema = await _dataStore.getTableSchema(currentTableName);
-          if (schema != null) {
-            await _dataStore.dataCacheManager.cacheEntireTable(
-              currentTableName,
-              schema.primaryKey,
-              allMigratedRecords,
-              isFullTableCache: true,
-            );
           }
         }
 
@@ -1618,12 +1949,7 @@ class MigrationManager {
 
       // async delete original table without waiting, avoid blocking migration process completion
       if (renameOp != null && renameOp.newTableName != null) {
-        _dataStore.dropTable(originalTableName).catchError((e) {
-          Logger.error(
-            'Failed to delete original table [$originalTableName]: $e',
-            label: 'MigrationManager._executeMigrationTask',
-          );
-        });
+        _dataStore.dropTable(originalTableName);
       } else {
         // if auto generated task, ensure schema consistency with async operation
         if (task.isAutoGenerated) {
@@ -1680,7 +2006,7 @@ class MigrationManager {
       return records;
     }
     // Get max concurrent
-    final maxConcurrent = _dataStore.config.maxConcurrent;
+    final maxConcurrent = _dataStore.config.maxConcurrency;
 
     // Batch size
     final int batchSize = (records.length / maxConcurrent).ceil();
@@ -1700,8 +2026,9 @@ class MigrationManager {
               records: batch,
               operations: operations,
               oldSchema: oldSchema,
+              yieldDurationMs: _dataStore.config.yieldDurationMs,
             ),
-            useIsolate: records.length > 2000)));
+            useIsolate: records.length > 500)));
 
     // Merge results
     final allProcessedRecords = <Map<String, dynamic>>[];
@@ -1725,20 +2052,23 @@ class MigrationManager {
     try {
       final taskPath = _dataStore.pathManager
           .getMigrationTaskPath(task.dirIndex, task.taskId);
-      await _dataStore.storage.deleteFile(taskPath);
 
-      // update meta data
-      final meta = await _loadMigrationMeta();
-      final updatedTaskIndex = Map<String, int>.from(meta.taskIndex)
-        ..remove(task.taskId);
-      final updatedDirUsage = Map<int, int>.from(meta.dirUsage)
-        ..update(task.dirIndex, (value) => value - 1);
+      // Check if file exists before attempting to delete
+      final fileExists = await _dataStore.storage.existsFile(taskPath);
+      if (fileExists) {
+        await _dataStore.storage.deleteFile(taskPath);
+      }
 
-      final updatedMeta = meta.copyWith(
-        dirUsage: updatedDirUsage,
-        taskIndex: updatedTaskIndex,
-      );
-      await _saveMigrationMeta(updatedMeta);
+      // Always update meta data: remove task from directory mapping
+      // This ensures mapping stays consistent even if file was already deleted
+      final meta = await _getOrLoadMigrationMeta();
+
+      // Verify task still exists in mapping before removing
+      if (meta.directoryMapping.getDirIndex(task.taskId) != null) {
+        final updatedMapping = meta.directoryMapping.removeId(task.taskId);
+        final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
+        await _saveMigrationMeta(updatedMeta);
+      }
     } catch (e) {
       Logger.error(
         'Cleanup migration task failed: $e',
@@ -1754,17 +2084,33 @@ class MigrationManager {
       final globalConfig = await _dataStore.getGlobalConfig();
       if (globalConfig != null && globalConfig.hasMigrationTask) {
         // load migration meta data
-        final meta = await _loadMigrationMeta();
-        if (meta.taskIndex.isNotEmpty) {
+        final meta = await _getOrLoadMigrationMeta();
+        if (meta.directoryMapping.idToDir.isNotEmpty) {
+          // Track tasks to remove from mapping (file doesn't exist)
+          final tasksToRemove = <String>[];
+
           // load unfinished tasks one by one
-          for (final entry in meta.taskIndex.entries) {
+          for (final entry in meta.directoryMapping.idToDir.entries) {
             final taskId = entry.key;
             final dirIndex = entry.value;
 
             try {
-              // read task file
+              // Check if task file exists
               final taskPath =
                   _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
+              final fileExists = await _dataStore.storage.existsFile(taskPath);
+
+              if (!fileExists) {
+                // File doesn't exist but mapping has it - mark for cleanup
+                Logger.warn(
+                  'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+                  label: 'MigrationManager.initialize',
+                );
+                tasksToRemove.add(taskId);
+                continue;
+              }
+
+              // read task file
               final taskContent =
                   await _dataStore.storage.readAsString(taskPath);
 
@@ -1781,14 +2127,34 @@ class MigrationManager {
 
                   // add to pending tasks queue
                   _pendingTasks.add(task);
+                } else {
+                  // Task is completed but still in mapping - mark for cleanup
+                  Logger.info(
+                    'Task completed but still in mapping: taskId[$taskId], cleaning up mapping',
+                    label: 'MigrationManager.initialize',
+                  );
+                  tasksToRemove.add(taskId);
                 }
+              } else {
+                // File exists but is empty - mark for cleanup
+                Logger.warn(
+                  'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+                  label: 'MigrationManager.initialize',
+                );
+                tasksToRemove.add(taskId);
               }
             } catch (e) {
               Logger.warn(
-                'Failed to load task: taskId[$taskId], error[$e]',
+                'Failed to load task: taskId[$taskId], error[$e], cleaning up mapping',
                 label: 'MigrationManager.initialize',
               );
+              tasksToRemove.add(taskId);
             }
+          }
+
+          // Clean up orphaned mappings (tasks that don't exist or are completed)
+          if (tasksToRemove.isNotEmpty) {
+            await _cleanupOrphanedMappings(tasksToRemove);
           }
 
           // start processing recovered tasks
@@ -1807,6 +2173,36 @@ class MigrationManager {
       Logger.error(
         'Failed to initialize migration manager: $e\n$stack',
         label: 'MigrationManager.initialize',
+      );
+    }
+  }
+
+  /// Clean up orphaned task mappings (tasks that no longer exist)
+  Future<void> _cleanupOrphanedMappings(List<String> taskIds) async {
+    try {
+      final meta = await _getOrLoadMigrationMeta();
+      var updatedMapping = meta.directoryMapping;
+
+      // Remove each orphaned task from mapping
+      for (final taskId in taskIds) {
+        updatedMapping = updatedMapping.removeId(taskId);
+      }
+
+      // Only save if mapping changed
+      if (updatedMapping.idToDir.length !=
+          meta.directoryMapping.idToDir.length) {
+        final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
+        await _saveMigrationMeta(updatedMeta);
+
+        Logger.info(
+          'Cleaned up ${taskIds.length} orphaned task mapping(s)',
+          label: 'MigrationManager._cleanupOrphanedMappings',
+        );
+      }
+    } catch (e) {
+      Logger.error(
+        'Failed to cleanup orphaned mappings: $e',
+        label: 'MigrationManager._cleanupOrphanedMappings',
       );
     }
   }
@@ -1861,14 +2257,14 @@ class MigrationManager {
   Future<MigrationStatus?> queryTaskStatus(String taskId) async {
     try {
       // load migration meta data
-      final meta = await _loadMigrationMeta();
-      final taskIndex = meta.taskIndex;
+      final meta = await _getOrLoadMigrationMeta();
+      final dirIndex = meta.directoryMapping.getDirIndex(taskId);
 
-      if (!taskIndex.containsKey(taskId)) {
+      if (dirIndex == null) {
         // task completed or not exist
         return MigrationStatus(
           taskId: taskId,
-          isCompleted: true, // task ID not in index, consider as completed
+          isCompleted: true, // task ID not in mapping, consider as completed
           createTime: DateTime.now(),
           pendingSpaces: const [],
           processedSpacesCount: 0,
@@ -1876,15 +2272,38 @@ class MigrationManager {
         );
       }
 
-      // get task directory index
-      final dirIndex = taskIndex[taskId]!;
-
       // read task file
       final taskPath =
           _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
+
+      // Check if file exists
+      final fileExists = await _dataStore.storage.existsFile(taskPath);
+      if (!fileExists) {
+        // File doesn't exist but mapping has it - cleanup mapping
+        Logger.warn(
+          'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+          label: 'MigrationManager.queryTaskStatus',
+        );
+        await _cleanupOrphanedMappings([taskId]);
+        return MigrationStatus(
+          taskId: taskId,
+          isCompleted: true,
+          createTime: DateTime.now(),
+          pendingSpaces: const [],
+          processedSpacesCount: 0,
+          totalSpacesCount: 0,
+        );
+      }
+
       final taskContent = await _dataStore.storage.readAsString(taskPath);
 
       if (taskContent == null || taskContent.isEmpty) {
+        // File exists but is empty - cleanup mapping
+        Logger.warn(
+          'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+          label: 'MigrationManager.queryTaskStatus',
+        );
+        await _cleanupOrphanedMappings([taskId]);
         return null;
       }
 
@@ -1938,13 +2357,14 @@ class MigrationManager {
         }
 
         // Get both schemas for comparison
-        final initialSchema = _dataStore.getInitialSchema();
+        final initialSchema = _dataStore.getInitialSchemas();
         final definitionSchema = initialSchema.firstWhere(
           (s) => s.name == targetTableName,
           orElse: () => throw Exception('Schema not found in initial schema'),
         );
 
-        final currentSchema = await _dataStore.getTableSchema(targetTableName);
+        final currentSchema =
+            await _dataStore.schemaManager?.getTableSchema(targetTableName);
 
         // Convert schemas to JSON for deep comparison
         final definitionJson = jsonEncode(definitionSchema.toJson());
@@ -1953,7 +2373,8 @@ class MigrationManager {
 
         // Only update if schemas are different
         if (currentJson == null || definitionJson != currentJson) {
-          await _dataStore.updateTableSchema(targetTableName, definitionSchema);
+          await _dataStore.schemaManager!
+              .saveTableSchema(targetTableName, definitionSchema);
         } else {
           Logger.debug(
             'Schema for table [$targetTableName] is already consistent with definition',
@@ -2033,6 +2454,115 @@ class MigrationManager {
       }
     }
     return false;
+  }
+
+  /// Check for orphaned records before removing foreign key
+  ///
+  /// Orphaned records are records in the referencing table that reference
+  /// records in the referenced table that no longer exist (or will no longer
+  /// be validated after foreign key removal).
+  ///
+  /// This method checks for potential data integrity issues and logs warnings.
+  /// It does not prevent the foreign key removal, but alerts the developer
+  /// to potential data quality issues.
+  Future<void> _checkOrphanedRecordsBeforeRemovingForeignKey(
+    String tableName,
+    ForeignKeySchema fk,
+  ) async {
+    try {
+      // Check if referenced table exists
+      final referencedSchema =
+          await _dataStore.schemaManager?.getTableSchema(fk.referencedTable);
+      if (referencedSchema == null) {
+        Logger.warn(
+          'Referenced table ${fk.referencedTable} does not exist. '
+          'Removing foreign key ${fk.actualName} from table $tableName. '
+          'All records in $tableName that reference ${fk.referencedTable} are now orphaned.',
+          label:
+              'MigrationManager._checkOrphanedRecordsBeforeRemovingForeignKey',
+        );
+        return;
+      }
+
+      // Build query to find records in referencing table
+      // We need to check if any records have foreign key values that don't exist in referenced table
+      final queryBuilder = QueryBuilder(_dataStore, tableName);
+
+      // For composite foreign keys, we need to check all fields
+      // For simplicity, we'll sample a few records to check
+      // In production, you might want to do a full scan or use a more efficient method
+
+      // Get a sample of records to check
+      final sampleResults = await queryBuilder.limit(100).future;
+
+      if (sampleResults.data.isEmpty) {
+        // No records to check
+        return;
+      }
+
+      // Check each sample record for orphaned references
+      int orphanedCount = 0;
+      final orphanedRecords = <Map<String, dynamic>>[];
+
+      for (final record in sampleResults.data) {
+        // Build condition to check if referenced record exists
+        final refCondition = <String, dynamic>{};
+        bool hasNonNullValue = false;
+
+        for (int i = 0; i < fk.fields.length; i++) {
+          final fkField = fk.fields[i];
+          final refField = fk.referencedFields[i];
+          final fkValue = record[fkField];
+
+          if (fkValue != null) {
+            hasNonNullValue = true;
+            refCondition[refField] = fkValue;
+          }
+        }
+
+        if (hasNonNullValue && refCondition.isNotEmpty) {
+          // Check if referenced record exists
+          final refQueryBuilder = QueryBuilder(_dataStore, fk.referencedTable);
+          for (final entry in refCondition.entries) {
+            refQueryBuilder.where(entry.key, '=', entry.value);
+          }
+          final refResults = await refQueryBuilder.limit(1).future;
+
+          if (refResults.data.isEmpty) {
+            orphanedCount++;
+            if (orphanedRecords.length < 10) {
+              // Keep sample of orphaned records for logging
+              orphanedRecords.add(record);
+            }
+          }
+        }
+      }
+
+      if (orphanedCount > 0) {
+        Logger.warn(
+          'Found $orphanedCount orphaned record(s) in sample when removing foreign key ${fk.actualName} from table $tableName. '
+          'These records reference non-existent records in table ${fk.referencedTable}. '
+          'After removing the foreign key, these records will no longer be validated, which may cause data integrity issues.\n'
+          'Sample orphaned records: ${orphanedRecords.take(3).map((r) => r.toString()).join(", ")}\n'
+          'Consider cleaning up orphaned records before or after removing the foreign key.',
+          label:
+              'MigrationManager._checkOrphanedRecordsBeforeRemovingForeignKey',
+        );
+      } else {
+        Logger.info(
+          'No orphaned records detected in sample when removing foreign key ${fk.actualName} from table $tableName.',
+          label:
+              'MigrationManager._checkOrphanedRecordsBeforeRemovingForeignKey',
+        );
+      }
+    } catch (e) {
+      // Don't throw - just log warning
+      // Foreign key removal should proceed even if orphaned record check fails
+      Logger.warn(
+        'Failed to check for orphaned records before removing foreign key ${fk.actualName}: $e',
+        label: 'MigrationManager._checkOrphanedRecordsBeforeRemovingForeignKey',
+      );
+    }
   }
 }
 

@@ -10,7 +10,15 @@
 
 ## 为什么选择 Tostore？
 
-Tostore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储引擎，采用多分区并行机制和互联拓扑结构构建智能数据网络，提供精准的表结构变动识别、加密保护以及多空间架构，Isolate并行处理机制充分释放多核心性能，dart跨平台特性天然支持从移动边缘设备到云端的协同参与，多种分布式主键算法与节点水平扩展能力，为沉浸式虚实融合、多模态交互、空间计算、生成式AI、语义向量空间建模提供分布式数据基座。
+Tostore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储引擎。采用类神经网络式架构，节点间智能互联协同，支持无限节点水平扩展，构建灵活的数据拓扑网络，提供精准的表结构变动识别、加密保护以及多空间数据隔离，充分利用多核心CPU实现极致并行处理，天然支持从移动边缘设备到云端的跨平台协同，具备多种分布式主键算法，为沉浸式虚实融合、多模态交互、空间计算、生成式AI、语义向量空间建模等场景提供强大的数据基座。
+
+随着生成式AI与空间计算驱动计算重心向边缘偏移，终端设备正由单纯的内容展示器演变为局部生成、环境感知与实时决策的核心。传统的单文件嵌入式数据库受限于架构设计，在面对高并发写入、海量向量检索以及云边协同生成时，往往难以支撑智能化应用对极致响应的要求。Tostore 专为边缘设备而生，赋予了边缘端足以支撑复杂AI局部生成与大规模数据流转的分布式存储能力，真正实现云端与边缘的深度协同。
+
+**不怕断电，不怕崩溃**：即使意外断电或应用崩溃，数据也能自动恢复，真正做到零丢失。当数据操作响应时，数据已经安全保存，无需担心数据丢失的风险。
+
+**性能突破极限**：实测普通手机在1000万数据量下也能立即启动，查询数据瞬间展示，无论数据量多大，都能享受流畅的体验，带来远超传统数据库的使用体验。
+
+
 
 
 ......  从指尖到云端应用，Tostore助你释放数据算力，赋能未来 ......
@@ -35,8 +43,9 @@ Tostore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储
 
 - ⚡ **极致并行处理能力**
   - Isolate实现真正并行读写，CPU多核心全速运行
+  - 智能资源调度，自动平衡负载，最大化发挥多核心性能
   - 多节点计算网络协同工作，任务处理效率倍增
-  - 资源感知的调度框架，自动优化执行计划
+  - 资源感知的调度框架，自动优化执行计划，避免资源竞争
   - 流式查询接口轻松处理海量数据集
 
 - 🔑 **多样化分布式主键算法**
@@ -45,21 +54,27 @@ Tostore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储
   - 日期前缀算法 - 完美支持时间范围数据展示
   - 短码算法 - 生成短小易读的唯一标识符
 
-- 🔄 **智能模式迁移**
+- 🔄 **智能模式迁移与数据完整性**
   - 精准识别表字段重命名，数据零丢失
   - 毫秒级自动检测表结构变动并完成数据迁移
   - 零停机升级，业务无感知
   - 复杂结构变更的安全迁移策略
+  - 外键约束自动验证，支持级联操作，确保数据引用完整性
 
-- 🛡️ **安全保障**
+- 🛡️ **企业级数据安全与持久性**
+  - 双重保障机制：数据变更实时记录，确保永不丢失
+  - 崩溃自动恢复：意外断电或崩溃后自动恢复未完成操作，数据零丢失
+  - 数据一致性保障：多个操作要么全部成功，要么全部回滚，保证数据准确
+  - 原子计算更新：表达式系统支持复杂计算，原子执行避免并发冲突
+  - 即时安全落盘：操作成功响应时，数据已安全保存，无需等待
   - ChaCha20Poly1305高强度加密算法保护敏感数据
   - 端到端加密，存储与传输全程安全
-  - 细粒度的数据访问控制
 
 - 🚀 **智能缓存与检索性能**
   - 多层级智能缓存机制，极速数据检索
   - 与存储引擎深度融合的缓存策略
   - 自适应扩展，数据规模增长下保持稳定性能
+  - 实时数据变动通知，查询结果自动更新
 
 - 🔄 **智能数据工作流**
   - 多空间架构，数据隔离兼具全局共享
@@ -67,125 +82,81 @@ Tostore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储
   - 为大规模数据训练和分析提供稳固底座
 
 
+## 安装
+
+> [!IMPORTANT]
+> **从 v2.x 升级？** 请阅读 [v3.0 升级指南](../UPGRADE_GUIDE_v3.md) 以了解关键的迁移步骤和重大更改。
+
+在 `pubspec.yaml` 中添加 `tostore` 依赖：
+
+```yaml
+dependencies:
+  tostore: any # 请使用最新版本
+```
 
 ## 快速开始
 
-```dart
-// 初始化数据库
-final db = ToStore();
-await db.initialize(); // 初始化，确保数据库就绪
+> [!IMPORTANT]
+> **定义表结构是首要步骤**：在进行增删改查之前，必须先定义表结构。具体的定义方式取决于您的场景：
+> - **移动端/桌面端**：推荐[静态定义](#频繁启动场景集成)。
+> - **服务端**：推荐[动态创建](#服务端集成方案)。
 
-// 插入数据
+```dart
+// 1. 初始化数据库
+final db = await ToStore.open();
+
+// 2. 插入数据
 await db.insert('users', {
   'username': 'John',
   'email': 'john@example.com',
+  'age': 25,
 });
 
-// 更新数据
-await db.update('users', {'age': 31}).where('id', '=', 1);
-
-// 删除数据
-await db.delete('users').where('id', '!=', 1);
-
-// 链式查询 - 简洁而强大
-// 支持的操作符：=, !=, <>, >, <, >=, <=, LIKE, NOT LIKE, IN, NOT IN, BETWEEN, IS, IS NOT
+// 3. 链式查询 (支持 =, !=, >, <, LIKE, IN 等)
 final users = await db.query('users')
     .where('age', '>', 20)
-    .where('name', 'like', '%John%')
-    .or()
-    .whereIn('id', [1, 2, 3])
+    .where('username', 'like', '%John%')
     .orderByDesc('age')
-    .limit(10);
-
-// 复杂查询条件嵌套 - 预定义构造查询条件模块化
-final recentLoginCondition = QueryCondition()
-    .where('fans', '>=', 200);
-
-final idCondition = QueryCondition()
-    .where('id', '>=', 123)
-    .orCondition(  // orCondition 相当于 OR 条件组合
-        recentLoginCondition
-    );
-
-// 自定义条件函数 - 灵活处理任何复杂逻辑
-final customCondition = QueryCondition()
-    .whereCustom((record) {
-      // 例如：判断标签包含'推荐'
-      return record['tags'] != null && record['tags'].contains('推荐');
-    });
-
-// 查询条件嵌套示例 - 展示无限嵌套能力
-final result = await db.query('users')
-    .condition(      
-        QueryCondition()    // 查询条件构造
-            .whereEqual('type', 'app')
-            .or()
-            .condition(idCondition)  // 再次嵌套已定义的条件
-    )
-    .orCondition(customCondition)    // 或满足自定义复杂条件
     .limit(20);
-// SQL等价: 
-// SELECT * FROM users 
-// WHERE (status = 'active' AND is_vip >= 1)
-//   AND (type = 'app' OR id >= 123 OR fans >= 200)
-//   OR ([自定义条件：标签包含'推荐'])
-// LIMIT 20
 
+// 4. 更新与删除
+await db.update('users', {'age': 26}).where('username', '=', 'John');
+await db.delete('users').where('username', '=', 'John');
 
-// 智能存储 - 存在则更新，不存在则插入
-await db.upsert('users', {
-  'name': 'John',
-  'email': 'john@example.com'
-}).where('email', '=', 'john@example.com');
-// 或使用主键ID直接更新插入
-await db.upsert('users', {
-  'id': 1,
-  'name': 'John',
-  'email': 'john@example.com'
+// 5. 实时监听 (数据变动时 UI 自动刷新)
+db.query('users').where('age', '>', 18).watch().listen((users) {
+  print('符合条件的用户已更新: $users');
 });
-
-// 高效统计
-final count = await db.query('users').count();
-
-// 流式查询 - 处理大数据集而不占用大量内存
-db.streamQuery('users')
-  .where('email', 'like', '%@example.com')
-  .listen((userData) {
-    // 逐条处理数据，避免内存压力
-    print('处理用户: ${userData['username']}');
-  });
-
-// 键值对存储数据
-await db.setValue('isAgreementPrivacy', true);
-
-// 获取键值对数据
-final isAgreementPrivacy = await db.getValue('isAgreementPrivacy');
-
-// 选择特定字段查询 - 提高性能
-final userProfiles = await db.query('users')
-    .select(['id', 'username', 'email']) // 只返回指定字段
-    .where('is_active', '=', true)
-    .limit(100);
-
-// 表连接查询 - 多表数据关联
-final ordersWithUsers = await db.query('orders')
-    .select([
-      'orders.id', 
-      'orders.amount', 
-      'users.username as customer_name', // 使用别名
-    ])
-    .join('users', 'orders.user_id', '=', 'users.id') // 内连接
-    .where('orders.amount', '>', 1000)
-    .limit(50);
-
 ```
+
+### 键值对存储 (KV)
+适用于不需要定义结构化表的场景，简单实用，内置了高性能的键值对存储，可用于存储配置信息、状态等零散数据。不同空间（Space）的数据是天然隔离的，可设置全局共享。
+
+```dart
+// 1. 设置键值对 (支持 String, int, bool, double, Map, List 等)
+await db.setValue('theme', 'dark');
+await db.setValue('login_attempts', 3);
+
+// 2. 获取数据
+final theme = await db.getValue('theme'); // 'dark'
+
+// 3. 删除数据
+await db.removeValue('theme');
+
+// 4. 全局键值对 (跨 Space 共享)
+// 在不同空间切换后，默认键值对数据会自动失效。使用 isGlobal: true 可以实现全局共享。
+await db.setValue('app_version', '1.0.0', isGlobal: true);
+final version = await db.getValue('app_version', isGlobal: true);
+```
+
+
 
 ## 频繁启动场景集成
 
 ```dart
 // 适用移动应用、桌面客户端等频繁启动场景的表结构定义方式
 // 精准识别表结构变动，自动升级迁移数据，零代码维护
-final db = ToStore(
+final db = await ToStore.open(
   schemas: [
     const TableSchema(
             name: 'global_settings',
@@ -222,17 +193,31 @@ final db = ToStore(
         IndexSchema(fields: ['email']),
       ],
     ),
+    // 外键约束定义示例
+    TableSchema(
+      name: 'posts',
+      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+      fields: [
+        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+        const FieldSchema(name: 'content', type: DataType.text),
+      ],
+      foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // 当前表的字段
+          referencedTable: 'users',         // 引用的表
+          referencedFields: ['id'],         // 引用的字段
+          onDelete: ForeignKeyCascadeAction.cascade,  // 删除时级联删除，users表的记录删除后会自动删除posts表的数据
+          onUpdate: ForeignKeyCascadeAction.cascade,  // 更新时级联更新
+        ),
+      ],
+    ),
   ],
 );
 
 // 多空间架构 - 完美隔离不同用户数据
 await db.switchSpace(spaceName: 'user_123');
-
-// 获取全局表数据 - 因为表名全局唯一，所以表操作不需要isGlobal参数区分
-final globalSettings = await db.query('global_settings');
-// 键值对存储才需要标注isGlobal是否全局，查询时与设置一致
-await db.setValue('global_config', true, isGlobal: true);
-final isAgreementPrivacy = await db.getValue('global_config', isGlobal: true);
 
 ```
 
@@ -308,8 +293,7 @@ print('迁移进度: ${status?.progressPercentage}%');
 
 
 // 手动查询缓存管理 (服务端)
-// 在客户端平台（移动端、桌面端）会智能管理。
-// 对于服务端或大规模数据等需要精细控制的场景，您可以通过以下API手动管理缓存以获得最佳性能。
+// 针对主键及索引的等值查询、IN 查询，由于引擎性能卓越，通常无须额外手动维护查询缓存。
 
 // 手动缓存一个查询结果5分钟。若不提供时长，则缓存永不过期。
 final activeUsers = await db.query('users')
@@ -328,11 +312,121 @@ final freshUserData = await db.query('users')
     
 ```
 
+
+
+## 进阶用法
+
+Tostore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
+
+### 复杂查询嵌套与自定义过滤
+支持无限层级的条件嵌套和灵活的自定义函数。
+
+```dart
+// 条件嵌套：(type = 'app' OR (id >= 123 OR fans >= 200))
+final idCondition = QueryCondition().where('id', '>=', 123).or().where('fans', '>=', 200);
+
+final result = await db.query('users')
+    .condition(
+        QueryCondition().whereEqual('type', 'app').or().condition(idCondition)
+    )
+    .limit(20);
+
+// 自定义条件函数
+final customResult = await db.query('users')
+    .whereCustom((record) => record['tags']?.contains('推荐') ?? false);
+```
+
+### 智能存储 (Upsert)
+存在则更新，不存在则插入。
+
+```dart
+await db.upsert('users', {
+  'email': 'john@example.com',
+  'name': 'John New'
+}).where('email', '=', 'john@example.com');
+```
+
+
+### 表连接关联查询与字段选择
+```dart
+final orders = await db.query('orders')
+    .select(['orders.id', 'users.name as user_name'])
+    .join('users', 'orders.user_id', '=', 'users.id')
+    .where('orders.amount', '>', 1000)
+    .limit(20);
+```
+
+### 流式处理与统计
+```dart
+// 统计表记录数
+final count = await db.query('users').count();
+
+// 流式查询 (适用于海量数据)
+db.streamQuery('users').listen((data) => print(data));
+```
+
+
+
+### 查询与高效分页
+
+> [!TIP]
+> **显式指定 `limit` 以获得最佳性能**：强烈建议在查询时始终指定 `limit`。如果省略，引擎默认限制为 1000 条记录。虽然核心查询速度极快，但在应用层序列化大量记录可能会带来不必要的耗时开销。
+
+Tostore 提供双模式分页支持，您可以根据数据规模和性能需求灵活选择：
+
+#### 1. 基础分页 (Offset Mode)
+适用于数据量较小（如万级以下）或需要精确跳转页码的场景。
+
+```dart
+final result = await db.query('users')
+    .orderByDesc('created_at')
+    .offset(40) // 跳过前 40 条
+    .limit(20); // 取 20 条
+```
+> [!TIP]
+> 当 `offset` 非常大时，数据库需要扫描并丢弃大量记录，性能会线性下降。建议深度翻页时使用 **Cursor 模式**。
+
+#### 2. 高性能游标分页 (Cursor Mode)
+**推荐用于海量数据和无限滚动场景**。利用 `nextCursor` 实现 O(1) 级别的性能，确保无论翻到多少页，查询速度始终恒定。
+
+> [!IMPORTANT]
+> 对于部分复杂的查询或针对未索引字段进行排序时，引擎可能会回退到全表扫描并返回 `null` 游标（即暂不支持该特定查询的分页）。
+
+```dart
+// 第一页查询
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+// 使用返回的游标查询下一页
+if (page1.nextCursor != null) {
+  final page2 = await db.query('users')
+      .orderByDesc('id')
+      .limit(20)
+      .cursor(page1.nextCursor); // 传入游标，引擎将直接 seek 到对应位置
+}
+
+// 同理，使用 prevCursor 可以实现高效回翻
+final prevPage = await db.query('users')
+    .limit(20)
+    .cursor(page2.prevCursor);
+```
+
+| 特性 | Offset 模式 | Cursor 模式 |
+| :--- | :--- | :--- |
+| **查询性能** | 随页数增加而下降 | **始终恒定 (O(1))** |
+| **适用范围** | 少量数据、精确跳转 | **海量数据、无限滚动** |
+| **数据一致性** | 数据变动后可能导致跳行 | **完美避免数据变动导致的重复或遗漏** |
+
+
+
+
+
 ## 分布式架构
 
 ```dart
 // 配置分布式节点
-final db = ToStore(
+final db = await ToStore.open(
   config: DataStoreConfig(
     distributedNodeConfig: const DistributedNodeConfig(
       enableDistributed: true,            // 启用分布式模式
@@ -388,19 +482,133 @@ await db.createTables([
 ```
 
 
-## 安全配置
+## 表达式原子操作
+
+表达式系统提供类型安全的原子字段更新，所有计算在数据库层面原子执行，避免并发冲突：
 
 ```dart
-// 数据安全保护配置
-final db = ToStore(
+// 简单增量：balance = balance + 100
+await db.update('accounts', {
+  'balance': Expr.field('balance') + Expr.value(100),
+}).where('id', '=', accountId);
+
+// 复杂计算：total = price * quantity + tax
+await db.update('orders', {
+  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
+}).where('id', '=', orderId);
+
+// 多层括号：finalPrice = ((price * quantity) + tax) * (1 - discount)
+await db.update('orders', {
+  'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
+                 (Expr.value(1) - Expr.field('discount')),
+}).where('id', '=', orderId);
+
+// 使用函数：price = min(price, maxPrice)
+await db.update('products', {
+  'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
+}).where('id', '=', productId);
+
+// 时间戳：updatedAt = now()
+await db.update('users', {
+  'updatedAt': Expr.now(),
+}).where('id', '=', userId);
+```
+
+## 事务操作
+
+事务确保多个操作的原子性，要么全部成功，要么全部回滚，保证数据一致性：
+
+**事务特性**：
+- 多个操作要么全部成功，要么全部回滚，保证数据准确
+- 崩溃后自动恢复未完成的操作
+- 操作成功时数据已安全保存
+
+```dart
+// 基本事务 - 多个操作原子提交
+final txResult = await db.transaction(() async {
+  // 插入用户
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+    'fans': 100,
+  });
+  
+  // 使用表达式原子更新
+  await db.update('users', {
+    'fans': Expr.field('fans') + Expr.value(50),
+  }).where('username', '=', 'john');
+  
+  // 如果任何操作失败，所有更改都会自动回滚
+});
+
+if (txResult.isSuccess) {
+  print('事务提交成功');
+} else {
+  print('事务回滚: ${txResult.error?.message}');
+}
+
+// 错误时自动回滚
+final txResult2 = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'jane',
+    'email': 'jane@example.com',
+  });
+  throw Exception('业务逻辑错误'); // 触发回滚
+}, rollbackOnError: true);
+```
+
+## 安全配置
+
+**数据安全机制**：
+- 双重保障机制确保数据永不丢失
+- 崩溃后自动恢复未完成操作
+- 操作成功时数据已安全保存
+- 高强度加密算法保护敏感数据
+
+> [!WARNING]
+> **密钥管理**：`encryptionKey` 的变更会导致旧数据无法解密（除非执行数据迁移）。请勿硬编码敏感密钥在代码中，建议从安全服务端获取。
+
+```dart
+final db = await ToStore.open(
   config: DataStoreConfig(
-    enableEncoding: true,          // 启用数据安全编码
-    encodingKey: 'YourEncodingKey', // 自定义编码密钥，调整后自动迁移数据
-    encryptionKey: 'YourEncryptionKey', // 加密密钥（警告：修改后无法访问旧数据，请勿硬编码到应用中）
+    encryptionConfig: EncryptionConfig(
+      // 加密算法支持：none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      encryptionType: EncryptionType.chacha20Poly1305, 
+      
+      // 数据编码密钥（必须在初始化时提供，否则将使用设备默认派生密钥）
+      encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
+      
+      // 关键数据加密密钥
+      encryptionKey: 'Your-Secure-Encryption-Key...',
+      
+      // 设备绑定 (Path-based binding)
+      // 开启后密钥将与数据库文件路径、设备特征深度绑定。数据在不同物理路径下无法解密。
+      // 优点：极大地提升了暴力拷贝数据库文件的安全性。
+      // 缺点：如果应用安装路径发生变化及设备特征发生变化，数据将无法还原。
+      deviceBinding: false, 
+    ),
+    // 启用崩溃恢复日志 (Write-Ahead Logging)，默认开启
+    enableJournal: true, 
+    // 事务提交时是否强制刷新数据到磁盘，追求极致性能可设为 false（交由后台自动刷新）
+    persistRecoveryOnCommit: true,
   ),
 );
 ```
 
+
+## 性能与体验
+
+### 性能表现
+
+- **启动速度**：实测普通手机在1000万数据量下也能立即启动，即时展示数据
+- **查询性能**：不会随着数据规模影响，恒定保持极速检索能力
+- **数据安全**：ACID事务保障 + 崩溃恢复机制，数据零丢失
+
+### 体验建议
+
+- 📱 **示例项目**：`example` 目录下提供了完整的Flutter应用示例
+- 🚀 **生产环境**：建议打包release版本，release模式下性能远超调试模式
+- ✅ **标准测试**：所有基础、核心功能都通过了标准测试
 
 
 

@@ -1,7 +1,7 @@
 import 'result_type.dart';
 
 /// Database operation result model
-/// Used to represent the result of database operations (insert, update, delete, etc.)
+/// Used to represent the result of database operations (insert, update, delete, createTable, dropTable, etc.)
 class DbResult {
   /// Result status type
   final ResultType type;
@@ -9,10 +9,20 @@ class DbResult {
   /// Result message
   final String message;
 
-  /// List of successfully processed record keys
+  /// List of successfully processed items
+  ///
+  /// The content depends on the operation type:
+  /// - For insert/update/delete operations: contains primary key values of successfully processed records
+  /// - For createTables/dropTable operations: contains table names that were successfully processed
+  /// - For other operations: contains operation-specific identifiers
   final List<String> successKeys;
 
-  /// List of failed record keys
+  /// List of failed items
+  ///
+  /// The content depends on the operation type:
+  /// - For insert/update/delete operations: contains primary key values of failed records
+  /// - For createTables/dropTable operations: contains table names that failed to process
+  /// - For other operations: contains operation-specific identifiers
   final List<String> failedKeys;
 
   /// Constructor
@@ -28,6 +38,10 @@ class DbResult {
 
   /// Whether the operation is successful
   bool get isSuccess => type == ResultType.success;
+
+  /// Whether the operation is partially successful
+  /// (some items succeeded, some failed - typically used in batch operations)
+  bool get isPartialSuccess => type == ResultType.partialSuccess;
 
   /// Create a success result
   static DbResult success({
@@ -88,19 +102,23 @@ class DbResult {
     );
   }
 
-  /// Get total number of records processed
+  /// Get total number of items processed
+  /// (records for insert/update/delete, tables for createTables/dropTable, etc.)
   int get totalCount => successKeys.length + failedKeys.length;
 
-  /// Get number of successful records
+  /// Get number of successful items
+  /// (records for insert/update/delete, tables for createTables/dropTable, etc.)
   int get successCount => successKeys.length;
 
-  /// Get number of failed records
+  /// Get number of failed items
+  /// (records for insert/update/delete, tables for createTables/dropTable, etc.)
   int get failedCount => failedKeys.length;
 
   /// Whether it is a resource not found error
   bool get isNotFound => type == ResultType.notFound;
 
-  /// Whether the operation succeeded but no records were affected
+  /// Whether the operation succeeded but no items were affected
+  /// (no records for insert/update/delete, no tables for createTables/dropTable, etc.)
   bool get isEmptySuccess => isSuccess && successKeys.isEmpty;
 
   /// Convert DbResult to a Map (for serialization)
@@ -156,9 +174,9 @@ class DbResult {
   /// Get the default message of batch operation
   static String _getBatchMessage(int successCount, int failedCount) {
     if (failedCount == 0) {
-      return 'All operations successful, total $successCount records';
+      return 'All operations successful, total $successCount items';
     } else if (successCount == 0) {
-      return 'All operations failed, total $failedCount records';
+      return 'All operations failed, total $failedCount items';
     } else {
       return 'Some operations successful, $successCount successful, $failedCount failed';
     }

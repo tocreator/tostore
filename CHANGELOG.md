@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.0.0-test
+
+### Added
+- Added foreign key support with comprehensive relationship management and referential integrity enforcement
+- Added atomic expression update operations for efficient batch data modifications
+- Added AES encryption support for critical data including logs, indexes, and table data, with device fingerprint binding for enhanced security
+- Added data change listeners for arbitrary queries, enabling automatic UI refresh when data changes
+- Added cursor-based pagination support for efficient large dataset navigation
+
+### Changed
+- Enhanced WAL (Write-Ahead Logging) and journal recovery mechanisms to handle catastrophic failures, power outages, and premature application shutdowns, ensuring data integrity through comprehensive benchmark testing
+- Enhanced transaction handling with improved reliability and performance
+- Optimized storage space usage, reducing data footprint
+- Improved pure Dart environment support for better server-side compatibility
+- Refined partitioning strategy with B+ tree, implementing file-level tree node structures to support TB and PB-scale data volumes on edge devices
+- Optimized parallel scheduling mechanism for better resource utilization and performance
+- Enhanced TreeCache caching mechanism for improved memory efficiency and access speed
+- Improved UI responsiveness and smoothness across various operations
+
 ## 2.2.3
 
 ### Changed

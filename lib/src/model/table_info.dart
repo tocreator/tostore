@@ -5,14 +5,11 @@ class TableInfo {
   /// table name
   final String tableName;
 
-  /// record count
-  final int recordCount;
+  /// total record count
+  final int totalRecords;
 
-  /// cache record count
-  final int cacheCount;
-
-  /// file size (byte)
-  final int fileSize;
+  /// file size in bytes
+  final int fileSizeInBytes;
 
   /// index count
   final int indexCount;
@@ -31,9 +28,8 @@ class TableInfo {
 
   const TableInfo({
     required this.tableName,
-    required this.recordCount,
-    required this.cacheCount,
-    required this.fileSize,
+    required this.totalRecords,
+    required this.fileSizeInBytes,
     required this.indexCount,
     required this.schema,
     required this.isGlobal,
@@ -43,22 +39,21 @@ class TableInfo {
 
   /// get formatted file size
   String get formattedFileSize {
-    if (fileSize < 1024) return '$fileSize B';
-    if (fileSize < 1024 * 1024) {
-      return '${(fileSize / 1024).toStringAsFixed(2)} KB';
+    if (fileSizeInBytes < 1024) return '$fileSizeInBytes B';
+    if (fileSizeInBytes < 1024 * 1024) {
+      return '${(fileSizeInBytes / 1024).toStringAsFixed(2)} KB';
     }
-    if (fileSize < 1024 * 1024 * 1024) {
-      return '${(fileSize / (1024 * 1024)).toStringAsFixed(2)} MB';
+    if (fileSizeInBytes < 1024 * 1024 * 1024) {
+      return '${(fileSizeInBytes / (1024 * 1024)).toStringAsFixed(2)} MB';
     }
-    return '${(fileSize / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    return '${(fileSizeInBytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   /// convert to json
   Map<String, dynamic> toJson() => {
         'tableName': tableName,
-        'recordCount': recordCount,
-        'cacheCount': cacheCount,
-        'fileSize': fileSize,
+        'totalRecords': totalRecords,
+        'fileSizeInBytes': fileSizeInBytes,
         'formattedFileSize': formattedFileSize,
         'indexCount': indexCount,
         'schema': schema.toJson(),

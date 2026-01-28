@@ -1,7 +1,23 @@
-import 'file_info.dart';
+import '../handler/common.dart';
+import 'meta_info.dart';
 
 /// global config model
 class GlobalConfig {
+  /// database version
+  final int version;
+
+  /// user defined database version
+  final int userVersion;
+
+  /// Engine-managed directory sharding parameter persisted for compatibility.
+  ///
+  /// Used for deterministic sharding:
+  /// `dirIndex = partitionIndex ~/ maxEntriesPerDir`.
+  ///
+  /// Do NOT expose this as a user-facing knob; changing it requires an explicit
+  /// migration for on-disk directory layout.
+  final int maxEntriesPerDir;
+
   /// all created space names
   final Set<String> spaceNames;
 
@@ -17,17 +33,29 @@ class GlobalConfig {
   final Map<String, int> directoryUsageMap;
 
   GlobalConfig({
+    int? version,
+    int? userVersion,
+    int? maxEntriesPerDir,
     Set<String>? spaceNames,
     this.hasMigrationTask = false,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
-  })  : spaceNames = spaceNames ?? {'default'},
+  })  : version = version ?? InternalConfig.engineVersion,
+        userVersion = userVersion ?? 0,
+        maxEntriesPerDir =
+            maxEntriesPerDir ?? InternalConfig.defaultMaxEntriesPerDir,
+        spaceNames = spaceNames ?? {'default'},
         tableDirectoryMap = tableDirectoryMap ?? {},
         directoryUsageMap = directoryUsageMap ?? {};
 
   /// create from json
   factory GlobalConfig.fromJson(Map<String, dynamic> json) {
     return GlobalConfig(
+      version: resolveVersionValue(
+          json['version'], InternalConfig.legacyEngineVersion),
+      userVersion: resolveVersionValue(json['userVersion'], 0),
+      maxEntriesPerDir: resolveVersionValue(
+          json['maxEntriesPerDir'], InternalConfig.defaultMaxEntriesPerDir),
       spaceNames: (json['spaceNames'] as List<dynamic>?)
               ?.map((e) => e as String)
               .toSet() ??
@@ -52,6 +80,9 @@ class GlobalConfig {
   /// convert to json
   Map<String, dynamic> toJson() {
     return {
+      'version': version,
+      'userVersion': userVersion,
+      'maxEntriesPerDir': maxEntriesPerDir,
       'spaceNames': spaceNames.toList(),
       'hasMigrationTask': hasMigrationTask,
       'tableDirectoryMap':
@@ -62,12 +93,18 @@ class GlobalConfig {
 
   /// create a copy and modify some fields
   GlobalConfig copyWith({
+    int? version,
+    int? userVersion,
+    int? maxEntriesPerDir,
     Set<String>? spaceNames,
     bool? hasMigrationTask,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
   }) {
     return GlobalConfig(
+      version: version ?? this.version,
+      userVersion: userVersion ?? this.userVersion,
+      maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
       spaceNames: spaceNames ?? this.spaceNames,
       hasMigrationTask: hasMigrationTask ?? this.hasMigrationTask,
       tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
@@ -91,5 +128,13 @@ class GlobalConfig {
   /// set whether there is a migration task
   GlobalConfig setHasMigrationTask(bool hasMigrationTask) {
     return copyWith(hasMigrationTask: hasMigrationTask);
+  }
+
+  GlobalConfig setVersion(int newVersion) {
+    return copyWith(version: newVersion);
+  }
+
+  GlobalConfig setUserVersion(int newVersion) {
+    return copyWith(userVersion: newVersion);
   }
 }

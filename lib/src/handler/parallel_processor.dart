@@ -58,6 +58,9 @@ class ParallelProcessor {
   /// - [timeout]: An optional [Duration] after which an individual task will time out.
   /// - [continueOnError]: If `true` (the default), execution continues even if some tasks
   ///   fail. If `false`, the first error will cause the entire execution to fail.
+  /// - [onRoundComplete]: Optional callback invoked after each round (concurrency tasks)
+  ///   completes. Should return the new concurrency value to use. Useful for dynamic
+  ///   workload adjustment based on system load.
   ///
   /// Returns a `Future` that completes with a list of results in the original order.
   static Future<List<T?>> execute<T>(
@@ -67,9 +70,10 @@ class ParallelProcessor {
     int? concurrency,
     Duration? timeout,
     bool? continueOnError,
+    Future<int> Function()? onRoundComplete,
   }) async {
     final effectiveLabel = label != null ? ".$label" : "";
-    final effectiveConcurrency = max(1, concurrency ?? _concurrency);
+    int effectiveConcurrency = max(1, concurrency ?? _concurrency);
     final effectiveContinueOnError = continueOnError ?? _continueOnError;
 
     // New timeout logic to handle explicit disabling
@@ -163,6 +167,27 @@ class ParallelProcessor {
         running--;
         tasksCompleted++;
 
+        // Check if a round is complete and adjust concurrency if needed
+        if (onRoundComplete != null &&
+            tasksCompleted % effectiveConcurrency == 0 &&
+            tasksCompleted < tasks.length) {
+          try {
+            final newConcurrency = await onRoundComplete();
+            if (newConcurrency > 0 && newConcurrency != effectiveConcurrency) {
+              effectiveConcurrency = newConcurrency;
+              Logger.debug(
+                'Concurrency adjusted to $newConcurrency after completing $tasksCompleted tasks',
+                label: 'ParallelProcessor$effectiveLabel',
+              );
+            }
+          } catch (e) {
+            Logger.warn(
+              'Failed to adjust concurrency: $e',
+              label: 'ParallelProcessor$effectiveLabel',
+            );
+          }
+        }
+
         // All tasks are either done or cancelled, clean up.
         if (tasksCompleted == tasks.length) {
           if (!taskIndices.isClosed) {
@@ -185,6 +210,10 @@ class ParallelProcessor {
       // This path is taken only when continueOnError is false.
       // At this point, controller is cancelled and other tasks are completing with null.
       // We rethrow the original error.
+      Logger.error(
+        '$effectiveLabel Parallel execution failed with error: $e',
+        label: "ParallelProcessor$effectiveLabel",
+      );
       rethrow;
     }
   }

@@ -62,4 +62,10 @@ abstract class PlatformInterface {
   /// requiredFile: Optional file path to check inside the ZIP (e.g., 'meta.json')
   /// Returns true if ZIP is valid and contains the required file (if specified)
   Future<bool> verifyZipFile(String zipPath, {String? requiredFile});
+
+  /// Get device hardware signature for security enhancement
+  int get deviceFingerprint;
+
+  /// Check if hardware-based key derivation is supported
+  bool get supportsHardwareKeyDerivation;
 }

@@ -1,23 +1,28 @@
-import '../chain/delete_builder.dart';
+import 'dart:async';
+import '../Interface/chain_builder.dart';
 import '../chain/schema_builder.dart';
 import '../chain/stream_query_builder.dart';
-import '../chain/update_builder.dart';
-import '../chain/upsert_builder.dart';
 import '../model/data_store_config.dart';
 import '../model/db_result.dart';
 import '../model/migration_task.dart';
+import '../model/transaction_result.dart';
 import '../model/space_info.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
-import '../chain/query_builder.dart';
+import '../model/backup_scope.dart';
+import 'status_provider.dart';
 
 /// Data store engine interface
 abstract class DataStoreInterface {
   /// Initialize data store engine
+  /// [reinitialize] when true, force reinitialize (close then reopen)
+  /// [noPersistOnClose] when reinitializing, do not persist pending buffers; only clear caches/flush handles
   Future<void> initialize({
     String? dbPath,
     String? dbName,
     DataStoreConfig? config,
+    bool reinitialize,
+    bool noPersistOnClose,
   });
 
   /// query data
@@ -38,7 +43,8 @@ abstract class DataStoreInterface {
       {bool allowPartialErrors = true});
 
   /// update data
-  UpdateBuilder update(String tableName, Map<String, dynamic> data);
+  UpdateBuilder update(String tableName,
+      [Map<String, dynamic> data = const {}]);
 
   /// delete data
   DeleteBuilder delete(String tableName);
@@ -53,19 +59,19 @@ abstract class DataStoreInterface {
   Future<DbResult> removeValue(String key, {bool isGlobal = false});
 
   /// create table
-  Future<void> createTable(TableSchema schema);
+  Future<DbResult> createTable(TableSchema schema);
 
   /// create multiple tables
-  Future<void> createTables(List<TableSchema> schemas);
+  Future<DbResult> createTables(List<TableSchema> schemas);
 
   /// update table schema
   SchemaBuilder updateSchema(String tableName);
 
   /// drop table
-  Future<void> dropTable(String tableName);
+  Future<DbResult> dropTable(String tableName);
 
   /// clear table
-  Future<void> clear(String tableName);
+  Future<DbResult> clear(String tableName);
 
   /// get table schema
   Future<TableSchema?> getTableSchema(String tableName);
@@ -80,10 +86,21 @@ abstract class DataStoreInterface {
   Future<void> close();
 
   /// backup database
-  Future<String> backup({bool compress = true});
+  Future<String> backup(
+      {bool compress = true,
+      BackupScope scope = BackupScope.currentSpaceWithGlobal});
 
   /// restore database
-  Future<bool> restore(String backupPath, {bool deleteAfterRestore = false});
+  Future<bool> restore(String backupPath,
+      {bool deleteAfterRestore = false, bool cleanupBeforeRestore = true});
+
+  /// Run a transaction
+  Future<TransactionResult> transaction<T>(
+    FutureOr<T> Function() action, {
+    bool rollbackOnError = true,
+    bool? persistRecoveryOnCommit,
+    TransactionIsolationLevel? isolation,
+  });
 
   /// get current config
   DataStoreConfig get config;
@@ -107,5 +124,8 @@ abstract class DataStoreInterface {
   Future<SpaceInfo> getSpaceInfo({bool useCache = true});
 
   /// Delete a space
-  Future<void> deleteSpace(String spaceName);
+  Future<DbResult> deleteSpace(String spaceName);
+
+  /// Get unified status and diagnostics
+  DbStatus get status;
 }

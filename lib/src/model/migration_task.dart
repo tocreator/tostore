@@ -126,6 +126,9 @@ enum MigrationType {
   renameTable,
   setPrimaryKeyConfig,
   dropTable,
+  addForeignKey,
+  removeForeignKey,
+  modifyForeignKey,
 }
 
 /// model for field update, allow explicit distinction of whether a value is set
@@ -141,6 +144,8 @@ class FieldSchemaUpdate {
   final num? minValue;
   final num? maxValue;
   final DefaultValueType? defaultValueType;
+  final String? fieldId;
+  final VectorFieldConfig? vectorConfig;
 
   // track which properties are explicitly set
   final Map<String, bool> _explicitlySet;
@@ -157,6 +162,8 @@ class FieldSchemaUpdate {
     this.minValue,
     this.maxValue,
     this.defaultValueType,
+    this.fieldId,
+    this.vectorConfig,
   }) : _explicitlySet = {
           'type': type != null,
           'nullable': nullable != null,
@@ -174,6 +181,8 @@ class FieldSchemaUpdate {
           'maxValue':
               true, // maxValue always considered explicitly set, even if null
           'defaultValueType': defaultValueType != null,
+          'fieldId': fieldId != null,
+          'vectorConfig': vectorConfig != null,
         };
 
   /// check if the property is explicitly set
@@ -195,6 +204,8 @@ class FieldSchemaUpdate {
       'maxValue': maxValue,
       if (defaultValueType != null)
         'defaultValueType': defaultValueType.toString().split('.').last,
+      'fieldId': fieldId,
+      if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
       '_explicitlySet': _explicitlySet,
     };
   }
@@ -227,6 +238,11 @@ class FieldSchemaUpdate {
       minValue: json['minValue'],
       maxValue: json['maxValue'],
       defaultValueType: getDefaultValueType(),
+      fieldId: json['fieldId'],
+      vectorConfig: json['vectorConfig'] != null
+          ? VectorFieldConfig.fromJson(
+              json['vectorConfig'] as Map<String, dynamic>)
+          : null,
     );
 
     // if JSON contains _explicitlySet, use it to update _explicitlySet
@@ -253,6 +269,9 @@ class MigrationOperation {
   final String? newTableName;
   final PrimaryKeyConfig? primaryKeyConfig;
   final PrimaryKeyConfig? oldPrimaryKeyConfig;
+  final ForeignKeySchema? foreignKey;
+  final String? foreignKeyName;
+  final ForeignKeySchema? oldForeignKey;
 
   const MigrationOperation({
     required this.type,
@@ -267,6 +286,9 @@ class MigrationOperation {
     this.newTableName,
     this.primaryKeyConfig,
     this.oldPrimaryKeyConfig,
+    this.foreignKey,
+    this.foreignKeyName,
+    this.oldForeignKey,
   });
 
   Map<String, dynamic> toJson() {
@@ -283,6 +305,9 @@ class MigrationOperation {
       'newTableName': newTableName,
       'primaryKeyConfig': primaryKeyConfig?.toJson(),
       'oldPrimaryKeyConfig': oldPrimaryKeyConfig?.toJson(),
+      'foreignKey': foreignKey?.toJson(),
+      'foreignKeyName': foreignKeyName,
+      'oldForeignKey': oldForeignKey?.toJson(),
     };
   }
 
@@ -308,6 +333,13 @@ class MigrationOperation {
           : null,
       oldPrimaryKeyConfig: json['oldPrimaryKeyConfig'] != null
           ? PrimaryKeyConfig.fromJson(json['oldPrimaryKeyConfig'])
+          : null,
+      foreignKey: json['foreignKey'] != null
+          ? ForeignKeySchema.fromJson(json['foreignKey'])
+          : null,
+      foreignKeyName: json['foreignKeyName'],
+      oldForeignKey: json['oldForeignKey'] != null
+          ? ForeignKeySchema.fromJson(json['oldForeignKey'])
           : null,
     );
   }

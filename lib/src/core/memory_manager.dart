@@ -3,7 +3,9 @@ import 'dart:math';
 
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
+
 import '../model/data_store_config.dart';
+import '../model/memory_info.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 
@@ -18,20 +20,19 @@ class MemoryManager {
   int _memoryThresholdInMB = 0;
 
   /// Allocation ratios for various caches
-  static const double _recordCacheRatio = 0.40; // Record cache 40%
+  static const double _tableDataCacheRatio = 0.45; // Table data cache 45%
   static const double _indexCacheRatio = 0.30; // Index cache 30%
-  static const double _queryCacheRatio = 0.15; // Query cache 15%
+  static const double _queryCacheRatio = 0.10; // Query cache 10%
+  static const double _metaCacheRatio =
+      0.10; // Table data and index all meta cache 10%
   static const double _schemaCacheRatio = 0.05; // Schema cache 5%
-  static const double _tableMetaCacheRatio = 0.05; // Table meta cache 5%
-  static const double _indexMetaCacheRatio = 0.05; // Index meta cache 5%
 
   /// Size thresholds for various caches (in bytes)
-  int _recordCacheSize = 0;
+  int _tableDataCacheSize = 0;
   int _indexCacheSize = 0;
   int _queryCacheSize = 0;
   int _schemaCacheSize = 0;
-  int _tableMetaCacheSize = 0;
-  int _indexMetaCacheSize = 0;
+  int _metaCacheSize = 0;
 
   /// Last cache clear time
   DateTime _lastCacheClearTime = DateTime.now();
@@ -46,13 +47,12 @@ class MemoryManager {
   DataStoreImpl? _dataStore;
 
   /// Cache eviction callback function by type
-  final Map<CacheType, Function()?> _cacheEvictionCallbacks = {
-    CacheType.record: null,
-    CacheType.query: null,
-    CacheType.indexData: null,
-    CacheType.schema: null,
-    CacheType.tableMeta: null,
-    CacheType.indexMeta: null,
+  final Map<MemoryQuotaType, Function()?> _cacheEvictionCallbacks = {
+    MemoryQuotaType.tableData: null,
+    MemoryQuotaType.queryResult: null,
+    MemoryQuotaType.indexData: null,
+    MemoryQuotaType.schema: null,
+    MemoryQuotaType.meta: null,
   };
 
   /// Flag to prevent re-entrant cache cleanup
@@ -87,14 +87,14 @@ class MemoryManager {
       int systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
 
       // Get the smaller value between available memory and total memory as the base value
-      int baseMemoryMB = availableMemoryMB < systemMemoryMB * 0.8
+      int baseMemoryMB = availableMemoryMB < systemMemoryMB * 0.7
           ? availableMemoryMB
-          : (systemMemoryMB * 0.8).toInt();
+          : (systemMemoryMB * 0.7).toInt();
 
-      if (config.memoryThresholdInMB != null &&
-          config.memoryThresholdInMB! > 0) {
+      if (config.cacheMemoryBudgetMB != null &&
+          config.cacheMemoryBudgetMB! > 0) {
         // Use user-configured memory threshold, but ensure it doesn't exceed available memory
-        _memoryThresholdInMB = min(config.memoryThresholdInMB!, baseMemoryMB);
+        _memoryThresholdInMB = min(config.cacheMemoryBudgetMB!, baseMemoryMB);
       } else {
         // Default to 75% of available memory
         _memoryThresholdInMB = (baseMemoryMB * 0.75).toInt();
@@ -216,23 +216,13 @@ class MemoryManager {
     Future(() async {
       try {
         // Clean up cache in order of priority, from low priority to high priority
-        await _evictCacheAndCheck(CacheType.record);
+        await _evictCacheAndCheck(MemoryQuotaType.tableData);
         if (!_isLowMemoryMode) return;
 
-        await _evictCacheAndCheck(CacheType.query);
+        await _evictCacheAndCheck(MemoryQuotaType.queryResult);
         if (!_isLowMemoryMode) return;
 
-        await _evictCacheAndCheck(CacheType.indexData);
-        if (!_isLowMemoryMode) return;
-
-        await _evictCacheAndCheck(CacheType.indexMeta);
-        if (!_isLowMemoryMode) return;
-
-        // If memory is still insufficient, clean up important metadata caches
-        await _evictCacheAndCheck(CacheType.schema);
-        if (!_isLowMemoryMode) return;
-
-        await _evictCacheAndCheck(CacheType.tableMeta);
+        await _evictCacheAndCheck(MemoryQuotaType.indexData);
       } catch (e) {
         Logger.error('An error occurred during cache eviction process: $e',
             label: 'MemoryManager._triggerCacheEviction');
@@ -243,7 +233,7 @@ class MemoryManager {
   }
 
   /// Evict a specific cache type and then check the memory status.
-  Future<void> _evictCacheAndCheck(CacheType cacheType) async {
+  Future<void> _evictCacheAndCheck(MemoryQuotaType cacheType) async {
     await _evictCacheByType(cacheType);
     final isMemorySufficient = await _checkMemoryUsageImmediate();
     if (isMemorySufficient) {
@@ -252,13 +242,13 @@ class MemoryManager {
   }
 
   /// Execute specific type cache cleanup
-  Future<void> _evictCacheByType(CacheType cacheType) async {
+  Future<void> _evictCacheByType(MemoryQuotaType cacheType) async {
     final callback = _cacheEvictionCallbacks[cacheType];
     if (callback == null) return;
 
     try {
       // Measure cache size before eviction for relevant cache types
-      int beforeSize = _getCurrentCacheSizeByType(cacheType);
+      int beforeSize = await _getCurrentCacheSizeByType(cacheType);
 
       // Execute eviction callback, which might be async
       final result = callback();
@@ -267,7 +257,7 @@ class MemoryManager {
       }
 
       // Measure cache size after eviction to verify the cleanup effect
-      int afterSize = _getCurrentCacheSizeByType(cacheType);
+      int afterSize = await _getCurrentCacheSizeByType(cacheType);
 
       // Log cleanup effect
       if (beforeSize > 0 && afterSize < beforeSize) {
@@ -284,23 +274,29 @@ class MemoryManager {
   }
 
   /// Get current cache size by type using appropriate cache manager methods
-  int _getCurrentCacheSizeByType(CacheType cacheType) {
+  Future<int> _getCurrentCacheSizeByType(MemoryQuotaType cacheType) async {
     if (_dataStore == null) return 0;
 
     try {
       switch (cacheType) {
-        case CacheType.record:
-          return _dataStore!.dataCacheManager.getCurrentRecordCacheSize();
-        case CacheType.query:
-          return _dataStore!.dataCacheManager.getCurrentQueryCacheSize();
-        case CacheType.indexData:
-          return _dataStore!.indexManager?.getCurrentIndexCacheSize() ?? 0;
-        case CacheType.schema:
-          return _dataStore!.dataCacheManager.getCurrentSchemaCacheSize();
-        case CacheType.tableMeta:
-          return _dataStore!.tableDataManager.getCurrentTableMetaCacheSize();
-        case CacheType.indexMeta:
-          return _dataStore!.indexManager?.getCurrentIndexMetaCacheSize() ?? 0;
+        case MemoryQuotaType.tableData:
+          return _dataStore!.cacheManager.getCurrentTableDataCacheSize();
+        case MemoryQuotaType.queryResult:
+          return _dataStore!.cacheManager.getCurrentQueryCacheSize();
+        case MemoryQuotaType.indexData:
+          return await _dataStore!.indexManager
+                  ?.getCurrentIndexDataCacheSize() ??
+              0;
+        case MemoryQuotaType.schema:
+          return _dataStore!.cacheManager.getCurrentSchemaCacheSize();
+        case MemoryQuotaType.meta:
+          // Meta cache = Table Meta + Index Meta (Data excluded)
+          final tableMetaSize =
+              _dataStore!.tableDataManager.getCurrentTableMetaCacheSize();
+          final indexMetaSize =
+              await _dataStore!.indexManager?.getCurrentIndexMetaCacheSize() ??
+                  0;
+          return tableMetaSize + indexMetaSize;
       }
     } catch (e) {
       Logger.error('Failed to get current cache size for ${cacheType.name}: $e',
@@ -315,26 +311,29 @@ class MemoryManager {
     int totalThresholdBytes = _memoryThresholdInMB * 1024 * 1024;
 
     // Allocate cache sizes based on predefined ratios
-    _recordCacheSize = (totalThresholdBytes * _recordCacheRatio).toInt();
+    _tableDataCacheSize = (totalThresholdBytes * _tableDataCacheRatio).toInt();
     _indexCacheSize = (totalThresholdBytes * _indexCacheRatio).toInt();
     _queryCacheSize = (totalThresholdBytes * _queryCacheRatio).toInt();
     _schemaCacheSize = (totalThresholdBytes * _schemaCacheRatio).toInt();
-    _tableMetaCacheSize = (totalThresholdBytes * _tableMetaCacheRatio).toInt();
-    _indexMetaCacheSize = (totalThresholdBytes * _indexMetaCacheRatio).toInt();
+    _metaCacheSize = (totalThresholdBytes * _metaCacheRatio).toInt();
   }
 
   /// Register cache eviction callback
-  void registerCacheEvictionCallback(CacheType cacheType, Function() callback) {
+  void registerCacheEvictionCallback(
+      MemoryQuotaType cacheType, Function() callback) {
     _cacheEvictionCallbacks[cacheType] = callback;
   }
 
   /// Unregister cache eviction callback
-  void unregisterCacheEvictionCallback(CacheType cacheType) {
+  void unregisterCacheEvictionCallback(MemoryQuotaType cacheType) {
     _cacheEvictionCallbacks[cacheType] = null;
   }
 
+  /// Get table data cache size limit
+  int getTableDataCacheSize() => _tableDataCacheSize;
+
   /// Get record cache size limit
-  int getRecordCacheSize() => _recordCacheSize;
+  int getRecordCacheSize() => (_tableDataCacheSize * 0.7).toInt();
 
   /// Get index cache size limit
   int getIndexCacheSize() => _indexCacheSize;
@@ -345,17 +344,36 @@ class MemoryManager {
   /// Get schema cache size limit
   int getSchemaCacheSize() => _schemaCacheSize;
 
-  /// Get table metadata cache size limit
-  int getTableMetaCacheSize() => _tableMetaCacheSize;
-
-  /// Get index metadata cache size limit
-  int getIndexMetaCacheSize() => _indexMetaCacheSize;
+  /// Get table data and index all meta cache size limit
+  int getMetaCacheSize() => _metaCacheSize;
 
   /// Get memory threshold (MB)
   int getMemoryThresholdMB() => _memoryThresholdInMB;
 
   /// Get current low memory mode status
-  bool isLowMemoryMode() => _isLowMemoryMode;
+  bool get isLowMemoryMode => _isLowMemoryMode;
+
+  /// Get current memory and cache usage information
+  Future<MemoryInfo> getMemoryInfo() async {
+    return MemoryInfo(
+      totalThresholdMB: _memoryThresholdInMB,
+      tableDataCacheUsage:
+          await _getCurrentCacheSizeByType(MemoryQuotaType.tableData),
+      tableDataCacheLimit: _tableDataCacheSize,
+      indexCacheUsage:
+          await _getCurrentCacheSizeByType(MemoryQuotaType.indexData),
+      indexCacheLimit: _indexCacheSize,
+      queryCacheUsage:
+          await _getCurrentCacheSizeByType(MemoryQuotaType.queryResult),
+      queryCacheLimit: _queryCacheSize,
+      schemaCacheUsage:
+          await _getCurrentCacheSizeByType(MemoryQuotaType.schema),
+      schemaCacheLimit: _schemaCacheSize,
+      metaCacheUsage: await _getCurrentCacheSizeByType(MemoryQuotaType.meta),
+      metaCacheLimit: _metaCacheSize,
+      isLowMemoryMode: _isLowMemoryMode,
+    );
+  }
 
   /// Clean up all resources
   void dispose() {
@@ -366,23 +384,20 @@ class MemoryManager {
   }
 }
 
-/// Cache type enumeration, sorted by importance
-enum CacheType {
-  /// Record cache (clean up first)
-  record,
+/// Memory quota allocation type (MemoryQuotaType), sorted by allocation priority
+enum MemoryQuotaType {
+  /// Table data cache (clean up first)
+  tableData,
 
   /// Query result cache
-  query,
+  queryResult,
 
-  /// Index cache
+  /// Index data cache
   indexData,
 
   /// Table structure cache (clean up last)
   schema,
 
-  /// Table metadata cache
-  tableMeta,
-
-  /// Index metadata cache
-  indexMeta,
+  /// Table data and index all meta cache
+  meta,
 }

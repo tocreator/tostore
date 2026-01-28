@@ -1,8 +1,4 @@
-import 'dart:async';
-
-import '../Interface/chain_builder.dart';
-import '../Interface/future_builder_mixin.dart';
-import '../model/db_result.dart';
+part of '../Interface/chain_builder.dart';
 
 /// delete builder
 class DeleteBuilder extends ChainBuilder<DeleteBuilder>
@@ -11,7 +7,12 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
   // add flag to indicate whether to allow delete without condition
   bool _allowAll = false;
 
-  DeleteBuilder(super.db, super.tableName);
+  DeleteBuilder(DataStoreImpl db, String tableName) : super(db, tableName);
+
+  @override
+  void _onChanged() {
+    _future = null;
+  }
 
   /// allow delete all records
   ///
@@ -19,17 +20,18 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
   /// if there is no query condition and this method is not called, the delete operation will be rejected to prevent accidental deletion.
   DeleteBuilder allowDeleteAll() {
     _allowAll = true;
+    _onChanged();
     return this;
   }
 
   @override
   Future<DbResult> get future async {
-    _future ??= $db.deleteInternal(
-      $tableName,
+    _future ??= _db.deleteInternal(
+      _tableName,
       queryCondition,
-      orderBy: $orderBy,
-      limit: $limit,
-      offset: $offset,
+      orderBy: _orderBy,
+      limit: _limit,
+      offset: _offset,
       allowAll: _allowAll,
     );
     return _future!;

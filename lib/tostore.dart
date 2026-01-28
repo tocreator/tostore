@@ -12,23 +12,31 @@
 /// multimodal interaction, 3D spatial features, generative AI, and semantic vector space modeling.
 library tostore;
 
+import 'dart:async';
+
 export 'src/model/table_schema.dart';
 export 'src/model/business_error.dart';
 export 'src/model/data_store_config.dart';
 export 'src/model/table_info.dart';
 export 'src/model/log_config.dart';
 export 'src/model/space_info.dart';
+export 'src/model/memory_info.dart';
+export 'src/model/config_info.dart';
+export 'src/Interface/status_provider.dart';
 export 'src/model/db_result.dart';
 export 'src/model/query_result.dart';
 export 'src/model/migration_task.dart';
 export 'src/model/result_type.dart';
+export 'src/model/transaction_result.dart';
+export 'src/model/backup_scope.dart';
+export 'src/model/expr.dart';
 export 'src/query/query_condition.dart';
 export 'src/handler/logger.dart' show LogType;
 
-import 'src/chain/delete_builder.dart';
-import 'src/chain/update_builder.dart';
-import 'src/chain/upsert_builder.dart';
+import 'src/Interface/chain_builder.dart';
 import 'src/Interface/data_store_interface.dart';
+import 'src/Interface/status_provider.dart';
+import 'src/model/transaction_result.dart';
 import 'src/model/data_store_config.dart';
 import 'src/core/data_store_impl.dart';
 import 'src/model/db_result.dart';
@@ -36,9 +44,9 @@ import 'src/model/migration_task.dart';
 import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/space_info.dart';
-import 'src/chain/query_builder.dart';
 import 'src/chain/schema_builder.dart';
 import 'src/chain/stream_query_builder.dart';
+import 'src/model/backup_scope.dart';
 
 /// High-performance storage engine
 /// Features:
@@ -55,7 +63,10 @@ import 'src/chain/stream_query_builder.dart';
 /// - 每个实例拥有独立的文件存储、缓存、索引和事务
 class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
-  /// [dbPath] Database path (optional, excluding filename)
+  /// [dbPath] Database root path. On Android/iOS: REQUIRED — provide a persistent app
+  /// directory (e.g., using path_provider's getApplicationDocumentsDirectory()).
+  /// On desktop/server: optional — if omitted, a standard OS application data
+  /// directory will be used.
   /// [dbName] Database name for quickly creating different database instances (will be stored in dbPath/dbName/)
   /// [config] Database configuration
   /// [schemas] Database table schemas, Designed for mobile application scenarios, auto upgrade
@@ -64,13 +75,16 @@ class ToStore implements DataStoreInterface {
   /// [onOpen] Callback when database is opened
   ///
   /// 以数据库路径的不同创建独立的实例
-  /// [dbPath] 数据库的根路径，可选。如果未提供，则使用应用程序的默认目录。
+  /// [dbPath] 数据库的根路径。移动端(Android/iOS)必须手动填写，推荐使用 path_provider
+  /// 的 getApplicationDocumentsDirectory() 作为持久化目录；桌面/服务器平台可缺省，未提供时
+  /// 将自动解析到系统应用数据目录。
   /// [dbName] 数据库名称，用于在dbPath下创建独立的数据库实例目录（如 'dbPath/dbName/'）。默认为 'default'。
   /// [config] 数据库配置。dbPath和dbName参数会覆盖此配置中的同名值。
   /// [schemas] 数据库表结构定义，适用移动应用场景，自动化升级
   /// [onConfigure] 数据库配置时的回调
   /// [onCreate] 数据库首次创建时的回调
   /// [onOpen] 数据库打开时的回调
+  @Deprecated('Use ToStore.open() instead')
   factory ToStore({
     String? dbPath,
     String? dbName,
@@ -102,22 +116,105 @@ class ToStore implements DataStoreInterface {
     return _instances[instanceKey]!;
   }
 
+  /// Open database instance (Single step initialization)
+  /// This method gets/creates the instance and initializes it.
+  /// Preferred way to obtain a initialized ToStore instance.
+  ///
+  /// For multi-instance scenarios, different [dbName] or [dbPath] will return different instances.
+  ///
+  /// 打开数据库实例（一步初始化）
+  /// 获取或创建实例并完成初始化。
+  /// 获取已初始化 ToStore 实例的首选方式。
+  ///
+  /// 多实例场景下，不同的 [dbName] 或 [dbPath] 将返回不同的实例。
+  ///
+  /// Examples:
+  /// ```dart
+  /// final db = await ToStore.open(
+  ///   dbName: 'my_db',
+  ///   schemas: [UserSchema],
+  /// );
+  /// ```
+  static Future<ToStore> open({
+    String? dbPath,
+    String? dbName,
+    DataStoreConfig? config,
+    List<TableSchema> schemas = const [],
+    Future<void> Function(ToStore db)? onConfigure,
+    Future<void> Function(ToStore db)? onCreate,
+    Future<void> Function(ToStore db)? onOpen,
+    bool reinitialize = false,
+    bool noPersistOnClose = false,
+  }) async {
+    // ignore: deprecated_member_use_from_same_package
+    final db = ToStore(
+      dbPath: dbPath,
+      dbName: dbName,
+      config: config,
+      schemas: schemas,
+      onConfigure: onConfigure,
+      onCreate: onCreate,
+      onOpen: onOpen,
+    );
+    // ignore: deprecated_member_use_from_same_package
+    await db.initialize(
+      dbPath: dbPath,
+      dbName: dbName,
+      config: config,
+      reinitialize: reinitialize,
+      noPersistOnClose: noPersistOnClose,
+    );
+    return db;
+  }
+
   /// Initialize database
-  /// Ensure database is fully initialized before any operations
+  /// Ensure the engine is fully initialized before any operations.
+  ///
+  /// Parameters:
+  /// - [dbPath]: Optional root path. If provided, overrides `config.dbPath`.
+  /// - [dbName]: Optional database name. If provided, overrides `config.dbName`.
+  /// - [config]: Database configuration. When `dbPath`/`dbName` are provided, they take precedence
+  ///   over the corresponding fields in this config.
+  /// - [reinitialize]: When true, force a re-open of the database (close then open).
+  /// - [noPersistOnClose]: Used together with `reinitialize`. When true, do NOT persist pending
   ///
   /// 初始化数据库
-  /// 确保数据库初始化完成并就绪后再执行其他操作
+  /// 在任何操作前确保引擎已就绪。
+  ///
+  /// 参数说明：
+  /// - dbPath：可选数据库根路径；传入时优先级高于 `config.dbPath`。
+  /// - dbName：可选数据库名称；传入时优先级高于 `config.dbName`。
+  /// - config：数据库配置；当同时传入 dbPath/dbName 时，以参数值覆盖配置中的同名字段。
+  /// - reinitialize：为 true 时强制重新初始化（先关闭后打开）。
+  /// - noPersistOnClose：与 reinitialize 配合；为 true 时关闭阶段不落盘缓冲数据，直接清理缓存
+  ///
+  /// Examples:
+  /// ```dart
+  /// await db.initialize(reinitialize: true); // 持久化缓冲并重启
+  /// ```
   @override
+  @Deprecated('Use ToStore.open() instead')
   Future<void> initialize(
-      {String? dbPath, String? dbName, DataStoreConfig? config}) async {
-    await _impl.initialize(dbPath: dbPath, dbName: dbName, config: config);
+      {String? dbPath,
+      String? dbName,
+      DataStoreConfig? config,
+      bool reinitialize = false,
+      bool noPersistOnClose = false}) async {
+    await _impl.initialize(
+      dbPath: dbPath,
+      dbName: dbName,
+      config: config,
+      reinitialize: reinitialize,
+      noPersistOnClose: noPersistOnClose,
+    );
   }
 
   /// Create table with schema
   /// [schema] Table schema definition
+  /// Returns [DbResult] to allow graceful error handling for business logic errors
   /// Example:
   /// ```dart
-  /// await db.createTable(
+  /// final result = await db.createTable(
   ///  TableSchema(
   ///   name: 'table_name',
   ///   primaryKeyConfig: PrimaryKeyConfig(
@@ -138,45 +235,41 @@ class ToStore implements DataStoreInterface {
   ///     ),
   ///   ],
   /// ));
+  /// if (!result.isSuccess) {
+  ///   print('Failed to create table: ${result.message}');
+  /// }
   /// ```
   ///
   /// 创建数据表
   /// [schema] 表结构定义
+  /// 返回 [DbResult] 方便处理业务逻辑错误
   /// 全局表数据共享，其他表在切换空间后数据隔离
   @override
-  Future<void> createTable(TableSchema schema) async {
+  Future<DbResult> createTable(TableSchema schema) async {
     return await _impl.createTable(schema);
   }
 
   /// Create multiple tables
   /// [schemas] List of table schemas
+  /// Returns [DbResult] to allow graceful error handling for business logic errors
   ///
   /// 创建多个表
   /// [schemas] 表结构定义列表
+  /// 返回 [DbResult] 方便处理业务逻辑错误
   ///
   /// Example:
   /// ```dart
-  /// await db.createTables([
-  ///   TableSchema(
-  ///     name: 'table_name',
-  ///     primaryKeyConfig: PrimaryKeyConfig(
-  ///       name: 'userId',
-  ///       type: PrimaryKeyType.timestampBased,
-  ///     ),
-  ///     fields: [
-  ///       FieldSchema(
-  ///         name: 'userName',
-  ///         type: DataType.text,
-  ///         nullable: false,
-  ///         unique: true,
-  ///       ),
-  ///     ],
-  ///   ),
+  /// final result = await db.createTables([
+  ///   TableSchema(...),
   ///   TableSchema(...),
   /// ]);
+  /// if (result.isPartialSuccess) {
+  ///   print('Some tables created: ${result.successKeys}');
+  ///   print('Failed: ${result.failedKeys}');
+  /// }
   /// ```
   @override
-  Future<void> createTables(List<TableSchema> schemas) async {
+  Future<DbResult> createTables(List<TableSchema> schemas) async {
     return await _impl.createTables(schemas);
   }
 
@@ -302,7 +395,8 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名
   /// [data] 要更新的数据
   @override
-  UpdateBuilder update(String tableName, Map<String, dynamic> data) {
+  UpdateBuilder update(String tableName,
+      [Map<String, dynamic> data = const {}]) {
     return UpdateBuilder(_impl, tableName, data);
   }
 
@@ -382,28 +476,65 @@ class ToStore implements DataStoreInterface {
 
   /// Create database backup
   /// [compress] Whether to compress the backup into a zip file, default is true
+  /// [scope] Backup scope, default is BackupScope.currentSpaceWithGlobal
   /// Returns backup file path
   ///
   /// 备份数据库
   /// [compress] 是否压缩备份为 zip 文件，默认为 true
+  /// [scope] 备份范围，默认为 BackupScope.currentSpaceWithGlobal
   /// 返回备份文件路径
   @override
-  Future<String> backup({bool compress = true}) async {
-    return await _impl.backup(compress: compress);
+  Future<String> backup(
+      {bool compress = true,
+      BackupScope scope = BackupScope.currentSpaceWithGlobal}) async {
+    return await _impl.backup(compress: compress, scope: scope);
   }
 
   /// Restore database from backup
   /// [backupPath] Backup file path
   /// [deleteAfterRestore] Whether to delete the backup file after restore, default is false
+  /// [cleanupBeforeRestore] Whether to cleanup the related data before restore, default is true
   ///
   /// 从备份恢复数据库
   /// [backupPath] 备份文件路径
   /// [deleteAfterRestore] 是否在恢复后删除备份文件，默认为 false
+  /// [cleanupBeforeRestore] 是否在恢复前清空相关数据，默认为 true
   @override
   Future<bool> restore(String backupPath,
-      {bool deleteAfterRestore = false}) async {
+      {bool deleteAfterRestore = false,
+      bool cleanupBeforeRestore = true}) async {
     return await _impl.restore(backupPath,
-        deleteAfterRestore: deleteAfterRestore);
+        deleteAfterRestore: deleteAfterRestore,
+        cleanupBeforeRestore: cleanupBeforeRestore);
+  }
+
+  /// Run a transaction scope
+  /// [action] Transaction action
+  /// [rollbackOnError] Rolls back on error if true.
+  /// [persistRecoveryOnCommit] Overrides the default recovery mechanism for this transaction.
+  /// [isolation] Overrides the default isolation level for this transaction.
+  ///
+  /// 运行一个事务范围
+  /// [action] 事务操作
+  /// [rollbackOnError] 如果为 true，则在发生错误时回滚。
+  /// [persistRecoveryOnCommit] 为本次事务恢复机制是否持久化，如果为null则使用配置的默认值。
+  /// [isolation] 为本次事务指定隔离级别，如果为null则使用配置的默认值。
+  ///
+  /// Example:
+  /// ```dart
+  /// await db.transaction(() async {
+  ///   await db.insert('users', {'name': 'John'});
+  /// });
+  /// ```
+  @override
+  Future<TransactionResult> transaction<T>(FutureOr<T> Function() action,
+      {bool rollbackOnError = true,
+      bool? persistRecoveryOnCommit,
+      TransactionIsolationLevel? isolation}) {
+    return _impl.transaction<T>(action,
+        rollbackOnError: rollbackOnError,
+        persistRecoveryOnCommit: persistRecoveryOnCommit,
+        isolation: isolation);
   }
 
   /// Delete data from table
@@ -428,21 +559,25 @@ class ToStore implements DataStoreInterface {
 
   /// Drop table
   /// [tableName] Table name
+  /// Returns [DbResult] to allow graceful error handling for business logic errors
   ///
   /// 删除表
   /// [tableName] 表名
+  /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
-  Future<void> dropTable(String tableName) async {
+  Future<DbResult> dropTable(String tableName) async {
     return await _impl.dropTable(tableName);
   }
 
   /// Clear all data in table
   /// [tableName] Table name
+  /// Returns [DbResult] to allow graceful error handling for business logic errors
   ///
   /// 清空表数据
   /// [tableName] 表名
+  /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
-  Future<void> clear(String tableName) async {
+  Future<DbResult> clear(String tableName) async {
     return await _impl.clear(tableName);
   }
 
@@ -453,7 +588,7 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名
   @override
   Future<TableSchema?> getTableSchema(String tableName) async {
-    return await _impl.getTableSchema(tableName);
+    return await _impl.schemaManager?.getTableSchema(tableName);
   }
 
   /// Get table information including:
@@ -493,8 +628,9 @@ class ToStore implements DataStoreInterface {
   String? get currentSpaceName => _impl.currentSpaceName;
 
   /// Get current database version number
-  ///
+  /// Only used for user-defined maintenance, not involved in any database internal logic.
   /// 获取当前数据库版本号
+  /// 仅由用户自定义维护，不参与数据库内部任何逻辑。
   @override
   Future<int> getVersion() async {
     return await _impl.getVersion();
@@ -506,9 +642,11 @@ class ToStore implements DataStoreInterface {
   String? get instancePath => _impl.instancePath;
 
   /// Set database version number
+  /// Only used for user-defined maintenance, not involved in any database internal logic.
   /// [version] New version number to set
   ///
   /// 设置数据库版本号
+  /// 仅由用户自定义维护，不参与数据库内部任何逻辑。
   /// [version] 要设置的新版本号
   @override
   Future<void> setVersion(int version) async {
@@ -614,14 +752,24 @@ class ToStore implements DataStoreInterface {
   /// Delete a space
   /// [spaceName] Space name to delete
   /// Cannot delete the default space or the currently active space
+  /// Returns [DbResult] to allow graceful error handling for business logic errors
   ///
   /// 删除空间
   /// [spaceName] 要删除的空间名称
   /// 不能删除默认空间或当前活动空间
+  /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
-  Future<void> deleteSpace(String spaceName) async {
+  Future<DbResult> deleteSpace(String spaceName) async {
     return await _impl.deleteSpace(spaceName);
   }
+
+  /// Get unified status and diagnostics
+  /// Returns a [DbStatus] object containing memory, space, table, config, and migration status information
+  ///
+  /// 获取统一的状态和诊断信息
+  /// 返回一个 [DbStatus] 对象，包含内存、空间、表、配置和迁移状态信息
+  @override
+  DbStatus get status => _impl.status;
 
   /// @nodoc
   static final Map<String, ToStore> _instances = {};

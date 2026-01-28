@@ -1,6 +1,6 @@
 import 'dart:developer';
 
-import 'package:flutter/foundation.dart';
+import 'platform_handler.dart';
 
 import 'common.dart';
 import '../model/log_config.dart';
@@ -109,7 +109,7 @@ class Logger {
 
   /// internal log handler
   static void _log(Object? message, {String label = "log-info"}) {
-    if (kDebugMode && LogConfig.enableLog) {
+    if (PlatformHandler.isDebug && LogConfig.enableLog) {
       String startDash = "${'-' * 20}    $label    ${'-' * 18}>>";
       String endDash = "${'-' * (startDash.length - 2)}<<";
       if (startDash.length > 130) {

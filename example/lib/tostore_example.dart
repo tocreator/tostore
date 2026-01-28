@@ -1,7 +1,10 @@
+import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
+import 'package:path/path.dart' as p;
 import 'dart:math';
 
-import 'service/log_service.dart';
+import 'testing/log_service.dart';
 
 /// This example demonstrates the core features of Tostore using a user management system
 /// with global settings. It shows how to:
@@ -14,11 +17,30 @@ class TostoreExample {
 
   /// Initialize database and create tables
   Future<void> initialize() async {
-    db = ToStore(
+    String dbRoot;
+    if (kIsWeb) {
+      dbRoot = 'common';
+    } else {
+      try {
+        // Resolve app documents directory via path_provider and inject into tostore
+        final docDir = await getApplicationDocumentsDirectory();
+        dbRoot = p.join(docDir.path,
+            'common'); // tostore: ^2.2.2 version default dbPath is getApplicationDocumentsDirectory()/common
+      } catch (e) {
+        dbRoot = 'common';
+      }
+    }
+
+    db = await ToStore.open(
+      dbPath: dbRoot,
       dbName: 'tostore_example',
       config: DataStoreConfig(
         enableLog: true,
         logLevel: LogLevel.debug,
+        enableJournal: true,
+        encryptionConfig: const EncryptionConfig(
+          encryptionType: EncryptionType.none,
+        ),
       ),
       schemas: [
         // suitable for table structure definition in frequent startup scenarios of mobile applications, accurately identifying table structure changes, automatically upgrading and migrating data
@@ -45,53 +67,83 @@ class TostoreExample {
             IndexSchema(fields: ['username'], unique: true),
             IndexSchema(fields: ['email'], unique: true),
             IndexSchema(fields: ['last_login'], unique: false),
-            IndexSchema(fields: ['is_active']),
-            IndexSchema(fields: ['type']),
+            IndexSchema(fields: ['age']),
+            IndexSchema(fields: ['fans']),
           ],
         ),
-        const TableSchema(
+        TableSchema(
           name: 'posts',
-          primaryKeyConfig: PrimaryKeyConfig(
+          primaryKeyConfig: const PrimaryKeyConfig(
             name: 'id',
           ),
           fields: [
-            FieldSchema(name: 'title', type: DataType.text, nullable: false),
-            FieldSchema(name: 'content', type: DataType.text),
-            FieldSchema(
+            const FieldSchema(
+                name: 'title', type: DataType.text, nullable: false),
+            const FieldSchema(name: 'content', type: DataType.text),
+            const FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
-            FieldSchema(
+            const FieldSchema(
                 name: 'created_at',
                 type: DataType.datetime,
                 defaultValueType: DefaultValueType.currentTimestamp),
-            FieldSchema(
+            const FieldSchema(
                 name: 'is_published',
                 type: DataType.boolean,
                 defaultValue: true),
           ],
+          foreignKeys: [
+            ForeignKeySchema(
+              name: 'fk_posts_user',
+              fields: ['user_id'],
+              referencedTable: 'users',
+              referencedFields: ['id'],
+              onDelete: ForeignKeyCascadeAction.cascade,
+              onUpdate: ForeignKeyCascadeAction.cascade,
+            ),
+          ],
           indexes: [
-            IndexSchema(fields: ['user_id']),
-            IndexSchema(fields: ['created_at']),
+            const IndexSchema(fields: ['user_id']),
+            const IndexSchema(fields: ['created_at']),
           ],
         ),
-        const TableSchema(
+        TableSchema(
           name: 'comments',
-          primaryKeyConfig: PrimaryKeyConfig(
+          primaryKeyConfig: const PrimaryKeyConfig(
             name: 'id',
           ),
           fields: [
-            FieldSchema(
+            const FieldSchema(
                 name: 'post_id', type: DataType.integer, nullable: false),
-            FieldSchema(
+            const FieldSchema(
                 name: 'user_id', type: DataType.integer, nullable: false),
-            FieldSchema(name: 'content', type: DataType.text, nullable: false),
-            FieldSchema(
+            const FieldSchema(
+                name: 'content', type: DataType.text, nullable: false),
+            const FieldSchema(
                 name: 'created_at',
                 type: DataType.datetime,
                 defaultValueType: DefaultValueType.currentTimestamp),
           ],
+          foreignKeys: [
+            ForeignKeySchema(
+              name: 'fk_comments_post',
+              fields: ['post_id'],
+              referencedTable: 'posts',
+              referencedFields: ['id'],
+              onDelete: ForeignKeyCascadeAction.cascade,
+              onUpdate: ForeignKeyCascadeAction.cascade,
+            ),
+            ForeignKeySchema(
+              name: 'fk_comments_user',
+              fields: ['user_id'],
+              referencedTable: 'users',
+              referencedFields: ['id'],
+              onDelete: ForeignKeyCascadeAction.restrict,
+              onUpdate: ForeignKeyCascadeAction.cascade,
+            ),
+          ],
           indexes: [
-            IndexSchema(fields: ['post_id']),
-            IndexSchema(fields: ['user_id']),
+            const IndexSchema(fields: ['post_id']),
+            const IndexSchema(fields: ['user_id']),
           ],
         ),
         const TableSchema(
@@ -117,7 +169,6 @@ class TostoreExample {
         ),
       ],
     );
-    await db.initialize();
   }
 
   /// Example: Basic CRUD operations for users
@@ -356,12 +407,15 @@ class TostoreExample {
   /// backend server or distributed example
   Future<void> distributedExample() async {
     // create database instance
-    final db = ToStore(
+    final db = await ToStore.open(
       config: DataStoreConfig(
-        enableEncoding: true, // enable security encoding for table data
-        encodingKey: 'YouEncodingKey', // encoding key, can be adjusted
-        encryptionKey:
-            'YouEncryptionKey', // encryption key, note: adjusting this key will make it impossible to decode old data
+        encryptionConfig: const EncryptionConfig(
+          encryptionType: EncryptionType
+              .chacha20Poly1305, // enable security encoding for data
+          encodingKey: 'YouEncodingKey', // encoding key, can be adjusted
+          encryptionKey:
+              'YouEncryptionKey', // encryption key, note: adjusting this key will make it impossible to decode old data
+        ),
         distributedNodeConfig: const DistributedNodeConfig(
           enableDistributed: true, // enable distributed mode
           clusterId: 1, // configure cluster id
@@ -540,14 +594,58 @@ class TostoreExample {
 
   /// Generates a single mock data record based on a table's schema.
   ///
-  Map<String, dynamic> _generateRecord(TableSchema schema, int index) {
+  Map<String, dynamic> _generateRecord(
+    TableSchema schema,
+    int index, {
+    Map<String, dynamic>? foreignKeyValues,
+    Map<String, ForeignKeyMode>? foreignKeyModes,
+    Map<String, List<dynamic>>? foreignKeyIdLists,
+  }) {
     final record = <String, dynamic>{};
     final random = Random();
+
+    // Build foreign key field set for fast lookup
+    final foreignKeyFields = <String>{};
+    for (final fk in schema.foreignKeys) {
+      if (fk.enabled) {
+        foreignKeyFields.addAll(fk.fields);
+      }
+    }
 
     for (final field in schema.fields) {
       // We don't generate data for the primary key if it's auto-incrementing.
       // The database will handle it.
       if (field.name == schema.primaryKeyConfig.name) {
+        continue;
+      }
+
+      // If the field is a foreign key field
+      if (foreignKeyFields.contains(field.name)) {
+        final mode = foreignKeyModes?[field.name] ?? ForeignKeyMode.fixed;
+        final idList = foreignKeyIdLists?[field.name];
+
+        if (mode == ForeignKeyMode.random &&
+            idList != null &&
+            idList.isNotEmpty) {
+          // Random mode: select a random ID from the ID list
+          record[field.name] = idList[random.nextInt(idList.length)];
+        } else if (foreignKeyValues != null &&
+            foreignKeyValues.containsKey(field.name)) {
+          // Fixed mode: use the provided fixed value
+          record[field.name] = foreignKeyValues[field.name];
+        } else {
+          // If no foreign key value is provided, record a warning but continue (database will validate)
+          logService.add(
+              'Warning: Foreign key field "${field.name}" in table "${schema.name}" has no provided value.',
+              LogType.warn);
+        }
+        continue;
+      }
+
+      // If the field is a foreign key and has a provided foreign key value, use the provided value (compatible with old logic)
+      if (foreignKeyValues != null &&
+          foreignKeyValues.containsKey(field.name)) {
+        record[field.name] = foreignKeyValues[field.name];
         continue;
       }
 
@@ -603,7 +701,13 @@ class TostoreExample {
   }
 
   /// Adds a specified number of example records to a given table using batch inserts.
-  Future<int> addExamples(String tableName, int count) async {
+  Future<int> addExamples(
+    String tableName,
+    int count, {
+    Map<String, dynamic>? foreignKeyValues,
+    Map<String, ForeignKeyMode>? foreignKeyModes,
+    Map<String, List<dynamic>>? foreignKeyIdLists,
+  }) async {
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
       logService.add(
@@ -612,44 +716,58 @@ class TostoreExample {
       return -1;
     }
 
-    // Find the current maximum ID to determine the starting index
-    final lastResult =
-        await db.query(tableName).orderByDesc('id').select(['id']).limit(1);
-    int startIndex = 0;
-    if (lastResult.data.isNotEmpty) {
-      final lastId = lastResult.data.first['id'];
-      if (lastId != null) {
-        startIndex = int.tryParse(lastId.toString()) ?? 0;
+    // Get current max ID to ensure field values (email, username, etc.)
+    // have sequential numbers matching the primary key IDs
+    // Note: This is only used for generating field values, NOT for setting primary key
+    // Primary key will be auto-generated by the database system
+    int baseIndex = 0;
+    if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+      try {
+        final lastResult = await db
+            .query(tableName)
+            .orderByDesc(schema.primaryKeyConfig.name)
+            .select([schema.primaryKeyConfig.name]).limit(1);
+        if (lastResult.data.isNotEmpty) {
+          final lastId = lastResult.data.first[schema.primaryKeyConfig.name];
+          if (lastId != null) {
+            baseIndex = int.tryParse(lastId.toString()) ?? 0;
+          }
+        }
+      } catch (e) {
+        // If query fails, start from 0 (will use initial value from schema)
+        logService.add(
+            'Warning: Failed to query max ID for field value generation: $e',
+            LogType.warn);
       }
     }
+
     final stopwatch = Stopwatch()..start();
 
-    // batch insert, 2000 records per batch
-    const int batchSize = 2000;
-
-    for (int batchStart = 0; batchStart < count; batchStart += batchSize) {
-      final int batchEnd =
-          (batchStart + batchSize < count) ? batchStart + batchSize : count;
-      // prepare records for current batch
-      final records = <Map<String, dynamic>>[];
-      for (var i = batchStart; i < batchEnd; i++) {
-        // The global unique index is startIndex + i + 1
-        records.add(_generateRecord(schema, startIndex + i + 1));
-        if (i % 50 == 0) {
-          // Yield more sparingly to improve performance while keeping UI responsive
-          await Future.delayed(Duration.zero);
-        }
+    // Prepare all records at once to avoid multiple batch splits
+    // This improves performance by reducing the number of batchInsert calls
+    final records = <Map<String, dynamic>>[];
+    for (var i = 0; i < count; i++) {
+      // Use baseIndex + i + 1 to generate field values that match primary key IDs
+      // Primary key will be auto-generated by the database system
+      records.add(_generateRecord(
+        schema,
+        baseIndex + i + 1,
+        foreignKeyValues: foreignKeyValues,
+        foreignKeyModes: foreignKeyModes,
+        foreignKeyIdLists: foreignKeyIdLists,
+      ));
+      // Yield periodically to keep UI responsive during large data construction
+      if (i > 0 && i % 1000 == 0) {
+        await Future.delayed(Duration.zero);
       }
+    }
 
-      // batch insert current batch
-      final result = await db.batchInsert(tableName, records);
-      if (!result.isSuccess) {
-        logService.add('Batch insert failed: ${result.message}', LogType.error);
-        return -1; // Indicate failure
-      }
-
-      // yield to event loop, keep UI responsive
-      await Future.delayed(Duration.zero);
+    // Single batch insert call with all records
+    // The batchInsert method will handle internal batching if needed for memory efficiency
+    final result = await db.batchInsert(tableName, records);
+    if (!result.isSuccess) {
+      logService.add('Batch insert failed: ${result.message}', LogType.error);
+      return -1; // Indicate failure
     }
 
     stopwatch.stop();
@@ -663,7 +781,13 @@ class TostoreExample {
   }
 
   /// Adds a specified number of example records to a given table one by one.
-  Future<int> addExamplesOneByOne(String tableName, int count) async {
+  Future<int> addExamplesOneByOne(
+    String tableName,
+    int count, {
+    Map<String, dynamic>? foreignKeyValues,
+    Map<String, ForeignKeyMode>? foreignKeyModes,
+    Map<String, List<dynamic>>? foreignKeyIdLists,
+  }) async {
     logService
         .add('Starting to add $count records to "$tableName" one by one...');
     final schema = await db.getTableSchema(tableName);
@@ -674,28 +798,62 @@ class TostoreExample {
       return -1;
     }
 
-    // Find the current maximum ID to determine the starting index
-    final lastResult =
-        await db.query(tableName).orderByDesc('id').select(['id']).limit(1);
-    int startIndex = 0;
-    if (lastResult.data.isNotEmpty) {
-      final lastId = lastResult.data.first['id'];
-      if (lastId != null) {
-        startIndex = int.tryParse(lastId.toString()) ?? 0;
+    // Get current max ID to ensure field values (email, username, etc.)
+    // have sequential numbers matching the primary key IDs
+    // Note: This is only used for generating field values, NOT for setting primary key
+    // Primary key will be auto-generated by the database system
+    // For one-by-one insertion, we query max ID before each insert to keep values in sync
+    int baseIndex = 0;
+    if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+      try {
+        final lastResult = await db
+            .query(tableName)
+            .orderByDesc(schema.primaryKeyConfig.name)
+            .select([schema.primaryKeyConfig.name]).limit(1);
+        if (lastResult.data.isNotEmpty) {
+          final lastId = lastResult.data.first[schema.primaryKeyConfig.name];
+          if (lastId != null) {
+            baseIndex = int.tryParse(lastId.toString()) ?? 0;
+          }
+        }
+      } catch (e) {
+        // If query fails, start from 0 (will use initial value from schema)
+        logService.add(
+            'Warning: Failed to query max ID for field value generation: $e',
+            LogType.warn);
       }
     }
+
+    // Pre-generate data to measure insert performance accurately (excluding data generation time)
+    logService.add('Generating $count records for one-by-one insertion...');
+    final records = <Map<String, dynamic>>[];
+    for (var i = 0; i < count; i++) {
+      records.add(_generateRecord(
+        schema,
+        baseIndex + i + 1,
+        foreignKeyValues: foreignKeyValues,
+        foreignKeyModes: foreignKeyModes,
+        foreignKeyIdLists: foreignKeyIdLists,
+      ));
+      // Yield periodically during generation to keep UI responsive
+      if (i > 0 && i % 1000 == 0) {
+        await Future.delayed(Duration.zero);
+      }
+    }
+    logService.add('Data generation complete. Starting insertion...');
+
     final stopwatch = Stopwatch()..start();
 
     for (var i = 0; i < count; i++) {
-      // The global unique index is startIndex + i + 1
       final result = await db.insert(
-          tableName, _generateRecord(schema, startIndex + i + 1));
+        tableName,
+        records[i],
+      );
+
       if (!result.isSuccess) {
-        return -1; // Indicate failure
+        return -1;
       }
-      // Yield to the event loop to prevent UI freezing
-      if (i % 50 == 0) {
-        // Yield more sparingly to improve performance while keeping UI responsive
+      if (i % 200 == 0) {
         await Future.delayed(Duration.zero);
       }
     }
@@ -731,4 +889,144 @@ class TostoreExample {
     logService.add('query count: $queryCount');
     return elapsed;
   }
+
+  /// Example: Expression operations for atomic field updates
+  /// Demonstrates using Expr for atomic calculations without race conditions
+  Future<void> expressionExamples() async {
+    logService.add('--- Expression Examples ---', LogType.info);
+
+    // Example 1: Simple increment using expression
+    await db.insert('users', {
+      'username': 'expr_user1',
+      'email': 'expr1@example.com',
+      'age': 25,
+      'fans': 100,
+    });
+
+    // Increment fans by 50 atomically
+    await db.update('users', {
+      'fans': Expr.field('fans') + Expr.value(50),
+    }).where('username', '=', 'expr_user1');
+
+    // Example 2: Complex calculation with multiple fields
+    await db.insert('users', {
+      'username': 'expr_user2',
+      'email': 'expr2@example.com',
+      'age': 30,
+      'fans': 200,
+    });
+
+    // Calculate total: fans + (age * 2)
+    await db.update('users', {
+      'fans': Expr.field('fans') + (Expr.field('age') * Expr.value(2)),
+    }).where('username', '=', 'expr_user2');
+
+    // Example 3: Multi-level parentheses for complex calculations
+    await db.insert('users', {
+      'username': 'expr_user3',
+      'email': 'expr3@example.com',
+      'age': 35,
+      'fans': 300,
+    });
+
+    // Complex calculation: ((fans + age) * 0.8) - 10
+    await db.update('users', {
+      'fans': ((Expr.field('fans') + Expr.field('age')) * Expr.value(0.8)) -
+          Expr.value(10),
+    }).where('username', '=', 'expr_user3');
+
+    // Example 4: Using chain builder syntax sugar
+    await db.insert('users', {
+      'username': 'expr_user4',
+      'email': 'expr4@example.com',
+      'age': 40,
+      'fans': 400,
+    });
+
+    // Chain builder methods (syntax sugar for expressions)
+    await db
+        .update('users', {})
+        .increment('fans', 100) // fans = fans + 100
+        .multiply('age', 1.1) // age = age * 1.1
+        .setServerTimestamp('last_login') // last_login = now()
+        .where('username', '=', 'expr_user4');
+
+    // Example 5: Using min/max functions
+    await db.update('users', {
+      'fans': Expr.min(Expr.field('fans'), Expr.value(500)),
+    }).where('username', '=', 'expr_user4');
+
+    // Example 6: Expression in Map literal (direct usage)
+    await db.update('users', {
+      'fans': Expr.field('fans') * Expr.field('age') / Expr.value(10),
+      'last_login': Expr.now(),
+    }).where('username', '=', 'expr_user4');
+
+    // Example 7: Complex business logic calculation
+    // Calculate final price: (price * quantity + tax) * (1 - discount)
+    await db.insert('posts', {
+      'title': 'Product A',
+      'user_id': 1,
+      'content': 'Product description',
+    });
+
+    // If posts table had price, quantity, tax, discount fields:
+    // await db.update('posts', {
+    //   'final_price': ((Expr.field('price') * Expr.field('quantity') + Expr.field('tax')) *
+    //                  (Expr.value(1) - Expr.field('discount'))),
+    // }).where('title', '=', 'Product A');
+
+    logService.add('Expression examples completed', LogType.info);
+  }
+
+  /// Example: Transaction operations
+  /// Demonstrates transaction commit, rollback, and atomic operations
+  Future<void> transactionExamples() async {
+    logService.add('--- Transaction Examples ---', LogType.info);
+
+    // Example 1: Basic transaction with commit
+    // All operations in the transaction are atomic - either all succeed or all fail
+    final txResult1 = await db.transaction(() async {
+      await db.insert('users', {
+        'username': 'tx_user1',
+        'email': 'tx1@example.com',
+        'age': 25,
+        'fans': 100,
+      });
+      await db.insert('users', {
+        'username': 'tx_user2',
+        'email': 'tx2@example.com',
+        'age': 30,
+        'fans': 200,
+      });
+    });
+
+    if (txResult1.isSuccess) {
+      logService.add('Transaction committed: 2 users inserted', LogType.info);
+    }
+
+    // Example 2: Transaction with rollback on error
+    // If an error occurs, all changes are automatically rolled back
+    final txResult2 = await db.transaction(() async {
+      await db.insert('users', {
+        'username': 'tx_user3',
+        'email': 'tx3@example.com',
+        'age': 35,
+      });
+      throw Exception('Simulated business error');
+    }, rollbackOnError: true);
+
+    if (txResult2.isFailed) {
+      logService.add(
+          'Transaction rolled back: ${txResult2.error?.message}', LogType.info);
+    }
+
+    logService.add('Transaction examples completed', LogType.info);
+  }
+}
+
+/// ForeignKeyMode: Foreign key ID allocation mode
+enum ForeignKeyMode {
+  fixed, // Fixed value
+  random, // Random value
 }

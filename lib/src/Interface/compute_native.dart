@@ -123,11 +123,9 @@ class _IsolatePool {
       _updateTaskStats(isolateId, taskTime);
     }
 
-    if (result.containsKey('error')) {
-      task.completer.completeError(result['error'], result['stackTrace']);
-    } else {
-      task.completer.complete(result['result']);
-    }
+    // Since we removed error handling from isolate, we only expect successful results
+    // Any errors will be handled by ComputeManager's fallback mechanism
+    task.completer.complete(result['result']);
 
     _isIdle[isolateId] = true;
     _dispatchTask(); // Isolate is free, try to process next task from global queue.

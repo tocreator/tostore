@@ -50,18 +50,38 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<void> writeAsBytesAt(String path, int start, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<void> writeManyAsBytesAt(String path, List<ByteWrite> writes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
   Future<String?> readAsString(String path) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }
 
   @override
-  Future<void> writeAsBytes(String path, Uint8List bytes) async {
+  Future<void> writeAsBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }
 
   @override
   Future<void> writeAsString(String path, String content,
-      {bool append = false}) async {
+      {bool append = false,
+      bool flush = true,
+      bool closeHandleAfterFlush = false}) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }
 
@@ -98,6 +118,39 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   Future<void> ensureDirectoryExists(String path) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<int> appendBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<int> appendString(String path, String content,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<List<String>> readAsLines(String path, {int offset = 0}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<void> flushAll(
+      {String? path, List<String>? paths, bool closeHandles = false}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<void> configureStorage({int? maxOpenHandles}) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
+  Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }
 }

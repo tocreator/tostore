@@ -1,14 +1,22 @@
 /// Represents the result of a search operation on an index.
 ///
-/// This class encapsulates the pointers to records found, grouped by the
-/// partition they reside in. It also provides crucial metadata for the query
-/// executor, such as whether a fallback to a full table scan is necessary.
+import 'dart:typed_data';
+
 class IndexSearchResult {
-  /// A map where the key is the partition ID and the value is a list of
-  /// record pointers (as strings) found in that partition.
-  /// This structure avoids extra traversals by pre-grouping results by partition,
-  /// allowing for efficient, batched data retrieval.
-  final Map<int, List<String>> pointersByPartition;
+  /// Primary keys that match the index condition.
+  final List<String> primaryKeys;
+
+  /// The last scanned index key (raw bytes) returned by the underlying range scan.
+  ///
+  /// This can be used as a keyset cursor (`startAfterKey`) to continue scanning
+  /// the same index range without re-reading already scanned entries.
+  ///
+  /// - For UNIQUE indexes, this is the encoded tuple of index fields.
+  /// - For NON-UNIQUE indexes, this is the encoded tuple of index fields + primary key.
+  ///
+  /// Note: This key represents the last *scanned* entry in the index order, not
+  /// necessarily the last returned record after applying higher-level predicates.
+  final Uint8List? lastKey;
 
   /// A flag indicating whether the query executor should fall back to a full
   /// table scan. This is `true` if the index could not be used conclusively
@@ -24,7 +32,8 @@ class IndexSearchResult {
 
   /// Creates an instance of an index search result.
   IndexSearchResult({
-    required this.pointersByPartition,
+    required this.primaryKeys,
+    this.lastKey,
     this.requiresTableScan = false,
     this.indexWasUsed = true,
   });
@@ -33,7 +42,8 @@ class IndexSearchResult {
   /// This is used when an index is not available or its use is inconclusive.
   factory IndexSearchResult.tableScan() {
     return IndexSearchResult(
-      pointersByPartition: {},
+      primaryKeys: const [],
+      lastKey: null,
       requiresTableScan: true,
       indexWasUsed: false,
     );
@@ -43,14 +53,15 @@ class IndexSearchResult {
   /// matching records were found.
   factory IndexSearchResult.empty() {
     return IndexSearchResult(
-      pointersByPartition: {},
+      primaryKeys: const [],
+      lastKey: null,
       requiresTableScan: false,
       indexWasUsed: true,
     );
   }
 
   /// Returns true if no pointers were found across any partitions.
-  bool get isEmpty => pointersByPartition.values.every((list) => list.isEmpty);
+  bool get isEmpty => primaryKeys.isEmpty;
 }
 
 /// Represents a condition for a single index search.
@@ -109,17 +120,22 @@ class IndexCondition {
     if (map.isEmpty) {
       throw ArgumentError('Condition map cannot be empty.');
     }
-    final op = map.keys.first;
+    final opRaw = map.keys.first;
     final value = map.values.first;
+    final opUpper = opRaw.toString().toUpperCase();
 
-    if (op == 'between') {
+    if (opUpper == 'BETWEEN') {
       if (value is List && value.length == 2) {
-        return IndexCondition._(op, value[0], endValue: value[1]);
-      } else {
-        throw ArgumentError(
-            'For "between" operator, value must be a List of two elements.');
+        return IndexCondition._(opUpper, value[0], endValue: value[1]);
       }
+      if (value is Map) {
+        return IndexCondition._(opUpper, value['start'],
+            endValue: value['end']);
+      }
+      throw ArgumentError(
+          'For "BETWEEN" operator, value must be a List of two elements or a Map {start,end}.');
     }
-    return IndexCondition._(op, value);
+
+    return IndexCondition._(opUpper, value);
   }
 }

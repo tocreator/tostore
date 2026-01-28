@@ -1,6 +1,6 @@
 import '../model/space_config.dart';
 import '../model/global_config.dart';
-import '../model/file_info.dart';
+import '../model/meta_info.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
@@ -163,7 +163,7 @@ class DirectoryManager {
   Future<int> _allocateDirectory(dynamic config, String spacePrefix) async {
     // Find directory with least usage
     int selectedDirIndex = 0;
-    int minTablesCount = _dataStore.config.maxEntriesPerDir +
+    int minTablesCount = _dataStore.maxEntriesPerDir +
         1; // Set to be larger than max, ensure replacement
 
     // Iterate through existing directories, find the one with the least tables
@@ -178,7 +178,7 @@ class DirectoryManager {
           final dirIndex = int.tryParse(parts[1]);
           if (dirIndex != null &&
               count < minTablesCount &&
-              count < _dataStore.config.maxEntriesPerDir) {
+              count < _dataStore.maxEntriesPerDir) {
             selectedDirIndex = dirIndex;
             minTablesCount = count;
           }
@@ -187,7 +187,7 @@ class DirectoryManager {
     }
 
     // If all directories are full or no directories exist, create a new one
-    if (minTablesCount >= _dataStore.config.maxEntriesPerDir) {
+    if (minTablesCount >= _dataStore.maxEntriesPerDir) {
       // Find the largest existing directory index
       int maxDirIndex = -1;
       for (var key in config.directoryUsageMap.keys) {
@@ -311,7 +311,7 @@ class DirectoryManager {
   Future<bool?> isTableGlobal(String tableName) async {
     try {
       // First try to get from table structure
-      final schema = await _dataStore.getTableSchema(tableName);
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema != null) {
         return schema.isGlobal;
       }
@@ -358,7 +358,7 @@ class DirectoryManager {
   /// Get table actual path
   /// If table does not exist, return null
   Future<String?> getTablePathIfExists(String tableName) async {
-    final schema = await _dataStore.getTableSchema(tableName);
+    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return null;
     }

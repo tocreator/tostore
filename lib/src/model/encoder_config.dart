@@ -1,47 +1,48 @@
+import 'dart:typed_data';
+import 'data_store_config.dart';
+
 class EncoderConfig {
-  final bool enableEncoding;
-  final bool enableObfuscation;
-  final List<int> activeKey;
+  final Uint8List activeKey;
   final int keyId;
-  final Map<int, List<int>>? fallbackKeys;
+  final Map<int, Uint8List>? fallbackKeys;
+  final EncryptionType encryptionType;
 
   EncoderConfig({
-    required this.enableEncoding,
-    required this.enableObfuscation,
     required this.activeKey,
     required this.keyId,
     this.fallbackKeys,
+    this.encryptionType = EncryptionType.xorObfuscation,
   });
 
   Map<String, dynamic> toJson() {
     return {
-      'enableEncoding': enableEncoding,
-      'enableObfuscation': enableObfuscation,
       'activeKey': activeKey,
       'keyId': keyId,
       // The keys of the map must be strings for JSON encoding.
       'fallbackKeys': fallbackKeys?.map((k, v) => MapEntry(k.toString(), v)),
+      'encryptionType': encryptionType.toInt(),
     };
   }
 
   factory EncoderConfig.fromJson(Map<String, dynamic> json) {
-    Map<int, List<int>>? fallbackKeys;
+    Map<int, Uint8List>? fallbackKeys;
     if (json['fallbackKeys'] != null) {
       final fallbackKeysRaw = json['fallbackKeys'] as Map;
       fallbackKeys = fallbackKeysRaw.map(
         (key, value) => MapEntry(
           int.parse(key.toString()),
-          List<int>.from(value),
+          Uint8List.fromList(List<int>.from(value)),
         ),
       );
     }
 
     return EncoderConfig(
-      enableEncoding: json['enableEncoding'] as bool,
-      enableObfuscation: json['enableObfuscation'] as bool,
-      activeKey: List<int>.from(json['activeKey']),
+      activeKey: Uint8List.fromList(List<int>.from(json['activeKey'])),
       keyId: json['keyId'] as int,
       fallbackKeys: fallbackKeys,
+      encryptionType: json['encryptionType'] != null
+          ? EncryptionTypeExtension.fromInt(json['encryptionType'] as int)
+          : EncryptionType.xorObfuscation,
     );
   }
 }

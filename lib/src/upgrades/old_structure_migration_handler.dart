@@ -1,11 +1,12 @@
 import 'dart:convert';
+import 'dart:math';
 
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../model/buffer_entry.dart';
-import 'data_store_impl.dart';
-import 'path_manager.dart';
-import 'storage_adapter.dart';
+import '../core/data_store_impl.dart';
+import '../core/path_manager.dart';
+import '../core/storage_adapter.dart';
+import '../core/yield_controller.dart';
 
 /// Old path structure migration handler
 /// Handles the logic for migrating from the old version database path structure to the new version
@@ -43,10 +44,13 @@ class OldStructureMigrationHandler {
           'Detected ${allSpaces.length} spaces need to migrate old path structure: $allSpaces',
           label: 'OldStructureMigrationHandler.migrate');
 
+      final yieldController =
+          YieldController('migrate_old_spaces', checkInterval: 1);
       // migrate each space one by one
       for (final spaceName in allSpaces) {
         Logger.info('Starting to migrate space: $spaceName',
             label: 'OldStructureMigrationHandler.migrate');
+        await yieldController.maybeYield();
 
         // create a migration instance for a specific space
         final migrationInstance = DataStoreImpl(
@@ -168,8 +172,11 @@ class OldStructureMigrationHandler {
         }
       }
 
+      final yieldController =
+          YieldController('migrate_old_tables', checkInterval: 1);
       // migrate each table one by one
       for (final tableName in tableNames) {
+        await yieldController.maybeYield();
         await _migrateTable(tableName, oldPath, isGlobal, dataStore);
 
         // clean old table files and directories
@@ -260,6 +267,7 @@ class OldStructureMigrationHandler {
           final lines = dataContent.split('\n');
           final List<Map<String, dynamic>> records = [];
 
+          final yieldController = YieldController('migrate_table_records');
           for (final line in lines) {
             if (line.isNotEmpty) {
               try {
@@ -272,16 +280,31 @@ class OldStructureMigrationHandler {
                 // continue to process the next line
               }
             }
+            await yieldController.maybeYield();
           }
 
           // write all collected records in batch
           if (records.isNotEmpty) {
             try {
-              await dataStore.tableDataManager.writeRecords(
-                tableName: tableName,
-                records: records,
-                operationType: BufferOperationType.insert,
-              );
+              const int batchSize = 5000;
+
+              for (int start = 0; start < records.length; start += batchSize) {
+                final end = min(start + batchSize, records.length);
+                final batch = records.sublist(start, end);
+
+                await dataStore.tableDataManager.writeChanges(
+                  tableName: tableName,
+                  inserts: batch,
+                );
+
+                // Maintain indexes to keep query paths consistent after migration.
+                await dataStore.indexManager?.writeChanges(
+                  tableName: tableName,
+                  inserts: batch,
+                );
+
+                await Future.delayed(Duration.zero);
+              }
             } catch (e) {
               Logger.error(
                   'Error occurred during writing table $tableName data: $e',
@@ -298,18 +321,13 @@ class OldStructureMigrationHandler {
       if (await _storage.existsFile(oldMaxIdPath)) {
         final maxIdContent = await _storage.readAsString(oldMaxIdPath);
         if (maxIdContent != null && maxIdContent.isNotEmpty) {
-          try {
-            final maxId = int.parse(maxIdContent.trim());
-            // get new table auto increment ID file path
-            final newAutoIncrementPath =
-                await dataStore.pathManager.getAutoIncrementPath(tableName);
-            // write auto increment ID
-            await _storage.writeAsString(
-                newAutoIncrementPath, maxId.toString());
-          } catch (e) {
-            Logger.error(
-                'Error occurred during migrating table $tableName auto increment ID: $e',
-                label: 'OldStructureMigrationHandler._migrateTable');
+          final maxId = int.parse(maxIdContent.trim());
+          // get new table auto increment ID file path
+          final fileMeta =
+              await dataStore.tableDataManager.getTableMeta(tableName);
+          if (fileMeta != null) {
+            await dataStore.tableDataManager.updateTableMeta(tableName,
+                fileMeta.copyWith(maxAutoIncrementId: maxId.toString()));
           }
         }
       }

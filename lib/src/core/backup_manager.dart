@@ -2,11 +2,11 @@ import 'dart:convert';
 
 import 'package:path/path.dart' as p;
 
-import 'package:flutter/foundation.dart';
-
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
+import '../model/backup_scope.dart';
+import '../model/backup_metadata.dart';
 import '../handler/platform_handler.dart';
 
 /// backup manager
@@ -19,13 +19,7 @@ class BackupManager {
   String _getFileName(String path) {
     final normalizedPath = path.replaceAll('\\', '/');
     final parts = normalizedPath.split('/');
-    final fileName = parts.isEmpty ? path : parts.last;
-
-    if (fileName.contains('.')) {
-      return fileName.substring(0, fileName.lastIndexOf('.'));
-    }
-
-    return fileName;
+    return parts.isEmpty ? path : parts.last;
   }
 
   /// Create backup using directory-based approach
@@ -36,14 +30,15 @@ class BackupManager {
   /// - fullBackup: If true, backs up the entire database directory including init files
   ///               If false, only backs up the spaces and global directories
   Future<String> createBackup(
-      {bool compress = false, bool fullBackup = false}) async {
-    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-');
+      {bool compress = false,
+      BackupScope scope = BackupScope.currentSpaceWithGlobal}) async {
+    final timestamp = _formatBackupTimestamp();
     final backupPath = _dataStore.pathManager.getBackupPath();
     final backupDir = pathJoin(backupPath, 'backup_$timestamp');
 
     try {
       Logger.info(
-          'Creating ${fullBackup ? "full" : "partial"} backup using directory-based approach',
+          'Creating backup using directory-based approach, scope=$scope',
           label: 'BackupManager.createBackup');
 
       // Ensure backup directory exists
@@ -52,23 +47,23 @@ class BackupManager {
 
       // Check if directory was created successfully
       if (!await _dataStore.storage.existsDirectory(backupDir)) {
-        if (!kIsWeb) {
+        if (!PlatformHandler.isWeb) {
           throw StateError('Failed to create backup directory: $backupDir');
         }
       }
 
       // Create metadata file with backup information
-      final metaData = {
-        'timestamp': timestamp,
-        'version': await _dataStore.getVersion(),
-        'type': fullBackup ? 'full' : 'partial',
-        'compressed': compress,
-      };
+      final meta = BackupMetadata(
+        timestamp: timestamp,
+        version: await _dataStore.getVersion(),
+        scope: scope,
+        compressed: compress,
+      );
       await _dataStore.storage.writeAsString(
-          pathJoin(backupDir, 'meta.json'), jsonEncode(metaData));
+          pathJoin(backupDir, 'meta.json'), jsonEncode(meta.toJson()));
 
-      if (fullBackup) {
-        // Full backup: copy the entire database directory (excluding backups dir)
+      if (scope == BackupScope.database) {
+        // Full database backup: copy the entire database directory (excluding backups dir)
         final dbRootDir = _dataStore.instancePath!;
         final dirItems = await _dataStore.storage.listDirectory(dbRootDir);
 
@@ -88,25 +83,22 @@ class BackupManager {
           }
         }
       } else {
-        // Partial backup: only copy spaces and global directories
-        // Copy base directory (contains all user tables)
+        // Copy current space directory
         final basePath = _dataStore.pathManager.getSpacePath();
+        final backupSpacePath =
+            _dataStore.pathManager.getSpacePath(rootPath: backupDir);
         if (await _isDirectory(basePath)) {
-          await _safeCopyDirectory(basePath, pathJoin(backupDir, 'spaces'));
+          await _safeCopyDirectory(basePath, backupSpacePath);
         }
 
-        // Copy global directory (contains global tables)
-        final globalPath = _dataStore.pathManager.getGlobalPath();
-        if (await _isDirectory(globalPath)) {
-          await _safeCopyDirectory(globalPath, pathJoin(backupDir, 'global'));
-        }
-
-        // Copy init.json file if it exists
-        final initFilePath = _dataStore.pathManager
-            .getSpaceConfigPath(spaceName: _dataStore.currentSpaceName);
-        if (await _dataStore.storage.existsFile(initFilePath)) {
-          final targetPath = pathJoin(backupDir, 'space_config.json');
-          await _safeCopyFile(initFilePath, targetPath);
+        // Optionally copy global directory
+        if (scope == BackupScope.currentSpaceWithGlobal) {
+          final globalPath = _dataStore.pathManager.getGlobalPath();
+          final backupGlobalPath =
+              _dataStore.pathManager.getGlobalPath(rootPath: backupDir);
+          if (await _isDirectory(globalPath)) {
+            await _safeCopyDirectory(globalPath, backupGlobalPath);
+          }
         }
       }
 
@@ -139,6 +131,13 @@ class BackupManager {
           label: 'BackupManager.createBackup');
       rethrow;
     }
+  }
+
+  /// Format timestamp for safe filesystem naming: no ':', '.', '+'
+  String _formatBackupTimestamp() {
+    final ts = DateTime.now().toUtc().toIso8601String();
+    // Example: 2025-09-26T12:34:56.123456Z -> 2025-09-26T12-34-56-123456Z
+    return ts.replaceAll(':', '-').replaceAll('.', '-').replaceAll('+', '-');
   }
 
   /// Compress directory to a zip file
@@ -233,10 +232,13 @@ class BackupManager {
   }
 
   /// Full backup restoration: replace entire database directory (excluding backups)
-  Future<void> _restoreFullBackup(String backupPath, String dbRootDir) async {
+  Future<void> _restoreFullBackup(String backupPath, String dbRootDir,
+      {bool cleanupBeforeRestore = true}) async {
     try {
-      // Clean database directory but preserve backups
-      await _cleanDatabaseRoot(dbRootDir);
+      // Clean database directory but preserve backups if requested
+      if (cleanupBeforeRestore) {
+        await _cleanDatabaseRoot(dbRootDir);
+      }
 
       // Copy all items from backup to database directory
       final backupItems = await _dataStore.storage.listDirectory(backupPath);
@@ -264,41 +266,42 @@ class BackupManager {
   }
 
   /// Partial backup restoration: only restore spaces and global directories
-  Future<void> _restorePartialBackup(String backupPath) async {
+  Future<void> _restorePartialBackup(String backupPath,
+      {bool cleanupBeforeRestore = true, bool includeGlobal = true}) async {
     try {
       final basePath = _dataStore.pathManager.getSpacePath();
       final globalPath = _dataStore.pathManager.getGlobalPath();
 
       // Clean base directory
-      if (await _dataStore.storage.existsDirectory(basePath)) {
-        await _dataStore.storage.deleteDirectory(basePath);
-        await _dataStore.storage.ensureDirectoryExists(basePath);
+      if (cleanupBeforeRestore) {
+        if (await _dataStore.storage.existsDirectory(basePath)) {
+          await _dataStore.storage.deleteDirectory(basePath);
+          await _dataStore.storage.ensureDirectoryExists(basePath);
+        }
       }
 
-      // Clean global directory
-      if (await _dataStore.storage.existsDirectory(globalPath)) {
-        await _dataStore.storage.deleteDirectory(globalPath);
-        await _dataStore.storage.ensureDirectoryExists(globalPath);
+      // Clean global directory when included in this restore
+      if (includeGlobal && cleanupBeforeRestore) {
+        if (await _dataStore.storage.existsDirectory(globalPath)) {
+          await _dataStore.storage.deleteDirectory(globalPath);
+          await _dataStore.storage.ensureDirectoryExists(globalPath);
+        }
       }
 
       // Copy base directory from backup
-      final backupBasePath = pathJoin(backupPath, 'spaces');
-      if (await _dataStore.storage.existsDirectory(backupBasePath)) {
+      final backupBasePath = _dataStore.pathManager.getSpacePath(
+          rootPath: backupPath, spaceName: _dataStore.currentSpaceName);
+      if (await _isDirectory(backupBasePath)) {
         await _safeCopyDirectory(backupBasePath, basePath);
       }
 
-      // Copy global directory from backup
-      final backupGlobalPath = pathJoin(backupPath, 'global');
-      if (await _dataStore.storage.existsDirectory(backupGlobalPath)) {
-        await _safeCopyDirectory(backupGlobalPath, globalPath);
-      }
-
-      // Restore space_config.json file if it exists in the backup
-      final backupConfigPath = pathJoin(backupPath, 'space_config.json');
-      if (await _dataStore.storage.existsFile(backupConfigPath)) {
-        final targetConfigPath = _dataStore.pathManager
-            .getSpaceConfigPath(spaceName: _dataStore.config.spaceName);
-        await _safeCopyFile(backupConfigPath, targetConfigPath);
+      // Copy global directory from backup (optional)
+      if (includeGlobal) {
+        final backupGlobalPath =
+            _dataStore.pathManager.getGlobalPath(rootPath: backupPath);
+        if (await _isDirectory(backupGlobalPath)) {
+          await _safeCopyDirectory(backupGlobalPath, globalPath);
+        }
       }
     } catch (e) {
       Logger.error('Error during partial backup restoration: $e',
@@ -308,56 +311,85 @@ class BackupManager {
   }
 
   /// Restore from backup
-  /// `backupPath` is the path to the backup directory or zip file
-  /// `deleteAfterRestore` is whether to delete the backup file after restore
+  /// `backupPath` can be a zip file or a backup root directory
+  /// `deleteAfterRestore` controls deletion of the original backup source after successful restore
   Future<void> restore(String backupPath,
-      {bool deleteAfterRestore = false}) async {
+      {bool deleteAfterRestore = false,
+      bool cleanupBeforeRestore = true}) async {
     try {
-      // Determine backup type
-      final isZip = backupPath.endsWith('.zip');
-      final isDirectory = await _isDirectory(backupPath);
+      final String originalInput = backupPath;
+      final bool inputIsZip = originalInput.toLowerCase().endsWith('.zip');
 
-      if (isZip) {
-        try {
-          // Extract zip first
-          final extractedDir = await _extractZipBackup(backupPath);
-          await restore(extractedDir, deleteAfterRestore: deleteAfterRestore);
+      // Normalize to a backup root directory that contains meta.json
+      String normalizedRoot = originalInput;
+      String? extractedTempDir;
 
-          await _dataStore.storage.deleteDirectory(extractedDir);
-          if (deleteAfterRestore) {
-            await _dataStore.storage.deleteFile(backupPath);
-          }
-          return;
-        } catch (e) {
-          Logger.error('Failed to extract or restore from zip backup: $e',
-              label: 'BackupManager.restore');
-          rethrow;
+      if (inputIsZip) {
+        // Extract zip into a temporary directory
+        extractedTempDir = await _extractZipBackup(originalInput);
+        normalizedRoot = extractedTempDir;
+      } else if (await _dataStore.storage
+          .existsFile(pathJoin(originalInput, 'meta.json'))) {
+        // Accept as backup root if it contains meta.json even when directory APIs are unreliable
+        normalizedRoot = originalInput;
+      } else if (await _isDirectory(originalInput)) {
+        // Already a directory root
+        normalizedRoot = originalInput;
+      } else {
+        throw FormatException('Invalid backup path: $originalInput');
+      }
+
+      // Ensure meta.json exists under normalizedRoot
+      final metaPath = pathJoin(normalizedRoot, 'meta.json');
+      if (!await _dataStore.storage.existsFile(metaPath)) {
+        throw StateError(
+            'Backup metadata file not found under: $normalizedRoot');
+      }
+
+      // Read metadata to choose restore scope
+      final metaMap = await readBackupMetadata(normalizedRoot);
+      final metadata = BackupMetadata.fromJson(metaMap);
+      final dbRootDir = _dataStore.instancePath!;
+
+      // Quiesce database IO before deleting/replacing directories to avoid ENOTEMPTY/EBUSY races.
+      // We only need to CLOSE the current instance here; it will be re-opened after files are restored.
+      try {
+        if (_dataStore.isInitialized) {
+          await _dataStore.close(persistChanges: false, closeStorage: false);
+        }
+      } catch (e) {
+        Logger.warn('Close datastore before restore failed: $e',
+            label: 'BackupManager.restore');
+      }
+
+      if (metadata.scope == BackupScope.database) {
+        await _restoreFullBackup(normalizedRoot, dbRootDir,
+            cleanupBeforeRestore: cleanupBeforeRestore);
+      } else {
+        final bool includeGlobal =
+            metadata.scope == BackupScope.currentSpaceWithGlobal;
+        await _restorePartialBackup(normalizedRoot,
+            cleanupBeforeRestore: cleanupBeforeRestore,
+            includeGlobal: includeGlobal);
+      }
+
+      // Handle deletion of original backup source if requested
+      if (deleteAfterRestore) {
+        if (inputIsZip) {
+          await _dataStore.storage.deleteFile(originalInput);
+        } else if (await _isDirectory(originalInput)) {
+          await _dataStore.storage.deleteDirectory(originalInput);
         }
       }
 
-      if (!isDirectory) {
-        throw FormatException(
-            'Invalid backup format: $backupPath is not a directory or zip file');
+      // Cleanup extracted temporary directory if used
+      if (extractedTempDir != null) {
+        try {
+          await PlatformHandler.deleteDirectory(extractedTempDir);
+        } catch (_) {}
       }
 
-      // Read metadata to verify backup
-      final metadata = await readBackupMetadata(backupPath);
-      final isFullBackup = metadata['type'] == 'full';
-
-      final dbRootDir = _dataStore.instancePath!;
-
-      if (isFullBackup) {
-        await _restoreFullBackup(backupPath, dbRootDir);
-      } else {
-        await _restorePartialBackup(backupPath);
-      }
-
-      if (deleteAfterRestore) {
-        await _dataStore.storage.deleteDirectory(backupPath);
-      }
-
-      await _dataStore.close();
-      await _dataStore.initialize();
+      await _dataStore.initialize(reinitialize: true);
 
       Logger.info('Database restored successfully',
           label: 'BackupManager.restore');
@@ -395,7 +427,9 @@ class BackupManager {
   }
 
   /// Verify backup integrity
-  Future<bool> verifyBackup(String backupPath) async {
+  /// [fast] = true: only do fast verification (zip exists & size threshold, directory exists & meta.json exists)
+  /// [fast] = false: parse BackupMetadata and do more strict structure verification based on scope
+  Future<bool> verifyBackup(String backupPath, {bool fast = true}) async {
     try {
       // Determine backup type
       final isZip = backupPath.endsWith('.zip');
@@ -408,11 +442,20 @@ class BackupManager {
       }
 
       if (isZip) {
-        // For zip files, verify archive integrity using PlatformHandler
+        // Fast path: file exists + size threshold
         try {
           if (!await _dataStore.storage.existsFile(backupPath)) return false;
+          final size = await _dataStore.storage.getFileSize(backupPath);
+          if (size <= 2048) {
+            Logger.warn('ZIP file size too small to be valid: ${size}B',
+                label: 'BackupManager.verifyBackup');
+            return false;
+          }
 
-          // Use PlatformHandler to verify ZIP file
+          if (fast) return true;
+
+          // Strict: decode zip to check required file exists without full extract
+          // Use platform verify to inspect entries efficiently
           return await PlatformHandler.verifyZipFile(backupPath,
               requiredFile: 'meta.json');
         } catch (e) {
@@ -430,30 +473,47 @@ class BackupManager {
         return false;
       }
 
-      // Read metadata to determine backup type
-      final metadata = await readBackupMetadata(backupPath);
-      final isFullBackup = metadata['type'] == 'full';
+      // Read metadata to determine backup scope (use BackupMetadata model)
+      if (fast) {
+        // Fast: only check if meta.json can be parsed
+        try {
+          final metaMap = await readBackupMetadata(backupPath);
+          BackupMetadata.fromJson(metaMap);
+          return true;
+        } catch (e) {
+          Logger.error('Fast verify: failed to parse metadata: $e',
+              label: 'BackupManager.verifyBackup');
+          return false;
+        }
+      }
 
-      if (isFullBackup) {
+      final metaMap = await readBackupMetadata(backupPath);
+      final meta = BackupMetadata.fromJson(metaMap);
+
+      // Build standardized paths via PathManager
+      final backupSpaceDir =
+          _dataStore.pathManager.getSpacePath(rootPath: backupPath);
+      final spacesRoot = p.dirname(backupSpaceDir);
+      final backupGlobalDir =
+          _dataStore.pathManager.getGlobalPath(rootPath: backupPath);
+
+      if (meta.scope == BackupScope.database) {
         // For full backups, verify some essential directories
         // This is a basic check - could be expanded
-        final spacesPath = pathJoin(backupPath, 'spaces');
-        final globalPath = pathJoin(backupPath, 'global');
-
         final spacesExists =
-            await _dataStore.storage.existsDirectory(spacesPath);
+            await _dataStore.storage.existsDirectory(spacesRoot);
         final globalExists =
-            await _dataStore.storage.existsDirectory(globalPath);
+            await _dataStore.storage.existsDirectory(backupGlobalDir);
 
         if (!spacesExists && !globalExists) {
           // at Web platform, try to verify by listing files if directory check fails
-          if (kIsWeb) {
+          if (PlatformHandler.isWeb) {
             try {
               // try to list directory content
               final spacesFiles =
-                  await _dataStore.storage.listDirectory(spacesPath);
+                  await _dataStore.storage.listDirectory(spacesRoot);
               final globalFiles =
-                  await _dataStore.storage.listDirectory(globalPath);
+                  await _dataStore.storage.listDirectory(backupGlobalDir);
 
               if (spacesFiles.isNotEmpty || globalFiles.isNotEmpty) {
                 Logger.warn(
@@ -471,23 +531,32 @@ class BackupManager {
           return false;
         }
       } else {
-        // For partial backups, check base directory
-        final spacesPath = pathJoin(backupPath, 'spaces');
-        if (!await _dataStore.storage.existsDirectory(spacesPath)) {
-          if (kIsWeb) {
+        // For partial backups, check current space directory exists and is not empty
+        if (await _dataStore.storage.existsDirectory(backupSpaceDir)) {
+          try {
+            final items =
+                await _dataStore.storage.listDirectory(backupSpaceDir);
+            if (items.isEmpty) {
+              Logger.error('Spaces directory is empty in partial backup',
+                  label: 'BackupManager.verifyBackup');
+              return false;
+            }
+          } catch (e) {
+            // On environments where listing may fail (e.g., some web FS), accept existence
+          }
+        } else {
+          if (PlatformHandler.isWeb) {
             try {
-              final files = await _dataStore.storage.listDirectory(spacesPath);
+              final files =
+                  await _dataStore.storage.listDirectory(backupSpaceDir);
               if (files.isNotEmpty) {
                 Logger.warn(
-                    'Web platform: Spaces directory existence check failed but found files',
+                    'Web platform: Directory existence check failed but found files in spaces',
                     label: 'BackupManager.verifyBackup');
                 return true;
               }
-            } catch (e) {
-              // ignore listing directory error
-            }
+            } catch (_) {}
           }
-
           Logger.error('Missing spaces directory in partial backup',
               label: 'BackupManager.verifyBackup');
           return false;
@@ -504,7 +573,10 @@ class BackupManager {
 
   /// Add improved directory check method
   Future<bool> _isDirectory(String path) async {
-    // First check if it's a file
+    // Prefer explicit directory/file checks first
+    if (await _dataStore.storage.existsDirectory(path)) {
+      return true;
+    }
     if (await _dataStore.storage.existsFile(path)) {
       return false;
     }
@@ -527,11 +599,6 @@ class BackupManager {
       }
     }
 
-    // Then check if it's a directory
-    if (await _dataStore.storage.existsDirectory(path)) {
-      return true;
-    }
-
     // If existsDirectory returns false, try using listDirectory to further confirm
     // On Web platform, existsDirectory might not be accurate
     try {
@@ -546,18 +613,6 @@ class BackupManager {
       Logger.warn('Failed to list directory for path $path: $e',
           label: 'BackupManager._isDirectory');
     }
-
     return false;
   }
-}
-
-/// file change record
-class FileChange {
-  final String filePath;
-  final DateTime modifiedTime;
-
-  FileChange({
-    required this.filePath,
-    required this.modifiedTime,
-  });
 }

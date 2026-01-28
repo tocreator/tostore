@@ -1,13 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
-import 'database_tester.dart';
-import 'service/log_service.dart';
-import 'tostore_example.dart';
-
-// This flag is controlled by the DatabaseTester to precisely enable/disable
-// suppression of expected warnings during specific tests.
-bool _suppressSpecificWarnings = false;
+import 'testing/database_tester.dart';
+import 'testing/log_service.dart';
+import 'tostore_example.dart' show ForeignKeyMode, TostoreExample;
 
 /// Simple UI to run examples
 void main() async {
@@ -17,18 +13,43 @@ void main() async {
   // This ensures that initialization logs are captured and displayed in the UI.
   LogConfig.setConfig(
     onLogHandler: (message, type, label) {
-      // This is a special case to ignore an expected warning during a specific test.
-      // The non-nullable constraint test intentionally tries to insert a null value
-      // to verify that the database correctly rejects it. This generates a
-      // warning log that, while correct, could confuse users of the example app
-      // into thinking there is an unexpected error. We filter it out here *only*
-      // when the DatabaseTester explicitly asks for it.
-      if (_suppressSpecificWarnings &&
-          type == LogType.warn &&
+      // 1. Suppress expected Non-Nullable Constraint warnings
+      if (type == LogType.warn &&
           (message.contains('Field email is required but not provided') ||
               message.contains('Data validation failed for table users'))) {
-        return; // Suppress expected warning from non-nullable constraint test
+        return;
       }
+
+      // 2. Suppress expected Unique Constraint Violations (New Format)
+      // Format: [Unique Constraint Violation] Table '...' Field(s) [...] already contain value '...' (source: ...).
+      if (message.contains('[Unique Constraint Violation]')) {
+        // Only suppress if it contains specific test data values
+        if (message.contains("value 'tx_user1'") || // Transaction test
+            message.contains("value 'tx_user4'") || // Transaction test
+            message.contains("value 'upsert_user'") || // Upsert test
+            message.contains("value '3'") || // Edge case test
+            message
+                .contains("value '4'") || // Edge case test (potential artifact)
+            message.contains("value '8'")) {
+          // Edge case test (potential artifact)
+          return;
+        }
+      }
+
+      // 3. Suppress expected Foreign Key and Transaction warnings
+      if (message.contains('Values: {id: 99999}') ||
+          message.contains(
+              'Cannot clear table users: Referenced by foreign keys with RESTRICT/NO ACTION in tables: comments') ||
+          message.contains(
+              'Cannot delete record from users: Referenced by records in comments (foreign key: fk_comments_user)') ||
+          message.contains('Division by zero in expression. Returning 0.') ||
+          message.contains(
+              'Table users has primary key conflict, update auto increment start:') ||
+          message.contains(
+              'Insert failed: Transaction operation failed: insert on users -> Unique constraint violation')) {
+        return; // Suppress expected foreign key constraint test errors
+      }
+
       logService.add('[$label] $message', type, true);
     },
   );
@@ -60,6 +81,8 @@ class MyApp extends StatelessWidget {
 }
 
 enum AppView { dataView, benchmark }
+
+enum PaginationMode { offset, cursor }
 
 class TostoreExamplePage extends StatefulWidget {
   const TostoreExamplePage({super.key, required this.example});
@@ -95,8 +118,16 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   int _totalRecords = 0;
   int _totalPages = 0;
   bool _isDataLoading = false;
+  bool _isCountLimited =
+      false; // Indicates if count might be limited by defaultQueryLimit
   String? _primaryKey;
   final Set<dynamic> _selectedRows = {};
+
+  // Pagination state
+  PaginationMode _paginationMode = PaginationMode.cursor;
+  String? _nextCursor;
+  String? _prevCursor;
+
   final TextEditingController _pageInputController = TextEditingController();
   final DraggableScrollableController _logPanelController =
       DraggableScrollableController();
@@ -138,7 +169,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     super.dispose();
   }
 
-  Future<void> _fetchTableData({bool resetPage = false}) async {
+  Future<void> _fetchTableData({bool resetPage = false, String? cursor}) async {
     if (!_isDbInitialized) return;
 
     setState(() {
@@ -147,6 +178,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         _currentPage = 1;
         _selectedRows.clear();
         _sortColumn = null; // Reset sort on page reset
+        _nextCursor = null;
+        _prevCursor = null;
       }
     });
 
@@ -164,20 +197,19 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         _tableColumns = [];
         _primaryKey = 'key';
       }
+
       // Base queries for data and count
       var dataQuery = widget.example.db.query(_selectedTable);
-      var countQuery = widget.example.db.query(_selectedTable);
 
-      // Apply active filters to both queries
+      // Apply active filters
       for (final filter in _activeFilters) {
         final field = filter['field'] as String;
         final op = filter['operator'] as String;
         final value = filter['value'];
         dataQuery = dataQuery.where(field, op, value);
-        countQuery = countQuery.where(field, op, value);
       }
 
-      // Apply sorting to the data query
+      // Apply sorting
       if (_sortColumn != null) {
         if (_sortAscending) {
           dataQuery = dataQuery.orderByAsc(_sortColumn!);
@@ -186,23 +218,83 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         }
       }
 
-      // Get total count for pagination
-      _totalRecords = await countQuery.count();
-      _totalPages = (_totalRecords / _pageSize).ceil();
-      if (_totalPages == 0) _totalPages = 1;
+      final int maxOffset = widget.example.db.config.maxQueryOffset;
 
-      // Clamp the current page to the new total, in case records were deleted.
-      if (_currentPage > _totalPages) {
-        _currentPage = _totalPages;
+      // Get defaultQueryLimit to detect if count might be limited
+      final int defaultQueryLimit = widget.example.db.config.defaultQueryLimit;
+
+      if (_paginationMode == PaginationMode.offset) {
+        // Get total count for pagination (only needed in offset mode)
+        _totalRecords = await dataQuery.count();
+
+        // Detect if count might be limited by defaultQueryLimit
+        // If count equals defaultQueryLimit and there are filters, it's likely limited
+        _isCountLimited =
+            _activeFilters.isNotEmpty && _totalRecords == defaultQueryLimit;
+
+        _totalPages = (_totalRecords / _pageSize).ceil();
+        if (_totalPages == 0) _totalPages = 1;
+
+        // Clamp the current page
+        if (_currentPage > _totalPages) {
+          _currentPage = _totalPages;
+        }
+
+        final int offset = (_currentPage - 1) * _pageSize;
+        if (offset > maxOffset) {
+          _showOffsetLimitWarning(offset, maxOffset);
+          setState(() => _isDataLoading = false);
+          return;
+        }
+
+        final result = await dataQuery.limit(_pageSize).offset(offset);
+        setState(() {
+          _tableData = result.data;
+          _nextCursor = result.nextCursor;
+          _prevCursor = result.prevCursor;
+        });
+      } else {
+        // Cursor mode
+        // IMPORTANT: Create a separate count query to avoid limit affecting the count
+        // Build count query with same filters but without limit/cursor
+        var countQuery = widget.example.db.query(_selectedTable);
+        for (final filter in _activeFilters) {
+          final field = filter['field'] as String;
+          final op = filter['operator'] as String;
+          final value = filter['value'];
+          countQuery = countQuery.where(field, op, value);
+        }
+        // Apply same sorting for consistency (though count doesn't need it)
+        if (_sortColumn != null) {
+          if (_sortAscending) {
+            countQuery = countQuery.orderByAsc(_sortColumn!);
+          } else {
+            countQuery = countQuery.orderByDesc(_sortColumn!);
+          }
+        }
+        _totalRecords = await countQuery.count();
+
+        // Detect if count might be limited by defaultQueryLimit
+        // If count equals defaultQueryLimit and there are filters, it's likely limited
+        _isCountLimited =
+            _activeFilters.isNotEmpty && _totalRecords == defaultQueryLimit;
+
+        // Now apply limit and cursor for data fetching
+        var q = dataQuery.limit(_pageSize);
+        if (cursor != null) {
+          q = q.cursor(cursor);
+        }
+
+        final result = await q;
+
+        setState(() {
+          _tableData = result.data;
+          _nextCursor = result.nextCursor;
+          _prevCursor = result.prevCursor;
+        });
       }
 
-      // Get paginated data
-      final result = await dataQuery
-          .limit(_pageSize)
-          .offset((_currentPage - 1) * _pageSize);
-
       setState(() {
-        _tableData = result.data;
         // if columns were not determined by schema, infer from first record
         if (_tableColumns.isEmpty && _tableData.isNotEmpty) {
           _tableColumns = _tableData.first.keys.toList();
@@ -638,7 +730,9 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 },
               ),
               Text(
-                  '$_totalRecords Records ($_selectedSpace)', // Show current space
+                  _isCountLimited
+                      ? '≥$_totalRecords Records ($_selectedSpace)' // Indicate count might be limited
+                      : '$_totalRecords Records ($_selectedSpace)', // Show current space
                   style: Theme.of(context).textTheme.bodyMedium),
             ],
           ),
@@ -812,88 +906,132 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: DataTable(
-              sortColumnIndex: _sortColumn == null
-                  ? null
-                  : _tableColumns.indexOf(_sortColumn!),
-              sortAscending: _sortAscending,
-              showCheckboxColumn: _primaryKey != null,
-              columns: [
-                for (final colName in _tableColumns)
-                  DataColumn(
-                    label: Text(colName),
-                    onSort: (columnIndex, ascending) {
-                      setState(() {
-                        // If the same column is clicked again, toggle through states:
-                        // asc -> desc -> no sort
-                        if (_sortColumn == _tableColumns[columnIndex]) {
-                          if (_sortAscending) {
-                            // Currently asc, switch to desc
-                            _sortAscending = false;
-                          } else {
-                            // Currently desc, switch to no sort
-                            _sortColumn = null;
-                          }
+            sortColumnIndex: _sortColumn == null
+                ? null
+                : _tableColumns.indexOf(_sortColumn!),
+            sortAscending: _sortAscending,
+            showCheckboxColumn: _primaryKey != null,
+            columns: [
+              for (final colName in _tableColumns)
+                DataColumn(
+                  label: Text(colName),
+                  onSort: (columnIndex, ascending) {
+                    setState(() {
+                      if (_sortColumn == _tableColumns[columnIndex]) {
+                        if (_sortAscending) {
+                          _sortAscending = false;
                         } else {
-                          // New column clicked, start with ascending
-                          _sortColumn = _tableColumns[columnIndex];
-                          _sortAscending = true;
+                          _sortColumn = null;
                         }
-                      });
-                      _fetchTableData();
-                    },
-                  ),
-              ],
-              rows: _tableData.map((row) {
-                final pkValue = _primaryKey != null ? row[_primaryKey] : null;
-                return DataRow(
-                  selected: pkValue != null && _selectedRows.contains(pkValue),
-                  onSelectChanged: pkValue == null
-                      ? null
-                      : (isSelected) {
-                          setState(() {
-                            if (isSelected ?? false) {
-                              _selectedRows.add(pkValue);
-                            } else {
-                              _selectedRows.remove(pkValue);
-                            }
-                          });
-                        },
-                  cells: [
-                    for (final colName in _tableColumns)
-                      DataCell(
-                        Text(
-                          '${row[colName] ?? 'NULL'}',
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        onLongPress: () {
-                          if (_primaryKey != null && row[_primaryKey] != null) {
-                            _showEditRowDialog(row);
+                      } else {
+                        _sortColumn = _tableColumns[columnIndex];
+                        _sortAscending = true;
+                      }
+                    });
+                    _fetchTableData();
+                  },
+                ),
+            ],
+            rows: _tableData.map((row) {
+              final pkValue = _primaryKey != null ? row[_primaryKey] : null;
+              return DataRow(
+                selected: pkValue != null && _selectedRows.contains(pkValue),
+                onSelectChanged: pkValue == null
+                    ? null
+                    : (isSelected) {
+                        setState(() {
+                          if (isSelected ?? false) {
+                            _selectedRows.add(pkValue);
+                          } else {
+                            _selectedRows.remove(pkValue);
                           }
-                        },
+                        });
+                      },
+                cells: [
+                  for (final colName in _tableColumns)
+                    DataCell(
+                      Text(
+                        '${row[colName] ?? 'NULL'}',
+                        overflow: TextOverflow.ellipsis,
                       ),
-                  ],
-                );
-              }).toList(),
-              onSelectAll: (isSelected) {
-                if (_primaryKey == null) return;
-                setState(() {
-                  if (isSelected ?? false) {
-                    for (final row in _tableData) {
-                      _selectedRows.add(row[_primaryKey]);
-                    }
-                  } else {
-                    for (final row in _tableData) {
-                      _selectedRows.remove(row[_primaryKey]);
-                    }
+                      onLongPress: () {
+                        if (_primaryKey != null && row[_primaryKey] != null) {
+                          _showEditRowDialog(row);
+                        }
+                      },
+                    ),
+                ],
+              );
+            }).toList(),
+            onSelectAll: (isSelected) {
+              if (_primaryKey == null) return;
+              setState(() {
+                if (isSelected ?? false) {
+                  for (final row in _tableData) {
+                    _selectedRows.add(row[_primaryKey]);
                   }
-                });
-              }),
+                } else {
+                  for (final row in _tableData) {
+                    _selectedRows.remove(row[_primaryKey]);
+                  }
+                }
+              });
+            },
+          ),
         ),
       ),
     );
   }
 
   Widget _buildPaginationControls() {
+    if (_paginationMode == PaginationMode.cursor) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.first_page, size: 20),
+              tooltip: 'Jump to First Page',
+              onPressed: _prevCursor != null
+                  ? () => _fetchTableData(resetPage: true)
+                  : null,
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.chevron_left, size: 16),
+              label: const Text('Prev'),
+              style: ElevatedButton.styleFrom(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                visualDensity: VisualDensity.compact,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed: _prevCursor != null
+                  ? () => _fetchTableData(cursor: _prevCursor)
+                  : null,
+            ),
+            const SizedBox(width: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.chevron_right, size: 16),
+              label: const Text('Next'),
+              style: ElevatedButton.styleFrom(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                visualDensity: VisualDensity.compact,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed: _nextCursor != null
+                  ? () => _fetchTableData(cursor: _nextCursor)
+                  : null,
+            ),
+          ],
+        ),
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
       child: Wrap(
@@ -971,13 +1109,56 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   }
 
   void _goToPage(int page) {
-    final newPage = page.clamp(1, _totalPages);
-    if (newPage != _currentPage) {
-      setState(() {
-        _currentPage = newPage;
-      });
-      _fetchTableData();
-    }
+    if (page < 1 || page > _totalPages) return;
+    setState(() {
+      _currentPage = page;
+    });
+    _fetchTableData();
+  }
+
+  void _showOffsetLimitWarning(int offset, int maxOffset) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('Offset Limit Reached'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Current offset: $offset'),
+            Text('Environment limit: $maxOffset'),
+            const SizedBox(height: 12),
+            const Text(
+              'Deep pagination using Offset is discouraged due to performance costs. '
+              'Please use Cursor mode for better performance at this depth.',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                _paginationMode = PaginationMode.cursor;
+              });
+              _fetchTableData(resetPage: true);
+            },
+            child: const Text('Switch to Cursor Mode'),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildBenchmarkView() {
@@ -1056,9 +1237,6 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                   widget.example.db,
                                   logService,
                                   _updateOperationInfo,
-                                  (isSuppressing) {
-                                    _suppressSpecificWarnings = isSuppressing;
-                                  },
                                 );
                                 await tester.runAllTests();
                               } finally {
@@ -1187,9 +1365,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                                                 Icons.copy_outlined,
                                                 size: 20),
                                             tooltip: 'Copy Visible Logs',
-                                            onPressed: () {
-                                              // Copy logic...
-                                            },
+                                            onPressed: _copyVisibleLogs,
                                           ),
                                           IconButton(
                                             icon: const Icon(
@@ -1410,15 +1586,27 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         }
 
         switch (value) {
+          case 'set_mode_offset':
+            setState(() {
+              _paginationMode = PaginationMode.offset;
+            });
+            _fetchTableData(resetPage: true);
+            break;
+          case 'set_mode_cursor':
+            setState(() {
+              _paginationMode = PaginationMode.cursor;
+            });
+            _fetchTableData(resetPage: true);
+            break;
           case 'clear_all_tables':
             setState(() {
               _isTesting = true;
               _lastOperationInfo = 'Clearing all tables...';
             });
             try {
-              await widget.example.db.clear('users');
-              await widget.example.db.clear('posts');
               await widget.example.db.clear('comments');
+              await widget.example.db.clear('posts');
+              await widget.example.db.clear('users');
               await widget.example.db.clear('settings');
               _updateOperationInfo('All tables cleared.');
               _fetchTableData(resetPage: true);
@@ -1434,14 +1622,37 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       },
       itemBuilder: (BuildContext context) {
         return [
-          const PopupMenuItem<String>(
-            value: 'clear_all_tables',
-            child: Text('Clear All Tables'),
+          PopupMenuItem<String>(
+            value: _paginationMode == PaginationMode.offset
+                ? 'set_mode_cursor'
+                : 'set_mode_offset',
+            child: Row(
+              children: [
+                Icon(
+                  _paginationMode == PaginationMode.offset
+                      ? Icons.ads_click
+                      : Icons.format_list_numbered,
+                  size: 20,
+                  color: Colors.blue,
+                ),
+                const SizedBox(width: 12),
+                Text(_paginationMode == PaginationMode.offset
+                    ? 'Switch to Cursor Mode'
+                    : 'Switch to Offset Mode'),
+              ],
+            ),
           ),
           const PopupMenuDivider(),
           const PopupMenuItem<String>(
             enabled: false,
-            child: Text('Switch Space'),
+            child: Row(
+              children: [
+                Icon(Icons.storage, size: 20, color: Colors.grey),
+                SizedBox(width: 12),
+                Text('Switch Space',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
           ),
           ..._spaceNames.map((spaceName) {
             return CheckedPopupMenuItem<String>(
@@ -1450,6 +1661,20 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
               child: Text(spaceName),
             );
           }),
+          const PopupMenuDivider(),
+          const PopupMenuItem<String>(
+            value: 'clear_all_tables',
+            child: Row(
+              children: [
+                Icon(
+                  Icons.delete_sweep,
+                  size: 20,
+                ),
+                SizedBox(width: 12),
+                Text('Clear All Tables'),
+              ],
+            ),
+          ),
         ];
       },
     );
@@ -1472,12 +1697,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           widget.example.db,
           logService,
           _updateOperationInfo,
-          (isSuppressing) {
-            _suppressSpecificWarnings = isSuppressing;
-          },
         );
-        await tester.runConfigurableConcurrencyTest(config);
-        _updateOperationInfo('✅ Custom Concurrency Test Finished');
+        final success = await tester.runConfigurableConcurrencyTest(config);
+        if (success) {
+          _updateOperationInfo('✅ Custom Concurrency Test Passed');
+        } else {
+          _updateOperationInfo('❌ Custom Concurrency Test Failed');
+        }
       } finally {
         if (mounted) {
           setState(() {
@@ -1492,13 +1718,22 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   Future<void> _showAddDataDialog() async {
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
-      builder: (context) =>
-          AddDataDialog(defaultCount: _totalRecords == 0 ? 10000 : 500),
+      builder: (context) => AddDataDialog(
+        defaultCount: 10000,
+        tableName: _selectedTable,
+        db: widget.example.db,
+      ),
     );
 
     if (result != null) {
       final count = result['count'] as int;
       final method = result['method'] as InsertMethod;
+      final foreignKeyValues =
+          result['foreignKeyValues'] as Map<String, dynamic>?;
+      final foreignKeyModes =
+          result['foreignKeyModes'] as Map<String, ForeignKeyMode>?;
+      final foreignKeyIdLists =
+          result['foreignKeyIdLists'] as Map<String, List<dynamic>>?;
 
       if (count <= 0) return;
 
@@ -1514,11 +1749,22 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       try {
         if (method == InsertMethod.batch) {
           // Use the existing benchmark logic for batch adding
-          elapsed = await widget.example.addExamples(_selectedTable, count);
+          elapsed = await widget.example.addExamples(
+            _selectedTable,
+            count,
+            foreignKeyValues: foreignKeyValues,
+            foreignKeyModes: foreignKeyModes,
+            foreignKeyIdLists: foreignKeyIdLists,
+          );
         } else {
           // Use the existing benchmark logic for one-by-one adding
-          elapsed =
-              await widget.example.addExamplesOneByOne(_selectedTable, count);
+          elapsed = await widget.example.addExamplesOneByOne(
+            _selectedTable,
+            count,
+            foreignKeyValues: foreignKeyValues,
+            foreignKeyModes: foreignKeyModes,
+            foreignKeyIdLists: foreignKeyIdLists,
+          );
         }
       } catch (e, s) {
         logService.add('Failed to add data: $e', LogType.error);
@@ -1879,6 +2125,65 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     }
   }
 
+  Future<void> _copyVisibleLogs() async {
+    final logs = logService.logs.value;
+    if (logs.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No logs to copy.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
+
+    // Apply the same filtering logic as in the log panel
+    var filteredLogs = logs;
+
+    // Filter by type
+    if (_selectedLogType != null) {
+      filteredLogs =
+          filteredLogs.where((log) => log.type == _selectedLogType).toList();
+    }
+
+    // Filter by search text
+    final searchText = _searchController.text.toLowerCase();
+    if (searchText.isNotEmpty) {
+      filteredLogs = filteredLogs
+          .where((log) => log.message.toLowerCase().contains(searchText))
+          .toList();
+    }
+
+    if (filteredLogs.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No visible logs to copy.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
+
+    // Format logs as text (one log per line)
+    final logText = filteredLogs.map((log) => log.message).join('\n');
+
+    // Copy to clipboard
+    await Clipboard.setData(ClipboardData(text: logText));
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Copied ${filteredLogs.length} log(s) to clipboard.'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
   void _checkAndExpandLogPanel() {
     // Threshold is slightly larger than minChildSize to handle tolerances
     // and minor user dragging.
@@ -1940,13 +2245,7 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
       'update': TextEditingController(text: '500'),
       'delete': TextEditingController(text: '500'),
     },
-    'posts': {
-      'insert': TextEditingController(text: '1000'),
-      'read': TextEditingController(text: '1000'),
-      'update': TextEditingController(text: '500'),
-      'delete': TextEditingController(text: '500'),
-    },
-    'comments': {
+    'settings': {
       'insert': TextEditingController(text: '1000'),
       'read': TextEditingController(text: '1000'),
       'update': TextEditingController(text: '500'),
@@ -2093,7 +2392,14 @@ enum InsertMethod { batch, oneByOne }
 /// A dialog for adding a specific number of records.
 class AddDataDialog extends StatefulWidget {
   final int defaultCount;
-  const AddDataDialog({super.key, required this.defaultCount});
+  final String tableName;
+  final ToStore db;
+  const AddDataDialog({
+    super.key,
+    required this.defaultCount,
+    required this.tableName,
+    required this.db,
+  });
 
   @override
   State<AddDataDialog> createState() => _AddDataDialogState();
@@ -2102,25 +2408,185 @@ class AddDataDialog extends StatefulWidget {
 class _AddDataDialogState extends State<AddDataDialog> {
   late final TextEditingController _controller;
   InsertMethod _method = InsertMethod.batch;
+  bool _isLoading = true;
+  Map<String, List<Map<String, dynamic>>> _foreignKeyOptions =
+      {}; // foreign key options for dropdown display (up to 100 records)
+  final Map<String, dynamic> _selectedForeignKeyValues = {};
+  Map<String, String> _foreignKeyFieldMap = {}; // fk_field -> referenced_table
+  final Map<String, ForeignKeyMode> _foreignKeyModes = {}; // fk_field -> mode
+  final Map<String, List<dynamic>> _foreignKeyIdLists =
+      {}; // fk_field -> [id1, id2, ...] all IDs for random
+  final Map<String, int> _foreignKeyTotalCounts =
+      {}; // fk_field -> total number of records
+  final Map<String, TextEditingController> _manualInputControllers =
+      {}; // manual input controller
+  final Map<String, bool> _useManualInput = {}; // whether to use manual input
+  List<String> _missingForeignKeyTables =
+      []; // records missing data in the main table
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.defaultCount.toString());
+    _loadForeignKeyData();
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    for (final controller in _manualInputControllers.values) {
+      controller.dispose();
+    }
     super.dispose();
+  }
+
+  Future<void> _loadForeignKeyData() async {
+    try {
+      final schema = await widget.db.getTableSchema(widget.tableName);
+      if (schema == null || schema.foreignKeys.isEmpty) {
+        setState(() {
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final Map<String, List<Map<String, dynamic>>> options = {};
+      final Map<String, String> fieldMap = {};
+      final List<String> missingTables = [];
+
+      for (final fk in schema.foreignKeys) {
+        if (!fk.enabled) continue;
+
+        // First query the total number of records
+        final totalCount = await widget.db.query(fk.referencedTable).count();
+
+        if (totalCount == 0) {
+          // The main table has no data, record it in the missing list
+          missingTables.add(fk.referencedTable);
+          continue;
+        }
+
+        // Query the first 100 records for dropdown display (performance optimization)
+        final refTableResult = await widget.db
+            .query(fk.referencedTable)
+            .select([fk.referencedFields.first])
+            .orderByAsc(fk.referencedFields.first)
+            .limit(100);
+
+        // Store option data (up to 100 records for dropdown)
+        options[fk.fields.first] = refTableResult.data;
+        fieldMap[fk.fields.first] = fk.referencedTable;
+        _foreignKeyTotalCounts[fk.fields.first] = totalCount;
+
+        // Extract all primary key values for random selection (need to query all data)
+        // If the total number exceeds 1000, only query the first 1000 records for random (performance consideration)
+        final maxForRandom = totalCount > 1000 ? 1000 : totalCount;
+        final allIdsResult = await widget.db
+            .query(fk.referencedTable)
+            .select([fk.referencedFields.first])
+            .orderByAsc(fk.referencedFields.first)
+            .limit(maxForRandom);
+
+        final idList = allIdsResult.data
+            .map((row) => row[fk.referencedFields.first])
+            .toList();
+        _foreignKeyIdLists[fk.fields.first] = idList;
+
+        // Initialize manual input controller
+        _manualInputControllers[fk.fields.first] = TextEditingController();
+        _useManualInput[fk.fields.first] = false;
+
+        // Default select the first record, default mode is random
+        if (refTableResult.data.isNotEmpty) {
+          final pkValue = refTableResult.data.first[fk.referencedFields.first];
+          _selectedForeignKeyValues[fk.fields.first] = pkValue;
+          _foreignKeyModes[fk.fields.first] =
+              ForeignKeyMode.random; // Default random mode
+        }
+      }
+
+      setState(() {
+        _foreignKeyOptions = options;
+        _foreignKeyFieldMap = fieldMap;
+        _missingForeignKeyTables = missingTables;
+        _isLoading = false;
+      });
+    } catch (e) {
+      logService.add('Error loading foreign key data: $e', LogType.error);
+      setState(() {
+        _isLoading = false;
+      });
+    }
   }
 
   void _onAdd() {
     final count = int.tryParse(_controller.text);
     if (count != null && count > 0) {
-      Navigator.of(context).pop({'count': count, 'method': _method});
-    } else {
-      // Show an error or just ignore
+      // Check maximum batch size limit
+      const int maxBatchSize = 1000000;
+      if (count > maxBatchSize) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            alignment: Alignment.topCenter,
+            title: const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, color: Colors.orange),
+                SizedBox(width: 8),
+                Text('Batch Size Warning', style: TextStyle(fontSize: 20)),
+              ],
+            ),
+            content: Text(
+              'The requested count ($count) exceeds the maximum allowed batch size ($maxBatchSize). '
+              'Please reduce the count and try again.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+        return;
+      }
+
+      // Check if there are foreign keys but the main table has no data
+      if (_missingForeignKeyTables.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+                'Cannot add: Tables "${_missingForeignKeyTables.join('", "')}" have no data, please add records first.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
+
+      // Process manual input values
+      final finalForeignKeyValues =
+          Map<String, dynamic>.from(_selectedForeignKeyValues);
+      for (final entry in _useManualInput.entries) {
+        if (entry.value) {
+          // Use manual input values
+          final controller = _manualInputControllers[entry.key];
+          if (controller != null && controller.text.isNotEmpty) {
+            final inputValue = controller.text.trim();
+            // Try to convert to number (if the foreign key is a number type)
+            final numValue = num.tryParse(inputValue);
+            finalForeignKeyValues[entry.key] = numValue ?? inputValue;
+          }
+        }
+      }
+
+      Navigator.of(context).pop({
+        'count': count,
+        'method': _method,
+        'foreignKeyValues': finalForeignKeyValues,
+        'foreignKeyModes': _foreignKeyModes,
+        'foreignKeyIdLists': _foreignKeyIdLists,
+      });
     }
   }
 
@@ -2128,42 +2594,271 @@ class _AddDataDialogState extends State<AddDataDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Add Test Data'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          TextField(
-            controller: _controller,
-            autofocus: true,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            decoration: const InputDecoration(
-              labelText: 'Number of records to add',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 20),
-          const Text('Insertion Method'),
-          RadioListTile<InsertMethod>(
-            title: const Text('Batch Insert'),
-            value: InsertMethod.batch,
-            groupValue: _method,
-            onChanged: (InsertMethod? value) {
-              setState(() {
-                _method = value!;
-              });
-            },
-          ),
-          RadioListTile<InsertMethod>(
-            title: const Text('Insert One by One'),
-            value: InsertMethod.oneByOne,
-            groupValue: _method,
-            onChanged: (InsertMethod? value) {
-              setState(() {
-                _method = value!;
-              });
-            },
-          ),
-        ],
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_isLoading)
+              const Padding(
+                padding: EdgeInsets.all(16.0),
+                child: CircularProgressIndicator(),
+              )
+            else ...[
+              // If there are missing main table data, display a warning
+              if (_missingForeignKeyTables.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.all(12.0),
+                  margin: const EdgeInsets.only(bottom: 16.0),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade50,
+                    border: Border.all(color: Colors.orange.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded,
+                              color: Colors.orange.shade700, size: 20),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Missing main table data',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.orange.shade700),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'The following tables have no data, please add first:\n${_missingForeignKeyTables.map((t) => '• $t').join('\n')}',
+                        style: TextStyle(color: Colors.orange.shade700),
+                      ),
+                    ],
+                  ),
+                ),
+              TextField(
+                controller: _controller,
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                decoration: const InputDecoration(
+                  labelText: 'Number of records to add',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 20),
+              // Display foreign key selector
+              ..._foreignKeyOptions.entries.map((entry) {
+                final fkField = entry.key;
+                final options = entry.value;
+                final refTable = _foreignKeyFieldMap[fkField] ?? '';
+                final selectedValue = _selectedForeignKeyValues[fkField];
+                final mode = _foreignKeyModes[fkField] ?? ForeignKeyMode.random;
+                final totalCount = _foreignKeyTotalCounts[fkField] ?? 0;
+                final displayCount = options.length;
+                final useManual = _useManualInput[fkField] ?? false;
+
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '$fkField (from $refTable)',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            totalCount > displayCount
+                                ? '($displayCount/$totalCount records)'
+                                : '($totalCount records)',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      // Mode selection
+                      RadioGroup<ForeignKeyMode>(
+                        groupValue: mode,
+                        onChanged: (value) {
+                          setState(() {
+                            _foreignKeyModes[fkField] = value!;
+                          });
+                        },
+                        child: const Row(
+                          children: [
+                            Expanded(
+                              child: RadioListTile<ForeignKeyMode>(
+                                title: Text('Fixed value'),
+                                value: ForeignKeyMode.fixed,
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                            Expanded(
+                              child: RadioListTile<ForeignKeyMode>(
+                                title: Text('Random value'),
+                                value: ForeignKeyMode.random,
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // Fixed value mode display dropdown or manual input
+                      if (mode == ForeignKeyMode.fixed) ...[
+                        // Select input method
+                        RadioGroup<bool>(
+                          groupValue: useManual,
+                          onChanged: (value) {
+                            setState(() {
+                              _useManualInput[fkField] = value!;
+                            });
+                          },
+                          child: const Row(
+                            children: [
+                              Expanded(
+                                child: RadioListTile<bool>(
+                                  title: Text('Dropdown selection'),
+                                  value: false,
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                ),
+                              ),
+                              Expanded(
+                                child: RadioListTile<bool>(
+                                  title: Text('Manual input'),
+                                  value: true,
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        if (!useManual)
+                          DropdownButtonFormField<dynamic>(
+                            initialValue: selectedValue,
+                            decoration: InputDecoration(
+                              labelText: 'Select foreign key value',
+                              border: const OutlineInputBorder(),
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 8),
+                              helperText: totalCount > displayCount
+                                  ? 'Only display the first $displayCount records, total $totalCount records'
+                                  : null,
+                            ),
+                            items: options.map((option) {
+                              final pkValue = option.values.first;
+                              return DropdownMenuItem<dynamic>(
+                                value: pkValue,
+                                child: Text('$pkValue'),
+                              );
+                            }).toList(),
+                            onChanged: (value) {
+                              setState(() {
+                                _selectedForeignKeyValues[fkField] = value;
+                              });
+                            },
+                          )
+                        else
+                          TextField(
+                            controller: _manualInputControllers[fkField],
+                            decoration: InputDecoration(
+                              labelText: 'Manual input foreign key value',
+                              border: const OutlineInputBorder(),
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 8),
+                              helperText: 'Enter valid $refTable table ID',
+                              hintText: 'For example: 1, 2, 100',
+                            ),
+                            keyboardType: TextInputType.number,
+                            onChanged: (value) {
+                              // Real-time update value
+                              if (value.isNotEmpty) {
+                                final numValue = num.tryParse(value);
+                                if (numValue != null) {
+                                  _selectedForeignKeyValues[fkField] = numValue;
+                                } else {
+                                  _selectedForeignKeyValues[fkField] = value;
+                                }
+                              }
+                            },
+                          ),
+                      ] else
+                        Container(
+                          padding: const EdgeInsets.all(12.0),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.shade50,
+                            border: Border.all(color: Colors.blue.shade200),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(Icons.shuffle,
+                                  size: 16, color: Colors.blue.shade700),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  totalCount >
+                                          (_foreignKeyIdLists[fkField]
+                                                  ?.length ??
+                                              0)
+                                      ? 'Will randomly select from ${_foreignKeyIdLists[fkField]?.length ?? 0} records (total $totalCount records)'
+                                      : 'Will randomly select from $totalCount records',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.blue.shade700,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              }),
+              const SizedBox(height: 20),
+              const Text('Insertion Method'),
+              RadioGroup<InsertMethod>(
+                groupValue: _method,
+                onChanged: (value) {
+                  setState(() {
+                    _method = value!;
+                  });
+                },
+                child: const Column(
+                  children: [
+                    RadioListTile<InsertMethod>(
+                      title: Text('Batch Insert'),
+                      value: InsertMethod.batch,
+                    ),
+                    RadioListTile<InsertMethod>(
+                      title: Text('Insert One by One'),
+                      value: InsertMethod.oneByOne,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
       actions: [
         TextButton(
@@ -2171,7 +2866,7 @@ class _AddDataDialogState extends State<AddDataDialog> {
           child: const Text('Cancel'),
         ),
         ElevatedButton(
-          onPressed: _onAdd,
+          onPressed: _isLoading ? null : _onAdd,
           child: const Text('Add'),
         ),
       ],
@@ -2390,7 +3085,7 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   DropdownButtonFormField<String>(
-                    value: _selectedField,
+                    initialValue: _selectedField,
                     items: _updatableFields.map((field) {
                       return DropdownMenuItem(
                         value: field.name,
@@ -2538,7 +3233,7 @@ class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
                 Expanded(
                   flex: 4,
                   child: DropdownButtonFormField<String>(
-                    value: _selectedField,
+                    initialValue: _selectedField,
                     items: allFields
                         .map((field) =>
                             DropdownMenuItem(value: field, child: Text(field)))
@@ -2562,7 +3257,7 @@ class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
                 Expanded(
                   flex: 3,
                   child: DropdownButtonFormField<String>(
-                    value: _selectedOperator,
+                    initialValue: _selectedOperator,
                     items: ['>', '>=', '<', '<=', '=', '!=', 'LIKE']
                         .map((op) =>
                             DropdownMenuItem(value: op, child: Text(op)))
@@ -2801,7 +3496,7 @@ class _FilterDialogState extends State<FilterDialog> {
                     Expanded(
                       flex: 5,
                       child: DropdownButtonFormField<String>(
-                        value: filter.field,
+                        initialValue: filter.field,
                         items: availableFields
                             .map((f) =>
                                 DropdownMenuItem(value: f, child: Text(f)))
@@ -2821,7 +3516,7 @@ class _FilterDialogState extends State<FilterDialog> {
                     Expanded(
                       flex: 3,
                       child: DropdownButtonFormField<String>(
-                        value: filter.operator,
+                        initialValue: filter.operator,
                         items: ['=', '!=', '>', '>=', '<', '<=', 'LIKE']
                             .map((op) =>
                                 DropdownMenuItem(value: op, child: Text(op)))

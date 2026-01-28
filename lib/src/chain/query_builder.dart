@@ -1,21 +1,19 @@
-import 'dart:async';
-import '../Interface/chain_builder.dart';
-import '../Interface/future_builder_mixin.dart';
-import '../model/join_clause.dart';
-import '../model/query_result.dart';
-import '../query/query_cache.dart';
+part of '../Interface/chain_builder.dart';
 
 /// query builder
 class QueryBuilder extends ChainBuilder<QueryBuilder>
     with FutureBuilderMixin<QueryResult<Map<String, dynamic>>> {
-  Future<List<Map<String, dynamic>>>? _future;
+  Future<ExecuteResult>? _future;
   List<String>? _selectedFields;
 
   // related query related properties
   final List<JoinClause> _joins = [];
 
+  // Pending foreign key joins to be resolved during query execution
+  List<PendingForeignKeyJoin>? _pendingForeignKeyJoins;
+
   // query cache control
-  bool? _enableQueryCache;
+  bool _enableQueryCache = false;
   Duration? _queryCacheExpiry;
 
   QueryBuilder(super.db, super.tableName);
@@ -24,10 +22,15 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     _future = null;
   }
 
+  @override
+  void _onChanged() {
+    _invalidateFuture();
+  }
+
   /// select specific fields to return
   QueryBuilder select(List<String> fields) {
     _selectedFields = fields;
-    _invalidateFuture();
+    _onChanged();
     return this;
   }
 
@@ -41,7 +44,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
-    _invalidateFuture();
+    _onChanged();
     return this;
   }
 
@@ -55,7 +58,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
-    _invalidateFuture();
+    _onChanged();
     return this;
   }
 
@@ -69,8 +72,71 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
-    _invalidateFuture();
+    _onChanged();
     return this;
+  }
+
+  /// Automatically join a table based on foreign key relationship
+  ///
+  /// This method automatically finds the foreign key relationship between
+  /// the current table and the specified table, and creates a JOIN clause.
+  /// The actual foreign key lookup is performed when the query is executed.
+  ///
+  /// [tableName] The table to join with
+  /// [type] The type of join (default: inner)
+  ///
+  /// Example:
+  /// ```dart
+  /// // If orders table has a foreign key to users table
+  /// db.query('orders')
+  ///   .joinWithForeignKey('users')  // Automatically uses orders.user_id = users.id
+  ///   .future;
+  /// ```
+  ///
+  /// Throws [StateError] if no foreign key relationship is found
+  QueryBuilder joinWithForeignKey(String tableName,
+      {JoinType type = JoinType.inner}) {
+    // Store the join request - will be resolved during query execution
+    _pendingForeignKeyJoins ??= [];
+    _pendingForeignKeyJoins!.add(PendingForeignKeyJoin(
+      tableName: tableName,
+      type: type,
+    ));
+    _onChanged();
+    return this;
+  }
+
+  /// Join with a table that is referenced by the current table (via foreign key)
+  ///
+  /// This is a convenience method for joining with a parent/referenced table.
+  /// It's equivalent to joinWithForeignKey but with clearer semantics.
+  ///
+  /// Example:
+  /// ```dart
+  /// // orders table references users table via user_id
+  /// db.query('orders')
+  ///   .joinReferencedTable('users')  // JOIN users ON orders.user_id = users.id
+  ///   .future;
+  /// ```
+  QueryBuilder joinReferencedTable(String tableName,
+      {JoinType type = JoinType.inner}) {
+    return joinWithForeignKey(tableName, type: type);
+  }
+
+  /// Join with a table that references the current table (reverse foreign key)
+  ///
+  /// This joins with a child table that has a foreign key pointing to the current table.
+  ///
+  /// Example:
+  /// ```dart
+  /// // users table is referenced by orders table
+  /// db.query('users')
+  ///   .joinReferencingTable('orders')  // JOIN orders ON users.id = orders.user_id
+  ///   .future;
+  /// ```
+  QueryBuilder joinReferencingTable(String tableName,
+      {JoinType type = JoinType.left}) {
+    return joinWithForeignKey(tableName, type: type);
   }
 
   /// Enable query result caching for this query
@@ -79,14 +145,14 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder useQueryCache([Duration? expiry]) {
     _enableQueryCache = true;
     _queryCacheExpiry = expiry;
-    _invalidateFuture();
+    _onChanged();
     return this;
   }
 
   /// Disable query result caching for this query, overriding the global setting.
   QueryBuilder noQueryCache() {
     _enableQueryCache = false;
-    _invalidateFuture();
+    _onChanged();
     return this;
   }
 
@@ -96,30 +162,23 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// is clear, regardless of whether it was present before).
   /// Returns `false` only if an error occurred during the process.
   Future<bool> clearQueryCache() async {
-    await $db.ensureInitialized();
-    final cacheManager = $db.dataCacheManager;
+    await _db.ensureInitialized();
 
     // Build cache key to ensure correct matching
     final cacheKey = QueryCacheKey(
-      tableName: $tableName,
+      tableName: _tableName,
       condition: queryCondition,
-      orderBy: $orderBy,
-      limit: $limit,
-      offset: $offset,
-      joins: _joins,
+      orderBy: _orderBy,
+      limit: _limit,
+      offset: _offset,
+      cursor: _cursor,
     );
-
-    // Get cache key string
-    final cacheKeyString = cacheKey.toString();
-
-    // Clean up specific query cache
-    return await cacheManager.invalidateQuery($tableName, cacheKeyString);
+    return _db.queryExecutor.clearQueryCacheForKey(cacheKey);
   }
 
   /// get first record
   Future<Map<String, dynamic>?> first() async {
     limit(1);
-    _invalidateFuture();
     final results = await this;
     return results.data.isEmpty ? null : results.data.first;
   }
@@ -128,7 +187,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<int> count() async {
     // if there are no conditions, get total count from metadata
     if (queryCondition.isEmpty) {
-      return await $db.tableDataManager.getTableRecordCount($tableName);
+      return await _db.tableDataManager.getTableRecordCount(_tableName);
     }
 
     // otherwise, execute query and calculate count of records
@@ -139,98 +198,116 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   @override
   Future<QueryResult<Map<String, dynamic>>> get future async {
     if (_future == null) {
-      final results = await _executeQuery();
-      return QueryResult.success(data: results);
+      final result = await _executeQuery();
+      return QueryResult.success(
+        data: result.records,
+        prevCursor: result.prevCursor,
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
+        hasPrev: result.hasPrev,
+        tableTotalCount: result.tableTotalCount,
+        executionTimeMs: result.executionTimeMs,
+      );
     }
-    final results = await _future!;
-    return QueryResult.success(data: results);
+    final result = await _future!;
+    return QueryResult.success(
+      data: result.records,
+      prevCursor: result.prevCursor,
+      nextCursor: result.nextCursor,
+      hasMore: result.hasMore,
+      hasPrev: result.hasPrev,
+      tableTotalCount: result.tableTotalCount,
+      executionTimeMs: result.executionTimeMs,
+    );
   }
 
-  /// modify conditions, add table name prefix (if needed)
-  Map<String, dynamic> _convertWhereClauses(
-      Map<String, dynamic> conditions, List<JoinClause> joins) {
-    if (joins.isEmpty) return conditions;
+  /// Watch for changes matching this query
+  Stream<List<Map<String, dynamic>>> watch() {
+    // Create a controller to manage the stream
+    late StreamController<List<Map<String, dynamic>>> controller;
+    StreamSubscription? subscription;
 
-    // collect all related table names for field processing
-    final Set<String> allTableNames = {$tableName};
-    for (var join in joins) {
-      allTableNames.add(join.table);
-    }
-
-    // process field prefix
-    var result = <String, dynamic>{};
-    for (var entry in conditions.entries) {
-      final field = entry.key;
-      // special operators not processed
-      if (field == 'OR' || field == 'AND') {
-        if (entry.value is List) {
-          final List<Map<String, dynamic>> convertedConditions = [];
-          for (var condition in entry.value as List) {
-            if (condition is Map<String, dynamic>) {
-              convertedConditions.add(_convertWhereClauses(condition, joins));
-            }
-          }
-          result[field] = convertedConditions;
+    controller = StreamController<List<Map<String, dynamic>>>(
+      onListen: () async {
+        // 1. Emit initial value
+        try {
+          _invalidateFuture();
+          final initialData = await this;
+          controller.add(initialData.data);
+        } catch (e) {
+          controller.addError(e);
         }
-        continue;
-      }
 
-      // if field already has table prefix, use directly
-      if (field.contains('.')) {
-        result[field] = entry.value;
-        continue;
-      }
+        // 2. Subscribe to changes
+        // We need to ensure db is initialized before accessing notificationManager
+        await _db.ensureInitialized();
 
-      // for fields without prefix, default add main table prefix
-      // this logic ensures where conditions apply to main table and related tables
-      result['${$tableName}.$field'] = entry.value;
-    }
+        subscription = _db.notificationManager.register(
+          _tableName,
+          queryCondition,
+          (event) async {
+            // Re-execute query on change
+            try {
+              _invalidateFuture();
+              final newData = await this;
+              controller.add(newData.data);
+            } catch (e) {
+              controller.addError(e);
+            }
+          },
+        );
+      },
+      onCancel: () async {
+        await subscription?.cancel();
+      },
+    );
 
-    return result;
+    return controller.stream;
   }
 
   /// execute query
-  Future<List<Map<String, dynamic>>> _executeQuery() async {
-    // convert where conditions, add table prefix to fields
-    var whereConditions = queryCondition.build();
-    if (_joins.isNotEmpty) {
-      whereConditions = _convertWhereClauses(whereConditions, _joins);
-    }
-    await $db.ensureInitialized();
-    // build query plan
-    final queryPlan = await $db.getQueryOptimizer()?.optimize(
-          $tableName,
-          whereConditions,
-          $orderBy,
-          joins: _joins,
-        );
+  Future<ExecuteResult> _executeQuery() async {
+    await _db.ensureInitialized();
 
-    if (queryPlan == null) {
-      throw StateError('Query optimizer not initialized');
+    // Resolve pending foreign key joins
+    if (_pendingForeignKeyJoins != null &&
+        _pendingForeignKeyJoins!.isNotEmpty) {
+      await _resolveForeignKeyJoins();
     }
 
-    // directly use QueryExecutor to execute query
-    final results = await $db.getQueryExecutor()?.execute(
-              queryPlan,
-              $tableName,
+    // Directly use QueryExecutor to execute query (optimizer runs inside executor).
+    final result = await _db.getQueryExecutor()?.execute(
+              _tableName,
               condition: queryCondition,
-              orderBy: $orderBy,
-              limit: $limit,
-              offset: $offset,
+              orderBy: _orderBy,
+              limit: _limit,
+              offset: _offset,
+              cursor: _cursor,
               joins: _joins,
               enableQueryCache: _enableQueryCache,
               queryCacheExpiry: _queryCacheExpiry,
             ) ??
-        [];
+        const ExecuteResult.empty();
+
+    List<Map<String, dynamic>> results = result.records;
 
     // process related query results, ensure consistent field naming format
     if (_joins.isNotEmpty) {
-      return _processManyTableResults(results);
+      final processed = _processManyTableResults(results);
+      return ExecuteResult(
+        records: processed,
+        nextCursor: result.nextCursor,
+        prevCursor: result.prevCursor,
+        hasMore: result.hasMore,
+        hasPrev: result.hasPrev,
+        executionTimeMs: result.executionTimeMs,
+        tableTotalCount: result.tableTotalCount,
+      );
     }
 
     // if fields are specified, only return selected fields
     if (_selectedFields != null && _selectedFields!.isNotEmpty) {
-      return results.map((record) {
+      final filtered = results.map((record) {
         final filteredRecord = <String, dynamic>{};
         for (final field in _selectedFields!) {
           // handle field alias (e.g. "name as username")
@@ -271,9 +348,26 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         }
         return filteredRecord;
       }).toList();
+      return ExecuteResult(
+        records: filtered,
+        nextCursor: result.nextCursor,
+        prevCursor: result.prevCursor,
+        hasMore: result.hasMore,
+        hasPrev: result.hasPrev,
+        executionTimeMs: result.executionTimeMs,
+        tableTotalCount: result.tableTotalCount,
+      );
     }
 
-    return results;
+    return ExecuteResult(
+      records: results,
+      nextCursor: result.nextCursor,
+      prevCursor: result.prevCursor,
+      hasMore: result.hasMore,
+      hasPrev: result.hasPrev,
+      executionTimeMs: result.executionTimeMs,
+      tableTotalCount: result.tableTotalCount,
+    );
   }
 
   /// Process multiple table query results, ensure consistent field naming format
@@ -311,7 +405,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             }
           } else {
             // for fields without prefix, try main table name prefix first
-            final prefixedKey = '${$tableName}.$fieldName';
+            final prefixedKey = '${_tableName}.$fieldName';
             if (record.containsKey(prefixedKey)) {
               fieldValue = record[prefixedKey];
             } else if (record.containsKey(fieldName)) {
@@ -405,5 +499,108 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     return field;
+  }
+
+  /// Resolve pending foreign key joins by looking up foreign key relationships
+  Future<void> _resolveForeignKeyJoins() async {
+    if (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty) {
+      return;
+    }
+
+    // Get current table schema
+    final currentSchema = await _db.schemaManager?.getTableSchema(_tableName);
+    if (currentSchema == null) {
+      throw StateError('Current table $_tableName does not exist');
+    }
+
+    for (final pendingJoin in _pendingForeignKeyJoins!) {
+      final tableName = pendingJoin.tableName;
+      final type = pendingJoin.type;
+
+      // Get target table schema
+      final targetSchema = await _db.schemaManager?.getTableSchema(tableName);
+      if (targetSchema == null) {
+        throw StateError('Target table $tableName does not exist');
+      }
+
+      // Try to find foreign key from current table to target table
+      ForeignKeySchema? fk;
+      for (final foreignKey in currentSchema.foreignKeys) {
+        if (foreignKey.referencedTable == tableName && foreignKey.enabled) {
+          fk = foreignKey;
+          break;
+        }
+      }
+
+      // If not found, try reverse: find foreign key from target table to current table
+      if (fk == null) {
+        for (final foreignKey in targetSchema.foreignKeys) {
+          if (foreignKey.referencedTable == _tableName && foreignKey.enabled) {
+            // Reverse the relationship
+            // Current table is referenced by target table
+            // So we join: current_table.pk = target_table.fk
+            if (foreignKey.fields.length == 1 &&
+                foreignKey.referencedFields.length == 1) {
+              _joins.add(JoinClause(
+                type: type,
+                table: tableName,
+                firstKey: '$_tableName.${foreignKey.referencedFields.first}',
+                operator: '=',
+                secondKey: '$tableName.${foreignKey.fields.first}',
+              ));
+              continue;
+            }
+          }
+        }
+
+        // If still not found, throw error
+        if (fk == null) {
+          throw StateError(
+              'No foreign key relationship found between $_tableName and $tableName. '
+              'Please use manual join() method instead.');
+        }
+      }
+
+      // Found foreign key from current table to target table
+      // Join: current_table.fk = target_table.pk
+      if (fk.fields.length == 1 && fk.referencedFields.length == 1) {
+        // Simple foreign key: single field join
+        _joins.add(JoinClause(
+          type: type,
+          table: tableName,
+          firstKey: '$_tableName.${fk.fields.first}',
+          operator: '=',
+          secondKey: '$tableName.${fk.referencedFields.first}',
+        ));
+      } else {
+        // Composite foreign key: join on first field pair
+        // Additional field pairs need to be added as WHERE conditions
+        // This is a limitation of the current JoinClause design
+        if (fk.fields.isNotEmpty && fk.referencedFields.isNotEmpty) {
+          _joins.add(JoinClause(
+            type: type,
+            table: tableName,
+            firstKey: '$_tableName.${fk.fields.first}',
+            operator: '=',
+            secondKey: '$tableName.${fk.referencedFields.first}',
+          ));
+
+          // Add additional field pairs as WHERE conditions for composite foreign keys
+          // This ensures all fields in the composite key are matched
+          for (int i = 1;
+              i < fk.fields.length && i < fk.referencedFields.length;
+              i++) {
+            queryCondition.where(
+              '$_tableName.${fk.fields[i]}',
+              '=',
+              '$tableName.${fk.referencedFields[i]}',
+            );
+          }
+        }
+      }
+    }
+
+    // Clear pending joins after resolution
+    _pendingForeignKeyJoins = null;
   }
 }

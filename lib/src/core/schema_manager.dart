@@ -1,22 +1,133 @@
 import 'dart:convert';
 import 'package:path/path.dart' show dirname;
-import '../model/file_info.dart';
+import '../model/meta_info.dart';
 import '../model/table_schema.dart';
 import '../model/system_table.dart';
-import '../handler/common.dart';
 import '../handler/logger.dart';
 import 'data_store_impl.dart';
+import 'tree_cache.dart';
 
 /// table schema manager
 class SchemaManager {
   final DataStoreImpl _dataStore;
   SchemaMeta? _schemaMeta; // Cache schema meta
 
+  /// Hot schema cache (TableSchema) using [TreeCache].
+  /// Managed by MemoryManager quota: [MemoryQuotaType.schema].
+  TreeCache<TableSchema>? _tableSchemaCache;
+
+  // Directory mapping cache for schema partitions
+  DirectoryMapping? _directoryMapping;
+  int _currentPartitionDirIndex = 0;
+
+  // Loading futures to prevent thundering herd on concurrent schema reads
+  final Map<String, Future<TableSchema?>> _schemaLoadingFutures = {};
+
   SchemaManager(this._dataStore);
+
+  TreeCache<TableSchema> _ensureTableSchemaCache() {
+    final existing = _tableSchemaCache;
+    if (existing != null) return existing;
+
+    final int maxBytes =
+        _dataStore.memoryManager?.getSchemaCacheSize() ?? (50 * 1024 * 1024);
+    final int minBytes = 50 * 1024 * 1024;
+
+    final cache = TreeCache<TableSchema>(
+      sizeCalculator: _estimateTableSchemaSize,
+      maxByteThreshold: maxBytes,
+      minByteThreshold: minBytes,
+    );
+    _tableSchemaCache = cache;
+    return cache;
+  }
+
+  /// Get cached [TableSchema] if present (O(1)).
+  TableSchema? getCachedTableSchema(String tableName) {
+    return _tableSchemaCache?.get(tableName);
+  }
+
+  /// Cache [TableSchema] into hotspot cache.
+  void cacheTableSchema(String tableName, TableSchema schema) {
+    _ensureTableSchemaCache().put(tableName, schema);
+  }
+
+  /// Remove cached schema for [tableName].
+  void removeCachedTableSchema(String tableName) {
+    _tableSchemaCache?.remove(tableName);
+  }
+
+  /// Current schema cache size in bytes (incremental tracked).
+  int getCurrentSchemaCacheSize() {
+    return _tableSchemaCache?.estimatedTotalSizeBytes ?? 0;
+  }
+
+  /// Evict a ratio of schema cache entries under memory pressure.
+  Future<void> evictSchemaCache({double ratio = 0.3}) async {
+    final cache = _tableSchemaCache;
+    if (cache == null) return;
+    await cache.cleanup(removeRatio: ratio);
+  }
+
+  /// Clear all schema cache entries.
+  Future<void> clearSchemaCache() async {
+    _tableSchemaCache?.clear();
+  }
+
+  /// Clear all schema cache entries synchronously (used on shutdown).
+  void clearSchemaCacheSync() {
+    _tableSchemaCache?.clear();
+  }
+
+  int _estimateTableSchemaSize(TableSchema schema) {
+    // Lightweight approximation (avoid jsonEncode for hot paths).
+    int size = 256;
+    size += schema.name.length * 2;
+    size += schema.primaryKey.length * 2;
+    size += 64;
+
+    // Fields
+    if (schema.fields.isNotEmpty) {
+      size += schema.fields.length * 140;
+      for (final f in schema.fields) {
+        size += f.name.length * 2;
+        size += 24;
+      }
+    }
+
+    // Indexes / FKs
+    if (schema.indexes.isNotEmpty) {
+      size += schema.indexes.length * 120;
+      for (final idx in schema.indexes) {
+        size += (idx.indexName?.length ?? 0) * 2;
+        size += idx.fields.length * 24;
+      }
+    }
+    if (schema.foreignKeys.isNotEmpty) {
+      size += schema.foreignKeys.length * 180;
+      for (final fk in schema.foreignKeys) {
+        size += fk.actualName.length * 2;
+        size += fk.referencedTable.length * 2;
+        size += fk.referencedFields.length * 24;
+      }
+    }
+
+    return size;
+  }
 
   /// get database schema meta
   Future<SchemaMeta> getSchemaMeta() async {
-    if (_schemaMeta != null) return _schemaMeta!;
+    if (_schemaMeta != null) {
+      // Warm cache if needed
+      if (_directoryMapping == null && _schemaMeta!.directoryMapping != null) {
+        _directoryMapping = _schemaMeta!.directoryMapping;
+        if (_directoryMapping!.dirToFileCount.isNotEmpty) {
+          _currentPartitionDirIndex = _directoryMapping!.dirToFileCount.keys
+              .reduce((a, b) => a > b ? a : b);
+        }
+      }
+      return _schemaMeta!;
+    }
 
     final path = _dataStore.pathManager.getSchemaMetaPath();
     if (await _dataStore.storage.existsFile(path)) {
@@ -24,6 +135,16 @@ class SchemaManager {
       if (content != null && content.isNotEmpty) {
         try {
           _schemaMeta = SchemaMeta.fromJson(jsonDecode(content));
+          // Warm cache
+          if (_schemaMeta!.directoryMapping != null) {
+            _directoryMapping = _schemaMeta!.directoryMapping;
+            if (_directoryMapping!.dirToFileCount.isNotEmpty) {
+              _currentPartitionDirIndex = _directoryMapping!.dirToFileCount.keys
+                  .reduce((a, b) => a > b ? a : b);
+            }
+          } else {
+            _directoryMapping = DirectoryMapping();
+          }
           return _schemaMeta!;
         } catch (e) {
           Logger.error('Failed to load schema meta: $e',
@@ -41,6 +162,7 @@ class SchemaManager {
         modified: DateTime.now(),
       ),
     );
+    _directoryMapping = DirectoryMapping();
 
     await saveSchemaStructure();
     return _schemaMeta!;
@@ -50,16 +172,21 @@ class SchemaManager {
   Future<void> saveSchemaStructure() async {
     if (_schemaMeta == null) return;
 
+    // Update directory mapping in meta if cache exists
+    if (_directoryMapping != null) {
+      _schemaMeta = _schemaMeta!.copyWith(directoryMapping: _directoryMapping);
+    }
+
     final path = _dataStore.pathManager.getSchemaMetaPath();
     await _dataStore.storage.ensureDirectoryExists(dirname(path));
     await _dataStore.storage
         .writeAsString(path, jsonEncode(_schemaMeta!.toJson()));
   }
 
-  /// get table partitions
-  Future<List<int>> getTablePartitions(String tableName) async {
+  /// get table partition index
+  Future<int?> getTablePartition(String tableName) async {
     final meta = await getSchemaMeta();
-    return meta.tablePartitionMap[tableName] ?? [];
+    return meta.tablePartitionMap[tableName];
   }
 
   /// find suitable partition
@@ -67,7 +194,7 @@ class SchemaManager {
     try {
       // check if table exists in a partition
       for (final entry in meta.tablePartitionMap.entries) {
-        final partitionIndex = entry.value.first;
+        final partitionIndex = entry.value; // Now it's int, not List<int>
         final partitionMeta = await _loadPartitionMeta(partitionIndex);
 
         if (partitionMeta != null) {
@@ -79,10 +206,7 @@ class SchemaManager {
       }
 
       // find partition with enough space
-      final existingPartitions = meta.tablePartitionMap.values
-          .expand((indices) => indices)
-          .toSet()
-          .toList();
+      final existingPartitions = meta.tablePartitionMap.values.toSet().toList();
 
       for (final partitionIndex in existingPartitions) {
         final partitionMeta = await _loadPartitionMeta(partitionIndex);
@@ -102,10 +226,7 @@ class SchemaManager {
         label: 'SchemaManager._findSuitablePartition',
       );
       // create new partition when error
-      final existingPartitions = meta.tablePartitionMap.values
-          .expand((indices) => indices)
-          .toSet()
-          .toList();
+      final existingPartitions = meta.tablePartitionMap.values.toSet().toList();
       return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
     }
   }
@@ -126,10 +247,87 @@ class SchemaManager {
     );
   }
 
+  /// Get or load directory mapping from cache or metadata.
+  Future<DirectoryMapping> _getOrLoadDirectoryMapping() async {
+    if (_directoryMapping != null) return _directoryMapping!;
+
+    final meta = await getSchemaMeta();
+    if (meta.directoryMapping != null) {
+      _directoryMapping = meta.directoryMapping;
+      if (_directoryMapping!.dirToFileCount.isNotEmpty) {
+        _currentPartitionDirIndex = _directoryMapping!.dirToFileCount.keys
+            .reduce((a, b) => a > b ? a : b);
+      }
+      return _directoryMapping!;
+    }
+
+    _directoryMapping = DirectoryMapping();
+    return _directoryMapping!;
+  }
+
+  /// Get directory index for an existing partition.
+  Future<int?> _getPartitionDirIndexForExistingPartition(
+      int partitionIndex) async {
+    final mapping = await _getOrLoadDirectoryMapping();
+    final d = mapping.getDirIndex(partitionIndex);
+    if (d != null) return d;
+
+    // Fallback: try to load from partition meta (legacy support)
+    final legacyDirIndex = partitionIndex ~/ _dataStore.maxEntriesPerDir;
+    final partitionPath = _dataStore.pathManager
+        .getSchemaPartitionFilePath(partitionIndex, legacyDirIndex);
+    if (await _dataStore.storage.existsFile(partitionPath)) {
+      final content = await _dataStore.storage.readAsString(partitionPath);
+      if (content != null) {
+        try {
+          final meta = SchemaPartitionMeta.fromJson(jsonDecode(content));
+          return meta.dirIndex;
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  /// Get or allocate directory index for a partition.
+  Future<int> _getOrAllocateDirIndexForPartition(int partitionIndex) async {
+    final mapping = await _getOrLoadDirectoryMapping();
+
+    // Existing mapping
+    final existing = mapping.getDirIndex(partitionIndex);
+    if (existing != null) return existing;
+
+    // Allocate for new partition
+    int currentDir = _currentPartitionDirIndex;
+    int currentCount = mapping.getFileCount(currentDir);
+
+    if (currentCount >= _dataStore.maxEntriesPerDir) {
+      if (mapping.dirToFileCount.isNotEmpty) {
+        currentDir =
+            mapping.dirToFileCount.keys.reduce((a, b) => a > b ? a : b) + 1;
+      } else {
+        currentDir = 0;
+      }
+      currentCount = 0;
+    }
+
+    // Update mapping
+    _directoryMapping = mapping.withPartitionAndDirCount(
+        partitionIndex, currentDir, currentCount + 1);
+    _currentPartitionDirIndex = currentDir;
+
+    return currentDir;
+  }
+
   /// load partition meta
   Future<SchemaPartitionMeta?> _loadPartitionMeta(int partitionIndex) async {
-    final partitionPath =
-        _dataStore.pathManager.getSchemaPartitionFilePath(partitionIndex);
+    final dirIndex =
+        await _getPartitionDirIndexForExistingPartition(partitionIndex);
+    if (dirIndex == null) {
+      return null;
+    }
+
+    final partitionPath = _dataStore.pathManager
+        .getSchemaPartitionFilePath(partitionIndex, dirIndex);
     if (!await _dataStore.storage.existsFile(partitionPath)) return null;
 
     final content = await _dataStore.storage.readAsString(partitionPath);
@@ -145,17 +343,21 @@ class SchemaManager {
   }
 
   /// save table schema, auto manage partitions
-  Future<void> saveTableSchema(String tableName, String schemaContent) async {
+  Future<void> saveTableSchema(String tableName, TableSchema schema) async {
     try {
       final meta = await getSchemaMeta();
-      final contentSize = calculateUtf8Length(schemaContent);
+      final contentSize = _estimateTableSchemaSize(schema);
 
       // find suitable partition
       int targetPartition = await _findSuitablePartition(meta, contentSize);
 
+      // Get or allocate directory index for this partition
+      final dirIndex =
+          await _getOrAllocateDirIndexForPartition(targetPartition);
+
       // read target partition meta
-      final partitionPath =
-          _dataStore.pathManager.getSchemaPartitionFilePath(targetPartition);
+      final partitionPath = _dataStore.pathManager
+          .getSchemaPartitionFilePath(targetPartition, dirIndex);
       SchemaPartitionMeta partitionMeta;
 
       if (await _dataStore.storage.existsFile(partitionPath)) {
@@ -170,7 +372,7 @@ class SchemaManager {
       }
 
       // update partition meta
-      final schemaObject = jsonDecode(schemaContent);
+      final schemaObject = schema.toJson();
       final oldSize = partitionMeta.tableSizes[tableName] ?? 0;
 
       // calculate new partition size (if update, subtract old size)
@@ -203,8 +405,11 @@ class SchemaManager {
           .writeAsString(partitionPath, jsonEncode(updatedMeta.toJson()));
 
       // update main meta mapping relation
-      meta.tablePartitionMap[tableName] = [targetPartition];
+      meta.tablePartitionMap[tableName] = targetPartition;
       await saveSchemaStructure();
+
+      // Cache the new schema
+      cacheTableSchema(tableName, schema);
     } catch (e) {
       Logger.error('Failed to save table schema: $tableName, $e',
           label: 'SchemaManager.saveTableSchema');
@@ -213,13 +418,41 @@ class SchemaManager {
   }
 
   /// read table schema
-  Future<String?> readTableSchema(String tableName) async {
-    try {
-      final partitions = await getTablePartitions(tableName);
-      if (partitions.isEmpty) return null;
+  Future<TableSchema?> getTableSchema(String tableName) async {
+    // Fast path: check in-memory cache
+    final cached = getCachedTableSchema(tableName);
+    if (cached != null) return cached;
 
-      final partitionPath =
-          _dataStore.pathManager.getSchemaPartitionFilePath(partitions.first);
+    // Check if another call is already loading this schema
+    final existing = _schemaLoadingFutures[tableName];
+    if (existing != null) {
+      return existing;
+    }
+
+    // Start loading and register the future
+    final loadFuture = _doLoadTableSchema(tableName);
+    _schemaLoadingFutures[tableName] = loadFuture;
+    try {
+      return await loadFuture;
+    } finally {
+      _schemaLoadingFutures.remove(tableName);
+    }
+  }
+
+  /// Internal helper to actually load schema from file.
+  Future<TableSchema?> _doLoadTableSchema(String tableName) async {
+    try {
+      final partitionIndex = await getTablePartition(tableName);
+      if (partitionIndex == null) return null;
+
+      final dirIndex =
+          await _getPartitionDirIndexForExistingPartition(partitionIndex);
+      if (dirIndex == null) {
+        return null;
+      }
+
+      final partitionPath = _dataStore.pathManager
+          .getSchemaPartitionFilePath(partitionIndex, dirIndex);
       if (!await _dataStore.storage.existsFile(partitionPath)) return null;
 
       final content = await _dataStore.storage.readAsString(partitionPath);
@@ -229,16 +462,34 @@ class SchemaManager {
         final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
         if (!partitionMeta.tableSchemas.containsKey(tableName)) return null;
 
-        return jsonEncode(partitionMeta.tableSchemas[tableName]);
+        final raw = partitionMeta.tableSchemas[tableName];
+        Map<String, dynamic>? schemaMap;
+        if (raw is Map<String, dynamic>) {
+          schemaMap = raw;
+        } else if (raw is Map) {
+          schemaMap = Map<String, dynamic>.from(raw);
+        } else if (raw is String) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map<String, dynamic>) {
+            schemaMap = decoded;
+          } else if (decoded is Map) {
+            schemaMap = Map<String, dynamic>.from(decoded);
+          }
+        }
+        if (schemaMap == null) return null;
+
+        final schema = TableSchema.fromJson(schemaMap);
+        cacheTableSchema(tableName, schema);
+        return schema;
       } catch (e) {
-        Logger.error('Failed to read table schema: $e',
-            label: 'SchemaManager.readTableSchema');
+        Logger.error('Failed to parse table schema: $tableName, $e',
+            label: 'SchemaManager.getTableSchema');
         return null;
       }
     } catch (e) {
       Logger.error(
-        'Failed to read table schema: $tableName, $e',
-        label: 'SchemaManager.readTableSchema',
+        'Failed to get table schema: $tableName, $e',
+        label: 'SchemaManager.getTableSchema',
       );
       return null;
     }
@@ -248,28 +499,21 @@ class SchemaManager {
   Future<bool> deleteTableSchema(String tableName) async {
     try {
       final meta = await getSchemaMeta();
-      final partitions = meta.tablePartitionMap[tableName] ?? [];
+      final partitionIndex = meta.tablePartitionMap[tableName];
 
-      if (partitions.isEmpty) return false;
+      if (partitionIndex == null) return false;
 
-      bool allSuccess = true;
-
-      // delete table from all partitions
-      for (final partitionIndex in partitions) {
-        final success =
-            await _removeTableFromPartition(tableName, partitionIndex);
-        if (!success) {
-          allSuccess = false;
-        }
-      }
+      final success =
+          await _removeTableFromPartition(tableName, partitionIndex);
 
       // if successfully delete table from all partitions, update meta
-      if (allSuccess) {
+      if (success) {
         meta.tablePartitionMap.remove(tableName);
         await saveSchemaStructure();
+        removeCachedTableSchema(tableName);
       }
 
-      return allSuccess;
+      return success;
     } catch (e) {
       Logger.error(
         'Failed to delete table schema: $tableName, $e',
@@ -282,8 +526,14 @@ class SchemaManager {
   /// remove table from partition
   Future<bool> _removeTableFromPartition(
       String tableName, int partitionIndex) async {
-    final partitionPath =
-        _dataStore.pathManager.getSchemaPartitionFilePath(partitionIndex);
+    final dirIndex =
+        await _getPartitionDirIndexForExistingPartition(partitionIndex);
+    if (dirIndex == null) {
+      return false;
+    }
+
+    final partitionPath = _dataStore.pathManager
+        .getSchemaPartitionFilePath(partitionIndex, dirIndex);
     if (!await _dataStore.storage.existsFile(partitionPath)) return false;
 
     final content = await _dataStore.storage.readAsString(partitionPath);
@@ -344,10 +594,7 @@ class SchemaManager {
     try {
       // get partition basic info
       final meta = await getSchemaMeta();
-      final uniquePartitions = meta.tablePartitionMap.values
-          .expand((indices) => indices)
-          .toSet()
-          .toList();
+      final uniquePartitions = meta.tablePartitionMap.values.toSet().toList();
 
       final result = <String, dynamic>{
         'totalTables': meta.tablePartitionMap.length,
@@ -406,10 +653,7 @@ class SchemaManager {
       }
 
       // get all partition info
-      final uniquePartitions = meta.tablePartitionMap.values
-          .expand((indices) => indices)
-          .toSet()
-          .toList();
+      final uniquePartitions = meta.tablePartitionMap.values.toSet().toList();
 
       if (uniquePartitions.isEmpty) {
         Logger.debug('No partition info, skip optimization',
@@ -522,8 +766,10 @@ class SchemaManager {
               await _removeTableFromPartition(tableName, overloadedIndex);
           if (success) {
             // read target partition meta
+            final targetDirIndex =
+                await _getOrAllocateDirIndexForPartition(targetPartition);
             final targetPartitionPath = _dataStore.pathManager
-                .getSchemaPartitionFilePath(targetPartition);
+                .getSchemaPartitionFilePath(targetPartition, targetDirIndex);
             SchemaPartitionMeta targetPartitionMeta;
 
             if (await _dataStore.storage.existsFile(targetPartitionPath)) {
@@ -557,14 +803,14 @@ class SchemaManager {
               ),
             );
 
-            // save target partition fileget partition file
+            // save target partition file
             await _dataStore.storage
                 .ensureDirectoryExists(dirname(targetPartitionPath));
             await _dataStore.storage.writeAsString(
                 targetPartitionPath, jsonEncode(updatedMeta.toJson()));
 
             // update main meta mapping relation
-            meta.tablePartitionMap[tableName] = [targetPartition];
+            meta.tablePartitionMap[tableName] = targetPartition;
 
             tablesMovedCount.add(tableName);
           }
@@ -611,15 +857,9 @@ class SchemaManager {
 
       // read all table schemas
       for (final tableName in tableNames) {
-        final schemaStr = await readTableSchema(tableName);
-        if (schemaStr != null) {
-          try {
-            final schema = jsonDecode(schemaStr);
-            tableSchemas.add(schema);
-          } catch (e) {
-            Logger.error('Failed to parse table schema: $tableName, $e',
-                label: 'SchemaManager.getAllTableSchemas');
-          }
+        final schema = await getTableSchema(tableName);
+        if (schema != null) {
+          tableSchemas.add(schema);
         }
       }
 
@@ -635,35 +875,32 @@ class SchemaManager {
 
   /// get table is global table
   Future<bool?> isTableGlobal(String tableName) async {
-    final schema = await _dataStore.getTableSchema(tableName);
+    final schema = await getTableSchema(tableName);
     if (schema == null) {
       return null;
     }
     return schema.isGlobal;
   }
 
-  /// high performance check if table schema has changed, used for upgrade judgment
-  /// [schemas] latest table schema list
+  bool _hasSchemaChanged(List<TableSchema> schemas, String? oldHash) {
+    if (oldHash == null || oldHash.isEmpty) {
+      return true;
+    }
+
+    final newHash = TableSchema.generateSchemasHash(schemas);
+    return oldHash != newHash;
+  }
+
+  /// High-performance check if user-defined table schema has changed (based on Tostore(schemas: []))
   Future<bool> isSchemaChanged(List<TableSchema> schemas) async {
     try {
       final meta = await getSchemaMeta();
-      final oldHash = meta.schemaHash;
+      final oldHash = meta.userSchemaHash;
 
-      if (oldHash == null || oldHash.isEmpty) {
-        Logger.debug(
-          'Table schema has no old hash value',
-          label: 'SchemaManager.isSchemaChanged',
-        );
-        return true;
-      }
-
-      // calculate current table schema hash
-      final newHash = TableSchema.generateSchemasHash(schemas);
-
-      // compare new and old hash values
-      final changed = oldHash != newHash;
-
-      return changed;
+      return _hasSchemaChanged(
+        schemas,
+        oldHash,
+      );
     } catch (e) {
       Logger.error(
         'Failed to judge table schema change: $e',
@@ -673,24 +910,53 @@ class SchemaManager {
     }
   }
 
-  /// update database initial table schema hash
-  Future<void> updateInitialSchemaHash() async {
+  /// Check if system table schema has changed
+  Future<bool> isSystemSchemaChanged(List<TableSchema> schemas) async {
     try {
-      final schemasTemp = _dataStore.getInitialSchema();
-
-      if (schemasTemp.isEmpty) return;
-
-      // calculate hash
-      final hash = TableSchema.generateSchemasHash(schemasTemp);
-
-      // update meta
       final meta = await getSchemaMeta();
-      _schemaMeta = meta.copyWith(schemaHash: hash);
+      final oldHash = meta.systemSchemaHash;
+
+      return _hasSchemaChanged(
+        schemas,
+        oldHash,
+      );
+    } catch (e) {
+      Logger.error(
+        'Failed to judge system schema change: $e',
+        label: 'SchemaManager.isSystemSchemaChanged',
+      );
+      return true;
+    }
+  }
+
+  /// Update user-defined table schema hash
+  Future<void> updateUserSchemaHash(List<TableSchema> schemas) async {
+    if (schemas.isEmpty) return;
+    try {
+      final hash = TableSchema.generateSchemasHash(schemas);
+      final meta = await getSchemaMeta();
+      _schemaMeta = meta.copyWith(userSchemaHash: hash);
       await saveSchemaStructure();
     } catch (e) {
       Logger.error(
-        'Failed to update schema hash: $e',
-        label: 'SchemaManager.updateSchemaHash',
+        'Failed to update user schema hash: $e',
+        label: 'SchemaManager.updateUserSchemaHash',
+      );
+    }
+  }
+
+  /// Update system table schema hash
+  Future<void> updateSystemSchemaHash(List<TableSchema> schemas) async {
+    if (schemas.isEmpty) return;
+    try {
+      final hash = TableSchema.generateSchemasHash(schemas);
+      final meta = await getSchemaMeta();
+      _schemaMeta = meta.copyWith(systemSchemaHash: hash);
+      await saveSchemaStructure();
+    } catch (e) {
+      Logger.error(
+        'Failed to update system schema hash: $e',
+        label: 'SchemaManager.updateSystemSchemaHash',
       );
     }
   }

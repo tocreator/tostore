@@ -3,347 +3,644 @@
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | Español | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
-Tostore es un motor de base de datos con arquitectura distribuida multiplataforma que se integra profundamente en tu proyecto. Su modelo de procesamiento de datos inspirado en redes neuronales implementa una gestión de datos similar al cerebro. Los mecanismos de paralelismo multi-partición y la topología de interconexión de nodos crean una red de datos inteligente, mientras que el procesamiento paralelo con Isolate aprovecha al máximo las capacidades multi-núcleo. Con varios algoritmos de clave primaria distribuidos y extensión ilimitada de nodos, puede servir como una capa de datos para infraestructuras de computación distribuida y entrenamiento de datos a gran escala, permitiendo un flujo de datos fluido desde dispositivos periféricos hasta servidores en la nube. Características como la detección precisa de cambios de esquema, migración inteligente, cifrado ChaCha20Poly1305 y arquitectura multi-espacio soportan perfectamente varios escenarios de aplicación, desde aplicaciones móviles hasta sistemas del lado del servidor.
 
 ## ¿Por qué elegir Tostore?
 
-### 1. Procesamiento Paralelo de Particiones vs. Almacenamiento en Archivo Único
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Mecanismo de particionamiento inteligente, datos distribuidos en múltiples archivos de tamaño adecuado | ❌ Almacenamiento en un único archivo de datos, degradación lineal del rendimiento con el crecimiento de datos |
-| ✅ Lee solo los archivos de partición relevantes, rendimiento de consulta desacoplado del volumen total de datos | ❌ Necesidad de cargar todo el archivo de datos, incluso para consultar un solo registro |
-| ✅ Mantiene tiempos de respuesta de milisegundos incluso con volúmenes de datos a nivel de TB | ❌ Aumento significativo en la latencia de lectura/escritura en dispositivos móviles cuando los datos exceden 5MB |
-| ✅ Consumo de recursos proporcional a la cantidad de datos consultados, no al volumen total de datos | ❌ Dispositivos con recursos limitados sujetos a presión de memoria y errores OOM |
-| ✅ La tecnología Isolate permite un verdadero procesamiento paralelo multi-núcleo | ❌ Un solo archivo no puede procesarse en paralelo, desperdicio de recursos de CPU |
+Tostore es el único motor de almacenamiento de alto rendimiento para bases de datos vectoriales distribuidas en el ecosistema Dart/Flutter. Utilizando una arquitectura de tipo red neuronal, presenta una interconectividad e inteligencia de colaboración entre nodos, permitiendo una escalabilidad horizontal infinita. Construye una red de topología de datos flexible y proporciona una identificación precisa de cambios de esquema, protección por cifrado y aislamiento de datos multiespacio. Tostore aprovecha al máximo las CPUs multinúcleo para un procesamiento paralelo extremo y soporta de forma nativa la colaboración multiplataforma desde dispositivos de borde (edge) móviles hasta la nube. Con varios algoritmos de claves primarias distribuidas, proporciona una base de datos potente para escenarios como la realidad virtual inmersiva, la interacción multimodal, la computación espacial, la IA generativa y el modelado de espacios vectoriales semánticos.
 
-### 2. Integración Incorporada vs. Almacenes de Datos Independientes
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Utiliza el lenguaje Dart, se integra perfectamente con proyectos Flutter/Dart | ❌ Requiere aprender SQL o lenguajes de consulta específicos, aumentando la curva de aprendizaje |
-| ✅ El mismo código soporta frontend y backend, sin necesidad de cambiar la pila tecnológica | ❌ Frontend y backend típicamente requieren diferentes bases de datos y métodos de acceso |
-| ✅ Estilo de API encadenada que coincide con estilos de programación modernos, excelente experiencia para desarrolladores | ❌ Concatenación de cadenas SQL vulnerable a ataques y errores, falta de seguridad de tipos |
-| ✅ Soporte para programación reactiva, se adapta naturalmente a frameworks de UI | ❌ Requiere capas de adaptación adicionales para conectar UI y capa de datos |
-| ✅ No hay necesidad de configuración compleja de mapeo ORM, uso directo de objetos Dart | ❌ Complejidad del mapeo objeto-relacional, altos costos de desarrollo y mantenimiento |
+A medida que la IA generativa y la computación espacial desplazan el centro de gravedad hacia el borde (edge), los dispositivos terminales están evolucionando de ser meros visualizadores de contenido a núcleos de generación local, percepción ambiental y toma de decisiones en tiempo real. Las bases de datos integradas tradicionales de un solo archivo están limitadas por su diseño arquitectónico, a menudo luchando para soportar los requisitos de respuesta inmediata de las aplicaciones inteligentes ante escrituras de alta concurrencia, recuperación de vectores masivos y generación colaborativa nube-borde. Tostore nace para dispositivos de borde, dotándolos de capacidades de almacenamiento distribuido suficientes para soportar la generación local de IA compleja y el flujo de datos a gran escala, logrando una verdadera colaboración profunda entre la nube y el borde.
 
-### 3. Detección Precisa de Cambios de Esquema vs. Gestión Manual de Migración
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Detecta automáticamente cambios de esquema, no necesita gestión de números de versión | ❌ Dependencia del control manual de versiones y código de migración explícito |
-| ✅ Detección a nivel de milisegundos de cambios de tabla/campo y migración automática de datos | ❌ Necesidad de mantener lógica de migración para actualizaciones entre versiones |
-| ✅ Identifica con precisión renombres de tabla/campo, preserva todos los datos históricos | ❌ Los renombres de tabla/campo pueden llevar a pérdida de datos |
-| ✅ Operaciones de migración atómicas asegurando consistencia de datos | ❌ Interrupciones de migración pueden causar inconsistencias de datos |
-| ✅ Actualizaciones de esquema totalmente automatizadas sin intervención manual | ❌ Lógica de actualización compleja y altos costos de mantenimiento con versiones crecientes |
+**Resistente a fallos de energía y bloqueos**: Incluso en caso de un corte de energía inesperado o un bloqueo de la aplicación, los datos pueden recuperarse automáticamente, logrando una pérdida cero real. Cuando una operación de datos responde, los datos ya se han guardado de forma segura, eliminando el riesgo de pérdida de datos.
 
-### 4. Arquitectura Multi-Espacio vs. Espacio de Almacenamiento Único
-| Tostore | Bases de Datos Tradicionales |
-|:---------|:-----------|
-| ✅ Arquitectura multi-espacio, aislando perfectamente datos de diferentes usuarios | ❌ Espacio de almacenamiento único, almacenamiento mixto de datos de múltiples usuarios |
-| ✅ Cambio de espacio con una línea de código, simple y efectivo | ❌ Requiere múltiples instancias de base de datos o lógica de aislamiento compleja |
-| ✅ Mecanismo flexible de aislamiento de espacio y compartición de datos global | ❌ Difícil equilibrar el aislamiento y la compartición de datos de usuario |
-| ✅ API simple para copiar o migrar datos entre espacios | ❌ Operaciones complejas para migración de inquilinos o copia de datos |
-| ✅ Consultas automáticamente limitadas al espacio actual, sin necesidad de filtrado adicional | ❌ Las consultas para diferentes usuarios requieren filtrado complejo |
+**Superando los límites de rendimiento**: Las pruebas de rendimiento muestran que incluso con 10 millones de registros, un smartphone típico puede iniciarse inmediatamente y mostrar los resultados de las consultas al instante. No importa cuán grande sea el volumen de datos, puede disfrutar de una experiencia fluida que supera con creces la de las bases de datos tradicionales.
 
 
 
 
+...... Desde la punta de los dedos hasta las aplicaciones en la nube, Tostore le ayuda a liberar la potencia de cálculo de datos y a potenciar el futuro ......
 
 
-## Aspectos Técnicos Destacados
 
-- 🌐 **Soporte Multiplataforma Transparente**:
-  - Experiencia consistente en plataformas Web, Linux, Windows, Mobile, Mac
-  - Interfaz API unificada, sincronización de datos multiplataforma sin problemas
-  - Adaptación automática a varios backends de almacenamiento multiplataforma (IndexedDB, sistemas de archivos, etc.)
-  - Flujo de datos fluido desde computación de borde hasta la nube
 
-- 🧠 **Arquitectura Distribuida Inspirada en Redes Neuronales**:
-  - Topología similar a redes neuronales de nodos interconectados
-  - Mecanismo eficiente de particionamiento de datos para procesamiento distribuido
-  - Equilibrio de carga de trabajo dinámico inteligente
-  - Soporte para extensión ilimitada de nodos, fácil construcción de redes de datos complejas
+## Características de Tostore
 
-- ⚡ **Capacidades Definitivas de Procesamiento Paralelo**:
-  - Lectura/escritura verdaderamente paralela con Isolates, utilización completa de CPU multi-núcleo
-  - Red de cómputo multi-nodo cooperando para eficiencia multiplicada de múltiples tareas
-  - Marco de procesamiento distribuido consciente de recursos, optimización automática de rendimiento
-  - Interfaz de consulta en streaming optimizada para procesar conjuntos de datos masivos
+- 🌐 **Soporte total multiplataforma sin fisuras**
+  - Ejecute el mismo código en todas las plataformas, desde aplicaciones móviles hasta servidores en la nube.
+  - Se adapta inteligentemente a diferentes backends de almacenamiento de plataforma (IndexedDB, sistema de archivos, etc.).
+  - Interfaz API unificada para una sincronización de datos multiplataforma sin preocupaciones.
+  - Flujo de datos fluido desde dispositivos de borde hasta servidores en la nube.
+  - Computación vectorial local en dispositivos de borde, reduciendo la latencia de red y la dependencia de la nube.
 
-- 🔑 **Varios Algoritmos de Clave Primaria Distribuidos**:
-  - Algoritmo de incremento secuencial - longitud de paso aleatorio libremente ajustable
-  - Algoritmo basado en marcas de tiempo - ideal para escenarios de ejecución paralela de alto rendimiento
-  - Algoritmo con prefijo de fecha - adecuado para datos con indicación de rango de tiempo
-  - Algoritmo de código corto - identificadores únicos concisos
+- 🧠 **Arquitectura distribuida tipo red neuronal**
+  - Estructura de topología de nodos interconectados para una organización eficiente del flujo de datos.
+  - Mecanismo de particionamiento de datos de alto rendimiento para un verdadero procesamiento distribuido.
+  - Equilibrio de carga de trabajo dinámico inteligente para maximizar la utilización de recursos.
+  - Escalado horizontal infinito de nodos para construir fácilmente redes de datos complejas.
 
-- 🔄 **Migración de Esquema Inteligente**:
-  - Identificación precisa de comportamientos de renombrado de tabla/campo
-  - Actualización automática de datos y migración durante cambios de esquema
-  - Actualizaciones sin tiempo de inactividad, sin impacto en operaciones de negocio
-  - Estrategias de migración seguras que previenen pérdida de datos
+- ⚡ **Máxima capacidad de procesamiento paralelo**
+  - Lectura/escritura paralela real utilizando Isolates, funcionando a máxima velocidad en CPUs multinúcleo.
+  - La programación inteligente de recursos equilibra automáticamente la carga para maximizar el rendimiento multinúcleo.
+  - La red de computación multinodo colaborativa duplica la eficiencia del procesamiento de tareas.
+  - El marco de programación consciente de los recursos optimiza automáticamente los planes de ejecución para evitar la contienda de recursos.
+  - La interfaz de consulta por flujo (streaming) maneja conjuntos de datos masivos con facilidad.
 
-- 🛡️ **Seguridad a Nivel Empresarial**:
-  - Algoritmo de cifrado ChaCha20Poly1305 para proteger datos sensibles
-  - Cifrado de extremo a extremo, asegurando la seguridad de datos almacenados y transmitidos
-  - Control de acceso a datos de grano fino
+- 🔑 **Diversos algoritmos de claves primarias distribuidas**
+  - Algoritmo de incremento secuencial - Ajuste libremente de los tamaños de paso aleatorios para ocultar la escala del negocio.
+  - Algoritmo basado en marca de tiempo (Timestamp) - La mejor opción para escenarios de alta concurrencia.
+  - Algoritmo de prefijo de fecha - Soporte perfecto para la visualización de datos de rango de tiempo.
+  - Algoritmo de código corto - Genera identificadores únicos cortos y fáciles de leer.
 
-- 🚀 **Caché Inteligente y Rendimiento de Búsqueda**:
-  - Mecanismo de caché inteligente multinivel para recuperación eficiente de datos
-  - Caché de inicio mejorando dramáticamente la velocidad de lanzamiento de aplicaciones
-  - Motor de almacenamiento profundamente integrado con caché, sin código de sincronización adicional necesario
-  - Escalado adaptativo, manteniendo rendimiento estable incluso con datos crecientes
+- 🔄 **Migración de esquema inteligente e integridad de datos**
+  - Identifica con precisión los campos de tabla renombrados con cero pérdida de datos.
+  - Detección automática de cambios de esquema y migración de datos en milisegundos.
+  - Actualizaciones sin tiempo de inactividad, imperceptibles para el negocio.
+  - Estrategias de migración seguras para cambios de estructura complejos.
+  - Validación automática de restricciones de claves foráneas con soporte de cascada que garantiza la integridad referencial.
 
-- 🔄 **Flujos de Trabajo Innovadores**:
-  - Aislamiento de datos multi-espacio, soporte perfecto para escenarios multi-inquilino, multi-usuario
-  - Asignación inteligente de carga de trabajo entre nodos de cómputo
-  - Proporciona base de datos robusta para entrenamiento y análisis de datos a gran escala
-  - Almacenamiento automático de datos, actualizaciones e inserciones inteligentes
+- 🛡️ **Seguridad y durabilidad de nivel empresarial**
+  - Mecanismo de doble protección: el registro en tiempo real de los cambios de datos garantiza que nunca se pierda nada.
+  - Recuperación automática de bloqueos: reanuda automáticamente las operaciones no finalizadas después de un fallo de energía o bloqueo.
+  - Garantía de consistencia de datos: las operaciones o bien tienen éxito por completo o se revierten totalmente.
+  - Actualizaciones computacionales atómicas: el sistema de expresiones soporta cálculos complejos, ejecutados atómicamente para evitar conflictos de concurrencia.
+  - Persistencia segura instantánea: los datos se guardan de forma segura cuando la operación tiene éxito.
+  - El algoritmo de cifrado de alta resistencia ChaCha20Poly1305 protege los datos sensibles.
+  - Cifrado de extremo a extremo para la seguridad durante todo el almacenamiento y transmisión.
 
-- 💼 **La Experiencia del Desarrollador es Prioridad**:
-  - Documentación detallada bilingüe y comentarios de código (Chino e Inglés)
-  - Rica información de depuración y métricas de rendimiento
-  - Capacidades incorporadas de validación de datos y recuperación de corrupción
-  - Configuración cero listo para usar, inicio rápido
+- 🚀 **Caché inteligente y rendimiento de recuperación**
+  - Mecanismo de caché inteligente multinivel para una recuperación de datos ultrarrápida.
+  - Estrategias de caché profundamente integradas con el motor de almacenamiento.
+  - El escalado adaptativo mantiene un rendimiento estable a medida que crece la escala de datos.
+  - Notificaciones de cambios de datos en tiempo real con actualizaciones automáticas de los resultados de consulta.
+
+- 🔄 **Flujo de trabajo de datos inteligente**
+  - La arquitectura multiespacio proporciona aislamiento de datos junto con el intercambio compartido global.
+  - Distribución inteligente de la carga de trabajo entre nodos de computación.
+  - Proporciona una base sólida para el entrenamiento y análisis de datos a gran escala.
+
+
+## Instalación
+
+> [!IMPORTANT]
+> **¿Actualizando desde v2.x?** Lea la [Guía de actualización v3.0](../UPGRADE_GUIDE_v3.md) para conocer los pasos críticos de migración y los cambios importantes.
+
+Añada `tostore` como dependencia en su `pubspec.yaml`:
+
+```yaml
+dependencies:
+  tostore: any # Por favor, utilice la versión más reciente
+```
 
 ## Inicio Rápido
 
-Uso básico:
+> [!IMPORTANT]
+> **Definir el esquema de la tabla es el primer paso**: Antes de realizar operaciones CRUD, debe definir el esquema de la tabla. El método de definición específico depende de su escenario:
+> - **Móvil/Escritorio**: Recomendado [Definición estática](#integración-para-escenarios-de-inicio-frecuente).
+> - **Servidor**: Recomendado [Creación dinámica](#integración-del-lado-del-servidor).
 
 ```dart
-// Inicialización de base de datos
-final db = ToStore();
-await db.initialize(); // Opcional, asegura que la inicialización de la base de datos se complete antes de las operaciones
+// 1. Inicializar la base de datos
+final db = await ToStore.open();
 
-// Inserción de datos
+// 2. Insertar datos
 await db.insert('users', {
   'username': 'John',
   'email': 'john@example.com',
+  'age': 25,
 });
 
-// Actualización de datos
-await db.update('users', {
-  'age': 31,
-}).where('id', '=', 1);
-
-// Eliminación de datos
-await db.delete('users').where('id', '!=', 1);
-
-// Soporte para consultas encadenadas complejas
+// 3. Consultas encadenadas (Soporta =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
-    .where('name', 'like', '%John%')
-    .or()
-    .whereIn('id', [1, 2, 3])
+    .where('username', 'like', '%John%')
     .orderByDesc('age')
-    .limit(10);
+    .limit(20);
 
-// Almacenamiento automático de datos, actualiza si existe, inserta si no
-await db.upsert('users', {'name': 'John','email': 'john@example.com'})
-  .where('email', '=', 'john@example.com');
-// O
-await db.upsert('users', {
-  'id': 1,
-  'name': 'John',
-  'email': 'john@example.com'
+// 4. Actualizar y Eliminar
+await db.update('users', {'age': 26}).where('username', '=', 'John');
+await db.delete('users').where('username', '=', 'John');
+
+// 5. Escucha en tiempo real (La interfaz se actualiza automáticamente)
+db.query('users').where('age', '>', 18).watch().listen((users) {
+  print('Usuarios coincidentes actualizados: $users');
 });
-
-// Conteo eficiente de registros
-final count = await db.query('users').count();
-
-// Procesamiento de datos masivos usando consultas en streaming
-db.streamQuery('users')
-  .where('email', 'like', '%@example.com')
-  .listen((userData) {
-    // Procesa cada registro según sea necesario, evitando presión de memoria
-    print('Procesando usuario: ${userData['username']}');
-  });
-
-// Establecer pares clave-valor globales
-await db.setValue('isAgreementPrivacy', true, isGlobal: true);
-
-// Obtener datos de pares clave-valor globales
-final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
 
-## Ejemplo de Aplicación Móvil
+### Almacenamiento Clave-Valor (KV)
+Adecuado para escenarios que no requieren definir tablas estructuradas. Es simple, práctico e incluye un almacén KV de alto rendimiento incorporado para configuraciones, estados y otros datos dispersos. Los datos en espacios (Spaces) diferentes están aislados de forma natural, pero pueden configurarse para el intercambio global.
 
 ```dart
-// Definición de estructura de tabla adecuada para escenarios de inicio frecuente como aplicaciones móviles, detección precisa de cambios de estructura de tabla, actualización automática de datos y migración
-final db = ToStore(
+// 1. Establecer pares clave-valor (Soporta String, int, bool, double, Map, List, etc.)
+await db.setValue('theme', 'dark');
+await db.setValue('login_attempts', 3);
+
+// 2. Obtener datos
+final theme = await db.getValue('theme'); // 'dark'
+
+// 3. Eliminar datos
+await db.removeValue('theme');
+
+// 4. Clave-valor global (Compartido entre Spaces)
+// Los datos KV por defecto son específicos del espacio. Use isGlobal: true para compartir.
+await db.setValue('app_version', '1.0.0', isGlobal: true);
+final version = await db.getValue('app_version', isGlobal: true);
+```
+
+
+
+## Integración para Escenarios de Inicio Frecuente
+
+```dart
+// Definición de esquema adecuada para aplicaciones móviles y de escritorio.
+// Identifica con precisión los cambios de esquema y migra automáticamente los datos.
+final db = await ToStore.open(
   schemas: [
     const TableSchema(
-      name: 'users', // Nombre de tabla
-      tableId: "users",  // Identificador único de tabla, opcional, usado para identificación 100% de requisitos de renombrado, incluso sin él puede lograr >98% tasa de precisión
+            name: 'global_settings',
+            isGlobal: true,  // Tabla global accesible para todos los espacios
+            fields: [],
+    ),
+    const TableSchema(
+      name: 'users', // Nombre de la tabla
+      tableId: "users",  // Identificador único para detección de renombrado al 100%
       primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id', // Clave primaria
+        name: 'id',       // Nombre de la clave primaria
       ),
-      fields: [ // Definición de campo, no incluye clave primaria
-        FieldSchema(name: 'username', type: DataType.text, nullable: false, unique: true),
-        FieldSchema(name: 'email', type: DataType.text, nullable: false, unique: true),
-        FieldSchema(name: 'last_login', type: DataType.datetime),
+      fields: [        // Definición de campos (excluyendo la clave primaria)
+        FieldSchema(
+          name: 'username', 
+          type: DataType.text, 
+          nullable: false, 
+          unique: true,
+          fieldId: 'username',  // Identificador único de campo
+        ),
+        FieldSchema(
+          name: 'email', 
+          type: DataType.text, 
+          nullable: false, 
+          unique: true
+        ),
+        FieldSchema(
+          name: 'last_login', 
+          type: DataType.datetime
+        ),
       ],
-      indexes: [ // Definición de índice
+      indexes: [ // Definición de índices
         IndexSchema(fields: ['username']),
         IndexSchema(fields: ['email']),
+      ],
+    ),
+    // Ejemplo de restricción de clave foránea
+    TableSchema(
+      name: 'posts',
+      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+      fields: [
+        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+        const FieldSchema(name: 'content', type: DataType.text),
+      ],
+      foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // Campos de la tabla actual
+          referencedTable: 'users',         // Tabla referenciada
+          referencedFields: ['id'],         // Campos referenciados
+          onDelete: ForeignKeyCascadeAction.cascade,  // Eliminación en cascada
+          onUpdate: ForeignKeyCascadeAction.cascade,  // Actualización en cascada
+        ),
       ],
     ),
   ],
 );
 
-// Cambiar a espacio de usuario - aislamiento de datos
+// Arquitectura multiespacio - aislamiento perfecto de los datos de diferentes usuarios
 await db.switchSpace(spaceName: 'user_123');
 ```
 
-## Ejemplo de Servidor Backend
+## Integración del Lado del Servidor
 
 ```dart
+// Creación masiva de esquemas en tiempo de ejecución
 await db.createTables([
-      const TableSchema(
-        name: 'users', // Nombre de tabla
-        primaryKeyConfig: PrimaryKeyConfig(
-          name: 'id', // Clave primaria
-          type: PrimaryKeyType.timestampBased,  // Tipo de clave primaria
-        ),
-        fields: [
-          // Definición de campo, no incluye clave primaria
-          FieldSchema(
-              name: 'username',
-              type: DataType.text,
-              nullable: false,
-              unique: true),
-          FieldSchema(name: 'vector_data', type: DataType.blob),  // Almacenamiento de datos vectoriales
-          // Otros campos...
-        ],
-        indexes: [
-          // Definición de índice
-          IndexSchema(fields: ['username']),
-          IndexSchema(fields: ['email']),
-        ],
+  // Tabla de almacenamiento de vectores de características espaciales 3D
+  const TableSchema(
+    name: 'spatial_embeddings',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.timestampBased,   // PK de marca de tiempo para alta concurrencia
+    ),
+    fields: [
+      FieldSchema(
+        name: 'video_name',
+        type: DataType.text,
+        nullable: false,
       ),
-      // Otras tablas...
+      FieldSchema(
+        name: 'spatial_features',
+        type: DataType.vector,                // Tipo de almacenamiento de vectores
+        vectorConfig: VectorFieldConfig(
+          dimensions: 1024,                   // Vector de alta dimensión
+          precision: VectorPrecision.float32, 
+        ),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['video_name'],
+        unique: true,
+      ),
+      IndexSchema(
+        type: IndexType.vector,              // Índice vectorial
+        fields: ['spatial_features'],
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.hnsw,   // Algoritmo HNSW para ANN eficiente
+          distanceMetric: VectorDistanceMetric.cosine,
+          parameters: {
+            'M': 16,
+            'efConstruction': 200,
+          },
+        ),
+      ),
+    ],
+  ),
+  // Otras tablas...
 ]);
 
-
-// Actualización de estructura de tabla
+// Actualizaciones de Esquema en Línea - Sin interrupción para el negocio
 final taskId = await db.updateSchema('users')
-    .renameTable('newTableName')  // Renombrar tabla
-    .modifyField('username',minLength: 5,maxLength: 20,unique: true)  // Modificar propiedades de campo
-    .renameField('oldName', 'newName')  // Renombrar campo
-    .removeField('fieldName')  // Eliminar campo
-    .addField('name', type: DataType.text)  // Añadir campo
-    .removeIndex(fields: ['age'])  // Eliminar índice
-    .setPrimaryKeyConfig(  // Establecer configuración de clave primaria
-      const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
-    );
+  .renameTable('users_new')                // Renombrar tabla
+  .modifyField(
+    'username',
+    minLength: 5,
+    maxLength: 20,
+    unique: true
+  )                                        // Modificar atributos de campo
+  .renameField('old_name', 'new_name')     // Renombrar campo
+  .removeField('deprecated_field')         // Eliminar campo
+  .addField('created_at', type: DataType.datetime)  // Añadir campo
+  .removeIndex(fields: ['age'])            // Eliminar índice
+  .setPrimaryKeyConfig(                    // Cambiar configuración de PK
+    const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
+  );
     
-// Consultar estado de tarea de migración
-final status = await db.queryMigrationTaskStatus(taskId);  
-print('Progreso de migración: ${status?.progressPercentage}%');
+// Monitorear el progreso de la migración
+final status = await db.queryMigrationTaskStatus(taskId);
+print('Progreso de la migración: ${status?.progressPercentage}%');
+
+
+// Gestión Manual de Caché de Consultas (Servidor)
+// Para consultas sobre claves primarias o campos indexados (consultas de igualdad, IN), el rendimiento ya es extremo y la gestión manual del caché suele ser innecesaria.
+
+// Cachear manualmente el resultado de una consulta durante 5 minutos.
+final activeUsers = await db.query('users')
+    .where('is_active', '=', true)
+    .useQueryCache(const Duration(minutes: 5));
+
+// Invalidar caché específica cuando los datos cambian.
+await db.query('users')
+    .where('is_active', '=', true)
+    .clearQueryCache();
+
+// Deshabilitar explícitamente el caché para consultas con datos en tiempo real.
+final freshUserData = await db.query('users')
+    .where('is_active', '=', true)
+    .noQueryCache();
 ```
+
+
+
+## Uso Avanzado
+
+Tostore proporciona un conjunto rico de características avanzadas para requisitos complejos:
+
+### Consultas Anidadas y Filtrado Personalizado
+Soporta el anidamiento infinito de condiciones y funciones personalizadas flexibles.
+
+```dart
+// Anidamiento de condiciones: (type = 'app' OR (id >= 123 OR fans >= 200))
+final idCondition = QueryCondition().where('id', '>=', 123).or().where('fans', '>=', 200);
+
+final result = await db.query('users')
+    .condition(
+        QueryCondition().whereEqual('type', 'app').or().condition(idCondition)
+    )
+    .limit(20);
+
+// Función de condición personalizada
+final customResult = await db.query('users')
+    .whereCustom((record) => record['tags']?.contains('recomendado') ?? false);
+```
+
+### Upsert Inteligente
+Actualiza si existe, de lo contrario inserta.
+
+```dart
+await db.upsert('users', {
+  'email': 'john@example.com',
+  'name': 'John New'
+}).where('email', '=', 'john@example.com');
+```
+
+
+### Uniones (Joins) y Selección de Campos
+```dart
+final orders = await db.query('orders')
+    .select(['orders.id', 'users.name as user_name'])
+    .join('users', 'orders.user_id', '=', 'users.id')
+    .where('orders.amount', '>', 1000)
+    .limit(20);
+```
+
+### Transmisión (Streaming) y Estadísticas
+```dart
+// Contar registros
+final count = await db.query('users').count();
+
+// Consulta por flujo (adecuada para datos masivos)
+db.streamQuery('users').listen((data) => print(data));
+```
+
+
+
+### Consultas y Paginación Eficiente
+
+> [!TIP]
+> **Especifique `limit` explícitamente para un mejor rendimiento**: Se recomienda encarecidamente especificar siempre un `limit` al realizar consultas. Si se omite, el motor limita por defecto a 1000 registros. Aunque la consulta principal es extremadamente rápida, la serialización de una gran cantidad de registros en aplicaciones sensibles a la interfaz de usuario puede causar una latencia innecesaria.
+
+Tostore ofrece soporte de paginación de modo dual:
+
+#### 1. Modo Offset (Desplazamiento)
+Adecuado para conjuntos de datos pequeños o cuando se requiere saltar a una página específica.
+
+```dart
+final result = await db.query('users')
+    .orderByDesc('created_at')
+    .offset(40) // Saltar los primeros 40
+    .limit(20); // Tomar 20
+```
+> [!TIP]
+> Cuando el `offset` es muy grande, la base de datos debe escanear y descartar muchos registros, lo que degrada el rendimiento. Use el **Modo Cursor** para paginación profunda.
+
+#### 2. Modo Cursor de Alto Rendimiento
+**Recomendado para datos masivos y escenarios de scroll infinito**. Utiliza `nextCursor` para un rendimiento O(1), asegurando una velocidad de consulta constante independientemente de la profundidad de la página.
+
+> [!IMPORTANT]
+> Si se ordena por un campo no indexado o para ciertas consultas complejas, el motor puede volver al escaneo completo de la tabla y devolver un cursor `null` (lo que significa que la paginación para esa consulta específica aún no es compatible).
+
+```dart
+// Página 1
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+// Obtener la siguiente página usando el cursor
+if (page1.nextCursor != null) {
+  final page2 = await db.query('users')
+      .orderByDesc('id')
+      .limit(20)
+      .cursor(page1.nextCursor); // Buscar directamente la posición
+}
+
+// Retroceder eficientemente con prevCursor
+final prevPage = await db.query('users')
+    .limit(20)
+    .cursor(page2.prevCursor);
+```
+
+| Característica | Modo Offset | Modo Cursor |
+| :--- | :--- | :--- |
+| **Rendimiento** | Disminuye al aumentar la página | **Constante (O(1))** |
+| **Complejidad** | Datos pequeños, saltos de página | **Datos masivos, scroll infinito** |
+| **Consistencia** | Los cambios pueden causar saltos | **Perfecta integridad ante cambios** |
+
+
+
 
 
 ## Arquitectura Distribuida
 
 ```dart
-// Configuración de nodo distribuido
-final db = ToStore(
-    config: DataStoreConfig(
-        distributedNodeConfig: const DistributedNodeConfig(
-            enableDistributed: true,  // Habilitar modo distribuido
-            clusterId: 1,  // Configuración de pertenencia a cluster
-            centralServerUrl: 'http://127.0.0.1:8080',
-            accessToken: 'b7628a4f9b4d269b98649129'))
+// Configurar Nodos Distribuidos
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    distributedNodeConfig: const DistributedNodeConfig(
+      enableDistributed: true,
+      clusterId: 1,
+      centralServerUrl: 'http://127.0.0.1:8080',
+      accessToken: 'b7628a4f9b4d269b98649129'
+    )
+  )
 );
 
-// Inserción por lotes de datos vectoriales
-await db.batchInsert('vector', [
+// Inserción masiva de alto rendimiento (Batch Insert)
+await db.batchInsert('vector_data', [
   {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
   {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
-  // ... Miles de registros
+  // ... Registros insertados eficientemente en lote
 ]);
 
-// Procesamiento en streaming de grandes conjuntos de datos para análisis
-await for (final record in db.streamQuery('vector')
-    .where('vector_name', '=', 'face_2366')
-    .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
-    .stream) {
-  // La interfaz de streaming soporta extracción y transformación de características a gran escala
+// Procesar grandes conjuntos de datos por flujo - Memoria constante
+await for (final record in db.streamQuery('vector_data')
+  .where('vector_name', '=', 'face_2366')
+  .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
+  .stream) {
+  // Procesa eficientemente incluso datos de escala TB sin alto uso de memoria
   print(record);
 }
 ```
 
-## Ejemplos de Clave Primaria
-Varios algoritmos de clave primaria, todos soportando generación distribuida, no se recomienda generar claves primarias usted mismo para evitar el impacto de claves primarias desordenadas en las capacidades de búsqueda.
-Clave primaria secuencial PrimaryKeyType.sequential: 238978991
-Clave primaria basada en marca de tiempo PrimaryKeyType.timestampBased: 1306866018836946
-Clave primaria con prefijo de fecha PrimaryKeyType.datePrefixed: 20250530182215887631
-Clave primaria de código corto PrimaryKeyType.shortCode: 9eXrF0qeXZ
+## Ejemplos de Claves Primarias
+
+Tostore proporciona varios algoritmos de claves primarias distribuidas:
+
+- **Secuencial** (PrimaryKeyType.sequential): 238978991
+- **Basada en marca de tiempo** (PrimaryKeyType.timestampBased): 1306866018836946
+- **Prefijo de fecha** (PrimaryKeyType.datePrefixed): 20250530182215887631
+- **Código corto** (PrimaryKeyType.shortCode): 9eXrF0qeXZ
 
 ```dart
-// Clave primaria secuencial PrimaryKeyType.sequential
-// Cuando el sistema distribuido está habilitado, el servidor central asigna rangos que los nodos generan por sí mismos, compacto y fácil de recordar, adecuado para IDs de usuario y números atractivos
+// Ejemplo de configuración de clave primaria secuencial
 await db.createTables([
-      const TableSchema(
-        name: 'users',
-        primaryKeyConfig: PrimaryKeyConfig(
-          type: PrimaryKeyType.sequential,  // Tipo de clave primaria secuencial
-          sequentialConfig:  SequentialIdConfig(
-              initialValue: 10000, // Valor inicial de autoincremento
-              increment: 50,  // Paso de incremento
-              useRandomIncrement: true,  // Usar paso aleatorio para evitar revelar volumen de negocio
-            ),
-        ),
-        // Definición de campo e índice...
-        fields: []
+  const TableSchema(
+    name: 'users',
+    primaryKeyConfig: PrimaryKeyConfig(
+      type: PrimaryKeyType.sequential,
+      sequentialConfig: SequentialIdConfig(
+        initialValue: 10000,
+        increment: 50,
+        useRandomIncrement: true, // Ocultar volumen de negocio
       ),
-      // Otras tablas...
- ]);
+    ),
+    fields: [/* Definición de campos */]
+  ),
+]);
 ```
 
+
+## Operaciones Atómicas con Expresiones
+
+El sistema de expresiones proporciona actualizaciones de campos atómicas y seguras. Todos los cálculos se ejecutan atómicamente a nivel de base de datos para evitar conflictos de concurrencia:
+
+```dart
+// Incremento simple: balance = balance + 100
+await db.update('accounts', {
+  'balance': Expr.field('balance') + Expr.value(100),
+}).where('id', '=', accountId);
+
+// Cálculo complejo: total = price * quantity + tax
+await db.update('orders', {
+  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
+}).where('id', '=', orderId);
+
+// Paréntesis anidados: finalPrice = ((price * quantity) + tax) * (1 - discount)
+await db.update('orders', {
+  'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
+                 (Expr.value(1) - Expr.field('discount')),
+}).where('id', '=', orderId);
+
+// Uso de funciones: price = min(price, maxPrice)
+await db.update('products', {
+  'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
+}).where('id', '=', productId);
+
+// Sello de tiempo: updatedAt = now()
+await db.update('users', {
+  'updatedAt': Expr.now(),
+}).where('id', '=', userId);
+```
+
+## Transacciones
+
+Las transacciones aseguran la atomicidad de múltiples operaciones: o bien todas tienen éxito o todas se revierten, garantizando la consistencia de los datos.
+
+**Características de las Transacciones**:
+- Ejecución atómica de múltiples operaciones.
+- Recuperación automática de operaciones inacabadas después de un fallo.
+- Los datos se guardan de forma segura al confirmar (commit) con éxito.
+
+```dart
+// Transacción básica
+final txResult = await db.transaction(() async {
+  // Insertar usuario
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+    'fans': 100,
+  });
+  
+  // Actualización atómica usando expresiones
+  await db.update('users', {
+    'fans': Expr.field('fans') + Expr.value(50),
+  }).where('username', '=', 'john');
+  
+  // Si cualquier operación falla, todos los cambios se revierten automáticamente.
+});
+
+if (txResult.isSuccess) {
+  print('Transacción confirmada con éxito');
+} else {
+  print('Transacción revertida: ${txResult.error?.message}');
+}
+
+// Reversión automática en caso de error
+final txResult2 = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'jane',
+    'email': 'jane@example.com',
+  });
+  throw Exception('Error de lógica de negocio'); // Activa la reversión
+}, rollbackOnError: true);
+```
 
 ## Configuración de Seguridad
 
+**Mecanismos de Seguridad de Datos**:
+- Mecanismos de doble protección garantizan que los datos nunca se pierdan.
+- Recuperación automática de bloqueos para operaciones incompletas.
+- Persistencia segura instantánea al éxito de la operación.
+- El cifrado de alta resistencia protege los datos sensibles.
+
+> [!WARNING]
+> **Gestión de Claves**: Cambiar `encryptionKey` hará que los datos antiguos sean ilegibles (a menos que se realice una migración). No codifique claves sensibles; obténgalas de un servidor seguro.
+
 ```dart
-// Renombrado de tabla y campo - reconocimiento automático y preservación de datos
-final db = ToStore(
-      config: DataStoreConfig(
-        enableEncoding: true, // Habilitar codificación segura para datos de tabla
-        encodingKey: 'YouEncodingKey', // Clave de codificación, puede ajustarse arbitrariamente
-        encryptionKey: 'YouEncryptionKey', // Clave de cifrado, nota: cambiar esto impedirá decodificar datos antiguos
-      ),
-    );
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    encryptionConfig: EncryptionConfig(
+      // Algoritmos soportados: none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      encryptionType: EncryptionType.chacha20Poly1305, 
+      
+      // Clave de codificación (debe proporcionarse al inicializar)
+      encodingKey: 'Su-Clave-De-Codificacion-De-32-Bytes...', 
+      
+      // Clave de cifrado para datos críticos
+      encryptionKey: 'Su-Clave-De-Cifrado-Segura...',
+      
+      // Vinculación al dispositivo (Basada en ruta)
+      // Cuando se habilita, las claves se vinculan a la ruta y a las características del dispositivo.
+      // Mejora la seguridad contra la copia de archivos de base de datos.
+      deviceBinding: false, 
+    ),
+    // Registro previo a la escritura (WAL) habilitado por defecto
+    enableJournal: true, 
+    // Forzar el volcado a disco en el commit (desactivar para mayor rendimiento)
+    persistRecoveryOnCommit: true,
+  ),
+);
 ```
 
-## Pruebas de Rendimiento
 
-Tostore 2.0 implementa escalabilidad de rendimiento lineal, cambios fundamentales en procesamiento paralelo, mecanismos de particionamiento y arquitectura distribuida han mejorado significativamente las capacidades de búsqueda de datos, proporcionando tiempos de respuesta de milisegundos incluso con crecimiento masivo de datos. Para procesar grandes conjuntos de datos, la interfaz de consulta en streaming puede procesar volúmenes masivos de datos sin agotar recursos de memoria.
+## Rendimiento y Experiencia
+
+### Especificaciones de Rendimiento
+
+- **Velocidad de Inicio**: Inicio instantáneo incluso con más de 10M de registros en smartphones típicos.
+- **Rendimiento de Consulta**: Independiente de la escala, rendimiento de búsqueda ultrarrápido constante.
+- **Seguridad de Datos**: Garantías de transacción ACID + recuperación ante fallos para cero pérdida de datos.
+
+### Recomendaciones
+
+- 📱 **Proyecto de Ejemplo**: Se proporciona un ejemplo completo de aplicación Flutter en el directorio `example`.
+- 🚀 **Producción**: Utilice el modo Release para un rendimiento muy superior al modo Debug.
+- ✅ **Pruebas Estándar**: Todas las funcionalidades principales han superado las pruebas de integración.
 
 
 
-## Planes Futuros
-Tostore está desarrollando soporte para vectores de alta dimensión para adaptarse al procesamiento de datos multimodales y búsqueda semántica.
+
+Si Tostore le ayuda, por favor danos una ⭐️
 
 
-Nuestro objetivo no es crear una base de datos; Tostore es simplemente un componente extraído del framework Toway para tu consideración. Si estás desarrollando aplicaciones móviles, recomendamos usar el framework Toway con su ecosistema integrado, que cubre la solución full-stack para desarrollo de aplicaciones Flutter. Con Toway, no necesitarás tocar la base de datos subyacente, todas las operaciones de consulta, carga, almacenamiento, caché y visualización de datos serán realizadas automáticamente por el framework.
-Para más información sobre el framework Toway, por favor visita el [repositorio de Toway](https://github.com/tocreator/toway).
 
-## Documentación
 
-Visita nuestra [Wiki](https://github.com/tocreator/tostore) para documentación detallada.
+## Hoja de Ruta (Roadmap)
 
-## Soporte y Retroalimentación
+Tostore está desarrollando activamente características para mejorar la infraestructura de datos en la era de la IA:
 
-- Envía problemas: [GitHub Issues](https://github.com/tocreator/tostore/issues)
-- Únete a la discusión: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-- Contribuye código: [Guía de Contribución](CONTRIBUTING.md)
+- **Vectores de Alta Dimensión**: Añadiendo recuperación de vectores y algoritmos de búsqueda semántica.
+- **Datos Multimodales**: Proporcionando procesamiento de extremo a extremo desde datos brutos hasta vectores de características.
+- **Estructuras de Datos de Grafos**: Soporte para el almacenamiento y consulta eficiente de grafos de conocimiento y redes relacionales complejas.
+
+
+
+
+
+> **Recomendación**: Los desarrolladores móviles también pueden considerar el [Framework Toway](https://github.com/tocreator/toway), una solución full-stack que automatiza las solicitudes de datos, carga, almacenamiento, caché y visualización.
+
+
+
+
+## Recursos Adicionales
+
+- 📖 **Documentación**: [Wiki](https://github.com/tocreator/tostore)
+- 📢 **Feedback**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **Discusión**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
+
 
 ## Licencia
 
-Este proyecto está licenciado bajo la Licencia MIT - consulta el archivo [LICENSE](LICENSE) para más detalles.
+Este proyecto está bajo la Licencia MIT - vea el archivo [LICENSE](LICENSE) para más detalles.
 
 ---
-
-<p align="center">Si encuentras Tostore útil, por favor danos una ⭐️</p>

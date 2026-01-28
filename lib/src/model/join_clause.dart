@@ -43,3 +43,14 @@ class JoinClause {
     return '$joinTypeStr JOIN $table ON $firstKey $operator $secondKey';
   }
 }
+
+/// Internal class to store pending foreign key join requests
+class PendingForeignKeyJoin {
+  final String tableName;
+  final JoinType type;
+
+  PendingForeignKeyJoin({
+    required this.tableName,
+    required this.type,
+  });
+}

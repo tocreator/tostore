@@ -276,4 +276,14 @@ class PlatformHandlerImpl implements PlatformInterface {
       return false;
     }
   }
+
+  @override
+  int get deviceFingerprint {
+    return 0;
+  }
+
+  @override
+  bool get supportsHardwareKeyDerivation {
+    return false;
+  }
 }

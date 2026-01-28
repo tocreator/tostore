@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../core/table_data_manager.dart';
+import '../core/compute_manager.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
@@ -36,7 +37,25 @@ enum MatcherType {
 }
 
 class ValueMatcher {
-  static void sortMapList(
+  /// Asynchronously sorts a list of maps, offloading to an isolate if the list is large.
+  ///
+  /// This prevents UI jank when sorting large datasets on the main thread.
+  static Future<List<Map<String, dynamic>>> sortMapList(
+    List<Map<String, dynamic>> list,
+    List<String> sortFields,
+    List<bool> sortDirections,
+    Map<String, TableSchema> schemas,
+    String mainTableName,
+  ) async {
+    if (list.isEmpty) return list;
+    return await ComputeManager.run(
+      executeSort,
+      SortMessage(list, sortFields, sortDirections, schemas, mainTableName),
+      useIsolate: list.length >= 500,
+    );
+  }
+
+  static void sortMapListWithIsolate(
     List<Map<String, dynamic>> list,
     List<String> sortFields,
     List<bool> sortDirections,
@@ -87,7 +106,9 @@ class ValueMatcher {
       case MatcherType.pkString:
         return (a, b) {
           if (a is String && b is String) {
-            if (a.length != b.length) return a.length.compareTo(b.length);
+            // Dictionary order (lexicographic). This is required for user-defined PKs
+            // to avoid length-first mis-ordering (e.g., 'b' vs 'aa'). Numeric/base62
+            // order is handled by pkNumericString/pkShortCodeString.
             return a.compareTo(b);
           }
           return a.toString().compareTo(b.toString());
@@ -97,6 +118,10 @@ class ValueMatcher {
         return (a, b) {
           // This is the most common case and avoids any type checks below.
           if (a is String && b is String) {
+            // Handle sentinel value \uffff for range scans (MAX value)
+            if (a == '\uffff') return (b == '\uffff') ? 0 : 1;
+            if (b == '\uffff') return -1;
+
             if (a.length != b.length) return a.length.compareTo(b.length);
             return a.compareTo(b);
           }
@@ -106,23 +131,13 @@ class ValueMatcher {
             return (a == b) ? 0 : (a == null ? -1 : 1);
           }
 
-          // Optimized path for mixed types (e.g., String vs BigInt).
-          if (a is String) {
-            // 'a' is already a string, only convert 'b'.
-            final sB = b.toString();
-            if (a.length != sB.length) return a.length.compareTo(sB.length);
-            return a.compareTo(sB);
-          }
-          if (b is String) {
-            // 'b' is already a string, only convert 'a'.
-            final sA = a.toString();
-            if (sA.length != b.length) return sA.length.compareTo(b.length);
-            return sA.compareTo(b);
-          }
-
-          // correctly compare their string representations based on length and content.
           final sA = a.toString();
           final sB = b.toString();
+
+          // Handle sentinel value \uffff for mixed types
+          if (sA == '\uffff') return (sB == '\uffff') ? 0 : 1;
+          if (sB == '\uffff') return -1;
+
           if (sA.length != sB.length) return sA.length.compareTo(sB.length);
           return sA.compareTo(sB);
         };
@@ -395,28 +410,38 @@ class ConditionRecordMatcher {
 
   /// Gets the value for a field from a record, handling prefixed names like 'table.field'.
   static dynamic getFieldValue(Map<String, dynamic> record, String field) {
-    // Direct match
-    if (record.containsKey(field)) {
-      return record[field];
+    // 1. Fast path: Direct match (most common)
+    final val = record[field];
+    if (val != null || record.containsKey(field)) {
+      return val;
     }
-    // Prefixed match, e.g., 'users.name'
-    if (field.contains('.')) {
-      // After joins, keys might be flattened to 'table_field'
-      final parts = field.split('.');
-      final underscoreField = '${parts[0]}_${parts[1]}';
-      if (record.containsKey(underscoreField)) {
-        return record[underscoreField];
+
+    // 2. Handle prefixed path (e.g., 'table.field' OR 'table_field')
+    final dotIndex = field.indexOf('.');
+    if (dotIndex != -1) {
+      final fieldPart = field.substring(dotIndex + 1);
+      final valBase = record[fieldPart];
+      if (valBase != null || record.containsKey(fieldPart)) {
+        return valBase;
       }
-      // Or the key might just be the field name without prefix
-      return record[parts[1]];
+
+      // Try table_field format (common after joins or migrations)
+      final underscored = field.replaceFirst('.', '_');
+      final valUnderscore = record[underscored];
+      if (valUnderscore != null || record.containsKey(underscored)) {
+        return valUnderscore;
+      }
     }
-    // Unprefixed field, but record key might have a prefix
-    // e.g., field is 'name', record key could be 'users.name'
-    for (String key in record.keys) {
-      if (key.endsWith('.$field')) {
+
+    // 3. Last resort: Slower search for any key ending with '.field'
+    // This is only for legacy or complex join results where prefix is unknown.
+    final suffix = '.$field';
+    for (final key in record.keys) {
+      if (key.endsWith(suffix)) {
         return record[key];
       }
     }
+
     return null;
   }
 
@@ -593,6 +618,101 @@ class ConditionRecordMatcher {
       return false;
     }
   }
+
+  /// Extracts primary keys if the condition restricts the query to a specific set of IDs.
+  /// Returns null if the condition is not a simple equality/IN check on the primary key.
+  Set<String>? getPrimaryKeys(String pkField) {
+    return _getPrimaryKeysFromNode(_rootNode, pkField);
+  }
+
+  Set<String>? _getPrimaryKeysFromNode(ConditionNode node, String pkField) {
+    if (node.type == NodeType.leaf) {
+      return _getPrimaryKeysFromLeaf(node.condition, pkField);
+    } else if (node.type == NodeType.and) {
+      // Intersection.
+      // If ANY child restricts PKs, we utilize it.
+      // If multiple restrict, we intersect.
+      Set<String>? current;
+      bool found = false;
+      for (final child in node.children) {
+        final childPks = _getPrimaryKeysFromNode(child, pkField);
+        if (childPks != null) {
+          if (!found) {
+            current = childPks;
+            found = true;
+          } else {
+            current = current!.intersection(childPks);
+          }
+        }
+      }
+      return current;
+    } else if (node.type == NodeType.or) {
+      // Union.
+      // All children MUST restrict PKs. If one doesn't, we can't optimize.
+      final result = <String>{};
+      for (final child in node.children) {
+        final childPks = _getPrimaryKeysFromNode(child, pkField);
+        if (childPks == null) return null; // Unbounded branch
+        result.addAll(childPks);
+      }
+      return result;
+    }
+    return null;
+  }
+
+  Set<String>? _getPrimaryKeysFromLeaf(
+      Map<String, dynamic> condition, String pkField) {
+    if (condition.containsKey(pkField)) {
+      final val = condition[pkField];
+      // Check if value is Map (operator) or direct.
+      if (val is Map) {
+        if (val.containsKey('=')) {
+          return {val['='].toString()};
+        } else if (val.containsKey('IN')) {
+          final list = val['IN'];
+          if (list is List) {
+            return list.map((e) => e.toString()).toSet();
+          }
+        }
+      } else {
+        // implicit =
+        return {val.toString()};
+      }
+    }
+    // Handle complex structure inside leaf (AND/OR keys valid in leaf map)
+    if (condition.containsKey('AND') && condition['AND'] is List) {
+      Set<String>? current;
+      bool found = false;
+      for (final sub in (condition['AND'] as List)) {
+        if (sub is Map<String, dynamic>) {
+          final subPks = _getPrimaryKeysFromLeaf(sub, pkField);
+          if (subPks != null) {
+            if (!found) {
+              current = subPks;
+              found = true;
+            } else {
+              current = current!.intersection(subPks);
+            }
+          }
+        }
+      }
+      return current;
+    } else if (condition.containsKey('OR') && condition['OR'] is List) {
+      final result = <String>{};
+      for (final sub in (condition['OR'] as List)) {
+        if (sub is Map<String, dynamic>) {
+          final subPks = _getPrimaryKeysFromLeaf(sub, pkField);
+          if (subPks == null) return null;
+          result.addAll(subPks);
+        } else {
+          return null;
+        }
+      }
+      return result;
+    }
+
+    return null;
+  }
 }
 
 /// Node type enumeration.
@@ -645,4 +765,28 @@ class ConditionNode {
 
     return copy;
   }
+}
+
+/// Message for offloading sort of Map lists to an isolate.
+class SortMessage {
+  final List<Map<String, dynamic>> list;
+  final List<String> sortFields;
+  final List<bool> sortDirections;
+  final Map<String, TableSchema> schemas;
+  final String mainTableName;
+
+  SortMessage(this.list, this.sortFields, this.sortDirections, this.schemas,
+      this.mainTableName);
+}
+
+/// Static entry point for execution in isolate.
+List<Map<String, dynamic>> executeSort(SortMessage message) {
+  ValueMatcher.sortMapListWithIsolate(
+    message.list,
+    message.sortFields,
+    message.sortDirections,
+    message.schemas,
+    message.mainTableName,
+  );
+  return message.list;
 }

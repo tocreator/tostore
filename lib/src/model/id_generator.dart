@@ -403,8 +403,6 @@ class TimeBasedIdGenerator implements IdGenerator {
 
   /// Refill ID pool - the only entry point for all ID generation
   Future<void> _refillIdPool(int targetCount, int recentTotal) async {
-    final operationId = '${tableName}_id_fill';
-
     // Add duplicate fill check
     if (_idGenerationInProgress[tableName] == true) {
       Logger.debug(
@@ -413,12 +411,23 @@ class TimeBasedIdGenerator implements IdGenerator {
       return;
     }
 
+    bool acquired = false;
+    final lockResource = 'id_refill_$tableName';
+    final operationId = '${tableName}_id_fill';
     try {
       // Mark generation task start - mark before acquiring lock to avoid duplicate requests
       _idGenerationInProgress[tableName] = true;
 
       // Acquire lock to ensure only one thread is generating IDs at the same time
-      await _lockManager.acquireExclusiveLock(operationId, 'id_generator');
+
+      acquired =
+          await _lockManager.acquireExclusiveLock(lockResource, operationId);
+      if (!acquired) {
+        Logger.warn(
+            'Failed to acquire exclusive lock for ID pool refill: $tableName',
+            label: 'TimeBasedIdGenerator._refillIdPool');
+        return;
+      }
 
       try {
         // Ensure ID pool exists
@@ -561,7 +570,9 @@ class TimeBasedIdGenerator implements IdGenerator {
       rethrow; // Re-throw exception for caller to handle
     } finally {
       // Release lock
-      _lockManager.releaseExclusiveLock(operationId, 'id_generator');
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(lockResource, operationId);
+      }
     }
   }
 
@@ -1323,7 +1334,7 @@ class IdGeneratorFactory {
           pkConfig.type,
           config.distributedNodeConfig,
           schema.name,
-          maxConcurrent: config.maxConcurrent,
+          maxConcurrent: config.maxConcurrency,
         );
 
       case PrimaryKeyType.none:
@@ -1331,5 +1342,86 @@ class IdGeneratorFactory {
         throw UnsupportedError(
             'Unsupported primary key generation type: ${pkConfig.type}');
     }
+  }
+}
+
+/// Global ID generator shared by locks, partitions, WAL, migration etc.
+/// Default returns Base62 short string, can switch encoding format via parameter.
+class GlobalIdGenerator {
+  static final Random _random = Random.secure();
+
+  static const int _timestampBits = 41;
+  static const int _sequenceBits = 12;
+
+  static const int _sequenceMask = (1 << _sequenceBits) - 1;
+  static const int _timestampMask = (1 << _timestampBits) - 1;
+
+  static int _lastTimestampMs = 0;
+  static int _sequence = 0;
+
+  /// Generate ID with optional prefix and encoding type.
+  /// [width] - optional fixed width for the random part (padding with 0).
+  ///            If set, result is padded to this length.
+  ///            Default 0 means no padding.
+  static String generate(String prefix, {bool base62 = true, int width = 0}) {
+    final core = base62 ? _nextBase62(width) : _nextDecimal(width);
+    return prefix.isEmpty ? core : '$prefix$core';
+  }
+
+  /// Prefix + optional suffix, and allow specifying encoding type.
+  static String generateWithSuffix(String prefix,
+      {String? suffix, bool base62 = true}) {
+    final base = generate(prefix, base62: base62);
+    if (suffix == null || suffix.isEmpty) return base;
+    return '$base$suffix';
+  }
+
+  static String _nextBase62(int width) {
+    String res = Base62Encoder.encode(BigInt.from(_nextId()));
+    if (width > 0 && res.length < width) {
+      res = res.padLeft(width, '0');
+    }
+    return res;
+  }
+
+  static String _nextDecimal(int width) {
+    String res = _nextId().toString();
+    if (width > 0 && res.length < width) {
+      res = res.padLeft(width, '0');
+    }
+    return res;
+  }
+
+  static int _nextId() {
+    int timestamp = DateTime.now().millisecondsSinceEpoch;
+
+    if (timestamp < _lastTimestampMs) {
+      // Clock went backwards; force monotonicity.
+      timestamp = _lastTimestampMs + 1;
+    }
+
+    if (timestamp == _lastTimestampMs) {
+      _sequence = (_sequence + 1) & _sequenceMask;
+      if (_sequence == 0) {
+        // Sequence overflow within same ms, wait for next millisecond.
+        timestamp = _waitNextMillis(_lastTimestampMs);
+      }
+    } else {
+      // Randomize start sequence a bit to reduce contention under bursts.
+      _sequence = _random.nextInt(4);
+    }
+
+    _lastTimestampMs = timestamp;
+
+    final int timestampPart = (timestamp & _timestampMask) << _sequenceBits;
+    return timestampPart | (_sequence & _sequenceMask);
+  }
+
+  static int _waitNextMillis(int lastTimestamp) {
+    int ts = DateTime.now().millisecondsSinceEpoch;
+    while (ts <= lastTimestamp) {
+      ts = DateTime.now().millisecondsSinceEpoch;
+    }
+    return ts;
   }
 }

@@ -2,6 +2,7 @@ import 'dart:math' show sqrt;
 import 'dart:typed_data';
 import 'dart:convert';
 import '../handler/logger.dart';
+import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
 import '../handler/value_matcher.dart';
 import 'business_error.dart';
@@ -20,6 +21,9 @@ class TableSchema {
   /// Index list
   final List<IndexSchema> indexes;
 
+  /// Foreign key constraints list
+  final List<ForeignKeySchema> foreignKeys;
+
   /// Whether it's a global table
   final bool isGlobal;
 
@@ -32,12 +36,105 @@ class TableSchema {
     required this.primaryKeyConfig,
     required this.fields,
     this.indexes = const [],
+    this.foreignKeys = const [],
     this.isGlobal = false,
     this.tableId,
   });
 
   /// Get primary key name
   String get primaryKey => primaryKeyConfig.name;
+
+  /// Get all indexes (Consolidated list of Explicit, Unique, and FK indexes)
+  List<IndexSchema> getAllIndexes() {
+    final allIndexes = <IndexSchema>[];
+    final existingIndexNames = <String>{};
+    // Track which fields are already the *prefix* of an index
+    // Key: Field Name, Value: Is this field the first field in an index?
+    final fieldIndexPrefixMap = <String, bool>{};
+
+    // 1. Add explicit indexes
+    for (final index in indexes) {
+      if (_isPrimaryKeyOnlyIndex(index)) {
+        Logger.warn(
+          'Table $name contains redundant primary-key index ${index.actualIndexName}; table data is already range-partitioned by PK, ignoring this index.',
+          label: 'TableSchema.getAllIndexes',
+        );
+        continue;
+      }
+      allIndexes.add(index);
+      existingIndexNames.add(index.actualIndexName);
+      if (index.fields.isNotEmpty) {
+        fieldIndexPrefixMap[index.fields.first] = true;
+      }
+    }
+
+    // 2. Add implicit unique indexes
+    for (final field in fields) {
+      // Skip primary key (already handled by storage engine)
+      if (field.name == primaryKey) continue;
+
+      if (field.unique) {
+        // Check if there's already an explicit unique index on this single field
+        final alreadyHasUniqueIndex = indexes.any((i) =>
+            i.unique && i.fields.length == 1 && i.fields.first == field.name);
+
+        if (!alreadyHasUniqueIndex) {
+          // Avoid duplicate names (though unlikely if schema validation is correct)
+          final uniqueIndexSchema = IndexSchema(
+            indexName: field.name,
+            fields: [field.name],
+            unique: true,
+          );
+          if (!existingIndexNames.contains(uniqueIndexSchema.actualIndexName)) {
+            allIndexes.add(uniqueIndexSchema);
+            existingIndexNames.add(uniqueIndexSchema.actualIndexName);
+            fieldIndexPrefixMap[field.name] = true;
+          }
+        }
+      }
+    }
+
+    // 3. Add implicit foreign key indexes
+    for (final fk in foreignKeys) {
+      if (!fk.enabled || !fk.autoCreateIndex) continue;
+
+      // Check if covered
+      bool isCovered = false;
+
+      // Check exact match or prefix match
+      for (final index in allIndexes) {
+        if (index.fields.length >= fk.fields.length) {
+          bool match = true;
+          for (int i = 0; i < fk.fields.length; i++) {
+            if (index.fields[i] != fk.fields[i]) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            isCovered = true;
+            break;
+          }
+        }
+      }
+
+      if (!isCovered) {
+        // Create auto index for FK
+        final fkIndex = IndexSchema(
+          indexName: fk.actualName,
+          fields: fk.fields,
+          unique: false, // FKs are not necessarily unique
+        );
+        if (!existingIndexNames.contains(fkIndex.actualIndexName)) {
+          allIndexes.add(fkIndex);
+          existingIndexNames.add(fkIndex
+              .actualIndexName); // This is approximate, actual comparison handled better structurally
+        }
+      }
+    }
+
+    return allIndexes;
+  }
 
   /// Validate table schema
   bool validateTableSchema() {
@@ -107,20 +204,193 @@ class TableSchema {
       }
     }
 
+    // Validate foreign key configuration
+    for (final fk in foreignKeys) {
+      if (!validateForeignKey(fk)) {
+        return false;
+      }
+    }
+
     return true;
+  }
+
+  /// Validate foreign key configuration
+  ///
+  /// This method validates the foreign key within the current table context.
+  /// For complete validation including referenced table field types, use validateForeignKeyWithReferencedTable.
+  bool validateForeignKey(ForeignKeySchema fk) {
+    // Validate foreign key schema itself
+    if (!fk.validate()) {
+      Logger.error(
+        'Invalid foreign key schema: ${fk.actualName}',
+        label: 'TableSchema.validateForeignKey',
+      );
+      return false;
+    }
+
+    // Validate that foreign key fields exist in this table
+    for (final fieldName in fk.fields) {
+      final fieldExists = fields.any((field) => field.name == fieldName) ||
+          fieldName == primaryKey;
+      if (!fieldExists) {
+        Logger.error(
+          'Foreign key ${fk.actualName} references non-existent field: $fieldName',
+          label: 'TableSchema.validateForeignKey',
+        );
+        return false;
+      }
+    }
+
+    // Validate that foreign key fields are not the same as primary key
+    // (unless it's a self-referencing foreign key, which is allowed)
+    if (fk.fields.length == 1 && fk.fields.first == primaryKey) {
+      // Self-referencing foreign key is allowed
+      return true;
+    }
+
+    return true;
+  }
+
+  /// Validate foreign key configuration with referenced table
+  ///
+  /// This method validates that:
+  /// 1. Foreign key fields exist in this table
+  /// 2. Referenced fields exist in the referenced table
+  /// 3. Field types are compatible between foreign key fields and referenced fields
+  ///
+  /// [fk] The foreign key schema to validate
+  /// [referencedSchema] The schema of the referenced table
+  ///
+  /// Returns true if validation passes, false otherwise
+  bool validateForeignKeyWithReferencedTable(
+    ForeignKeySchema fk,
+    TableSchema referencedSchema,
+  ) {
+    // First validate within current table context
+    if (!validateForeignKey(fk)) {
+      return false;
+    }
+
+    // Validate that referenced fields exist in the referenced table
+    for (final refFieldName in fk.referencedFields) {
+      final refFieldExists = referencedSchema.fields.any(
+            (field) => field.name == refFieldName,
+          ) ||
+          refFieldName == referencedSchema.primaryKey;
+      if (!refFieldExists) {
+        Logger.error(
+          'Foreign key ${fk.actualName} references non-existent field: $refFieldName in table ${fk.referencedTable}',
+          label: 'TableSchema.validateForeignKeyWithReferencedTable',
+        );
+        return false;
+      }
+    }
+
+    // Validate field type compatibility
+    for (int i = 0; i < fk.fields.length; i++) {
+      final fkFieldName = fk.fields[i];
+      final refFieldName = fk.referencedFields[i];
+
+      // Get field schemas
+      FieldSchema? fkField;
+      if (fkFieldName == primaryKey) {
+        // Primary key field - need to check primary key type
+        // For now, we'll skip type validation for primary key fields
+        // as they may have special handling
+        continue;
+      } else {
+        fkField = fields.firstWhere(
+          (f) => f.name == fkFieldName,
+          orElse: () => throw StateError('Field $fkFieldName not found'),
+        );
+      }
+
+      FieldSchema? refField;
+      DataType refFieldType;
+      if (refFieldName == referencedSchema.primaryKey) {
+        // Referenced primary key - primary keys are always stored as text
+        // Get the default data type for primary key
+        refFieldType = referencedSchema.primaryKeyConfig.getDefaultDataType();
+        // Create a virtual FieldSchema for type comparison
+        refField = FieldSchema(
+          name: refFieldName,
+          type: refFieldType,
+        );
+      } else {
+        refField = referencedSchema.fields.firstWhere(
+          (f) => f.name == refFieldName,
+          orElse: () => throw StateError('Field $refFieldName not found'),
+        );
+        refFieldType = refField.type;
+      }
+
+      // Validate type compatibility
+      // Note: fkField and refField are guaranteed to be non-null here due to the logic above
+      if (!_areTypesCompatible(fkField.type, refFieldType)) {
+        Logger.error(
+          'Foreign key ${fk.actualName}: Field type mismatch - $fkFieldName (${fkField.type}) vs $refFieldName (${refFieldType}). '
+          'Foreign key fields must have compatible types with referenced fields. '
+          'Note: Primary keys are stored as text, so numeric types (integer, bigInt, double) can reference them.',
+          label: 'TableSchema.validateForeignKeyWithReferencedTable',
+        );
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /// Check if two data types are compatible for foreign key relationships
+  bool _areTypesCompatible(DataType fkType, DataType refType) {
+    // Exact match is always compatible
+    if (fkType == refType) {
+      return true;
+    }
+
+    // Numeric types are compatible with each other (with some restrictions)
+    final numericTypes = [
+      DataType.integer,
+      DataType.bigInt,
+      DataType.double,
+    ];
+
+    if (numericTypes.contains(fkType) && numericTypes.contains(refType)) {
+      // Integer and BigInt are compatible
+      if ((fkType == DataType.integer || fkType == DataType.bigInt) &&
+          (refType == DataType.integer || refType == DataType.bigInt)) {
+        return true;
+      }
+      // Integer can be stored in Double, but not vice versa
+      if (fkType == DataType.integer && refType == DataType.double) {
+        return true;
+      }
+      // BigInt can be stored in Double (with precision loss warning)
+      if (fkType == DataType.bigInt && refType == DataType.double) {
+        return true;
+      }
+    }
+
+    // Primary keys are stored as text, so numeric types can reference text primary keys
+    // This is a common pattern: user_id (integer) -> users.id (text primary key)
+    if (numericTypes.contains(fkType) && refType == DataType.text) {
+      return true;
+    }
+
+    // Text can reference text (exact match already handled above)
+    // But text cannot reference numeric types (would require parsing, which is error-prone)
+
+    return false;
   }
 
   /// Validate index fields
   bool validateIndexFields(IndexSchema index) {
     final primaryKeyName = primaryKeyConfig.name;
 
-    // check if the index only contains the primary key field and the name is not the primary key index name
-    // the primary key index should be automatically created by the system, should not be manually defined
-    if (index.fields.length == 1 &&
-        index.fields.first == primaryKeyName &&
-        index.actualIndexName != 'pk_$name') {
+    // Primary-key-only index is redundant:
+    // table data itself is range-partitioned by primary key.
+    if (_isPrimaryKeyOnlyIndex(index)) {
       Logger.warn(
-        'Table $name contains redundant primary key index: ${index.actualIndexName}, primary key is automatically indexed',
+        'Table $name contains redundant primary key-only index: ${index.actualIndexName}. Table data is already range-partitioned by primary key.',
         label: 'TableSchema.validateIndexFields',
       );
       // do not return false, because this is just a warning, should not block the table creation
@@ -151,6 +421,7 @@ class TableSchema {
     PrimaryKeyConfig? primaryKeyConfig,
     List<FieldSchema>? fields,
     List<IndexSchema>? indexes,
+    List<ForeignKeySchema>? foreignKeys,
     bool? isGlobal,
     String? tableId,
   }) {
@@ -159,6 +430,7 @@ class TableSchema {
       primaryKeyConfig: primaryKeyConfig ?? this.primaryKeyConfig,
       fields: fields ?? this.fields,
       indexes: indexes ?? this.indexes,
+      foreignKeys: foreignKeys ?? this.foreignKeys,
       isGlobal: isGlobal ?? this.isGlobal,
       tableId: tableId ?? this.tableId,
     );
@@ -170,9 +442,14 @@ class TableSchema {
       'primaryKeyConfig': primaryKeyConfig.toJson(),
       'fields': fields.map((c) => c.toJson()).toList(),
       'indexes': indexes.map((i) => i.toJson()).toList(),
+      'foreignKeys': foreignKeys.map((fk) => fk.toJson()).toList(),
       'isGlobal': isGlobal,
       if (tableId != null) 'tableId': tableId,
     };
+  }
+
+  bool _isPrimaryKeyOnlyIndex(IndexSchema index) {
+    return index.fields.length == 1 && index.fields.first == primaryKey;
   }
 
   factory TableSchema.fromJson(Map<String, dynamic> json) {
@@ -206,6 +483,11 @@ class TableSchema {
           .toList(),
       indexes: (json['indexes'] as List?)
               ?.map((i) => IndexSchema.fromJson(i as Map<String, dynamic>))
+              .toList() ??
+          [],
+      foreignKeys: (json['foreignKeys'] as List?)
+              ?.map(
+                  (fk) => ForeignKeySchema.fromJson(fk as Map<String, dynamic>))
               .toList() ??
           [],
       isGlobal: json['isGlobal'] as bool? ?? false,
@@ -340,6 +622,99 @@ class TableSchema {
     }
   }
 
+  /// Encode primary key as a MemComparable component.
+  ///
+  /// Primary keys are treated as strings to avoid precision overflow while still
+  /// supporting monotonic ordering for numeric/base62-based PKs.
+  Uint8List encodePrimaryKeyComponent(String pk) {
+    switch (getPrimaryKeyMatcherType()) {
+      case MatcherType.pkNumericString:
+      case MatcherType.pkShortCodeString:
+        return MemComparableKey.encodeTextLenFirst(pk);
+      case MatcherType.pkString:
+      default:
+        return MemComparableKey.encodeTextLex(pk);
+    }
+  }
+
+  /// Encode a field value as a MemComparable component.
+  ///
+  /// When [truncateText] is true, long text values are truncated to 256 chars
+  /// (recommended for non-unique indexes).
+  Uint8List? encodeFieldComponentToMemComparable(
+    String fieldName,
+    dynamic value, {
+    required bool truncateText,
+  }) {
+    if (value == null) return null;
+    final mt = getFieldMatcherType(fieldName);
+    switch (mt) {
+      case MatcherType.pkNumericString:
+      case MatcherType.pkShortCodeString:
+        return MemComparableKey.encodeTextLenFirst(value.toString());
+      case MatcherType.pkString:
+      case MatcherType.text:
+      case MatcherType.textNullable:
+      case MatcherType.datetime:
+      case MatcherType.datetimeNullable:
+      case MatcherType.unsupported:
+        var s = value.toString();
+        if (truncateText && s.length > 256) {
+          s = s.substring(0, 256);
+        }
+        return MemComparableKey.encodeTextLex(s);
+      case MatcherType.integer:
+      case MatcherType.integerNullable:
+        final n =
+            (value is num) ? value.toInt() : int.tryParse(value.toString());
+        if (n == null) return MemComparableKey.encodeTextLex(value.toString());
+        return MemComparableKey.encodeInt64(n);
+      case MatcherType.bigInt:
+      case MatcherType.bigIntNullable:
+        final s = value.toString();
+        // Avoid incorrect numeric ordering for negative bigints here; fall back to lex.
+        if (s.startsWith('-')) {
+          return MemComparableKey.encodeTextLex(s);
+        }
+        final asInt = int.tryParse(s);
+        if (asInt != null) return MemComparableKey.encodeInt64(asInt);
+        // Length-first preserves numeric order for non-negative decimal strings.
+        return MemComparableKey.encodeTextLenFirst(s);
+      case MatcherType.double:
+      case MatcherType.doubleNullable:
+        final d = (value is num)
+            ? value.toDouble()
+            : double.tryParse(value.toString());
+        if (d == null) return MemComparableKey.encodeTextLex(value.toString());
+        return MemComparableKey.encodeFloat64(d);
+      case MatcherType.boolean:
+      case MatcherType.booleanNullable:
+        final b = (value is bool)
+            ? value
+            : (value.toString().toLowerCase() == 'true'
+                ? true
+                : (value.toString().toLowerCase() == 'false' ? false : null));
+        if (b == null) return MemComparableKey.encodeTextLex(value.toString());
+        return MemComparableKey.encodeBool(b);
+      case MatcherType.blob:
+      case MatcherType.blobNullable:
+        if (value is Uint8List) return MemComparableKey.encodeBytes(value);
+        return MemComparableKey.encodeTextLex(value.toString());
+    }
+  }
+
+  /// Create a delimiter-free canonical key for unique refs (buffer overlay).
+  ///
+  /// - Does NOT truncate values (unique indexes must preserve full value).
+  dynamic createCanonicalIndexKey(
+    List<String> fields,
+    Map<String, dynamic> record,
+  ) {
+    if (fields.isEmpty) return null;
+    if (fields.length == 1) return record[fields[0]];
+    return fields.map((f) => record[f]).toList();
+  }
+
   /// Check if primary key is ordered type
   bool isPrimaryKeyOrdered() {
     try {
@@ -426,6 +801,15 @@ class TableSchema {
       byteBuffer.addByte(sortedIndexes.length);
       for (final index in sortedIndexes) {
         _addIndexSchemaToBuffer(byteBuffer, index);
+      }
+
+      // Write foreign key information
+      final sortedForeignKeys = List<ForeignKeySchema>.from(schema.foreignKeys)
+        ..sort((a, b) => a.actualName.compareTo(b.actualName));
+
+      byteBuffer.addByte(sortedForeignKeys.length);
+      for (final fk in sortedForeignKeys) {
+        _addForeignKeySchemaToBuffer(byteBuffer, fk);
       }
     }
 
@@ -523,10 +907,9 @@ class TableSchema {
 
   /// Add index schema to buffer
   static void _addIndexSchemaToBuffer(BytesBuilder buffer, IndexSchema index) {
-    _addStringToBuffer(buffer, index.indexName ?? "");
+    _addStringToBuffer(buffer, index.actualIndexName);
     buffer.addByte(index.unique ? 1 : 0);
-    buffer.addByte(index.type.index);
-
+    buffer.addByte(index.type.index); // Keep original type index
     // Index fields
     final sortedIndexFields = List<String>.from(index.fields)..sort();
     buffer.addByte(sortedIndexFields.length);
@@ -535,24 +918,45 @@ class TableSchema {
     }
   }
 
+  /// Add foreign key schema to buffer
+  static void _addForeignKeySchemaToBuffer(
+      BytesBuilder buffer, ForeignKeySchema fk) {
+    _addStringToBuffer(buffer, fk.actualName);
+    _addStringToBuffer(buffer, fk.referencedTable);
+    buffer.addByte(fk.fields.length);
+    for (final field in fk.fields) {
+      _addStringToBuffer(buffer, field);
+    }
+    for (final field in fk.referencedFields) {
+      _addStringToBuffer(buffer, field);
+    }
+    buffer.addByte(fk.onDelete.index);
+    buffer.addByte(fk.onUpdate.index);
+    buffer.addByte(fk.autoCreateIndex ? 1 : 0); // Keep original autoCreateIndex
+    buffer.addByte(fk.enabled ? 1 : 0); // Keep original enabled
+    if (fk.comment != null) {
+      // Keep original comment
+      buffer.addByte(1);
+      _addStringToBuffer(buffer, fk.comment!);
+    } else {
+      buffer.addByte(0);
+    }
+  }
+
   /// Add string to binary buffer
   static void _addStringToBuffer(BytesBuilder buffer, String value) {
     final bytes = utf8.encode(value);
-    buffer.addByte(bytes.length); // Length prefix
+    _addInt32ToBuffer(buffer, bytes.length);
     buffer.add(bytes);
   }
 
   /// Add optional integer to buffer
   static void _addOptionalInt(BytesBuilder buffer, int? value) {
-    if (value == null) {
-      buffer.addByte(0);
-    } else {
+    if (value != null) {
       buffer.addByte(1);
-      // Integer to 4 bytes
-      buffer.addByte((value >> 24) & 0xFF);
-      buffer.addByte((value >> 16) & 0xFF);
-      buffer.addByte((value >> 8) & 0xFF);
-      buffer.addByte(value & 0xFF);
+      _addInt32ToBuffer(buffer, value);
+    } else {
+      buffer.addByte(0);
     }
   }
 
@@ -565,9 +969,6 @@ class TableSchema {
   }
 
   MatcherType getMatcherTypeForIndex(String indexName) {
-    if (indexName == 'pk_$name') {
-      return getPrimaryKeyMatcherType();
-    }
     final index = indexes.firstWhere((i) => i.actualIndexName == indexName,
         orElse: () => const IndexSchema(fields: []));
     if (index.fields.isNotEmpty) {
@@ -2000,5 +2401,309 @@ extension VectorMethods on VectorData {
     final normalizedValues =
         values.map((v) => v / magnitude).toList(growable: false);
     return VectorData(normalizedValues);
+  }
+}
+
+/// ForeignKeyCascadeAction: Foreign key cascade action enum
+///
+/// Define how to handle related records in the child table (referenced table) when the record in the parent table (referenced table) is deleted or updated
+enum ForeignKeyCascadeAction {
+  /// Restrict operation (RESTRICT)
+  ///
+  /// If there are rows referencing this record in the child table, prohibit deleting or updating the record in the parent table
+  /// This is the strictest constraint, ensuring data integrity
+  restrict,
+
+  /// Cascade delete/update (CASCADE)
+  ///
+  /// When the record in the parent table is deleted or updated, automatically delete or update all rows referencing this record in the child table
+  /// For example: when deleting a user, automatically delete all orders of the user
+  cascade,
+
+  /// Set to null (SET NULL)
+  ///
+  /// When the record in the parent table is deleted or updated, set the foreign key field in the child table referencing this record to null
+  /// Note: the foreign key field must allow null
+  setNull,
+
+  /// Set to default value (SET DEFAULT)
+  ///
+  /// When the record in the parent table is deleted or updated, set the foreign key field in the child table referencing this record to default value
+  /// Note: the foreign key field must have a default value
+  setDefault,
+
+  /// No action (NO ACTION)
+  ///
+  /// Similar to RESTRICT, but in some database systems, the check may be delayed until the end of the transaction
+  /// If the constraint is violated, the transaction will be rolled back
+  noAction,
+}
+
+/// ForeignKeySchema: Foreign key constraint configuration
+///
+/// Define the relationship between tables, ensuring reference integrity
+///
+/// Example:
+/// ```dart
+/// // Simple foreign key: order table references user table
+/// ForeignKeySchema(
+///   name: 'fk_order_user',
+///   fields: ['user_id'],
+///   referencedTable: 'users',
+///   referencedFields: ['id'],
+///   onDelete: ForeignKeyCascadeAction.cascade,
+///   onUpdate: ForeignKeyCascadeAction.cascade,
+/// )
+///
+/// // Composite foreign key: order item table references order table and product table
+/// ForeignKeySchema(
+///   name: 'fk_order_item_order',
+///   fields: ['order_id', 'product_id'],
+///   referencedTable: 'orders',
+///   referencedFields: ['id', 'product_id'],
+///   onDelete: ForeignKeyCascadeAction.restrict,
+///   onUpdate: ForeignKeyCascadeAction.cascade,
+/// )
+/// ```
+class ForeignKeySchema {
+  /// Foreign key constraint name (optional, used for identification and management)
+  ///
+  /// If not provided, the system will automatically generate: fk_{table name}_{field name}
+  final String? name;
+
+  /// Fields in this table (child table)
+  ///
+  /// For simple foreign keys, only contains one field name
+  /// For composite foreign keys, contains multiple field names, the order must correspond to referencedFields
+  ///
+  /// Example:
+  /// - Simple foreign key: ['user_id']
+  /// - Composite foreign key: ['order_id', 'product_id']
+  final List<String> fields;
+
+  /// Referenced table name (parent table)
+  final String referencedTable;
+
+  /// Fields in the referenced table (parent table)
+  ///
+  /// Usually the primary key or unique index fields
+  /// The order must correspond to fields, and the field types must be compatible
+  ///
+  /// Example:
+  /// - Simple foreign key: ['id']
+  /// - Composite foreign key: ['id', 'product_id']
+  final List<String> referencedFields;
+
+  /// Cascade action for DELETE operation
+  ///
+  /// When the record in the parent table is deleted, how to handle the related records in the child table
+  /// Default value: restrict (prohibit deletion)
+  final ForeignKeyCascadeAction onDelete;
+
+  /// Cascade action for UPDATE operation
+  ///
+  /// When the record in the parent table is updated, how to handle the related records in the child table
+  /// Default value: restrict (prohibit update)
+  final ForeignKeyCascadeAction onUpdate;
+
+  /// Whether to automatically create index for foreign key fields
+  ///
+  /// Default value: true
+  /// Foreign key fields usually need indexes to improve JOIN query performance
+  final bool autoCreateIndex;
+
+  /// Whether the foreign key constraint is enabled
+  ///
+  /// Default value: true
+  /// Can temporarily disable foreign key constraints (e.g. during data migration)
+  final bool enabled;
+
+  /// Comment for the foreign key constraint
+  final String? comment;
+
+  ForeignKeySchema({
+    this.name,
+    required this.fields,
+    required this.referencedTable,
+    required this.referencedFields,
+    this.onDelete = ForeignKeyCascadeAction.restrict,
+    this.onUpdate = ForeignKeyCascadeAction.restrict,
+    this.autoCreateIndex = true,
+    this.enabled = true,
+    this.comment,
+  })  : assert(
+          fields.isNotEmpty,
+          'Foreign key fields cannot be empty',
+        ),
+        assert(
+          referencedFields.isNotEmpty,
+          'Referenced fields cannot be empty',
+        ),
+        assert(
+          fields.length == referencedFields.length,
+          'Fields and referencedFields must have the same length',
+        );
+
+  /// Get the actual name of the foreign key constraint
+  ///
+  /// If name is provided, use it; otherwise, generate automatically
+  String get actualName {
+    if (name != null && name!.isNotEmpty) {
+      return name!;
+    }
+    // Automatically generate name: fk_{table name}_{field name}
+    final fieldNames = fields.join('_');
+    return 'fk_${fieldNames}';
+  }
+
+  /// Whether it is a composite foreign key (contains multiple fields)
+  bool get isComposite => fields.length > 1;
+
+  /// Create a copy and modify some properties
+  ForeignKeySchema copyWith({
+    String? name,
+    List<String>? fields,
+    String? referencedTable,
+    List<String>? referencedFields,
+    ForeignKeyCascadeAction? onDelete,
+    ForeignKeyCascadeAction? onUpdate,
+    bool? autoCreateIndex,
+    bool? enabled,
+    String? comment,
+  }) {
+    return ForeignKeySchema(
+      name: name ?? this.name,
+      fields: fields ?? this.fields,
+      referencedTable: referencedTable ?? this.referencedTable,
+      referencedFields: referencedFields ?? this.referencedFields,
+      onDelete: onDelete ?? this.onDelete,
+      onUpdate: onUpdate ?? this.onUpdate,
+      autoCreateIndex: autoCreateIndex ?? this.autoCreateIndex,
+      enabled: enabled ?? this.enabled,
+      comment: comment ?? this.comment,
+    );
+  }
+
+  /// Convert to JSON
+  Map<String, dynamic> toJson() {
+    return {
+      if (name != null) 'name': name,
+      'fields': fields,
+      'referencedTable': referencedTable,
+      'referencedFields': referencedFields,
+      'onDelete': onDelete.toString().split('.').last,
+      'onUpdate': onUpdate.toString().split('.').last,
+      'autoCreateIndex': autoCreateIndex,
+      'enabled': enabled,
+      if (comment != null) 'comment': comment,
+    };
+  }
+
+  /// Create from JSON
+  factory ForeignKeySchema.fromJson(Map<String, dynamic> json) {
+    // Parse cascade action
+    ForeignKeyCascadeAction parseCascadeAction(String? value) {
+      if (value == null) return ForeignKeyCascadeAction.restrict;
+      switch (value.toLowerCase()) {
+        case 'restrict':
+          return ForeignKeyCascadeAction.restrict;
+        case 'cascade':
+          return ForeignKeyCascadeAction.cascade;
+        case 'setnull':
+        case 'set_null':
+          return ForeignKeyCascadeAction.setNull;
+        case 'setdefault':
+        case 'set_default':
+          return ForeignKeyCascadeAction.setDefault;
+        case 'noaction':
+        case 'no_action':
+          return ForeignKeyCascadeAction.noAction;
+        default:
+          return ForeignKeyCascadeAction.restrict;
+      }
+    }
+
+    return ForeignKeySchema(
+      name: json['name'] as String?,
+      fields: (json['fields'] as List).cast<String>(),
+      referencedTable: json['referencedTable'] as String,
+      referencedFields: (json['referencedFields'] as List).cast<String>(),
+      onDelete: parseCascadeAction(json['onDelete'] as String?),
+      onUpdate: parseCascadeAction(json['onUpdate'] as String?),
+      autoCreateIndex: json['autoCreateIndex'] as bool? ?? true,
+      enabled: json['enabled'] as bool? ?? true,
+      comment: json['comment'] as String?,
+    );
+  }
+
+  /// Validate the validity of the foreign key configuration
+  ///
+  /// Check the number of fields, name format, etc.
+  bool validate() {
+    // Validate that the field list is not empty
+    if (fields.isEmpty || referencedFields.isEmpty) {
+      return false;
+    }
+
+    // Validate that the number of fields matches
+    if (fields.length != referencedFields.length) {
+      return false;
+    }
+
+    // Validate that the field name format is valid (letters, numbers, underscores)
+    final nameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
+    for (final field in fields) {
+      if (!nameRegex.hasMatch(field)) {
+        return false;
+      }
+    }
+    for (final field in referencedFields) {
+      if (!nameRegex.hasMatch(field)) {
+        return false;
+      }
+    }
+
+    // Validate that the table name format is valid
+    if (!nameRegex.hasMatch(referencedTable)) {
+      return false;
+    }
+
+    // Validate that the foreign key name format is valid (if provided)
+    if (name != null && name!.isNotEmpty && !nameRegex.hasMatch(name!)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  @override
+  String toString() {
+    return 'ForeignKeySchema('
+        'name: $actualName, '
+        'fields: $fields, '
+        'referencedTable: $referencedTable, '
+        'referencedFields: $referencedFields, '
+        'onDelete: $onDelete, '
+        'onUpdate: $onUpdate)';
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! ForeignKeySchema) return false;
+    return actualName == other.actualName &&
+        fields.toString() == other.fields.toString() &&
+        referencedTable == other.referencedTable &&
+        referencedFields.toString() == other.referencedFields.toString();
+  }
+
+  @override
+  int get hashCode {
+    return Object.hash(
+      actualName,
+      fields.toString(),
+      referencedTable,
+      referencedFields.toString(),
+    );
   }
 }

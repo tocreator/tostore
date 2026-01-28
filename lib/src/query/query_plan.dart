@@ -2,13 +2,23 @@ import 'cost_estimator.dart';
 
 /// query plan
 class QueryPlan {
-  final List<QueryOperation> operations;
+  final QueryOperation operation;
 
-  QueryPlan(this.operations);
+  /// The natural scan order produced by this plan (unprefixed field names).
+  ///
+  /// This is used by the executor when the caller does not specify an explicit
+  /// `orderBy`, so that index scans default to index-key order (enabling index-key
+  /// cursors) instead of blindly defaulting to primary-key order.
+  final List<String> naturalOrderBy;
+
+  QueryPlan(
+    this.operation, {
+    List<String>? naturalOrderBy,
+  }) : naturalOrderBy = naturalOrderBy ?? const <String>[];
 
   @override
   String toString() {
-    return 'QueryPlan(operations: ${operations.map((op) => op.toString()).join(', ')})';
+    return 'QueryPlan(operation: ${operation.toString()}, naturalOrderBy: $naturalOrderBy)';
   }
 
   /// estimate execution cost
@@ -16,56 +26,55 @@ class QueryPlan {
     return estimator.estimateCost(this);
   }
 
-  /// add operation
-  void addOperation(QueryOperation operation) {
-    operations.add(operation);
-  }
-
   /// get estimated number of rows
   int estimatedRows(CostEstimator estimator) {
-    return estimator.estimateCardinality(
-      operations.first.value as String,
-      _extractWhereConditions(),
-    );
-  }
-
-  /// extract query conditions
-  Map<String, dynamic>? _extractWhereConditions() {
-    for (var operation in operations) {
-      if (operation.type == QueryOperationType.filter) {
-        return operation.value as Map<String, dynamic>;
-      }
+    final v = operation.value;
+    if (v is Map<String, dynamic>) {
+      final tableName = (v['table'] as String?) ?? '';
+      final where = v['where'] as Map<String, dynamic>?;
+      return estimator.estimateCardinality(tableName, where);
     }
-    return null;
+    return estimator.estimateCardinality('', null);
   }
 
   /// get query plan description
   String explain() {
-    final buffer = StringBuffer();
-    for (var i = 0; i < operations.length; i++) {
-      buffer.writeln('${i + 1}. ${_explainOperation(operations[i])}');
-    }
-    return buffer.toString();
+    return _explainOperation(operation);
   }
 
   /// explain query operation
   String _explainOperation(QueryOperation operation) {
     switch (operation.type) {
       case QueryOperationType.tableScan:
-        return 'TABLE SCAN on ${operation.value}';
+        final v = operation.value;
+        final table = (v is Map<String, dynamic>) ? (v['table'] ?? '') : '';
+        final where = (v is Map<String, dynamic>) ? v['where'] : null;
+        return where == null
+            ? 'TABLE SCAN on $table'
+            : 'TABLE SCAN on $table where: $where';
       case QueryOperationType.indexScan:
-        return 'INDEX SCAN using ${operation.indexName} with conditions: ${operation.value}';
-      case QueryOperationType.primaryKeyScan:
-        return 'PRIMARY KEY SCAN directly locating partition for: ${operation.value}';
-      case QueryOperationType.filter:
-        return 'FILTER by ${operation.value}';
-      case QueryOperationType.sort:
-        return 'SORT by ${operation.value}';
-      case QueryOperationType.join:
-        final joinInfo = operation.value as Map<String, dynamic>;
-        return '${joinInfo['type'].toString().toUpperCase()} JOIN ${joinInfo['table']} ON ${joinInfo['firstKey']} ${joinInfo['operator']} ${joinInfo['secondKey']}';
-      case QueryOperationType.cacheQuery:
-        return 'CACHE QUERY on ${operation.value}';
+        final v = operation.value;
+        final where = (v is Map<String, dynamic>) ? v['where'] : null;
+        return 'INDEX SCAN using ${operation.indexName} with conditions: $where';
+      case QueryOperationType.union:
+        final v = operation.value;
+        final table = (v is Map<String, dynamic>) ? (v['table'] ?? '') : '';
+        final children =
+            (v is Map<String, dynamic>) ? (v['children'] as List?) : null;
+        if (children == null || children.isEmpty) {
+          return 'UNION on $table (empty)';
+        }
+        final buff = StringBuffer();
+        buff.writeln('UNION on $table (');
+        for (final c in children) {
+          if (c is QueryPlan) {
+            buff.writeln('  - ${c.explain()}');
+          } else {
+            buff.writeln('  - $c');
+          }
+        }
+        buff.write(')');
+        return buff.toString();
     }
   }
 }
@@ -99,9 +108,5 @@ class QueryOperation {
 enum QueryOperationType {
   tableScan, // scan all records in the table
   indexScan, // use index to locate partition file
-  primaryKeyScan, // directly use primary key range mapping to locate partition file, skip index retrieval
-  filter, // filter records by conditions
-  sort, // sort records by conditions
-  join, // join tables
-  cacheQuery, // cache query results
+  union, // union results from multiple sub-plans (OR / DNF)
 }

@@ -5,15 +5,20 @@ import 'package:web/web.dart';
 import '../handler/logger.dart';
 import 'dart:convert';
 import '../handler/common.dart';
+import 'yield_controller.dart';
 
 import '../Interface/storage_interface.dart';
-import '../model/file_info.dart';
+import '../model/meta_info.dart';
 
 /// Web platform storage adapter implementation
 class WebStorageImpl implements StorageInterface {
   static final Map<String, WebStorageImpl> _instances = {};
   IDBDatabase? _db;
   final Completer<void> _initCompleter = Completer<void>();
+
+  // In-memory write buffer to simulate OS page cache on web.
+  // Key: normalized path
+  final Map<String, _BufferedEntry> _writeBuffer = {};
 
   // store type
   static const String _fileStore = 'files'; // file storage（meta data）
@@ -106,10 +111,19 @@ class WebStorageImpl implements StorageInterface {
 
       final request = index.getAllKeys(range);
       final allKeys = await _wrapRequest<JSArray>(request);
-      final allPaths = allKeys.toDart
+      final allPathsSet = allKeys.toDart
           .cast<String>()
           .where((key) => !key.contains('.block'))
-          .toList();
+          .toSet();
+
+      // Overlay buffered (unflushed) files so listing reflects in-memory state
+      for (final p in _writeBuffer.keys) {
+        if (p == normalizedPath) continue;
+        if (p == normalizedPath || p.startsWith('$normalizedPath/')) {
+          allPathsSet.add(p);
+        }
+      }
+      final allPaths = allPathsSet.toList();
 
       // if recursive mode, return all paths directly
       if (recursive) {
@@ -153,6 +167,8 @@ class WebStorageImpl implements StorageInterface {
     try {
       if (_db == null) throw Exception('Database not initialized');
       final normalizedPath = _normalizePath(path);
+      // Drop from buffer first
+      _writeBuffer.remove(normalizedPath);
       final transaction =
           _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
       final store = transaction.objectStore(_fileStore);
@@ -196,6 +212,17 @@ class WebStorageImpl implements StorageInterface {
       for (var filePath in filePaths) {
         await deleteFile(filePath);
       }
+
+      // Also remove buffered entries under this directory
+      final toRemove = <String>[];
+      for (final p in _writeBuffer.keys) {
+        if (p.startsWith('$normalizedPath/')) {
+          toRemove.add(p);
+        }
+      }
+      for (final p in toRemove) {
+        _writeBuffer.remove(p);
+      }
     } catch (e) {
       Logger.error('Delete directory failed: $e', label: 'WebStorageImpl');
       rethrow;
@@ -211,6 +238,11 @@ class WebStorageImpl implements StorageInterface {
       if (_db == null) throw Exception('Database not initialized');
 
       final normalizedPath = _normalizePath(path);
+
+      // If there is a pending buffered entry, consider file existing
+      if (_writeBuffer.containsKey(normalizedPath)) {
+        return true;
+      }
 
       final transaction =
           _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
@@ -249,9 +281,15 @@ class WebStorageImpl implements StorageInterface {
       final request =
           index.getAllKeys(range, 1); // limit to only one key for performance
       final keys = await _wrapRequest<JSArray>(request);
-      final exists = keys.toDart.isNotEmpty;
+      final existsOnDisk = keys.toDart.isNotEmpty;
 
-      return exists;
+      if (existsOnDisk) return true;
+
+      // Check buffered entries for any path under this directory
+      for (final p in _writeBuffer.keys) {
+        if (p.startsWith('$normalizedPath/')) return true;
+      }
+      return false;
     } catch (e) {
       Logger.error('Check directory exists failed: $e',
           label: 'WebStorageAdapter');
@@ -287,6 +325,13 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future; // ensure database is initialized
 
     try {
+      // Ensure buffered data is flushed before closing
+      try {
+        await flushAll();
+      } catch (e) {
+        Logger.warn('Flush on close failed: $e', label: 'WebStorageAdapter');
+      }
+
       if (_db == null) throw Exception('Database not initialized');
       _db!.close();
       _instances.remove(_db!.name);
@@ -358,9 +403,14 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
     try {
       final normalizedPath = _normalizePath(path);
+      final buffered = _writeBuffer[normalizedPath];
+      if (buffered != null) {
+        final bytes = buffered.buildBytes();
+        return utf8.decode(bytes);
+      }
       final fileInfo = await _getFileInfo(normalizedPath);
       if (fileInfo == null || fileInfo.data == null) return null;
-      final bytes = List<int>.from(fileInfo.data!);
+      final bytes = _convertDataToList(fileInfo.data);
       return utf8.decode(bytes);
     } catch (e) {
       Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsString');
@@ -371,24 +421,24 @@ class WebStorageImpl implements StorageInterface {
   /// Update writeAsString to store FileInfo
   @override
   Future<void> writeAsString(String path, String content,
-      {bool append = false}) async {
+      {bool append = false,
+      bool flush = true,
+      bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
       if (_db == null) throw Exception('Database not initialized');
       final normalizedPath = _normalizePath(path);
-      String newContent = content;
-      if (append && await existsFile(normalizedPath)) {
-        final existingContent = await readAsString(normalizedPath);
-        if (existingContent != null) {
-          newContent = existingContent + content;
-        }
+      final entry = await _getOrCreateBufferedEntry(normalizedPath,
+          prepareBase: append && !_writeBuffer.containsKey(normalizedPath));
+      final bytes = Uint8List.fromList(utf8.encode(content));
+      if (append) {
+        entry.append(bytes);
+      } else {
+        entry.overwrite(bytes);
       }
-      final meta = _generateFileMeta(normalizedPath, newContent);
-      // Encode the content to bytes using utf8.encode
-      final encoded = utf8.encode(newContent);
-      final fileInfo =
-          FileInfo(path: normalizedPath, meta: meta, data: encoded);
-      await _storeFileInfo(fileInfo);
+      if (flush) {
+        await _flushPath(normalizedPath);
+      }
     } catch (e) {
       Logger.error('Write failed: $e', label: 'WebStorageImpl.writeAsString');
       rethrow;
@@ -397,26 +447,18 @@ class WebStorageImpl implements StorageInterface {
 
   /// Update writeAsBytes to store FileInfo
   @override
-  Future<void> writeAsBytes(String path, Uint8List bytes) async {
+  Future<void> writeAsBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
       if (_db == null) throw Exception('Database not initialized');
       final normalizedPath = _normalizePath(path);
-      final now = DateTime.now();
-      final meta = FileMeta(
-        version: 1,
-        type: _getFileType(normalizedPath),
-        name: _extractFileName(normalizedPath),
-        fileSizeInBytes: bytes.length,
-        totalRecords: 0,
-        timestamps: Timestamps(
-          created: now,
-          modified: now,
-        ),
-        partitions: null,
-      );
-      final fileInfo = FileInfo(path: normalizedPath, meta: meta, data: bytes);
-      await _storeFileInfo(fileInfo);
+      final entry =
+          await _getOrCreateBufferedEntry(normalizedPath, prepareBase: false);
+      entry.overwrite(bytes);
+      if (flush) {
+        await _flushPath(normalizedPath);
+      }
     } catch (e) {
       Logger.error('Write bytes failed: $e',
           label: 'WebStorageImpl.writeAsBytes');
@@ -429,13 +471,89 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
     try {
       final normalizedPath = _normalizePath(path);
+      final buffered = _writeBuffer[normalizedPath];
+      if (buffered != null) {
+        return buffered.buildBytes();
+      }
       final fileInfo = await _getFileInfo(normalizedPath);
       if (fileInfo == null || fileInfo.data == null) return Uint8List(0);
-      final bytes = List<int>.from(fileInfo.data!);
-      return Uint8List.fromList(bytes);
+      return _convertDataToUint8List(fileInfo.data);
     } catch (e) {
-      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsString');
+      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsBytes');
       return Uint8List(0);
+    }
+  }
+
+  @override
+  Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    await _initCompleter.future;
+    try {
+      final normalizedPath = _normalizePath(path);
+      final buffered = _writeBuffer[normalizedPath];
+      Uint8List fullData;
+      if (buffered != null) {
+        fullData = buffered.buildBytes();
+      } else {
+        final fileInfo = await _getFileInfo(normalizedPath);
+        if (fileInfo == null || fileInfo.data == null) return Uint8List(0);
+        fullData = _convertDataToUint8List(fileInfo.data);
+      }
+
+      if (start >= fullData.length) return Uint8List(0);
+
+      final end = length != null
+          ? (start + length > fullData.length
+              ? fullData.length
+              : start + length)
+          : fullData.length;
+
+      return fullData.sublist(start, end);
+    } catch (e) {
+      Logger.error('Read bytes at offset failed: $e', label: 'WebStorageImpl');
+      return Uint8List(0);
+    }
+  }
+
+  @override
+  Future<void> writeAsBytesAt(
+    String path,
+    int start,
+    Uint8List bytes, {
+    bool flush = true,
+    bool closeHandleAfterFlush = false,
+  }) async {
+    if (bytes.isEmpty) return;
+    await writeManyAsBytesAt(
+      path,
+      <ByteWrite>[ByteWrite(offset: start, bytes: bytes)],
+      flush: flush,
+      closeHandleAfterFlush: closeHandleAfterFlush,
+    );
+  }
+
+  @override
+  Future<void> writeManyAsBytesAt(
+    String path,
+    List<ByteWrite> writes, {
+    bool flush = true,
+    bool closeHandleAfterFlush = false,
+  }) async {
+    await _initCompleter.future;
+    if (writes.isEmpty) return;
+    try {
+      if (_db == null) throw Exception('Database not initialized');
+      final normalizedPath = _normalizePath(path);
+      // Random writes require base for correct in-place modification.
+      final entry =
+          await _getOrCreateBufferedEntry(normalizedPath, prepareBase: true);
+      entry.writeManyAt(writes);
+      if (flush) {
+        await _flushPath(normalizedPath);
+      }
+    } catch (e) {
+      Logger.error('Write bytes at offsets failed: $e',
+          label: 'WebStorageImpl.writeManyAsBytesAt');
+      rethrow;
     }
   }
 
@@ -446,15 +564,8 @@ class WebStorageImpl implements StorageInterface {
     try {
       final normalizedSource = _normalizePath(sourcePath);
       final normalizedDest = _normalizePath(targetPath);
-      final fileInfo = await _getFileInfo(normalizedSource);
-      if (fileInfo == null) {
-        throw Exception('Source file not found: $sourcePath');
-      }
-      final newName = _extractFileName(normalizedDest);
-      final newMeta = fileInfo.meta.copyWith(name: newName);
-      final newFileInfo =
-          FileInfo(path: normalizedDest, meta: newMeta, data: fileInfo.data);
-      await _storeFileInfo(newFileInfo);
+      final data = await readAsBytes(normalizedSource);
+      await writeAsBytes(normalizedDest, data, flush: true);
     } catch (e) {
       Logger.error('Copy file failed: $e', label: 'WebStorageImpl.copyFile');
     }
@@ -513,13 +624,11 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
-  // calculate record count
-  int _calculateRecordCount(String content) {
-    return const LineSplitter().convert(content).length;
-  }
-
   @override
   Future<int> getFileSize(String path) async {
+    final normalizedPath = _normalizePath(path);
+    final buffered = _writeBuffer[normalizedPath];
+    if (buffered != null) return buffered.length;
     final meta = await _getFileMeta(path);
     return meta?.fileSizeInBytes ?? 0;
   }
@@ -537,6 +646,9 @@ class WebStorageImpl implements StorageInterface {
 
   @override
   Future<DateTime?> getFileModifiedTime(String path) async {
+    final normalizedPath = _normalizePath(path);
+    final buffered = _writeBuffer[normalizedPath];
+    if (buffered != null) return buffered.modified;
     final meta = await _getFileMeta(path);
     return meta?.timestamps.modified;
   }
@@ -548,33 +660,31 @@ class WebStorageImpl implements StorageInterface {
         .replaceAll(RegExp(r'^/+'), '');
   }
 
-  FileMeta _generateFileMeta(String path, String content) {
-    return FileMeta(
-      version: 1,
-      type: _getFileType(path),
-      name: _extractFileName(path),
-      fileSizeInBytes: calculateUtf8Length(content),
-      totalRecords: _calculateRecordCount(content),
-      timestamps: Timestamps(
-        created: DateTime.now(),
-        modified: DateTime.now(),
-      ),
-      partitions: null,
-    );
-  }
-
   /// extract file name from path
   String _extractFileName(String path) {
     return path.split('/').last.split('.').first;
   }
 
-  Future<bool> validateFile(String path) async {
-    final meta = await _getFileMeta(path);
-    if (meta == null) return false;
+  /// Safely convert FileInfo.data to Uint8List
+  Uint8List _convertDataToUint8List(dynamic data) {
+    if (data is Uint8List) {
+      return data;
+    } else if (data is List) {
+      return Uint8List.fromList(List<int>.from(data));
+    } else {
+      throw Exception('Unexpected data type: ${data.runtimeType}');
+    }
+  }
 
-    final content = await readAsString(path);
-    return content != null &&
-        calculateUtf8Length(content) == meta.fileSizeInBytes;
+  /// Safely convert FileInfo.data to List<int>
+  List<int> _convertDataToList(dynamic data) {
+    if (data is Uint8List) {
+      return data.toList();
+    } else if (data is List) {
+      return List<int>.from(data);
+    } else {
+      throw Exception('Unexpected data type: ${data.runtimeType}');
+    }
   }
 
   // enhance type conversion method
@@ -591,9 +701,12 @@ class WebStorageImpl implements StorageInterface {
     return list.map((e) {
       if (e is JSArray) {
         return Uint8List.fromList(List<int>.from(e.toDart));
+      } else if (e is List) {
+        // Handle regular List as well - recursively convert nested lists
+        return _convertJsList(e);
+      } else if (e is Map) {
+        return _convertJsMap(e);
       }
-      if (e is Map) return _convertJsMap(e);
-      if (e is List) return _convertJsList(e);
       return e;
     }).toList();
   }
@@ -606,6 +719,12 @@ class WebStorageImpl implements StorageInterface {
         if (v is JSArray) {
           // Directly convert JSArray to Uint8List for 'data' field and return immediately
           return MapEntry(key, Uint8List.fromList(List<int>.from(v.toDart)));
+        } else if (v is List) {
+          // Handle regular List as well
+          return MapEntry(key, Uint8List.fromList(List<int>.from(v)));
+        } else if (v is Uint8List) {
+          // Already a Uint8List, return as is
+          return MapEntry(key, v);
         } else {
           return MapEntry(key, v);
         }
@@ -615,16 +734,11 @@ class WebStorageImpl implements StorageInterface {
       // Process other nested structures
       if (value is JSArray) {
         value = Uint8List.fromList(List<int>.from(value.toDart));
+      } else if (value is List) {
+        // For non-data fields, convert nested lists recursively
+        value = _convertJsList(value);
       } else if (value is Map) {
         value = _convertJsMap(value);
-      } else if (value is List) {
-        value = value.map((e) {
-          if (e is Map) return _convertJsMap(e);
-          if (e is JSArray) {
-            return Uint8List.fromList(List<int>.from(e.toDart));
-          }
-          return e;
-        }).toList();
       }
       return MapEntry(key, value);
     });
@@ -655,4 +769,296 @@ class WebStorageImpl implements StorageInterface {
   Future<void> ensureDirectoryExists(String path) async {
     return;
   }
+
+  @override
+  Future<int> appendBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    await _initCompleter.future;
+    try {
+      if (_db == null) throw Exception('Database not initialized');
+      final normalizedPath = _normalizePath(path);
+      final entry =
+          await _getOrCreateBufferedEntry(normalizedPath, prepareBase: true);
+      final offset = entry.length;
+      entry.append(bytes);
+      if (flush) {
+        await _flushPath(normalizedPath);
+      }
+      return offset;
+    } catch (e) {
+      Logger.error('Append bytes failed: $e', label: 'WebStorageImpl');
+      rethrow;
+    }
+  }
+
+  @override
+  Future<int> appendString(String path, String content,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    await _initCompleter.future;
+    try {
+      if (_db == null) throw Exception('Database not initialized');
+      final normalizedPath = _normalizePath(path);
+      final entry =
+          await _getOrCreateBufferedEntry(normalizedPath, prepareBase: true);
+      final offset = entry.length;
+      entry.append(Uint8List.fromList(utf8.encode(content)));
+      if (flush) {
+        await _flushPath(normalizedPath);
+      }
+      return offset;
+    } catch (e) {
+      Logger.error('Append string failed: $e', label: 'WebStorageImpl');
+      rethrow;
+    }
+  }
+
+  @override
+  Future<List<String>> readAsLines(String path, {int offset = 0}) async {
+    await _initCompleter.future;
+    try {
+      final bytes = await readAsBytes(path);
+      if (bytes.isEmpty || offset >= bytes.length) {
+        return [];
+      }
+      final byteStream = Stream.fromIterable([bytes.sublist(offset)]);
+      return utf8.decoder
+          .bind(byteStream)
+          .transform(const LineSplitter())
+          .toList();
+    } catch (e) {
+      Logger.error('Read as lines failed: $e', label: 'WebStorageImpl');
+      return [];
+    }
+  }
+
+  @override
+  Future<void> flushAll(
+      {String? path, List<String>? paths, bool closeHandles = false}) async {
+    await _initCompleter.future;
+    if (_writeBuffer.isEmpty &&
+        path == null &&
+        (paths == null || paths.isEmpty)) return;
+    if (paths != null && paths.isNotEmpty) {
+      final yieldController = YieldController('web_storage_flush_paths');
+      for (final pth in paths) {
+        final normalized = _normalizePath(pth);
+        await _flushPath(normalized);
+        await yieldController.maybeYield();
+      }
+      return;
+    }
+    if (path != null) {
+      final normalized = _normalizePath(path);
+      await _flushPath(normalized);
+      return;
+    }
+    // Flush all dirty entries
+    final yieldController = YieldController('web_storage_flush_all');
+    for (final entry in _writeBuffer.entries.toList()) {
+      if (entry.value.dirty) {
+        await _flushPath(entry.key);
+      }
+      await yieldController.maybeYield();
+    }
+  }
+
+  @override
+  Future<void> configureStorage({int? maxOpenHandles}) async {
+    // No-op for web
+    return;
+  }
+
+  @override
+  Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
+    // Web platform lacks true atomic rename; emulate by copy then delete.
+    await _initCompleter.future;
+    try {
+      final normalizedTmp = _normalizePath(tempPath);
+      final normalizedFinal = _normalizePath(finalPath);
+      final bytes = await readAsBytes(normalizedTmp);
+      await writeAsBytes(normalizedFinal, bytes, flush: true);
+      await deleteFile(normalizedTmp);
+    } catch (e) {
+      Logger.error('replaceFileAtomic (web fallback) failed: $e',
+          label: 'WebStorageImpl');
+      rethrow;
+    }
+  }
+
+  Future<_BufferedEntry> _getOrCreateBufferedEntry(String normalizedPath,
+      {required bool prepareBase}) async {
+    final existing = _writeBuffer[normalizedPath];
+    if (existing != null) return existing;
+    final entry = _BufferedEntry();
+    _writeBuffer[normalizedPath] = entry;
+    if (prepareBase) {
+      final info = await _getFileInfo(normalizedPath);
+      if (info != null && info.data != null) {
+        entry.ensureBase(_convertDataToUint8List(info.data));
+      } else {
+        entry.ensureBase(Uint8List(0));
+      }
+    }
+    return entry;
+  }
+
+  Future<void> _flushPath(String normalizedPath) async {
+    final entry = _writeBuffer[normalizedPath];
+    if (entry == null || !entry.dirty) return;
+    final bytes = entry.buildBytes();
+    final now = DateTime.now();
+    final meta = FileMeta(
+      version: 1,
+      type: _getFileType(normalizedPath),
+      name: _extractFileName(normalizedPath),
+      fileSizeInBytes: bytes.length,
+      timestamps: Timestamps(
+        created: now,
+        modified: now,
+      ),
+    );
+    final fileInfo = FileInfo(path: normalizedPath, meta: meta, data: bytes);
+    await _storeFileInfo(fileInfo);
+    // After flush, release buffered memory to avoid growth; base can be reloaded lazily on next append
+    _writeBuffer.remove(normalizedPath);
+  }
+}
+
+class _BufferedEntry {
+  Uint8List? _base; // persisted or lazily loaded
+  final List<Uint8List> _chunks = [];
+  bool _overwrite = false; // true if write replaces base
+  Uint8List? _materialized; // materialized full bytes for random writes
+  bool dirty = false;
+  DateTime modified = DateTime.now();
+
+  int get length {
+    final mat = _materialized;
+    if (mat != null) return mat.length;
+    final baseLen = _overwrite ? 0 : (_base?.length ?? 0);
+    int chunksLen = 0;
+    for (final c in _chunks) {
+      chunksLen += c.length;
+    }
+    return baseLen + chunksLen;
+  }
+
+  void ensureBase(Uint8List? base) {
+    if (_materialized != null) return;
+    if (_base == null && !_overwrite) {
+      _base = base ?? Uint8List(0);
+    }
+  }
+
+  void append(Uint8List chunk) {
+    final mat = _materialized;
+    if (mat != null) {
+      final oldLen = mat.length;
+      final next = Uint8List(oldLen + chunk.length);
+      next.setRange(0, oldLen, mat);
+      next.setRange(oldLen, oldLen + chunk.length, chunk);
+      _materialized = next;
+      dirty = true;
+      modified = DateTime.now();
+      return;
+    }
+    _chunks.add(chunk);
+    dirty = true;
+    modified = DateTime.now();
+  }
+
+  void overwrite(Uint8List data) {
+    _materialized = Uint8List.fromList(data);
+    _base = null;
+    _chunks.clear();
+    _overwrite = true;
+    dirty = true;
+    modified = DateTime.now();
+  }
+
+  void _ensureMaterialized() {
+    if (_materialized != null) return;
+    _materialized = buildBytes();
+    // Drop chunk/base state to avoid duplication; materialized becomes the source of truth.
+    _base = null;
+    _chunks.clear();
+    _overwrite = true;
+  }
+
+  void writeAt(int offset, Uint8List data) {
+    if (data.isEmpty) return;
+    if (offset < 0) {
+      throw ArgumentError.value(offset, 'offset', 'must be >= 0');
+    }
+    _ensureMaterialized();
+    final buf = _materialized!;
+    final end = offset + data.length;
+    Uint8List out = buf;
+    if (end > buf.length) {
+      out = Uint8List(end);
+      out.setRange(0, buf.length, buf);
+    }
+    out.setRange(offset, end, data);
+    _materialized = out;
+    dirty = true;
+    modified = DateTime.now();
+  }
+
+  void writeManyAt(List<ByteWrite> writes) {
+    if (writes.isEmpty) return;
+    // Deterministic order: sort by offset, stable by original order.
+    final items = <_WebWriteSpan>[];
+    items.addAll(<_WebWriteSpan>[
+      for (int i = 0; i < writes.length; i++)
+        _WebWriteSpan(
+          offset: writes[i].offset,
+          bytes: writes[i].bytes,
+          order: i,
+        ),
+    ]);
+    items.sort((a, b) {
+      final c = a.offset.compareTo(b.offset);
+      return c != 0 ? c : a.order.compareTo(b.order);
+    });
+    int lastEnd = -1;
+    for (final s in items) {
+      if (s.bytes.isEmpty) continue;
+      if (s.offset < 0) {
+        throw ArgumentError.value(s.offset, 'offset', 'must be >= 0');
+      }
+      if (lastEnd >= 0 && s.offset < lastEnd) {
+        throw StateError(
+            'Overlapping write spans: offset=${s.offset} < lastEnd=$lastEnd');
+      }
+      lastEnd = s.offset + s.bytes.length;
+    }
+    for (final s in items) {
+      writeAt(s.offset, s.bytes);
+    }
+  }
+
+  Uint8List buildBytes() {
+    final mat = _materialized;
+    if (mat != null) return mat;
+    final total = length;
+    final out = Uint8List(total);
+    int offset = 0;
+    if (!_overwrite && _base != null && _base!.isNotEmpty) {
+      out.setRange(0, _base!.length, _base!);
+      offset = _base!.length;
+    }
+    for (final c in _chunks) {
+      out.setRange(offset, offset + c.length, c);
+      offset += c.length;
+    }
+    return out;
+  }
+}
+
+final class _WebWriteSpan {
+  final int offset;
+  final Uint8List bytes;
+  final int order;
+  _WebWriteSpan(
+      {required this.offset, required this.bytes, required this.order});
 }

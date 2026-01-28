@@ -17,6 +17,15 @@ class CrontabManager {
   // Main timer
   Timer? _timer;
 
+  // Idle stop timer (one-shot)
+  Timer? _idleTimer;
+
+  // Idle timeout duration (default 30s)
+  Duration _idleTimeout = const Duration(seconds: 30);
+
+  // Last external activity timestamp
+  DateTime _lastActivityAt = DateTime.now();
+
   // Dynamically calculated optimal check interval
   Duration _checkInterval = const Duration(seconds: 3);
 
@@ -38,39 +47,37 @@ class CrontabManager {
     // Check if optimization of check interval is needed
     bool needOptimize = _instance._groups[interval]!.callbacks.length == 1;
 
-    // If manager is not started yet, start it automatically
+    // If manager is not started yet, start it automatically (only when there are tasks)
     if (!_instance._isStarted) {
       start();
-    }
-    // If already started and optimization is needed, re-optimize check interval
-    else if (needOptimize) {
+    } else if (needOptimize) {
+      // If already started and a new group becomes active, re-optimize
       _instance._optimizeCheckInterval();
       _restartTimer();
     }
+    // Treat registration as activity
+    _instance._onActivity();
   }
 
   /// Remove a callback function
   static void removeCallback(ExecuteInterval interval, Function() callback) {
     _instance._groups[interval]!.callbacks.remove(callback);
 
-    // Check if optimization of check interval is needed
-    bool needOptimize = _instance._groups[interval]!.callbacks.isEmpty;
+    if (!_instance._isStarted) return;
 
-    // If optimization is needed and already started, re-optimize check interval
-    if (needOptimize && _instance._isStarted) {
-      _instance._optimizeCheckInterval();
-      _restartTimer();
+    // If no callbacks remain at all, stop the manager to save energy
+    if (!_instance._hasAnyCallbacks()) {
+      stop();
+      return;
     }
+
+    // Otherwise re-optimize check interval since global composition changed
+    _instance._optimizeCheckInterval();
+    _restartTimer();
   }
 
   /// Optimize check interval
   void _optimizeCheckInterval() {
-    // Check if there are tasks with 1-second interval
-    if (_groups[ExecuteInterval.seconds1]!.callbacks.isNotEmpty) {
-      _checkInterval = const Duration(seconds: 1);
-      return;
-    }
-
     // Check if there are active short intervals
     bool hasShortInterval =
         _groups[ExecuteInterval.seconds3]!.callbacks.isNotEmpty ||
@@ -105,6 +112,7 @@ class CrontabManager {
       _instance._timer?.cancel();
       _instance._timer = Timer.periodic(
           _instance._checkInterval, (_) => _instance._processIntervals());
+      _instance._scheduleIdleStop();
     }
   }
 
@@ -112,6 +120,9 @@ class CrontabManager {
   static void start() {
     // If already started, ignore
     if (_instance._isStarted) return;
+
+    // If there are no callbacks, do not start (energy saving)
+    if (!_instance._hasAnyCallbacks()) return;
 
     // Cancel any existing timer
     _instance._timer?.cancel();
@@ -124,6 +135,15 @@ class CrontabManager {
         _instance._checkInterval, (_) => _instance._processIntervals());
 
     _instance._isStarted = true;
+    _instance._scheduleIdleStop();
+  }
+
+  /// Whether there is at least one active callback across all groups
+  bool _hasAnyCallbacks() {
+    for (var group in _groups.values) {
+      if (group.callbacks.isNotEmpty) return true;
+    }
+    return false;
   }
 
   /// Process all intervals
@@ -170,6 +190,8 @@ class CrontabManager {
     _instance._timer?.cancel();
     _instance._timer = null;
     _instance._isStarted = false;
+    _instance._idleTimer?.cancel();
+    _instance._idleTimer = null;
   }
 
   /// Release resources
@@ -180,15 +202,74 @@ class CrontabManager {
     }
   }
 
+  /// External activity signal: keeps scheduler alive and restarts if paused
+  static void notifyActivity() {
+    try {
+      _instance._onActivity();
+    } catch (_) {}
+  }
+
+  /// Optionally customize idle timeout
+  static void setIdleTimeout(Duration timeout) {
+    _instance._idleTimeout = timeout;
+    if (_instance._isStarted) {
+      _instance._scheduleIdleStop();
+    }
+  }
+
+  // Internal: record activity and ensure timer is running
+  void _onActivity() {
+    _lastActivityAt = DateTime.now();
+    if (!_isStarted) {
+      if (_hasAnyCallbacks()) {
+        CrontabManager.start();
+      }
+      return;
+    }
+    _scheduleIdleStop();
+  }
+
+  // Internal: schedule idle stop
+  void _scheduleIdleStop() {
+    if (_idleTimer != null)
+      return; // already scheduled; keep single timer to reduce churn
+    void _arm(Duration d) {
+      _idleTimer = Timer(d, () {
+        _idleTimer = null;
+        final now = DateTime.now();
+        final elapsed = now.difference(_lastActivityAt);
+        if (elapsed >= _idleTimeout) {
+          if (_hasAnyCallbacks()) {
+            // Pause main timer; callbacks remain registered
+            _timer?.cancel();
+            _timer = null;
+            _isStarted = false;
+            return;
+          }
+        }
+        // Not idle long enough; schedule remaining time
+        final remaining = _idleTimeout - elapsed;
+        final safe = remaining.inMilliseconds <= 0
+            ? const Duration(milliseconds: 50)
+            : remaining;
+        _arm(safe);
+      });
+    }
+
+    _arm(_idleTimeout);
+  }
+
   /// Get string representation of interval
   static String _intervalToString(ExecuteInterval interval) {
     switch (interval) {
-      case ExecuteInterval.seconds1:
-        return '1 second';
       case ExecuteInterval.seconds3:
         return '3 seconds';
       case ExecuteInterval.seconds10:
-        return '15 seconds';
+        return '10 seconds';
+      case ExecuteInterval.minutes1:
+        return '1 minute';
+      case ExecuteInterval.minutes5:
+        return '5 minutes';
       case ExecuteInterval.hour1:
         return '1 hour';
       case ExecuteInterval.hour24:
@@ -199,14 +280,17 @@ class CrontabManager {
 
 /// Predefined execution intervals
 enum ExecuteInterval {
-  /// 1-second interval
-  seconds1(Duration(seconds: 1)),
-
   /// 3-second interval
   seconds3(Duration(seconds: 3)),
 
   /// 10-second interval
   seconds10(Duration(seconds: 10)),
+
+  /// 1-minute interval
+  minutes1(Duration(minutes: 1)),
+
+  /// 5-minute interval
+  minutes5(Duration(minutes: 5)),
 
   /// 1-hour interval
   hour1(Duration(hours: 1)),
@@ -245,7 +329,15 @@ class _IntervalGroup {
     final callbacksCopy = List<Function()>.from(callbacks);
     for (var callback in callbacksCopy) {
       try {
-        callback();
+        final result = callback();
+        // If callback returns a Future, schedule it asynchronously to avoid blocking
+        // This is important for async callbacks like weight decay that should not block the timer
+        if (result is Future) {
+          result.catchError((e) {
+            Logger.error('Error executing async callback: $e',
+                label: 'CrontabManager');
+          });
+        }
       } catch (e) {
         Logger.error('Error executing callback: $e', label: 'CrontabManager');
       }

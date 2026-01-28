@@ -13,10 +13,42 @@ class QueryCondition {
   List<String>? _orderBy;
   int? _limit;
   int? _offset;
+  String? _cursor;
 
   /// Create a new query condition builder
   QueryCondition() : _current = ConditionNode(type: NodeType.and) {
     _root.children.add(_current);
+  }
+
+  /// Creates a QueryCondition from a map representation.
+  factory QueryCondition.fromMap(Map<String, dynamic> map) {
+    final qc = QueryCondition();
+    qc._root.children.clear(); // Clear the default initial node.
+    qc._root.children.add(_nodeFromMap(map));
+    qc._current =
+        qc._root; // Set current to the root for further modifications.
+    return qc;
+  }
+
+  static ConditionNode _nodeFromMap(Map<String, dynamic> map) {
+    if (map.containsKey('AND')) {
+      final node = ConditionNode(type: NodeType.and);
+      final conditions = map['AND'] as List;
+      for (final condition in conditions) {
+        node.children.add(_nodeFromMap(condition as Map<String, dynamic>));
+      }
+      return node;
+    } else if (map.containsKey('OR')) {
+      final node = ConditionNode(type: NodeType.or);
+      final conditions = map['OR'] as List;
+      for (final condition in conditions) {
+        node.children.add(_nodeFromMap(condition as Map<String, dynamic>));
+      }
+      return node;
+    } else {
+      // It's a leaf node (a simple condition)
+      return ConditionNode(type: NodeType.leaf, condition: map);
+    }
   }
 
   /// Expose the root for external evaluators
@@ -49,7 +81,7 @@ class QueryCondition {
     copy._orderBy = _orderBy != null ? List.from(_orderBy!) : null;
     copy._limit = _limit;
     copy._offset = _offset;
-
+    copy._cursor = _cursor;
     return copy;
   }
 
@@ -483,10 +515,27 @@ class QueryCondition {
 
   /// Check if the condition is empty
   bool get isEmpty {
-    return _root.children.isEmpty ||
-        (_root.children.length == 1 &&
-            _root.children[0].type != NodeType.leaf &&
-            _root.children[0].children.isEmpty);
+    return !_hasMeaningfulPredicate(_root);
+  }
+
+  /// Determine if the condition tree contains any effective predicate
+  /// (leaf node with non-empty condition, or a custom node).
+  bool _hasMeaningfulPredicate(ConditionNode node) {
+    // A custom node is always meaningful
+    if (node.type == NodeType.custom) {
+      return true;
+    }
+    // A leaf node is meaningful only when it carries a condition
+    if (node.type == NodeType.leaf) {
+      return node.condition.isNotEmpty;
+    }
+    // For AND/OR nodes, check children recursively
+    for (final child in node.children) {
+      if (_hasMeaningfulPredicate(child)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// orWhere condition - add OR logic
@@ -632,6 +681,18 @@ class QueryCondition {
   /// set offset
   QueryCondition offset(int value) {
     _offset = value;
+    if (value > 0) {
+      _cursor = null;
+    }
+    return this;
+  }
+
+  /// set cursor
+  QueryCondition cursor(String? value) {
+    _cursor = value;
+    if (value != null && value.isNotEmpty) {
+      _offset = null;
+    }
     return this;
   }
 
@@ -640,7 +701,8 @@ class QueryCondition {
       List<String>? Function() getOrderBy,
       void Function(List<String>) setOrderBy,
       void Function(int) setLimit,
-      void Function(int) setOffset) {
+      void Function(int) setOffset,
+      void Function(String?) setCursor) {
     if (_orderBy != null && _orderBy!.isNotEmpty) {
       final existingOrderBy = getOrderBy() ?? [];
       existingOrderBy.addAll(_orderBy!);
@@ -653,6 +715,10 @@ class QueryCondition {
 
     if (_offset != null) {
       setOffset(_offset!);
+    }
+
+    if (_cursor != null) {
+      setCursor(_cursor);
     }
   }
 

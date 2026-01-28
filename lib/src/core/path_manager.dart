@@ -1,7 +1,7 @@
 import '../model/data_store_config.dart';
 import '../handler/common.dart';
 import 'data_store_impl.dart';
-import '../model/file_info.dart';
+import '../model/meta_info.dart';
 
 /// path manager
 /// responsible for all file path related operations, including table paths, index paths, data paths, etc.
@@ -32,13 +32,17 @@ class PathManager {
   String get _currentSpaceName => dataStore.currentSpaceName;
 
   /// get space directory path
-  String getSpacePath({String? spaceName}) {
-    return pathJoin(_instancePath, 'spaces', spaceName ?? _currentSpaceName);
+  /// If [rootPath] is provided, build path from that root; otherwise use instance path
+  String getSpacePath({String? rootPath, String? spaceName}) {
+    final String baseRoot = rootPath ?? _instancePath;
+    return pathJoin(baseRoot, 'spaces', spaceName ?? _currentSpaceName);
   }
 
   /// get global table directory path
-  String getGlobalPath() {
-    return pathJoin(_instancePath, 'global');
+  /// If [rootPath] is provided, build path from that root; otherwise use instance path
+  String getGlobalPath({String? rootPath}) {
+    final String baseRoot = rootPath ?? _instancePath;
+    return pathJoin(baseRoot, 'global');
   }
 
   /// get schemas directory path (at root level)
@@ -77,9 +81,23 @@ class PathManager {
   }
 
   /// get space config path
-  String getSpaceConfigPath({String? spaceName}) {
-    final spacePath = getSpacePath(spaceName: spaceName);
+  /// If [rootPath] is provided, build path from that root; otherwise use instance path
+  String getSpaceConfigPath({String? rootPath, String? spaceName}) {
+    final spacePath = getSpacePath(rootPath: rootPath, spaceName: spaceName);
     return pathJoin(spacePath, 'space_config.json');
+  }
+
+  /// Get weight file path
+  String getWeightFilePath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'cache_weights.json');
+  }
+
+  /// get temp directory path under current space
+  /// All crash-safe temporary files are placed here to ensure same filesystem/volume.
+  String getTempDirPath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'tmp');
   }
 
   /// get schema meta file path (database schema metadata)
@@ -88,14 +106,13 @@ class PathManager {
   }
 
   /// get schema partition file path
-  String getSchemaPartitionFilePath(int partitionIndex) {
-    final dirPath = getSchemaPartitionDirPath(partitionIndex);
+  String getSchemaPartitionFilePath(int partitionIndex, int dirIndex) {
+    final dirPath = getSchemaPartitionDirPath(dirIndex);
     return pathJoin(dirPath, 'schema_p$partitionIndex.${FileType.schema.ext}');
   }
 
-  /// get schema partition directory path based on partition index
-  String getSchemaPartitionDirPath(int partitionIndex) {
-    final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
+  /// get schema partition directory path
+  String getSchemaPartitionDirPath(int dirIndex) {
     return pathJoin(getSchemasPath(), 'dir_$dirIndex');
   }
 
@@ -140,37 +157,61 @@ class PathManager {
     return tablePath;
   }
 
-  /// get table data directory path
+  /// get table data root directory path
   Future<String> getDataDirPath(String tableName) async {
     final tablePath = await getTablePath(tableName);
     return pathJoin(tablePath, 'data');
   }
 
-  /// get data meta file path
+  /// get table data main meta file path
   Future<String> getDataMetaPath(String tableName) async {
     final dataPath = await getDataDirPath(tableName);
-    return pathJoin(dataPath, 'main.${FileType.data.ext}');
+    return pathJoin(dataPath, 'meta.json');
   }
 
-  /// get partition directory path
+  /// get table data btree partitions directory path
   Future<String> getPartitionsDirPath(String tableName) async {
     final dataPath = await getDataDirPath(tableName);
-    return pathJoin(dataPath, 'partitions');
+    return pathJoin(dataPath, 'btree');
   }
 
-  /// get partition directory path
-  Future<String> getPartitionDirPath(
-      String tableName, int partitionIndex) async {
+  /// Get table overflow (TOAST-like) directory path.
+  ///
+  /// This directory stores out-of-line large values referenced by pointers in the
+  /// primary B+Tree. We keep it separated from `btree/` so future format evolution
+  /// (heap pages / slotted pages / compression) can be isolated.
+  Future<String> getOverflowDirPath(String tableName) async {
+    final dataPath = await getDataDirPath(tableName);
+    return pathJoin(dataPath, 'overflow');
+  }
+
+  /// Get overflow partition file path by partitionNo.
+  ///
+  /// Deterministic sharding:
+  /// `dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir`
+  Future<String> getOverflowPartitionFilePathByNo(
+      String tableName, int partitionNo) async {
+    final overflowDir = await getOverflowDirPath(tableName);
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    final dirPath = pathJoin(overflowDir, 'dir_$dirIndex');
+    return pathJoin(dirPath, 'p$partitionNo.dat');
+  }
+
+  /// get table data partition directory path
+  Future<String> getPartitionDirPath(String tableName, int dirIndex) async {
     final partitionsPath = await getPartitionsDirPath(tableName);
-    final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
     return pathJoin(partitionsPath, 'dir_$dirIndex');
   }
 
-  /// get partition file path
-  Future<String> getPartitionFilePath(
-      String tableName, int partitionIndex) async {
-    final dirPath = await getPartitionDirPath(tableName, partitionIndex);
-    return pathJoin(dirPath, 'p$partitionIndex.${FileType.data.ext}');
+  /// Get table B+Tree partition file path by partitionNo (new layout).
+  ///
+  /// Deterministic sharding:
+  /// `dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir`
+  Future<String> getPartitionFilePathByNo(
+      String tableName, int partitionNo) async {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    final dirPath = await getPartitionDirPath(tableName, dirIndex);
+    return pathJoin(dirPath, 'p$partitionNo.dat');
   }
 
   /// get table index directory path
@@ -179,87 +220,38 @@ class PathManager {
     return pathJoin(tablePath, 'index');
   }
 
+  /// get index root directory path
+  Future<String> getIndexPath(String tableName, String indexName) async {
+    final indexDirPath = await getIndexDirPath(tableName);
+    return pathJoin(indexDirPath, indexName);
+  }
+
   /// get index meta file path
   Future<String> getIndexMetaPath(String tableName, String indexName) async {
-    final indexPath = await getIndexDirPath(tableName);
-    return pathJoin(indexPath, indexName, '$indexName.meta.json');
+    final indexPath = await getIndexPath(tableName, indexName);
+    return pathJoin(indexPath, 'meta.json');
   }
 
-  /// get index partition directory path
+  /// get index btree partition directory path
   Future<String> getIndexPartitionDirPath(
-      String tableName, String indexName, int partitionIndex) async {
-    final indexPath = await getIndexDirPath(tableName);
-    final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
-    return pathJoin(indexPath, indexName, 'partitions', 'dir_$dirIndex');
+      String tableName, String indexName, int dirIndex) async {
+    final indexPath = await getIndexPath(tableName, indexName);
+    return pathJoin(indexPath, 'btree', 'dir_$dirIndex');
   }
 
-  /// get index partition file path
-  Future<String> getIndexPartitionPath(
-      String tableName, String indexName, int partitionIndex) async {
+  /// Get index B+Tree partition file path by partitionNo (new layout).
+  Future<String> getIndexPartitionPathByNo(
+      String tableName, String indexName, int partitionNo) async {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dirPath =
-        await getIndexPartitionDirPath(tableName, indexName, partitionIndex);
-    return pathJoin(
-        dirPath, '${indexName}_p$partitionIndex.${FileType.idx.ext}');
-  }
-
-  /// get auto increment id file path
-  Future<String> getAutoIncrementPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
-    return pathJoin(tablePath, 'maxid.txt');
+        await getIndexPartitionDirPath(tableName, indexName, dirIndex);
+    return pathJoin(dirPath, 'p$partitionNo.idx');
   }
 
   /// get stats file path
   Future<String> getStatsPath(String tableName) async {
     final tablePath = await getTablePath(tableName);
     return pathJoin(tablePath, 'stats.json');
-  }
-
-  //==================================
-  // WAL path methods (sync methods)
-  //==================================
-
-  /// get WAL root path for a space
-  String getWalRootPath() {
-    return pathJoin(getSpacePath(), 'wal');
-  }
-
-  /// get main WAL meta file path
-  String getMainWalMetaPath() {
-    return pathJoin(getWalRootPath(), 'wal_meta.json');
-  }
-
-  /// get table WAL root path
-  Future<String> getTableWalRootPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
-    return pathJoin(tablePath, 'wal');
-  }
-
-  /// get table WAL meta file path
-  Future<String> getTableWalMetaPath(String tableName) async {
-    final walRootPath = await getTableWalRootPath(tableName);
-    return pathJoin(walRootPath, 'wal_meta.json');
-  }
-
-  /// get table WAL partition directory path
-  Future<String> getTableWalPartitionsDirPath(String tableName) async {
-    final walRootPath = await getTableWalRootPath(tableName);
-    return pathJoin(walRootPath, 'partitions');
-  }
-
-  /// get table WAL partition directory path
-  Future<String> getTableWalPartitionDirPath(
-      String tableName, int partitionIndex) async {
-    final walRootPath = await getTableWalPartitionsDirPath(tableName);
-    final dirIndex = partitionIndex ~/ config.maxEntriesPerDir;
-    return pathJoin(walRootPath, 'dir_$dirIndex');
-  }
-
-  /// get table WAL partition file path
-  Future<String> getTableWalPartitionPath(
-      String tableName, int partitionIndex) async {
-    final dirPath =
-        await getTableWalPartitionDirPath(tableName, partitionIndex);
-    return pathJoin(dirPath, 'wal_$partitionIndex.log');
   }
 
   //==================================
@@ -279,5 +271,150 @@ class PathManager {
   /// get spaces cache root path
   String getSpacesCachePath() {
     return pathJoin(getCacheRootPath(), 'spaces');
+  }
+
+  //==================================
+  // Transaction path methods
+  //==================================
+
+  /// transaction root path in current space
+  String getTransactionRootPath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'transactions');
+  }
+
+  /// transaction main meta file path (track active partitions, next index, etc.)
+  String getTransactionMainMetaPath({String? spaceName}) {
+    return pathJoin(getTransactionRootPath(spaceName: spaceName), 'meta.json');
+  }
+
+  /// transaction directory path by directory shard
+  String getTransactionDirShardPath(int dirIndex, {String? spaceName}) {
+    final root = getTransactionRootPath(spaceName: spaceName);
+    return pathJoin(root, 'dir_$dirIndex');
+  }
+
+  /// transaction partition directory path
+  String getTransactionPartitionDirPath(int dirIndex, int partitionIndex,
+      {String? spaceName}) {
+    final shard = getTransactionDirShardPath(dirIndex, spaceName: spaceName);
+    return pathJoin(shard, 'p$partitionIndex');
+  }
+
+  /// transaction partition log directory path
+  String getTransactionPartitionLogPath(int dirIndex, int partitionIndex,
+      {String? spaceName}) {
+    final dirPath = getTransactionPartitionDirPath(dirIndex, partitionIndex,
+        spaceName: spaceName);
+    return pathJoin(dirPath, 'tx_$partitionIndex.log');
+  }
+
+  /// transaction partition main log file path (append-only), stores all transaction entries
+  /// Note: This method requires dirIndex to be provided. Use TransactionManager to get dirIndex.
+  String getTransactionPartitionLogPathById(String transactionId, int dirIndex,
+      {String? spaceName}) {
+    final pIndex = parseTransactionPartitionIndex(transactionId);
+    return getTransactionPartitionLogPath(dirIndex, pIndex,
+        spaceName: spaceName);
+  }
+
+  /// transaction partition meta file path, tracking counts and finished stats
+  String getTransactionPartitionMetaPath(int dirIndex, int partitionIndex,
+      {String? spaceName}) {
+    final dirPath = getTransactionPartitionDirPath(dirIndex, partitionIndex,
+        spaceName: spaceName);
+    return pathJoin(dirPath, 'meta.json');
+  }
+
+  /// transaction partition status log file path
+  String getTransactionPartitionStatusLogPath(int dirIndex, int partitionIndex,
+      {String? spaceName}) {
+    final dirPath = getTransactionPartitionDirPath(dirIndex, partitionIndex,
+        spaceName: spaceName);
+    return pathJoin(dirPath, 'status.log');
+  }
+
+  /// transaction partition status log file path, append one line per txn state change
+  /// Note: This method requires dirIndex to be provided. Use TransactionManager to get dirIndex.
+  String getTransactionPartitionStatusLogPathById(
+      String transactionId, int dirIndex,
+      {String? spaceName}) {
+    final pIndex = parseTransactionPartitionIndex(transactionId);
+    return getTransactionPartitionStatusLogPath(dirIndex, pIndex,
+        spaceName: spaceName);
+  }
+
+  /// Build a transaction ID encoding partition index for quick location.
+  /// Format: tx-{partitionIndex}-{uniqueSuffix}
+  String buildTransactionId(int partitionIndex, String uniqueSuffix) {
+    return 'tx-$partitionIndex-$uniqueSuffix';
+  }
+
+  /// Parse transaction ID, return partition index; returns -1 if invalid.
+  int parseTransactionPartitionIndex(String transactionId) {
+    try {
+      // Expected format: tx-<partitionIndex>-<suffix>
+      final parts = transactionId.split('-');
+      if (parts.length < 3) return -1;
+      if (parts[0] != 'tx') return -1;
+      return int.tryParse(parts[1]) ?? -1;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  //==================================
+  // WAL path methods
+  //==================================
+
+  /// WAL root path under the current space
+  String getWalRootPath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'wal');
+  }
+
+  /// WAL backup meta file path (stores previous stable WAL meta snapshot)
+  String getWalBackupMetaPath({String? spaceName}) {
+    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.bak.json');
+  }
+
+  /// WAL main meta file path (checkpoint, partition ranges, flags)
+  String getWalMainMetaPath({String? spaceName}) {
+    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.json');
+  }
+
+  /// WAL partition directory shard path
+  String getWalDirShardPath(int dirIndex, {String? spaceName}) {
+    final root = getWalRootPath(spaceName: spaceName);
+    return pathJoin(root, 'dir_$dirIndex');
+  }
+
+  /// WAL partition file path: wal_<partitionIndex>.log
+  String getWalPartitionLogPath(int dirIndex, int partitionIndex,
+      {String? spaceName}) {
+    final dirPath = getWalDirShardPath(dirIndex, spaceName: spaceName);
+    return pathJoin(dirPath, 'wal_$partitionIndex.log');
+  }
+
+  //==================================
+  // Parallel journal (A/B) path methods
+  //==================================
+
+  /// Parallel journal root path under the current space
+  String getParallelJournalRootPath({String? spaceName}) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'parallel_journal');
+  }
+
+  /// Parallel journal A file path
+  String getParallelJournalAPath({String? spaceName}) {
+    return pathJoin(
+        getParallelJournalRootPath(spaceName: spaceName), 'journal_a.log');
+  }
+
+  /// Parallel journal B file path
+  String getParallelJournalBPath({String? spaceName}) {
+    return pathJoin(
+        getParallelJournalRootPath(spaceName: spaceName), 'journal_b.log');
   }
 }

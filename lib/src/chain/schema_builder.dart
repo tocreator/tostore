@@ -19,7 +19,13 @@ class SchemaBuilder with FutureBuilderMixin {
     bool? nullable,
     dynamic defaultValue,
     bool? unique,
+    int? maxLength,
+    int? minLength,
+    num? minValue,
+    num? maxValue,
     String? comment,
+    DefaultValueType? defaultValueType,
+    VectorFieldConfig? vectorConfig,
   }) {
     _operations.add(MigrationOperation(
       type: MigrationType.addField,
@@ -29,7 +35,13 @@ class SchemaBuilder with FutureBuilderMixin {
         nullable: nullable ?? true,
         defaultValue: defaultValue,
         unique: unique ?? false,
+        maxLength: maxLength,
+        minLength: minLength,
+        minValue: minValue,
+        maxValue: maxValue,
         comment: comment,
+        defaultValueType: defaultValueType ?? DefaultValueType.none,
+        vectorConfig: vectorConfig,
       ),
     ));
     return this;
@@ -67,6 +79,7 @@ class SchemaBuilder with FutureBuilderMixin {
     num? maxValue,
     String? comment,
     DefaultValueType? defaultValueType,
+    VectorFieldConfig? vectorConfig,
   }) {
     _operations.add(MigrationOperation(
       type: MigrationType.modifyField,
@@ -83,25 +96,28 @@ class SchemaBuilder with FutureBuilderMixin {
         minValue: minValue,
         maxValue: maxValue,
         defaultValueType: defaultValueType,
+        vectorConfig: vectorConfig,
       ),
     ));
     return this;
   }
 
   /// Add index
-  SchemaBuilder addIndex(
-    String name, {
+  SchemaBuilder addIndex({
     required List<String> fields,
+    String? indexName,
     bool? unique,
     IndexType type = IndexType.btree,
+    VectorIndexConfig? vectorConfig,
   }) {
     _operations.add(MigrationOperation(
       type: MigrationType.addIndex,
       index: IndexSchema(
-        indexName: name,
+        indexName: indexName,
         fields: fields,
         unique: unique ?? false,
         type: type,
+        vectorConfig: vectorConfig,
       ),
     ));
     return this;
@@ -141,6 +157,84 @@ class SchemaBuilder with FutureBuilderMixin {
     _operations.add(MigrationOperation(
       type: MigrationType.setPrimaryKeyConfig,
       primaryKeyConfig: config,
+    ));
+    return this;
+  }
+
+  /// Add foreign key to table
+  SchemaBuilder addForeignKey({
+    String? name,
+    required List<String> fields,
+    required String referencedTable,
+    required List<String> referencedFields,
+    ForeignKeyCascadeAction onDelete = ForeignKeyCascadeAction.restrict,
+    ForeignKeyCascadeAction onUpdate = ForeignKeyCascadeAction.restrict,
+    bool autoCreateIndex = true,
+    bool enabled = true,
+    String? comment,
+  }) {
+    _operations.add(MigrationOperation(
+      type: MigrationType.addForeignKey,
+      foreignKey: ForeignKeySchema(
+        name: name,
+        fields: fields,
+        referencedTable: referencedTable,
+        referencedFields: referencedFields,
+        onDelete: onDelete,
+        onUpdate: onUpdate,
+        autoCreateIndex: autoCreateIndex,
+        enabled: enabled,
+        comment: comment,
+      ),
+    ));
+    return this;
+  }
+
+  /// Remove foreign key from table
+  SchemaBuilder removeForeignKey(String foreignKeyName) {
+    _operations.add(MigrationOperation(
+      type: MigrationType.removeForeignKey,
+      foreignKeyName: foreignKeyName,
+    ));
+    return this;
+  }
+
+  /// Modify foreign key properties
+  ///
+  /// Note: Core definitions (fields, referencedTable, referencedFields) cannot be modified.
+  /// If these need to change, remove the old foreign key and add a new one.
+  ///
+  /// The actual modification will be done in migration manager during execution,
+  /// which will load the current schema and merge old FK with new properties.
+  SchemaBuilder modifyForeignKey({
+    required String foreignKeyName,
+    ForeignKeyCascadeAction? onDelete,
+    ForeignKeyCascadeAction? onUpdate,
+    bool? enabled,
+    bool? autoCreateIndex,
+    String? comment,
+  }) {
+    // Store modification parameters - will be applied during migration execution
+    // The migration manager will load the current schema and merge properties
+    _operations.add(MigrationOperation(
+      type: MigrationType.modifyForeignKey,
+      foreignKeyName: foreignKeyName,
+      // Note: The new foreign key will be constructed during execution
+      // by loading current schema and merging old FK with new properties
+      // We store a partial FK with only the properties to modify
+      foreignKey: ForeignKeySchema(
+        name: foreignKeyName, // Use name to identify the FK
+        fields: [], // Will be filled from old FK during execution
+        referencedTable: '', // Will be filled from old FK during execution
+        referencedFields: [], // Will be filled from old FK during execution
+        onDelete: onDelete ??
+            ForeignKeyCascadeAction.restrict, // Use provided or default
+        onUpdate: onUpdate ??
+            ForeignKeyCascadeAction.restrict, // Use provided or default
+        enabled: enabled ?? true, // Use provided or default
+        autoCreateIndex: autoCreateIndex ?? true, // Use provided or default
+        comment: comment, // Use provided or null
+      ),
     ));
     return this;
   }

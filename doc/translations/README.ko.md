@@ -3,346 +3,644 @@
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | 한국어 | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![Build Status](https://github.com/tocreator/tostore/workflows/build/badge.svg)](https://github.com/tocreator/tostore/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
-Tostore는 프로젝트에 깊이 통합된, 크로스 플랫폼 분산 아키텍처 데이터베이스 엔진입니다. 뉴럴 네트워크에서 영감을 받은 데이터 처리 모델은 뇌와 유사한 데이터 관리를 구현합니다. 다중 파티션 병렬 처리 메커니즘과 노드 상호 연결 토폴로지는 지능형 데이터 네트워크를 구축하는 한편, Isolate를 이용한 병렬 처리는 멀티코어 성능을 최대한 활용합니다. 다양한 분산 기본 키 알고리즘과 무제한 노드 확장으로 분산 컴퓨팅 인프라와 대규모 데이터 훈련을 위한 데이터 레이어 역할을 할 수 있으며, 엣지 디바이스에서 클라우드 서버까지 끊김 없는 데이터 흐름을 가능하게 합니다. 정확한 스키마 변경 감지, 지능형 마이그레이션, ChaCha20Poly1305 암호화, 다중 공간 아키텍처와 같은 기능들은 모바일 앱부터 서버 사이드 시스템까지 다양한 응용 시나리오를 완벽하게 지원합니다.
 
-## Tostore를 선택해야 하는 이유?
+## 왜 Tostore를 선택해야 할까요?
 
-### 1. 파티션 병렬 처리 vs. 단일 파일 저장
-| Tostore | 전통적인 데이터베이스 |
-|:---------|:-----------|
-| ✅ 지능형 파티셔닝 엔진, 데이터를 적절한 크기의 여러 파일로 분산 | ❌ 단일 데이터 파일에 저장, 데이터 증가에 따른 선형적 성능 저하 |
-| ✅ 관련 파티션 파일만 읽음, 전체 데이터 볼륨과 분리된 쿼리 성능 | ❌ 단일 레코드 쿼리에도 전체 데이터 파일 로드 필요 |
-| ✅ TB급 데이터 볼륨에서도 밀리초 단위 응답 시간 유지 | ❌ 모바일 기기에서 데이터가 5MB를 초과할 경우 읽기/쓰기 지연 시간 크게 증가 |
-| ✅ 총 데이터 볼륨이 아닌 조회된 데이터 양에 비례하는 자원 소비 | ❌ 제한된 자원을 가진 기기는 메모리 압박과 OOM 오류에 취약 |
-| ✅ Isolate 기술로 진정한 멀티코어 병렬 처리 가능 | ❌ 단일 파일은 병렬 처리할 수 없어 CPU 자원 낭비 |
+Tostore는 Dart/Flutter 생태계에서 유일한 고성능 분산형 벡터 데이터베이스 스토리지 엔진입니다. 신경망 방식의 아키텍처를 채택하여 노드 간 지능형 상호 연결 및 협업이 가능하며, 무제한 노드 수평 확장을 지원하여 유연한 데이터 토폴로지 네트워크를 구축합니다. 정밀한 테이블 구조 변경 식별, 암호화 보호 및 멀티 스페이스 데이터 격리를 제공하며, 멀티코어 CPU를 충분히 활용하여 극한의 병렬 처리를 구현합니다. 모바일 에지 장치부터 클라우드까지의 크로스 플랫폼 협업을 기본적으로 지원하며, 다양한 분산 기본 키 알고리즘을 갖추고 있어 몰입형 가상 현실 융합, 멀티모달 상호 작용, 공간 컴퓨팅, 생성형 AI, 시맨틱 벡터 공간 모델링 등의 시나리오에 강력한 데이터 기반을 제공합니다.
 
-### 2. 임베디드 통합 vs. 독립 데이터 저장소
-| Tostore | 전통적인 데이터베이스 |
-|:---------|:-----------|
-| ✅ Dart 언어 사용, Flutter/Dart 프로젝트와 완벽하게 통합 | ❌ SQL 또는 특정 쿼리 언어 학습 필요, 학습 곡선 증가 |
-| ✅ 동일한 코드가 프론트엔드와 백엔드 지원, 기술 스택 전환 불필요 | ❌ 프론트엔드와 백엔드에 종종 다른 데이터베이스와 접근 방식 필요 |
-| ✅ 현대적 프로그래밍 스타일에 맞는 체인 API 스타일, 뛰어난 개발자 경험 | ❌ SQL 문자열 연결은 공격과 오류에 취약, 타입 안전성 부족 |
-| ✅ 반응형 프로그래밍 지원, UI 프레임워크와 자연스럽게 결합 | ❌ UI와 데이터 레이어를 연결하기 위한 추가 어댑터 레이어 필요 |
-| ✅ 복잡한 ORM 매핑 설정 불필요, Dart 객체 직접 사용 | ❌ 객체-관계형 매핑 복잡성, 높은 개발 및 유지 관리 비용 |
+생성형 AI와 공간 컴퓨팅이 계산의 중심을 에지로 이동시킴에 따라, 단말 장치는 단순한 콘텐츠 디스플레이에서 로컬 생성, 환경 인지 및 실시간 의사 결정의 핵심으로 진화하고 있습니다. 기존의 단일 파일 임베디드 데이터베이스는 아키텍처 설계상의 한계로 인해 높은 동시 쓰기, 대규모 벡터 검색 및 클라우드-에지 협업 생성과 같은 지능형 애플리케이션의 극한 응답 요구 사항을 지원하기 어려운 경우가 많습니다. Tostore는 에지 장치를 위해 태어났으며, 복잡한 AI 로컬 생성과 대규모 데이터 흐름을 지원하기에 충분한 분산 스토리지 기능을 에지 측에 부여하여 클라우드와 에지의 진정한 심층 협업을 실현합니다.
 
-### 3. 정확한 스키마 변경 감지 vs. 수동 마이그레이션 관리
-| Tostore | 전통적인 데이터베이스 |
-|:---------|:-----------|
-| ✅ 자동으로 스키마 변경 감지, 버전 번호 관리 불필요 | ❌ 수동 버전 제어 및 명시적 마이그레이션 코드 의존 |
-| ✅ 밀리초 수준의 테이블/필드 변경 감지 및 자동 데이터 마이그레이션 | ❌ 버전 간 업데이트를 위한 마이그레이션 로직 유지 필요 |
-| ✅ 테이블/필드 이름 변경 정확히 식별, 모든 히스토리 데이터 보존 | ❌ 테이블/필드 이름 변경은 데이터 손실 초래 가능 |
-| ✅ 데이터 일관성을 보장하는 원자적 마이그레이션 작업 | ❌ 마이그레이션 중단은 데이터 불일치 초래 가능 |
-| ✅ 수동 개입 없는 완전 자동화된 스키마 업데이트 | ❌ 복잡한 업데이트 로직, 버전 증가에 따른 높은 유지 관리 비용 |
+**정전 및 충돌에 강함**: 예기치 않은 정전이나 애플리케이션 충돌이 발생하더라도 데이터는 자동으로 복구되어 진정한 데이터 손실 제로를 실현합니다. 데이터 작업에 대한 응답이 있을 때 데이터는 이미 안전하게 저장되어 있으므로 데이터 손실 위험을 걱정할 필요가 없습니다.
 
-### 4. 다중 공간 아키텍처 vs. 단일 저장 공간
-| Tostore | 전통적인 데이터베이스 |
-|:---------|:-----------|
-| ✅ 다중 공간 아키텍처, 다른 사용자의 데이터 완벽히 격리 | ❌ 단일 저장 공간, 여러 사용자의 데이터 혼합 저장 |
-| ✅ 한 줄의 코드로 공간 전환, 간단하고 효과적 | ❌ 여러 데이터베이스 인스턴스 또는 복잡한 격리 로직 필요 |
-| ✅ 유연한 공간 격리 메커니즘 및 글로벌 데이터 공유 | ❌ 사용자 데이터 격리와 공유 간의 균형 유지 어려움 |
-| ✅ 공간 간 데이터 복사 또는 마이그레이션을 위한 간단한 API | ❌ 테넌트 마이그레이션 또는 데이터 복사를 위한 복잡한 작업 |
-| ✅ 쿼리가 자동으로 현재 공간으로 제한, 추가 필터링 불필요 | ❌ 다른 사용자에 대한 쿼리는 복잡한 필터링 필요 |
+**성능의 한계 돌파**: 실제 테스트 결과, 일반 스마트폰에서도 1,000만 건의 데이터량에서 즉시 실행되며 쿼리 결과가 순식간에 표시됩니다. 데이터 양에 관계없이 기존 데이터베이스를 훨씬 능가하는 부드러운 경험을 즐길 수 있습니다.
 
 
 
 
+...... 손끝에서 클라우드 애플리케이션까지, Tostore는 데이터 연산력을 해방하고 미래를 지원합니다 ......
 
-## 기술적 하이라이트
 
-- 🌐 **투명한 크로스 플랫폼 지원**:
-  - 웹, Linux, Windows, 모바일, Mac 플랫폼에서 일관된 경험
-  - 통합 API 인터페이스, 번거로움 없는 크로스 플랫폼 데이터 동기화
-  - 다양한 크로스 플랫폼 스토리지 백엔드(IndexedDB, 파일 시스템 등)에 자동 적응
-  - 엣지 컴퓨팅에서 클라우드까지 끊김 없는 데이터 흐름
 
-- 🧠 **뉴럴 네트워크에서 영감을 받은 분산 아키텍처**:
-  - 상호 연결된 노드의 뉴럴 네트워크 같은 토폴로지
-  - 분산 처리를 위한 효율적인 데이터 파티셔닝 엔진
-  - 동적 지능형 워크로드 밸런싱
-  - 무제한 노드 확장 지원, 복잡한 데이터 네트워크 구축 용이
 
-- ⚡ **결정적인 병렬 처리 능력**:
-  - Isolate를 이용한 진정한 병렬 읽기/쓰기, 멀티코어 CPU 완전 활용
-  - 다중 작업 효율성 증대를 위해 협력하는 다중 노드 컴퓨팅 네트워크
-  - 자원 인식 분산 처리 프레임워크, 자동 성능 최적화
-  - 대규모 데이터셋 처리에 최적화된 스트리밍 쿼리 인터페이스
+## Tostore의 특징
 
-- 🔑 **다양한 분산 기본 키 알고리즘**:
-  - 순차적 증가 알고리즘 - 자유롭게 조정 가능한 무작위 스텝 길이
-  - 타임스탬프 기반 알고리즘 - 고성능 병렬 실행 시나리오에 이상적
-  - 날짜 접두사 알고리즘 - 시간 범위 표시가 있는 데이터에 적합
-  - 짧은 코드 알고리즘 - 간결한 고유 식별자
+- 🌐 **모든 플랫폼 완벽 지원**
+  - 모바일 앱부터 클라우드 서버까지, 하나의 코드로 모든 플랫폼에서 동작.
+  - 플랫폼별 스토리지 백엔드(IndexedDB, 파일 시스템 등)에 지능적으로 적응.
+  - 통합 API 인터페이스로 크로스 플랫폼 데이터 동기화 걱정 해결.
+  - 에지 장치에서 클라우드 서버까지 원활한 데이터 흐름.
+  - 에지 장치 로컬 벡터 계산을 통한 네트워크 지연 및 클라우드 의존성 감소.
 
-- 🔄 **지능형 스키마 마이그레이션**:
-  - 테이블/필드 이름 변경 동작 정확히 식별
-  - 스키마 변경 중 자동 데이터 업데이트 및 마이그레이션
-  - 다운타임 없는 업데이트, 비즈니스 운영에 영향 없음
-  - 데이터 손실 방지하는 안전한 마이그레이션 전략
+- 🧠 **신경망 방식 분산 아키텍처**
+  - 노드 간 상호 연결된 신경망형 토폴로지 구조로 효율적인 데이터 흐름 구성.
+  - 고성능 데이터 파티셔닝 메커니즘을 통한 진정한 분산 처리 구현.
+  - 지능형 동적 워크로드 밸런싱으로 리소스 활용 극대화.
+  - 노드 무제한 수평 확장을 통해 복잡한 데이터 네트워크를 쉽게 구축.
 
-- 🛡️ **엔터프라이즈급 보안**:
-  - 민감한 데이터 보호를 위한 ChaCha20Poly1305 암호화 알고리즘
-  - 저장 및 전송 데이터 보안 보장하는 엔드투엔드 암호화
-  - 세분화된 데이터 접근 제어
+- ⚡ **극한의 병렬 처리 능력**
+  - Isolate를 통한 진정한 병렬 읽기/쓰기 구현, 멀티코어 CPU 최대 속도 가동.
+  - 지능형 리소스 스케줄링으로 부하를 자동 분산하고 멀티코어 성능을 최대화.
+  - 멀티 노드 컴퓨팅 네트워크의 협업을 통해 작업 처리 효율 배가.
+  - 리소스 인식 스케줄링 프레임워크가 실행 계획을 자동 최적화하여 리소스 경합 방지.
+  - 스트리밍 쿼리 인터페이스로 대규모 데이터 세트를 쉽게 처리.
 
-- 🚀 **지능형 캐싱 및 검색 성능**:
-  - 효율적인 데이터 검색을 위한 다중 레벨 지능형 캐시 엔진
-  - 앱 시작 속도를 크게 향상시키는 부팅 캐시
-  - 캐시와 깊이 통합된 스토리지 엔진, 추가 동기화 코드 불필요
-  - 증가하는 데이터에도 안정적 성능 유지하는 적응형 스케일링
+- 🔑 **다양한 분산 기본 키 알고리즘**
+  - 순차 증가 알고리즘 - 무작위 단계 길이를 자유롭게 조정하여 비즈니스 규모 은폐 가능.
+  - 타임스탬프 기반 알고리즘 - 고동시성 시나리오를 위한 최적의 선택.
+  - 날짜 접두사 알고리즘 - 시간 범위 데이터 표시 완벽 지원.
+  - 단축 코드 알고리즘 - 짧고 읽기 쉬운 고유 식별자 생성.
 
-- 🔄 **혁신적인 워크플로우**:
-  - 다중 공간 데이터 격리, 다중 테넌트, 다중 사용자 시나리오 완벽 지원
-  - 컴퓨팅 노드 간 지능형 워크로드 할당
-  - 대규모 데이터 훈련 및 분석을 위한 견고한 데이터베이스 제공
-  - 자동 데이터 저장, 지능형 업데이트 및 삽입
+- 🔄 **지능형 스키마 마이그레이션 및 데이터 무결성**
+  - 테이블 필드 이름 변경을 정밀하게 식별하여 데이터 손실 제로 달성.
+  - 밀리초 단위의 자동 스키마 변경 감지 및 데이터 마이그레이션 완료.
+  - 서비스 중단 없는 업그레이드(Zero Downtime), 비즈니스 무중단 유지.
+  - 복잡한 구조 변경에 대한 안전한 마이그레이션 전략 제공.
+  - 외래 키 제약 조건 자동 검증 및 캐스케이드(연쇄) 작업 지원으로 참조 무결성 확보.
 
-- 💼 **개발자 경험 우선**:
-  - 상세한 이중 언어 문서 및 코드 주석(중국어 및 영어)
-  - 풍부한 디버깅 정보 및 성능 지표
-  - 내장된 데이터 검증 및 손상 복구 기능
-  - 즉시 사용 가능한 제로 구성, 빠른 시작
+- 🛡️ **엔터프라이즈급 데이터 보안 및 지속성**
+  - 이중 보호 메커니즘: 데이터 변경 사항을 실시간으로 기록하여 손실 방지.
+  - 자동 충돌 복구: 예기치 않은 정전이나 충돌 후 완료되지 않은 작업을 자동 복구하여 데이터 손실 제로.
+  - 데이터 일관성 보장: 여러 작업이 모두 성공하거나 모두 롤백되어 데이터 정확성 유지.
+  - 원자적 계산 업데이트: 표현식(Expression) 시스템이 복잡한 계산을 원자적으로 실행하여 동시성 충돌 방지.
+  - 즉각적인 안전 저장: 작업 성공 응답 시 데이터가 이미 안전하게 저장되어 대기 시간 불필요.
+  - 고강도 ChaCha20Poly1305 암호화 알고리즘으로 민감한 데이터 보호.
+  - 스토리지부터 전송까지 전 과정을 보호하는 엔드 투 엔드 암호화.
+
+- 🚀 **지능형 캐싱 및 검색 성능**
+  - 다계층 지능형 캐싱 메커니즘을 통한 초고속 데이터 검색.
+  - 스토리지 엔진과 깊이 통합된 캐싱 전략.
+  - 데이터 규모 증가에도 안정적인 성능을 유지하는 적응형 확장성.
+  - 실시간 데이터 변경 알림 및 쿼리 결과 자동 업데이트.
+
+- 🔄 **지능형 데이터 워크플로우**
+  - 멀티 스페이스 아키텍처를 통한 데이터 격리 및 글로벌 공유 동시 지원.
+  - 컴퓨팅 노드 간의 지능형 워크로드 분산.
+  - 대규모 데이터 훈련 및 분석을 위한 견고한 기반 제공.
+
+
+## 설치
+
+> [!IMPORTANT]
+> **v2.x에서 업그레이드하시겠습니까?** 중요한 마이그레이션 단계 및 주요 변경 사항은 [v3.0 업그레이드 가이드](../UPGRADE_GUIDE_v3.md)를 참조하세요.
+
+`pubspec.yaml`에 `tostore` 의존성을 추가하세요:
+
+```yaml
+dependencies:
+  tostore: any # 최신 버전을 사용해 주세요
+```
 
 ## 빠른 시작
 
-기본 사용법:
+> [!IMPORTANT]
+> **테이블 스키마 정의가 첫 번째 단계입니다**: CRUD 작업을 수행하기 전에 반드시 테이블 스키마를 정의해야 합니다. 구체적인 정의 방법은 시나리오에 따라 다릅니다:
+> - **모바일/데스크톱**: [빈번한 시작 시나리오 통합](#빈번한 시작 시나리오-통합)(정적 정의)을 권장합니다.
+> - **서버 측**: [서버 측 통합](#서버-측-통합)(동적 생성)을 권장합니다.
 
 ```dart
-// 데이터베이스 초기화
-final db = ToStore();
-await db.initialize(); // 선택 사항, 작업 전 데이터베이스 초기화 완료 보장
+// 1. 데이터베이스 초기화
+final db = await ToStore.open();
 
-// 데이터 삽입
+// 2. 데이터 삽입
 await db.insert('users', {
   'username': 'John',
   'email': 'john@example.com',
+  'age': 25,
 });
 
-// 데이터 업데이트
-await db.update('users', {
-  'age': 31,
-}).where('id', '=', 1);
-
-// 데이터 삭제
-await db.delete('users').where('id', '!=', 1);
-
-// 복잡한 체인 쿼리 지원
+// 3. 체인형 쿼리 (=, !=, >, <, LIKE, IN 등 지원)
 final users = await db.query('users')
     .where('age', '>', 20)
-    .where('name', 'like', '%John%')
-    .or()
-    .whereIn('id', [1, 2, 3])
+    .where('username', 'like', '%John%')
     .orderByDesc('age')
-    .limit(10);
+    .limit(20);
 
-// 자동 데이터 저장, 존재하면 업데이트, 없으면 삽입
-await db.upsert('users', {'name': 'John','email': 'john@example.com'})
-  .where('email', '=', 'john@example.com');
-// 또는
-await db.upsert('users', {
-  'id': 1,
-  'name': 'John',
-  'email': 'john@example.com'
+// 4. 업데이트 및 삭제
+await db.update('users', {'age': 26}).where('username', '=', 'John');
+await db.delete('users').where('username', '=', 'John');
+
+// 5. 실시간 리스닝 (데이터 변경 시 UI 자동 갱신)
+db.query('users').where('age', '>', 18).watch().listen((users) {
+  print('조건에 맞는 사용자가 업데이트되었습니다: $users');
 });
-
-// 효율적인 레코드 카운트
-final count = await db.query('users').count();
-
-// 스트리밍 쿼리를 사용한 대규모 데이터 처리
-db.streamQuery('users')
-  .where('email', 'like', '%@example.com')
-  .listen((userData) {
-    // 메모리 압박 없이 필요에 따라 각 레코드 처리
-    print('사용자 처리 중: ${userData['username']}');
-  });
-
-// 글로벌 키-값 쌍 설정
-await db.setValue('isAgreementPrivacy', true, isGlobal: true);
-
-// 글로벌 키-값 쌍 데이터 가져오기
-final isAgreementPrivacy = await db.getValue('isAgreementPrivacy', isGlobal: true);
 ```
 
-## 모바일 앱 예제
+### 키-값 저장소 (KV)
+구조화된 테이블을 정의할 필요가 없는 시나리오에 적합하며, 설정 정보나 상태 등 흩어진 데이터를 저장하기 위해 고성능 키-값 저장소가 내장되어 있습니다. 서로 다른 스페이스(Space)의 데이터는 본질적으로 격리되어 있으나 글로벌 공유 설정이 가능합니다.
 
 ```dart
-// 모바일 앱과 같은 빈번한 시작 시나리오에 적합한 테이블 구조 정의, 정확한 테이블 구조 변경 감지, 자동 데이터 업데이트 및 마이그레이션
-final db = ToStore(
+// 1. 키-값 설정 (String, int, bool, double, Map, List 등 지원)
+await db.setValue('theme', 'dark');
+await db.setValue('login_attempts', 3);
+
+// 2. 데이터 가져오기
+final theme = await db.getValue('theme'); // 'dark'
+
+// 3. 데이터 삭제
+await db.removeValue('theme');
+
+// 4. 글로벌 키-값 (스페이스 간 공유)
+// 기본적으로 키-값 데이터는 스페이스별로 독립적입니다. isGlobal: true를 사용하여 글로벌 공유가 가능합니다.
+await db.setValue('app_version', '1.0.0', isGlobal: true);
+final version = await db.getValue('app_version', isGlobal: true);
+```
+
+
+
+## 빈번한 시작 시나리오 통합
+
+```dart
+// 모바일 앱, 데스크톱 클라이언트 등 자주 실행되는 시나리오에 적합한 스키마 정의 방식
+// 스키마 변경을 정밀하게 식별하고 자동 업그레이드 및 마이그레이션을 코드 없이 실현
+final db = await ToStore.open(
   schemas: [
     const TableSchema(
-      name: 'users', // 테이블 이름
-      tableId: "users",  // 선택적 고유 테이블 식별자, 이름 변경 요구사항의 100% 식별에 사용, 없어도 >98% 정확도 달성 가능
+            name: 'global_settings',
+            isGlobal: true,  // 글로벌 테이블로 설정하여 모든 스페이스에서 접근 가능
+            fields: [],
+    ),
+    const TableSchema(
+      name: 'users', // 테이블 명
+      tableId: "users",  // 이름 변경을 100% 식별하기 위한 고유 식별자(선택 사항)
       primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id', // 기본 키
+        name: 'id',       // 기본 키 이름
       ),
-      fields: [ // 필드 정의, 기본 키 포함하지 않음
-        FieldSchema(name: 'username', type: DataType.text, nullable: false, unique: true),
-        FieldSchema(name: 'email', type: DataType.text, nullable: false, unique: true),
-        FieldSchema(name: 'last_login', type: DataType.datetime),
+      fields: [        // 필드 정의(기본 키 제외)
+        FieldSchema(
+          name: 'username', 
+          type: DataType.text, 
+          nullable: false, 
+          unique: true,
+          fieldId: 'username',  // 필드 고유 식별자(선택 사항)
+        ),
+        FieldSchema(
+          name: 'email', 
+          type: DataType.text, 
+          nullable: false, 
+          unique: true
+        ),
+        FieldSchema(
+          name: 'last_login', 
+          type: DataType.datetime
+        ),
       ],
       indexes: [ // 인덱스 정의
         IndexSchema(fields: ['username']),
         IndexSchema(fields: ['email']),
       ],
     ),
+    // 외래 키 제약 조건 정의 예시
+    TableSchema(
+      name: 'posts',
+      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+      fields: [
+        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+        const FieldSchema(name: 'content', type: DataType.text),
+      ],
+      foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // 현재 테이블의 필드
+          referencedTable: 'users',         // 참조하는 테이블
+          referencedFields: ['id'],         // 참조하는 필드
+          onDelete: ForeignKeyCascadeAction.cascade,  // 삭제 시 연쇄 삭제
+          onUpdate: ForeignKeyCascadeAction.cascade,  // 업데이트 시 연쇄 업데이트
+        ),
+      ],
+    ),
   ],
 );
 
-// 사용자 공간으로 전환 - 데이터 격리
+// 멀티 스페이스 아키텍처 - 사용자별 데이터 완벽 격리
 await db.switchSpace(spaceName: 'user_123');
 ```
 
-## 백엔드 서버 예제
+## 서버 측 통합
 
 ```dart
+// 실행 시 스키마 일괄 생성 - 지속 실행 시나리오에 적합
 await db.createTables([
-      const TableSchema(
-        name: 'users', // 테이블 이름
-        primaryKeyConfig: PrimaryKeyConfig(
-          name: 'id', // 기본 키
-          type: PrimaryKeyType.timestampBased,  // 기본 키 유형
-        ),
-        fields: [
-          // 필드 정의, 기본 키 포함하지 않음
-          FieldSchema(
-              name: 'username',
-              type: DataType.text,
-              nullable: false,
-              unique: true),
-          FieldSchema(name: 'vector_data', type: DataType.blob),  // 벡터 데이터 저장
-          // 기타 필드...
-        ],
-        indexes: [
-          // 인덱스 정의
-          IndexSchema(fields: ['username']),
-          IndexSchema(fields: ['email']),
-        ],
+  // 3차원 공간 특징 벡터 저장 테이블
+  const TableSchema(
+    name: 'spatial_embeddings',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.timestampBased,   // 고동시성 쓰기에 적합한 타임스탬프 기반 PK
+    ),
+    fields: [
+      FieldSchema(
+        name: 'video_name',
+        type: DataType.text,
+        nullable: false,
       ),
-      // 다른 테이블...
+      FieldSchema(
+        name: 'spatial_features',
+        type: DataType.vector,                // 벡터 저장 유형
+        vectorConfig: VectorFieldConfig(
+          dimensions: 1024,                   // 고차원 벡터
+          precision: VectorPrecision.float32, 
+        ),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['video_name'],
+        unique: true,
+      ),
+      IndexSchema(
+        type: IndexType.vector,              // 벡터 인덱스
+        fields: ['spatial_features'],
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.hnsw,   // 효율적인 근접 검색을 위한 HNSW 알고리즘
+          distanceMetric: VectorDistanceMetric.cosine,
+          parameters: {
+            'M': 16,
+            'efConstruction': 200,
+          },
+        ),
+      ),
+    ],
+  ),
+  // 기타 테이블...
 ]);
 
-
-// 테이블 구조 업데이트
+// 온라인 스키마 업데이트 - 비즈니스 중단 없음
 final taskId = await db.updateSchema('users')
-    .renameTable('newTableName')  // 테이블 이름 변경
-    .modifyField('username',minLength: 5,maxLength: 20,unique: true)  // 필드 속성 수정
-    .renameField('oldName', 'newName')  // 필드 이름 변경
-    .removeField('fieldName')  // 필드 제거
-    .addField('name', type: DataType.text)  // 필드 추가
-    .removeIndex(fields: ['age'])  // 인덱스 제거
-    .setPrimaryKeyConfig(  // 기본 키 구성 설정
-      const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
-    );
+  .renameTable('users_new')                // 테이블 이름 변경
+  .modifyField(
+    'username',
+    minLength: 5,
+    maxLength: 20,
+    unique: true
+  )                                        // 필드 속성 변경
+  .renameField('old_name', 'new_name')     // 필드 이름 변경
+  .removeField('deprecated_field')         // 필드 삭제
+  .addField('created_at', type: DataType.datetime)  // 필드 추가
+  .removeIndex(fields: ['age'])            // 인덱스 삭제
+  .setPrimaryKeyConfig(                    // 기본 키 구성 변경
+    const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
+  );
     
-// 마이그레이션 작업 상태 쿼리
-final status = await db.queryMigrationTaskStatus(taskId);  
+// 마이그레이션 진행 상태 모니터링
+final status = await db.queryMigrationTaskStatus(taskId);
 print('마이그레이션 진행률: ${status?.progressPercentage}%');
+
+
+// 수동 쿼리 캐시 관리 (서버 측)
+// 기본 키 및 인덱스 기반의 등치 조회, IN 조회의 경우, 엔진 성능이 매우 뛰어나고 최적화되어 있으므로 일반적으로 수동으로 쿼리 캐시를 관리할 필요가 없습니다.
+
+// 쿼리 결과를 5분간 수동으로 캐시.
+final activeUsers = await db.query('users')
+    .where('is_active', '=', true)
+    .useQueryCache(const Duration(minutes: 5));
+
+// 데이터 변경 시 특정 캐시를 무효화하여 일관성 보장.
+await db.query('users')
+    .where('is_active', '=', true)
+    .clearQueryCache();
+
+// 최신 데이터가 반드시 필요한 쿼리는 캐시를 명시적으로 비활성화.
+final freshUserData = await db.query('users')
+    .where('is_active', '=', true)
+    .noQueryCache();
 ```
+
+
+
+## 고급 사용법
+
+Tostore는 복잡한 비즈니스 요구 사항을 충족하기 위해 다양한 고급 기능을 제공합니다:
+
+### 복잡한 쿼리 중첩 및 맞춤형 필터링
+무제한 조건 중첩과 유연한 맞춤형 함수를 지원합니다.
+
+```dart
+// 조건 중첩: (type = 'app' OR (id >= 123 OR fans >= 200))
+final idCondition = QueryCondition().where('id', '>=', 123).or().where('fans', '>=', 200);
+
+final result = await db.query('users')
+    .condition(
+        QueryCondition().whereEqual('type', 'app').or().condition(idCondition)
+    )
+    .limit(20);
+
+// 맞춤형 조건 함수
+final customResult = await db.query('users')
+    .whereCustom((record) => record['tags']?.contains('추천') ?? false);
+```
+
+### 지능형 업서트 (Upsert)
+존재하면 업데이트하고, 존재하지 않으면 삽입합니다.
+
+```dart
+await db.upsert('users', {
+  'email': 'john@example.com',
+  'name': 'John New'
+}).where('email', '=', 'john@example.com');
+```
+
+
+### 테이블 조인 및 필드 선택
+```dart
+final orders = await db.query('orders')
+    .select(['orders.id', 'users.name as user_name'])
+    .join('users', 'orders.user_id', '=', 'users.id')
+    .where('orders.amount', '>', 1000)
+    .limit(20);
+```
+
+### 스트리밍 및 통계
+```dart
+// 레코드 수 집계
+final count = await db.query('users').count();
+
+// 스트리밍 쿼리 (대규모 데이터에 적합)
+db.streamQuery('users').listen((data) => print(data));
+```
+
+
+
+### 쿼리 및 효율적인 페이지네이션
+
+> [!TIP]
+> **최고의 성능을 위해 `limit`을 명시하세요**: 쿼리 시 항상 `limit`을 명시적으로 지정하는 것을 강력히 권장합니다. 생략하면 엔진은 기본적으로 1000개의 레코드로 제한합니다. 엔진 자체의 쿼리 속도는 매우 빠르지만, UI에 민감한 애플리케이션에서 대량의 레코드를 직렬화하면 불필요한 성능 오버헤드가 발생할 수 있습니다.
+
+Tostore는 데이터 규모와 성능 요구 사항에 따라 선택할 수 있는 두 가지 페이지네이션 모드를 제공합니다:
+
+#### 1. 오프셋 모드 (Offset Mode)
+데이터 양이 적거나(예: 1만 건 이하) 특정 페이지 번호로 정확하게 이동해야 하는 경우에 적합합니다.
+
+```dart
+final result = await db.query('users')
+    .orderByDesc('created_at')
+    .offset(40) // 처음 40개를 건너뜀
+    .limit(20); // 20개 가져옴
+```
+> [!TIP]
+> `offset`이 매우 클 경우 데이터베이스가 많은 레코드를 스캔하고 버려야 하므로 성능이 저하됩니다. 깊은 페이지네이션에는 **커서 모드**를 권장합니다.
+
+#### 2. 고성능 커서 모드 (Cursor Mode)
+**대규모 데이터 및 무한 스크롤 시나리오에 권장됩니다**. `nextCursor`를 사용하여 O(1) 수준의 성능을 구현하며, 페이지 수에 관계없이 일정한 쿼리 속도를 보장합니다.
+
+> [!IMPORTANT]
+> 인덱싱되지 않은 필드로 정렬하거나 일부 복잡한 쿼리의 경우, 엔진이 전체 테이블 스캔으로 전환하고 `null` 커서를 반환할 수 있습니다(즉, 해당 특정 쿼리에 대한 페이지네이션이 현재 지원되지 않음을 의미함).
+
+```dart
+// 1페이지 쿼리
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+// 반환된 커서를 사용하여 다음 페이지 조회
+if (page1.nextCursor != null) {
+  final page2 = await db.query('users')
+      .orderByDesc('id')
+      .limit(20)
+      .cursor(page1.nextCursor); // 커서 위치로 직접 seek
+}
+
+// 마찬가지로 prevCursor를 사용하여 이전 페이지로 효율적으로 이동
+final prevPage = await db.query('users')
+    .limit(20)
+    .cursor(page2.prevCursor);
+```
+
+| 기능 | 오프셋 모드 | 커서 모드 |
+| :--- | :--- | :--- |
+| **쿼리 성능** | 페이지가 증가할수록 저하 | **항상 일정 (O(1))** |
+| **적용 범위** | 적은 데이터, 페이지 이동 | **대규모 데이터, 무한 스크롤** |
+| **데이터 일관성** | 데이터 변경 시 누락 발생 가능 | **변경으로 인한 중복/누락 완벽 방지** |
+
+
+
 
 
 ## 분산 아키텍처
 
 ```dart
 // 분산 노드 구성
-final db = ToStore(
-    config: DataStoreConfig(
-        distributedNodeConfig: const DistributedNodeConfig(
-            enableDistributed: true,  // 분산 모드 활성화
-            clusterId: 1,  // 클러스터 멤버십 구성
-            centralServerUrl: 'http://127.0.0.1:8080',
-            accessToken: 'b7628a4f9b4d269b98649129'))
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    distributedNodeConfig: const DistributedNodeConfig(
+      enableDistributed: true,
+      clusterId: 1,
+      centralServerUrl: 'http://127.0.0.1:8080',
+      accessToken: 'b7628a4f9b4d269b98649129'
+    )
+  )
 );
 
-// 벡터 데이터 일괄 삽입
-await db.batchInsert('vector', [
+// 고성능 일괄 삽입
+await db.batchInsert('vector_data', [
   {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
   {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
-  // ... 수천 개의 레코드
+  // ... 대량의 레코드를 한 번에 효율적으로 삽입
 ]);
 
-// 분석을 위한 대규모 데이터셋 스트림 처리
-await for (final record in db.streamQuery('vector')
-    .where('vector_name', '=', 'face_2366')
-    .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
-    .stream) {
-  // 스트리밍 인터페이스는 대규모 특성 추출 및 변환 지원
+// 대규모 데이터 세트 스트리밍 처리 - 일정한 메모리 사용량 유지
+await for (final record in db.streamQuery('vector_data')
+  .where('vector_name', '=', 'face_2366')
+  .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
+  .stream) {
+  // TB급 데이터도 메모리 부담 없이 효율적으로 처리 가능
   print(record);
 }
 ```
 
-## 기본 키 예제
-다양한 기본 키 알고리즘, 모두 분산 생성 지원, 검색 기능에 대한 무질서한 기본 키의 영향을 피하기 위해 직접 기본 키 생성은 권장하지 않습니다.
-순차 기본 키 PrimaryKeyType.sequential: 238978991
-타임스탬프 기반 기본 키 PrimaryKeyType.timestampBased: 1306866018836946
-날짜 접두사 기본 키 PrimaryKeyType.datePrefixed: 20250530182215887631
-짧은 코드 기본 키 PrimaryKeyType.shortCode: 9eXrF0qeXZ
+## 기본 키 유형 예시
+
+Tostore는 다양한 비즈니스 시나리오를 지원하기 위해 여러 분산 기본 키 알고리즘을 제공합니다:
+
+- **순차 증가형** (PrimaryKeyType.sequential): 238978991
+- **타임스탬프 기반** (PrimaryKeyType.timestampBased): 1306866018836946
+- **날짜 접두사형** (PrimaryKeyType.datePrefixed): 20250530182215887631
+- **단축 코드형** (PrimaryKeyType.shortCode): 9eXrF0qeXZ
 
 ```dart
-// 순차 기본 키 PrimaryKeyType.sequential
-// 분산 시스템이 활성화되면 중앙 서버가 노드가 스스로 생성하는 범위를 할당, 간결하고 기억하기 쉬움, 사용자 ID 및 매력적인 번호에 적합
+// 순차 증가형 기본 키 구성 예시
 await db.createTables([
-      const TableSchema(
-        name: 'users',
-        primaryKeyConfig: PrimaryKeyConfig(
-          type: PrimaryKeyType.sequential,  // 순차 기본 키 유형
-          sequentialConfig:  SequentialIdConfig(
-              initialValue: 10000, // 자동 증분 시작 값
-              increment: 50,  // 증분 단계
-              useRandomIncrement: true,  // 비즈니스 볼륨 노출 방지를 위한 무작위 단계 사용
-            ),
-        ),
-        // 필드 및 인덱스 정의...
-        fields: []
+  const TableSchema(
+    name: 'users',
+    primaryKeyConfig: PrimaryKeyConfig(
+      type: PrimaryKeyType.sequential,
+      sequentialConfig: SequentialIdConfig(
+        initialValue: 10000,
+        increment: 50,
+        useRandomIncrement: true, // 무작위 증분으로 비즈니스 규모 은폐
       ),
-      // 다른 테이블...
- ]);
+    ),
+    fields: [/* 필드 정의 */]
+  ),
+]);
 ```
 
+
+## 표현식 원자적 작업
+
+표현식 시스템은 유형 안전한 원자적 필드 업데이트를 제공합니다. 모든 계산은 데이터베이스 계층에서 원자적으로 실행되어 동시성 충돌을 방지합니다:
+
+```dart
+// 단순 증감: balance = balance + 100
+await db.update('accounts', {
+  'balance': Expr.field('balance') + Expr.value(100),
+}).where('id', '=', accountId);
+
+// 복잡한 계산: total = price * quantity + tax
+await db.update('orders', {
+  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
+}).where('id', '=', orderId);
+
+// 다중 괄호: finalPrice = ((price * quantity) + tax) * (1 - discount)
+await db.update('orders', {
+  'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
+                 (Expr.value(1) - Expr.field('discount')),
+}).where('id', '=', orderId);
+
+// 함수 사용: price = min(price, maxPrice)
+await db.update('products', {
+  'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
+}).where('id', '=', productId);
+
+// 타임스탬프: updatedAt = now()
+await db.update('users', {
+  'updatedAt': Expr.now(),
+}).where('id', '=', userId);
+```
+
+## 트랜잭션 작업
+
+트랜잭션은 여러 작업의 원자성을 보장하며, 모든 작업이 성공하거나 모두 롤백되어 데이터 일관성을 유지합니다.
+
+**트랜잭션 특징**:
+- 여러 작업의 원자적 제출.
+- 충돌 발생 시 완료되지 않은 작업 자동 복구.
+- 성공적인 커밋 시 데이터가 안전하게 영구 저장됨.
+
+```dart
+// 기본 트랜잭션 - 여러 작업 원자적 커밋
+final txResult = await db.transaction(() async {
+  // 사용자 삽입
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+    'fans': 100,
+  });
+  
+  // 표현식을 사용한 원자적 업데이트
+  await db.update('users', {
+    'fans': Expr.field('fans') + Expr.value(50),
+  }).where('username', '=', 'john');
+  
+  // 실패 시 모든 변경 사항이 자동으로 롤백됨
+});
+
+if (txResult.isSuccess) {
+  print('트랜잭션 커밋 성공');
+} else {
+  print('트랜잭션 롤백: ${txResult.error?.message}');
+}
+
+// 오류 발생 시 자동 롤백
+final txResult2 = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'jane',
+    'email': 'jane@example.com',
+  });
+  throw Exception('비즈니스 로직 오류'); // 롤백 트리거
+}, rollbackOnError: true);
+```
 
 ## 보안 구성
 
+**데이터 보안 메커니즈**:
+- 이중 보호 메커니즘으로 데이터 유실 방지.
+- 충돌 시 완료되지 않은 작업 자동 복구.
+- 작업 성공 시 데이터 즉시 안전 저장.
+- 고강도 암호화 알고리즘으로 민감한 데이터 보호.
+
+> [!WARNING]
+> **키 관리**: `encryptionKey`를 변경하면 기존 데이터를 해독할 수 없게 됩니다(데이터 마이그레이션이 필요함). 보안 서버 등에서 키를 가져오고 코드에 하드코딩하지 않는 것이 좋습니다.
+
 ```dart
-// 테이블 및 필드 이름 변경 - 자동 인식 및 데이터 보존
-final db = ToStore(
-      config: DataStoreConfig(
-        enableEncoding: true, // 테이블 데이터에 대한 보안 인코딩 활성화
-        encodingKey: 'YouEncodingKey', // 인코딩 키, 임의로 조정 가능
-        encryptionKey: 'YouEncryptionKey', // 암호화 키, 참고: 이를 변경하면 이전 데이터 디코딩 불가
-      ),
-    );
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    encryptionConfig: EncryptionConfig(
+      // 지원 알고리즘: none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      encryptionType: EncryptionType.chacha20Poly1305, 
+      
+      // 인코딩 키 (초기화 시 반드시 제공해야 함)
+      encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
+      
+      // 중요 데이터 암호화 키
+      encryptionKey: 'Your-Secure-Encryption-Key...',
+      
+      // 장치 결합 (Path-based binding)
+      // 활성화 시 키가 데이터베이스 경로 및 장치 특징과 깊이 결합됩니다.
+      // 물리적 데이터베이스 파일 복제 보안을 강화하지만, 설치 경로 변경 시 데이터 복구가 어려울 수 있습니다.
+      deviceBinding: false, 
+    ),
+    // WAL (Write-Ahead Logging) 활성화 (기본값: 활성화)
+    enableJournal: true, 
+    // 커밋 시 디스크 강제 동기화 (성능 중시형은 false 설정 가능)
+    persistRecoveryOnCommit: true,
+  ),
+);
 ```
 
-## 성능 테스트
 
-Tostore 2.0은 선형 성능 확장성을 구현, 병렬 처리, 파티셔닝 메커니즘 및 분산 아키텍처의 근본적인 변화가 데이터 검색 능력을 크게 향상시켜 대규모 데이터 증가에도 밀리초 단위 응답 시간 제공. 대규모 데이터셋 처리를 위해 스트리밍 쿼리 인터페이스는 메모리 자원 고갈 없이 대량의 데이터 처리 가능.
+## 성능 및 경험
+
+### 성능 지표
+
+- **시작 속도**: 1000만 건 이상의 데이터에서도 일반 스마트폰에서 즉시 시작 및 데이터 표시.
+- **조회 성능**: 데이터 규모에 관계없이 항상 초고속 검색 성능 유지.
+- **데이터 안전**: ACID 트랜잭션 보장 + 충돌 복구로 데이터 손실 제로.
+
+### 조언 및 제안
+
+- 📱 **예제 프로젝트**: `example` 디렉터리에 전체 Flutter 앱 예제가 제공됩니다.
+- 🚀 **프로덕션 환경**: 성능이 월등한 Release 모드로 빌드하여 배포하는 것을 권장합니다.
+- ✅ **표준 테스트**: 모든 핵심 기능은 표준 통합 테스트를 통과했습니다.
+
+
+
+
+Tostore가 도움이 되었다면 ⭐️를 눌러주세요.
+
 
 
 
 ## 향후 계획
-Tostore는 멀티모달 데이터 처리 및 의미 검색에 적응하기 위해 고차원 벡터 지원을 개발 중입니다.
+
+Tostore는 AI 시대의 데이터 인프라 역량을 강화하기 위해 다음 기능을 적극적으로 개발하고 있습니다:
+
+- **고차원 벡터**: 벡터 검색 및 시맨틱 검색 알고리즘 고도화.
+- **멀티모달 데이터**: 원시 데이터부터 특징 벡터까지의 엔드 투 엔드 처리 지원.
+- **그래프 구조**: 지식 그래프 및 복잡한 관계망의 효율적인 저장과 조회.
 
 
-우리의 목표는 데이터베이스를 만드는 것이 아닙니다; Tostore는 단순히 Toway 프레임워크에서 추출한 컴포넌트입니다. 모바일 앱을 개발 중이라면, 통합 생태계를 갖춘 Toway 프레임워크를 사용하는 것이 좋습니다. 이는 Flutter 앱 개발을 위한 풀스택 솔루션을 제공합니다. Toway를 사용하면 기본 데이터베이스를 직접 다룰 필요가 없으며, 모든 쿼리, 로딩, 저장, 캐싱 및 데이터 표시 작업은 프레임워크에 의해 자동으로 수행됩니다.
-Toway 프레임워크에 대한 자세한 정보는 [Toway 저장소](https://github.com/tocreator/toway)를 방문하세요.
 
-## 문서
 
-자세한 문서는 [Wiki](https://github.com/tocreator/tostore)를 방문하세요.
 
-## 지원 및 피드백
+> **추천**: 모바일 개발자라면 데이터 요청, 로딩, 저장, 캐시 및 표시를 자동으로 처리하는 풀스택 솔루션 [Toway Framework](https://github.com/tocreator/toway) 사용을 고려해 보세요.
 
-- 이슈 제출: [GitHub Issues](https://github.com/tocreator/tostore/issues)
-- 토론 참여: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-- 코드 기여: [기여 가이드](CONTRIBUTING.md)
+
+
+
+## 더 많은 리소스
+
+- 📖 **문서**: [Wiki](https://github.com/tocreator/tostore)
+- 📢 **피드백**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **토론**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
+
 
 ## 라이선스
 
-이 프로젝트는 MIT 라이선스 하에 있습니다 - 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
+이 프로젝트는 MIT 라이선스를 따릅니다 - 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
 
 ---
-
-<p align="center">Tostore가 유용하다고 생각하시면, ⭐️을 주세요</p>
