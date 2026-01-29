@@ -42,12 +42,12 @@ final class CompactionManager {
 
   void dispose() {
     try {
-    CrontabManager.removeCallback(ExecuteInterval.minutes1, _tick);
-    _queue.clear();
-    _dedup.clear();
-    _tableHint.clear();
-    _indexHint.clear();
-    _pumpInProgress = false;
+      CrontabManager.removeCallback(ExecuteInterval.minutes1, _tick);
+      _queue.clear();
+      _dedup.clear();
+      _tableHint.clear();
+      _indexHint.clear();
+      _pumpInProgress = false;
     } catch (_) {}
   }
 
@@ -213,11 +213,13 @@ final class _CompactionTask {
   factory _CompactionTask.table(String table) =>
       _CompactionTask._(kind: _CompactionKind.table, tableName: table);
 
-  factory _CompactionTask.index(String table, String index) => _CompactionTask._(
-      kind: _CompactionKind.idx, tableName: table, indexName: index);
+  factory _CompactionTask.index(String table, String index) =>
+      _CompactionTask._(
+          kind: _CompactionKind.idx, tableName: table, indexName: index);
 
-  String get dedupKey =>
-      kind == _CompactionKind.table ? 't:$tableName' : 'i:$tableName:$indexName';
+  String get dedupKey => kind == _CompactionKind.table
+      ? 't:$tableName'
+      : 'i:$tableName:$indexName';
 
   _CompactionTask withCursor(TreePagePtr next) => _CompactionTask._(
         kind: kind,
@@ -226,4 +228,3 @@ final class _CompactionTask {
         cursor: next,
       );
 }
-

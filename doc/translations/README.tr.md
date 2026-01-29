@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Zincirleme sorgular (=, !=, >, <, LIKE, IN vb. destekler)
+// 3. Zincirleme sorgular ([sorgu operatörleri](#sorgu-operatörleri), =, !=, >, <, LIKE, IN vb. destekler)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Sık Başlatılan Senaryolar İçin Entegrasyon
 
+📱 **Örnek**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Mobil ve masaüstü uygulamaları için uygun şema tanımı.
 // Şema değişikliklerini hassas bir şekilde tanımlar ve verileri otomatik olarak taşır.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Otomatik olarak benzersiz bir dizin oluşturur
           fieldId: 'username',  // Benzersiz alan tanımlayıcı
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Otomatik olarak benzersiz bir dizin oluşturur
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Otomatik olarak bir dizin oluşturur (idx_last_login)
         ),
       ],
-      indexes: [ // Dizin tanımları
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Bileşik dizin örneği
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Yabancı anahtar kısıtlaması örneği
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Sunucu Tarafı Entegrasyonu
 
+🖥️ **Örnek**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Çalışma zamanında toplu şema oluşturma
 await db.createTables([
   // 3D mekansal özellik vektör depolama tablosu
@@ -415,7 +422,61 @@ final prevPage = await db.query('users')
 
 
 
+### Sorgu operatörleri
 
+`where(field, operator, value)` için tüm operatörler (büyük/küçük harf duyarsız):
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Anlamsal sorgu yöntemleri (önerilen)
+
+Operatörleri elle yazmak yerine anlamsal yöntemleri tercih edin.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Dağıtık Mimari
 
@@ -561,7 +622,7 @@ final txResult2 = await db.transaction(() async {
 - Yüksek dirençli şifreleme hassas verileri korur.
 
 > [!WARNING]
-> **Anahtar Yönetimi**: `encryptionKey`'i değiştirmek, eski verileri okunamaz hale getirir (bir migrasyon yapılmadığı sürece). Hassas anahtarları koda gömmeyin; güvenli bir sunucudan alın.
+> **Anahtar Yönetimi**: **`encodingKey`** serbestçe değiştirilebilir; değiştiğinde motor verileri otomatik olarak taşır, veri kaybı endişesi yoktur. **`encryptionKey`** keyfi değiştirilmemelidir—değiştirmek eski verileri okunamaz yapar (migrasyon yapılmadıkça). Hassas anahtarları koda gömmeyin; güvenli bir sunucudan alın.
 
 ```dart
 final db = await ToStore.open(
@@ -570,10 +631,10 @@ final db = await ToStore.open(
       // Desteklenen algoritmalar: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Kodlama anahtarı (başlatma sırasında sağlanmalıdır)
+      // Kodlama anahtarı (serbestçe değiştirilebilir; veriler otomatik taşınır)
       encodingKey: '32-Byte-Uzunluğunda-Kodlama-Anahtarınız...', 
       
-      // Kritik veriler için şifreleme anahtarı
+      // Kritik veriler için şifreleme anahtarı (keyfi değiştirmeyin; migrasyon olmadan eski veriler okunamaz)
       encryptionKey: 'Güvenli-Şifreleme-Anahtarınız...',
       
       // Cihaz Bağlama (Yol tabanlı)

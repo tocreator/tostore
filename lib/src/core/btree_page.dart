@@ -178,7 +178,13 @@ final class BTreePageIO {
     final headerBytes = hdr.encode();
     final total = BTreePageHeader.size + encodedPayload.length;
     if (total > pageSize) {
-      throw StateError('Page overflow: total=$total > pageSize=$pageSize');
+      throw StateError(
+        'Page overflow: total=$total > pageSize=$pageSize '
+        '(header=${BTreePageHeader.size}, payload=${encodedPayload.length}, '
+        'overflow=${total - pageSize} bytes). '
+        'This indicates the page size estimation was inaccurate. '
+        'Consider checking BTreePageSizer.fitsInPage before encoding.',
+      );
     }
     final out = Uint8List(pageSize);
     out.setRange(0, BTreePageHeader.size, headerBytes);
@@ -839,6 +845,10 @@ final class BTreePageSizer {
   }
 
   /// Returns true if a payload of [plainPayloadLen] will fit into a fixed-size page.
+  ///
+  /// Uses a small safety margin (4 bytes) to account for potential estimation
+  /// inaccuracies in header length calculation, especially when keyId digits change
+  /// or encoding overhead varies slightly.
   static bool fitsInPage({
     required int pageSize,
     required int plainPayloadLen,
@@ -850,7 +860,10 @@ final class BTreePageSizer {
       config: config,
       encryptionKeyId: encryptionKeyId,
     );
-    return BTreePageHeader.size + encodedLen <= pageSize;
+    // Add 4-byte safety margin to prevent occasional overflow due to estimation
+    // inaccuracies (e.g., keyId digit changes, encoding header variations)
+    const int safetyMargin = 4;
+    return BTreePageHeader.size + encodedLen + safetyMargin <= pageSize;
   }
 }
 

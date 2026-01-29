@@ -68,7 +68,6 @@ class TostoreExample {
             IndexSchema(fields: ['email'], unique: true),
             IndexSchema(fields: ['last_login'], unique: false),
             IndexSchema(fields: ['age']),
-            IndexSchema(fields: ['fans']),
           ],
         ),
         TableSchema(
@@ -741,8 +740,6 @@ class TostoreExample {
       }
     }
 
-    final stopwatch = Stopwatch()..start();
-
     // Prepare all records at once to avoid multiple batch splits
     // This improves performance by reducing the number of batchInsert calls
     final records = <Map<String, dynamic>>[];
@@ -761,6 +758,8 @@ class TostoreExample {
         await Future.delayed(Duration.zero);
       }
     }
+
+    final stopwatch = Stopwatch()..start();
 
     // Single batch insert call with all records
     // The batchInsert method will handle internal batching if needed for memory efficiency

@@ -616,11 +616,15 @@ class MigrationManager {
           }
 
           if (!isAllowed) {
-            throw Exception(
-                'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
-                'This is to prevent accidental data loss or long-running migrations. \n'
-                'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
-                'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.');
+            final recordCount = await _dataStore.tableDataManager
+                .getTableRecordCount(tableName);
+            if (recordCount != 0) {
+              throw Exception(
+                  'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
+                  'This is to prevent accidental data loss or long-running migrations. \n'
+                  'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
+                  'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.');
+            }
           }
         }
       }
@@ -1785,8 +1789,7 @@ class MigrationManager {
 
       // clear table record cache
       // Don't mark as fully cached since migration preserves data, just invalidates cache
-      await _dataStore.cacheManager
-          .invalidateCache(task.tableName, markAsFullyCached: false);
+      await _dataStore.cacheManager.invalidateCache(task.tableName);
 
       // update global table structure first
       if (!task.isSchemaUpdated) {
@@ -1848,10 +1851,26 @@ class MigrationManager {
 
         for (var operation in task.operations) {
           if (operation.type == MigrationType.addField ||
-              operation.type == MigrationType.modifyField ||
-              operation.type == MigrationType.renameField ||
               operation.type == MigrationType.removeField) {
             needDataMigration = true;
+          } else if (operation.type == MigrationType.modifyField) {
+            // Only migrate data if field definition changes affect storage
+            final update = operation.fieldUpdate!;
+            final oldField = oldSchema?.fields.cast<FieldSchema?>().firstWhere(
+                  (f) => f?.name == update.name,
+                  orElse: () => null,
+                );
+
+            if (oldField != null) {
+              // Type change requires migration
+              if (update.type != null && oldField.type != update.type) {
+                needDataMigration = true;
+              }
+              // Nullable -> Non-nullable requires migration (to fill defaults)
+              else if (oldField.nullable && update.nullable == false) {
+                needDataMigration = true;
+              }
+            }
           }
           if (operation.type == MigrationType.addIndex) {
             await migrationInstance.indexManager

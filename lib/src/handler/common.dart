@@ -50,8 +50,10 @@ String toStringWithAll(Object? object) {
       value = object.toString();
     }
   } catch (e) {
-    Logger.error('cannot convert ${object.runtimeType} to string: $e',
-        label: 'toStringWithAll');
+    Logger.error(
+      'cannot convert ${object.runtimeType} to string: $e',
+      label: 'toStringWithAll',
+    );
   }
   return value;
 }
@@ -175,7 +177,7 @@ String generateDeviceId(String seed, int deviceBindType) {
     0x7a,
     0x69,
     0x6e,
-    0x67
+    0x67,
   ];
 
   final o = Uint8List(parts.length);

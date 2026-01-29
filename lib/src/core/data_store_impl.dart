@@ -29,7 +29,6 @@ import 'index_manager.dart';
 import 'foreign_key_manager.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/table_info.dart';
-import '../model/meta_info.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
@@ -869,43 +868,69 @@ class DataStoreImpl {
     }
   }
 
-  /// Automatic table structure migration - based on table structure hash comparison
+  /// Automatic table structure migration - based on table structure hash comparison.
+  /// Uses maintenance mode: user operations are suspended until migration completes
+  /// to avoid conflicts with schema/data changes.
   Future<void> autoSchemaMigrate(List<TableSchema> schemas) async {
     String backupPath = '';
+    final migrationConfig = config.migrationConfig ?? const MigrationConfig();
+
+    for (var schema in schemas) {
+      if (!schema.validateTableSchema()) {
+        throw const BusinessError(
+          'Invalid table structure',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+    }
+
+    // Backup before entering maintenance so restore is available on failure
+    if (migrationConfig.backupBeforeMigrate) {
+      backupPath = await backup();
+    }
+
+    // Enter maintenance: block new user lock acquisitions and wait for quiescent state.
+    // Migration runs as system operation so it can acquire locks; user ops wait until exitMaintenance.
     try {
-      final migrationConfig = config.migrationConfig ?? const MigrationConfig();
-
-      // Backup database according to configuration
-      if (migrationConfig.backupBeforeMigrate) {
-        backupPath = await backup();
-      }
-
-      for (var schema in schemas) {
-        if (!schema.validateTableSchema()) {
-          throw const BusinessError(
-            'Invalid table structure',
-            type: BusinessErrorType.schemaError,
-          );
-        }
-      }
-
-      await migrationManager?.migrate(
-        schemas,
-        batchSize: migrationConfig.batchSize,
+      Logger.info(
+        'Entering maintenance for table structure migration (user ops will wait)',
+        label: 'DataStoreImpl.autoSchemaMigrate',
       );
-
-      // Validate migration results according to configuration
-      if (migrationConfig.validateAfterMigrate) {
-        final isValid = await _validateMigration(schemas);
-        if (!isValid && migrationConfig.strictMode) {
-          throw const BusinessError(
-            'Migration validation failed',
-            type: BusinessErrorType.migrationError,
-          );
-        }
+      final entered = await lockManager?.enterMaintenance(
+              timeout: config.transactionTimeout) ??
+          true;
+      if (!entered) {
+        Logger.warn(
+          'Maintenance enter timeout (quiescent not reached), proceeding with migration',
+          label: 'DataStoreImpl.autoSchemaMigrate',
+        );
       }
+    } catch (e) {
+      Logger.error(
+        'Failed to enter maintenance for migration: $e',
+        label: 'DataStoreImpl.autoSchemaMigrate',
+      );
+      rethrow;
+    }
 
-      // After successful migration, delete backup
+    try {
+      await TransactionContext.runAsSystemOperation(() async {
+        await migrationManager?.migrate(
+          schemas,
+          batchSize: migrationConfig.batchSize,
+        );
+
+        if (migrationConfig.validateAfterMigrate) {
+          final isValid = await _validateMigration(schemas);
+          if (!isValid && migrationConfig.strictMode) {
+            throw const BusinessError(
+              'Migration validation failed',
+              type: BusinessErrorType.migrationError,
+            );
+          }
+        }
+      });
+
       if (backupPath.isNotEmpty) {
         await storage.deleteDirectory(backupPath);
       }
@@ -919,11 +944,16 @@ class DataStoreImpl {
         'Table structure auto-migration failed: $e\n$stack',
         label: 'DataStoreImpl.autoSchemaMigrate',
       );
-      // Restore backup on failure
       if (backupPath.isNotEmpty) {
         await restore(backupPath, deleteAfterRestore: true);
       }
       rethrow;
+    } finally {
+      lockManager?.exitMaintenance();
+      Logger.info(
+        'Exited maintenance after table structure migration',
+        label: 'DataStoreImpl.autoSchemaMigrate',
+      );
     }
   }
 
@@ -1121,12 +1151,6 @@ class DataStoreImpl {
 
         // New table created successfully, call table creation statistics method
         tableDataManager.tableCreated(schema.name);
-
-        // Initialize full index cache for the new empty table
-        _indexManager?.initializeFullIndexCacheForTable(
-            schema.name, schemaValid);
-
-        tableDataManager.setTableFullyCached(schema.name, true);
 
         if (!SystemTable.isSystemTable(schema.name)) {
           Logger.info(
@@ -2772,9 +2796,6 @@ class DataStoreImpl {
       //  reset index
       await _indexManager?.resetIndexes(tableName);
 
-      // Re-establish fully cached status for empty table
-      _indexManager?.initializeFullIndexCacheForTable(tableName, schema);
-
       // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
       // or before checkpoint), the clear/drop op does not need to stay in
       // WAL meta for skip semantics. After a successful clear we can mark
@@ -3439,14 +3460,16 @@ class DataStoreImpl {
 
   /// Resume pending table-level maintenance operations (clear/drop) recorded in WAL meta.
   ///
-  /// This is executed on startup after WAL meta is loaded but before WAL replay,
-  /// so that table state at each cutoff point is applied first and WAL replay
-  /// can skip entries before the cutoff.
+  /// Only ops with [completed]==false are re-executed (physical op was registered
+  /// but not finished before crash). Completed ops remain only for WAL cutoff
+  /// semantics and must not be re-executed to avoid repeated clear on every restart.
   Future<void> _resumePendingTableOps() async {
     try {
       final ops = walManager.tableOps.values.toList();
       if (ops.isEmpty) return;
       for (final op in ops) {
+        if (op.completed)
+          continue; // Already finished; only used for cutoff, do not re-execute
         try {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
           if (op.type == 'clear') {
@@ -4017,12 +4040,51 @@ class DataStoreImpl {
                 _indexManager != null &&
                 batchRecordsForBuffer.isNotEmpty) {
               try {
-                final vios =
-                    await _indexManager!.checkUniqueConstraintsBatchForInsert(
-                  tableName,
-                  batchRecordsForBuffer,
-                  schemaOverride: tableSchema,
-                );
+                // The disk batch unique check can become expensive for very large batches
+                // (e.g., 10w+ inserts) because it may need to locate many leaves.
+                // When pressure is high, a large batch can fail transiently. For safety,
+                // we retry with smaller chunks instead of failing the entire batch.
+                Future<List<UniqueViolation?>> checkWithFallback(
+                    List<Map<String, dynamic>> recs) async {
+                  try {
+                    return await _indexManager!
+                        .checkUniqueConstraintsBatchForInsert(
+                      tableName,
+                      recs,
+                      schemaOverride: tableSchema,
+                    );
+                  } catch (e) {
+                    // Fallback: chunked validation to reduce peak memory/IO pressure.
+                    // This keeps correctness (still checks committed data) while preventing
+                    // "all failed" outcomes caused by transient overload.
+                    Logger.warn(
+                      'Batch unique disk check failed for ${recs.length} records, fallback to chunked checks: $e',
+                      label: 'DataStore.batchInsert',
+                    );
+                    const int chunkSize = 512;
+                    final out = List<UniqueViolation?>.filled(recs.length, null,
+                        growable: false);
+                    for (int off = 0; off < recs.length; off += chunkSize) {
+                      await yieldController.maybeYield();
+                      final int to = (off + chunkSize < recs.length)
+                          ? off + chunkSize
+                          : recs.length;
+                      final sub = recs.sublist(off, to);
+                      final subVios = await _indexManager!
+                          .checkUniqueConstraintsBatchForInsert(
+                        tableName,
+                        sub,
+                        schemaOverride: tableSchema,
+                      );
+                      for (int i = 0; i < subVios.length; i++) {
+                        out[off + i] = subVios[i];
+                      }
+                    }
+                    return out;
+                  }
+                }
+
+                final vios = await checkWithFallback(batchRecordsForBuffer);
 
                 if (vios.isNotEmpty) {
                   final keepRecords = <Map<String, dynamic>>[];
@@ -4427,42 +4489,6 @@ class DataStoreImpl {
             continue;
           }
 
-          final schema = await schemaManager?.getTableSchema(tableName);
-          if (schema == null || schema.name.isEmpty) {
-            continue;
-          }
-
-          // Get table meta size
-          final tableMeta = await tableDataManager.getTableMeta(tableName);
-          if (tableMeta != null) {
-            final tableSizeBytes = _estimateTableSizeBytes(tableMeta);
-
-            // Check if loading will exceed threshold
-            if (loadedSizeBytes + tableSizeBytes > thresholdBytes) {
-              Logger.debug(
-                'Skipping table $tableName: would exceed threshold (${(loadedSizeBytes + tableSizeBytes) ~/ (1024 * 1024)}MB > ${config.prewarmThresholdMB}MB)',
-                label: 'DataStore._executePrewarm',
-              );
-              continue;
-            }
-
-            // Prewarm full table record cache
-            await tableDataManager.prewarmTableRecordCache(tableName);
-            loadedSizeBytes += tableSizeBytes;
-
-            // Prewarm full in-memory index cache (unique constraints)
-            final indexSizeBytes = await _estimateIndexSizeBytes(tableName);
-            if (loadedSizeBytes + indexSizeBytes <= thresholdBytes) {
-              await _indexManager?.prewarmIndexDataCache(tableName);
-              loadedSizeBytes += indexSizeBytes;
-            } else {
-              Logger.debug(
-                'Skipping index prewarm for $tableName: would exceed threshold',
-                label: 'DataStore._executePrewarm',
-              );
-            }
-          }
-
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
           await yieldController.maybeYield();
         } catch (e, stackTrace) {
@@ -4480,35 +4506,6 @@ class DataStoreImpl {
           label: 'DataStore._executePrewarm');
     } finally {
       _isGlobalPrewarming = false;
-    }
-  }
-
-  /// Estimate table size (bytes)
-  int _estimateTableSizeBytes(TableMeta tableMeta) {
-    // Use totalSizeInBytes directly from table metadata
-    return tableMeta.totalSizeInBytes;
-  }
-
-  /// Estimate index size (bytes)
-  Future<int> _estimateIndexSizeBytes(String tableName) async {
-    try {
-      int totalSize = 0;
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) return 0;
-
-      final indexes = schema.getAllIndexes();
-      for (final index in indexes) {
-        final indexMeta =
-            await _indexManager?.getIndexMeta(tableName, index.actualIndexName);
-        if (indexMeta != null && indexMeta.totalSizeInBytes > 0) {
-          totalSize += indexMeta.totalSizeInBytes.toInt();
-        }
-      }
-      return totalSize;
-    } catch (e) {
-      Logger.warn('Failed to estimate index size for $tableName: $e',
-          label: 'DataStore._estimateIndexSizeBytes');
-      return 0;
     }
   }
 

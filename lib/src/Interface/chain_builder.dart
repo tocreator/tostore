@@ -193,6 +193,34 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     return _self;
   }
 
+  /// whereGreaterThan condition
+  SELF whereGreaterThan(String field, dynamic value) {
+    _condition.whereGreaterThan(field, value);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereGreaterThanOrEqualTo condition
+  SELF whereGreaterThanOrEqualTo(String field, dynamic value) {
+    _condition.whereGreaterThanOrEqualTo(field, value);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereLessThan condition
+  SELF whereLessThan(String field, dynamic value) {
+    _condition.whereLessThan(field, value);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereLessThanOrEqualTo condition
+  SELF whereLessThanOrEqualTo(String field, dynamic value) {
+    _condition.whereLessThanOrEqualTo(field, value);
+    _onChanged();
+    return _self;
+  }
+
   /// whereContains condition
   SELF whereContains(String field, String value) {
     _condition.whereContains(field, value);

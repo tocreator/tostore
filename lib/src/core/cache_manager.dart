@@ -46,13 +46,6 @@ final class CacheManager {
     // Index data (data cache + B+Tree pages)
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
       try {
-        // Sophisticated eviction: hard-disable if data too large, else partial 30% eviction
-        await _dataStore.indexManager?.handleMemoryPressure();
-      } catch (e) {
-        Logger.warn('Smart eviction of full index caches failed: $e',
-            label: 'CacheManager.indexData');
-      }
-      try {
         // Then evict page cache (B+Tree pages)
         await _dataStore.indexTreePartitionManager.evictPageCache(ratio: 0.3);
       } catch (e) {
@@ -177,7 +170,6 @@ final class CacheManager {
     Future(() async {
       try {
         await _dataStore.indexManager?.clearIndexMetaCache();
-        await _dataStore.indexManager?.evictAllFullIndexCaches();
       } catch (_) {}
     });
 
@@ -196,7 +188,6 @@ final class CacheManager {
       _dataStore.indexTreePartitionManager.clearPageCacheSync();
       await _dataStore.schemaManager?.clearSchemaCache();
       await _dataStore.indexManager?.clearIndexMetaCache();
-      await _dataStore.indexManager?.evictAllFullIndexCaches();
       _dataStore.weightManager?.clearMemory();
 
       Logger.debug('Base path change completed, caches cleared',
@@ -209,15 +200,11 @@ final class CacheManager {
   }
 
   /// Invalidate all caches of a table
-  /// [markAsFullyCached] - If true, marks the table as fully cached after clearing (for empty tables).
-  /// If false, clears the fully cached flag (for migration scenarios where data still exists).
-  Future<void> invalidateCache(String tableName,
-      {bool markAsFullyCached = true}) async {
+  Future<void> invalidateCache(String tableName) async {
     try {
       _statsCache.remove(tableName);
 
-      await _dataStore.tableDataManager.clearTableRecordsForTable(tableName,
-          markAsFullyCached: markAsFullyCached);
+      await _dataStore.tableDataManager.clearTableRecordsForTable(tableName);
       // Manually remove record count cache to force reload next time
       _dataStore.tableDataManager.removeRecordCountCache(tableName);
       _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
@@ -229,7 +216,6 @@ final class CacheManager {
 
       // Best-effort: remove index meta cache (coarse-grained).
       await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
-      await _dataStore.indexManager?.removeFullIndexCacheForTable(tableName);
       _dataStore.indexTreePartitionManager.clearPageCacheForTable(tableName);
     } catch (e) {
       Logger.error(

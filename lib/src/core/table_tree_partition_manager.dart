@@ -752,12 +752,44 @@ final class TableTreePartitionManager {
     // ---- Apply ops ----
     TreePagePtr? lastDeleteLeafPtr;
 
+    // Bulk cursor: for sorted keys, avoid descending the tree for every record.
+    TreePagePtr? curLeafPtr;
+    LeafPage? curLeaf;
+
+    Future<TreePagePtr> descendToLeafPtrOnly(Uint8List key) async {
+      await ensureRootLeaf();
+      if (meta.btreeHeight <= 0) return meta.btreeRoot;
+      TreePagePtr cur = meta.btreeRoot;
+      for (int depth = meta.btreeHeight; depth > 0; depth--) {
+        final node = await getInternal(cur);
+        if (node.children.isEmpty) return meta.btreeFirstLeaf;
+        final idx = node.childIndexForKey(key);
+        if (idx < 0 || idx >= node.children.length) return meta.btreeFirstLeaf;
+        cur = node.children[idx];
+      }
+      return cur;
+    }
+
     for (final op in opList) {
       await yc.maybeYield();
       final keyBytes = op.pkBytes;
-      final frames = <_Frame>[];
-      final leafPtr = await descendToLeaf(keyBytes, frames);
-      final leaf = await getLeaf(leafPtr);
+
+      TreePagePtr leafPtr;
+      LeafPage leaf;
+      final lp = curLeafPtr;
+      final lf = curLeaf;
+      if (lp != null &&
+          lf != null &&
+          (lf.highKey.isEmpty ||
+              MemComparableKey.compare(lf.highKey, keyBytes) >= 0)) {
+        leafPtr = lp;
+        leaf = lf;
+      } else {
+        leafPtr = await descendToLeafPtrOnly(keyBytes);
+        leaf = await getLeaf(leafPtr);
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
+      }
 
       if (op.type == _OpType.del) {
         final i = leaf.find(keyBytes);
@@ -784,8 +816,14 @@ final class TableTreePartitionManager {
         getStats(leafPtr.partitionNo).recordsDelta -= 1;
         // Delete cannot cause overflow; stage lazily.
         markLeafDirty(leafPtr, leaf);
-        // Opportunistic compaction: merge with right sibling under the same parent.
-        await tryMergeLeafWithRightSibling(leafPtr, leaf, frames);
+        // Opportunistic compaction: only compute parent frames if underfull.
+        if (meta.btreeHeight > 0 &&
+            isLeafUnderfull(leaf) &&
+            leaf.keys.isNotEmpty) {
+          final frames = <_Frame>[];
+          await descendToLeaf(leaf.keys.first, frames);
+          await tryMergeLeafWithRightSibling(leafPtr, leaf, frames);
+        }
         lastDeleteLeafPtr = leafPtr;
         continue;
       } else {
@@ -840,6 +878,16 @@ final class TableTreePartitionManager {
         continue;
       }
 
+      // Structural update: compute parent frames only when needed (split).
+      final frames = <_Frame>[];
+      final locatedPtr = await descendToLeaf(keyBytes, frames);
+      if (locatedPtr != leafPtr) {
+        leafPtr = locatedPtr;
+        leaf = await getLeaf(leafPtr);
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
+      }
+
       final split = leaf.split();
       final rightPtr = await allocatePage();
       final right = split.right;
@@ -868,6 +916,15 @@ final class TableTreePartitionManager {
         rightHighKey: right.highKey,
         rightPtr: rightPtr,
       );
+
+      // Update cursor after split for subsequent sorted keys.
+      if (MemComparableKey.compare(leaf.highKey, keyBytes) < 0) {
+        curLeafPtr = rightPtr;
+        curLeaf = right;
+      } else {
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
+      }
     }
 
     // Lightweight trigger: enqueue background compaction when deletes happen.
@@ -1580,8 +1637,7 @@ final class TableTreePartitionManager {
           encryptionKeyId: encryptionKeyId,
         );
         if (decoded == null) continue;
-        decoded[primaryKey] = pk;
-        out.add(decoded);
+        out.add(TableSchema.rowWithPrimaryKeyFirst(primaryKey, pk, decoded));
       }
     }
     return out;
@@ -1694,8 +1750,9 @@ final class TableTreePartitionManager {
         );
         if (decoded == null) continue;
         final pk = MemComparableKey.decodeLastText(leaf.keys[i]);
-        if (pk != null) decoded[schema.primaryKey] = pk;
-        out.add(decoded);
+        out.add(pk != null
+            ? TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded)
+            : decoded);
       }
     }
     return out;
@@ -1828,9 +1885,12 @@ final class TableTreePartitionManager {
           );
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          if (pk != null) decoded[schema.primaryKey] = pk;
-          if (recordPredicate != null && !recordPredicate(decoded)) continue;
-          yield decoded;
+          final row = pk != null
+              ? TableSchema.rowWithPrimaryKeyFirst(
+                  schema.primaryKey, pk, decoded)
+              : decoded;
+          if (recordPredicate != null && !recordPredicate(row)) continue;
+          yield row;
           remaining--;
         }
         ptr = leaf.next;
@@ -1867,9 +1927,12 @@ final class TableTreePartitionManager {
           );
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          if (pk != null) decoded[schema.primaryKey] = pk;
-          if (recordPredicate != null && !recordPredicate(decoded)) continue;
-          yield decoded;
+          final row = pk != null
+              ? TableSchema.rowWithPrimaryKeyFirst(
+                  schema.primaryKey, pk, decoded)
+              : decoded;
+          if (recordPredicate != null && !recordPredicate(row)) continue;
+          yield row;
           remaining--;
         }
         ptr = leaf.prev;
@@ -2018,9 +2081,12 @@ final class TableTreePartitionManager {
           );
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          if (pk != null) decoded[schema.primaryKey] = pk;
-          if (recordPredicate != null && !recordPredicate(decoded)) continue;
-          if (!onRecord(decoded)) return;
+          final row = pk != null
+              ? TableSchema.rowWithPrimaryKeyFirst(
+                  schema.primaryKey, pk, decoded)
+              : decoded;
+          if (recordPredicate != null && !recordPredicate(row)) continue;
+          if (!onRecord(row)) return;
           remaining--;
         }
         ptr = leaf.next;
@@ -2057,9 +2123,12 @@ final class TableTreePartitionManager {
           );
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          if (pk != null) decoded[schema.primaryKey] = pk;
-          if (recordPredicate != null && !recordPredicate(decoded)) continue;
-          if (!onRecord(decoded)) return;
+          final row = pk != null
+              ? TableSchema.rowWithPrimaryKeyFirst(
+                  schema.primaryKey, pk, decoded)
+              : decoded;
+          if (recordPredicate != null && !recordPredicate(row)) continue;
+          if (!onRecord(row)) return;
           remaining--;
         }
         ptr = leaf.prev;

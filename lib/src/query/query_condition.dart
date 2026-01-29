@@ -603,6 +603,26 @@ class QueryCondition {
     return where(field, '!=', value);
   }
 
+  /// Greater than condition
+  QueryCondition whereGreaterThan(String field, dynamic value) {
+    return where(field, '>', value);
+  }
+
+  /// Greater than or equal condition
+  QueryCondition whereGreaterThanOrEqualTo(String field, dynamic value) {
+    return where(field, '>=', value);
+  }
+
+  /// Less than condition
+  QueryCondition whereLessThan(String field, dynamic value) {
+    return where(field, '<', value);
+  }
+
+  /// Less than or equal condition
+  QueryCondition whereLessThanOrEqualTo(String field, dynamic value) {
+    return where(field, '<=', value);
+  }
+
   /// Contains condition
   QueryCondition whereContains(String field, String value) {
     return where(field, 'LIKE', '%$value%');

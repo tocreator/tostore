@@ -702,6 +702,26 @@ final class IndexTreePartitionManager {
     bool sawDelete = false;
     TreePagePtr? lastDeleteLeafPtr;
     // Apply sorted ops.
+
+    // Bulk cursor: for sorted keys, avoid descending the tree for every delta.
+    TreePagePtr? curLeafPtr;
+    LeafPage? curLeaf;
+
+    Future<TreePagePtr> descendToLeafPtrOnly(Uint8List key) async {
+      await ensureRootLeaf();
+      final height = meta.btreeHeight;
+      if (height <= 0) return meta.btreeRoot;
+      TreePagePtr cur = meta.btreeRoot;
+      for (int depth = height; depth > 0; depth--) {
+        final node = await getInternal(cur);
+        if (node.children.isEmpty) return meta.btreeFirstLeaf;
+        final idx = node.childIndexForKey(key);
+        if (idx < 0 || idx >= node.children.length) return meta.btreeFirstLeaf;
+        cur = node.children[idx];
+      }
+      return cur;
+    }
+
     for (final e in entries) {
       await yc.maybeYield();
       final keyBytes = e.key.bytes;
@@ -709,9 +729,22 @@ final class IndexTreePartitionManager {
       final isDelete = val.isNotEmpty && val[0] == 1;
       if (isDelete) sawDelete = true;
 
-      final frames = <_IFrame>[];
-      final leafPtr = await descendToLeaf(keyBytes, frames);
-      final leaf = await getLeaf(leafPtr);
+      TreePagePtr leafPtr;
+      LeafPage leaf;
+      final lp = curLeafPtr;
+      final lf = curLeaf;
+      if (lp != null &&
+          lf != null &&
+          (lf.highKey.isEmpty ||
+              MemComparableKey.compare(lf.highKey, keyBytes) >= 0)) {
+        leafPtr = lp;
+        leaf = lf;
+      } else {
+        leafPtr = await descendToLeafPtrOnly(keyBytes);
+        leaf = await getLeaf(leafPtr);
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
+      }
 
       if (isDelete) {
         final deleted = leaf.delete(keyBytes);
@@ -719,7 +752,14 @@ final class IndexTreePartitionManager {
         getStats(leafPtr.partitionNo).entriesDelta -= 1;
         // Delete cannot cause overflow.
         markLeafDirty(leafPtr, leaf);
-        await tryMergeLeafWithRightSibling(leafPtr, leaf, frames);
+        // Only compute parent frames if underfull to avoid per-op descent.
+        if (meta.btreeHeight > 0 &&
+            isLeafUnderfull(leaf) &&
+            leaf.keys.isNotEmpty) {
+          final frames = <_IFrame>[];
+          await descendToLeaf(leaf.keys.first, frames);
+          await tryMergeLeafWithRightSibling(leafPtr, leaf, frames);
+        }
         lastDeleteLeafPtr = leafPtr;
         continue;
       } else {
@@ -734,6 +774,16 @@ final class IndexTreePartitionManager {
       if (leafFits(leaf)) {
         markLeafDirty(leafPtr, leaf);
         continue;
+      }
+
+      // Structural update: compute parent frames only when needed (split).
+      final frames = <_IFrame>[];
+      final locatedPtr = await descendToLeaf(keyBytes, frames);
+      if (locatedPtr != leafPtr) {
+        leafPtr = locatedPtr;
+        leaf = await getLeaf(leafPtr);
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
       }
 
       final split = leaf.split();
@@ -762,6 +812,15 @@ final class IndexTreePartitionManager {
         rightHighKey: rightLeaf.highKey,
         rightPtr: rightLeafPtr,
       );
+
+      // Update cursor after split for subsequent sorted keys.
+      if (MemComparableKey.compare(leaf.highKey, keyBytes) < 0) {
+        curLeafPtr = rightLeafPtr;
+        curLeaf = rightLeaf;
+      } else {
+        curLeafPtr = leafPtr;
+        curLeaf = leaf;
+      }
     }
 
     // Lightweight trigger: enqueue background compaction when deletes happen.

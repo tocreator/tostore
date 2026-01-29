@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. 链式查询 (支持 =, !=, >, <, LIKE, IN 等)
+// 3. 链式查询（详见[查询操作符](#查询操作符)，支持 =, !=, >, <, LIKE, IN 等）
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## 频繁启动场景集成
 
+📱 **示例**：[mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // 适用移动应用、桌面客户端等频繁启动场景的表结构定义方式
 // 精准识别表结构变动，自动升级迁移数据，零代码维护
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // 自动创建唯一索引
           fieldId: 'username',  // 字段唯一标识，可选
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // 自动创建唯一索引
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // 自动创建索引
         ),
       ],
-      indexes: [ // 索引定义
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // 组合索引示例
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // 外键约束定义示例
@@ -223,7 +226,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## 服务端集成
 
+🖥️ **示例**：[server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // 服务端运行时批量创建表结构 - 适合持续运行场景 （单个表创建为 db.createTable）
 await db.createTables([
   // 三维空间特征向量存储表结构
@@ -420,7 +427,61 @@ final prevPage = await db.query('users')
 
 
 
+### 查询操作符
 
+所有 `where(field, operator, value)` 条件支持以下操作符（大小写不敏感）：
+
+| 操作符 | 说明 | 示例 / 值类型 |
+| :--- | :--- | :--- |
+| `=` | 等于 | `where('status', '=', 'active')` |
+| `!=`, `<>` | 不等于 | `where('role', '!=', 'guest')` |
+| `>` | 大于 | `where('age', '>', 18)` |
+| `>=` | 大于等于 | `where('score', '>=', 60)` |
+| `<` | 小于 | `where('price', '<', 100)` |
+| `<=` | 小于等于 | `where('quantity', '<=', 10)` |
+| `IN` | 在列表中 | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | 不在列表中 | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | 介于（含首尾） | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | 模式匹配（`%` 任意，`_` 单字符） | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | 模式不匹配 | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | 为 null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | 不为 null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### 语义化查询方法（推荐）
+
+推荐使用语义化方法，避免手写操作符字符串并便于 IDE 提示：
+
+```dart
+// 比较
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// 集合与范围
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// 空值判断
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// 模式匹配
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// 等价于：.where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## 分布式架构
 
@@ -566,7 +627,7 @@ final txResult2 = await db.transaction(() async {
 - 高强度加密算法保护敏感数据
 
 > [!WARNING]
-> **密钥管理**：`encryptionKey` 的变更会导致旧数据无法解密（除非执行数据迁移）。请勿硬编码敏感密钥在代码中，建议从安全服务端获取。
+> **密钥管理**：**`encodingKey`** 可随意修改，修改后引擎会自动迁移数据，无需担心数据不可恢复。**`encryptionKey`** 不可随意变更，变更后旧数据将无法解密（除非执行数据迁移）。请勿硬编码敏感密钥，建议从安全服务端获取。
 
 ```dart
 final db = await ToStore.open(
@@ -575,10 +636,10 @@ final db = await ToStore.open(
       // 加密算法支持：none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // 数据编码密钥（必须在初始化时提供，否则将使用设备默认派生密钥）
+      // 编码密钥（可随意修改，修改后数据会自动迁移）
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // 关键数据加密密钥
+      // 关键数据加密密钥（不可随意变更，否则旧数据无法解密，除非执行迁移）
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
       // 设备绑定 (Path-based binding)

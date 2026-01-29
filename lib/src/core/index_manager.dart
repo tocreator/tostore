@@ -41,8 +41,9 @@ class IndexManager {
   // This avoids the old "bucket Set<PK>" read/modify/write amplification for non-unique indexes.
   late final TreeCache<dynamic> _indexDataCache;
 
-  // Comparator Registry: Map<"tableName:indexName", MatcherFunction>
-  final Map<String, MatcherFunction> _comparatorRegistry = {};
+  // Index Field Matchers: Map<"tableName:indexName", List<MatcherFunction>>
+  // Stores ordered matchers for each indexed field to ensure correct TreeCache path comparison.
+  final Map<String, List<MatcherFunction>> _indexFieldMatchers = {};
 
   // Index metadata cache using TreeCache
   late final TreeCache<IndexMeta> _indexMetaCache;
@@ -145,129 +146,8 @@ class IndexManager {
     }
   }
 
-  /// Check if full index cache is available
-  bool hasFullIndexCache(String tableName, String indexName) {
-    return _indexDataCache.isFullyCached([tableName, indexName]);
-  }
-
-  /// Estimate full index cache size
-  Future<int> estimateFullIndexCacheSize() async {
-    return _indexDataCache.estimatedTotalSizeBytes;
-  }
-
-  /// Evict all full index caches (for memory pressure)
-  Future<void> evictAllFullIndexCaches() async {
-    _indexDataCache.clear();
-    Logger.info('Evicted all full index data caches', label: 'IndexManager');
-  }
-
-  /// Evict full index caches based on memory pressure and data volume
-  Future<void> handleMemoryPressure() async {
-    // 1. Calculate average table size to see if full caching is sustainable
-    // We use total data size / table count to estimate the average index footprint
-    final totalSize = _dataStore.tableDataManager.getTotalDataSizeBytes();
-    final allTables = await _dataStore.schemaManager?.listAllTables() ?? [];
-    final tableCount = max(1, allTables.length);
-    final avgTableSizeMB = (totalSize / tableCount) / (1024 * 1024);
-
-    final threshold = _dataStore.config.prewarmThresholdMB;
-
-    if (avgTableSizeMB > threshold) {
-      _indexDataCache.clear(); // Clear all
-      Logger.warn(
-          'Average table size too large (${avgTableSizeMB.toStringAsFixed(1)}MB > ${threshold}MB), '
-          'clearing index cache to ensure stability.',
-          label: 'IndexManager.handleMemoryPressure');
-      return;
-    }
-
-    // 2. Partial eviction handled by TreeCache internal mechanism or usage-based cleanup.
-    // We trigger cleanup if needed.
-    if (_indexDataCache.estimatedTotalSizeBytes >
-        _indexDataCache.maxByteThreshold * 0.7) {
-      await _indexDataCache.cleanup();
-    }
-  }
-
-  /// Prewarm full index cache for a table
-  /// Loads all index data for UNIQUE indexes into memory
-  Future<void> prewarmIndexDataCache(String tableName) async {
-    try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) return;
-
-      final indexes = schema.getAllIndexes();
-      if (indexes.isEmpty) return;
-
-      final yieldController =
-          YieldController('IndexManager.prewarmFullIndex', checkInterval: 100);
-
-      // Check memory before starting
-      if (_dataStore.memoryManager?.isLowMemoryMode ?? false) {
-        Logger.warn(
-            'Skipping prewarmFullIndex for $tableName due to low memory',
-            label: 'IndexManager');
-        return;
-      }
-
-      for (final index in indexes) {
-        // Skip vector indexes for full cache
-        if (index.type == IndexType.vector) continue;
-
-        final indexName = index.actualIndexName;
-        // Check availability
-        if (hasFullIndexCache(tableName, indexName)) continue;
-
-        // We need meta to get entries
-        final meta = await getIndexMeta(tableName, indexName);
-        if (meta == null) continue;
-
-        final decodedEntries = await _dataStore.indexTreePartitionManager
-            .getAllDecodedEntries(
-                tableName: tableName, indexName: indexName, meta: meta);
-
-        // Even if empty, we proceed to mark as fully cached below
-
-        if (decodedEntries.isNotEmpty) {
-          for (final entry in decodedEntries) {
-            await yieldController.maybeYield();
-            final compositeKey = [tableName, indexName, ...entry.keyComponents];
-
-            if (index.unique) {
-              _indexDataCache.put(compositeKey, entry.pk,
-                  size: entry.pk.length);
-            } else {
-              // Non-unique: one entry per PK (PK is part of the key)
-              final fullKey = <dynamic>[...compositeKey, entry.pk];
-              _indexDataCache.put(fullKey, true, size: entry.pk.length + 1);
-            }
-          }
-
-          // Mark as fully cached AFTER successful prewarm
-          _indexDataCache.setFullyCached([tableName, indexName], true);
-        } else {
-          // Even if empty, we mark as fully cached so we know we have "all 0 records"
-          _indexDataCache.setFullyCached([tableName, indexName], true);
-        }
-      }
-    } catch (e, s) {
-      Logger.error('Failed to prewarm index cache for $tableName: $e\n$s',
-          label: 'IndexManager.prewarmFullIndex');
-    }
-  }
-
-  /// Pre-initialize full index cache for a new table (empty table is ready by default)
-  void initializeFullIndexCacheForTable(String tableName, TableSchema schema) {
-    // Empty table -> all indexes are effectively fully cached (empty).
-    final indexes = schema.getAllIndexes();
-    for (final index in indexes) {
-      if (index.type == IndexType.vector) continue;
-      _indexDataCache.setFullyCached([tableName, index.actualIndexName], true);
-    }
-  }
-
   /// Update full index cache based on record changes
-  Future<void> updateFullIndexCache(String tableName, String pk,
+  Future<void> updateIndexDataCache(String tableName, String pk,
       Map<String, dynamic>? oldData, Map<String, dynamic>? newData,
       {bool force = false}) async {
     try {
@@ -280,7 +160,6 @@ class IndexManager {
         if (index.type == IndexType.vector) continue;
         final indexName = index.actualIndexName;
 
-        final bool isFullyCached = hasFullIndexCache(tableName, indexName);
         // Ensure comparator is registered
         _registerIndexComparator(tableName, indexName, schema);
 
@@ -307,8 +186,7 @@ class IndexManager {
 
             final dynamic removeKey =
                 index.unique ? compositeKey : <dynamic>[...compositeKey, pk];
-            if (isFullyCached ||
-                _indexDataCache.containsKey(removeKey) ||
+            if (_indexDataCache.containsKey(removeKey) ||
                 force ||
                 _dataStore.isGlobalPrewarming) {
               _indexDataCache.remove(removeKey);
@@ -334,8 +212,7 @@ class IndexManager {
 
             if (index.unique) {
               // Unique: key is index fields; value is PK.
-              if (isFullyCached ||
-                  _indexDataCache.containsKey(compositeKey) ||
+              if (_indexDataCache.containsKey(compositeKey) ||
                   force ||
                   _dataStore.isGlobalPrewarming) {
                 _indexDataCache.put(compositeKey, pk);
@@ -343,8 +220,7 @@ class IndexManager {
             } else {
               // Non-unique: key includes PK; value is a bool marker.
               final fullKey = <dynamic>[...compositeKey, pk];
-              if (isFullyCached ||
-                  _indexDataCache.containsKey(fullKey) ||
+              if (_indexDataCache.containsKey(fullKey) ||
                   force ||
                   _dataStore.isGlobalPrewarming) {
                 _indexDataCache.put(fullKey, true, size: pk.length + 1);
@@ -359,130 +235,48 @@ class IndexManager {
     }
   }
 
-  /// Batch update full index cache for multiple records (optimized for batch operations)
-  /// This method is more efficient than calling updateFullIndexCache multiple times
-  /// because it only fetches the schema once and processes all records together
-  Future<void> batchUpdateFullIndexCache(
-    String tableName,
-    List<Map<String, dynamic>> records, {
-    TableSchema? schemaOverride,
-    bool isInsertOperation = false,
-  }) async {
-    if (records.isEmpty) {
-      return;
-    }
-    try {
-      final schema = schemaOverride ??
-          await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) return;
-      final indexes = schema.getAllIndexes();
-      if (indexes.isEmpty) return;
-
-      final primaryKey = schema.primaryKey;
-
-      // Pre-register all comparators to avoid repeated lookups
-      for (final index in indexes) {
-        if (index.type == IndexType.vector) continue;
-        _registerIndexComparator(tableName, index.actualIndexName, schema);
-      }
-
-      // Use YieldController to avoid UI blocking during large batch operations
-      final yieldController =
-          YieldController('IndexManager.batchUpdateFullIndexCache');
-
-      // Process all records in batch
-      for (final index in indexes) {
-        if (index.fields.isEmpty || index.type == IndexType.vector) continue;
-        final indexName = index.actualIndexName;
-
-        _registerIndexComparator(tableName, index.actualIndexName, schema);
-
-        final bool isFullyCached = hasFullIndexCache(tableName, indexName);
-
-        if (!isFullyCached &&
-            isInsertOperation &&
-            !_dataStore.isGlobalPrewarming) {
-          continue;
-        }
-
-        // Direct iterative put for batch update
-        for (final record in records) {
-          await yieldController.maybeYield();
-
-          final pk = record[primaryKey]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-
-          // Extract index field values
-          final fields = <dynamic>[];
-          bool success = true;
-          for (final f in index.fields) {
-            final v = record[f];
-            if (v == null) {
-              success = false;
-              break;
-            }
-            fields.add(v);
-          }
-
-          if (success) {
-            final compositeKey = <dynamic>[tableName, indexName, ...fields];
-
-            if (index.unique) {
-              // Unique: key is index fields; value is PK.
-              if (isFullyCached ||
-                  _indexDataCache.containsKey(compositeKey) ||
-                  _dataStore.isGlobalPrewarming) {
-                _indexDataCache.put(compositeKey, pk, size: pk.length);
-              }
-            } else {
-              // Non-unique: key includes PK; value is a bool marker.
-              final fullKey = <dynamic>[...compositeKey, pk];
-              if (isFullyCached ||
-                  _indexDataCache.containsKey(fullKey) ||
-                  _dataStore.isGlobalPrewarming) {
-                _indexDataCache.put(fullKey, true, size: pk.length + 1);
-              }
-            }
-          }
-        }
-      }
-    } catch (e) {
-      Logger.warn('Failed to batch update index cache: $e',
-          label: 'IndexManager.batchUpdateFullIndexCache');
-    }
-  }
-
   /// Factory to provide comparators for TreeCache based on path
   Comparator<dynamic> _indexComparatorFactory(List<dynamic> path) {
-    // Path: [tableName, indexName, ...values]
-    if (path.length >= 2) {
-      final tableName = path[0] as String;
-      final indexName = path[1] as String;
-      final matcher = _comparatorRegistry['$tableName:$indexName'];
-      if (matcher != null) {
-        // Return a Comparator wrapper around the MatcherFunction
+    // Path structure: [tableName, indexName, field1, field2, ..., pk]
+    if (path.length < 2) return TreeCache.compareNative;
+
+    final tableName = path.isNotEmpty ? path[0]?.toString() ?? '' : '';
+    final indexName = path.length > 1 ? path[1]?.toString() ?? '' : '';
+    final matchers = _indexFieldMatchers['$tableName:$indexName'];
+
+    if (matchers != null) {
+      // path.length == 2: We are at [tableName, indexName], next element to compare is field1
+      // path.length == 3: Next is field2, etc.
+      final fieldIndex = path.length - 2;
+      if (fieldIndex < matchers.length) {
+        final matcher = matchers[fieldIndex];
         return (a, b) => matcher(a, b);
       }
     }
+
+    // Default: compareNative (strings, numbers, etc. using standard Dart comparison)
+    // This is used for tableName, indexName, and trailing PKs in non-unique indexes.
     return TreeCache.compareNative;
   }
 
-  /// Register a comparator for a specific index
+  /// Register field comparators for a specific index to ensure TreeCache works correctly.
   void _registerIndexComparator(
       String tableName, String indexName, TableSchema schema) {
-    // Only register if not already present
-    if (_comparatorRegistry.containsKey('$tableName:$indexName')) return;
+    final key = '$tableName:$indexName';
+    if (_indexFieldMatchers.containsKey(key)) return;
 
-    final indexArgs = schema.indexes.firstWhere(
+    final indexSchema = schema.indexes.firstWhere(
         (i) => i.actualIndexName == indexName,
         orElse: () => IndexSchema(indexName: '', fields: []));
 
-    if (indexArgs.fields.isEmpty) return;
+    if (indexSchema.fields.isEmpty) return;
 
-    // Register matcher for the FIRST field.
-    final firstField = indexArgs.fields.first;
-    final mt = schema.getFieldMatcherType(firstField);
-    _comparatorRegistry['$tableName:$indexName'] = ValueMatcher.getMatcher(mt);
+    final matchers = <MatcherFunction>[];
+    for (final field in indexSchema.fields) {
+      final mt = schema.getFieldMatcherType(field);
+      matchers.add(ValueMatcher.getMatcher(mt));
+    }
+    _indexFieldMatchers[key] = matchers;
   }
 
   /// Get index metadata
@@ -895,104 +689,12 @@ class IndexManager {
       final constraintsToCheckOnDisk = <_UniqueConstraint>[];
 
       for (final constraint in constraints) {
-        bool fastPathPassed = false;
-        try {
-          // 0.1 Full Index Cache Check (InMemory)
-          final indexName = constraint.indexName;
+        // Fast-path: check pending in-memory unique keys first
+        final violation = checkInBuffer(constraint);
+        if (violation != null) return violation;
 
-          // Check if prefix is fully cached
-          if (_indexDataCache.isFullyCached([tableName, indexName])) {
-            try {
-              final rawVal = constraint.value;
-              final int fieldCount = constraint.fields.length;
-
-              final List<dynamic> vals;
-              if (fieldCount <= 1) {
-                vals = <dynamic>[rawVal];
-              } else if (rawVal is List && rawVal.length == fieldCount) {
-                vals = rawVal;
-              } else {
-                // Defensive fallback (should not happen with canonical key generation).
-                vals = <dynamic>[rawVal];
-              }
-
-              // OPTIMIZATION:
-              // - For fully cached unique indexes, bypass MemComparable encoding
-              // - For INSERT, use containsKey() (fastest bool path)
-              // - For UPDATE, use peek() (no stats update)
-              final compositeKey = [tableName, indexName, ...vals];
-
-              if (!isUpdate) {
-                if (_indexDataCache.containsKey(compositeKey)) {
-                  Logger.warn(
-                      "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (in-memory cache)",
-                      label: 'IndexManager.checkUniqueConstraints');
-                  return UniqueViolation(
-                    tableName: tableName,
-                    fields: constraint.fields,
-                    value: constraint.value,
-                    indexName: constraint.indexName,
-                  );
-                }
-                // Fully cached and key not found.
-                // Only check transaction conflicts if there's an active transaction.
-                // If no transaction, skip buffer check (full cache already validated committed data).
-                if (currentTxId != null) {
-                  final violation =
-                      checkInBuffer(constraint, transactionOnly: true);
-                  if (violation != null) return violation;
-                }
-                fastPathPassed = true;
-              } else {
-                final dynamic existing =
-                    _indexDataCache.get(compositeKey, updateStats: false);
-                if (existing != null) {
-                  final bool isCollision = (existing is! String) ||
-                      selfStoreIndexStr == null ||
-                      existing != selfStoreIndexStr;
-
-                  if (isCollision) {
-                    Logger.warn(
-                        "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (in-memory cache)",
-                        label: 'IndexManager.checkUniqueConstraints');
-                    return UniqueViolation(
-                      tableName: tableName,
-                      fields: constraint.fields,
-                      value: constraint.value,
-                      indexName: constraint.indexName,
-                    );
-                  }
-                  // Hit but no collision -> same record.
-                  fastPathPassed = true;
-                } else {
-                  // Fully cached and key not found.
-                  // Only check transaction conflicts if there's an active transaction.
-                  // If no transaction, skip buffer check (full cache already validated committed data).
-                  if (currentTxId != null) {
-                    final violation =
-                        checkInBuffer(constraint, transactionOnly: true);
-                    if (violation != null) return violation;
-                  }
-                  // Safe: not in cache (committed) and not in transaction (if any)
-                  fastPathPassed = true;
-                }
-              }
-            } catch (e) {
-              // Fallback
-            }
-          }
-
-          if (!fastPathPassed) {
-            // 0. Fast-path: check pending in-memory unique keys first
-            final violation = checkInBuffer(constraint);
-            if (violation != null) return violation;
-
-            // If passed fast path, queue for disk check
-            constraintsToCheckOnDisk.add(constraint);
-          }
-        } catch (e) {
-          Logger.error('Unique check setup failed: $e');
-        }
+        // If passed fast path, queue for disk check
+        constraintsToCheckOnDisk.add(constraint);
       }
 
       if (constraintsToCheckOnDisk.isEmpty) return null;
@@ -1129,13 +831,6 @@ class IndexManager {
 
   /// Batch unique check for INSERTs.
   ///
-  /// - Always validates in-memory buffer/transaction conflicts for transactional safety.
-  /// - Uses **full unique index cache** when `_indexDataCache.isFullyCached(...)` is true.
-  ///   When fully cached, only checks transaction conflicts (if any), skipping buffer checks.
-  /// - For non-fully-cached unique indexes, uses **BinaryFuseFilter + grouped point lookups** via
-  ///   `indexTreePartitionManager.existsUniqueKeysBatch` (no `searchIndex`, no PK decoding).
-  /// - For custom primary keys (PrimaryKeyType.none), uses `TableRangePartitionManager.existingPrimaryKeysBatch`.
-  ///
   /// Returns a list aligned with [records], where each entry is either null (no violation)
   /// or a [UniqueViolation] describing the first detected conflict for that record.
   Future<List<UniqueViolation?>> checkUniqueConstraintsBatchForInsert(
@@ -1244,91 +939,31 @@ class IndexManager {
       }
       if (!hasCandidate) break;
 
-      // 2.1 Fully cached fast path
-      if (_indexDataCache.isFullyCached([tableName, indexName])) {
-        for (int i = 0; i < records.length; i++) {
-          await yieldController.maybeYield();
-          if (violations[i] != null) continue;
-          final r = records[i];
+      for (int i = 0; i < records.length; i++) {
+        await yieldController.maybeYield();
+        if (violations[i] != null) continue;
 
-          final fieldVals = <dynamic>[];
-          bool ok = true;
-          for (final f in idx.fields) {
-            final v = r[f];
-            if (v == null) {
-              ok = false;
-              break;
-            }
-            fieldVals.add(v);
-          }
-          if (!ok) continue;
+        final r = records[i];
+        final recordId = r[primaryKey]?.toString();
+        if (recordId == null || recordId.isEmpty) continue;
 
-          final compositeKey = <dynamic>[tableName, indexName, ...fieldVals];
-          if (_indexDataCache.containsKey(compositeKey)) {
-            Logger.warn(
-                "[Unique Constraint Violation] Table '$tableName' Field(s) [${idx.fields.join(', ')}] already contain value '${fieldVals}' (in-memory cache)",
-                label: 'IndexManager.checkUniqueConstraints');
-            violations[i] = UniqueViolation(
-              tableName: tableName,
-              fields: idx.fields,
-              value: (idx.fields.length == 1) ? fieldVals.first : fieldVals,
-              indexName: indexName,
-            );
-            continue;
-          }
+        final canKey = schema.createCanonicalIndexKey(idx.fields, r);
+        if (canKey == null) continue;
 
-          // Fully cached and key not found in cache.
-          // Only check transaction conflicts if there's an active transaction.
-          // If no transaction, skip (full cache already validated committed data).
-          if (txId != null) {
-            final recordId = r[primaryKey]?.toString();
-            if (recordId != null && recordId.isNotEmpty) {
-              final conflict = writeBuf.hasUniqueKeyOwnedByOtherTransaction(
-                tableName,
-                indexName,
-                compositeKey,
-                recordId,
-                transactionId: txId,
-              );
-              if (conflict) {
-                violations[i] = UniqueViolation(
-                  tableName: tableName,
-                  fields: idx.fields,
-                  value: (idx.fields.length == 1) ? fieldVals.first : fieldVals,
-                  indexName: indexName,
-                );
-              }
-            }
-          }
-        }
-        continue;
-      } else {
-        for (int i = 0; i < records.length; i++) {
-          await yieldController.maybeYield();
-          if (violations[i] != null) continue;
-
-          final r = records[i];
-          final recordId = r[primaryKey]?.toString();
-          if (recordId == null || recordId.isEmpty) continue;
-
-          final canKey = schema.createCanonicalIndexKey(idx.fields, r);
-          if (canKey == null) continue;
-
-          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
-            tableName,
-            indexName,
-            canKey,
-            recordId,
-            transactionId: txId,
+        final conflict = writeBuf.hasUniqueKeyOwnedByOther(
+          tableName,
+          indexName,
+          canKey,
+          recordId,
+          transactionId: txId,
+        );
+        if (conflict) {
+          violations[i] = UniqueViolation(
+            tableName: tableName,
+            fields: idx.fields,
+            value: canKey,
+            indexName: indexName,
           );
-          if (conflict) {
-            violations[i] = UniqueViolation(
-              tableName: tableName,
-              fields: idx.fields,
-              value: canKey,
-              indexName: indexName,
-            );
-          }
         }
       }
 
@@ -1959,6 +1594,9 @@ class IndexManager {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) return IndexSearchResult.tableScan();
 
+      // Ensure comparator is registered before cache access
+      _registerIndexComparator(tableName, indexName, schema);
+
       final meta = await getIndexMeta(tableName, indexName);
       if (meta == null) return IndexSearchResult.tableScan();
       if (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull) {
@@ -2063,103 +1701,15 @@ class IndexManager {
           if (isUnique) {
             final val = _indexDataCache.get(compositePrefix);
             if (val == null) {
-              if (!_indexDataCache.isFullyCached([tableName, indexName]))
-                return null;
-              return IndexSearchResult.empty();
+              return null;
             }
             if (val is String) {
               return IndexSearchResult(primaryKeys: [val]);
             }
             return IndexSearchResult.empty();
           }
-
-          // Non-unique: one entry per PK (PK is part of the key).
-          if (!_indexDataCache.isFullyCached([tableName, indexName]))
-            return null;
-
-          final results = <String>[];
-          final startKey = <dynamic>[...compositePrefix, ''];
-          final endKey = <dynamic>[...compositePrefix, '\uffff'];
-
-          await _indexDataCache.scanRange(
-            startKey,
-            endKey,
-            reverse: reverse,
-            onEntry: (key, _) {
-              if (key.length <= compositePrefix.length) return true;
-              final pk = key.last?.toString();
-              if (pk != null) results.add(pk);
-              return true;
-            },
-          );
-
-          if (results.isEmpty) return IndexSearchResult.empty();
-          return IndexSearchResult(primaryKeys: results);
         }
 
-        // Range Search
-        if (!_indexDataCache.isFullyCached([tableName, indexName])) return null;
-
-        if (start != null || end != null) {
-          // Allow one-sided checks
-          final results = <String>[];
-          final prefixKey = [tableName, indexName];
-
-          final List<dynamic> startNative = (start is Uint8List)
-              ? MemComparableKey.decodeTuple(start)
-              : ((start is List) ? start : (start != null ? [start] : []));
-          final List<dynamic> endNative = (end is Uint8List)
-              ? MemComparableKey.decodeTuple(end)
-              : ((end is List) ? end : (end != null ? [end] : []));
-
-          _registerIndexComparator(tableName, indexName, schema);
-          final comparator = _comparatorRegistry['$tableName:$indexName'] ??
-              TreeCache.compareNative;
-
-          int compareKey(
-              List<dynamic> keyPathValues, List<dynamic> boundValues) {
-            for (int i = 0; i < boundValues.length; i++) {
-              if (i >= keyPathValues.length) return -1;
-              int c;
-              if (i == 0) {
-                c = comparator(keyPathValues[i], boundValues[i]);
-              } else {
-                c = TreeCache.compareNative(keyPathValues[i], boundValues[i]);
-              }
-              if (c != 0) return c;
-            }
-            return 0;
-          }
-
-          await _indexDataCache.scanRange(prefixKey, null, reverse: reverse,
-              onEntry: (key, val) {
-            if (key.length < 2 || key[0] != tableName || key[1] != indexName)
-              return false;
-
-            final keyValues = key.sublist(2);
-
-            if (startNative.isNotEmpty) {
-              // For start bound: key >= start
-              final cmp = compareKey(keyValues, startNative);
-              if (cmp < 0) return reverse ? false : true;
-            }
-            if (endNative.isNotEmpty) {
-              // For end bound: key < end
-              final cmp = compareKey(keyValues, endNative);
-              if (cmp >= 0) return reverse ? true : false;
-            }
-
-            if (isUnique) {
-              results.add(val as String);
-            } else {
-              final pk = key.isNotEmpty ? key.last?.toString() : null;
-              if (pk != null) results.add(pk);
-            }
-            return true;
-          });
-
-          return IndexSearchResult(primaryKeys: results);
-        }
         return null;
       }
 
@@ -2220,7 +1770,6 @@ class IndexManager {
             }
           }
         }
-
         final prefix = encodePrefix(condition.value);
         if (prefix == null) return IndexSearchResult.empty();
 
@@ -2359,17 +1908,6 @@ class IndexManager {
           return IndexSearchResult.empty();
         }
 
-        if (_indexDataCache.isFullyCached([tableName, indexName])) {
-          return _scanIndexDataFullCache(tableName, indexName,
-              startKeyInclusive: start,
-              endKeyExclusive: end,
-              reverse: reverse,
-              isUnique: isUnique,
-              limit: limit,
-              offset: effectiveOffset,
-              schema: schema);
-        }
-
         return await _dataStore.indexTreePartitionManager.searchByKeyRange(
           tableName: tableName,
           indexName: indexName,
@@ -2436,17 +1974,6 @@ class IndexManager {
             // Valid range check
             if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
               return IndexSearchResult.empty();
-            }
-
-            if (_indexDataCache.isFullyCached([tableName, indexName])) {
-              return _scanIndexDataFullCache(tableName, indexName,
-                  startKeyInclusive: start,
-                  endKeyExclusive: end,
-                  reverse: reverse,
-                  isUnique: isUnique,
-                  limit: limit,
-                  offset: effectiveOffset,
-                  schema: schema);
             }
 
             return await _dataStore.indexTreePartitionManager.searchByKeyRange(
@@ -2627,130 +2154,6 @@ class IndexManager {
           label: 'IndexManager.searchIndex');
       return IndexSearchResult.tableScan();
     }
-  }
-
-  Future<IndexSearchResult> _scanIndexDataFullCache(
-    String tableName,
-    String indexName, {
-    required Uint8List startKeyInclusive,
-    required Uint8List endKeyExclusive,
-    required bool reverse,
-    required bool isUnique,
-    int? limit,
-    int? offset,
-    required TableSchema schema,
-  }) async {
-    // OPTIMIZATION: Decode bounds to seek in TreeCache
-    List<dynamic>? rangeStart;
-    List<dynamic>? rangeEnd;
-
-    try {
-      if (startKeyInclusive.isNotEmpty) {
-        // Decode start cursor
-        final decoded = MemComparableKey.decodeTuple(startKeyInclusive);
-        rangeStart = [tableName, indexName, ...decoded];
-      }
-
-      if (endKeyExclusive.isNotEmpty) {
-        final decoded = MemComparableKey.decodeTuple(endKeyExclusive);
-        rangeEnd = [tableName, indexName, ...decoded];
-        if (!isUnique) {
-          // Optimized: Even with truncation, encoded cursor <= real key.
-          // EndKey (Cursor) is Exclusive.
-          // If StartAt = Cursor.
-          // RealKey > Cursor.
-          // RealKey >= StartAt.
-          // Reverse Scan needs items < Cursor.
-          // Since RealKey > Cursor, it is correctly excluded if we seek to Cursor.
-          // Thus, it is safe to use rangeEnd for seeking in reverse mode.
-        }
-      }
-    } catch (_) {
-      rangeStart = null;
-      rangeEnd = null;
-    }
-
-    _registerIndexComparator(tableName, indexName, schema);
-
-    int scannedCount = 0;
-    int addedCount = 0;
-
-    final prefixKey = [tableName, indexName];
-    // Safety check on bounds validity vs prefix
-    if (rangeStart != null &&
-        (rangeStart.length < 2 || rangeStart[0] != tableName))
-      rangeStart = null;
-    if (rangeEnd != null && (rangeEnd.length < 2 || rangeEnd[0] != tableName))
-      rangeEnd = null;
-
-    final results = <String>[];
-
-    await _indexDataCache.scanRange(rangeStart ?? prefixKey, rangeEnd,
-        reverse: reverse, onEntry: (key, val) {
-      if (key.length < 2 || key[0] != tableName || key[1] != indexName)
-        return false;
-
-      final keyValues = key.sublist(2); // values + pk?
-
-      if (startKeyInclusive.isNotEmpty || endKeyExclusive.isNotEmpty) {
-        final index =
-            schema.indexes.firstWhere((i) => i.actualIndexName == indexName);
-        final comps = <Uint8List>[];
-        final bool truncateText = !index.unique;
-
-        final int fieldCount = index.fields.length;
-        if (keyValues.length < fieldCount) return true;
-
-        for (int i = 0; i < fieldCount; i++) {
-          final c = schema.encodeFieldComponentToMemComparable(
-              index.fields[i], keyValues[i],
-              truncateText: truncateText);
-          if (c != null) comps.add(c);
-        }
-
-        if (!index.unique) {
-          final pk = keyValues.last;
-          if (pk != null) {
-            comps.add(schema.encodePrimaryKeyComponent(pk.toString()));
-          }
-        }
-
-        final encodedKey = MemComparableKey.encodeTuple(comps);
-
-        if (startKeyInclusive.isNotEmpty) {
-          if (MemComparableKey.compare(encodedKey, startKeyInclusive) < 0) {
-            return reverse ? false : true;
-          }
-        }
-        if (endKeyExclusive.isNotEmpty) {
-          if (MemComparableKey.compare(encodedKey, endKeyExclusive) >= 0) {
-            return reverse ? true : false;
-          }
-        }
-      }
-
-      scannedCount++;
-
-      if (offset != null && scannedCount <= offset) return true;
-
-      String? pk;
-      if (isUnique) {
-        pk = val as String;
-      } else {
-        pk = key.isNotEmpty ? key.last?.toString() : null;
-      }
-
-      if (pk != null) {
-        results.add(pk);
-        addedCount++;
-      }
-
-      if (limit != null && addedCount >= limit) return false;
-
-      return true;
-    });
-
-    return IndexSearchResult(primaryKeys: results);
   }
 
   /// Get current index data cache size in bytes (Data Partition + Range Partition Data + B+Tree pages)

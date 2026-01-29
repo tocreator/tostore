@@ -13,6 +13,7 @@ import '../model/index_search.dart';
 import '../model/business_error.dart';
 
 import '../model/join_clause.dart';
+import '../model/buffer_entry.dart';
 import '../model/table_schema.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
@@ -450,7 +451,7 @@ class QueryExecutor {
       List<Map<String, dynamic>> results = planResult.records.toList();
 
       // Manual Offset skip if not applied at lower level (e.g. table scans with matcher)
-      if (!planResult.offsetApplied && effectiveOffset > 0) {
+      if (effectiveOffset > 0) {
         if (results.length > effectiveOffset) {
           results = results.sublist(effectiveOffset);
         } else {
@@ -492,16 +493,10 @@ class QueryExecutor {
         }
       }
 
-      // Final sort and pagination
-      final bool hasJoins = joins != null && joins.isNotEmpty;
-      final bool isUnion = plan.operation.type == QueryOperationType.union;
-
-      // For non-join single-table scans, the lower layers already produce ordered results:
-      // - TableDataManager.searchTableData sorts (PK or topK)
-      // - Index scans stream in index order or topK-sort when orderBy mismatches index
-      // Avoid redundant full sorts here for performance.
-      final bool needPostSort =
-          effectiveOrderBy.isNotEmpty && (hasJoins || isUnion);
+      // Final sort: single place after offset/joins, before limit truncation.
+      // mergeConsistency does not sort; buffer-unordered inserts can break order for custom PK.
+      // One _applySort here covers both single-table (buffer merge) and join/union—no redundant sort.
+      final bool needPostSort = effectiveOrderBy.isNotEmpty;
 
       if (needPostSort) {
         // For index cursor mode, validate orderBy matches index key order.
@@ -645,7 +640,7 @@ class QueryExecutor {
   }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      return PlanExecutionResult([], false);
+      return PlanExecutionResult([]);
     }
 
     // For sort-key cursor mode, build a keyset filter that will be applied during
@@ -692,9 +687,8 @@ class QueryExecutor {
           final updatedResults = resultMap.values.toList();
           final filteredResults = await _dataStore.tableDataManager
               .mergeConsistency(tableName, updatedResults,
-                  matcher: matcher, limit: limit, onlyMergeTransaction: true);
-          return PlanExecutionResult(filteredResults,
-              false); // Cache results usually don't have offset applied in the way we track here
+                  matcher: matcher, limit: limit);
+          return PlanExecutionResult(filteredResults);
         }
       }
     }
@@ -703,9 +697,6 @@ class QueryExecutor {
     // Capture snapshot for consistency (Local View)
     final int? localViewId = _dataStore.readViewManager.registerReadView();
     try {
-      bool offsetApplied = false;
-      bool resultsConsistent = false;
-
       List<Map<String, dynamic>> results;
       final operation = plan.operation;
       switch (operation.type) {
@@ -724,8 +715,6 @@ class QueryExecutor {
             startAfterPrimaryKey: startAfterPk,
             filter: cursorFilter,
           );
-          offsetApplied = scanRes.offsetApplied;
-          resultsConsistent = scanRes.onlyMergeTransaction;
           results = scanRes.records;
           break;
         case QueryOperationType.indexScan:
@@ -919,7 +908,6 @@ class QueryExecutor {
         orderBy: orderBy,
         filter: bufferFilter,
         reverse: reverseBuffer, // Pass reverse flag
-        onlyMergeTransaction: resultsConsistent,
       );
 
       // Cache query results (skip if already full-table cached)
@@ -949,7 +937,7 @@ class QueryExecutor {
         }
       }
 
-      return PlanExecutionResult(results, offsetApplied);
+      return PlanExecutionResult(results);
     } finally {
       if (localViewId != null) {
         _dataStore.readViewManager.releaseReadView(localViewId);
@@ -1230,7 +1218,6 @@ class QueryExecutor {
           rightRecords = await _dataStore.tableDataManager.mergeConsistency(
             rightTableName,
             rightRecords,
-            onlyMergeTransaction: scanRes.onlyMergeTransaction,
           );
         } finally {
           if (localViewId != null) {
@@ -1502,7 +1489,7 @@ class QueryExecutor {
     } catch (e) {
       Logger.error('Table scan failed: $e',
           label: 'QueryExecutor._performTableScan');
-      return TableScanResult(records: [], wasFull: false);
+      return TableScanResult(records: []);
     }
   }
 
@@ -1695,6 +1682,12 @@ class QueryExecutor {
               if (out.length >= targetNeed) break;
               final rec = recordByPk[pk];
               if (rec == null) continue;
+
+              final be = _dataStore.writeBufferManager
+                  .getBufferedRecord(tableName, pk);
+              if (be != null && be.operation == BufferOperationType.delete) {
+                continue;
+              }
               if ((matcher == null || matcher.matches(rec)) &&
                   (filter == null || filter(rec))) {
                 out.add(rec);
@@ -1849,6 +1842,12 @@ class QueryExecutor {
           for (final pk in pks) {
             final rec = recordByPk[pk];
             if (rec == null) continue;
+
+            final be =
+                _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+            if (be != null && be.operation == BufferOperationType.delete) {
+              continue;
+            }
             if ((matcher == null || matcher.matches(rec)) &&
                 (filter == null || filter(rec))) {
               selector.offer(rec);
@@ -2831,22 +2830,15 @@ final class _QueryCacheEntry {
 
 class TableScanResult {
   final List<Map<String, dynamic>> records;
-  final bool wasFull;
-  final bool offsetApplied;
-  final bool onlyMergeTransaction;
 
   TableScanResult({
     required this.records,
-    required this.wasFull,
-    this.offsetApplied = false,
-    this.onlyMergeTransaction = false,
   });
 }
 
 class PlanExecutionResult {
   final List<Map<String, dynamic>> records;
-  final bool offsetApplied;
-  PlanExecutionResult(this.records, this.offsetApplied);
+  PlanExecutionResult(this.records);
 }
 
 class ExecuteResult {

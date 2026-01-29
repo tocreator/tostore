@@ -57,7 +57,8 @@ final class StoredValue {
     final tag = bytes[0];
     switch (tag) {
       case tagInline:
-        return StoredValue.inline(bytes.length <= 1 ? Uint8List(0) : bytes.sublist(1));
+        return StoredValue.inline(
+            bytes.length <= 1 ? Uint8List(0) : bytes.sublist(1));
       case tagOverflowRef:
         final rb = bytes.length <= 1 ? Uint8List(0) : bytes.sublist(1);
         final r = ValueRef.tryDecode(rb);
@@ -70,4 +71,3 @@ final class StoredValue {
     }
   }
 }
-

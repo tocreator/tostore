@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Chained queries (Supports =, !=, >, <, LIKE, IN, etc.)
+// 3. Chained queries ([query operators](#query-operators) support =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Integration for Frequent Startup Scenarios
 
+📱 **Example**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Schema definition suitable for frequent startup scenarios like mobile and desktop apps.
 // Precisely identifies schema changes and auto-migrates data with zero code maintenance.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
-          fieldId: 'username',  // Unique field identifier
+          unique: true, // Automatically creates a unique index
+          fieldId: 'username',
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Automatically creates a unique index
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Automatically creates an index
         ),
       ],
-      indexes: [ // Index definitions
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Composite index example
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Foreign key constraint example
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Server-Side Integration
 
+🖥️ **Example**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Bulk schema creation at runtime - suitable for continuous running scenarios
 await db.createTables([
   // 3D Spatial Feature Vector storage
@@ -420,7 +427,61 @@ final prevPage = await db.query('users')
 
 
 
+### Query Operators
 
+All `where(field, operator, value)` conditions use the following operators (case-insensitive):
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Semantic query methods (recommended)
+
+Prefer semantic methods to avoid typing operator strings and get better IDE support:
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Distributed Architecture
 
@@ -566,7 +627,7 @@ final txResult2 = await db.transaction(() async {
 - High-strength encryption protects sensitive data.
 
 > [!WARNING]
-> **Key Management**: Changing the `encryptionKey` will make old data unreadable (unless a migration is performed). Do not hardcode sensitive keys; fetch them from a secure server.
+> **Key Management**: **`encodingKey`** can be changed freely; the engine will automatically migrate data when it changes, so you need not worry about data loss. **`encryptionKey`** must not be changed arbitrarily—changing it will make old data unreadable unless a migration is performed. Do not hardcode sensitive keys; fetch them from a secure server.
 
 ```dart
 final db = await ToStore.open(
@@ -575,10 +636,10 @@ final db = await ToStore.open(
       // Algorithms supported: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Encoding Key (must be provided at initialization)
+      // Encoding Key (can be changed freely; data will be auto-migrated)
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // Encryption Key for critical data
+      // Encryption Key for critical data (do not change arbitrarily; old data becomes unreadable unless migrated)
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
       // Device Binding (Path-based)

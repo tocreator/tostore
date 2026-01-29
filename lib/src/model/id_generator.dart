@@ -26,7 +26,8 @@ abstract class IdGenerator {
   String get type;
 }
 
-/// Sequential ID generator
+/// Sequential ID generator with ID pool pre-generation (lock-free consumption).
+/// Only acquires lock when refilling pool; high concurrency gets IDs from queue.
 class SequentialIdGenerator implements IdGenerator {
   final SequentialIdConfig config;
   final DistributedNodeConfig? nodeConfig;
@@ -38,7 +39,16 @@ class SequentialIdGenerator implements IdGenerator {
   int _lastRequestTime = 0;
   final Random _random = Random(DateTime.now().millisecondsSinceEpoch);
 
-  // Whether to use distributed mode
+  final Queue<String> _idPool = Queue<String>();
+  final LockManager _lockManager = LockManager();
+  bool _idGenerationInProgress = false;
+
+  int _recentRequestCount = 0;
+  DateTime _lastCountResetTime = DateTime.now();
+
+  static const int _minGenerateBatchSize = 100;
+  static const Duration _recentWindow = Duration(seconds: 3);
+
   bool get isDistributed =>
       nodeConfig != null &&
       nodeConfig!.enableDistributed &&
@@ -50,98 +60,174 @@ class SequentialIdGenerator implements IdGenerator {
     this.tableName,
     this.centralClient,
   }) : _currentId = config.initialValue - 1 {
-    // Subtract 1 because nextId will first add increment
     _initializeGenerator();
+    Future.microtask(() => _refillIdPool(_minGenerateBatchSize, 0));
   }
 
-  /// Initialize generator
   void _initializeGenerator() {
-    // If using distributed mode, initial value depends on central server allocation
     if (!isDistributed) {
-      // Ensure _currentId is initialized to at least equal to initialValue
       if (_currentId < config.initialValue - 1) {
         _currentId = config.initialValue - 1;
       }
     }
   }
 
-  /// Unified ID retrieval method implementation
+  /// Request stats over last 3 seconds for pool size prediction.
+  void _updateRequestStats(int count) {
+    final now = DateTime.now();
+    if (now.difference(_lastCountResetTime) > _recentWindow) {
+      _recentRequestCount = count;
+      _lastCountResetTime = now;
+    } else {
+      _recentRequestCount += count;
+    }
+  }
+
+  /// Recent request count in last 3 seconds.
+  int _getRecentRequestCount() {
+    final now = DateTime.now();
+    if (now.difference(_lastCountResetTime) > _recentWindow) {
+      _recentRequestCount = 0;
+      _lastCountResetTime = now;
+      return 0;
+    }
+    return _recentRequestCount;
+  }
+
+  /// Predict next batch from recent 3s request count; pre-generate 2x to avoid over/under.
+  int _calculateExpectedPoolSize(int recentTotal) {
+    if (recentTotal <= 0) return _minGenerateBatchSize;
+    return max((recentTotal * 2).ceil(), _minGenerateBatchSize);
+  }
+
+  Future<void> _refillIdPool(int targetCount, int recentTotal) async {
+    if (_idGenerationInProgress) return;
+
+    bool acquired = false;
+    final lockResource = 'sequential_id_refill_${tableName ?? "default"}';
+    final operationId = '${tableName ?? "default"}_sequential_refill';
+    try {
+      _idGenerationInProgress = true;
+      acquired =
+          await _lockManager.acquireExclusiveLock(lockResource, operationId);
+      if (!acquired) return;
+
+      final currentPoolSize = _idPool.length;
+      if (currentPoolSize >= targetCount) return;
+
+      final latestRecentTotal = _getRecentRequestCount();
+      final expectedSize = _calculateExpectedPoolSize(latestRecentTotal);
+      int neededCount = max(targetCount, expectedSize) - currentPoolSize;
+      if (neededCount <= 0) return;
+
+      int generated = 0;
+      while (generated < neededCount) {
+        if (isDistributed) {
+          final minIncrement = config.useRandomIncrement ? 1 : config.increment;
+          if (_currentId + minIncrement > _maxId) {
+            if (!await requestNewBatch()) break;
+          }
+        }
+
+        final increment = config.useRandomIncrement
+            ? _random.nextInt(config.increment) + 1
+            : config.increment;
+
+        if (isDistributed && _currentId + increment > _maxId) {
+          if (!await requestNewBatch()) break;
+        }
+
+        _currentId += increment;
+        _idPool.add(_currentId.toString());
+        generated++;
+      }
+    } catch (e) {
+      Logger.error('SequentialIdGenerator refill failed: $e',
+          label: 'SequentialIdGenerator._refillIdPool');
+    } finally {
+      _idGenerationInProgress = false;
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(lockResource, operationId);
+      }
+    }
+  }
+
   @override
   Future<List<String>> getId(int count, {int recentTotal = 0}) async {
     if (count <= 0) return [];
 
+    _updateRequestStats(count);
+
     final result = <String>[];
+    while (result.length < count && _idPool.isNotEmpty) {
+      result.add(_idPool.removeFirst());
+    }
+    if (result.length == count) return result;
 
-    // In distributed mode, need to check ID segment
-    if (isDistributed && (_currentId + config.increment * count > _maxId)) {
-      if (!await requestNewBatch()) {
-        throw Exception('Unable to get enough ID segments');
+    final effectiveRecentTotal =
+        recentTotal > 0 ? recentTotal : _getRecentRequestCount();
+    final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
+    final targetSize = expectedPoolSize + (count - result.length);
+
+    _refillIdPool(targetSize, effectiveRecentTotal);
+
+    final remainingCount = count - result.length;
+    final timeout = Duration(
+      seconds: 5 + ((remainingCount ~/ 1000) * 5),
+    );
+    final startTime = DateTime.now();
+    final endTime = startTime.add(timeout);
+
+    while (result.length < count) {
+      if (DateTime.now().isAfter(endTime)) {
+        Logger.warn(
+            'SequentialIdGenerator getId timeout: Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds}s',
+            label: 'SequentialIdGenerator.getId');
+        break;
       }
-
-      // Recalculate the number of IDs that can be retrieved
-      final availableIds = (_maxId - _currentId) ~/ config.increment;
-      if (availableIds < count) {
-        // If not enough to generate the required amount, only return available amount
-        count = max(availableIds, 0);
-        if (count <= 0) {
-          throw Exception('No ID segment available');
-        }
+      if (_idPool.isNotEmpty) {
+        result.add(_idPool.removeFirst());
+      } else {
+        await Future.delayed(const Duration(milliseconds: 10));
       }
     }
 
-    // Efficiently generate multiple IDs
-    for (int i = 0; i < count; i++) {
-      // Calculate increment, each ID can have different step
-      final increment = config.useRandomIncrement
-          ? _random.nextInt(config.increment) + 1
-          : config.increment;
-
-      _currentId += increment;
-      result.add(_currentId.toString());
+    if (result.isEmpty) {
+      throw Exception(
+          'SequentialIdGenerator: Pool empty and fill timeout. Request=$count, '
+          'RefillInProgress=$_idGenerationInProgress, PoolSize=${_idPool.length}');
     }
-
     return result;
   }
 
   @override
-  int get remainingIds => isDistributed ? _maxId - _currentId : -1;
+  int get remainingIds => _idPool.length;
 
   @override
   bool get needsFetch {
     if (!isDistributed) return false;
-
-    // If remaining ID count is below threshold, need to get new batch
     final threshold = (10000 * nodeConfig!.idFetchThreshold).toInt();
-    return remainingIds < threshold;
+    return _idPool.length < threshold;
   }
 
   @override
   Future<bool> requestNewBatch() async {
-    if (!isDistributed) {
-      return true; // Non-distributed mode does not need request
-    }
+    if (!isDistributed) return true;
 
     try {
-      // Limit request frequency
       final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - _lastRequestTime < 5000) {
-        // Do not repeat request within 5 seconds
-        return false;
-      }
+      if (now - _lastRequestTime < 5000) return false;
 
       _lastRequestTime = now;
 
-      // Request new ID segment
       final result = await centralClient!.requestIdBatch(
           tableName: tableName!, nodeId: nodeConfig!.nodeId, batchSize: 10000);
 
       if (result != null) {
-        _currentId = result.startId -
-            1; // Subtract 1 because nextId() will first add increment
+        _currentId = result.startId - 1;
         _maxId = result.endId;
         return true;
       }
-
       return false;
     } catch (e) {
       Logger.error('Request ID segment failed: $e',
@@ -153,16 +239,17 @@ class SequentialIdGenerator implements IdGenerator {
   @override
   String get type => isDistributed ? 'distributed-sequential' : 'sequential';
 
-  /// Set current ID value (for recovery from storage)
   void setCurrentId(int id) {
     _currentId = id;
   }
 
-  /// Set current ID range (for recovery from distributed storage)
   void setIdRange(int currentId, int maxId) {
     _currentId = currentId;
     _maxId = maxId;
   }
+
+  /// Current id position (for persistence/recovery). Last allocated id.
+  int get currentId => _currentId;
 }
 
 /// Base62 encoder (used for generating short code IDs)

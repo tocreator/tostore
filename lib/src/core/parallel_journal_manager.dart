@@ -232,32 +232,45 @@ class ParallelJournalManager {
     });
   }
 
-  /// Adaptive lingering to fill batch or detect pause in production.
+  /// Tail-wait strategy for normal online flush:
   ///
-  /// - [targetSize]: Try to fill up to this many items.
-  /// - [maxDelayMs]: Absolute maximum wait time.
-  Future<void> _lingerOnFrist(int targetSize, {required int maxDelayMs}) async {
-    if (maxDelayMs <= 0) return;
+  /// If the queue is below [targetSize], wait in [delayMs] windows.
+  /// - If the queue grows during the wait but still doesn't reach [targetSize],
+  ///   wait another window (up to [maxExtraRounds] times).
+  /// - If the queue does not grow, return quickly so we flush the tail.
+  ///
+  /// This matches "keep waiting 5s while data keeps arriving" for mobile,
+  /// without starving durability indefinitely.
+  Future<void> _waitTailFillWhileGrowing({
+    required int targetSize,
+    required int delayMs,
+    int maxExtraRounds = 3,
+  }) async {
+    if (delayMs <= 0) return;
     if (_bufferManager.queueLength >= targetSize) return;
+    if (maxExtraRounds < 0) maxExtraRounds = 0;
 
-    final sw = Stopwatch()..start();
-    int lastSize = _bufferManager.queueLength;
-    int idleMs = 0;
+    int rounds = 0;
+    while (true) {
+      final before = _bufferManager.queueLength;
+      if (before >= targetSize) return;
+      if (before <= 0) return;
 
-    // Monitor periodically for changes
-    while (sw.elapsedMilliseconds < maxDelayMs) {
-      await Future.delayed(const Duration(milliseconds: 100));
+      await Future.delayed(
+          Duration(milliseconds: rounds == 0 ? 1000 : delayMs));
 
-      final currentSize = _bufferManager.queueLength;
-      if (currentSize >= targetSize) return;
+      final after = _bufferManager.queueLength;
+      if (after >= targetSize) return;
 
-      if (currentSize > lastSize) {
-        lastSize = currentSize;
-        idleMs = 0; // Reset idle timer since data is arriving
-      } else {
-        idleMs++;
-        if (idleMs >= 3) return; // Silent for too long, flush now
+      // If no growth in this window, flush now (tail is stable).
+      if (after <= before) return;
+
+      // If data is still coming in but we are below target, extend the wait.
+      if (after > before && rounds < maxExtraRounds) {
+        rounds++;
+        continue;
       }
+      return;
     }
   }
 
@@ -296,13 +309,7 @@ class ParallelJournalManager {
     final batchSize = batchSizeOverride ?? _dataStore.config.writeBatchSize;
     bool firstIteration = true;
     final int delayMs = _dataStore.config.maxFlushLatencyMs;
-    // Only linger if we are in normal mode (not draining, not recovering)
-    if (_bufferManager.queueLength < 500 &&
-        !drainCompletely &&
-        recoveryBatchContext == null) {
-      await _lingerOnFrist(batchSize, maxDelayMs: delayMs);
-    }
-    // return;
+
     while (_running && !_bufferManager.isEmpty) {
       List<WriteQueueEntry> batch = const <WriteQueueEntry>[];
       try {
@@ -311,12 +318,14 @@ class ParallelJournalManager {
         // wait up to maxFlushLatencyMs before flushing the remaining tail, to avoid flushing
         // every tiny batch immediately while still bounding latency.
         // In drain mode (close/switch space), ignore this and ensure the queue is fully flushed.
-        if (!firstIteration && !drainCompletely) {
+        if (!drainCompletely) {
           final currentSize = _bufferManager.queueLength;
           if (currentSize < batchSize) {
-            if (delayMs > 0) {
-              await Future.delayed(Duration(milliseconds: delayMs));
-            }
+            await _waitTailFillWhileGrowing(
+              targetSize: batchSize,
+              delayMs: delayMs,
+              maxExtraRounds: 3,
+            );
           }
         }
 

@@ -363,8 +363,9 @@ class LockManager {
           label: 'LockManager');
       return false;
     }
-    // Intercept during maintenance: wait until maintenance ends
-    if (_maintenanceMode) {
+    // Intercept during maintenance: user ops wait until maintenance ends;
+    // system ops (e.g. migration) bypass and can acquire locks.
+    if (_maintenanceMode && !TransactionContext.isSystemOperation()) {
       final c = _maintenanceCompleter;
       if (c != null) {
         try {
@@ -384,7 +385,8 @@ class LockManager {
           label: 'LockManager');
       return false;
     }
-    if (_maintenanceMode) {
+    // Intercept during maintenance: user ops wait; system ops (e.g. migration) bypass.
+    if (_maintenanceMode && !TransactionContext.isSystemOperation()) {
       final c = _maintenanceCompleter;
       if (c != null) {
         try {

@@ -17,8 +17,9 @@ const List<String> _validOperators = [
   'NOT IN',
   'BETWEEN',
   'LIKE',
+  'NOT LIKE',
   'IS',
-  'IS NOT'
+  'IS NOT',
 ];
 
 /// A builder for creating streaming queries with a fluent API

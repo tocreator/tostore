@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Verkettete Abfragen (Unterstützt =, !=, >, <, LIKE, IN usw.)
+// 3. Verkettete Abfragen ([Abfrageoperatoren](#abfrageoperatoren), unterstützt =, !=, >, <, LIKE, IN usw.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Integration für Szenarien mit häufigem Start
 
+📱 **Beispiel**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Schemadefinition geeignet für mobile/Desktop-Apps mit häufigen Starts.
 // Erkennt Schemaänderungen präzise und migriert Daten automatisch ohne Code-Wartung.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Erstellt automatisch einen eindeutigen Index
           fieldId: 'username',  // Eindeutige Feld-ID
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Erstellt automatisch einen eindeutigen Index
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Erstellt automatisch einen Index (idx_last_login)
         ),
       ],
-      indexes: [ // Indexdefinitionen
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Beispiel für zusammengesetzten Index
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Beispiel für Fremdschlüssel-Einschränkung
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Serverseitige Integration
 
+🖥️ **Beispiel**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Massenweise Schemaerstellung zur Laufzeit - geeignet für kontinuierlichen Betrieb
 await db.createTables([
   // Speicher für 3D-räumliche Merkmalsvektoren
@@ -418,7 +425,61 @@ final prevPage = await db.query('users')
 
 
 
+### Abfrageoperatoren
 
+Alle Operatoren (groß-/kleinschreibungsunabhängig) für `where(field, operator, value)`:
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Semantische Abfragemethoden (empfohlen)
+
+Semantische Methoden vermeiden manuelle Operatoreingabe und verbessern die IDE-Unterstützung.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Verteilte Architektur
 
@@ -564,7 +625,7 @@ final txResult2 = await db.transaction(() async {
 - Hochfeste Verschlüsselung schützt sensible Daten.
 
 > [!WARNING]
-> **Schlüsselverwaltung**: Eine Änderung des `encryptionKey` macht alte Daten unlesbar (außer bei Durchführung einer Migration). Codieren Sie keine sensiblen Schlüssel fest ein; beziehen Sie diese von einem sicheren Server.
+> **Schlüsselverwaltung**: **`encodingKey`** kann frei geändert werden; der Motor migriert die Daten bei Änderung automatisch, Datenverlust ist nicht zu befürchten. **`encryptionKey`** darf nicht beliebig geändert werden—eine Änderung macht alte Daten unlesbar (außer bei Durchführung einer Migration). Codieren Sie keine sensiblen Schlüssel fest ein; beziehen Sie diese von einem sicheren Server.
 
 ```dart
 final db = await ToStore.open(
@@ -573,10 +634,10 @@ final db = await ToStore.open(
       // Unterstützte Algorithmen: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Kodierungsschlüssel (muss bei Initialisierung bereitgestellt werden)
+      // Kodierungsschlüssel (kann frei geändert werden; Daten werden automatisch migriert)
       encodingKey: 'Ihr-32-Byte-langer-Kodierungsschlüssel...', 
       
-      // Verschlüsselungsschlüssel für kritische Daten
+      // Verschlüsselungsschlüssel für kritische Daten (nicht beliebig ändern; alte Daten unlesbar ohne Migration)
       encryptionKey: 'Ihr-sicherer-Verschlüsselungsschlüssel...',
       
       // Gerätebindung (Pfad-basiert)

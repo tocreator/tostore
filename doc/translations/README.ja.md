@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. メソッドチェーンによるクエリ (=, !=, >, <, LIKE, IN などをサポート)
+// 3. メソッドチェーンによるクエリ（[クエリ演算子](#クエリ演算子)参照。=, !=, >, <, LIKE, IN などをサポート）
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## 頻繁な起動シナリオでの統合
 
+📱 **サンプル**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // モバイルアプリやデスクトップクライアントなど、頻繁に起動されるシナリオに適したスキーマ定義方法
 // スキーマ変更を正確に識別し、自動アップグレードとデータ移行をコードなしで実現
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // 自動的に一意インデックスを作成
           fieldId: 'username',  // フィールドの一意識別子（オプション）
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // 自動的に一意インデックスを作成
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // 自動的にインデックスを作成
         ),
       ],
-      indexes: [ // インデックス定義
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // 複合インデックスの例
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // 外部キー制約の定義例
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## サーバーサイド統合
 
+🖥️ **サンプル**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // サーバー実行時のスキーマ一括作成 - 継続的な実行シナリオに適しています
 await db.createTables([
   // 3次元空間特徴ベクトル保存用テーブル
@@ -418,7 +425,61 @@ final prevPage = await db.query('users')
 
 
 
+### クエリ演算子
 
+`where(field, operator, value)` で使用できる演算子（大文字小文字無視）は以下のとおりです。
+
+| 演算子 | 説明 | 例 / 値の型 |
+| :--- | :--- | :--- |
+| `=` | 等しい | `where('status', '=', 'active')` |
+| `!=`, `<>` | 等しくない | `where('role', '!=', 'guest')` |
+| `>` | より大きい | `where('age', '>', 18)` |
+| `>=` | 以上 | `where('score', '>=', 60)` |
+| `<` | より小さい | `where('price', '<', 100)` |
+| `<=` | 以下 | `where('quantity', '<=', 10)` |
+| `IN` | リストに含む | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | リストに含まない | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | 範囲（両端含む） | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | パターン一致（`%` 任意、`_` 1文字） | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | パターン不一致 | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | null である | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | null でない | `where('email', 'IS NOT', null)` — value: `null` |
+
+### セマンティッククエリメソッド（推奨）
+
+演算子文字列を手で書かず、IDE の補完を活用するため、セマンティックメソッドの利用を推奨します。
+
+```dart
+// 比較
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// 所属・範囲
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// null 判定
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// パターン
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// .where('age', '>', 18).where('name', 'like', '%John%') と同等
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## 分散アーキテクチャ
 
@@ -564,7 +625,7 @@ final txResult2 = await db.transaction(() async {
 - 高強度な暗号化による機密データ保護。
 
 > [!WARNING]
-> **キー管理**: `encryptionKey` を変更すると、既存のデータが復号できなくなります（データ移行が必要な場合を除く）。キーをコード内にハードコードせず、セキュアなサーバーから取得することを推奨します。
+> **キー管理**: **`encodingKey`** は自由に変更可能です。変更時はエンジンが自動でデータを移行するため、データ消失の心配はありません。**`encryptionKey`** は任意に変更しないでください。変更すると既存データが復号できなくなります（データ移行を除く）。キーをコード内にハードコードせず、セキュアなサーバーから取得することを推奨します。
 
 ```dart
 final db = await ToStore.open(
@@ -573,10 +634,10 @@ final db = await ToStore.open(
       // 対応アルゴリズム：none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // エンコーディングキー（初期化時に必須）
+      // エンコーディングキー（自由に変更可能、変更時はデータを自動移行）
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // 重要データ暗号化キー
+      // 重要データ暗号化キー（任意に変更不可、変更すると旧データが復号不可、移行を除く）
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
       // デバイス連結 (Path-based binding)

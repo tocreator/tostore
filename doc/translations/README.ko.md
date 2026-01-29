@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. 체인형 쿼리 (=, !=, >, <, LIKE, IN 등 지원)
+// 3. 체인형 쿼리 ([쿼리 연산자](#쿼리-연산자) 참조, =, !=, >, <, LIKE, IN 등 지원)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## 빈번한 시작 시나리오 통합
 
+📱 **예제**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // 모바일 앱, 데스크톱 클라이언트 등 자주 실행되는 시나리오에 적합한 스키마 정의 방식
 // 스키마 변경을 정밀하게 식별하고 자동 업그레이드 및 마이그레이션을 코드 없이 실현
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // 자동으로 고유 인덱스 생성
           fieldId: 'username',  // 필드 고유 식별자(선택 사항)
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // 자동으로 고유 인덱스 생성
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // 자동으로 인덱스 생성
         ),
       ],
-      indexes: [ // 인덱스 정의
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // 복합 인덱스 예시
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // 외래 키 제약 조건 정의 예시
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## 서버 측 통합
 
+🖥️ **예제**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // 실행 시 스키마 일괄 생성 - 지속 실행 시나리오에 적합
 await db.createTables([
   // 3차원 공간 특징 벡터 저장 테이블
@@ -418,7 +425,61 @@ final prevPage = await db.query('users')
 
 
 
+### 쿼리 연산자
 
+`where(field, operator, value)` 조건에서 사용 가능한 연산자(대소문자 무시)는 다음과 같습니다.
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### 시맨틱 쿼리 메서드 (권장)
+
+연산자 문자열 대신 시맨틱 메서드를 사용하면 IDE 지원이 좋아집니다.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## 분산 아키텍처
 
@@ -564,7 +625,7 @@ final txResult2 = await db.transaction(() async {
 - 고강도 암호화 알고리즘으로 민감한 데이터 보호.
 
 > [!WARNING]
-> **키 관리**: `encryptionKey`를 변경하면 기존 데이터를 해독할 수 없게 됩니다(데이터 마이그레이션이 필요함). 보안 서버 등에서 키를 가져오고 코드에 하드코딩하지 않는 것이 좋습니다.
+> **키 관리**: **`encodingKey`** 는 자유롭게 변경할 수 있으며, 변경 시 엔진이 데이터를 자동으로 마이그레이션하므로 데이터 손실을 걱정하지 않아도 됩니다. **`encryptionKey`** 는 임의로 변경하면 안 됩니다. 변경 시 기존 데이터를 해독할 수 없게 됩니다(마이그레이션 제외). 보안 서버 등에서 키를 가져오고 코드에 하드코딩하지 않는 것이 좋습니다.
 
 ```dart
 final db = await ToStore.open(
@@ -573,10 +634,10 @@ final db = await ToStore.open(
       // 지원 알고리즘: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // 인코딩 키 (초기화 시 반드시 제공해야 함)
+      // 인코딩 키 (자유롭게 변경 가능, 변경 시 데이터 자동 마이그레이션)
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // 중요 데이터 암호화 키
+      // 중요 데이터 암호화 키 (임의 변경 불가, 변경 시 기존 데이터 해독 불가, 마이그레이션 제외)
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
       // 장치 결합 (Path-based binding)

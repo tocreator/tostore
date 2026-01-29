@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Query concatenate (Supporta =, !=, >, <, LIKE, IN, ecc.)
+// 3. Query concatenate ([operatori di query](#operatori-di-query), supporta =, !=, >, <, LIKE, IN, ecc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Integrazione per scenari di avvio frequente
 
+📱 **Esempio**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Definizione dello schema adatta per app mobili/desktop ad avvio frequente.
 // Identifica con precisione i cambiamenti dello schema e migra i dati automaticamente.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Crea automaticamente un indice univoco
           fieldId: 'username',  // Identificativo campo unico
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Crea automaticamente un indice univoco
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Crea automaticamente un indice (idx_last_login)
         ),
       ],
-      indexes: [ // Definizioni indici
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Esempio di indice composto
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Esempio di vincolo di chiave esterna
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Integrazione lato server
 
+🖥️ **Esempio**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Creazione massiva di schemi a runtime
 await db.createTables([
   // Tabella per l'archiviazione di vettori di caratteristiche spaziali 3D
@@ -415,7 +422,61 @@ final prevPage = await db.query('users')
 
 
 
+### Operatori di query
 
+Tutti gli operatori (insensibili al maiuscolo/minuscolo) per `where(field, operator, value)`:
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Metodi di query semantici (consigliato)
+
+Preferire i metodi semantici per evitare di digitare gli operatori manualmente.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Architettura distribuita
 
@@ -561,7 +622,7 @@ final txResult2 = await db.transaction(() async {
 - La crittografia ad alta resistenza protegge i dati sensibili.
 
 > [!WARNING]
-> **Gestione chiavi**: Cambiare la `encryptionKey` renderà i vecchi dati illeggibili (a meno di una migrazione). Non cablare chiavi sensibili nel codice; recuperale da un server sicuro.
+> **Gestione chiavi**: **`encodingKey`** può essere modificata liberamente; il motore migrerà i dati automaticamente alla modifica, senza rischio di perdita. **`encryptionKey`** non va modificata arbitrariamente: modificarla renderà i vecchi dati illeggibili (a meno di una migrazione). Non cablare chiavi sensibili nel codice; recuperale da un server sicuro.
 
 ```dart
 final db = await ToStore.open(
@@ -570,10 +631,10 @@ final db = await ToStore.open(
       // Algoritmi supportati: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Chiave di codifica (da fornire all'inizializzazione)
+      // Chiave di codifica (modificabile liberamente; i dati vengono migrati automaticamente)
       encodingKey: 'Tua-Chiave-Di-Codifica-Lunga-32-Byte...', 
       
-      // Chiave di crittografia per dati critici
+      // Chiave di crittografia per dati critici (non modificare arbitrariamente; vecchi dati illeggibili senza migrazione)
       encryptionKey: 'Tua-Chiave-Di-Crittografia-Sicura...',
       
       // Binding del dispositivo (basato su percorso)

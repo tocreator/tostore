@@ -44,6 +44,22 @@ class TableSchema {
   /// Get primary key name
   String get primaryKey => primaryKeyConfig.name;
 
+  /// Returns a new map with primary key first, then other fields in original order.
+  /// Use when returning rows from storage so display/serialization shows PK first.
+  static Map<String, dynamic> rowWithPrimaryKeyFirst(
+    String primaryKeyName,
+    dynamic primaryKeyValue,
+    Map<String, dynamic> row,
+  ) {
+    final out = <String, dynamic>{};
+    out[primaryKeyName] = primaryKeyValue;
+    for (final e in row.entries) {
+      if (e.key == primaryKeyName) continue;
+      out[e.key] = e.value;
+    }
+    return out;
+  }
+
   /// Get all indexes (Consolidated list of Explicit, Unique, and FK indexes)
   List<IndexSchema> getAllIndexes() {
     final allIndexes = <IndexSchema>[];
@@ -68,7 +84,7 @@ class TableSchema {
       }
     }
 
-    // 2. Add implicit unique indexes
+    // 2. Add implicit unique indexes and field-level indexes
     for (final field in fields) {
       // Skip primary key (already handled by storage engine)
       if (field.name == primaryKey) continue;
@@ -88,6 +104,30 @@ class TableSchema {
           if (!existingIndexNames.contains(uniqueIndexSchema.actualIndexName)) {
             allIndexes.add(uniqueIndexSchema);
             existingIndexNames.add(uniqueIndexSchema.actualIndexName);
+            fieldIndexPrefixMap[field.name] = true;
+          }
+        }
+      } else if (field.createIndex) {
+        // Identify if there is an explicit index on this field
+        // Note: Even if there is a composite index starting with this field,
+        // if the user explicitly marks createIndex, we prefer to create a separate independent index
+        // to ensure simple query optimization (unless a single-field index already exists).
+        final alreadyHasIndex = indexes
+            .any((i) => i.fields.length == 1 && i.fields.first == field.name);
+
+        if (!alreadyHasIndex) {
+          final indexSchema = IndexSchema(
+            indexName: field.name,
+            fields: [field.name],
+            unique: false,
+          );
+
+          // Check if we already created a unique index derived from field.unique above
+          // (Actually if field.unique is true, we entered the block above, not this one)
+          // So just check name collision
+          if (!existingIndexNames.contains(indexSchema.actualIndexName)) {
+            allIndexes.add(indexSchema);
+            existingIndexNames.add(indexSchema.actualIndexName);
             fieldIndexPrefixMap[field.name] = true;
           }
         }
@@ -855,6 +895,7 @@ class TableSchema {
     buffer.addByte(field.type.index);
     buffer.addByte(field.nullable ? 1 : 0);
     buffer.addByte(field.unique ? 1 : 0);
+    buffer.addByte(field.createIndex ? 1 : 0);
 
     // Add defaultValueType
     buffer.addByte(field.defaultValueType.index);
@@ -999,6 +1040,7 @@ class FieldSchema {
   final bool nullable;
   final dynamic defaultValue;
   final bool unique;
+  final bool createIndex; // create index for this field
   final int? maxLength; // for text fields
   final int? minLength; // for text fields
   final num? minValue; // for numeric fields (integer, double)
@@ -1019,6 +1061,7 @@ class FieldSchema {
     this.nullable = true,
     this.defaultValue,
     this.unique = false,
+    this.createIndex = false,
     this.maxLength,
     this.minLength,
     this.minValue,
@@ -1036,6 +1079,7 @@ class FieldSchema {
     bool? nullable,
     dynamic defaultValue = _unsetValue,
     bool? unique,
+    bool? createIndex,
     int? maxLength,
     int? minLength,
     num? minValue,
@@ -1052,6 +1096,7 @@ class FieldSchema {
       defaultValue:
           defaultValue == _unsetValue ? this.defaultValue : defaultValue,
       unique: unique ?? this.unique,
+      createIndex: createIndex ?? this.createIndex,
       maxLength: maxLength ?? this.maxLength,
       minLength: minLength ?? this.minLength,
       minValue: minValue ?? this.minValue,
@@ -1074,6 +1119,7 @@ class FieldSchema {
       'minValue': minValue,
       'maxValue': maxValue,
       'unique': unique,
+      'createIndex': createIndex,
       'comment': comment,
       if (fieldId != null) 'fieldId': fieldId,
       if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
@@ -1126,6 +1172,7 @@ class FieldSchema {
       nullable: json['nullable'] as bool? ?? true,
       defaultValue: json['defaultValue'],
       unique: json['unique'] as bool? ?? false,
+      createIndex: json['createIndex'] as bool? ?? false,
       maxLength: json['maxLength'] as int?,
       minLength: json['minLength'] as int?,
       minValue: json['minValue'] as num?,

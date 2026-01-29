@@ -311,17 +311,17 @@ class DataStoreConfig {
       maxIo = 256;
     } else if (PlatformHandler.isDesktop) {
       // Desktop: 2x CPU cores
-      baseIo = cpuConcurrent * 2;
-      minIo = 8;
+      baseIo = cpuConcurrent * 3;
+      minIo = 12;
       maxIo = 64;
     } else if (PlatformHandler.isMobile) {
       // Mobile: 2x CPU cores, but bounded
-      baseIo = cpuConcurrent * 2;
-      minIo = 6;
+      baseIo = cpuConcurrent * 3;
+      minIo = 12;
       maxIo = 64;
     } else {
       // Web: keep low regardless of partition size
-      return 4;
+      return 6;
     }
 
     // Scale down concurrency for large partition files
@@ -430,12 +430,12 @@ class DataStoreConfig {
     if (PlatformHandler.isWeb) {
       return targetBatchSize.clamp(1000, 5000);
     } else if (PlatformHandler.isMobile) {
-      return targetBatchSize.clamp(5000, 20000);
+      return targetBatchSize.clamp(100000, 200000);
     } else if (PlatformHandler.isServerEnvironment) {
-      return targetBatchSize.clamp(50000, 500000);
+      return targetBatchSize.clamp(100000, 500000);
     } else {
       // Desktop
-      return targetBatchSize.clamp(10000, 50000);
+      return targetBatchSize.clamp(20000, 100000);
     }
   }
 

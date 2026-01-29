@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Цепочечные запросы (Поддержка =, !=, >, <, LIKE, IN и др.)
+// 3. Цепочечные запросы ([операторы запросов](#операторы-запросов), поддержка =, !=, >, <, LIKE, IN и др.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Интеграция для сценариев с частым запуском
 
+📱 **Пример**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Определение схемы, подходящее для мобильных и десктопных приложений с частыми запусками.
 // Точно идентифицирует изменения схемы и автоматически мигрирует данные.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Автоматически создает уникальный индекс
           fieldId: 'username',  // Уникальный ID поля
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Автоматически создает уникальный индекс
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Автоматически создает индекс (idx_last_login)
         ),
       ],
-      indexes: [ // Определения индексов
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Пример составного индекса
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Пример ограничения внешнего ключа
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Серверная интеграция
 
+🖥️ **Пример**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Массовое создание схем во время выполнения
 await db.createTables([
   // Таблица хранения 3D пространственных векторов признаков
@@ -415,7 +422,61 @@ final prevPage = await db.query('users')
 
 
 
+### Операторы запросов
 
+Операторы (без учета регистра) для `where(field, operator, value)`:
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Семантические методы запросов (рекомендуется)
+
+Рекомендуется использовать семантические методы вместо ручного ввода операторов.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Распределенная архитектура
 
@@ -561,7 +622,7 @@ final txResult2 = await db.transaction(() async {
 - Высокопрочное шифрование защищает конфиденциальные данные.
 
 > [!WARNING]
-> **Управление ключами**: Изменение `encryptionKey` сделает старые данные нечитаемыми (если не проведена миграция). Не зашивайте конфиденциальные ключи в код; получайте их с защищенного сервера.
+> **Управление ключами**: **`encodingKey`** можно менять свободно; при изменении движок автоматически мигрирует данные, беспокоиться о потере данных не нужно. **`encryptionKey`** не меняйте произвольно — после изменения старые данные станут нечитаемыми, если не проведена миграция. Не зашивайте конфиденциальные ключи в код; получайте их с защищенного сервера.
 
 ```dart
 final db = await ToStore.open(
@@ -570,10 +631,10 @@ final db = await ToStore.open(
       // Поддерживаемые алгоритмы: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Ключ кодирования (должен быть предоставлен при инициализации)
+      // Ключ кодирования (можно менять свободно; данные мигрируют автоматически)
       encodingKey: 'Ваш-32-байтный-ключ-кодирования...', 
       
-      // Ключ шифрования для критически важных данных
+      // Ключ шифрования для критически важных данных (не менять произвольно; старые данные нечитаемы без миграции)
       encryptionKey: 'Ваш-надежный-ключ-шифрования...',
       
       // Привязка к устройству (на основе пути)

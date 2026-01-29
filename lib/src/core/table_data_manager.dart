@@ -78,6 +78,9 @@ class TableDataManager {
   /// ID generator cache
   final Map<String, IdGenerator> _idGenerators = {};
 
+  /// Pending generator creation per table (ensures single instance under concurrency)
+  final Map<String, Future<IdGenerator>> _idGeneratorPending = {};
+
   /// ID range storage data
   final Map<String, Map<String, dynamic>> _idRanges = {};
 
@@ -194,7 +197,7 @@ class TableDataManager {
   /// Cache a single table record
   void cacheTableRecord(String tableName, String pk,
       Map<String, dynamic> record, TableSchema schema,
-      {bool isInsertOperation = false, bool force = false}) {
+      {bool force = false}) {
     if (_tableRecordCache.maxByteThreshold <= 0) {
       return;
     }
@@ -205,20 +208,9 @@ class TableDataManager {
     }
 
     // [Cache Optimization] Use Fast O(1) checks
-    final bool isFullyCached = _tableRecordCache.isFullyCached(tableName);
-    if (!isFullyCached &&
-        isInsertOperation &&
-        !_dataStore.isGlobalPrewarming &&
-        !force) {
-      return;
-    }
-
     final bool alreadyInCache = _tableRecordCache.containsKey([tableName, pk]);
 
-    if (isFullyCached ||
-        alreadyInCache ||
-        force ||
-        _dataStore.isGlobalPrewarming) {
+    if (alreadyInCache || force || _dataStore.isGlobalPrewarming) {
       // Lazy registration of comparator
       _registerTableComparator(tableName, schema);
 
@@ -246,13 +238,8 @@ class TableDataManager {
       return;
     }
 
-    final bool isFullyCached = _tableRecordCache.isFullyCached(tableName);
-
-    // [Optimization] If NOT fully cached, and the cache is EMPTY,
-    // we can safely skip the entire batch since these are inserts.
-    // Exception: If we are prewarming (global flag), we MUST cache.
-    final doNotCache =
-        !isFullyCached && !_dataStore.isGlobalPrewarming && !force;
+    // [Optimization] We only update if it's already there or forced
+    final doNotCache = !_dataStore.isGlobalPrewarming && !force;
     if (isInsertOperation && doNotCache) {
       return;
     }
@@ -267,7 +254,7 @@ class TableDataManager {
 
       final key = [tableName, pk];
 
-      // If not fully cached, we only update if it's already there
+      // If not forced/prewarming, we only update if it's already there
       if (doNotCache) {
         if (!_tableRecordCache.containsKey(key)) continue;
       }
@@ -276,16 +263,6 @@ class TableDataManager {
       final size = _estimateRecordSizeBytes(value);
       _tableRecordCache.put(key, value, size: size);
     }
-  }
-
-  /// Mark a table as fully cached (or not).
-  void setTableFullyCached(String tableName, bool isFullyCached) {
-    _tableRecordCache.setFullyCached([tableName], isFullyCached);
-  }
-
-  /// Check if a table is fully cached.
-  bool isTableFullyCached(String tableName) {
-    return _tableRecordCache.isFullyCached([tableName]);
   }
 
   /// Remove a cached table record (if present).
@@ -305,22 +282,11 @@ class TableDataManager {
   }
 
   /// Remove all cached records of a table (used for drop/clear/space switching).
-  /// [markAsFullyCached] - If true, marks the table as fully cached (for empty tables).
-  /// If false, clears the fully cached flag (for migration scenarios where data still exists).
-  Future<void> clearTableRecordsForTable(String tableName,
-      {bool markAsFullyCached = true}) async {
+  Future<void> clearTableRecordsForTable(String tableName) async {
     _tableRecordCache.remove([tableName]);
 
     // Also remove from record count cache
     _tableRecordCounts.remove(tableName);
-
-    // Only mark as fully cached if explicitly requested (for empty tables after drop/clear)
-    // For migration scenarios, we should not mark as fully cached since data still exists
-    if (markAsFullyCached) {
-      setTableFullyCached(tableName, true);
-    } else {
-      setTableFullyCached(tableName, false);
-    }
   }
 
   /// Remove record count cache for a table.
@@ -346,63 +312,6 @@ class TableDataManager {
   /// Clear all table record cache entries synchronously (used on shutdown).
   void clearAllTableRecordCacheSync() {
     _tableRecordCache.clear();
-  }
-
-  /// Initialize full table record cache for a table.
-  /// Streams all records and populates the cache.
-  Future<void> prewarmTableRecordCache(String tableName) async {
-    try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) return;
-      final primaryKey = schema.primaryKey;
-
-      // Register comparator for this table (ensure correct cache sorting)
-      _registerTableComparator(tableName, schema);
-
-      final yieldController = YieldController(
-        'TableDataManager.initializeTableRecordCache',
-        checkInterval: 20,
-      );
-
-      final List<Map<String, dynamic>> batch = [];
-      const int batchSize = 5000;
-
-      await for (final record in streamRecords(tableName)) {
-        batch.add(record);
-        if (batch.length >= batchSize) {
-          cacheTableRecordsBatch(
-            tableName,
-            batch,
-            primaryKey: primaryKey,
-            schema: schema,
-            isInsertOperation:
-                true, // Internal stream records can be safely shared
-            force: true, // Force write during pre-warm
-          );
-          batch.clear();
-          // Yield periodically to prevent UI blocking during large cache population
-          await yieldController.maybeYield();
-        }
-      }
-
-      if (batch.isNotEmpty) {
-        cacheTableRecordsBatch(
-          tableName,
-          batch,
-          primaryKey: primaryKey,
-          schema: schema,
-          isInsertOperation: true,
-          force: true, // Force write during pre-warm
-        );
-      }
-
-      // Mark the table as fully cached
-      setTableFullyCached(tableName, true);
-    } catch (e, s) {
-      Logger.error(
-          'Failed to initialize table record cache for $tableName: $e\n$s',
-          label: 'TableDataManager.initializeTableRecordCache');
-    }
   }
 
   /// Current table record cache size in bytes.
@@ -863,6 +772,7 @@ class TableDataManager {
 
       // Cleanup ID generator resources
       _idGenerators.clear();
+      _idGeneratorPending.clear();
       _idRanges.clear();
       _checkedOrderedRange.clear();
       _maxIds.clear();
@@ -1095,9 +1005,7 @@ class TableDataManager {
       Map<String, dynamic>? indexOldData;
       Map<String, dynamic>? indexNewData;
 
-      if (finalOperation == BufferOperationType.insert) {
-        indexNewData = bufferedData;
-      } else if (finalOperation == BufferOperationType.update) {
+      if (finalOperation == BufferOperationType.update) {
         indexOldData = oldValues;
         indexNewData = bufferedData;
       } else if (finalOperation == BufferOperationType.delete) {
@@ -1106,7 +1014,7 @@ class TableDataManager {
 
       if (indexOldData != null || indexNewData != null) {
         // Fire and forget, don't block main flow
-        await _dataStore.indexManager!.updateFullIndexCache(
+        await _dataStore.indexManager!.updateIndexDataCache(
           tableName,
           recordId,
           indexOldData,
@@ -1118,9 +1026,8 @@ class TableDataManager {
     // Sync to TableRecordCache
     if (finalOperation == BufferOperationType.delete) {
       removeTableRecord(tableName, recordId);
-    } else {
-      cacheTableRecord(tableName, recordId, bufferedData, schema,
-          isInsertOperation: finalOperation == BufferOperationType.insert);
+    } else if (finalOperation == BufferOperationType.update) {
+      cacheTableRecord(tableName, recordId, bufferedData, schema);
     }
 
     // Statistics
@@ -1277,24 +1184,6 @@ class TableDataManager {
         uniqueKeysList: uniqueKeysList,
       );
       successIds.addAll(recordIds);
-
-      cacheTableRecordsBatch(
-        tableName,
-        recordsForCache,
-        primaryKey: pkName,
-        isInsertOperation: true,
-        schema: schema,
-      );
-
-      // Keep INDEX cache in sync for all indexes (unique + non-unique).
-      // This is critical for query performance immediately after insert.
-      await _dataStore.indexManager?.batchUpdateFullIndexCache(
-        tableName,
-        recordsForCache,
-        schemaOverride: schema,
-        isInsertOperation: true,
-      );
-
       _needSaveStats = true;
     }
 
@@ -1428,47 +1317,6 @@ class TableDataManager {
       uniqueKeys: uniqueKeyRefs ?? const <UniqueKeyRef>[],
       updateStats: updateStats,
     );
-
-    // 2. Update Hot Cache (Unconditional/Forced)
-    // User requested consistency: batch recovery data is "hot" and small, so we force-cache it
-    // to ensure queries immediately after startup return correct results, even if pre-warm isn't done.
-    if (operationType == BufferOperationType.delete) {
-      removeTableRecord(tableName, recordId);
-    } else {
-      cacheTableRecord(
-        tableName,
-        recordId,
-        data,
-        schema,
-        isInsertOperation: operationType == BufferOperationType.insert,
-        force: true, // FORCE CACHE
-      );
-    }
-    // Also update Index Cache for immediate consistency
-    if (_dataStore.indexManager != null) {
-      Map<String, dynamic>? indexOldData;
-      Map<String, dynamic>? indexNewData;
-
-      if (operationType == BufferOperationType.insert) {
-        indexNewData = data;
-      } else if (operationType == BufferOperationType.update) {
-        indexOldData = oldValues;
-        indexNewData = data;
-      } else if (operationType == BufferOperationType.delete) {
-        indexOldData = data;
-      }
-
-      if (indexOldData != null || indexNewData != null) {
-        // Fire and forget, don't block main flow
-        await _dataStore.indexManager!.updateFullIndexCache(
-          tableName,
-          recordId,
-          indexOldData,
-          indexNewData,
-          force: true,
-        );
-      }
-    }
   }
 
   /// get total table count
@@ -1757,59 +1605,60 @@ class TableDataManager {
     await _dataStore.storage.ensureDirectoryExists(path);
   }
 
-  /// get id generator, create if not exists
+  /// Get id generator, create if not exists. Single instance per table under concurrency.
   Future<IdGenerator> _getIdGenerator(String tableName) async {
-    // check cache
-    if (_idGenerators.containsKey(tableName)) {
-      return _idGenerators[tableName]!;
-    }
+    final cached = _idGenerators[tableName];
+    if (cached != null) return cached;
 
+    final pending = _idGeneratorPending[tableName];
+    if (pending != null) return await pending;
+
+    final future = _createIdGeneratorForTable(tableName);
+    _idGeneratorPending[tableName] = future;
     try {
-      // get table schema
+      final generator = await future;
+      _idGenerators[tableName] = generator;
+      return generator;
+    } finally {
+      _idGeneratorPending.remove(tableName);
+    }
+  }
+
+  /// Create and initialize id generator for a table (single creation per table under concurrency).
+  Future<IdGenerator> _createIdGeneratorForTable(String tableName) async {
+    try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         throw Exception('Table schema is null, cannot get batch ids');
       }
 
-      // create id generator
       final generator = IdGeneratorFactory.createGenerator(
         schema,
         _dataStore.config,
         centralClient: _centralClient,
       );
 
-      // if sequential id generator, set current id value
       if (generator is SequentialIdGenerator) {
         final currentId = _maxIds[tableName];
 
-        // if current id value exists in memory, try to convert to integer and set to generator
         if (currentId != null) {
           try {
-            // convert string id to integer (because generator still uses integer internally)
             if (currentId is String && _isNumericString(currentId)) {
               final intId = int.parse(currentId);
-              if (intId > 0) {
-                generator.setCurrentId(intId);
-              }
+              if (intId > 0) generator.setCurrentId(intId);
             } else if (currentId is int && currentId > 0) {
-              // backward compatible, handle possible integer value
               generator.setCurrentId(currentId);
             }
           } catch (e) {
             Logger.error(
                 'Failed to set id generator current value: $e, value=$currentId',
-                label: 'TableDataManager._getIdGenerator');
+                label: 'TableDataManager._createIdGeneratorForTable');
           }
         } else {
-          // If maxId is still null after updateMaxIdFromTable, use schema initialValue
-          // This should only happen for empty tables
-          // Generator constructor already sets _currentId = initialValue - 1, so no need to set again
-          // But we ensure it's at least initialValue - 1
           final initialValue =
               schema.primaryKeyConfig.sequentialConfig?.initialValue ?? 1;
           generator.setCurrentId(initialValue - 1);
         }
-        // if using distributed mode, restore id range info
         if (_idRanges.containsKey(tableName)) {
           final rangeInfo = _idRanges[tableName];
           if (rangeInfo != null &&
@@ -1818,46 +1667,33 @@ class TableDataManager {
             try {
               final current = rangeInfo['current'];
               final max = rangeInfo['max'];
-
               int currentInt, maxInt;
-
               if (current is String && max is String) {
-                // new string format id
                 currentInt = int.parse(current);
                 maxInt = int.parse(max);
               } else {
-                // old integer format id
                 currentInt = current as int;
                 maxInt = max as int;
               }
-
               generator.setIdRange(currentInt, maxInt);
             } catch (e) {
               Logger.error('Failed to set id generator range: $e',
-                  label: 'TableDataManager._getIdGenerator');
+                  label: 'TableDataManager._createIdGeneratorForTable');
             }
           }
         }
       }
 
-      // save to cache
-      _idGenerators[tableName] = generator;
-
       return generator;
     } catch (e) {
       Logger.error(
         'Failed to get id generator: $e',
-        label: 'TableDataManager._getIdGenerator',
+        label: 'TableDataManager._createIdGeneratorForTable',
       );
-
-      // return a simple default generator
       const defaultConfig = SequentialIdConfig();
       final defaultGenerator =
           SequentialIdGenerator(defaultConfig, tableName: tableName);
-
-      // cache this generator to avoid duplicate creation
       _idGenerators[tableName] = defaultGenerator;
-
       return defaultGenerator;
     }
   }
@@ -1874,16 +1710,10 @@ class TableDataManager {
       // all ids use string type
       final maxIdStr = currentMaxId.toString();
 
-      // if max id is numeric string, calculate current id
+      // if max id is numeric string, use generator's current id for persistence
       if (_isNumericString(maxIdStr)) {
-        // get remaining ids
-        final remainingIds =
-            generator.remainingIds > 0 ? generator.remainingIds : 0;
-
         try {
-          // convert string to integer for calculation
-          final maxIdInt = int.parse(maxIdStr);
-          final currentIdInt = maxIdInt - remainingIds;
+          final currentIdInt = generator.currentId;
 
           // save as string type
           _idRanges[tableName] = {
@@ -2608,8 +2438,8 @@ class TableDataManager {
       await updateTableMeta(tableName, emptyMeta);
 
       // 5. clean ID generator related resources
-      // remove ID generator instance for this table
       _idGenerators.remove(tableName);
+      _idGeneratorPending.remove(tableName);
 
       // 6. handle auto increment ID reset
       try {
@@ -3084,6 +2914,7 @@ class TableDataManager {
     _maxIds.remove(tableName);
     _maxIdsDirty.remove(tableName);
     _idGenerators.remove(tableName);
+    _idGeneratorPending.remove(tableName);
     _idRanges.remove(tableName);
     _checkedOrderedRange.remove(tableName);
     _processingTables.remove(tableName);
@@ -3175,198 +3006,6 @@ class TableDataManager {
     );
   }
 
-  /// Supports any query conditions on the primary key, as well as limit, offset, and orderBy. Only when the query conditions do not include the primary key will it iterate and scan partitions one by one.
-  ///
-  /// [tableName]          - Name of the table.
-  /// [matcher]            - Optional: record matcher to filter records.
-  /// [limit]              - Optional: maximum number of records to return.
-  /// [offset]             - Optional: number of records to skip before returning results.
-  /// [orderBy]            - Optional: list of fields to order by.
-  /// [startAfterPrimaryKey] - Optional: keyset cursor (exclusive) for primary key string.
-  /// Optimized search path for fully cached tables.
-  /// Skips disk I/O and efficiently queries the in-memory TreeCache.
-  Future<TableScanResult> _searchTableDataFullCache(
-    String tableName,
-    ConditionRecordMatcher? matcher, {
-    required int? limit,
-    required int? offset,
-    required List<String>? orderBy,
-    required String? startAfterPrimaryKey,
-    required bool Function(Map<String, dynamic>)? filter,
-  }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      return TableScanResult(records: [], wasFull: false);
-    }
-    final primaryKey = schema.primaryKey;
-    final pkMatcher =
-        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
-
-    // 1. Prepare Sort
-    bool isPkOrder = true;
-    bool reverse = false;
-    List<String> sortFields = [];
-    List<bool> sortDirections = [];
-
-    if (orderBy != null && orderBy.isNotEmpty) {
-      // (Simplified Parse Logic - relies on caller passing valid orderBy or parsed logic duplication?)
-      // Actually caller logic is duplicated here in previous implementation, preserving it.
-      if (orderBy.length == 1) {
-        String f = orderBy[0];
-        bool isDesc = false;
-        if (f.startsWith('-')) {
-          f = f.substring(1);
-          isDesc = true;
-        } else if (f.toUpperCase().endsWith(' DESC')) {
-          f = f.substring(0, f.length - 5).trim();
-          isDesc = true;
-        } else if (f.toUpperCase().endsWith(' ASC')) {
-          f = f.substring(0, f.length - 4).trim();
-        }
-        if (f == primaryKey) {
-          isPkOrder = true;
-          reverse = isDesc;
-        } else {
-          isPkOrder = false;
-          sortFields.add(f);
-          sortDirections.add(!isDesc);
-        }
-      } else {
-        isPkOrder = false;
-        for (final raw in orderBy) {
-          String f = raw;
-          bool asc = true;
-          if (f.startsWith('-')) {
-            f = f.substring(1);
-            asc = false;
-          }
-          sortFields.add(f);
-          sortDirections.add(asc);
-        }
-      }
-    }
-
-    var results = <Map<String, dynamic>>[];
-    int effectiveOffset = offset ?? 0;
-    if (effectiveOffset < 0) effectiveOffset = 0;
-    int? effectiveLimit = limit;
-    if (limit != null && limit <= 0) effectiveLimit = null;
-    int produced = 0;
-
-    // Filter validation helper
-    bool matches(Map<String, dynamic> r) {
-      if (isDeletedRecord(r)) return false;
-      if (filter != null && !filter(r)) return false;
-      if (matcher != null && !matcher.matches(r)) return false;
-      return true;
-    }
-
-    if (!isPkOrder) {
-      // NON-PK ORDER: Collect ALL, Sort, Apply Offset/Limit
-      // 1. Scan Cache
-      await _tableRecordCache.scan([tableName], onEntry: (keyPath, val) {
-        if (matches(val)) {
-          results.add(val);
-        }
-        return true;
-      });
-
-      // 3. Sort
-      if (sortFields.isNotEmpty) {
-        final schemas = <String, TableSchema>{tableName: schema};
-        results = await ValueMatcher.sortMapList(
-            results, sortFields, sortDirections, schemas, tableName);
-      }
-
-      // 4. Offset/Limit
-      if (effectiveOffset > 0) {
-        if (effectiveOffset >= results.length)
-          return TableScanResult(records: [], wasFull: true);
-        results.removeRange(0, effectiveOffset);
-      }
-      if (effectiveLimit != null && results.length > effectiveLimit) {
-        results.removeRange(effectiveLimit, results.length);
-      }
-      return TableScanResult(
-          records: results,
-          wasFull: true,
-          offsetApplied: true,
-          onlyMergeTransaction: true);
-    } else {
-      // PK ORDER: Streaming Scan with Merge
-      final cursorPk = (startAfterPrimaryKey ?? '').trim();
-
-      // Merge Iterator variables
-      // (Simplified: No overlay needed here anymore)
-
-      // Helper to process a record
-      // Returns true if we should continue
-      bool process(Map<String, dynamic> r) {
-        // Cursor check (strict >)
-        final rPk = r[primaryKey].toString();
-        if (cursorPk.isNotEmpty) {
-          final cmp = pkMatcher(rPk, cursorPk);
-          // ASC: must be > cursor (1). DESC: must be < cursor (-1)
-          if (!reverse) {
-            if (cmp <= 0) return true;
-          } else {
-            if (cmp >= 0) return true;
-          }
-        }
-
-        if (matches(r)) {
-          if (effectiveOffset > 0) {
-            effectiveOffset--;
-          } else {
-            results.add(r);
-            produced++;
-          }
-        }
-        if (effectiveLimit != null && produced >= effectiveLimit) return false;
-        return true;
-      }
-
-      // Start Scan
-      dynamic startKey;
-      dynamic endKey;
-
-      if (cursorPk.isNotEmpty) {
-        // The current cursor logic inside scan callback handles strict/loose comparison,
-        // but for TreeCache range we need inclusive bounds.
-        // We can use cursor directly, scanRange is inclusive.
-        // If ASC: start=cursor, end=MAX.
-        // If DESC: start=MIN, end=cursor.
-        if (!reverse) {
-          startKey = [tableName, cursorPk];
-          endKey = [tableName, '\uffff']; // Using high-value string as sentinel
-        } else {
-          startKey = [tableName, ''];
-          endKey = [tableName, cursorPk];
-        }
-      } else {
-        startKey = [tableName, ''];
-        endKey = [tableName, '\uffff'];
-      }
-
-      // We start a scanRange on TreeCache.
-      // Critical Fix: We pass limit: null to scanRange because scanRange's limit counts *visited* entries,
-      // not *matched* entries. If we passed scanLimit here, the scanner would stop prematurely
-      // when filtering (e.g. LIKE %...) before determining if entries match.
-      // We enforce the effective limit inside the [process] callback, which returns false to stop
-      // scanning once enough *matching* records are collected.
-      await _tableRecordCache.scanRange(startKey, endKey,
-          reverse: reverse, limit: null, onEntry: (path, val) {
-        if (path.isEmpty || path[0] != tableName) return false;
-        return process(val);
-      });
-      return TableScanResult(
-          records: results,
-          wasFull: true,
-          offsetApplied: true,
-          onlyMergeTransaction: true);
-    }
-  }
-
   /// Batch query with full consistency checking (Txn > Cache > Buffer > Disk).
   /// Batch query. Note: Returns results from Cache and Disk (Committed data).
   /// [isConsistent] in the result indicates if all requested keys were found in the committed state.
@@ -3376,17 +3015,14 @@ class TableDataManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    if (keys.isEmpty) return TableScanResult(records: [], wasFull: true);
+    if (keys.isEmpty) return TableScanResult(records: []);
 
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-    if (schema == null) return TableScanResult(records: [], wasFull: true);
+    if (schema == null) return TableScanResult(records: []);
 
     final results = <Map<String, dynamic>>[];
     final missingKeys = <dynamic>[];
     final uniqueKeys = keys.toSet().toList();
-
-    // Check if table is fully cached
-    final isFullyCached = isTableFullyCached(tableName);
 
     // 1. Try Cache
     for (final key in uniqueKeys) {
@@ -3395,17 +3031,12 @@ class TableDataManager {
       if (cached != null) {
         results.add(cached);
       } else {
-        // If fully cached, missing keys don't exist (no need to check disk)
-        if (!isFullyCached) {
-          missingKeys.add(key);
-        }
+        missingKeys.add(key);
       }
     }
 
-    // 2. Try Disk (only if not fully cached)
-    bool readFromDisk = false;
+    // 2. Try Disk
     if (missingKeys.isNotEmpty) {
-      readFromDisk = true;
       final pkMatcher =
           ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
       final diskResults =
@@ -3431,19 +3062,9 @@ class TableDataManager {
       results.addAll(diskResults);
     }
 
-    // onlyMergeTransaction should be true ONLY if:
-    // 1. All keys were found (complete = true)
-    // 2. AND we did NOT read from disk (all from cache)
-    // If we read from disk, we must merge buffers even if all keys were found,
-    // because buffer may contain updates/deletes for those records.
-    bool onlyMergeTransaction =
-        !readFromDisk && results.length >= uniqueKeys.length;
-
     return TableScanResult(
-        records: results,
-        wasFull: true,
-        offsetApplied: true,
-        onlyMergeTransaction: onlyMergeTransaction);
+      records: results,
+    );
   }
 
   Future<TableScanResult> searchTableData(
@@ -3463,22 +3084,37 @@ class TableDataManager {
     );
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      return TableScanResult(records: const [], wasFull: false);
+      return TableScanResult(records: const []);
     }
     final primaryKey = schema.primaryKey;
     final pkMatcher =
         ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
+    final bufferMgr = _dataStore.writeBufferManager;
+
     bool recordMatches(Map<String, dynamic> r) {
       // Defensive: always treat deleted/tombstone as non-visible.
       if (isDeletedRecord(r)) return false;
+
+      // Check Real-time WriteBuffer to filter out pending deletes.
+      // This prevents "page gaps" where disk records are counted towards limit
+      // but later removed during mergeConsistency.
+      final pk = r[primaryKey]?.toString();
+      if (pk != null) {
+        final be = bufferMgr.getBufferedRecord(tableName, pk);
+        if (be != null && be.operation == BufferOperationType.delete) {
+          return false;
+        }
+      }
+
       if (filter != null && !filter(r)) return false;
       if (matcher != null && !matcher.matches(r)) return false;
       return true;
     }
 
-    final bool Function(Map<String, dynamic>)? recordPredicate =
-        (matcher == null && filter == null) ? null : recordMatches;
+    // Always apply recordMatches to ensure WriteBuffer deletions are filtered out
+    // during the scan (preserving the limit), even if matcher/filter are null.
+    final bool Function(Map<String, dynamic>)? recordPredicate = recordMatches;
 
     // Parse Sort Order first as it is needed by fast paths
     bool isPkOrder = true;
@@ -3543,7 +3179,7 @@ class TableDataManager {
       final keys =
           pkEqValue != null ? [pkEqValue] : pkInValues!.toSet().toList();
       if (keys.isEmpty) {
-        return TableScanResult(records: [], wasFull: false);
+        return TableScanResult(records: []);
       }
 
       final batchRes = await queryRecordsBatch(tableName, keys);
@@ -3569,7 +3205,7 @@ class TableDataManager {
       // Apply Offset/Limit in memory
       if (offset != null && offset > 0) {
         if (offset >= filtered.length) {
-          return TableScanResult(records: const [], wasFull: true);
+          return TableScanResult(records: const []);
         }
         filtered.removeRange(0, offset);
       }
@@ -3578,29 +3214,13 @@ class TableDataManager {
       }
 
       return TableScanResult(
-          records: filtered,
-          wasFull: true,
-          offsetApplied: true,
-          onlyMergeTransaction: batchRes.onlyMergeTransaction);
+        records: filtered,
+      );
     }
 
-    // OPTIMIZATION: Full Cache for Range/Scan/Sort
-    if (isTableFullyCached(tableName)) {
-      final res = await _searchTableDataFullCache(tableName, matcher,
-          limit: limit,
-          offset: offset,
-          orderBy: orderBy,
-          startAfterPrimaryKey: startAfterPrimaryKey,
-          filter: filter);
-      return TableScanResult(
-          records: res.records,
-          wasFull: res.wasFull,
-          offsetApplied: res.offsetApplied,
-          onlyMergeTransaction: true); // Full cache scan is committed-complete
-    }
     final fileMeta = await getTableMeta(tableName);
     if (fileMeta == null || fileMeta.totalRecords <= 0) {
-      return TableScanResult(records: const [], wasFull: true);
+      return TableScanResult(records: const []);
     }
 
     final rangeMgr = _dataStore.tableTreePartitionManager;
@@ -3764,11 +3384,8 @@ class TableDataManager {
     if (endKeyBytes.isNotEmpty &&
         startKeyBytes.isNotEmpty &&
         MemComparableKey.compare(startKeyBytes, endKeyBytes) >= 0) {
-      return TableScanResult(records: [], wasFull: false);
+      return TableScanResult(records: []);
     }
-
-    final bool wasFullScan =
-        startKeyBytes.isEmpty && endKeyBytes.isEmpty && needCount < 0;
 
     // PK-ordered scan: can stop early at offset+limit.
     if (isPkOrder) {
@@ -3782,8 +3399,7 @@ class TableDataManager {
         limit: (needCount < 0) ? null : needCount,
         recordPredicate: recordPredicate,
       );
-      return TableScanResult(
-          records: out, wasFull: wasFullScan, offsetApplied: false);
+      return TableScanResult(records: out);
     }
 
     // Non-PK orderBy: must scan all target partitions, then do in-memory topK sort (bounded by offset+limit).
@@ -3830,8 +3446,7 @@ class TableDataManager {
       // Note: Sorting is handled by the upper layer (QueryExecutor._applySort),
       // so we skip sorting here to avoid redundant operations and improve performance.
       // Only need to handle reverse partition scanning based on sort direction.
-      return TableScanResult(
-          records: out, wasFull: wasFullScan, offsetApplied: false);
+      return TableScanResult(records: out);
     }
 
     // Maintain a bounded global topK heap of size <= needCount.
@@ -3871,8 +3486,7 @@ class TableDataManager {
       });
 
       if (tasks.isEmpty) {
-        return TableScanResult(
-            records: [], wasFull: wasFullScan, offsetApplied: false);
+        return TableScanResult(records: []);
       }
 
       final effectiveConcurrency = min(queryConcurrency, tasks.length);
@@ -3906,10 +3520,7 @@ class TableDataManager {
       lease?.release();
     }
 
-    return TableScanResult(
-        records: globalTop.toSortedList(),
-        wasFull: wasFullScan,
-        offsetApplied: false);
+    return TableScanResult(records: globalTop.toSortedList());
   }
 }
 

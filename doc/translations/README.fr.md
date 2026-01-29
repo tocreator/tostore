@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Requêtes chaînées (Supporte =, !=, >, <, LIKE, IN, etc.)
+// 3. Requêtes chaînées ([opérateurs de requête](#opérateurs-de-requête), supporte =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Intégration pour les scénarios de démarrage fréquent
 
+📱 **Exemple** : [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Définition de schéma adaptée aux scénarios de démarrage fréquent (applications mobiles/bureau).
 // Identifie précisément les changements de schéma et migre automatiquement les données.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Crée automatiquement un index unique
           fieldId: 'username',  // Identifiant unique du champ
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Crée automatiquement un index unique
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Crée automatiquement un index
         ),
       ],
-      indexes: [ // Définition des index
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Exemple d'index composite
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Exemple de contrainte de clé étrangère
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Intégration côté serveur
 
+🖥️ **Exemple** : [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Création massive de schémas au runtime
 await db.createTables([
   // Table de stockage des vecteurs de caractéristiques spatiales 3D
@@ -418,7 +425,61 @@ final prevPage = await db.query('users')
 
 
 
+### Opérateurs de requête
 
+Tous les opérateurs (insensibles à la casse) pour `where(field, operator, value)` :
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Méthodes de requête sémantiques (recommandé)
+
+Préférez les méthodes sémantiques pour éviter de taper les opérateurs à la main.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Architecture distribuée
 
@@ -564,7 +625,7 @@ final txResult2 = await db.transaction(() async {
 - Cryptage haute résistance pour les données sensibles.
 
 > [!WARNING]
-> **Gestion des clés** : Changer la `encryptionKey` rendra les anciennes données illisibles (sauf migration). Ne codez pas les clés en dur ; récupérez-les depuis un serveur sécurisé.
+> **Gestion des clés** : **`encodingKey`** peut être modifiée librement ; le moteur migrera les données automatiquement à la modification, pas de risque de perte. **`encryptionKey`** ne doit pas être modifiée arbitrairement : la modifier rendra les anciennes données illisibles (sauf migration). Ne codez pas les clés en dur ; récupérez-les depuis un serveur sécurisé.
 
 ```dart
 final db = await ToStore.open(
@@ -573,10 +634,10 @@ final db = await ToStore.open(
       // Algorithmes supportés : none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Clé d'encodage (obligatoire à l'initialisation)
+      // Clé d'encodage (modifiable librement ; les données sont migrées automatiquement)
       encodingKey: 'Votre-Clé-D-Encodage-De-32-Octets...', 
       
-      // Clé de cryptage pour les données critiques
+      // Clé de cryptage pour les données critiques (ne pas modifier arbitrairement ; anciennes données illisibles sans migration)
       encryptionKey: 'Votre-Clé-De-Cryptage-Sécurisée...',
       
       // Liaison à l'appareil (basé sur le chemin)

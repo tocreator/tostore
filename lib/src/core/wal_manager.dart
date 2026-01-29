@@ -376,11 +376,13 @@ class WalManager {
 
   void _pruneTableOpsUpToCheckpoint() {
     final checkpoint = _meta.checkpoint;
-    // Snapshot entries to avoid concurrent modification issues
+    // Remove only completed ops whose cutoff is at or before checkpoint.
+    // Pending (completed=false) ops stay until they are completed and checkpoint passes.
     final entries =
         Map<String, TableOpMeta>.from(_meta.tableOps).entries.toList();
     for (final entry in entries) {
-      if (isAtOrBefore(entry.value.cutoff, checkpoint)) {
+      final op = entry.value;
+      if (op.completed && isAtOrBefore(op.cutoff, checkpoint)) {
         _meta.tableOps.remove(entry.key);
       }
     }
@@ -1399,24 +1401,18 @@ class WalManager {
 
   /// Mark a table-level maintenance operation as completed.
   ///
-  /// - This should be called by the clear/drop implementation *after* the
-  ///   physical table operation has finished successfully.
-  /// - If the op's cutoff is already at or before the current checkpoint,
-  ///   it no longer affects recovery/replay semantics and can be removed
-  ///   from WAL meta immediately.
-  /// - If the cutoff is newer than the checkpoint (there is still WAL
-  ///   between [checkpoint] and [cutoff]), we keep the entry so that
-  ///   recovery/flush can still use it to skip obsolete WAL. In that case
-  ///   the entry will be pruned later by [_pruneTableOpsUpToCheckpoint]
-  ///   when the checkpoint advances.
+  /// Called by the clear/drop implementation *after* the physical table
+  /// operation has finished successfully. We only set [completed]=true and
+  /// persist; the op stays in [tableOps] so that WAL replay can still use
+  /// its cutoff to skip obsolete entries. On next startup, [_resumePendingTableOps]
+  /// will skip this op (only re-executes when completed==false). The op is
+  /// removed later by [_pruneTableOpsUpToCheckpoint] when checkpoint advances
+  /// past the cutoff.
   Future<void> completeTableOp(String opId) async {
     final op = _meta.tableOps[opId];
     if (op == null) return;
-    // Only remove if cutoff is not newer than checkpoint.
-    if (isAtOrBefore(op.cutoff, _meta.checkpoint)) {
-      _meta.tableOps.remove(opId);
-      await persistMeta(flush: false);
-    }
+    _meta.tableOps[opId] = op.copyWith(completed: true);
+    await persistMeta(flush: false);
   }
 }
 

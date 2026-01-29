@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Consultas encadenadas (Soporta =, !=, >, <, LIKE, IN, etc.)
+// 3. Consultas encadenadas ([operadores de consulta](#operadores-de-consulta), soporta =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Integración para Escenarios de Inicio Frecuente
 
+📱 **Ejemplo**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Definición de esquema adecuada para aplicaciones móviles y de escritorio.
 // Identifica con precisión los cambios de esquema y migra automáticamente los datos.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Crea automáticamente un índice único
           fieldId: 'username',  // Identificador único de campo
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Crea automáticamente un índice único
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Crea automáticamente un índice
         ),
       ],
-      indexes: [ // Definición de índices
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Ejemplo de índice compuesto
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Ejemplo de restricción de clave foránea
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Integración del Lado del Servidor
 
+🖥️ **Ejemplo**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Creación masiva de esquemas en tiempo de ejecución
 await db.createTables([
   // Tabla de almacenamiento de vectores de características espaciales 3D
@@ -418,7 +425,61 @@ final prevPage = await db.query('users')
 
 
 
+### Operadores de consulta
 
+Todos los operadores (insensibles a mayúsculas) para `where(field, operator, value)`:
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Métodos de consulta semánticos (recomendado)
+
+Se recomienda usar métodos semánticos en lugar de escribir operadores a mano.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Arquitectura Distribuida
 
@@ -564,7 +625,7 @@ final txResult2 = await db.transaction(() async {
 - El cifrado de alta resistencia protege los datos sensibles.
 
 > [!WARNING]
-> **Gestión de Claves**: Cambiar `encryptionKey` hará que los datos antiguos sean ilegibles (a menos que se realice una migración). No codifique claves sensibles; obténgalas de un servidor seguro.
+> **Gestión de Claves**: **`encodingKey`** puede cambiarse libremente; el motor migrará los datos automáticamente al cambiarla, por lo que no hay que preocuparse por la pérdida de datos. **`encryptionKey`** no debe cambiarse arbitrariamente: cambiarla hará que los datos antiguos sean ilegibles salvo que se realice una migración. No codifique claves sensibles; obténgalas de un servidor seguro.
 
 ```dart
 final db = await ToStore.open(
@@ -573,10 +634,10 @@ final db = await ToStore.open(
       // Algoritmos soportados: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Clave de codificación (debe proporcionarse al inicializar)
+      // Clave de codificación (puede cambiarse libremente; los datos se migran automáticamente)
       encodingKey: 'Su-Clave-De-Codificacion-De-32-Bytes...', 
       
-      // Clave de cifrado para datos críticos
+      // Clave de cifrado para datos críticos (no cambiar arbitrariamente; datos antiguos ilegibles salvo migración)
       encryptionKey: 'Su-Clave-De-Cifrado-Segura...',
       
       // Vinculación al dispositivo (Basada en ruta)

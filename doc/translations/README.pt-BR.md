@@ -112,7 +112,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Consultas encadeadas (Suporta =, !=, >, <, LIKE, IN, etc.)
+// 3. Consultas encadeadas ([operadores de consulta](#operadores-de-consulta), suporta =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -153,6 +153,8 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 ## Integração para Cenários de Inicialização Frequente
 
+📱 **Exemplo**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+
 ```dart
 // Definição de esquema adequada para aplicativos móveis e desktop de inicialização frequente.
 // Identifica com precisão as mudanças de esquema e migra automaticamente os dados.
@@ -174,23 +176,24 @@ final db = await ToStore.open(
           name: 'username', 
           type: DataType.text, 
           nullable: false, 
-          unique: true,
+          unique: true, // Cria automaticamente um índice único
           fieldId: 'username',  // Identificador de campo exclusivo
         ),
         FieldSchema(
           name: 'email', 
           type: DataType.text, 
           nullable: false, 
-          unique: true
+          unique: true // Cria automaticamente um índice único
         ),
         FieldSchema(
           name: 'last_login', 
-          type: DataType.datetime
+          type: DataType.datetime,
+          createIndex: true // Cria automaticamente um índice
         ),
       ],
-      indexes: [ // Definições de índice
-        IndexSchema(fields: ['username']),
-        IndexSchema(fields: ['email']),
+      // Exemplo de índice composto
+      indexes: [
+        IndexSchema(fields: ['username', 'last_login']),
       ],
     ),
     // Exemplo de restrição de chave estrangeira
@@ -222,7 +225,11 @@ await db.switchSpace(spaceName: 'user_123');
 
 ## Integração no Lado do Servidor
 
+🖥️ **Exemplo**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+
 ```dart
+final db = await ToStore.open();
+
 // Criação massiva de esquemas em tempo de execução
 await db.createTables([
   // Tabela de armazenamento de vetores de características espaciais 3D
@@ -415,7 +422,61 @@ final prevPage = await db.query('users')
 
 
 
+### Operadores de consulta
 
+Operadores (insensíveis a maiúsculas) para `where(field, operator, value)`:
+
+| Operator | Description | Example / Value type |
+| :--- | :--- | :--- |
+| `=` | Equal | `where('status', '=', 'active')` |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
+| `>` | Greater than | `where('age', '>', 18)` |
+| `>=` | Greater than or equal | `where('score', '>=', 60)` |
+| `<` | Less than | `where('price', '<', 100)` |
+| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
+| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
+
+### Métodos de consulta semânticos (recomendado)
+
+Prefira métodos semânticos em vez de digitar operadores manualmente.
+
+```dart
+// Comparison
+db.query('users').whereEqual('username', 'John');
+db.query('users').whereNotEqual('role', 'guest');
+db.query('users').whereGreaterThan('age', 18);
+db.query('users').whereGreaterThanOrEqualTo('score', 60);
+db.query('users').whereLessThan('price', 100);
+db.query('users').whereLessThanOrEqualTo('quantity', 10);
+
+// Membership & range
+db.query('users').whereIn('id', ['id1', 'id2']);
+db.query('users').whereNotIn('status', ['banned', 'pending']);
+db.query('users').whereBetween('age', 18, 65);
+
+// Null checks
+db.query('users').whereNull('deleted_at');
+db.query('users').whereNotNull('email');
+
+// Pattern match
+db.query('users').whereLike('name', '%John%');
+db.query('users').whereNotLike('email', '%@temp.');
+db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
+db.query('users').whereNotContains('title', 'draft');
+
+// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
+final users = await db.query('users')
+    .whereGreaterThan('age', 18)
+    .whereLike('username', '%John%')
+    .orderByDesc('age')
+    .limit(20);
+```
 
 ## Arquitetura Distribuída
 
@@ -561,7 +622,7 @@ final txResult2 = await db.transaction(() async {
 - Criptografia de alta resistência protege dados sensíveis.
 
 > [!WARNING]
-> **Gestão de Chaves**: Alterar `encryptionKey` tornará os dados antigos ilegíveis (a menos que uma migração seja realizada). Não codifique chaves sensíveis; obtenha-as de um servidor seguro.
+> **Gestão de Chaves**: **`encodingKey`** pode ser alterada livremente; o motor migrará os dados automaticamente ao alterá-la, sem risco de perda. **`encryptionKey`** não deve ser alterada arbitrariamente: alterá-la tornará os dados antigos ilegíveis, a menos que uma migração seja realizada. Não codifique chaves sensíveis; obtenha-as de um servidor seguro.
 
 ```dart
 final db = await ToStore.open(
@@ -570,10 +631,10 @@ final db = await ToStore.open(
       // Algoritmos suportados: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Chave de codificação (deve ser fornecida na inicialização)
+      // Chave de codificação (pode ser alterada livremente; os dados são migrados automaticamente)
       encodingKey: 'Sua-Chave-De-Codificacao-De-32-Bytes...', 
       
-      // Chave de criptografia para dados críticos
+      // Chave de criptografia para dados críticos (não alterar arbitrariamente; dados antigos ilegíveis salvo migração)
       encryptionKey: 'Sua-Chave-De-Criptografia-Segura...',
       
       // Vinculação ao dispositivo (Baseada em caminho)
