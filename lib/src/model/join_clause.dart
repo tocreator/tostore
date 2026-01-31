@@ -21,7 +21,7 @@ class JoinClause {
   /// The key from the first table
   final String firstKey;
 
-  /// The operator to use for comparison (=, <, >, etc.)
+  /// The operator to use for comparison (`=`, `<`, `>`, etc.)
   final String operator;
 
   /// The key from the second table

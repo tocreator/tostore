@@ -389,7 +389,7 @@ class PathManager {
     return pathJoin(root, 'dir_$dirIndex');
   }
 
-  /// WAL partition file path: wal_<partitionIndex>.log
+  /// WAL partition file path: `wal_partitionIndex.log`
   String getWalPartitionLogPath(int dirIndex, int partitionIndex,
       {String? spaceName}) {
     final dirPath = getWalDirShardPath(dirIndex, spaceName: spaceName);

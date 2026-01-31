@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'platform_byte_data.dart';
 
-/// A compact binary codec for Map<String, dynamic>.
+/// A compact binary codec for `Map<String, dynamic>`.
 ///
 /// This is a MessagePack-compatible subset with a small custom extension:
 /// - BigInt is encoded as MessagePack ext (type=1) with decimal string payload.

@@ -1426,11 +1426,12 @@ class DataStoreImpl {
 
         final bool userProvidedPk =
             data.containsKey(primaryKey) && data[primaryKey] != null;
-        if (isSequentialPk &&
-            providedId != null &&
-            !userProvidedPk &&
-            !retryOnPkConflict) {
-          return await insert(tableName, data, retryOnPkConflict: true);
+        if (isSequentialPk && providedId != null && !retryOnPkConflict) {
+          // Automatic correction and retry: if conflict occurs on sequential PK, we fix the sequence
+          // and then retry insertion. If user provided the PK, we clear it to let the system generate a new one.
+          final Map<String, dynamic> retryData =
+              userProvidedPk ? (Map.from(data)..remove(primaryKey)) : data;
+          return await insert(tableName, retryData, retryOnPkConflict: true);
         }
 
         return finish(DbResult.error(
@@ -4246,9 +4247,66 @@ class DataStoreImpl {
                         pkVal != null &&
                         !triedPkConflictRetry) {
                       try {
+                        // Handle primary key conflict: recalculate from disk/buffer
                         await tableDataManager.handlePrimaryKeyConflict(
                             tableName, pkVal);
-                      } catch (_) {}
+
+                        // CRITICAL: Also consider records already processed in the current flush batch
+                        // to ensure the new ID stays ahead of everything currently in-flight.
+                        dynamic maxInCurrentBatch;
+                        for (final r in batchRecordsForBuffer) {
+                          final val = r[primaryKey];
+                          if (val != null) {
+                            if (maxInCurrentBatch == null ||
+                                pkMatcher(val, maxInCurrentBatch) > 0) {
+                              maxInCurrentBatch = val;
+                            }
+                          }
+                        }
+                        if (maxInCurrentBatch != null) {
+                          await tableDataManager.updateMaxIdInMemory(
+                              tableName, maxInCurrentBatch);
+                        }
+
+                        // Update local lastMaxKey
+                        final newMaxId =
+                            tableDataManager.getMaxIdInMemory(tableName);
+                        if (newMaxId != null) {
+                          lastMaxKey = newMaxId;
+                        }
+
+                        // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
+                        if (isAutoPk) {
+                          final List<Map<String, dynamic>>
+                              subsequentToReassign = [];
+                          for (int k = j + 1;
+                              k < recordsToProcess.length;
+                              k++) {
+                            if (autoPkRecords.contains(recordsToProcess[k])) {
+                              subsequentToReassign.add(recordsToProcess[k]);
+                            }
+                          }
+
+                          if (subsequentToReassign.isNotEmpty) {
+                            final newIds = await tableDataManager.getBatchIds(
+                                tableName, subsequentToReassign.length);
+                            for (int k = 0;
+                                k < subsequentToReassign.length;
+                                k++) {
+                              if (k < newIds.length) {
+                                subsequentToReassign[k][primaryKey] = newIds[k];
+                              }
+                            }
+                          }
+                        } else {
+                          // For user-provided PK, remove it so retry uses next auto ID
+                          record.remove(primaryKey);
+                        }
+                      } catch (err) {
+                        Logger.warn(
+                            'Failed to auto-correct PK order violation in batch: $err',
+                            label: 'DataStore.batchInsert');
+                      }
                       record[primaryKey] = null;
                       triedPkConflictRetry = true;
                       continue;
@@ -4297,6 +4355,78 @@ class DataStoreImpl {
                   batchContext.tryReserve(recordId, planIns.refs);
                 } catch (e) {
                   if (e is UniqueViolation) {
+                    final bool isSequentialPk =
+                        tableSchema.primaryKeyConfig.type ==
+                            PrimaryKeyType.sequential;
+                    if (isSequentialPk && !triedPkConflictRetry) {
+                      try {
+                        // Handle primary key conflict: recalculate from disk and buffer
+                        final dynamic pkVal = validData[primaryKey];
+                        await tableDataManager.handlePrimaryKeyConflict(
+                            tableName, pkVal);
+
+                        // CRITICAL: Also consider records already processed in the current flush batch
+                        // (but not yet in WriteBufferManager) to ensure the corrected sequence
+                        // stays ahead of everything currently in-flight.
+                        dynamic maxInCurrentBatch;
+                        for (final r in batchRecordsForBuffer) {
+                          final val = r[primaryKey];
+                          if (val != null) {
+                            if (maxInCurrentBatch == null ||
+                                pkMatcher(val, maxInCurrentBatch) > 0) {
+                              maxInCurrentBatch = val;
+                            }
+                          }
+                        }
+                        if (maxInCurrentBatch != null) {
+                          await tableDataManager.updateMaxIdInMemory(
+                              tableName, maxInCurrentBatch);
+                        }
+
+                        // Update local lastMaxKey to stay consistent and avoid repeated order checks
+                        final newMaxId =
+                            tableDataManager.getMaxIdInMemory(tableName);
+                        if (newMaxId != null) {
+                          lastMaxKey = newMaxId;
+                        }
+
+                        // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
+                        if (isAutoPk) {
+                          final List<Map<String, dynamic>>
+                              subsequentToReassign = [];
+                          for (int k = j + 1;
+                              k < recordsToProcess.length;
+                              k++) {
+                            if (autoPkRecords.contains(recordsToProcess[k])) {
+                              subsequentToReassign.add(recordsToProcess[k]);
+                            }
+                          }
+
+                          if (subsequentToReassign.isNotEmpty) {
+                            final newIds = await tableDataManager.getBatchIds(
+                                tableName, subsequentToReassign.length);
+                            for (int k = 0;
+                                k < subsequentToReassign.length;
+                                k++) {
+                              if (k < newIds.length) {
+                                subsequentToReassign[k][primaryKey] = newIds[k];
+                              }
+                            }
+                          }
+                        } else {
+                          // For user-provided PK, remove it so retry uses next auto ID
+                          record.remove(primaryKey);
+                        }
+                      } catch (err) {
+                        Logger.warn(
+                            'Failed to auto-correct PK conflict in batch: $err',
+                            label: 'DataStore.batchInsert');
+                      }
+                      record[primaryKey] = null;
+                      triedPkConflictRetry = true;
+                      continue;
+                    }
+
                     invalidRecords.add(record);
                     final failedKey = validData[primaryKey]?.toString() ?? '';
                     if (failedKey.isNotEmpty) {

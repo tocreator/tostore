@@ -69,7 +69,7 @@ class IndexSearchResult {
 /// Represents a condition for a single index search.
 /// This provides a type-safe way to define index queries instead of using raw maps.
 class IndexCondition {
-  /// The comparison operator (e.g., '=', '>', '<').
+  /// The comparison operator (e.g., `=`, `>`, `<`).
   final String operator;
 
   /// The value to compare against. For range queries, this is the start value.
@@ -96,12 +96,12 @@ class IndexCondition {
     return IndexCondition._('>=', value);
   }
 
-  /// Creates a 'less than' condition ('<').
+  /// Creates a 'less than' condition (`<`).
   factory IndexCondition.lessThan(dynamic value) {
     return IndexCondition._('<', value);
   }
 
-  /// Creates a 'less than or equal to' condition ('<=').
+  /// Creates a 'less than or equal to' condition (`<=`).
   factory IndexCondition.lessThanOrEqual(dynamic value) {
     return IndexCondition._('<=', value);
   }

@@ -32,9 +32,6 @@ class V2Upgrade {
     // Upgrade Schema partition mapping (global, not space-specific)
     await _upgradeSchemaPartitionMapping(_dataStore);
 
-    // Upgrade global tables (isGlobal = true)
-    await _upgradeGlobalTablesPartitionMapping();
-
     // Upgrade migration metadata (global, not space-specific)
     await _upgradeMigrationMeta(_dataStore);
 
@@ -47,8 +44,10 @@ class V2Upgrade {
     final yieldController =
         YieldController('upgrade_v2_execute', checkInterval: 1);
 
+    bool globalUpgraded = false;
     for (final spaceName in spaces) {
-      await _upgradeSpaceToV2(spaceName);
+      await _upgradeSpaceToV2(spaceName, upgradeGlobal: !globalUpgraded);
+      globalUpgraded = true;
       await yieldController.maybeYield();
     }
 
@@ -63,33 +62,9 @@ class V2Upgrade {
     );
   }
 
-  /// Upgrade all non-space-bound global tables (schema.isGlobal == true).
-  Future<void> _upgradeGlobalTablesPartitionMapping() async {
-    try {
-      final tableNames =
-          await _dataStore.schemaManager?.listAllTables() ?? const <String>[];
-      if (tableNames.isEmpty) return;
-
-      final yieldController = YieldController('upgrade_v2_global_tables');
-      for (final tableName in tableNames) {
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableName);
-        if (schema == null || !schema.isGlobal) continue;
-        // Upgrade table data to new range partition format
-        await _upgradeTableDataToNewFormat(_dataStore, tableName);
-        await yieldController.maybeYield();
-      }
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to upgrade global tables partition mapping: $e\n$stack',
-        label: 'V2Upgrade._upgradeGlobalTablesPartitionMapping',
-      );
-      rethrow;
-    }
-  }
-
   /// Upgrade a specific space to version 2 using a dedicated migration instance.
-  Future<void> _upgradeSpaceToV2(String spaceName) async {
+  Future<void> _upgradeSpaceToV2(String spaceName,
+      {bool upgradeGlobal = false}) async {
     Logger.info(
       'Upgrading space [$spaceName] to database version 2',
       label: 'V2Upgrade._upgradeSpaceToV2',
@@ -138,7 +113,7 @@ class V2Upgrade {
         return;
       }
 
-      // Upgrade all non-global tables in this space
+      // Upgrade tables in this space (including global tables if requested)
       final tableNames =
           await migrationInstance.schemaManager?.listAllTables() ??
               const <String>[];
@@ -147,9 +122,10 @@ class V2Upgrade {
         for (final tableName in tableNames) {
           final schema =
               await migrationInstance.schemaManager?.getTableSchema(tableName);
-          if (schema == null || schema.isGlobal) {
-            // Global tables are handled separately
-            continue;
+          if (schema == null) continue;
+
+          if (schema.isGlobal) {
+            if (!upgradeGlobal) continue;
           }
           // Upgrade table data to new range partition format
           await _upgradeTableDataToNewFormat(migrationInstance, tableName);

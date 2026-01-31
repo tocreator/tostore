@@ -98,12 +98,14 @@ class StorageAdapter implements StorageInterface {
 
   /// Build a temporary file path for crash-safe atomic replacement.
   ///
-  /// For paths under a database space root (`.../spaces/<spaceName>/...`),
+  /// For paths under a database space root (`.../spaces/{spaceName}/...`),
   /// place all temporary files under that space's `tmp` directory with
   /// the same relative layout:
   ///
-  ///   final:  /.../spaces/<spaceName>/data/xxx/meta.json
-  ///   temp :  /.../spaces/<spaceName>/tmp/data/xxx/.meta.json.tmp-<ts>
+  /// ```text
+  /// final:  /.../spaces/{spaceName}/data/xxx/meta.json
+  /// temp :  /.../spaces/{spaceName}/tmp/data/xxx/.meta.json.tmp-{ts}
+  /// ```
   ///
   /// This allows the caller to simply delete the `tmp` directory on
   /// startup for cleanup, without scanning all data/index directories.

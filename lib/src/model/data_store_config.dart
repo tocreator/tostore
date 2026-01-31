@@ -57,14 +57,14 @@ class DataStoreConfig {
   /// Maximum number of concurrent table partition maintenances (e.g., processTablePartitions)
   final int maxConcurrentPartitionMaintenances;
 
-  /// Default query limit when the caller does not explicitly specify [limit].
+  /// Default query limit when the caller does not explicitly specify `limit`.
   ///
   /// - Set to a positive number (recommended) to avoid unbounded result sets that
   ///   can cause memory pressure in large-scale tables.
   /// - Set to 0 (or negative) to keep legacy behavior (no default limit).
   final int defaultQueryLimit;
 
-  /// Hard cap for query [offset] to prevent pathological pagination that may
+  /// Hard cap for query `offset` to prevent pathological pagination that may
   /// cause excessive IO and memory pressure.
   ///
   /// - Set to a positive number to enforce a max offset.

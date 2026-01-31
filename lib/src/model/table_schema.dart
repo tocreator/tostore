@@ -2524,8 +2524,8 @@ class ForeignKeySchema {
   /// For composite foreign keys, contains multiple field names, the order must correspond to referencedFields
   ///
   /// Example:
-  /// - Simple foreign key: ['user_id']
-  /// - Composite foreign key: ['order_id', 'product_id']
+  /// - Simple foreign key: `['user_id']`
+  /// - Composite foreign key: `['order_id', 'product_id']`
   final List<String> fields;
 
   /// Referenced table name (parent table)
@@ -2537,8 +2537,8 @@ class ForeignKeySchema {
   /// The order must correspond to fields, and the field types must be compatible
   ///
   /// Example:
-  /// - Simple foreign key: ['id']
-  /// - Composite foreign key: ['id', 'product_id']
+  /// - Simple foreign key: `['id']`
+  /// - Composite foreign key: `['id', 'product_id']`
   final List<String> referencedFields;
 
   /// Cascade action for DELETE operation

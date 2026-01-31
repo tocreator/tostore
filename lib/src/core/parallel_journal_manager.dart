@@ -171,6 +171,7 @@ class ParallelJournalManager {
       }
 
       // Finally execute a "complete flush" until the queue is truly empty
+      _flushInProgress = true;
       await _pumpFlush(drainCompletely: true);
     } finally {
       _running = false;
@@ -301,7 +302,6 @@ class ParallelJournalManager {
     if (_dataStore.config.enableJournal &&
         _walManager.hasPendingParallelBatches &&
         recoveryBatchContext == null) {
-      await _reconcileWithParallelJournal();
       // After checkpoint advanced by recovery, drop already-committed queue entries
       // so we don't keep reprocessing persisted WAL operations.
       await _bufferManager.cleanupCommittedUpTo(
@@ -1075,6 +1075,9 @@ class ParallelJournalManager {
           await _walManager.clearWalPartitionsAndResetMeta();
         } catch (_) {}
         return;
+      } else {
+        Logger.debug('Recovery added effective entries',
+            label: 'ParallelJournalManager._recoverWAL');
       }
 
       try {
@@ -1153,18 +1156,23 @@ class ParallelJournalManager {
           label: 'ParallelJournalManager');
       _isRecovering = false;
     }
-    // Note: _isRecovering reset is handled by _pumpFlush at the end of the recovery chain
+    // Note: _isRecovering reset is handled by _executeRecoveryFlushChain at the end of the recovery chain
     return excludeRanges;
   }
 
   Future<void> _executeRecoveryFlushChain(
       List<Future<void> Function()> tasks) async {
-    // Unawaited background execution
-    Future(() async {
+    if (tasks.isEmpty) {
+      _isRecovering = false;
+      return;
+    }
+
+    // Wrap the background chain into a managed Future
+    final recoveryChainFuture = Future(() async {
       try {
         for (final task in tasks) {
-          // Check running state to abort if needed?
-          // Actually recovery flush is critical, should try to complete.
+          // Check running state before each recovery task
+          if (!_running) break;
           try {
             await task();
           } catch (e, s) {
@@ -1173,19 +1181,17 @@ class ParallelJournalManager {
           }
         }
       } finally {
-        // After all recovery tasks are processed (or skipped if tasks was empty),
-        // ensure we exit recovery mode and trigger normal flushing.
-        if (_walManager.meta.pendingBatches.isEmpty) {
-          _isRecovering = false;
-        }
+        _isRecovering = false;
+        _loopFuture = null;
 
-        // Trigger a normal flush if there's any data left in the buffer
-        // (e.g. data recovered from regular WAL during startup).
-        if (!_isRecovering) {
+        // If data was added during recovery, trigger a normal flush
+        if (_running && !_bufferManager.isEmpty) {
           _scheduleFlushIfNeeded();
         }
       }
     });
+
+    _loopFuture = recoveryChainFuture;
   }
 
   /// Recover maintenance batch metadata for tables and indexes
@@ -1619,16 +1625,22 @@ class ParallelJournalManager {
       );
 
       return () async {
-        await _replayPageRedoLogIfExists(captureBatchId);
-        await _pumpFlush(
-          drainCompletely: false, // will just pop the batch we added
-          recoveryBatchContext: BatchContext(
-            batchId: captureBatchId,
-            batchType: captureBatchType,
-          ),
-          batchSizeOverride:
-              captureCount, // Ensure we take everything we just added
-        );
+        if (!_running) return;
+        _flushInProgress = true;
+        try {
+          await _replayPageRedoLogIfExists(captureBatchId);
+          await _pumpFlush(
+            drainCompletely: false, // will just pop the batch we added
+            recoveryBatchContext: BatchContext(
+              batchId: captureBatchId,
+              batchType: captureBatchType,
+            ),
+            batchSizeOverride:
+                captureCount, // Ensure we take everything we just added
+          );
+        } finally {
+          _flushInProgress = false;
+        }
       };
     } catch (e, s) {
       Logger.error('Recover pending batch failed: $e\n$s',
@@ -2436,7 +2448,8 @@ class _BatchJournalScanResult {
   final Set<String> flushedTables;
 
   /// Indexes whose metadata has been successfully updated (IndexMetaUpdatedEntry).
-  /// Map: tableName -> Set<indexName>
+  ///
+  /// Map: `tableName -> Set<indexName>`
   final Map<String, Set<String>> flushedIndexes;
 
   /// Table plans found in BatchStartEntry

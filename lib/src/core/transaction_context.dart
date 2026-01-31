@@ -4,7 +4,7 @@ import '../model/data_store_config.dart';
 /// Lightweight transaction-scoped context for tracking touched file paths
 /// without introducing circular dependencies. Values are stored in Zone.
 class TransactionContext {
-  /// Zone key to store a Set<String> of touched file paths in current transaction
+  /// Zone key to store a `Set<String>` of touched file paths in current transaction
   static const Symbol touchedPathsKey = #to_touched_paths;
 
   /// Zone key for current transaction id
@@ -13,10 +13,10 @@ class TransactionContext {
   /// Zone key for current transaction isolation level
   static const Symbol isolationLevelKey = #to_isolation_level;
 
-  /// Zone key for current transaction acquired exclusive locks: Map<resource, operationId>
+  /// Zone key for current transaction acquired exclusive locks: `Map<resource, operationId>`
   static const Symbol acquiredExclusiveLocksKey = #to_exclusive_locks;
 
-  /// Zone key for read-set tracking in current transaction: Map<tableName, Set<primaryKey>>
+  /// Zone key for read-set tracking in current transaction: `Map<tableName, Set<primaryKey>>`
   static const Symbol readKeysKey = #to_read_keys;
 
   /// Zone key indicating we are applying commit (bypassing tx deferral)

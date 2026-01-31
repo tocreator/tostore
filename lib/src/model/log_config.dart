@@ -19,7 +19,7 @@ enum LogLevel {
 class LogConfig {
   /// enable log
   static bool _enableLog = true;
-  static get enableLog => _enableLog;
+  static bool get enableLog => _enableLog;
 
   /// Current log level, default shows all logs
   static LogLevel _logLevel = LogLevel.warn;

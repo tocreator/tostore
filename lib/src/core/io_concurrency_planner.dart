@@ -45,7 +45,7 @@ final class IoConcurrencyPlanner {
   /// - Table-data weight is 1
   /// - Index weight is [indexCount] (each record impacts indexes roughly O(indexCount))
   ///
-  /// If [perTableTokens] < 2 and indexes exist, planner will mark [runInParallel]=false
+  /// If [perTableTokens] `< 2` and indexes exist, planner will mark [runInParallel]=false
   /// and still return both sides as 1 so caller can run them sequentially without
   /// losing the "budget intent".
   static ({int tableDataTokens, int indexTokens, bool runInParallel})
@@ -84,7 +84,7 @@ final class IoConcurrencyPlanner {
   /// Guarantees:
   /// - indexConcurrency >= 1
   /// - partitionTokensPerIndex >= 1
-  /// - indexConcurrency * partitionTokensPerIndex <= budgetTokens
+  /// - indexConcurrency * partitionTokensPerIndex `<= budgetTokens`
   static IndexWriteBudget planIndexWriteBudget({
     required int budgetTokens,
     required int indexCount,

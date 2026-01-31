@@ -15,7 +15,7 @@ typedef TreeCacheWeightQueryCallback = Future<int?> Function(
 ///
 /// Key model:
 /// - Accepts either a scalar key (e.g. `String`) or a `List` path key.
-/// - Internally, all keys are normalized to a `List<dynamic>` path.
+/// - Internally, all keys are normalized to a `List` path.
 ///
 /// Performance model:
 /// - **Group partitioning** (controlled by [groupDepth]) provides O(1) prefix removal
@@ -37,7 +37,7 @@ class TreeCache<T> {
   /// - 2: group by first 2 components (e.g. tableName + indexName)
   /// - 3: group by first 3 components (e.g. tableName + indexName + partitionNo)
   ///
-  /// Prefix removals whose path length is <= [groupDepth] can be executed without
+  /// Prefix removals whose path length is `<= [groupDepth]` can be executed without
   /// scanning entries (O(number of affected groups)).
   final int groupDepth;
 
@@ -56,9 +56,9 @@ class TreeCache<T> {
   int _totalEntries = 0;
 
   /// Nested group map (depth = [groupDepth]).
-  /// - depth=1: Map<k0, _Group>
-  /// - depth=2: Map<k0, Map<k1, _Group>>
-  /// - depth=3: Map<k0, Map<k1, Map<k2, _Group>>>
+  /// - depth=1: `Map<k0, _Group>`
+  /// - depth=2: `Map<k0, Map<k1, _Group>>`
+  /// - depth=3: `Map<k0, Map<k1, Map<k2, _Group>>>`
   final Map<Object?, dynamic> _groupsRoot = <Object?, dynamic>{};
 
   /// Fully-cached markers (nested map by prefix path).
@@ -236,7 +236,7 @@ class TreeCache<T> {
   /// Semantics:
   /// - If [keyOrPrefix] is a scalar: removes that single key.
   /// - If it's a `List`: tries to remove the exact key first. If not found and
-  ///   prefix length <= [groupDepth], removes the aligned prefix groups.
+  ///   prefix length `<= [groupDepth]`, removes the aligned prefix groups.
   void remove(dynamic keyOrPrefix) {
     final p = _normalizeKey(keyOrPrefix);
 

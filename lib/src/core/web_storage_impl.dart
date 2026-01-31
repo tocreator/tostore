@@ -676,7 +676,7 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
-  /// Safely convert FileInfo.data to List<int>
+  /// Safely convert FileInfo.data to `List<int>`
   List<int> _convertDataToList(dynamic data) {
     if (data is Uint8List) {
       return data.toList();

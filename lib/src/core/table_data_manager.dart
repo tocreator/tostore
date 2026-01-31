@@ -585,6 +585,11 @@ class TableDataManager {
     }
   }
 
+  /// Get current max ID in memory for a table
+  dynamic getMaxIdInMemory(String tableName) {
+    return _maxIds[tableName];
+  }
+
   /// Save statistics to configuration
   Future<void> _saveStatisticsToConfig() async {
     try {
@@ -3378,7 +3383,7 @@ class TableDataManager {
     ///
     /// Returns a merged operator map like:
     /// - {'=': 10}
-    /// - {'>=': 1, '<=': 9}
+    /// - {'`>=`': 1, '`<=`': 9}
     /// - {'IN': [..]}
     /// - {'BETWEEN': {'start': 1, 'end': 9}}
     ///

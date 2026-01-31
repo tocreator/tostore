@@ -4,7 +4,7 @@ import 'dart:typed_data';
 ///
 /// Backward compatibility:
 /// - Old inline values (BinarySchemaCodec bytes) start with fieldCount:u16be,
-///   so their first byte is always <= 0x27 for practical schemas.
+///   so their first byte is always `<= 0x27` for practical schemas.
 /// - We reserve 0xFF as a marker for ValueRef bytes so old data remains readable
 ///   without migration.
 final class ValueRef {

@@ -87,7 +87,8 @@ class WeightManager {
   };
 
   /// High weight cache (default 70% or higher)
-  /// Structure: WeightType -> Set<identifier>
+  ///
+  /// Structure: `WeightType -> Set<identifier>`
   final Map<WeightType, Set<String>> _highWeightCache = {
     WeightType.tableRecord: {},
     WeightType.indexData: {},
