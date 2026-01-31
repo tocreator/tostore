@@ -55,11 +55,17 @@ class BatchCheckContext {
   final String tableName;
   final String? transactionId;
   final WriteDataBuffer? mainBuf;
+  // ignore: library_private_types_in_public_api
   final _TxnUniqueTableBuffer? txnBuf;
   final Map<String, Map<dynamic, Map<String, Set<String>>>>? globalIndices;
 
-  BatchCheckContext(this.tableName, this.transactionId, this.mainBuf,
-      this.txnBuf, this.globalIndices);
+  BatchCheckContext(
+      this.tableName,
+      this.transactionId,
+      this.mainBuf,
+      // ignore: library_private_types_in_public_api
+      this.txnBuf,
+      this.globalIndices);
 
   List<UniqueKeyRef>? tryReserve(
       String recordId, List<UniqueKeyRef> uniqueKeys) {
@@ -935,7 +941,7 @@ class WriteBufferManager {
     final yieldControl =
         YieldController('WriteBufferManager.getTableDeltaFromQueueSince');
 
-    int _walCycle = _dataStore.config.logPartitionCycle;
+    int walCycle = _dataStore.config.logPartitionCycle;
 
     // Helper to process an entry and decide whether to continue
     // Returns true to continue scanning, false to stop (limit reached)
@@ -947,7 +953,7 @@ class WriteBufferManager {
       // Since we scan Reverse (Newest -> Oldest),
       // if ptr <= since, we can stop for this queue/global timeline?
       // Yes, because queues are ordered.
-      if (!ptr.isNewerThan(since, _walCycle)) {
+      if (!ptr.isNewerThan(since, walCycle)) {
         // Found entry older than 'since'.
         // Because of strict ordering, all subsequent entries (older) are also irrelevant.
         // BUT be careful: isNewerThan on HEAD (oldest) check?
@@ -956,7 +962,7 @@ class WriteBufferManager {
       }
 
       // 3. Check 'until' (future filter)
-      if (ptr.isNewerThan(until, _walCycle)) return true; // Skip (too new)
+      if (ptr.isNewerThan(until, walCycle)) return true; // Skip (too new)
 
       // 4. Check Key Predicate
       if (keyPredicate != null && !keyPredicate(rId)) return true; // Skip
@@ -1267,8 +1273,9 @@ class WriteBufferManager {
       for (final entry in globalOwners.entries) {
         final txId = entry.key;
         final recordIds = entry.value;
-        if (recordIds.isEmpty)
+        if (recordIds.isEmpty) {
           continue; // should not happen if maintained correctly
+        }
 
         // If checking check against OWN transaction
         if (transactionId != null && txId == transactionId) {
@@ -1307,8 +1314,9 @@ class WriteBufferManager {
       for (final entry in globalOwners.entries) {
         final txId = entry.key;
         final recordIds = entry.value;
-        if (recordIds.isEmpty)
+        if (recordIds.isEmpty) {
           continue; // should not happen if maintained correctly
+        }
 
         // If checking against OWN transaction
         if (transactionId != null && txId == transactionId) {
@@ -1481,7 +1489,7 @@ class _TxnUniqueTableBuffer {
 /// If it's not a List, returns as is.
 dynamic _toInternalKey(dynamic key) {
   if (key is List) {
-    if (key.length == 0) return '';
+    if (key.isEmpty) return '';
     if (key.length == 1) return key[0];
     // Optimized join for internal keying.
     // Uses \x00 as delimiter which is rare and fast for joining.

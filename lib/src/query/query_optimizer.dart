@@ -649,7 +649,9 @@ class QueryOptimizer {
             op == '>=' ||
             op == '<' ||
             op == '<=' ||
-            op == 'BETWEEN') return true;
+            op == 'BETWEEN') {
+          return true;
+        }
       }
       return false;
     }

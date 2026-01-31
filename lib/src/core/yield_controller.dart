@@ -180,7 +180,9 @@ class YieldController {
 
     // Calculate new smoothed interval (Simple Moving Average)
     int sum = 0;
-    for (final s in _recentSamples) sum += s;
+    for (final s in _recentSamples) {
+      sum += s;
+    }
     final int smoothedInterval = (sum / _smoothingSampleSize).round();
 
     _currentCheckInterval = smoothedInterval;

@@ -2099,8 +2099,9 @@ class TableDataManager {
 
       // Yield buffer inserts that weren't processed from file
       for (final key in bufferInsertKeys) {
-        if (processedKeys.contains(key))
+        if (processedKeys.contains(key)) {
           continue; // Already processed from file
+        }
 
         await yieldController.maybeYield();
 
@@ -2126,8 +2127,9 @@ class TableDataManager {
 
       // Yield transaction inserts that weren't processed from file or buffer
       for (final key in txInsertKeys) {
-        if (processedKeys.contains(key))
+        if (processedKeys.contains(key)) {
           continue; // Already processed from file
+        }
 
         await yieldController.maybeYield();
 
@@ -2172,7 +2174,6 @@ class TableDataManager {
         targetPartitionNos, // Optional: specific partition numbers to process
     ParallelController? controller,
     bool skipMaintenanceGlobalLock = false,
-    bool useJournal = true,
     String? largeDeleteOpId,
     String? largeUpdateOpId,
     Future<void> Function(int partitionNo)? onPartitionFlushed,
@@ -2254,83 +2255,192 @@ class TableDataManager {
       }
 
       final effectiveController = controller ?? ParallelController();
-
-      final journaling =
-          _dataStore.config.enableJournal && !onlyRead && useJournal;
-      BatchContext? batchContext;
-      if (journaling) {
-        batchContext = await _dataStore.parallelJournalManager
-            .beginMaintenanceBatch(table: tableName);
-      }
-
       final rangeManager = _dataStore.tableTreePartitionManager;
-      final yc = YieldController('TableDataManager.processTablePartitions',
-          checkInterval: 100);
+      final journaling = _dataStore.config.enableJournal && !onlyRead;
+      final scheduler = _dataStore.workloadScheduler;
 
-      for (final pNo in partitionNosToProcess) {
-        if (effectiveController.isStopped) break;
-        await yc.maybeYield();
-
-        // Use decodeSchema for migration scenarios, or current schema for normal operations
-        final records = await rangeManager.loadPartitionDataByNo(
-          tableName: tableName,
-          partitionNo: pNo,
-          encryptionKey: customKey,
-          encryptionKeyId: customKeyId,
-          decodeSchema:
-              decodeSchema, // Use old schema for decoding during migration
-        );
-
-        final processed =
-            await processFunction(records, pNo, effectiveController);
-
-        if (onlyRead || effectiveController.isStopped) continue;
-
-        // Compute per-batch delta ops (preserve legacy "rewrite" semantics).
+      // Helper: compute delta (inserts/updates/deletes) from records vs processed.
+      void computeDelta(
+        List<Map<String, dynamic>> records,
+        List<Map<String, dynamic>> processed,
+        List<Map<String, dynamic>> outInserts,
+        List<Map<String, dynamic>> outUpdates,
+        List<Map<String, dynamic>> outDeletes,
+      ) {
         final originalByPk = <String, Map<String, dynamic>>{};
         for (final r in records) {
           final pk = r[primaryKey]?.toString();
           if (pk == null || pk.isEmpty) continue;
           originalByPk[pk] = r;
         }
-
         final processedPks = <String>{};
-        final inserts = <Map<String, dynamic>>[];
-        final updates = <Map<String, dynamic>>[];
         for (final r in processed) {
           final pk = r[primaryKey]?.toString();
           if (pk == null || pk.isEmpty) continue;
           processedPks.add(pk);
           if (originalByPk.containsKey(pk)) {
-            updates.add(r);
+            outUpdates.add(r);
           } else {
-            inserts.add(r);
+            outInserts.add(r);
           }
         }
-
-        final deletes = <Map<String, dynamic>>[];
         for (final e in originalByPk.entries) {
-          if (!processedPks.contains(e.key)) {
-            deletes.add(e.value);
-          }
+          if (!processedPks.contains(e.key)) outDeletes.add(e.value);
         }
-
-        if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) continue;
-
-        await rangeManager.writeChanges(
-          tableName: tableName,
-          inserts: inserts,
-          updates: updates,
-          deletes: deletes,
-          batchContext: batchContext,
-          encryptionKey: customKey,
-          encryptionKeyId: customKeyId,
-        );
       }
 
-      if (journaling && batchContext != null) {
-        await _dataStore.parallelJournalManager
-            .completeMaintenanceBatch(batchContext: batchContext);
+      if (onlyRead) {
+        // Read-only: parallel load + process, no writeChanges, no journal batch.
+        final capacity = scheduler.capacityTokens(WorkloadType.maintenance);
+        var concurrency = max(1, min(capacity, partitionNosToProcess.length));
+        if (maxConcurrent != null && maxConcurrent > 0) {
+          concurrency = min(concurrency, maxConcurrent);
+        }
+        final tasks = <Future<void> Function()>[];
+        for (final pNo in partitionNosToProcess) {
+          tasks.add(() async {
+            if (effectiveController.isStopped) return;
+            final records = await rangeManager.loadPartitionDataByNo(
+              tableName: tableName,
+              partitionNo: pNo,
+              encryptionKey: customKey,
+              encryptionKeyId: customKeyId,
+              decodeSchema: decodeSchema,
+            );
+            await processFunction(records, pNo, effectiveController);
+          });
+        }
+        WorkloadLease? lease;
+        try {
+          lease = await scheduler.acquire(
+            WorkloadType.maintenance,
+            requestedTokens: concurrency,
+            minTokens: 1,
+            label: 'processTablePartitions.$tableName.readOnly',
+          );
+          await ParallelProcessor.execute<void>(
+            tasks,
+            concurrency: lease.asConcurrency(1),
+            controller: effectiveController,
+            label: 'processTablePartitions.$tableName',
+            continueOnError: false,
+          );
+        } finally {
+          lease?.release();
+        }
+        return;
+      }
+
+      // Write path: process in chunks; each chunk = one maintenance batch so
+      // page redo is deleted and metadata advanced after each chunk.
+      final yc = YieldController('TableDataManager.processTablePartitions',
+          checkInterval: 100);
+      for (int chunkStart = 0;
+          chunkStart < partitionNosToProcess.length &&
+              !effectiveController.isStopped;
+          chunkStart += 3) {
+        await yc.maybeYield();
+        final chunkEnd = min(chunkStart + 3, partitionNosToProcess.length);
+        final chunkPartitions =
+            partitionNosToProcess.sublist(chunkStart, chunkEnd);
+
+        BatchContext? batchContext;
+        if (journaling) {
+          batchContext = await _dataStore.parallelJournalManager
+              .beginMaintenanceBatch(table: tableName);
+        }
+
+        final capacity = scheduler.capacityTokens(WorkloadType.maintenance);
+        var concurrency = max(1, min(capacity, chunkPartitions.length));
+        if (maxConcurrent != null && maxConcurrent > 0) {
+          concurrency = min(concurrency, maxConcurrent);
+        }
+        final tasks = <Future<
+                (
+                  int,
+                  List<Map<String, dynamic>>,
+                  List<Map<String, dynamic>>,
+                  List<Map<String, dynamic>>
+                )?>
+            Function()>[];
+        for (final pNo in chunkPartitions) {
+          tasks.add(() async {
+            if (effectiveController.isStopped) return null;
+            final records = await rangeManager.loadPartitionDataByNo(
+              tableName: tableName,
+              partitionNo: pNo,
+              encryptionKey: customKey,
+              encryptionKeyId: customKeyId,
+              decodeSchema: decodeSchema,
+            );
+            final processed =
+                await processFunction(records, pNo, effectiveController);
+            if (effectiveController.isStopped) return null;
+            final inserts = <Map<String, dynamic>>[];
+            final updates = <Map<String, dynamic>>[];
+            final deletes = <Map<String, dynamic>>[];
+            computeDelta(records, processed, inserts, updates, deletes);
+            if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
+              return null;
+            }
+            return (pNo, inserts, updates, deletes);
+          });
+        }
+
+        List<
+            (
+              int,
+              List<Map<String, dynamic>>,
+              List<Map<String, dynamic>>,
+              List<Map<String, dynamic>>
+            )?> results;
+        WorkloadLease? lease;
+        try {
+          lease = await scheduler.acquire(
+            WorkloadType.maintenance,
+            requestedTokens: concurrency,
+            minTokens: 1,
+            label: 'processTablePartitions.$tableName',
+          );
+          results = await ParallelProcessor.execute<
+              (
+                int,
+                List<Map<String, dynamic>>,
+                List<Map<String, dynamic>>,
+                List<Map<String, dynamic>>
+              )?>(
+            tasks,
+            concurrency: lease.asConcurrency(1),
+            controller: effectiveController,
+            label: 'processTablePartitions.$tableName',
+            continueOnError: false,
+          );
+        } finally {
+          lease?.release();
+        }
+
+        for (var i = 0; i < chunkPartitions.length; i++) {
+          final r = results[i];
+          if (r == null) continue;
+          final (pNo, inserts, updates, deletes) = r;
+          await rangeManager.writeChanges(
+            tableName: tableName,
+            inserts: inserts,
+            updates: updates,
+            deletes: deletes,
+            batchContext: batchContext,
+            encryptionKey: customKey,
+            encryptionKeyId: customKeyId,
+          );
+          await onPartitionFlushed?.call(pNo);
+        }
+
+        if (journaling && batchContext != null) {
+          // Complete this chunk only: delete this chunk's page redo log now (not whole table).
+          await _dataStore.parallelJournalManager
+              .completeMaintenanceBatch(batchContext: batchContext);
+          await persistRuntimeMetaIfNeeded();
+        }
       }
     } finally {
       // Only clean up locks/flags if we actually acquired them (write operations).
@@ -3114,6 +3224,7 @@ class TableDataManager {
 
     // Always apply recordMatches to ensure WriteBuffer deletions are filtered out
     // during the scan (preserving the limit), even if matcher/filter are null.
+    // ignore: unnecessary_nullable_for_final_variable_declarations
     final bool Function(Map<String, dynamic>)? recordPredicate = recordMatches;
 
     // Parse Sort Order first as it is needed by fast paths

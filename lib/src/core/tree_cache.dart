@@ -97,8 +97,9 @@ class TreeCache<T> {
   static int compareNative(dynamic a, dynamic b) {
     if (identical(a, b)) return 0;
     // Sentinel MAX for common range scans.
-    if (a is String && a == '\uffff')
+    if (a is String && a == '\uffff') {
       return (b is String && b == '\uffff') ? 0 : 1;
+    }
     if (b is String && b == '\uffff') return -1;
 
     if (a == null) return b == null ? 0 : -1;
@@ -1380,8 +1381,9 @@ final class _BPlusTree<K, V> {
       final leaf = node as _BPlusLeaf<K, V>;
 
       final pos = _lowerBound(leaf.keys, key);
-      if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0)
+      if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0) {
         return null;
+      }
 
       // Removal strategy:
       // - End: removeLast (O(1))
@@ -1421,8 +1423,9 @@ final class _BPlusTree<K, V> {
     final leaf = _findLeaf(key, path: _scratchPath, idxPath: _scratchIdxPath);
 
     final pos = _lowerBound(leaf.keys, key);
-    if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0)
+    if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0) {
       return null;
+    }
 
     // Optimize removal: same strategy as lazy delete path.
     final keys = leaf.keys;

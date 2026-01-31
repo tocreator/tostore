@@ -405,7 +405,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             }
           } else {
             // for fields without prefix, try main table name prefix first
-            final prefixedKey = '${_tableName}.$fieldName';
+            final prefixedKey = '$_tableName.$fieldName';
             if (record.containsKey(prefixedKey)) {
               fieldValue = record[prefixedKey];
             } else if (record.containsKey(fieldName)) {

@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:path/path.dart' as p;
+
 import '../handler/wal_encoder.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
@@ -12,12 +14,14 @@ import 'compute_manager.dart';
 import '../model/buffer_entry.dart';
 import '../model/wal_pointer.dart';
 import 'data_store_impl.dart';
+import 'page_redo_log_codec.dart';
 import 'wal_manager.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/meta_info.dart';
 
 import '../handler/value_matcher.dart';
 import 'write_buffer_manager.dart';
+import '../Interface/storage_interface.dart';
 import 'storage_adapter.dart';
 import 'btree_page.dart';
 
@@ -512,8 +516,8 @@ class ParallelJournalManager {
 
         // Build per-table tasks with unified insert/update/delete handling to minimize partition rewrites.
         final tasks = <Future<void> Function()>[];
-        late final int _plannedTableConcurrency;
-        late final int _perTableTokenBudget;
+        late final int plannedTableConcurrency;
+        late final int perTableTokenBudget;
         grouped.forEach((table, byOp) {
           // Use the epoch captured before/during grouping
           final capturedEpoch = tableEpochs[table] ?? 0;
@@ -541,7 +545,7 @@ class ParallelJournalManager {
 
           tasks.add(() async {
             try {
-              final lockKey = 'table_' + table;
+              final lockKey = 'table_$table';
               final opId = GlobalIdGenerator.generate('flush_batch_unified_');
               bool locked = false;
               try {
@@ -560,7 +564,7 @@ class ParallelJournalManager {
                         ?.acquireExclusiveLock(lockKey, opId) ??
                     true);
                 if (!locked) {
-                  Logger.warn('Skip write due to lock not acquired: ' + table,
+                  Logger.warn('Skip write due to lock not acquired: $table',
                       label: 'ParallelJournalManager');
                   return;
                 }
@@ -626,7 +630,7 @@ class ParallelJournalManager {
                 // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
                 final indexesForBudget = schema.getAllIndexes().toList();
                 final split = IoConcurrencyPlanner.splitPerTableBudget(
-                  perTableTokens: _perTableTokenBudget,
+                  perTableTokens: perTableTokenBudget,
                   indexCount: indexesForBudget.length,
                 );
 
@@ -712,15 +716,15 @@ class ParallelJournalManager {
           final int effectiveCapacity =
               max(1, min(typeCapacity, max(1, physicalAvailable)));
           final int taskCount = tasks.length;
-          _plannedTableConcurrency = IoConcurrencyPlanner.planTableConcurrency(
+          plannedTableConcurrency = IoConcurrencyPlanner.planTableConcurrency(
             capacityTokens: effectiveCapacity,
             tableCount: taskCount,
             minTokensPerTable: 2,
           );
-          _perTableTokenBudget =
-              max(1, (effectiveCapacity / _plannedTableConcurrency).floor());
+          perTableTokenBudget =
+              max(1, (effectiveCapacity / plannedTableConcurrency).floor());
 
-          final int outerConcurrency = _plannedTableConcurrency;
+          final int outerConcurrency = plannedTableConcurrency;
           // Calculate dynamic timeout based on actual batch size and max partition file size
           // Base 300s + 50ms per atomic operation (record write or index update)
           final int timeoutSeconds =
@@ -760,6 +764,7 @@ class ParallelJournalManager {
           await _walManager.advanceCheckpoint(endPtr);
           await _walManager
               .removePendingParallelBatch(currentBatchContext.batchId);
+          await _deletePageRedoLogIfExists(currentBatchContext.batchId);
           await _maybeRotateParallelJournal();
           await _walManager.cleanupObsoletePartitions();
 
@@ -829,11 +834,17 @@ class ParallelJournalManager {
       final meta = _walManager.meta;
       // If there are no known WAL partitions, nothing to replay.
       if (meta.existingStartPartitionIndex < 0 ||
-          meta.existingEndPartitionIndex < 0) return;
+          meta.existingEndPartitionIndex < 0) {
+        return;
+      }
+
+      // Fast-path: skip full replay when tail partition file is unchanged since last recovery
+      // (single getFileSize check, no file content read).
+      if (await _walManager.tryFastPathSkipRecovery()) return;
 
       final checkpoint = meta.checkpoint;
 
-      // Fast-path: if checkpoint partition is behind the logical tail partition
+      // Fast-path: if checkpoint partition equals tail partition, only need last pointer
       // in the cycle, we know there is unprocessed WAL without examining entry
       // sequence numbers. Otherwise, we need to inspect the last WAL pointer
       // in the tail partition to decide.
@@ -843,10 +854,11 @@ class ParallelJournalManager {
         tailLastPtr = await _walManager.readLastWalPointer();
         if (tailLastPtr == null ||
             tailLastPtr.entrySeq <= checkpoint.entrySeq) {
-          // No WAL beyond checkpoint; also update in-memory current pointer.
-          _walManager.updateCurrentPointerAfterRecovery(
-            tailLastPtr ?? checkpoint,
-          );
+          final ptr = tailLastPtr ?? checkpoint;
+          _walManager.updateCurrentPointerAfterRecovery(ptr);
+          try {
+            await _walManager.setLastRecoveredPointer(ptr);
+          } catch (_) {}
           return;
         }
       }
@@ -882,7 +894,11 @@ class ParallelJournalManager {
               .add(op.cutoff);
         }
       } catch (_) {}
+      final partitionYieldController = YieldController(
+          'ParallelJournalManager._recoverFromWal.partition',
+          checkInterval: 1);
       while (true) {
+        await partitionYieldController.maybeYield();
         final dirIndex = _walManager.getPartitionDirIndex(p);
         final path = dirIndex != null
             ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
@@ -934,6 +950,7 @@ class ParallelJournalManager {
           // Process each entry
           final yieldController =
               YieldController('ParallelJournalManager._recoverFromWal');
+
           for (final entry in entries) {
             await yieldController.maybeYield();
             seq++;
@@ -1050,22 +1067,25 @@ class ParallelJournalManager {
           WalPointer(partitionIndex: lastPartition, entrySeq: lastSeq);
       _walManager.updateCurrentPointerAfterRecovery(lastPtr);
 
-      // If the range (checkpoint, lastPtr] contains *no* effective WAL entries
-      // that need to be flushed (all entries were skipped due to clear/drop
-      // cutoff or dropped tables), then this range is no longer needed for
-      // future recovery. In that case we can safely advance the global
-      // checkpoint to [lastPtr].
-      //
-      // For ranges that contain effective entries, we must NOT touch the
-      // checkpoint here; it will be advanced strictly by flush batches via
-      // WalManager.advanceCheckpoint(endPtr) when data becomes durable.
-      if (!hasEffectiveEntry &&
-          (lastPartition != checkpoint.partitionIndex ||
-              lastSeq != checkpoint.entrySeq)) {
+      // No effective entries to recover: delete all WAL partitions and reset meta
+      // so next startup sees no WAL (existingStart/End = -1) and returns
+      // immediately, avoiding repeated full WAL read and unbounded growth.
+      if (!hasEffectiveEntry) {
         try {
-          await _walManager.advanceCheckpoint(lastPtr);
+          await _walManager.clearWalPartitionsAndResetMeta();
         } catch (_) {}
+        return;
       }
+
+      try {
+        // Persist recovery hint using tail partition so tryFastPathSkipRecovery
+        // can match next startup (lastRecoveredPointer.partitionIndex must equal
+        // existingEndPartitionIndex; otherwise fast path never triggers).
+        final ptrForMeta = (lastPartition == endP)
+            ? lastPtr
+            : WalPointer(partitionIndex: endP, entrySeq: 0);
+        await _walManager.setLastRecoveredPointer(ptrForMeta);
+      } catch (_) {}
 
       // After WAL recovery completes, update maxId for all tables that had inserts
       // We tracked the max primary key during recovery (WAL entries are processed in order,
@@ -1323,24 +1343,24 @@ class ParallelJournalManager {
 
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
-            'Recovered maintenance batch metadata and B+Tree structure for $tableName: ${expectedTotalRecords} records (was $currentTotalRecords), ${expectedTotalSize} bytes (was $currentTotalSize), partitionCount=${recoveredPartitionCount} (was ${tableMeta.btreePartitionCount})',
+            'Recovered maintenance batch metadata and B+Tree structure for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
             label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
-            'Recovered maintenance batch metadata for $tableName: ${expectedTotalRecords} records (was $currentTotalRecords), ${expectedTotalSize} bytes (was $currentTotalSize)',
+            'Recovered maintenance batch metadata for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize)',
             label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
-            'Recovered B+Tree structure for $tableName: partitionCount=${recoveredPartitionCount} (was ${tableMeta.btreePartitionCount})',
+            'Recovered B+Tree structure for $tableName: partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
             label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         }
       } else if (expectedTotalRecords != null && expectedTotalSize != null) {
         // Metadata is consistent, no need to update
         Logger.info(
-          'Maintenance batch metadata for $tableName is already correct: ${currentTotalRecords} records, ${currentTotalSize} bytes (verified from last flushed partition ${lastEntry.partitionNo})',
+          'Maintenance batch metadata for $tableName is already correct: $currentTotalRecords records, $currentTotalSize bytes (verified from last flushed partition ${lastEntry.partitionNo})',
           label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
         );
       } else {
@@ -1447,17 +1467,17 @@ class ParallelJournalManager {
 
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
-            'Recovered maintenance batch metadata and B+Tree structure for $tableName.$indexName: ${expectedTotalEntries} entries (was $currentTotalEntries), ${expectedTotalSize} bytes (was $currentTotalSize), partitionCount=${recoveredPartitionCount} (was ${indexMeta.btreePartitionCount})',
+            'Recovered maintenance batch metadata and B+Tree structure for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
             label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
-            'Recovered maintenance batch metadata for $tableName.$indexName: ${expectedTotalEntries} entries (was $currentTotalEntries), ${expectedTotalSize} bytes (was $currentTotalSize)',
+            'Recovered maintenance batch metadata for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize)',
             label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
-            'Recovered B+Tree structure for $tableName.$indexName: partitionCount=${recoveredPartitionCount} (was ${indexMeta.btreePartitionCount})',
+            'Recovered B+Tree structure for $tableName.$indexName: partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
             label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         }
@@ -1486,6 +1506,11 @@ class ParallelJournalManager {
       PendingParallelBatch batch) async {
     try {
       if (batch.batchType == BatchType.maintenance) {
+        // Same as flush: replay page redo log first so any half-written pages
+        // (including new partitions/splits) are fixed before metadata recovery.
+        // Metadata recovery then uses journal + disk (last partition file) and
+        // stays consistent with the replayed data.
+        await _replayPageRedoLogIfExists(batch.batchId);
         // Recover metadata updates for maintenance batches
         await _recoverMaintenanceBatch(batch);
 
@@ -1494,6 +1519,7 @@ class ParallelJournalManager {
             batchId: batch.batchId,
             batchType: BatchType.maintenance));
         await _walManager.removePendingParallelBatch(batch.batchId);
+        await _deletePageRedoLogIfExists(batch.batchId);
         await _maybeRotateParallelJournal();
         try {
           await _flushRecoveryArtifactsIfNeeded();
@@ -1507,6 +1533,7 @@ class ParallelJournalManager {
       // This handles case where crash occurred after Journal update but before WAL meta cleanup.
       if (scanResult.isCompleted) {
         await _walManager.removePendingParallelBatch(batch.batchId);
+        await _deletePageRedoLogIfExists(batch.batchId);
         await _maybeRotateParallelJournal();
         try {
           await _flushRecoveryArtifactsIfNeeded();
@@ -1520,49 +1547,50 @@ class ParallelJournalManager {
 
       final maxIds = <String, int>{};
       int count = 0;
-      for (final table in walData.orderedOpsByTable.keys) {
-        final ops = walData.orderedOpsByTable[table]!;
-        for (final op in ops) {
-          if (op.walPointer == null) continue;
-          final schema = await _dataStore.schemaManager?.getTableSchema(table);
-          if (schema == null) continue;
-          final pkName = schema.primaryKey;
-          final pkValue = op.data[pkName]?.toString();
-          if (pkValue == null) continue;
+      // Iterate in exact WAL order so buffer queue order matches normal flush;
+      // then pop(captureCount) yields exactly this batch (all tables, no partial-table loss).
+      for (final item in walData.orderedOpsInWalOrder) {
+        final table = item.table;
+        final op = item.op;
+        if (op.walPointer == null) continue;
+        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        if (schema == null) continue;
+        final pkName = schema.primaryKey;
+        final pkValue = op.data[pkName]?.toString();
+        if (pkValue == null) continue;
 
-          final be = BufferEntry(
-            data: op.data,
-            operation: op.op,
-            timestamp: DateTime.now(),
-            oldValues: op.oldValues,
-            walPointer: op.walPointer,
-          );
+        final be = BufferEntry(
+          data: op.data,
+          operation: op.op,
+          timestamp: DateTime.now(),
+          oldValues: op.oldValues,
+          walPointer: op.walPointer,
+        );
 
-          final uniqueKeys = await _computeUniqueKeyRefs(table, op.data);
+        final uniqueKeys = await _computeUniqueKeyRefs(table, op.data);
 
-          await _dataStore.tableDataManager.recoverRecordToBuffer(
-            table,
-            op.data,
-            op.op,
-            entry: be,
-            uniqueKeyRefs: uniqueKeys,
-            oldValues: op.oldValues,
-            // Always update memory stats during recovery replay so that
-            // memory total counts are correct before the recovery flush starts.
-            updateStats: true,
-          );
+        await _dataStore.tableDataManager.recoverRecordToBuffer(
+          table,
+          op.data,
+          op.op,
+          entry: be,
+          uniqueKeyRefs: uniqueKeys,
+          oldValues: op.oldValues,
+          // Always update memory stats during recovery replay so that
+          // memory total counts are correct before the recovery flush starts.
+          updateStats: true,
+        );
 
-          // Track maxId for batch update
-          if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
-              op.op == BufferOperationType.insert) {
-            final id = int.tryParse(pkValue) ?? 0;
-            final currentMax = maxIds[table] ?? 0;
-            if (id > currentMax) {
-              maxIds[table] = id;
-            }
+        // Track maxId for batch update
+        if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
+            op.op == BufferOperationType.insert) {
+          final id = int.tryParse(pkValue) ?? 0;
+          final currentMax = maxIds[table] ?? 0;
+          if (id > currentMax) {
+            maxIds[table] = id;
           }
-          count++;
         }
+        count++;
       }
 
       // Batch update maxId
@@ -1591,6 +1619,7 @@ class ParallelJournalManager {
       );
 
       return () async {
+        await _replayPageRedoLogIfExists(captureBatchId);
         await _pumpFlush(
           drainCompletely: false, // will just pop the batch we added
           recoveryBatchContext: BatchContext(
@@ -1724,8 +1753,9 @@ class ParallelJournalManager {
   }
 
   bool _reachedWalEnd(int partitionIndex, int entrySeq, WalPointer end) {
-    if (partitionIndex == end.partitionIndex && entrySeq > end.entrySeq)
+    if (partitionIndex == end.partitionIndex && entrySeq > end.entrySeq) {
       return true;
+    }
     return false;
   }
 
@@ -1735,6 +1765,8 @@ class ParallelJournalManager {
     final Map<String, List<Map<String, dynamic>>> updates = {};
     final Map<String, List<Map<String, dynamic>>> deletes = {};
     final Map<String, List<_WalOp>> ordered = {};
+    // Same ops in exact WAL order so recovery push order matches normal flush pop order.
+    final List<({String table, _WalOp op})> orderedOpsInWalOrder = [];
 
     try {
       // Precompute table-level WAL cutoff pointers from WAL meta (clear/drop ops)
@@ -1755,6 +1787,7 @@ class ParallelJournalManager {
           updatesByTable: updates,
           deletesByTable: deletes,
           orderedOpsByTable: ordered,
+          orderedOpsInWalOrder: [],
         );
       }
       final cap = _dataStore.config.logPartitionCycle;
@@ -1831,28 +1864,30 @@ class ParallelJournalManager {
             }
             if (_reachedWalEnd(p, seq, batch.end)) break;
             final op = BufferOperationType.values[opIdx];
+            final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
+            _WalOp walOp;
             switch (op) {
               case BufferOperationType.insert:
                 (inserts.putIfAbsent(table, () => <Map<String, dynamic>>[]))
                     .add(data);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(_WalOp(
-                    op, data,
-                    walPointer: WalPointer(partitionIndex: p, entrySeq: seq)));
+                walOp = _WalOp(op, data, walPointer: walPtr);
+                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
+                orderedOpsInWalOrder.add((table: table, op: walOp));
                 break;
               case BufferOperationType.update:
                 (updates.putIfAbsent(table, () => <Map<String, dynamic>>[]))
                     .add(data);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(_WalOp(
-                    op, data,
-                    oldValues: oldValues,
-                    walPointer: WalPointer(partitionIndex: p, entrySeq: seq)));
+                walOp =
+                    _WalOp(op, data, oldValues: oldValues, walPointer: walPtr);
+                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
+                orderedOpsInWalOrder.add((table: table, op: walOp));
                 break;
               case BufferOperationType.delete:
                 (deletes.putIfAbsent(table, () => <Map<String, dynamic>>[]))
                     .add(data);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(_WalOp(
-                    op, data,
-                    walPointer: WalPointer(partitionIndex: p, entrySeq: seq)));
+                walOp = _WalOp(op, data, walPointer: walPtr);
+                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
+                orderedOpsInWalOrder.add((table: table, op: walOp));
                 break;
               case BufferOperationType.rewrite:
                 break;
@@ -1874,6 +1909,7 @@ class ParallelJournalManager {
       updatesByTable: updates,
       deletesByTable: deletes,
       orderedOpsByTable: ordered,
+      orderedOpsInWalOrder: orderedOpsInWalOrder,
     );
   }
 
@@ -1906,11 +1942,35 @@ class ParallelJournalManager {
     final Map<String, Map<int, int>> planned = {
       table: {BufferOperationType.update.index: 0},
     };
+    // Capture base totals so recovery can safely restore to "before maintenance batch".
+    final schema = await _dataStore.schemaManager?.getTableSchema(table);
+    final tableMeta = await _dataStore.tableDataManager.getTableMeta(table);
+    final indexNames = <String>[];
+    final baseIndexTotalEntries = <String, int>{};
+    final baseIndexTotalSizeInBytes = <String, int>{};
+    try {
+      if (schema != null) {
+        for (final idx in schema.getAllIndexes()) {
+          final idxName = idx.actualIndexName;
+          indexNames.add(idxName);
+          final idxMeta =
+              await _dataStore.indexManager?.getIndexMeta(table, idxName);
+          if (idxMeta != null) {
+            baseIndexTotalEntries[idxName] = idxMeta.totalEntries;
+            baseIndexTotalSizeInBytes[idxName] = idxMeta.totalSizeInBytes;
+          }
+        }
+      }
+    } catch (_) {}
     final Map<String, TablePlan> tablePlan = {
-      table: const TablePlan(
+      table: TablePlan(
         willUpdateTableMeta: true,
-        indexes: [],
-        willUpdateIndexMeta: false,
+        indexes: indexNames,
+        willUpdateIndexMeta: indexNames.isNotEmpty,
+        baseTotalRecords: tableMeta?.totalRecords,
+        baseTotalSizeInBytes: tableMeta?.totalSizeInBytes,
+        baseIndexTotalEntries: baseIndexTotalEntries,
+        baseIndexTotalSizeInBytes: baseIndexTotalSizeInBytes,
       ),
     };
 
@@ -1952,6 +2012,7 @@ class ParallelJournalManager {
             batchId: batchId,
             batchType: BatchType.maintenance));
         await _walManager.removePendingParallelBatch(batchId);
+        await _deletePageRedoLogIfExists(batchId);
       }
       await _maybeRotateParallelJournal();
       // Durability flush policy at batch end
@@ -1963,6 +2024,189 @@ class ParallelJournalManager {
           label: 'ParallelJournalManager');
     }
     _activeBatchContext = null;
+  }
+
+  /// Replay page redo log for [batchId] if it exists and has content.
+  /// Writes each (path, offset, payload) from the log so recovery does not read possibly corrupted pages.
+  ///
+  /// Redo log contains **intended page images** (what the batch was about to write), not "before" images,
+  /// so we always correct to latest. Consistency: for **flush**, metadata is restored to "before batch"
+  /// and then [_pumpFlush] re-runs the batch (same pages written again, meta updated). For **maintenance**,
+  /// we replay redo first so disk matches intended content, then [_recoverMaintenanceBatch] recovers
+  /// metadata from journal + last partition file on disk, so meta aligns with replayed data.
+  Future<void> _replayPageRedoLogIfExists(String batchId) async {
+    final redoPath = _dataStore.pathManager
+        .getPageRedoLogPath(batchId, spaceName: _dataStore.currentSpaceName);
+    if (!await _dataStore.storage.existsFile(redoPath)) return;
+    final size = await _dataStore.storage.getFileSize(redoPath);
+    if (size <= 0) return;
+    final bytes = await _dataStore.storage.readAsBytes(redoPath);
+    int pos = 0;
+    // Deduplicate by logical identity with last-write-wins.
+    // Reason: redo log may contain multiple attempts or duplicates for the same page.
+    final byPartition = <({
+      PageRedoTreeKind kind,
+      String table,
+      String index,
+      int partitionNo
+    }),
+        Map<int, Uint8List>>{};
+    final treeMeta = <({PageRedoTreeKind kind, String table, String index}),
+        PageRedoTreeMetaRecord>{};
+    const yieldInterval = 50;
+    final parseYc = YieldController(
+        'ParallelJournalManager._replayPageRedoLog.parse',
+        checkInterval: yieldInterval);
+    while (pos < bytes.length) {
+      await parseYc.maybeYield();
+      final rec = PageRedoLogCodec.decodeRecord(bytes, pos);
+      if (rec == null) break;
+      pos = rec.nextStart;
+      if (rec is PageRedoPageRecord) {
+        final key = (
+          kind: rec.treeKind,
+          table: rec.tableName,
+          index: rec.indexName ?? '',
+          partitionNo: rec.partitionNo,
+        );
+        byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
+            rec.payload;
+      } else if (rec is PageRedoTreeMetaRecord) {
+        final key = (
+          kind: rec.treeKind,
+          table: rec.tableName,
+          index: rec.indexName ?? '',
+        );
+        treeMeta[key] = rec;
+      }
+    }
+    final writeYc = YieldController(
+        'ParallelJournalManager._replayPageRedoLog.write',
+        checkInterval: 5);
+    for (final e in byPartition.entries) {
+      await writeYc.maybeYield();
+      final key = e.key;
+      final pages = e.value;
+      if (pages.isEmpty) continue;
+      if (key.kind == PageRedoTreeKind.indexTree && key.index.isEmpty) continue;
+
+      String path;
+      try {
+        if (key.kind == PageRedoTreeKind.table) {
+          path = await _dataStore.pathManager
+              .getPartitionFilePathByNo(key.table, key.partitionNo);
+        } else {
+          path = await _dataStore.pathManager
+              .getIndexPartitionPathByNo(key.table, key.index, key.partitionNo);
+        }
+      } catch (_) {
+        continue;
+      }
+
+      // Ensure directory exists before writing.
+      try {
+        await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
+      } catch (_) {}
+
+      // Use a consistent pageSize for this partition; skip inconsistent payloads.
+      int pageSize = 0;
+      for (final v in pages.values) {
+        if (v.isNotEmpty) {
+          pageSize = v.length;
+          break;
+        }
+      }
+      if (pageSize <= 0) continue;
+
+      final pageNos = pages.keys.toList(growable: false)..sort();
+      final writes = <ByteWrite>[];
+      for (final pg in pageNos) {
+        if (pg < 0) continue;
+        final payload = pages[pg];
+        if (payload == null || payload.isEmpty) continue;
+        if (payload.length != pageSize) continue;
+        final off = pg * pageSize;
+        writes.add(ByteWrite(offset: off, bytes: payload));
+      }
+      if (writes.isEmpty) continue;
+      writes.sort((a, b) => a.offset.compareTo(b.offset));
+      await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+    }
+
+    // Apply tree metadata snapshots after pages are restored.
+    if (treeMeta.isNotEmpty) {
+      final metaYc = YieldController(
+        'ParallelJournalManager._replayPageRedoLog.meta',
+        checkInterval: 5,
+      );
+      for (final rec in treeMeta.values) {
+        await metaYc.maybeYield();
+        try {
+          if (rec.treeKind == PageRedoTreeKind.table) {
+            final meta =
+                await _dataStore.tableDataManager.getTableMeta(rec.tableName);
+            if (meta == null) continue;
+            final updated = meta.copyWith(
+              btreePageSize: rec.btreePageSize,
+              btreeNextPageNo: rec.btreeNextPageNo,
+              btreePartitionCount: rec.btreePartitionCount,
+              btreeRoot:
+                  TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
+              btreeFirstLeaf: TreePagePtr(
+                  rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
+              btreeLastLeaf: TreePagePtr(
+                  rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
+              btreeHeight: rec.btreeHeight,
+              timestamps: Timestamps(
+                created: meta.timestamps.created,
+                modified: DateTime.now(),
+              ),
+            );
+            await _dataStore.tableDataManager
+                .updateTableMeta(rec.tableName, updated, flush: true);
+          } else {
+            final idxName = rec.indexName;
+            if (idxName == null || idxName.isEmpty) continue;
+            final meta = await _dataStore.indexManager
+                ?.getIndexMeta(rec.tableName, idxName);
+            if (meta == null) continue;
+            final updated = meta.copyWith(
+              btreePageSize: rec.btreePageSize,
+              btreeNextPageNo: rec.btreeNextPageNo,
+              btreePartitionCount: rec.btreePartitionCount,
+              btreeRoot:
+                  TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
+              btreeFirstLeaf: TreePagePtr(
+                  rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
+              btreeLastLeaf: TreePagePtr(
+                  rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
+              btreeHeight: rec.btreeHeight,
+              timestamps: Timestamps(
+                created: meta.timestamps.created,
+                modified: DateTime.now(),
+              ),
+            );
+            await _dataStore.indexManager?.updateIndexMeta(
+              tableName: rec.tableName,
+              indexName: idxName,
+              updatedMeta: updated,
+              flush: true,
+            );
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// Delete page redo log for [batchId] if it exists (after batch is fully flushed, before checkpoint).
+  Future<void> _deletePageRedoLogIfExists(String batchId) async {
+    try {
+      final redoPath = _dataStore.pathManager
+          .getPageRedoLogPath(batchId, spaceName: _dataStore.currentSpaceName);
+      if (await _dataStore.storage.existsFile(redoPath)) {
+        await _dataStore.storage.deleteFile(redoPath);
+      }
+    } catch (_) {}
   }
 
   /// Scan journal to find batch status, flushed tables, and flushed indexes.
@@ -2098,47 +2342,61 @@ class ParallelJournalManager {
       final Map<String, dynamic> json = entry.toJson();
       final activeContext = _activeBatchContext;
       if (!json.containsKey('batchId')) {
-        if (entry is BatchStartEntry)
+        if (entry is BatchStartEntry) {
           json['batchId'] = entry.batchId;
-        else if (entry is BatchCompletedEntry)
+        } else if (entry is BatchCompletedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId ?? (activeContext?.batchId ?? '');
         else if (entry is TaskDoneEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId ?? (activeContext?.batchId ?? '');
         else if (entry is TablePartitionFlushedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId;
         else if (entry is TableMetaUpdatedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId ?? (activeContext?.batchId ?? '');
         else if (entry is IndexPartitionFlushedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId;
         else if (entry is IndexMetaUpdatedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId ?? (activeContext?.batchId ?? '');
         else
+          // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = activeContext?.batchId ?? '';
       }
       if (!json.containsKey('batchType')) {
-        if (entry is BatchStartEntry)
+        if (entry is BatchStartEntry) {
           json['batchType'] = entry.batchType.value;
-        else if (entry is BatchCompletedEntry)
+        } else if (entry is BatchCompletedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType?.value ??
               (activeContext?.batchType.value ?? BatchType.flush.value);
         else if (entry is TaskDoneEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType?.value ??
               (activeContext?.batchType.value ?? BatchType.flush.value);
         else if (entry is TablePartitionFlushedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType.value;
         else if (entry is TableMetaUpdatedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType?.value ??
               (activeContext?.batchType.value ?? BatchType.flush.value);
         else if (entry is IndexPartitionFlushedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType.value;
         else if (entry is IndexMetaUpdatedEntry)
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType?.value ??
               (activeContext?.batchType.value ?? BatchType.flush.value);
         else
+          // ignore: curly_braces_in_flow_control_structures
           json['batchType'] =
               activeContext?.batchType.value ?? BatchType.flush.value;
       }
-      await _dataStore.storage.writeAsString(path, jsonEncode(json) + '\n',
+      await _dataStore.storage.writeAsString(path, '${jsonEncode(json)}\n',
           append: true, flush: false);
     } catch (e) {
       Logger.error('Failed to append parallel journal: $e',
@@ -2198,6 +2456,10 @@ class _BatchWalData {
   final Map<String, List<Map<String, dynamic>>> deletesByTable;
   // Preserve ordered operations per table for coalescing within a batch
   final Map<String, List<_WalOp>> orderedOpsByTable;
+
+  /// Same ops in exact WAL (partition+seq) order so recovery push order
+  /// matches normal flush pop order and pop(captureCount) yields this batch.
+  final List<({String table, _WalOp op})> orderedOpsInWalOrder;
   // Table plans for precise repair
   final Map<String, TablePlan> tablePlans = {};
 
@@ -2206,6 +2468,7 @@ class _BatchWalData {
     required this.updatesByTable,
     required this.deletesByTable,
     required this.orderedOpsByTable,
+    required this.orderedOpsInWalOrder,
   });
 }
 

@@ -10,10 +10,9 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   // add flag to indicate whether to continue on partial errors
   bool _continueOnPartialErrors = false;
 
-  UpdateBuilder(DataStoreImpl db, String tableName,
+  UpdateBuilder(super.db, super.tableName,
       [Map<String, dynamic> data = const {}])
-      : _updateData = Map.from(data),
-        super(db, tableName);
+      : _updateData = Map.from(data);
 
   @override
   void _onChanged() {

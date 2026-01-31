@@ -1,5 +1,6 @@
 /// Typed journal entry models for parallel processing A/B journal.
 /// Keep JSON schema compatible with existing map-based entries.
+library;
 
 abstract class ParallelJournalEntry {
   String get type; // discriminator

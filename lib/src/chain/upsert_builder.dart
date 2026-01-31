@@ -11,8 +11,7 @@ class UpsertBuilder extends ChainBuilder<UpsertBuilder>
   // flag to indicate whether to continue on partial errors
   bool _continueOnPartialErrors = false;
 
-  UpsertBuilder(DataStoreImpl db, String tableName, this._data)
-      : super(db, tableName);
+  UpsertBuilder(super.db, super.tableName, this._data);
 
   Future<DbResult>? _future;
 

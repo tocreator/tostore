@@ -224,6 +224,12 @@ class WalMeta {
   /// Maintains partition index -> directory index mapping and directory file counts.
   final DirectoryMapping? directoryMapping;
 
+  /// Last WAL pointer after a successful recovery; used for fast-path skip on next startup.
+  final WalPointer? lastRecoveredPointer;
+
+  /// Tail partition file size when lastRecoveredPointer was set; fast-path only when size unchanged.
+  final int? lastRecoveredTailFileSize;
+
   WalMeta({
     required this.checkpoint,
     required this.existingStartPartitionIndex,
@@ -234,7 +240,42 @@ class WalMeta {
     required this.largeUpdates,
     required this.tableOps,
     this.directoryMapping,
+    this.lastRecoveredPointer,
+    this.lastRecoveredTailFileSize,
   });
+
+  /// Returns a copy with the given fields overridden; omitted fields keep current values.
+  WalMeta copyWith({
+    WalPointer? checkpoint,
+    int? existingStartPartitionIndex,
+    int? existingEndPartitionIndex,
+    String? activeParallelJournal,
+    List<PendingParallelBatch>? pendingBatches,
+    Map<String, LargeDeleteMeta>? largeDeletes,
+    Map<String, LargeUpdateMeta>? largeUpdates,
+    Map<String, TableOpMeta>? tableOps,
+    DirectoryMapping? directoryMapping,
+    WalPointer? lastRecoveredPointer,
+    int? lastRecoveredTailFileSize,
+  }) {
+    return WalMeta(
+      checkpoint: checkpoint ?? this.checkpoint,
+      existingStartPartitionIndex:
+          existingStartPartitionIndex ?? this.existingStartPartitionIndex,
+      existingEndPartitionIndex:
+          existingEndPartitionIndex ?? this.existingEndPartitionIndex,
+      activeParallelJournal:
+          activeParallelJournal ?? this.activeParallelJournal,
+      pendingBatches: pendingBatches ?? this.pendingBatches,
+      largeDeletes: largeDeletes ?? this.largeDeletes,
+      largeUpdates: largeUpdates ?? this.largeUpdates,
+      tableOps: tableOps ?? this.tableOps,
+      directoryMapping: directoryMapping ?? this.directoryMapping,
+      lastRecoveredPointer: lastRecoveredPointer ?? this.lastRecoveredPointer,
+      lastRecoveredTailFileSize:
+          lastRecoveredTailFileSize ?? this.lastRecoveredTailFileSize,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
         'checkpoint': checkpoint.toJson(),
@@ -247,6 +288,10 @@ class WalMeta {
         'tableOps': tableOps.map((k, v) => MapEntry(k, v.toJson())),
         if (directoryMapping != null)
           'directoryMapping': directoryMapping!.toJson(),
+        if (lastRecoveredPointer != null)
+          'lastRecoveredPointer': lastRecoveredPointer!.toJson(),
+        if (lastRecoveredTailFileSize != null)
+          'lastRecoveredTailFileSize': lastRecoveredTailFileSize,
       };
 
   static WalMeta initial({required int startPartitionIndex}) => WalMeta(
@@ -303,6 +348,12 @@ class WalMeta {
           ? DirectoryMapping.fromJson(
               json['directoryMapping'] as Map<String, dynamic>)
           : null,
+      lastRecoveredPointer: json['lastRecoveredPointer'] != null
+          ? WalPointer.fromJson(
+              json['lastRecoveredPointer'] as Map<String, dynamic>)
+          : null,
+      lastRecoveredTailFileSize:
+          (json['lastRecoveredTailFileSize'] as num?)?.toInt(),
     );
   }
 }
@@ -583,18 +634,7 @@ class WalManager {
         partitionIndex, currentDir, currentCount + 1);
     _currentPartitionDirIndex = currentDir;
 
-    // Update meta (create new WalMeta with updated directoryMapping)
-    _meta = WalMeta(
-      checkpoint: _meta.checkpoint,
-      existingStartPartitionIndex: _meta.existingStartPartitionIndex,
-      existingEndPartitionIndex: _meta.existingEndPartitionIndex,
-      activeParallelJournal: _meta.activeParallelJournal,
-      pendingBatches: _meta.pendingBatches,
-      largeDeletes: _meta.largeDeletes,
-      largeUpdates: _meta.largeUpdates,
-      tableOps: _meta.tableOps,
-      directoryMapping: _directoryMapping,
-    );
+    _meta = _meta.copyWith(directoryMapping: _directoryMapping);
 
     return currentDir;
   }
@@ -670,11 +710,83 @@ class WalManager {
     await persistMeta(flush: false, backupOld: true);
   }
 
+  /// Delete all WAL partition files in the current range and reset meta so that
+  /// next startup sees no WAL (existingStart/End = -1). Used when recovery found
+  /// no effective entries so WAL can be cleared to avoid repeated full reads.
+  Future<void> clearWalPartitionsAndResetMeta() async {
+    if (_meta.existingStartPartitionIndex < 0 ||
+        _meta.existingEndPartitionIndex < 0) {
+      return;
+    }
+    final start = _meta.existingStartPartitionIndex;
+    final end = _meta.existingEndPartitionIndex;
+    final cap = _config.logPartitionCycle;
+
+    int idx = start;
+    final toDelete = <int>[];
+    while (true) {
+      toDelete.add(idx);
+      if (idx == end) break;
+      idx = (idx + 1) % cap;
+      if (idx == start) break;
+    }
+
+    final partitionToDirIndex = <int, int>{};
+    if (_directoryMapping != null) {
+      for (final p in toDelete) {
+        final dirIndex = _directoryMapping!.getDirIndex(p);
+        if (dirIndex != null) partitionToDirIndex[p] = dirIndex;
+      }
+    }
+    for (final p in toDelete) {
+      if (partitionToDirIndex.containsKey(p)) continue;
+      partitionToDirIndex[p] = p ~/ _dataStore.maxEntriesPerDir;
+    }
+
+    final yieldController = YieldController(
+        'WalManager.clearWalPartitionsAndResetMeta',
+        checkInterval: 1);
+    for (final p in toDelete) {
+      await yieldController.maybeYield();
+      final dirIndex = partitionToDirIndex[p]!;
+      final path = _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
+          spaceName: _dataStore.currentSpaceName);
+      try {
+        try {
+          await _dataStore.storage.flushAll(path: path, closeHandles: true);
+        } catch (_) {}
+        await _dataStore.storage.deleteFile(path);
+      } catch (_) {}
+    }
+
+    _directoryMapping = null;
+    _current = const WalPointer(partitionIndex: 0, entrySeq: 0);
+    _appended = const WalPointer(partitionIndex: 0, entrySeq: 0);
+    _meta = WalMeta(
+      checkpoint: const WalPointer(partitionIndex: 0, entrySeq: 0),
+      existingStartPartitionIndex: -1,
+      existingEndPartitionIndex: -1,
+      activeParallelJournal: _meta.activeParallelJournal,
+      pendingBatches: _meta.pendingBatches,
+      largeDeletes: _meta.largeDeletes,
+      largeUpdates: _meta.largeUpdates,
+      tableOps: _meta.tableOps,
+      directoryMapping: null,
+      lastRecoveredPointer: null,
+      lastRecoveredTailFileSize: null,
+    );
+    _currentPartitionSizeLoaded = true;
+    _currentPartitionSizeApprox = 0;
+    await persistMeta(flush: true);
+  }
+
   /// Delete WAL partition files strictly older than checkpoint partition within the existing range (cycle-aware)
   Future<void> cleanupObsoletePartitions() async {
     try {
       if (_meta.existingStartPartitionIndex < 0 ||
-          _meta.existingEndPartitionIndex < 0) return;
+          _meta.existingEndPartitionIndex < 0) {
+        return;
+      }
       final start = _meta.existingStartPartitionIndex;
       final end = _meta.existingEndPartitionIndex;
       final cap = _config.logPartitionCycle;
@@ -760,17 +872,8 @@ class WalManager {
       // Move start forward
       if (toDelete.isNotEmpty) {
         final newStart = (toDelete.last + 1) % cap;
-        _meta.existingStartPartitionIndex = newStart;
-        // Update meta with cleaned mapping
-        _meta = WalMeta(
-          checkpoint: _meta.checkpoint,
+        _meta = _meta.copyWith(
           existingStartPartitionIndex: newStart,
-          existingEndPartitionIndex: _meta.existingEndPartitionIndex,
-          activeParallelJournal: _meta.activeParallelJournal,
-          pendingBatches: _meta.pendingBatches,
-          largeDeletes: _meta.largeDeletes,
-          largeUpdates: _meta.largeUpdates,
-          tableOps: _meta.tableOps,
           directoryMapping: _directoryMapping,
         );
         await persistMeta();
@@ -1001,6 +1104,62 @@ class WalManager {
     _currentPartitionSizeLoaded = true;
   }
 
+  /// Fast-path: skip full WAL replay when tail partition is unchanged since last recovery.
+  /// Uses only a single getFileSize (no file content read). Returns true if recovery was skipped.
+  Future<bool> tryFastPathSkipRecovery() async {
+    if (!_config.enableJournal) return false;
+    final ptr = _meta.lastRecoveredPointer;
+    final savedSize = _meta.lastRecoveredTailFileSize;
+    if (ptr == null ||
+        savedSize == null ||
+        _meta.existingEndPartitionIndex < 0 ||
+        ptr.partitionIndex != _meta.existingEndPartitionIndex) {
+      return false;
+    }
+    final pIdx = _meta.existingEndPartitionIndex;
+    final dirIndex = getPartitionDirIndex(pIdx);
+    if (dirIndex == null) return false;
+    final path = _dataStore.pathManager.getWalPartitionLogPath(
+      dirIndex,
+      pIdx,
+      spaceName: _dataStore.currentSpaceName,
+    );
+    try {
+      if (!await _dataStore.storage.existsFile(path)) {
+        return false;
+      }
+      final size = await _dataStore.storage.getFileSize(path);
+      if (size != savedSize) return false;
+      updateCurrentPointerAfterRecovery(ptr);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Persist last-recovered pointer and tail file size after a successful WAL recovery
+  /// so that the next startup can skip replay via tryFastPathSkipRecovery when unchanged.
+  Future<void> setLastRecoveredPointer(WalPointer ptr) async {
+    final dirIndex = getPartitionDirIndex(ptr.partitionIndex);
+    if (dirIndex == null) return;
+    final path = _dataStore.pathManager.getWalPartitionLogPath(
+      dirIndex,
+      ptr.partitionIndex,
+      spaceName: _dataStore.currentSpaceName,
+    );
+    int size = 0;
+    try {
+      if (await _dataStore.storage.existsFile(path)) {
+        size = await _dataStore.storage.getFileSize(path);
+      }
+    } catch (_) {}
+    _meta = _meta.copyWith(
+      lastRecoveredPointer: ptr,
+      lastRecoveredTailFileSize: size,
+    );
+    await persistMeta(flush: false);
+  }
+
   /// Efficiently read the last WAL pointer from the logical tail partition.
   /// Reads only the last 64KB of the file to find the last entry, avoiding
   /// the need to read and decode the entire file.
@@ -1052,30 +1211,29 @@ class WalManager {
         }
       }
 
-      // Fallback: if tail scan failed (e.g., tail was insufficient or corrupted),
-      // we need to read more data. Try reading a larger tail (up to 256KB) before
-      // falling back to reading the entire file.
-      if (size > tailSize) {
-        const int largerTailSize = 256 * 1024;
-        final int largerReadSize =
-            size < largerTailSize ? size : largerTailSize;
-        final int largerOffset = size - largerReadSize;
+      // Fallback: if tail scan failed, try larger tails (256KB then 512KB)
+      // before falling back to reading the entire file to avoid 600ms+ startup.
+      const int tier2Tail = 256 * 1024;
+      const int tier3Tail = 512 * 1024;
+      for (final largerTailSize in [tier2Tail, tier3Tail]) {
+        if (size <= largerTailSize) continue;
+        final largerReadSize = size < largerTailSize ? size : largerTailSize;
+        final largerOffset = size - largerReadSize;
         final largerTailData = await _dataStore.storage
             .readAsBytesAt(path, largerOffset, length: largerReadSize);
-        if (largerTailData.isNotEmpty) {
-          final lastEntryLarger =
-              await WalEncoder.decodeLastEntryFromTail(largerTailData, pIdx);
-          if (lastEntryLarger != null) {
-            final p = lastEntryLarger['p'] as int?;
-            final seq = (lastEntryLarger['seq'] as num?)?.toInt();
-            if (p != null && seq != null) {
-              return WalPointer(partitionIndex: p, entrySeq: seq);
-            }
+        if (largerTailData.isEmpty) continue;
+        final lastEntryLarger =
+            await WalEncoder.decodeLastEntryFromTail(largerTailData, pIdx);
+        if (lastEntryLarger != null) {
+          final p = lastEntryLarger['p'] as int?;
+          final seq = (lastEntryLarger['seq'] as num?)?.toInt();
+          if (p != null && seq != null) {
+            return WalPointer(partitionIndex: p, entrySeq: seq);
           }
         }
       }
 
-      // Last resort: decode entire file (only if tail scans failed)
+      // Last resort: decode entire file (only if all tail scans failed)
       // This should be rare and only happen if the file structure is unusual
       final fullData = await _dataStore.storage.readAsBytes(path);
       if (fullData.isEmpty) {
@@ -1118,6 +1276,8 @@ class WalManager {
       }
     }
 
+    await persistMeta(flush: true);
+
     final nextDirIndex = _getOrAllocateDirIndexForPartition(next);
     final newPath = _dataStore.pathManager.getWalPartitionLogPath(
         nextDirIndex, next,
@@ -1139,8 +1299,6 @@ class WalManager {
     // Reset in-memory size approximation for the new active partition.
     _currentPartitionSizeApprox = 0;
     _currentPartitionSizeLoaded = true;
-
-    await persistMeta(flush: false);
   }
 
   Future<void> persistMeta({bool flush = false, bool backupOld = false}) async {
@@ -1192,17 +1350,7 @@ class WalManager {
     try {
       // Update directory mapping in meta if cache exists
       if (_directoryMapping != null) {
-        _meta = WalMeta(
-          checkpoint: _meta.checkpoint,
-          existingStartPartitionIndex: _meta.existingStartPartitionIndex,
-          existingEndPartitionIndex: _meta.existingEndPartitionIndex,
-          activeParallelJournal: _meta.activeParallelJournal,
-          pendingBatches: _meta.pendingBatches,
-          largeDeletes: _meta.largeDeletes,
-          largeUpdates: _meta.largeUpdates,
-          tableOps: _meta.tableOps,
-          directoryMapping: _directoryMapping,
-        );
+        _meta = _meta.copyWith(directoryMapping: _directoryMapping);
       }
       try {
         final metaPath = _dataStore.pathManager

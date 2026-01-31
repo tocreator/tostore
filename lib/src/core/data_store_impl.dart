@@ -1380,7 +1380,7 @@ class DataStoreImpl {
       }
 
       // 3. Plan unique locks + refs once; acquire locks then reuse refs for buffer
-      final _planIns = planUniqueForInsert(tableName, schema, validData);
+      final planIns = planUniqueForInsert(tableName, schema, validData);
 
       // Reservation based: try reserve unique keys first
       final recordId = validData[schema.primaryKey].toString();
@@ -1388,7 +1388,7 @@ class DataStoreImpl {
         writeBufferManager.tryReserveUniqueKeys(
           tableName: tableName,
           recordId: recordId,
-          uniqueKeys: _planIns.refs,
+          uniqueKeys: planIns.refs,
           transactionId: txId,
         );
       } catch (e) {
@@ -1452,7 +1452,7 @@ class DataStoreImpl {
       }
 
       // 5. Add to write queue (insert operation) using planned refs (no extra parsing)
-      final uniqueRefs = _planIns.refs;
+      final uniqueRefs = planIns.refs;
       await tableDataManager.addToBuffer(
         tableName,
         orderedValidData,
@@ -2321,7 +2321,6 @@ class DataStoreImpl {
             processFunction: processFunction,
             startPartitionNo: startPartitionNo,
             skipMaintenanceGlobalLock: true,
-            useJournal: false,
             largeUpdateOpId: largeUpdateOpId,
             onPartitionFlushed: (int partitionNo) async {
               try {
@@ -2379,7 +2378,7 @@ class DataStoreImpl {
         // Optimizable query path: use regular method
         // find matching records (for optimizable queries)
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
-        final int? effectiveLimit = limit ?? 1000000000;
+        final int effectiveLimit = limit ?? 1000000000;
         final records = await executeQuery(tableName, condition,
             orderBy: orderBy, limit: effectiveLimit, offset: offset);
         if (records.isEmpty) {
@@ -2536,20 +2535,20 @@ class DataStoreImpl {
 
           bool ok = true;
           UniqueViolation? uniqueViolation;
-          UniquePlan? _planUpd;
-          List<UniqueKeyRef>? _oldUniqueKeys;
+          UniquePlan? planUpd;
+          List<UniqueKeyRef>? oldUniqueKeys;
 
           if (fieldsToCheck.isNotEmpty) {
             // Plan unique + refs for update
-            _planUpd = planUniqueForUpdate(
+            planUpd = planUniqueForUpdate(
                 tableName, schema, updatedRecord, changedFields);
 
             // Try reserve unique keys (replaces manual locking)
             try {
-              _oldUniqueKeys = writeBufferManager.tryReserveUniqueKeys(
+              oldUniqueKeys = writeBufferManager.tryReserveUniqueKeys(
                 tableName: tableName,
                 recordId: recordKey,
-                uniqueKeys: _planUpd.refs,
+                uniqueKeys: planUpd.refs,
                 transactionId: txId,
               );
             } catch (e) {
@@ -2588,7 +2587,7 @@ class DataStoreImpl {
                 tableName: tableName,
                 recordId: recordKey,
                 transactionId: txId,
-                restoreKeys: _oldUniqueKeys,
+                restoreKeys: oldUniqueKeys,
               );
             }
           }
@@ -2617,7 +2616,7 @@ class DataStoreImpl {
                   tableName: tableName,
                   recordId: recordKey,
                   transactionId: txId,
-                  restoreKeys: _oldUniqueKeys,
+                  restoreKeys: oldUniqueKeys,
                 );
                 if (continueOnPartialErrors) {
                   // release unique locks before continuing
@@ -2643,7 +2642,7 @@ class DataStoreImpl {
           }
 
           // update write queue using planned refs
-          final uniqueRefsUpd = _planUpd?.refs ?? const <UniqueKeyRef>[];
+          final uniqueRefsUpd = planUpd?.refs ?? const <UniqueKeyRef>[];
           final Set<String> indexFields = <String>{primaryKey};
           final bool pkChanged = isPrimaryKeyUpdate &&
               record[primaryKey] != null &&
@@ -2975,7 +2974,7 @@ class DataStoreImpl {
       if (isOptimizableQuery) {
         // standard method: get all records
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
-        final int? effectiveLimit = limit ?? 1000000000;
+        final int effectiveLimit = limit ?? 1000000000;
         final recordsToDelete = await executeQuery(tableName, condition,
             orderBy: orderBy, limit: effectiveLimit, offset: offset);
 
@@ -3251,7 +3250,7 @@ class DataStoreImpl {
                     if (!controller.isStopped) {
                       controller.stop();
                     }
-                    throw e; // This will be caught by the outer try-catch
+                    rethrow; // This will be caught by the outer try-catch
                   }
 
                   // Phase 2: Execute CASCADE operations immediately for this record
@@ -3271,7 +3270,7 @@ class DataStoreImpl {
                     if (!controller.isStopped) {
                       controller.stop();
                     }
-                    throw e; // This will be caught by the outer try-catch
+                    rethrow; // This will be caught by the outer try-catch
                   }
                 }
 
@@ -3345,7 +3344,6 @@ class DataStoreImpl {
             processFunction: processFunction,
             startPartitionNo: startPartitionNo,
             skipMaintenanceGlobalLock: true,
-            useJournal: false,
             largeDeleteOpId: largeDeleteOpId,
             onPartitionFlushed: (int partitionNo) async {
               try {
@@ -3468,8 +3466,9 @@ class DataStoreImpl {
       final ops = walManager.tableOps.values.toList();
       if (ops.isEmpty) return;
       for (final op in ops) {
-        if (op.completed)
+        if (op.completed) {
           continue; // Already finished; only used for cutoff, do not re-execute
+        }
         try {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
           if (op.type == 'clear') {
@@ -3651,8 +3650,9 @@ class DataStoreImpl {
   TransactionErrorType _classifyTransactionErrorOrUnknown(Object e) {
     final msg = e.toString().toLowerCase();
     if (msg.contains('timeout')) return TransactionErrorType.timeout;
-    if (msg.contains('io') || msg.contains('filesystem'))
+    if (msg.contains('io') || msg.contains('filesystem')) {
       return TransactionErrorType.io;
+    }
     if (msg.contains('unique') ||
         msg.contains('constraint') ||
         msg.contains('integrity')) {
@@ -4288,13 +4288,13 @@ class DataStoreImpl {
                 }
 
                 // Plan unique locks + refs for atomic check+reserve
-                final _planIns =
+                final planIns =
                     planUniqueForInsert(tableName, tableSchema, validData);
 
                 // Reservation based: try reserve unique keys first
                 final recordId = validData[primaryKey].toString();
                 try {
-                  batchContext.tryReserve(recordId, _planIns.refs);
+                  batchContext.tryReserve(recordId, planIns.refs);
                 } catch (e) {
                   if (e is UniqueViolation) {
                     invalidRecords.add(record);
@@ -4319,7 +4319,7 @@ class DataStoreImpl {
 
                 try {
                   batchRecordsForBuffer.add(validData);
-                  batchUniqueRefsForBuffer.add(_planIns.refs);
+                  batchUniqueRefsForBuffer.add(planIns.refs);
                   batchOriginalById[recordId] = record;
 
                   finishedRecord = true;

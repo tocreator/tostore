@@ -368,7 +368,7 @@ class TableSchema {
       // Note: fkField and refField are guaranteed to be non-null here due to the logic above
       if (!_areTypesCompatible(fkField.type, refFieldType)) {
         Logger.error(
-          'Foreign key ${fk.actualName}: Field type mismatch - $fkFieldName (${fkField.type}) vs $refFieldName (${refFieldType}). '
+          'Foreign key ${fk.actualName}: Field type mismatch - $fkFieldName (${fkField.type}) vs $refFieldName ($refFieldType). '
           'Foreign key fields must have compatible types with referenced fields. '
           'Note: Primary keys are stored as text, so numeric types (integer, bigInt, double) can reference them.',
           label: 'TableSchema.validateForeignKeyWithReferencedTable',
@@ -2600,7 +2600,7 @@ class ForeignKeySchema {
     }
     // Automatically generate name: fk_{table name}_{field name}
     final fieldNames = fields.join('_');
-    return 'fk_${fieldNames}';
+    return 'fk_$fieldNames';
   }
 
   /// Whether it is a composite foreign key (contains multiple fields)

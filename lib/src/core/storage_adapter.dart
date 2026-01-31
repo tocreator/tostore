@@ -202,8 +202,10 @@ class StorageAdapter implements StorageInterface {
     _burstTimer = Timer(delay, () async {
       final now = DateTime.now();
       // Prevent overly frequent bursts
-      if (_lastBurstAt != null && now.difference(_lastBurstAt!) < _burstMinGap)
+      if (_lastBurstAt != null &&
+          now.difference(_lastBurstAt!) < _burstMinGap) {
         return;
+      }
       // Skip if no new write since last flush
       final lastWrite = _lastWriteAt;
       if (lastWrite == null) return;

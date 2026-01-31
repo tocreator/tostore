@@ -174,7 +174,9 @@ class TransactionManager {
           try {
             final now = DateTime.now().millisecondsSinceEpoch;
             if (now - _lastPeriodicCleanupMs <
-                _dataStore.config.transactionCleanupIntervalMs) return;
+                _dataStore.config.transactionCleanupIntervalMs) {
+              return;
+            }
             _lastPeriodicCleanupMs = now;
             await periodicCleanup(
                 nowMs: now, ttlMs: _dataStore.config.transactionMetaTtlMs);
@@ -978,6 +980,7 @@ class TransactionManager {
   }
 
   /// Get deferred cascade delete operations for a transaction
+  // ignore: library_private_types_in_public_api
   List<_CascadeDeleteOp> getDeferredCascadeDeletes(String txId) {
     final list = _txnCascadeDeletes[txId];
     if (list == null) return const <_CascadeDeleteOp>[];
@@ -997,6 +1000,7 @@ class TransactionManager {
   }
 
   /// Get deferred cascade update operations for a transaction
+  // ignore: library_private_types_in_public_api
   List<_CascadeUpdateOp> getDeferredCascadeUpdates(String txId) {
     final list = _txnCascadeUpdates[txId];
     if (list == null) return const <_CascadeUpdateOp>[];

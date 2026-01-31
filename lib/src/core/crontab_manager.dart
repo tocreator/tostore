@@ -231,9 +231,10 @@ class CrontabManager {
 
   // Internal: schedule idle stop
   void _scheduleIdleStop() {
-    if (_idleTimer != null)
+    if (_idleTimer != null) {
       return; // already scheduled; keep single timer to reduce churn
-    void _arm(Duration d) {
+    }
+    void arm(Duration d) {
       _idleTimer = Timer(d, () {
         _idleTimer = null;
         final now = DateTime.now();
@@ -252,11 +253,11 @@ class CrontabManager {
         final safe = remaining.inMilliseconds <= 0
             ? const Duration(milliseconds: 50)
             : remaining;
-        _arm(safe);
+        arm(safe);
       });
     }
 
-    _arm(_idleTimeout);
+    arm(_idleTimeout);
   }
 
   /// Get string representation of interval

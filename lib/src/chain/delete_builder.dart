@@ -7,7 +7,7 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
   // add flag to indicate whether to allow delete without condition
   bool _allowAll = false;
 
-  DeleteBuilder(DataStoreImpl db, String tableName) : super(db, tableName);
+  DeleteBuilder(super.db, super.tableName);
 
   @override
   void _onChanged() {

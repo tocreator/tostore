@@ -552,8 +552,9 @@ final class LeafPage {
   /// Find exact key index, or null if not found.
   int? find(Uint8List key) {
     final i = _lowerBound(key);
-    if (i < keys.length && MemComparableKey.compare(keys[i], key) == 0)
+    if (i < keys.length && MemComparableKey.compare(keys[i], key) == 0) {
       return i;
+    }
     return null;
   }
 
@@ -846,9 +847,8 @@ final class BTreePageSizer {
 
   /// Returns true if a payload of [plainPayloadLen] will fit into a fixed-size page.
   ///
-  /// Uses a small safety margin (4 bytes) to account for potential estimation
-  /// inaccuracies in header length calculation, especially when keyId digits change
-  /// or encoding overhead varies slightly.
+  /// Prefer passing actual plain length (e.g. [encodePayload].length) when available.
+  /// Uses a safety margin for encoder header/keyId and AEAD overhead variance.
   static bool fitsInPage({
     required int pageSize,
     required int plainPayloadLen,
@@ -860,9 +860,10 @@ final class BTreePageSizer {
       config: config,
       encryptionKeyId: encryptionKeyId,
     );
-    // Add 4-byte safety margin to prevent occasional overflow due to estimation
-    // inaccuracies (e.g., keyId digit changes, encoding header variations)
-    const int safetyMargin = 4;
+    // 128-byte margin to avoid page overflow during batch flush/recovery.
+    // The previous 24-byte margin was insufficient for certain variable-length
+    // encoder headers or crypto overheads, causing "total > pageSize" crashes.
+    const int safetyMargin = 128;
     return BTreePageHeader.size + encodedLen + safetyMargin <= pageSize;
   }
 }

@@ -57,10 +57,13 @@ class FileStorageImpl implements StorageInterface {
 
   bool _isRecoveryArtifact(String path) {
     final normalized = p.normalize(path).replaceAll('\\', '/');
-    if (normalized.endsWith('.log'))
+    if (normalized.endsWith('.log')) {
       return true; // WAL partitions and parallel journal
+    }
     if (normalized.endsWith('/wal/meta.json') ||
-        normalized.contains('/wal/meta.json')) return true; // WAL meta
+        normalized.contains('/wal/meta.json')) {
+      return true; // WAL meta
+    }
     return false;
   }
 

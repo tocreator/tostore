@@ -24,9 +24,7 @@ class NotificationManager {
     QueryCondition condition,
     void Function(ChangeEvent) onData,
   ) {
-    final id = DateTime.now().microsecondsSinceEpoch.toString() +
-        '_' +
-        (condition.hashCode).toString();
+    final id = '${DateTime.now().microsecondsSinceEpoch}_${condition.hashCode}';
 
     final controller = StreamController<ChangeEvent>();
 

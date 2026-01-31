@@ -60,8 +60,9 @@ class AESGCM {
     Uint8List? aad,
   }) {
     key ??= defaultKey;
-    if (key.length != 32)
+    if (key.length != 32) {
       throw ArgumentError('Key must be 32 bytes for AES-256');
+    }
     aad ??= Uint8List(0);
 
     final input = plaintext;
@@ -144,8 +145,9 @@ class AESGCM {
   }) {
     key ??= defaultKey;
     if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
-    if (encryptedData.length < 12 + 16)
+    if (encryptedData.length < 12 + 16) {
       throw ArgumentError('Invalid input length');
+    }
     aad ??= Uint8List(0);
 
     final nonce =
@@ -307,7 +309,9 @@ class AESGCM {
       if ((i & (i - 1)) != 0) {
         // Not power of 2
         int bit = 1;
-        while ((i & bit) == 0) bit <<= 1;
+        while ((i & bit) == 0) {
+          bit <<= 1;
+        }
         final base = table[bit];
         final rest = table[i ^ bit];
         final dest = table[i];
@@ -502,7 +506,9 @@ class AESGCM {
     }
     if (pos < aad.length) {
       final tmp = Uint8List(16);
-      for (int i = 0; i < aad.length - pos; i++) tmp[i] = aad[pos + i];
+      for (int i = 0; i < aad.length - pos; i++) {
+        tmp[i] = aad[pos + i];
+      }
       processBlock(tmp, 0);
     }
 
@@ -514,8 +520,9 @@ class AESGCM {
     }
     if (pos < ciphertext.length) {
       final tmp = Uint8List(16);
-      for (int i = 0; i < ciphertext.length - pos; i++)
+      for (int i = 0; i < ciphertext.length - pos; i++) {
         tmp[i] = ciphertext[pos + i];
+      }
       processBlock(tmp, 0);
     }
 
@@ -531,9 +538,13 @@ class AESGCM {
 
   // --- AES Core (Unrolled) ---
 
+  // ignore: non_constant_identifier_names
   static final Uint32List _Te0 = Uint32List(256);
+  // ignore: non_constant_identifier_names
   static final Uint32List _Te1 = Uint32List(256);
+  // ignore: non_constant_identifier_names
   static final Uint32List _Te2 = Uint32List(256);
+  // ignore: non_constant_identifier_names
   static final Uint32List _Te3 = Uint32List(256);
   static final Uint8List _sbox = Uint8List(256);
   static final Uint32List _rcon = Uint32List(15);

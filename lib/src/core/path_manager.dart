@@ -417,4 +417,12 @@ class PathManager {
     return pathJoin(
         getParallelJournalRootPath(spaceName: spaceName), 'journal_b.log');
   }
+
+  /// Page redo log path for a batch (full page images before writing to index/table files).
+  /// Replay on recovery to restore pages without reading possibly corrupted files.
+  /// Caller should delete this file after the batch is fully flushed and before checkpoint.
+  String getPageRedoLogPath(String batchId, {String? spaceName}) {
+    return pathJoin(getParallelJournalRootPath(spaceName: spaceName),
+        'page_redo_$batchId.log');
+  }
 }

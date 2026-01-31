@@ -837,7 +837,9 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
     if (_writeBuffer.isEmpty &&
         path == null &&
-        (paths == null || paths.isEmpty)) return;
+        (paths == null || paths.isEmpty)) {
+      return;
+    }
     if (paths != null && paths.isNotEmpty) {
       final yieldController = YieldController('web_storage_flush_paths');
       for (final pth in paths) {

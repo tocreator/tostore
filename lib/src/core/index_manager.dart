@@ -771,8 +771,9 @@ class IndexManager {
           for (int j = 0; j < exists.length; j++) {
             if (!exists[j]) continue;
             final constraintIdx = constraintIndices[j];
-            if (constraintIdx < 0 || constraintIdx >= indexConstraints.length)
+            if (constraintIdx < 0 || constraintIdx >= indexConstraints.length) {
               continue;
+            }
             final constraint = indexConstraints[constraintIdx];
 
             // For updates, we need to verify it's not the same record
@@ -1642,7 +1643,7 @@ class IndexManager {
           startAfterKey != null && startAfterKey.isNotEmpty;
 
       // Local helper for nextKey (exclusive -> inclusive switch)
-      Uint8List _nextKey(Uint8List key) {
+      Uint8List nextKey(Uint8List key) {
         final out = Uint8List(key.length + 1);
         out.setAll(0, key);
         out[key.length] = 0;
@@ -1659,7 +1660,7 @@ class IndexManager {
         // We want strictly AFTER cursor.
         // startInclusive = nextKey(cursor).
         // If cursor >= originalStart, we need to bump originalStart to cursor+1.
-        final cursorNext = _nextKey(startAfterKey);
+        final cursorNext = nextKey(startAfterKey);
         if (originalStart.isEmpty ||
             MemComparableKey.compare(cursorNext, originalStart) > 0) {
           return cursorNext;
@@ -1833,8 +1834,9 @@ class IndexManager {
       if (opUpper == 'BETWEEN') {
         final startPrefix = encodePrefix(condition.value);
         final endPrefix = encodePrefix(condition.endValue);
-        if (startPrefix == null || endPrefix == null)
+        if (startPrefix == null || endPrefix == null) {
           return IndexSearchResult.empty();
+        }
         final endExclusive = upperBoundExclusiveForPrefix(endPrefix);
         final start = applyCursorStart(startPrefix);
         final endEffective = applyCursorEnd(endExclusive);
@@ -2135,8 +2137,9 @@ class IndexManager {
         // Final Filter
         List<String> finalPks = out;
         if (effectiveOffset != null && effectiveOffset > 0) {
-          if (effectiveOffset >= finalPks.length)
+          if (effectiveOffset >= finalPks.length) {
             return IndexSearchResult.empty();
+          }
           finalPks = finalPks.sublist(effectiveOffset);
         }
         if (limit != null && finalPks.length > limit) {

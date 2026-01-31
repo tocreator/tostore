@@ -695,7 +695,7 @@ class QueryExecutor {
 
     // Execute actual operation (range-partitioned IO; no full-table caching here)
     // Capture snapshot for consistency (Local View)
-    final int? localViewId = _dataStore.readViewManager.registerReadView();
+    final int localViewId = _dataStore.readViewManager.registerReadView();
     try {
       List<Map<String, dynamic>> results;
       final operation = plan.operation;
@@ -939,9 +939,7 @@ class QueryExecutor {
 
       return PlanExecutionResult(results);
     } finally {
-      if (localViewId != null) {
-        _dataStore.readViewManager.releaseReadView(localViewId);
-      }
+      _dataStore.readViewManager.releaseReadView(localViewId);
     }
   }
 
@@ -1211,7 +1209,7 @@ class QueryExecutor {
         rightRecords = rightPlanResult.records;
       } else {
         // Fallback: perform raw scan then apply overlays manually
-        final int? localViewId = _dataStore.readViewManager.registerReadView();
+        final int localViewId = _dataStore.readViewManager.registerReadView();
         try {
           final scanRes = await _performTableScan(rightTableName, null);
           rightRecords = scanRes.records;
@@ -1220,9 +1218,7 @@ class QueryExecutor {
             rightRecords,
           );
         } finally {
-          if (localViewId != null) {
-            _dataStore.readViewManager.releaseReadView(localViewId);
-          }
+          _dataStore.readViewManager.releaseReadView(localViewId);
         }
       }
     }
@@ -1246,15 +1242,15 @@ class QueryExecutor {
         : ValueMatcher.getMatcher(MatcherType.unsupported);
 
     // Closures to avoid repeated string parsing/key hunting in getFieldValue
-    final leftValGetter = (Map<String, dynamic> r) =>
+    leftValGetter(Map<String, dynamic> r) =>
         ConditionRecordMatcher.getFieldValue(r, leftKey);
-    final rightValGetter = (Map<String, dynamic> r) =>
+    rightValGetter(Map<String, dynamic> r) =>
         ConditionRecordMatcher.getFieldValue(r, rightKey);
 
     final isEquality = operator == '=';
 
     // Helper to canonicalize values for Hash Join (supports loose equality like int vs String)
-    dynamic _canonicalizeKey(dynamic val) {
+    dynamic canonicalizeKey(dynamic val) {
       if (val == null) return null;
       // Convert primitives to string to ensure 1 == "1" matches
       if (val is num || val is String || val is bool) {
@@ -1272,7 +1268,7 @@ class QueryExecutor {
       for (final rr in rightRecords) {
         await yieldBuild.maybeYield();
         final val = rightValGetter(rr);
-        final key = _canonicalizeKey(val);
+        final key = canonicalizeKey(val);
         rightLookup.putIfAbsent(key, () => []).add(rr);
       }
     }
@@ -1317,7 +1313,7 @@ class QueryExecutor {
         final lVal = leftValGetter(lr);
 
         if (isEquality && rightLookup != null) {
-          final lKey = _canonicalizeKey(lVal);
+          final lKey = canonicalizeKey(lVal);
           final matches = rightLookup[lKey];
           if (matches != null) {
             for (final mr in matches) {
@@ -1343,7 +1339,7 @@ class QueryExecutor {
         bool hasMatch = false;
 
         if (isEquality && rightLookup != null) {
-          final lKey = _canonicalizeKey(lVal);
+          final lKey = canonicalizeKey(lVal);
           final matches = rightLookup[lKey];
           if (matches != null) {
             hasMatch = true;
@@ -1375,7 +1371,7 @@ class QueryExecutor {
         for (final lr in leftRecords) {
           await yieldController.maybeYield();
           final val = leftValGetter(lr);
-          final key = _canonicalizeKey(val);
+          final key = canonicalizeKey(val);
           leftLookupMap.putIfAbsent(key, () => []).add(lr);
         }
       }
@@ -1386,7 +1382,7 @@ class QueryExecutor {
         bool hasMatch = false;
 
         if (isEquality && leftLookupMap != null) {
-          final rKey = _canonicalizeKey(rVal);
+          final rKey = canonicalizeKey(rVal);
           final matches = leftLookupMap[rKey];
           if (matches != null) {
             hasMatch = true;

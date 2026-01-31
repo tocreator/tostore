@@ -7,6 +7,7 @@ import '../model/migration_task.dart';
 import '../handler/value_matcher.dart';
 import '../handler/logger.dart';
 import 'btree_page.dart';
+import 'page_redo_log_codec.dart';
 import 'table_data_manager.dart';
 import 'yield_controller.dart';
 import '../handler/wal_encoder.dart';
@@ -1446,6 +1447,15 @@ final class BatchBTreePageEncodeRequest {
 
   final List<BTreePageEncodeItem> pages;
 
+  /// When non-null, isolate also builds page redo log bytes to avoid main-thread encode.
+  ///
+  /// Note:
+  /// - Redo records store logical identity (table/index + partitionNo + pageNo), not absolute paths,
+  ///   so recovery can rebuild paths even if directory layout changes across restart.
+  final int? pageRedoTreeKindIndex; // PageRedoTreeKind.indexTree
+  final String? pageRedoTableName;
+  final String? pageRedoIndexName; // required when treeKind == index
+
   const BatchBTreePageEncodeRequest({
     required this.pageSize,
     required this.encryptionTypeIndex,
@@ -1453,13 +1463,20 @@ final class BatchBTreePageEncodeRequest {
     required this.pages,
     this.customKey,
     this.customKeyId,
+    this.pageRedoTreeKindIndex,
+    this.pageRedoTableName,
+    this.pageRedoIndexName,
   });
 }
 
 /// Batch encode result (aligned with request order).
 final class BatchBTreePageEncodeResult {
   final List<Uint8List> pageBytes;
-  const BatchBTreePageEncodeResult(this.pageBytes);
+
+  /// Present when request had [pageRedoTreeKindIndex] and [pageRedoTableName]; encoded in isolate.
+  final Uint8List? pageRedoBytes;
+
+  const BatchBTreePageEncodeResult(this.pageBytes, [this.pageRedoBytes]);
 }
 
 /// Batch encode B+Tree pages to fixed-size page bytes.
@@ -1523,6 +1540,19 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       );
     }
 
+    // Extra guardrail: provide full context if caller's sizing/splitting is wrong.
+    final int totalLen = BTreePageHeader.size + encodedPayload.length;
+    if (totalLen > pageSize) {
+      final int keyId = request.customKeyId ?? EncoderHandler.getCurrentKeyId();
+      throw StateError(
+        'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
+        '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
+        'plainPayload=${p.payload.length}, typeIndex=${p.typeIndex}, '
+        'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
+        'encryptionTypeIndex=${request.encryptionTypeIndex}, keyId=$keyId).',
+      );
+    }
+
     final pageBytes = BTreePageIO.buildPageBytes(
       type: BTreePageType.values[p.typeIndex],
       encodedPayload: encodedPayload,
@@ -1532,5 +1562,36 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     out[i] = pageBytes;
   }
 
-  return BatchBTreePageEncodeResult(out);
+  Uint8List? pageRedoBytes;
+  final kindIdx = request.pageRedoTreeKindIndex;
+  final tableName = request.pageRedoTableName;
+  if (kindIdx != null &&
+      tableName != null &&
+      kindIdx >= 0 &&
+      kindIdx < PageRedoTreeKind.values.length) {
+    final treeKind = PageRedoTreeKind.values[kindIdx];
+    final indexName = request.pageRedoIndexName;
+    final records = <Uint8List>[];
+    for (int i = 0; i < out.length; i++) {
+      final p = pages[i];
+      records.add(PageRedoLogCodec.encodePageRecord(
+        treeKind: treeKind,
+        tableName: tableName,
+        indexName: treeKind == PageRedoTreeKind.indexTree ? indexName : null,
+        partitionNo: p.partitionNo,
+        pageNo: p.pageNo,
+        payload: out[i],
+      ));
+    }
+    final total = records.fold<int>(0, (s, r) => s + r.length);
+    final combined = Uint8List(total);
+    int pos = 0;
+    for (final r in records) {
+      combined.setRange(pos, pos + r.length, r);
+      pos += r.length;
+    }
+    pageRedoBytes = combined;
+  }
+
+  return BatchBTreePageEncodeResult(out, pageRedoBytes);
 }

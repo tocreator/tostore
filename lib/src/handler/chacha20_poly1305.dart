@@ -110,8 +110,9 @@ class ChaCha20Poly1305 {
   }) {
     key ??= defaultKey;
     if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
-    if (encryptedData.length < 12 + 16)
+    if (encryptedData.length < 12 + 16) {
       throw ArgumentError('Invalid input length');
+    }
     aad ??= Uint8List(0);
 
     final nonce = Uint8List.view(
@@ -790,7 +791,9 @@ class ChaCha20Poly1305 {
         pos += 16;
       } else {
         final tmp = Uint8List(16);
-        for (int i = 0; i < len; i++) tmp[i] = aad[pos + i];
+        for (int i = 0; i < len; i++) {
+          tmp[i] = aad[pos + i];
+        }
         int t0 = tmp[0] | (tmp[1] << 8) | (tmp[2] << 16) | (tmp[3] << 24);
         int t1 = tmp[4] | (tmp[5] << 8) | (tmp[6] << 16) | (tmp[7] << 24);
         int t2 = tmp[8] | (tmp[9] << 8) | (tmp[10] << 16) | (tmp[11] << 24);
@@ -905,7 +908,9 @@ class ChaCha20Poly1305 {
         pos += 16;
       } else {
         final tmp = Uint8List(16);
-        for (int i = 0; i < len; i++) tmp[i] = msg[pos + i];
+        for (int i = 0; i < len; i++) {
+          tmp[i] = msg[pos + i];
+        }
         int t0 = tmp[0] | (tmp[1] << 8) | (tmp[2] << 16) | (tmp[3] << 24);
         int t1 = tmp[4] | (tmp[5] << 8) | (tmp[6] << 16) | (tmp[7] << 24);
         int t2 = tmp[8] | (tmp[9] << 8) | (tmp[10] << 16) | (tmp[11] << 24);

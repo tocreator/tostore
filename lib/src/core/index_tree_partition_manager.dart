@@ -21,6 +21,7 @@ import 'storage_adapter.dart';
 import 'btree_page.dart';
 import 'compute_tasks.dart';
 import 'compute_manager.dart';
+import 'page_redo_log_codec.dart';
 import 'yield_controller.dart';
 import 'workload_scheduler.dart';
 import 'tree_cache.dart';
@@ -197,8 +198,9 @@ final class IndexTreePartitionManager {
 
     // Cache miss: read from disk
     final count = meta.btreePartitionCount;
-    if (ptr.partitionNo < 0 || ptr.partitionNo >= count)
+    if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return LeafPage.empty();
+    }
     final path =
         await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
     final pageSize = meta.btreePageSize;
@@ -337,6 +339,28 @@ final class IndexTreePartitionManager {
     return cur;
   }
 
+  Future<TreePagePtr> _locateRightmostLeaf(
+    String tableName,
+    String indexName,
+    IndexMeta meta, {
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final root = meta.btreeRoot;
+    final lastLeaf = meta.btreeLastLeaf;
+    if (root.isNull) return lastLeaf;
+    if (meta.btreeHeight <= 0) return root;
+    TreePagePtr cur = root;
+    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+      final node = await _readInternal(tableName, indexName, meta, cur,
+          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+      if (node.children.isEmpty) return lastLeaf;
+      cur = node.children.last;
+    }
+
+    return cur;
+  }
+
   /// Apply index deltas (put/delete) to paged tree.
   Future<void> writeChanges({
     required String tableName,
@@ -463,19 +487,32 @@ final class IndexTreePartitionManager {
       final raw = stagedBytes ??
           await _storage.readAsBytesAt(stats.path!, off, length: pageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
-      if (parsed.type != BTreePageType.free) {
-        throw StateError(
-            'Freelist head page is not free: index=$tableName.$indexName partition=$partitionNo pageNo=$head type=${parsed.type}');
+      try {
+        final parsed = BTreePageIO.parsePageBytes(raw);
+        if (parsed.type != BTreePageType.free) {
+          throw StateError(
+              'Freelist head page is not free: type=${parsed.type}');
+        }
+        final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
+        if (fp == null) {
+          throw StateError('Failed to decode FreePage payload');
+        }
+        // Cycle safety: if corrupted and points to itself, drop the freelist.
+        if (fp.nextFreePageNo == head) {
+          stats.freeListHeadPageNo = -1;
+          stats.freePageCount = 0;
+          return null;
+        }
+        stats.freeListHeadPageNo = fp.nextFreePageNo;
+        stats.freePageCount = max(0, stats.freePageCount - 1);
+        return TreePagePtr(partitionNo, head);
+      } catch (_) {
+        // Corruption tolerance:
+        // freelist is an optimization; if it is damaged, reset it and fall back to append allocation.
+        stats.freeListHeadPageNo = -1;
+        stats.freePageCount = 0;
+        return null;
       }
-      final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
-      if (fp == null) {
-        throw StateError(
-            'Failed to decode FreePage payload: index=$tableName.$indexName partition=$partitionNo pageNo=$head');
-      }
-      stats.freeListHeadPageNo = fp.nextFreePageNo;
-      stats.freePageCount = max(0, stats.freePageCount - 1);
-      return TreePagePtr(partitionNo, head);
     }
 
     // ---- Dirty pages (encode once per page at end) ----
@@ -865,6 +902,13 @@ final class IndexTreePartitionManager {
       final bool useIsolateForPageEncode =
           shouldUseIsolateForPageEncode(totalPagesToEncode);
 
+      bool payloadFitsInPage(int plainPayloadLen) => BTreePageSizer.fitsInPage(
+            pageSize: meta.btreePageSize,
+            plainPayloadLen: plainPayloadLen,
+            config: _dataStore.config,
+            encryptionKeyId: encryptionKeyId,
+          );
+
       const int chunkSize = 32;
       final pending = <BTreePageEncodeItem>[];
       final pendingPtrs = <TreePagePtr>[];
@@ -872,13 +916,19 @@ final class IndexTreePartitionManager {
       Future<void> flushEncodeChunk() async {
         if (pending.isEmpty) return;
 
+        final pageSize = meta.btreePageSize;
+
         final req = BatchBTreePageEncodeRequest(
-          pageSize: meta.btreePageSize,
+          pageSize: pageSize,
           encryptionTypeIndex: encTypeIndex,
           encoderConfig: encoderConfig,
           customKey: encryptionKey,
           customKeyId: encryptionKeyId,
           pages: List<BTreePageEncodeItem>.from(pending, growable: false),
+          pageRedoTreeKindIndex:
+              batchContext != null ? PageRedoTreeKind.indexTree.index : null,
+          pageRedoTableName: batchContext != null ? tableName : null,
+          pageRedoIndexName: batchContext != null ? indexName : null,
         );
 
         final res = await ComputeManager.run(
@@ -888,19 +938,25 @@ final class IndexTreePartitionManager {
         );
 
         final bytesList = res.pageBytes;
+
+        if (res.pageRedoBytes != null && batchContext != null) {
+          final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+              batchContext.batchId,
+              spaceName: _dataStore.currentSpaceName);
+          await _storage.ensureDirectoryExists(p.dirname(redoPath));
+          await _storage.appendBytes(redoPath, res.pageRedoBytes!, flush: true);
+        }
+
         for (int i = 0; i < bytesList.length; i++) {
           await stageYc.maybeYield();
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
-          if (stats.path == null) {
-            stats.path = await _partitionFilePath(
-                tableName, indexName, meta, ptr.partitionNo);
-          }
+          stats.path ??= await _partitionFilePath(
+              tableName, indexName, meta, ptr.partitionNo);
           if (!stats.dirEnsured) {
             await _storage.ensureDirectoryExists(p.dirname(stats.path!));
             stats.dirEnsured = true;
           }
-          final pageSize = meta.btreePageSize;
           stageWrite(stats.path!, ptr.pageNo * pageSize, bytesList[i]);
         }
 
@@ -912,13 +968,67 @@ final class IndexTreePartitionManager {
         await stageYc.maybeYield();
         final ptr = entry.key;
         final leaf = entry.value;
-        pendingPtrs.add(ptr);
-        pending.add(BTreePageEncodeItem(
-          typeIndex: BTreePageType.leaf.index,
-          partitionNo: ptr.partitionNo,
-          pageNo: ptr.pageNo,
-          payload: leaf.encodePayload(),
-        ));
+        final payload = leaf.encodePayload();
+        if (!payloadFitsInPage(payload.length)) {
+          final frames = <_IFrame>[];
+          await descendToLeaf(
+              leaf.keys.isEmpty ? leaf.highKey : leaf.keys.first, frames);
+          final splitResult = leaf.split();
+          final rightLeaf = splitResult.right;
+          final rightLeafPtr = await allocatePage();
+          rightLeaf.prev = ptr;
+          rightLeaf.next = leaf.next;
+          final oldNext = leaf.next;
+          leaf.next = rightLeafPtr;
+          if (!oldNext.isNull) {
+            final nextLeaf = await getLeaf(oldNext);
+            nextLeaf.prev = rightLeafPtr;
+            markLeafDirty(oldNext, nextLeaf);
+          } else {
+            meta = meta.copyWith(btreeLastLeaf: rightLeafPtr);
+          }
+          await insertSplitIntoParents(
+            frames,
+            leftHighKey: leaf.highKey,
+            leftPtr: ptr,
+            rightHighKey: rightLeaf.highKey,
+            rightPtr: rightLeafPtr,
+          );
+          leafCache[keyOfPtr(rightLeafPtr)] = rightLeaf;
+          final leftPayload = leaf.encodePayload();
+          final rightPayload = rightLeaf.encodePayload();
+          if (!payloadFitsInPage(leftPayload.length) ||
+              !payloadFitsInPage(rightPayload.length)) {
+            throw StateError(
+              'Index $tableName.$indexName: page overflow after split '
+              '(single entry may exceed page capacity). '
+              'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
+              'pageSize=${meta.btreePageSize}',
+            );
+          }
+          pendingPtrs.add(ptr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.leaf.index,
+            partitionNo: ptr.partitionNo,
+            pageNo: ptr.pageNo,
+            payload: leftPayload,
+          ));
+          pendingPtrs.add(rightLeafPtr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.leaf.index,
+            partitionNo: rightLeafPtr.partitionNo,
+            pageNo: rightLeafPtr.pageNo,
+            payload: rightPayload,
+          ));
+        } else {
+          pendingPtrs.add(ptr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.leaf.index,
+            partitionNo: ptr.partitionNo,
+            pageNo: ptr.pageNo,
+            payload: payload,
+          ));
+        }
         if (pending.length >= chunkSize) {
           await flushEncodeChunk();
         }
@@ -928,13 +1038,72 @@ final class IndexTreePartitionManager {
         await stageYc.maybeYield();
         final ptr = entry.key;
         final node = entry.value;
-        pendingPtrs.add(ptr);
-        pending.add(BTreePageEncodeItem(
-          typeIndex: BTreePageType.internal.index,
-          partitionNo: ptr.partitionNo,
-          pageNo: ptr.pageNo,
-          payload: node.encodePayload(),
-        ));
+        final payload = node.encodePayload();
+        if (!payloadFitsInPage(payload.length)) {
+          final frames = <_IFrame>[];
+          await descendToLeaf(
+              node.maxKeys.isEmpty ? Uint8List(0) : node.maxKeys.first, frames);
+          int selfFrameIndex = -1;
+          for (int i = 0; i < frames.length; i++) {
+            if (frames[i].ptr.partitionNo == ptr.partitionNo &&
+                frames[i].ptr.pageNo == ptr.pageNo) {
+              selfFrameIndex = i;
+              break;
+            }
+          }
+          if (selfFrameIndex < 0) {
+            throw StateError(
+              'Index $tableName.$indexName: internal ptr not found in descent frames',
+            );
+          }
+          if (selfFrameIndex > 0) {
+            frames.removeRange(selfFrameIndex, frames.length);
+          } else {
+            frames.clear();
+          }
+          final splitResult = node.split();
+          final rightNode = splitResult.right;
+          final rightNodePtr = await allocatePage();
+          await insertSplitIntoParents(
+            frames,
+            leftHighKey: node.maxKey(),
+            leftPtr: ptr,
+            rightHighKey: rightNode.maxKey(),
+            rightPtr: rightNodePtr,
+          );
+          internalCache[keyOfPtr(rightNodePtr)] = rightNode;
+          final leftPayload = node.encodePayload();
+          final rightPayload = rightNode.encodePayload();
+          if (!payloadFitsInPage(leftPayload.length) ||
+              !payloadFitsInPage(rightPayload.length)) {
+            throw StateError(
+              'Index $tableName.$indexName: internal page overflow after split. '
+              'pageSize=${meta.btreePageSize}',
+            );
+          }
+          pendingPtrs.add(ptr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.internal.index,
+            partitionNo: ptr.partitionNo,
+            pageNo: ptr.pageNo,
+            payload: leftPayload,
+          ));
+          pendingPtrs.add(rightNodePtr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.internal.index,
+            partitionNo: rightNodePtr.partitionNo,
+            pageNo: rightNodePtr.pageNo,
+            payload: rightPayload,
+          ));
+        } else {
+          pendingPtrs.add(ptr);
+          pending.add(BTreePageEncodeItem(
+            typeIndex: BTreePageType.internal.index,
+            partitionNo: ptr.partitionNo,
+            pageNo: ptr.pageNo,
+            payload: payload,
+          ));
+        }
         if (pending.length >= chunkSize) {
           await flushEncodeChunk();
         }
@@ -953,9 +1122,7 @@ final class IndexTreePartitionManager {
       final pNo = entry.key;
       final stats = entry.value;
 
-      if (stats.path == null) {
-        stats.path = await _partitionFilePath(tableName, indexName, meta, pNo);
-      }
+      stats.path ??= await _partitionFilePath(tableName, indexName, meta, pNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1025,7 +1192,9 @@ final class IndexTreePartitionManager {
       );
       stageWrite(stats.path!, 0, metaBytes);
 
-      final int partitionEntriesDelta = newEntries - oldEntries;
+      // IMPORTANT: global totals delta must not depend on reading old partition meta page
+      // (may be corrupted during crash tests). Use batch-local delta (idempotent).
+      final int partitionEntriesDelta = stats.entriesDelta;
       final int partitionSizeDelta = newSize - oldSize;
       entriesDeltaSum += partitionEntriesDelta;
       sizeDeltaSum += partitionSizeDelta;
@@ -1051,6 +1220,32 @@ final class IndexTreePartitionManager {
           ),
         );
       }
+    }
+
+    // ---- Page redo: persist tree structure snapshot (no totals) ----
+    // Needed because replay may write newly split pages/partitions before meta.json update.
+    if (batchContext != null) {
+      final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+        batchContext.batchId,
+        spaceName: _dataStore.currentSpaceName,
+      );
+      await _storage.ensureDirectoryExists(p.dirname(redoPath));
+      final rec = PageRedoLogCodec.encodeTreeMetaRecord(
+        treeKind: PageRedoTreeKind.indexTree,
+        tableName: tableName,
+        indexName: indexName,
+        btreePageSize: meta.btreePageSize,
+        btreeNextPageNo: meta.btreeNextPageNo,
+        btreePartitionCount: meta.btreePartitionCount,
+        btreeRootPartitionNo: meta.btreeRoot.partitionNo,
+        btreeRootPageNo: meta.btreeRoot.pageNo,
+        btreeFirstLeafPartitionNo: meta.btreeFirstLeaf.partitionNo,
+        btreeFirstLeafPageNo: meta.btreeFirstLeaf.pageNo,
+        btreeLastLeafPartitionNo: meta.btreeLastLeaf.partitionNo,
+        btreeLastLeafPageNo: meta.btreeLastLeaf.pageNo,
+        btreeHeight: meta.btreeHeight,
+      );
+      await _storage.appendBytes(redoPath, rec, flush: true);
     }
 
     // Flush staged random writes per file.
@@ -1239,7 +1434,7 @@ final class IndexTreePartitionManager {
       s.maxPageNoWritten = max(s.maxPageNoWritten, pagePtr.pageNo);
     }
 
-    Uint8List _encodeLeaf(TreePagePtr p, LeafPage leaf) {
+    Uint8List encodeLeaf(TreePagePtr p, LeafPage leaf) {
       final plain = leaf.encodePayload();
       final enc = BTreePageCodec.encodePayload(
         plain,
@@ -1255,7 +1450,7 @@ final class IndexTreePartitionManager {
       );
     }
 
-    Uint8List _encodeInternal(TreePagePtr p, InternalPage node) {
+    Uint8List encodeInternal(TreePagePtr p, InternalPage node) {
       final plain = node.encodePayload();
       final enc = BTreePageCodec.encodePayload(
         plain,
@@ -1367,7 +1562,7 @@ final class IndexTreePartitionManager {
         final pth = await _partitionFilePath(
             tableName, indexName, meta, oldRightNext.partitionNo);
         stageWrite(pth, oldRightNext.pageNo * meta.btreePageSize,
-            _encodeLeaf(oldRightNext, nextLeaf));
+            encodeLeaf(oldRightNext, nextLeaf));
       }
 
       parent.setEntry(i, leaf.highKey, ptr);
@@ -1386,13 +1581,13 @@ final class IndexTreePartitionManager {
         final parentPath = await _partitionFilePath(
             tableName, indexName, meta, parentFrame.ptr.partitionNo);
         stageWrite(parentPath, parentFrame.ptr.pageNo * meta.btreePageSize,
-            _encodeInternal(parentFrame.ptr, parent));
+            encodeInternal(parentFrame.ptr, parent));
       }
 
       final leftPath =
           await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
       stageWrite(
-          leftPath, ptr.pageNo * meta.btreePageSize, _encodeLeaf(ptr, leaf));
+          leftPath, ptr.pageNo * meta.btreePageSize, encodeLeaf(ptr, leaf));
       await pushFree(rightPtr);
 
       if (meta.btreeLastLeaf == rightPtr) {
@@ -1581,7 +1776,14 @@ final class IndexTreePartitionManager {
         );
       } else {
         // Reverse scan from end (Infinity).
-        leafPtr = meta.btreeLastLeaf;
+        // Robustness: descend tree to find true last leaf
+        leafPtr = await _locateRightmostLeaf(
+          tableName,
+          indexName,
+          meta,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
       }
     } else {
       // Forward scan: start at lower bound.

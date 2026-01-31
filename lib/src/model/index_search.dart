@@ -1,5 +1,7 @@
 /// Represents the result of a search operation on an index.
 ///
+library;
+
 import 'dart:typed_data';
 
 class IndexSearchResult {
