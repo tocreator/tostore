@@ -119,6 +119,37 @@ await db.initialize();
 final db = await ToStore.open(...);
 ```
 
+### 5. Upsert: Chain Builder Removed
+
+**New in v3.x**: The chain-style `UpsertBuilder` has been removed. `upsert` no longer supports `.where()`, `.allowUpdateAll()`, `.setField()`, `.increment()`, or `.future`; it returns `Future<DbResult>` directly, consistent with `insert` and `batchUpsert`.
+
+**Before (chain-style, no longer supported):**
+```dart
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+await db.upsert('users', data).setField('balance', 100).future;
+```
+
+**After (v3.x):**
+```dart
+// Conflict target from data: primary key or first complete unique index
+final result = await db.upsert('users', {'id': 1, 'name': 'John'});
+final result2 = await db.upsert('users', {'username': 'john', 'email': 'john@example.com'});
+
+// Atomic expression only on update: use Expr.ifElse / Expr.when with isUpdate (insert branch: plain value)
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(
+    Expr.isUpdate(),
+    Expr.field('count') + Expr.value(1),
+    1,
+  ),
+});
+```
+
+- **No where clause**: Upsert decides update vs insert only by primary key or unique key **in the data**. To change a unique key value, include the primary key so the row is found by PK.
+- **Atomic expressions**: Use `Expr.ifElse(Expr.isUpdate(), updateExpr, insertValue)` or `Expr.when(Expr.isUpdate(), updateExpr, otherwise: insertValue)` so expressions run only on update.
+
 ---
 
 ## ⚠️ Important Warnings
@@ -250,6 +281,37 @@ await db.initialize();
 // 推荐
 final db = await ToStore.open(...);
 ```
+
+### 5. Upsert：链式构建器已移除
+
+**v3.x 变更**：已移除链式 `UpsertBuilder`。`upsert` 不再支持 `.where()`、`.allowUpdateAll()`、`.setField()`、`.increment()` 或 `.future`，改为直接返回 `Future<DbResult>`，与 `insert`、`batchUpsert` 一致。
+
+**之前（链式，已不再支持）：**
+```dart
+await db.upsert('users', {'name': 'John'})
+  .where('email', '=', 'john@example.com');
+await db.upsert('users', data).setField('balance', 100).future;
+```
+
+**之后（v3.x）：**
+```dart
+// 冲突目标由 data 决定：主键或第一个完整的唯一索引
+final result = await db.upsert('users', {'id': 1, 'name': 'John'});
+final result2 = await db.upsert('users', {'username': 'john', 'email': 'john@example.com'});
+
+// 仅在更新时做原子运算：使用 Expr.ifElse / Expr.when 配合 isUpdate（插入分支用字面量即可）
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(
+    Expr.isUpdate(),
+    Expr.field('count') + Expr.value(1),
+    1,
+  ),
+});
+```
+
+- **不支持 where**：upsert 仅根据 data 中的**主键或唯一键**判断是更新还是插入。若要修改唯一键值，请在 data 中带上主键，以便按主键定位行。
+- **原子表达式**：使用 `Expr.ifElse(Expr.isUpdate(), 更新表达式, 插入值)` 或 `Expr.when(Expr.isUpdate(), 更新表达式, otherwise: 插入值)`，使表达式仅在更新操作时执行。
 
 ---
 

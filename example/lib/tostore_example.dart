@@ -187,13 +187,15 @@ class TostoreExample {
       'last_login': DateTime.now().toIso8601String(),
     }).where('username', '=', 'john_doe');
 
-    // Automatically store data,Support batch upsert
-    await db.upsert('users', {'name': 'John'}).where(
-        'email', '=', 'john@example.com');
+    // Automatically store data, support batch upsert (uses pk or unique key from data)
+    await db.upsert('users', {'username': 'John', 'email': 'john@example.com'});
 
     // Auto insert or update based on primary key
-    await db.upsert(
-        'users', {'id': 1, 'name': 'John', 'email': 'john@example.com'});
+    await db.upsert('users', {
+      'id': 1,
+      'username': 'John',
+      'email': 'john@example.com',
+    });
 
     // Delete: Remove user
     await db.delete('users').where('username', '=', 'john_doe');
@@ -337,8 +339,7 @@ class TostoreExample {
             fields: ['embedding'],
             type: IndexType.vector,
             vectorConfig: VectorIndexConfig(
-              indexType:
-                  VectorIndexType.hnsw, // HNSW for fast approximate search
+              indexType: VectorIndexType.ngh,
               distanceMetric: VectorDistanceMetric.cosine, // Cosine similarity
               parameters: {
                 'M': 16, // Max number of connections per layer

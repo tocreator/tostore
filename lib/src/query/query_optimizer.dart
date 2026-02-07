@@ -305,7 +305,9 @@ class QueryOptimizer {
 
     // Priority 3: Unique index '=' / IN (single-field) or full '=' tuple (composite).
     IndexSchema? bestUniqueEq;
-    for (final idx in schema.getAllIndexes()) {
+    final allIndexes =
+        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    for (final idx in allIndexes) {
       if (!idx.unique) continue;
       bool ok = true;
       if (idx.fields.length == 1) {
@@ -337,7 +339,7 @@ class QueryOptimizer {
     // Priority 4: Other indexes (equality/range/prefix).
     IndexSchema? bestIndex;
     int bestScore = 0;
-    for (final idx in schema.getAllIndexes()) {
+    for (final idx in allIndexes) {
       int matched = 0;
       for (final f in idx.fields) {
         if (!tableWhere.containsKey(f)) break;
@@ -620,8 +622,9 @@ class QueryOptimizer {
 
     bool isUniqueSingleField(String field) {
       if (field == schema.primaryKey) return true;
-      for (final idx in schema.getAllIndexes()) {
-        if (!idx.unique) continue;
+      final allIndexes = _dataStore.schemaManager?.getUniqueIndexesFor(schema);
+      if (allIndexes == null) return false;
+      for (final idx in allIndexes) {
         if (idx.fields.length == 1 && idx.fields.first == field) return true;
       }
       return false;
@@ -710,9 +713,9 @@ class QueryOptimizer {
 
   List<String> _resolveIndexFields(TableSchema schema, String indexName) {
     try {
-      final idx = schema
-          .getAllIndexes()
-          .firstWhere((i) => i.actualIndexName == indexName);
+      final indexes =
+          _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+      final idx = indexes.firstWhere((i) => i.actualIndexName == indexName);
       return idx.fields;
     } catch (_) {
       if (indexName.startsWith('uniq_') && indexName.length > 5) {
@@ -841,7 +844,9 @@ class QueryOptimizer {
   IndexSchema? _findSortingIndex(TableSchema schema, List<String> orderBy) {
     if (orderBy.isEmpty) return null;
 
-    for (final idx in schema.getAllIndexes()) {
+    final allIndexes =
+        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    for (final idx in allIndexes) {
       // For now, we only support single-field orderBy matching the first field of an index
       // OR a composite index where the orderBy prefix matches exactly.
       bool matches = true;

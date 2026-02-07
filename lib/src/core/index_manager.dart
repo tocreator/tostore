@@ -153,7 +153,8 @@ class IndexManager {
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) return;
-      final indexes = schema.getAllIndexes();
+      final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+          const <IndexSchema>[];
       if (indexes.isEmpty) return;
 
       for (final index in indexes) {
@@ -480,8 +481,11 @@ class IndexManager {
       }
 
       // Clear index data
-      final indexesToReset =
-          schema.getAllIndexes().map((i) => i.actualIndexName).toList();
+      final indexesToReset = _dataStore.schemaManager
+              ?.getAllIndexesFor(schema)
+              .map((i) => i.actualIndexName)
+              .toList() ??
+          const <String>[];
 
       // Clear index data from memory and files
       final yieldController = YieldController('IndexManager.resetIndexes');
@@ -505,7 +509,8 @@ class IndexManager {
       }
 
       // Collect all indexes to rebuild
-      final indexesToBuild = schema.getAllIndexes();
+      final indexesToBuild = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (indexesToBuild == null) return;
 
       // Use optimized batch index building mechanism
       await _rebuildTableIndexes(tableName, schema, indexesToBuild);
@@ -615,7 +620,9 @@ class IndexManager {
       }
 
       // Add all unique indexes from schema (single and composite)
-      for (final index in schema.getAllIndexes()) {
+      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (allIndexes == null) return null;
+      for (final index in allIndexes) {
         if (!index.unique) continue;
         final v = valueForFields(index.fields);
         if (v == null) continue;
@@ -913,10 +920,9 @@ class IndexManager {
     }
 
     // 2) Unique indexes
-    final uniqueIndexes = schema
-        .getAllIndexes()
-        .where((i) => i.unique && i.type != IndexType.vector)
-        .toList(growable: false);
+    final uniqueIndexes =
+        (_dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+            const <IndexSchema>[]);
     if (uniqueIndexes.isEmpty) return violations;
 
     for (final idx in uniqueIndexes) {
@@ -1054,10 +1060,11 @@ class IndexManager {
         return;
       }
 
+      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (allIndexes == null) return;
+
       // check if index already exists
-      if (schema
-          .getAllIndexes()
-          .any((i) => i.actualIndexName == index.actualIndexName)) {
+      if (allIndexes.any((i) => i.actualIndexName == index.actualIndexName)) {
         Logger.warn(
           'Index ${index.actualIndexName} already exists in table $tableName',
           label: 'IndexManager.addIndex',
@@ -1123,13 +1130,16 @@ class IndexManager {
         return;
       }
 
+      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (allIndexes == null) return;
+
       // find matching index
       IndexSchema? targetIndex;
 
       // 1. if index name is provided, try to match by index name
       if (indexName != null) {
         // try to match by index name
-        for (var index in schema.getAllIndexes()) {
+        for (var index in allIndexes) {
           if (index.indexName == indexName ||
               index.actualIndexName == indexName) {
             targetIndex = index;
@@ -1142,7 +1152,7 @@ class IndexManager {
           // check if it is an auto-generated index name
           final autoGenPattern = RegExp(r'^' + tableName + r'_\w+');
           if (autoGenPattern.hasMatch(indexName)) {
-            for (var index in schema.getAllIndexes()) {
+            for (var index in allIndexes) {
               if (index.actualIndexName == indexName) {
                 targetIndex = index;
                 break;
@@ -1157,7 +1167,7 @@ class IndexManager {
         // sort fields list to ensure consistency
         final sortedFields = List<String>.from(fields)..sort();
 
-        for (var index in schema.getAllIndexes()) {
+        for (var index in allIndexes) {
           // sort index fields
           final indexFields = List<String>.from(index.fields)..sort();
 
@@ -1376,7 +1386,9 @@ class IndexManager {
     final pkName = schema.primaryKey;
 
     // Build index targets: explicit indexes + auto-unique single-field + foreign keys (excluding PK).
-    final targets = schema.getAllIndexes().toList();
+    final targets = (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
+            const <IndexSchema>[])
+        .toList();
 
     // Skip redundant PK-only indexes (table data is already range-partitioned by PK).
     targets
@@ -1922,10 +1934,11 @@ class IndexManager {
         );
       }
 
+      // Prefix LIKE: use index range scan [prefix, nextPrefix) so only matching keys are read (same cost as equality).
       if (opUpper == 'LIKE' && condition.value is String) {
         final pattern = condition.value as String;
 
-        // Find the effective prefix (stop at first wildcard)
+        // Find the effective prefix (stop at first wildcard % or _)
         int wildcardIndex = -1;
         final firstPercent = pattern.indexOf('%');
         final firstUnderscore = pattern.indexOf('_');
@@ -1938,13 +1951,11 @@ class IndexManager {
           wildcardIndex = firstUnderscore;
         }
 
-        // If there is ANY valid prefix before the wildcard, we can use it for range scan
         if (wildcardIndex > 0 || (wildcardIndex == -1 && pattern.isNotEmpty)) {
           final prefix = (wildcardIndex != -1)
               ? pattern.substring(0, wildcardIndex)
               : pattern;
 
-          // Helper to increment the last character of a string to find upper bound
           String? incrementString(String s) {
             if (s.isEmpty) return null;
             final codeUnits = List<int>.from(s.codeUnits);
@@ -1958,8 +1969,8 @@ class IndexManager {
             return null;
           }
 
-          final startBytes = encodePrefix(prefix);
-
+          // Single-field index: encode full key. Composite: encode first field only for range.
+          Uint8List? startBytes = encodePrefix(prefix);
           Uint8List? endBytes;
           if (prefix.isNotEmpty) {
             final nextPrefix = incrementString(prefix);
@@ -1968,12 +1979,35 @@ class IndexManager {
             }
           }
 
+          // Composite index: encodePrefix(prefix) returns null (needs n components). Use first field only.
+          if (startBytes == null && fields.isNotEmpty) {
+            final c0 = schema.encodeFieldComponentToMemComparable(
+              fields[0],
+              prefix,
+              truncateText: truncateText,
+            );
+            if (c0 != null) {
+              startBytes = MemComparableKey.encodeTuple([c0]);
+              if (prefix.isNotEmpty) {
+                final nextPrefix = incrementString(prefix);
+                if (nextPrefix != null) {
+                  final c0End = schema.encodeFieldComponentToMemComparable(
+                    fields[0],
+                    nextPrefix,
+                    truncateText: truncateText,
+                  );
+                  if (c0End != null) {
+                    endBytes = MemComparableKey.encodeTuple([c0End]);
+                  }
+                }
+              }
+            }
+          }
+
           if (startBytes != null) {
             final start = applyCursorStart(startBytes);
-            // If endBytes is null (meaning prefix empty or overflow), use empty (unbounded)
             final end = applyCursorEnd(endBytes ?? Uint8List(0));
 
-            // Valid range check
             if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
               return IndexSearchResult.empty();
             }

@@ -117,6 +117,46 @@ class FunctionCall extends ExprNode {
   String toString() => 'FunctionCall($functionName, $arguments)';
 }
 
+/// Predicate: true when the current operation is an update (e.g. upsert matched existing row).
+class IsUpdate extends ExprNode {
+  const IsUpdate();
+
+  @override
+  String toString() => 'IsUpdate()';
+}
+
+/// Predicate: true when the current operation is an insert (e.g. upsert inserted new row).
+class IsInsert extends ExprNode {
+  const IsInsert();
+
+  @override
+  String toString() => 'IsInsert()';
+}
+
+/// Conditional expression: if condition then thenValue else elseValue.
+class IfElse extends ExprNode {
+  final ExprNode condition;
+  final dynamic thenValue;
+  final dynamic elseValue;
+
+  const IfElse(this.condition, this.thenValue, this.elseValue);
+
+  @override
+  String toString() => 'IfElse($condition, $thenValue, $elseValue)';
+}
+
+/// Single-branch conditional: when condition holds use value, otherwise use otherwise (default null).
+class When extends ExprNode {
+  final ExprNode condition;
+  final dynamic value;
+  final dynamic otherwise;
+
+  const When(this.condition, this.value, {this.otherwise});
+
+  @override
+  String toString() => 'When($condition, $value, otherwise: $otherwise)';
+}
+
 /// Binary operators supported in expressions.
 enum BinaryOperator {
   add, // +
@@ -269,6 +309,36 @@ class Expr {
   /// Expr.abs(Expr.field('balance'))
   /// ```
   static FunctionCall abs(ExprNode x) => FunctionCall('abs', [x]);
+
+  /// Predicate: true when the current operation is an update (e.g. upsert matched existing row).
+  static IsUpdate isUpdate() => const IsUpdate();
+
+  /// Predicate: true when the current operation is an insert (e.g. upsert inserted new row).
+  static IsInsert isInsert() => const IsInsert();
+
+  /// Conditional: if condition then thenValue else elseValue.
+  /// Use with [isUpdate]/[isInsert] for update-vs-insert semantics.
+  ///
+  /// Example:
+  /// ```dart
+  /// 'balance': Expr.ifElse(
+  ///   Expr.isUpdate(),
+  ///   Expr.field('balance') + Expr.value(100),
+  ///   Expr.value(100),
+  /// )
+  /// ```
+  static IfElse ifElse(
+          ExprNode condition, dynamic thenValue, dynamic elseValue) =>
+      IfElse(condition, thenValue, elseValue);
+
+  /// Single-branch conditional: when condition holds use value, otherwise use otherwise (default null).
+  ///
+  /// Example:
+  /// ```dart
+  /// 'count': Expr.when(Expr.isUpdate(), Expr.field('count') + Expr.value(1), otherwise: 1)
+  /// ```
+  static When when(ExprNode condition, dynamic value, {dynamic otherwise}) =>
+      When(condition, value, otherwise: otherwise);
 }
 
 /// Extension methods on ExprNode to enable operator overloading for fluent expression building.

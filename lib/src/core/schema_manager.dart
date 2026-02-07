@@ -16,6 +16,23 @@ class SchemaManager {
   /// Managed by MemoryManager quota: [MemoryQuotaType.schema].
   TreeCache<TableSchema>? _tableSchemaCache;
 
+  /// Per-table index cache derived from [TableSchema].
+  ///
+  /// Responsibilities:
+  /// - Provide O(1) access to:
+  ///   - all indexes (explicit + implicit unique + FK)
+  ///   - unique indexes (including composite unique)
+  ///   - vector indexes
+  /// - Avoid repeated traversal of fields / foreign keys on hot paths
+  ///
+  /// Lifecycle:
+  /// - Populated when a schema is cached or first requested via getter.
+  /// - Cleared together with schema cache on:
+  ///   - explicit table cache invalidation
+  ///   - global schema cache clear / eviction
+  final Map<String, _IndexListCacheEntry> _indexListCache =
+      <String, _IndexListCacheEntry>{};
+
   // Directory mapping cache for schema partitions
   DirectoryMapping? _directoryMapping;
   int _currentPartitionDirIndex = 0;
@@ -50,11 +67,14 @@ class SchemaManager {
   /// Cache [TableSchema] into hotspot cache.
   void cacheTableSchema(String tableName, TableSchema schema) {
     _ensureTableSchemaCache().put(tableName, schema);
+    // Rebuild index cache for this table in O(indexCount) time.
+    _indexListCache[tableName] = _buildIndexListCache(schema);
   }
 
   /// Remove cached schema for [tableName].
   void removeCachedTableSchema(String tableName) {
     _tableSchemaCache?.remove(tableName);
+    _indexListCache.remove(tableName);
   }
 
   /// Current schema cache size in bytes (incremental tracked).
@@ -72,11 +92,13 @@ class SchemaManager {
   /// Clear all schema cache entries.
   Future<void> clearSchemaCache() async {
     _tableSchemaCache?.clear();
+    _indexListCache.clear();
   }
 
   /// Clear all schema cache entries synchronously (used on shutdown).
   void clearSchemaCacheSync() {
     _tableSchemaCache?.clear();
+    _indexListCache.clear();
   }
 
   int _estimateTableSchemaSize(TableSchema schema) {
@@ -113,6 +135,56 @@ class SchemaManager {
     }
 
     return size;
+  }
+
+  /// Get consolidated index list for a table (explicit + implicit).
+  ///
+  /// This is an O(1) operation on hot path – it uses a lightweight cache
+  /// derived from [TableSchema.getAllIndexes] and is rebuilt only when:
+  /// - a new schema is saved for the table, or
+  /// - the schema/index cache is explicitly cleared.
+  List<IndexSchema> getAllIndexesFor(TableSchema schema) {
+    final entry = _indexListCache[schema.name] ?? _buildIndexListCache(schema);
+    _indexListCache[schema.name] = entry;
+    return entry.allIndexes;
+  }
+
+  /// Get all unique indexes (including composite unique indexes) for a table.
+  List<IndexSchema> getUniqueIndexesFor(TableSchema schema) {
+    final entry = _indexListCache[schema.name] ?? _buildIndexListCache(schema);
+    _indexListCache[schema.name] = entry;
+    return entry.uniqueIndexes;
+  }
+
+  /// Get all vector indexes for a table.
+  ///
+  /// When a table has no vector index, this returns an empty list and
+  /// avoids any additional traversal in hot write/read paths.
+  List<IndexSchema> getVectorIndexesFor(TableSchema schema) {
+    final entry = _indexListCache[schema.name] ?? _buildIndexListCache(schema);
+    _indexListCache[schema.name] = entry;
+    return entry.vectorIndexes;
+  }
+
+  /// Async helper by table name – mainly for management / background tasks.
+  Future<List<IndexSchema>> getAllIndexesForTable(String tableName) async {
+    final schema = await getTableSchema(tableName);
+    if (schema == null) return const <IndexSchema>[];
+    return getAllIndexesFor(schema);
+  }
+
+  /// Async helper by table name – unique indexes only.
+  Future<List<IndexSchema>> getUniqueIndexesForTable(String tableName) async {
+    final schema = await getTableSchema(tableName);
+    if (schema == null) return const <IndexSchema>[];
+    return getUniqueIndexesFor(schema);
+  }
+
+  /// Async helper by table name – vector indexes only.
+  Future<List<IndexSchema>> getVectorIndexesForTable(String tableName) async {
+    final schema = await getTableSchema(tableName);
+    if (schema == null) return const <IndexSchema>[];
+    return getVectorIndexesFor(schema);
   }
 
   /// get database schema meta
@@ -960,4 +1032,55 @@ class SchemaManager {
       );
     }
   }
+}
+
+/// Lightweight per-table index cache entry.
+///
+/// All lists are immutable views to avoid accidental modification on hot paths.
+class _IndexListCacheEntry {
+  final List<IndexSchema> allIndexes;
+  final List<IndexSchema> uniqueIndexes;
+  final List<IndexSchema> vectorIndexes;
+
+  const _IndexListCacheEntry({
+    required this.allIndexes,
+    required this.uniqueIndexes,
+    required this.vectorIndexes,
+  });
+}
+
+/// Build index cache entry from a [TableSchema].
+///
+/// This is the only place that calls the relatively expensive
+/// [TableSchema.getAllIndexes], ensuring we pay the cost only when
+/// table structure actually changes, not per-record.
+_IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
+  final all = schema.getAllIndexes();
+  if (all.isEmpty) {
+    const emptyList = <IndexSchema>[];
+    return const _IndexListCacheEntry(
+      allIndexes: emptyList,
+      uniqueIndexes: emptyList,
+      vectorIndexes: emptyList,
+    );
+  }
+
+  final unique = <IndexSchema>[];
+  final vector = <IndexSchema>[];
+
+  for (final idx in all) {
+    if (idx.unique) {
+      unique.add(idx);
+    }
+    if (idx.type == IndexType.vector) {
+      vector.add(idx);
+    }
+  }
+
+  // Use unmodifiable views to guard against accidental mutation.
+  return _IndexListCacheEntry(
+    allIndexes: List<IndexSchema>.unmodifiable(all),
+    uniqueIndexes: List<IndexSchema>.unmodifiable(unique),
+    vectorIndexes: List<IndexSchema>.unmodifiable(vector),
+  );
 }

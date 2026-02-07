@@ -1252,7 +1252,9 @@ class TableDataManager {
     final Set<String> needFields = () {
       final s = <String>{primaryKey};
       // Collect all fields used in any index (auto-generated unique/fk or explicit)
-      for (final idx in schema.getAllIndexes()) {
+      final allIndexes =
+          _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+      for (final idx in allIndexes) {
         s.addAll(idx.fields);
       }
       return s;

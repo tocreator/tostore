@@ -17,12 +17,14 @@ abstract class DataStoreInterface {
   /// Initialize data store engine
   /// [reinitialize] when true, force reinitialize (close then reopen)
   /// [noPersistOnClose] when reinitializing, do not persist pending buffers; only clear caches/flush handles
+  /// [applyActiveSpaceOnDefault] when true (default), if config spaceName is default, use stored activeSpace so first open lands in last used space
   Future<void> initialize({
     String? dbPath,
     String? dbName,
     DataStoreConfig? config,
-    bool reinitialize,
-    bool noPersistOnClose,
+    bool reinitialize = false,
+    bool noPersistOnClose = false,
+    bool applyActiveSpaceOnDefault = false,
   });
 
   /// query data
@@ -34,11 +36,16 @@ abstract class DataStoreInterface {
   /// insert data, returns the operation result with primary key if successful
   Future<DbResult> insert(String tableName, Map<String, dynamic> data);
 
-  /// upsert data
-  UpsertBuilder upsert(String tableName, Map<String, dynamic> data);
+  /// upsert data; conflict target from primary key or unique index in data
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data);
 
   /// batch insert data, returns the operation result with successful and failed keys
   Future<DbResult> batchInsert(
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true});
+
+  /// batch upsert data based on unique constraints.
+  Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
       {bool allowPartialErrors = true});
 
@@ -80,10 +87,14 @@ abstract class DataStoreInterface {
   Future<TableInfo?> getTableInfo(String tableName);
 
   /// switch space
-  Future<bool> switchSpace({String spaceName = 'default'});
+  ///
+  /// [keepActive] When true, saves this space as last active for next launch.
+  Future<bool> switchSpace(
+      {String spaceName = 'default', bool keepActive = true});
 
   /// close data store engine
-  Future<void> close();
+  /// [keepActiveSpace] when false, clears active space so next launch uses default (e.g. logout). Default true.
+  Future<void> close({bool keepActiveSpace = true});
 
   /// backup database
   Future<String> backup(
@@ -125,6 +136,10 @@ abstract class DataStoreInterface {
 
   /// Delete a space
   Future<DbResult> deleteSpace(String spaceName);
+
+  /// List all space names (e.g. for multi-account switch or admin).
+  /// Returns sorted list; at least contains 'default'.
+  Future<List<String>> listSpaces();
 
   /// Get unified status and diagnostics
   DbStatus get status;

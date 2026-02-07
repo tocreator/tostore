@@ -21,6 +21,9 @@ class GlobalConfig {
   /// all created space names
   final Set<String> spaceNames;
 
+  /// Active space name. Default is 'default'. Used on next open when opening with default space.
+  final String? activeSpace;
+
   /// whether there is a pending migration task
   final bool hasMigrationTask;
 
@@ -37,6 +40,7 @@ class GlobalConfig {
     int? userVersion,
     int? maxEntriesPerDir,
     Set<String>? spaceNames,
+    this.activeSpace,
     this.hasMigrationTask = false,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
@@ -60,6 +64,7 @@ class GlobalConfig {
               ?.map((e) => e as String)
               .toSet() ??
           {'default'},
+      activeSpace: json['activeSpace'] as String? ?? 'default',
       hasMigrationTask: json['hasMigrationTask'] as bool? ?? false,
       tableDirectoryMap: json.containsKey('tableDirectoryMap')
           ? (json['tableDirectoryMap'] as Map<String, dynamic>).map(
@@ -84,6 +89,7 @@ class GlobalConfig {
       'userVersion': userVersion,
       'maxEntriesPerDir': maxEntriesPerDir,
       'spaceNames': spaceNames.toList(),
+      if (activeSpace != null) 'activeSpace': activeSpace!,
       'hasMigrationTask': hasMigrationTask,
       'tableDirectoryMap':
           tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
@@ -92,11 +98,14 @@ class GlobalConfig {
   }
 
   /// create a copy and modify some fields
+  /// [clearActiveSpace] when true, sets [activeSpace] to null (e.g. for logout).
   GlobalConfig copyWith({
     int? version,
     int? userVersion,
     int? maxEntriesPerDir,
     Set<String>? spaceNames,
+    String? activeSpace,
+    bool clearActiveSpace = false,
     bool? hasMigrationTask,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
@@ -106,6 +115,7 @@ class GlobalConfig {
       userVersion: userVersion ?? this.userVersion,
       maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
       spaceNames: spaceNames ?? this.spaceNames,
+      activeSpace: clearActiveSpace ? null : (activeSpace ?? this.activeSpace),
       hasMigrationTask: hasMigrationTask ?? this.hasMigrationTask,
       tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
       directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
@@ -123,6 +133,12 @@ class GlobalConfig {
     if (!spaceNames.contains(spaceName)) return this;
     final newSpaces = {...spaceNames}..remove(spaceName);
     return copyWith(spaceNames: newSpaces);
+  }
+
+  /// Clear active space so next launch uses default (e.g. after logout).
+  GlobalConfig clearActiveSpace() {
+    if (activeSpace == null) return this;
+    return copyWith(clearActiveSpace: true);
   }
 
   /// set whether there is a migration task

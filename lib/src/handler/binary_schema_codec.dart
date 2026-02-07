@@ -61,9 +61,10 @@ class BinarySchemaCodec {
       final result = <String, dynamic>{};
       for (int i = 0; i < fieldCount; i++) {
         final field = fieldStructure[i];
-        final value = _readValue(r);
+        final raw = _readValue(r);
         // Only include non-null values to match original behavior
-        if (value != null) {
+        if (raw != null) {
+          final value = _coerceByTypeIndex(field.typeIndex, raw);
           result[field.name] = value;
         }
       }
@@ -293,6 +294,56 @@ class BinarySchemaCodec {
     }
     // Unknown extension: return raw bytes.
     return payload;
+  }
+
+  /// Coerce decoded value to match the table field type when safe.
+  ///
+  /// - Only handles numeric normalization between integer / bigInt.
+  /// - For all other types, or when coercion is unsafe (e.g. BigInt out of 64-bit
+  ///   range for integer fields), the original value is returned to avoid data loss.
+  ///
+  /// DataType enum indices (from model/table_schema.dart):
+  ///   0: integer, 1: bigInt, 2: double, 3: text, 4: blob,
+  ///   5: boolean, 6: datetime, 7: array, 8: vector, 9: json.
+  static dynamic _coerceByTypeIndex(int typeIndex, dynamic value) {
+    switch (typeIndex) {
+      // DataType.integer
+      case 0:
+        if (value is BigInt) {
+          // Only downcast when within signed 64-bit range to avoid silent overflow.
+          const intMin = -0x8000000000000000; // -2^63
+          const intMax = 0x7FFFFFFFFFFFFFFF; // 2^63 - 1
+          final min = BigInt.from(intMin);
+          final max = BigInt.from(intMax);
+          if (value >= min && value <= max) {
+            return value.toInt();
+          }
+          // Keep BigInt if out of range; caller can decide how to handle it.
+          return value;
+        }
+        return value;
+
+      // DataType.bigInt
+      case 1:
+        if (value is int) return BigInt.from(value);
+        return value;
+
+      // DataType.double
+      case 2:
+        if (value is double) return value;
+        if (value is int) return value.toDouble();
+        if (value is BigInt) {
+          try {
+            return value.toDouble();
+          } catch (_) {
+            return value;
+          }
+        }
+        return value;
+
+      default:
+        return value;
+    }
   }
 
   // MessagePack uses big-endian for multi-byte integers and floats

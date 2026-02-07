@@ -267,9 +267,12 @@ class DatabaseTester {
       isTestPassed &=
           _expect('Upsert-insert should result in 1 user', countAfterInsert, 1);
 
-      // Upsert (update)
-      await db
-          .upsert('users', {'age': 40}).where('email', '=', 'upsert@test.com');
+      // Upsert (update): include all non-nullable + unique key fields for conflict target
+      await db.upsert('users', {
+        'username': 'upsert_user',
+        'email': 'upsert@test.com',
+        'age': 40,
+      });
       final updatedUser = await db
           .query('users')
           .where('email', '=', 'upsert@test.com')

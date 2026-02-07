@@ -1806,7 +1806,9 @@ class ForeignKeyManager {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
 
-    final allIndexes = schema.getAllIndexes();
+    final allIndexes =
+        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    if (allIndexes.isEmpty) return;
 
     for (final fk in schema.foreignKeys) {
       if (!fk.enabled || !fk.autoCreateIndex) {

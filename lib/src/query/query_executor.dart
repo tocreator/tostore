@@ -837,10 +837,10 @@ class QueryExecutor {
             // Note: indexName in token is the actual name.
             IndexSchema? idx;
             try {
-              // Use getAllIndexes to ensure we find implicit unique/FK indexes too.
-              idx = schema
-                  .getAllIndexes()
-                  .firstWhere((i) => i.actualIndexName == idxName);
+              final allIndexes =
+                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                      <IndexSchema>[];
+              idx = allIndexes.firstWhere((i) => i.actualIndexName == idxName);
             } catch (_) {
               // Not found
             }
@@ -1516,9 +1516,11 @@ class QueryExecutor {
       String? fieldName;
       IndexSchema? indexSchema;
       try {
-        indexSchema = schema.getAllIndexes().firstWhere(
-              (idx) => idx.actualIndexName == actualIndexName,
-            );
+        final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+            <IndexSchema>[];
+        indexSchema = allIndexes.firstWhere(
+          (idx) => idx.actualIndexName == actualIndexName,
+        );
       } catch (_) {
         indexSchema = null;
       }
@@ -1547,7 +1549,14 @@ class QueryExecutor {
         final indexConditionValue =
             fieldName != null ? conditions[fieldName] : searchValue;
         if (indexConditionValue is Map<String, dynamic>) {
-          indexCondition = IndexCondition.fromMap(indexConditionValue);
+          // Prefer explicit LIKE so prefix pattern uses index range scan (not full scan).
+          final likePattern =
+              indexConditionValue['LIKE'] ?? indexConditionValue['like'];
+          if (likePattern is String) {
+            indexCondition = IndexCondition.like(likePattern);
+          } else {
+            indexCondition = IndexCondition.fromMap(indexConditionValue);
+          }
         } else {
           indexCondition = IndexCondition.fromMap({'=': indexConditionValue});
         }
@@ -2008,9 +2017,9 @@ class QueryExecutor {
     final idxName = plan.operation.indexName;
     if (idxName == null) return false;
     try {
-      final idx = schema
-          .getAllIndexes()
-          .firstWhere((i) => i.actualIndexName == idxName);
+      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (allIndexes == null) return false;
+      final idx = allIndexes.firstWhere((i) => i.actualIndexName == idxName);
       if (orderBy.length != idx.fields.length) return false;
 
       // We assume validation has already passed and all fields have uniform direction.
@@ -2025,9 +2034,9 @@ class QueryExecutor {
   ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
       TableSchema schema, String indexName) {
     try {
-      final idx = schema
-          .getAllIndexes()
-          .firstWhere((i) => i.actualIndexName == indexName);
+      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      if (allIndexes == null) return (fields: <String>[], isUnique: false);
+      final idx = allIndexes.firstWhere((i) => i.actualIndexName == indexName);
       return (fields: idx.fields, isUnique: idx.unique);
     } catch (_) {
       // Fallback for implicit unique single-field indexes (uniq_field).
@@ -2341,10 +2350,16 @@ class QueryExecutor {
       }
 
       if (cursorToken.mode == _CursorMode.sortKey) {
-        if (op.type != QueryOperationType.tableScan &&
-            op.type != QueryOperationType.indexScan) {
+        // IMPORTANT:
+        // sort-key cursor requires a stable total ordering and a scan that can apply
+        // keyset filtering efficiently. For index scans, we only allow cursor pagination
+        // when orderBy matches the index key exactly (indexKey mode). Otherwise, keyset
+        // pagination would degrade to repeated full-range scans + post-sort, which is
+        // not acceptable for ultra-large datasets.
+        if (op.type != QueryOperationType.tableScan) {
           throw BusinessError(
-            'Sort-key cursor requires a TABLE/INDEX scan plan.',
+            'Sort-key cursor is not supported for non-table-scan plans. '
+            'For index scans, ensure orderBy matches the index fields exactly to use index-key cursor pagination.',
             type: BusinessErrorType.dbError,
             data: {'table': tableName, 'plan': op.type.toString()},
           );
@@ -2467,9 +2482,11 @@ class QueryExecutor {
             where: where,
           );
         } catch (e) {
-          // Even if index-key cursor is not supported, we can still provide
-          // sort-key cursor as long as results are ordered by [orderBy].
-          return orderBy.isNotEmpty ? _CursorMode.sortKey : null;
+          // Do not fall back to sort-key cursor for index scans:
+          // - It would require repeated full-range scans + post-sort on each page.
+          // - Cursor semantics become "best effort" and can be surprising when
+          //   query fields and ordering fields are not aligned with the scan key.
+          return null;
         }
       }
       if (orderBy.isNotEmpty) {
@@ -2481,8 +2498,10 @@ class QueryExecutor {
             orderBy: orderBy,
           );
         } catch (e) {
-          // If orderBy doesn't match the index, fall back to sort-key cursor.
-          return _CursorMode.sortKey;
+          // If orderBy doesn't match the index, DO NOT return cursor pagination.
+          // This avoids non-standard cursor behavior for patterns like:
+          // - non-unique index equality query + sorting by other fields
+          return null;
         }
       }
       return _CursorMode.indexKey;

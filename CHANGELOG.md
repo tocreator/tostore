@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.0.3
+
+### Added
+- Added `ToCrypto` for encrypting specific field values
+- Added `batchUpsert` for batch upsert operations
+- Added atomic condition judgment expressions for conditional updates and logic in expressions
+
+### Changed
+- Adjusted `upsert` API: removed chained query conditions; use atomic condition expressions for conditional upsert logic
+- `switchSpace` and `close`: added `keepActive` / `keepActiveSpace` options to manage active space for “keep login state” and “logout” scenarios, avoiding extra open-then-switch flow; opening with default space can use stored active space so the first open lands in the last used space
+- Optimized constraint and migration prompt wording and consistency
+- Standardized README and translation docs (multi-space, login state, and close examples)
+
+### Fixed
+- Fixed Windows file process occupancy issue
+- Fixed vulnerability where the system could treat numeric values as bigint by default
+
 ## 3.0.2
 
 ### Added

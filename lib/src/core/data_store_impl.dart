@@ -409,7 +409,13 @@ class DataStoreImpl {
 
     _initCompleter = Completer<void>();
 
-    initialize(dbPath: dbPath, dbName: dbName, config: config).then((_) {
+    final applyActive = !isMigrationInstance;
+    initialize(
+            dbPath: dbPath,
+            dbName: dbName,
+            config: config,
+            applyActiveSpaceOnDefault: applyActive)
+        .then((_) {
       if (!_initCompleter.isCompleted) {
         _initCompleter.complete();
       }
@@ -539,12 +545,14 @@ class DataStoreImpl {
 
   /// Initialize storage engine
   /// [reinitialize]: when true, always close current instance
+  /// [applyActiveSpaceOnDefault]: when true and spaceName is default, use stored activeSpace. Default false so that upgrade/reinit/switchSpace with default space are not overwritten; set true only for app first open when opening with default and wanting to use stored active space.
   Future<bool> initialize(
       {String? dbPath,
       String? dbName,
       DataStoreConfig? config,
       bool reinitialize = false,
-      bool noPersistOnClose = false}) async {
+      bool noPersistOnClose = false,
+      bool applyActiveSpaceOnDefault = false}) async {
     if (_initializing && !_initCompleter.isCompleted) {
       await _initCompleter.future;
       return true;
@@ -649,6 +657,18 @@ class DataStoreImpl {
         _memoryManager!.initialize(_config!, this),
         Future(() async => await transactionManager!.initialize()),
       ]);
+
+      // When opening with default space (first open only), use stored activeSpace so one open lands in the right space. Skip when re-initializing after switchSpace(spaceName: 'default').
+      if (applyActiveSpaceOnDefault && _config!.spaceName == 'default') {
+        final globalConfig = await getGlobalConfig();
+        final active = globalConfig?.activeSpace;
+        if (active != null && active != 'default') {
+          _config = _config!.copyWith(spaceName: active);
+          _currentSpaceName = active;
+          _spaceConfigCache = null;
+          await getSpaceConfig(nowGetFromFile: true);
+        }
+      }
 
       directoryManager = DirectoryManager(this);
       _indexManager = IndexManager(this);
@@ -976,8 +996,11 @@ class DataStoreImpl {
   /// [closeStorage]: whether to close the underlying storage (IndexedDB etc.).
   /// Set [closeStorage] to false when performing operations like Restore that need
   /// to re-initialize the DataStore but keep the connection logic alive.
+  /// [keepActiveSpace]: when false, clears [GlobalConfig.activeSpace] so next launch uses default (e.g. logout). Default true.
   Future<void> close(
-      {bool persistChanges = true, bool closeStorage = true}) async {
+      {bool persistChanges = true,
+      bool closeStorage = true,
+      bool keepActiveSpace = true}) async {
     if (!_isInitialized) return;
 
     try {
@@ -1036,6 +1059,20 @@ class DataStoreImpl {
         }
 
         await _tableDataManager?.dispose(persistChanges: persistChanges);
+
+        // Clear active space so next launch uses default (e.g. logout).
+        if (!keepActiveSpace) {
+          try {
+            final globalConfig = await getGlobalConfig();
+            if (globalConfig != null && globalConfig.activeSpace != null) {
+              await saveGlobalConfig(globalConfig.clearActiveSpace());
+            }
+          } catch (e) {
+            Logger.error('Clear activeSpace on close failed: $e',
+                label: 'DataStoreImpl.close');
+          }
+        }
+
         if (closeStorage) {
           await storage.close(isMigrationInstance: isMigrationInstance);
         }
@@ -1147,7 +1184,9 @@ class DataStoreImpl {
         await schemaManager?.saveTableSchema(schema.name, schemaValid);
 
         // Create all indexes (explicit, unique, and foreign key)
-        for (var index in schema.getAllIndexes()) {
+        final allIndexes =
+            schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+        for (var index in allIndexes) {
           await _indexManager?.createIndex(schema.name, index);
         }
 
@@ -1365,11 +1404,20 @@ class DataStoreImpl {
         ));
       }
 
-      validData = await _validateAndProcessData(schema, data, tableName);
+      final validationErrors = <String>[];
+      validData = await _validateAndProcessData(
+        schema,
+        data,
+        tableName,
+        validationErrors: validationErrors,
+      );
       if (validData == null) {
+        final detailMsg = validationErrors.isNotEmpty
+            ? 'Data validation failed for table $tableName: ${validationErrors.join("; ")}'
+            : 'Data validation failed for table $tableName';
         return finish(DbResult.error(
           type: ResultType.validationFailed,
-          message: 'Data validation failed',
+          message: detailMsg,
         ));
       }
 
@@ -1426,21 +1474,25 @@ class DataStoreImpl {
 
         final primaryKey = schema.primaryKey;
         final providedId = validData[primaryKey];
+        final bool isPkConflict = uniqueViolation.indexName == 'pk';
 
         final bool isSequentialPk =
             schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
 
-        if (isSequentialPk && providedId != null) {
-          // Notify TableDataManager to handle primary key conflict
+        // Only adjust maxId and retry when the conflict is on the primary key.
+        // Non-PK unique violations (e.g. duplicate email) must not trigger handlePrimaryKeyConflict
+        // or retry, to avoid wasting auto-increment IDs and wrong "primary key conflict" logs.
+        if (isPkConflict && isSequentialPk && providedId != null) {
           await tableDataManager.handlePrimaryKeyConflict(
               tableName, providedId);
         }
 
         final bool userProvidedPk =
             data.containsKey(primaryKey) && data[primaryKey] != null;
-        if (isSequentialPk && providedId != null && !retryOnPkConflict) {
-          // Automatic correction and retry: if conflict occurs on sequential PK, we fix the sequence
-          // and then retry insertion. If user provided the PK, we clear it to let the system generate a new one.
+        if (isPkConflict &&
+            isSequentialPk &&
+            providedId != null &&
+            !retryOnPkConflict) {
           final Map<String, dynamic> retryData =
               userProvidedPk ? (Map.from(data)..remove(primaryKey)) : data;
           return await insert(tableName, retryData, retryOnPkConflict: true);
@@ -1542,9 +1594,13 @@ class DataStoreImpl {
 
   /// validate and process data
   Future<Map<String, dynamic>?> _validateAndProcessData(
-      TableSchema schema, Map<String, dynamic> data, String tableName,
-      {bool skipPrimaryKeyOrderCheck = false,
-      bool skipPrimaryKeyFormatCheck = false}) async {
+    TableSchema schema,
+    Map<String, dynamic> data,
+    String tableName, {
+    bool skipPrimaryKeyOrderCheck = false,
+    bool skipPrimaryKeyFormatCheck = false,
+    List<String>? validationErrors,
+  }) async {
     try {
       final primaryKey = schema.primaryKey;
       var result = <String, dynamic>{};
@@ -1631,8 +1687,11 @@ class DataStoreImpl {
       }
 
       // 3. validate data using schema constraints and apply constraints if needed
-      final validatedResult =
-          schema.validateData(result, applyConstraints: true);
+      final validatedResult = schema.validateData(
+        result,
+        applyConstraints: true,
+        errors: validationErrors,
+      );
       if (validatedResult == null) {
         Logger.warn(
           'Data validation failed for table $tableName',
@@ -1643,8 +1702,20 @@ class DataStoreImpl {
 
       return validatedResult;
     } catch (e) {
-      Logger.error('Data validation failed: $e',
-          label: 'DataStore._validateAndProcessData');
+      Logger.error(
+        'Data validation failed: $e',
+        label: 'DataStore._validateAndProcessData',
+      );
+      // propagate a meaningful message to caller if a buffer is provided
+      if (validationErrors != null) {
+        if (e is BusinessError &&
+            e.type == BusinessErrorType.invalidData &&
+            e.message.isNotEmpty) {
+          validationErrors.add(e.message);
+        } else {
+          validationErrors.add(e.toString());
+        }
+      }
       return null;
     }
   }
@@ -1679,8 +1750,9 @@ class DataStoreImpl {
       refs.add(UniqueKeyRef('pk', pkVal.toString()));
     }
 
-    for (final idx in schema.getAllIndexes()) {
-      if (!idx.unique) continue;
+    final allIndexes =
+        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    for (final idx in allIndexes) {
       // use actualIndexName which handles both explicit and implicit names
       final canKey = schema.createCanonicalIndexKey(idx.fields, data);
       if (canKey != null) {
@@ -1693,8 +1765,9 @@ class DataStoreImpl {
   UniquePlan planUniqueForUpdate(String tableName, TableSchema schema,
       Map<String, dynamic> updatedRecord, Set<String> changedFields) {
     final refs = <UniqueKeyRef>[];
-    for (final idx in schema.getAllIndexes()) {
-      if (!idx.unique) continue;
+    final allIndexes =
+        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    for (final idx in allIndexes) {
       // Check if any field in the unique index is changed
       if (idx.fields.any((f) => changedFields.contains(f))) {
         final canKey =
@@ -1705,6 +1778,137 @@ class DataStoreImpl {
       }
     }
     return UniquePlan(refs);
+  }
+
+  /// Build QueryCondition for upsert conflict target (pk or unique index).
+  /// Returns null if no valid conflict target.
+  QueryCondition? _buildUpsertCondition(
+    TableSchema schema,
+    Map<String, dynamic> data,
+    List<IndexSchema> uniqueIndexes,
+  ) {
+    final pk = schema.primaryKey;
+    final pkVal = data[pk];
+    if (pkVal != null && pkVal.toString().trim().isNotEmpty) {
+      return QueryCondition()..where(pk, '=', pkVal);
+    }
+    for (final idx in uniqueIndexes) {
+      if (idx.fields.every((f) => data.containsKey(f) && data[f] != null)) {
+        final cond = QueryCondition();
+        for (final f in idx.fields) {
+          cond.where(f, '=', data[f]);
+        }
+        return cond;
+      }
+    }
+    return null;
+  }
+
+  /// Validate upsert record: must contain all non-nullable fields + pk or a complete unique index.
+  /// Returns null on valid, or error message.
+  String? _validateUpsertRecord(
+    TableSchema schema,
+    Map<String, dynamic> data,
+    List<IndexSchema> uniqueIndexes,
+  ) {
+    final pk = schema.primaryKey;
+    for (final f in schema.fields) {
+      if (f.name == pk) continue;
+      if (!f.nullable && (!data.containsKey(f.name) || data[f.name] == null)) {
+        return 'Field ${f.name} is required (nullable=false) for upsert';
+      }
+    }
+    final hasPk = data.containsKey(pk) && data[pk] != null;
+    if (hasPk) return null;
+    if (uniqueIndexes.isEmpty) {
+      return 'Record has no primary key and table has no unique constraints; '
+          'upsert would risk massive duplicates';
+    }
+    bool hasValidUnique = false;
+    for (final idx in uniqueIndexes) {
+      if (idx.fields.every((f) =>
+          data.containsKey(f) &&
+          data[f] != null &&
+          data[f].toString().trim().isNotEmpty)) {
+        hasValidUnique = true;
+        break;
+      }
+    }
+    if (!hasValidUnique) {
+      return 'Record has no primary key; provide all fields of at least one '
+          'unique index: ${uniqueIndexes.map((i) => i.fields.join(",")).join(" or ")}';
+    }
+    return null;
+  }
+
+  /// Upsert one record: update-first by pk or unique key, then insert if not found.
+  /// Returns [DbResult]. No where clause; conflict target from data (pk or first complete unique index).
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
+    DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
+    await ensureInitialized();
+    final schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return finish(DbResult.error(
+        type: ResultType.notFound,
+        message: 'Table $tableName does not exist',
+      ));
+    }
+    final uniqueIndexes =
+        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    return upsertOne(
+      tableName,
+      data,
+      schema,
+      uniqueIndexes,
+    );
+  }
+
+  /// Single-record upsert implementation. Used by [upsert] and [batchUpsert].
+  Future<DbResult> upsertOne(
+    String tableName,
+    Map<String, dynamic> data,
+    TableSchema schema,
+    List<IndexSchema> uniqueIndexes, {
+    bool continueOnPartialErrors = false,
+  }) async {
+    DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
+    final validationErr = _validateUpsertRecord(schema, data, uniqueIndexes);
+    if (validationErr != null) {
+      return finish(DbResult.error(
+        type: ResultType.validationFailed,
+        message: validationErr,
+        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
+      ));
+    }
+    final cond = _buildUpsertCondition(schema, data, uniqueIndexes);
+    if (cond == null) {
+      return finish(DbResult.error(
+        type: ResultType.validationFailed,
+        message: 'No valid conflict target for upsert',
+        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
+      ));
+    }
+    try {
+      // Pass data directly: updateInternal handles ExprNode; insert() will validate/process.
+      final updateResult = await updateInternal(
+        tableName,
+        Map<String, dynamic>.from(data),
+        cond,
+        limit: 1,
+        continueOnPartialErrors: continueOnPartialErrors,
+      );
+      if (updateResult.isSuccess && updateResult.successKeys.isNotEmpty) {
+        return finish(updateResult);
+      }
+      return finish(await insert(tableName, data));
+    } catch (e) {
+      Logger.error('Upsert failed: $e', label: 'DataStore.upsertOne');
+      return finish(DbResult.error(
+        type: ResultType.dbError,
+        message: 'Upsert failed: $e',
+        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
+      ));
+    }
   }
 
   /// backup data and return backup path
@@ -1918,8 +2122,10 @@ class DataStoreImpl {
             // Heuristic 3: unique field equality or IN (range operators are excluded)
             if (!isOptimizableQuery) {
               final uniqueFieldNames = <String>{};
-              for (final index in schema.getAllIndexes()) {
-                if (index.unique && index.fields.length == 1) {
+              final allIndexes =
+                  schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+              for (final index in allIndexes) {
+                if (index.fields.length == 1) {
                   uniqueFieldNames.add(index.fields[0]);
                 }
               }
@@ -2040,8 +2246,9 @@ class DataStoreImpl {
           final oldRecordsInBatch = <Map<String, dynamic>>[];
 
           final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
-          final Set<String> indexedFieldNames = <String>{primaryKey}
-            ..addAll(schema.getAllIndexes().expand((i) => i.fields));
+          final Set<String> indexedFieldNames = <String>{primaryKey}..addAll(
+              (schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[])
+                  .expand((i) => i.fields));
 
           Future<void> flushIndexUpdateBatch() async {
             if (_indexManager == null || recordsInBatch.isEmpty) return;
@@ -2090,8 +2297,9 @@ class DataStoreImpl {
           // Identify unique fields that need validation during heavy update
           final Set<String> uniqueFieldsToCheck = <String>{};
           if (_indexManager != null) {
-            for (final index in schema.getAllIndexes()) {
-              if (!index.unique) continue;
+            final allIndexes =
+                schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+            for (final index in allIndexes) {
               if (index.fields.any((f) => validData.containsKey(f))) {
                 uniqueFieldsToCheck.addAll(index.fields);
               }
@@ -2148,14 +2356,13 @@ class DataStoreImpl {
                       validData.containsKey(fname) ? validData[fname] : null;
 
                   if (proposed is ExprNode) {
-                    // Evaluate expression atomically using current record values
                     try {
                       final result = _evaluateExpression(
                         proposed,
                         record,
                         schema,
+                        isUpdate: true,
                       );
-                      // Convert result to match field type (e.g., round double to int for integer fields)
                       updatedRecord[fname] = field.convertValue(result);
                     } catch (e) {
                       Logger.error(
@@ -2493,8 +2700,9 @@ class DataStoreImpl {
         final Set<String> fieldsToCheck = <String>{};
 
         // Collect fields from unique composite/single-field indexes that are affected by this update
-        for (final index in schema.getAllIndexes()) {
-          if (!index.unique) continue;
+        final allIndexes =
+            schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+        for (final index in allIndexes) {
           if (index.fields.any((f) => changedFields.contains(f))) {
             fieldsToCheck.addAll(index.fields);
           }
@@ -2522,14 +2730,13 @@ class DataStoreImpl {
                 validData.containsKey(fname) ? validData[fname] : null;
 
             if (proposed is ExprNode) {
-              // Evaluate expression atomically using current record values
               try {
                 final result = _evaluateExpression(
                   proposed,
                   record,
                   schema,
+                  isUpdate: true,
                 );
-                // Convert result to match field type (e.g., round double to int for integer fields)
                 updatedRecord[fname] = field.convertValue(result);
               } catch (e) {
                 Logger.error(
@@ -2661,13 +2868,15 @@ class DataStoreImpl {
               record[primaryKey] != null &&
               updatedRecord[primaryKey] != null &&
               record[primaryKey] != updatedRecord[primaryKey];
+          final allIndexes =
+              schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
           if (pkChanged) {
             // Primary key change affects all secondary indexes (non-unique: key suffix; unique: value).
-            for (final idx in schema.getAllIndexes()) {
+            for (final idx in allIndexes) {
               indexFields.addAll(idx.fields);
             }
           } else {
-            for (final idx in schema.getAllIndexes()) {
+            for (final idx in allIndexes) {
               if (idx.fields.any((f) => changedFields.contains(f))) {
                 indexFields.addAll(idx.fields);
               }
@@ -2949,8 +3158,10 @@ class DataStoreImpl {
             // Heuristic 3: unique field equality or IN (range operators are excluded)
             if (!isOptimizableQuery) {
               final uniqueFieldNames = <String>{};
-              for (final index in schema.getAllIndexes()) {
-                if (index.unique && index.fields.length == 1) {
+              final allIndexes =
+                  schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+              for (final index in allIndexes) {
+                if (index.fields.length == 1) {
                   uniqueFieldNames.add(index.fields[0]);
                 }
               }
@@ -3957,6 +4168,9 @@ class DataStoreImpl {
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
+      // Collect a limited number of detailed validation error messages for result reporting.
+      // This is per-batch only and does not grow with table size, so it is safe for large-scale data.
+      final List<String> validationErrorsForResult = [];
       // Track records whose primary key was auto-generated in this batch
       final Set<Map<String, dynamic>> autoPkRecords = <Map<String, dynamic>>{};
 
@@ -4225,12 +4439,14 @@ class DataStoreImpl {
 
               while (!finishedRecord) {
                 // Validate and process data (may be re-run once if we correct PK)
+                final recordErrors = <String>[];
                 final validData = await _validateAndProcessData(
                   tableSchema,
                   record,
                   tableName,
                   skipPrimaryKeyOrderCheck: true,
                   skipPrimaryKeyFormatCheck: isAutoPk,
+                  validationErrors: recordErrors,
                 );
 
                 if (validData == null) {
@@ -4238,6 +4454,13 @@ class DataStoreImpl {
                   final failedKey = record[primaryKey]?.toString() ?? '';
                   if (failedKey.isNotEmpty) {
                     failedKeys.add(failedKey);
+                  }
+                  if (recordErrors.isNotEmpty &&
+                      validationErrorsForResult.length < 20) {
+                    final prefix =
+                        failedKey.isNotEmpty ? 'pk=$failedKey' : 'index=$j';
+                    validationErrorsForResult
+                        .add('$prefix: ${recordErrors.join("; ")}');
                   }
                   finishedRecord = true;
                   break;
@@ -4363,12 +4586,16 @@ class DataStoreImpl {
                   batchContext.tryReserve(recordId, planIns.refs);
                 } catch (e) {
                   if (e is UniqueViolation) {
+                    final bool isPkConflict = e.indexName == 'pk';
                     final bool isSequentialPk =
                         tableSchema.primaryKeyConfig.type ==
                             PrimaryKeyType.sequential;
-                    if (isSequentialPk && !triedPkConflictRetry) {
+                    // Only adjust maxId and retry when the conflict is on the primary key.
+                    // Non-PK unique violations must not trigger handlePrimaryKeyConflict or retry.
+                    if (isPkConflict &&
+                        isSequentialPk &&
+                        !triedPkConflictRetry) {
                       try {
-                        // Handle primary key conflict: recalculate from disk and buffer
                         final dynamic pkVal = validData[primaryKey];
                         await tableDataManager.handlePrimaryKeyConflict(
                             tableName, pkVal);
@@ -4508,19 +4735,41 @@ class DataStoreImpl {
 
         // If no valid records and not allowing partial errors, return error
         if (successKeys.isEmpty) {
+          String message = 'All data validation failed';
+          if (validationErrorsForResult.isNotEmpty) {
+            final preview = validationErrorsForResult.length > 5
+                ? validationErrorsForResult.sublist(0, 5)
+                : validationErrorsForResult;
+            final suffix = validationErrorsForResult.length > preview.length
+                ? ' (showing ${preview.length} of ${validationErrorsForResult.length} validation errors)'
+                : '';
+            message =
+                '$message. Example validation errors: ${preview.join(" | ")}$suffix';
+          }
           return DbResult.error(
             type: ResultType.validationFailed,
-            message: 'All data validation failed',
+            message: message,
             failedKeys: failedKeys,
           );
         }
 
         // If not allowing partial errors and some records failed, return error
         if (!allowPartialErrors && invalidRecords.isNotEmpty) {
+          String message =
+              'Some records failed validation or have unique constraint conflicts';
+          if (validationErrorsForResult.isNotEmpty) {
+            final preview = validationErrorsForResult.length > 5
+                ? validationErrorsForResult.sublist(0, 5)
+                : validationErrorsForResult;
+            final suffix = validationErrorsForResult.length > preview.length
+                ? ' (showing ${preview.length} of ${validationErrorsForResult.length} validation errors)'
+                : '';
+            message =
+                '$message. Example validation errors: ${preview.join(" | ")}$suffix';
+          }
           return DbResult.error(
             type: ResultType.validationFailed,
-            message:
-                'Some records failed validation or have unique constraint conflicts',
+            message: message,
             failedKeys: failedKeys,
           );
         }
@@ -4532,11 +4781,22 @@ class DataStoreImpl {
             message: 'All records inserted successfully',
           );
         } else {
+          String message =
+              'Partial records inserted successfully, ${successKeys.length} successful, ${failedKeys.length} failed';
+          if (validationErrorsForResult.isNotEmpty) {
+            final preview = validationErrorsForResult.length > 5
+                ? validationErrorsForResult.sublist(0, 5)
+                : validationErrorsForResult;
+            final suffix = validationErrorsForResult.length > preview.length
+                ? ' (showing ${preview.length} of ${validationErrorsForResult.length} validation errors)'
+                : '';
+            message =
+                '$message. Example validation errors: ${preview.join(" | ")}$suffix';
+          }
           return DbResult.batch(
             successKeys: successKeys,
             failedKeys: failedKeys,
-            message:
-                'Partial records inserted successfully, ${successKeys.length} successful, ${failedKeys.length} failed',
+            message: message,
           );
         }
       } catch (e) {
@@ -4566,6 +4826,98 @@ class DataStoreImpl {
         message: 'Batch insertion failed: $e',
         failedKeys: failedKeys,
       );
+    }
+  }
+
+  /// Batch upsert: each record must contain all non-nullable fields + pk or all fields
+  /// of at least one unique index. No where support. Uses update-first: try update by
+  /// conflict target, then insert if not found. Rejects when record has no pk and
+  /// table has no unique constraints.
+  Future<DbResult> batchUpsert(
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true}) async {
+    DbResult finish(DbResult r) =>
+        _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
+    await ensureInitialized();
+
+    TableSchema? schema;
+    try {
+      schema = await schemaManager?.getTableSchema(tableName);
+      if (schema == null || schema.name.isEmpty) {
+        return finish(DbResult.error(
+          type: ResultType.notFound,
+          message: 'Table $tableName does not exist',
+        ));
+      }
+      final uniqueIndexes =
+          schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+      final pk = schema.primaryKey;
+
+      final successKeys = <String>[];
+      final failedKeys = <String>[];
+      final yieldController =
+          YieldController('DataStoreImpl.batchUpsert', checkInterval: 64);
+
+      for (final record in records) {
+        await yieldController.maybeYield();
+        final err = _validateUpsertRecord(schema, record, uniqueIndexes);
+        if (err != null) {
+          failedKeys.add(record[pk]?.toString() ?? '');
+          if (!allowPartialErrors) {
+            return finish(DbResult.error(
+              type: ResultType.validationFailed,
+              message: err,
+              failedKeys: failedKeys,
+            ));
+          }
+          continue;
+        }
+        final result = await upsertOne(
+          tableName,
+          record,
+          schema,
+          uniqueIndexes,
+          continueOnPartialErrors: allowPartialErrors,
+        );
+        if (result.isSuccess && result.successKeys.isNotEmpty) {
+          successKeys.addAll(result.successKeys);
+        } else if (result.failedKeys.isNotEmpty) {
+          failedKeys.addAll(result.failedKeys);
+          if (!allowPartialErrors) {
+            return finish(DbResult.error(
+              type: result.type,
+              message: result.message,
+              failedKeys: failedKeys,
+            ));
+          }
+        }
+      }
+
+      if (successKeys.isEmpty && failedKeys.isEmpty) {
+        return finish(DbResult.success(
+          message: 'No records to upsert',
+          successKeys: [],
+        ));
+      }
+      return finish(DbResult.batch(
+        successKeys: successKeys,
+        failedKeys: failedKeys,
+      ));
+    } catch (e) {
+      Logger.error('Batch upsert failed: $e', label: 'DataStore.batchUpsert');
+      final failedKeys = <String>[];
+      if (schema != null) {
+        final pk = schema.primaryKey;
+        for (final r in records) {
+          final k = r[pk]?.toString();
+          if (k != null && k.isNotEmpty) failedKeys.add(k);
+        }
+      }
+      return finish(DbResult.error(
+        type: ResultType.dbError,
+        message: 'Batch upsert failed: $e',
+        failedKeys: failedKeys,
+      ));
     }
   }
 
@@ -4757,7 +5109,11 @@ class DataStoreImpl {
   }
 
   /// Switch space
-  Future<bool> switchSpace({String spaceName = 'default'}) async {
+  ///
+  /// [keepActive] When true (default), writes this [spaceName] to
+  /// [GlobalConfig.activeSpace]. When opening with default space, init will use activeSpace so one open lands in the right space.
+  Future<bool> switchSpace(
+      {String spaceName = 'default', bool keepActive = true}) async {
     await ensureInitialized();
 
     if (_currentSpaceName == spaceName) {
@@ -4847,17 +5203,33 @@ class DataStoreImpl {
       // Clear caches
       await cacheManager.onBasePathChanged();
 
-      // Reinitialize database
+      // Reinitialize database; do not apply activeSpace-on-default so switching to default stays default
       _isInitialized = false;
       _baseInitialized = false;
-      await initialize();
+      await initialize(applyActiveSpaceOnDefault: false);
 
-      // Add new space to GlobalConfig
+      // Update GlobalConfig only if there are actual changes to avoid unnecessary IO
       final globalConfig = await getGlobalConfig();
-      if (globalConfig != null &&
-          !globalConfig.spaceNames.contains(spaceName)) {
-        final updatedConfig = globalConfig.addSpace(spaceName);
-        await saveGlobalConfig(updatedConfig);
+      if (globalConfig != null) {
+        bool needsUpdate = false;
+        GlobalConfig updatedConfig = globalConfig;
+
+        // Add space if it doesn't exist
+        if (!globalConfig.spaceNames.contains(spaceName)) {
+          updatedConfig = updatedConfig.addSpace(spaceName);
+          needsUpdate = true;
+        }
+
+        // Update activeSpace only if keepActive is true and it's different
+        if (keepActive && globalConfig.activeSpace != spaceName) {
+          updatedConfig = updatedConfig.copyWith(activeSpace: spaceName);
+          needsUpdate = true;
+        }
+
+        // Save only if there are actual changes
+        if (needsUpdate) {
+          await saveGlobalConfig(updatedConfig);
+        }
       }
 
       Logger.info(
@@ -5642,6 +6014,18 @@ class DataStoreImpl {
     }
   }
 
+  /// List all space names (e.g. for multi-account UI or admin).
+  /// Returns sorted list; at least contains 'default'.
+  Future<List<String>> listSpaces() async {
+    await ensureInitialized();
+    final globalConfig = await getGlobalConfig();
+    if (globalConfig == null || globalConfig.spaceNames.isEmpty) {
+      return ['default'];
+    }
+    final list = List<String>.from(globalConfig.spaceNames)..sort();
+    return list;
+  }
+
   /// Stream records from a table with filtering
   /// This method provides an efficient way to process large datasets by streaming records one at a time
   ///
@@ -5724,37 +6108,97 @@ class DataStoreImpl {
   /// [expression] - The expression AST to evaluate
   /// [record] - The current record containing field values
   /// [schema] - The table schema for field name validation
+  /// [isUpdate] - When true, [Expr.isUpdate]/[Expr.isInsert] resolve accordingly.
   ///
-  /// Returns the computed numeric value.
+  /// Returns the computed value.
   ///
   /// Throws [ArgumentError] if a field reference is invalid or field doesn't exist.
   dynamic _evaluateExpression(
     ExprNode expression,
     Map<String, dynamic> record,
-    TableSchema schema,
-  ) {
-    // Build field name whitelist from schema for security validation
+    TableSchema schema, {
+    bool isUpdate = false,
+  }) {
     final validFieldNames = <String>{
       ...schema.fields.map((f) => f.name),
       schema.primaryKey,
     };
+    return _evaluateExprNode(
+      expression,
+      record,
+      validFieldNames,
+      isUpdate: isUpdate,
+    );
+  }
 
-    return _evaluateExprNode(expression, record, validFieldNames);
+  static bool _toBool(dynamic v) {
+    if (v == null) return false;
+    if (v is bool) return v;
+    if (v is num) return v != 0;
+    if (v is String) return v.isNotEmpty;
+    return true;
   }
 
   /// Recursively evaluates an expression node.
   ///
-  /// This is the core evaluation engine that safely computes expression values
-  /// while validating all field references against the whitelist.
-  ///
-  /// Returns num for numeric expressions, or String for timestamp expressions.
+  /// [isUpdate] - Used by IsUpdate/IsInsert; true when the operation is update.
   dynamic _evaluateExprNode(
     ExprNode node,
     Map<String, dynamic> record,
-    Set<String> validFieldNames,
-  ) {
-    if (node is TimestampExpr) {
-      // Return ISO 8601 timestamp string
+    Set<String> validFieldNames, {
+    bool isUpdate = false,
+  }) {
+    if (node is IsUpdate) {
+      return isUpdate;
+    } else if (node is IsInsert) {
+      return !isUpdate;
+    } else if (node is IfElse) {
+      final cond = _evaluateExprNode(
+        node.condition,
+        record,
+        validFieldNames,
+        isUpdate: isUpdate,
+      );
+      final branch = _toBool(cond) ? node.thenValue : node.elseValue;
+      if (branch is ExprNode) {
+        return _evaluateExprNode(
+          branch,
+          record,
+          validFieldNames,
+          isUpdate: isUpdate,
+        );
+      }
+      return branch;
+    } else if (node is When) {
+      final cond = _evaluateExprNode(
+        node.condition,
+        record,
+        validFieldNames,
+        isUpdate: isUpdate,
+      );
+      if (_toBool(cond)) {
+        final v = node.value;
+        if (v is ExprNode) {
+          return _evaluateExprNode(
+            v,
+            record,
+            validFieldNames,
+            isUpdate: isUpdate,
+          );
+        }
+        return v;
+      }
+      final o = node.otherwise;
+      if (o is ExprNode) {
+        return _evaluateExprNode(
+          o,
+          record,
+          validFieldNames,
+          isUpdate: isUpdate,
+        );
+      }
+      return o;
+    } else if (node is TimestampExpr) {
       return DateTime.now().toIso8601String();
     } else if (node is FieldRef) {
       // Validate field name against whitelist to prevent injection
@@ -5789,8 +6233,18 @@ class DataStoreImpl {
     } else if (node is Constant) {
       return node.value;
     } else if (node is BinaryOp) {
-      final left = _evaluateExprNode(node.left, record, validFieldNames);
-      final right = _evaluateExprNode(node.right, record, validFieldNames);
+      final left = _evaluateExprNode(
+        node.left,
+        record,
+        validFieldNames,
+        isUpdate: isUpdate,
+      );
+      final right = _evaluateExprNode(
+        node.right,
+        record,
+        validFieldNames,
+        isUpdate: isUpdate,
+      );
 
       switch (node.op) {
         case BinaryOperator.add:
@@ -5823,7 +6277,12 @@ class DataStoreImpl {
           return left > right ? left : right;
       }
     } else if (node is UnaryOp) {
-      final operand = _evaluateExprNode(node.operand, record, validFieldNames);
+      final operand = _evaluateExprNode(
+        node.operand,
+        record,
+        validFieldNames,
+        isUpdate: isUpdate,
+      );
 
       switch (node.op) {
         case UnaryOperator.negate:
@@ -5832,9 +6291,13 @@ class DataStoreImpl {
           return operand.abs();
       }
     } else if (node is FunctionCall) {
-      // Evaluate all arguments first
       final args = node.arguments
-          .map((arg) => _evaluateExprNode(arg, record, validFieldNames))
+          .map((arg) => _evaluateExprNode(
+                arg,
+                record,
+                validFieldNames,
+                isUpdate: isUpdate,
+              ))
           .toList();
 
       switch (node.functionName) {

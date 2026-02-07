@@ -223,6 +223,26 @@ final db = await ToStore.open(
 await db.switchSpace(spaceName: 'user_123');
 ```
 
+### Keeping login state and logout (active space)
+
+Multi-space works well for **per-user data**: use one space per user and switch when the user logs in. To keep the current user across app restarts and to support logout, use **active space** and **close** options.
+
+- **Keeping login state**: When the user switches to their space, save it as the active space so the next launch opens in that space by default (no need to "open default then switch").
+- **Logout**: When the user logs out, close the database with `keepActiveSpace: false` so the next launch does not auto-open in the previous user's space.
+
+```dart
+
+// After login: switch to this user's space and remember it for next launch (keep login state)
+await db.switchSpace(spaceName: 'user_${userId}', keepActive: true);
+
+// Optional: open strictly in default (e.g. login screen only) — do not use stored active space
+// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
+
+// On logout: close and clear active space so next launch uses default space (logout)
+await db.close(keepActiveSpace: false);
+```
+
+
 ## Server-Side Integration
 
 🖥️ **Example**: [server_quickstart.dart](example/lib/server_quickstart.dart)
@@ -344,13 +364,28 @@ final customResult = await db.query('users')
 ```
 
 ### Intelligent Upsert
-Update if exists, otherwise insert.
+Update if a row exists (by primary key or unique key in data), otherwise insert. No where clause; conflict target is derived from data.
 
 ```dart
-await db.upsert('users', {
+// By primary key
+final result = await db.upsert('users', {
+  'id': 1,
+  'username': 'john',
   'email': 'john@example.com',
-  'name': 'John New'
-}).where('email', '=', 'john@example.com');
+});
+
+// By unique key (record must contain all fields of one unique index + required fields)
+await db.upsert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+  'age': 26,
+});
+
+// Batch upsert
+final batchResult = await db.batchUpsert('users', [
+  {'username': 'a', 'email': 'a@example.com'},
+  {'username': 'b', 'email': 'b@example.com'},
+], allowPartialErrors: true);
 ```
 
 
@@ -575,6 +610,26 @@ await db.update('users', {
 }).where('id', '=', userId);
 ```
 
+**Conditional expressions (e.g. for upsert)**: Use `Expr.isUpdate()` / `Expr.isInsert()` with `Expr.ifElse` or `Expr.when` so that expressions run only on update or only on insert:
+
+```dart
+// Upsert: increment on update, set to 1 on insert (insert branch uses plain value; only update evaluates expression)
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(
+    Expr.isUpdate(),
+    Expr.field('count') + Expr.value(1),
+    1,  // insert branch: plain value, not evaluated by insert
+  ),
+});
+
+// Same with Expr.when (single-branch, otherwise defaults to null)
+await db.upsert('orders', {
+  'id': orderId,
+  'updatedAt': Expr.when(Expr.isUpdate(), Expr.now(), otherwise: Expr.now()),
+});
+```
+
 ## Transactions
 
 Transactions ensure the atomicity of multiple operations—either all succeed or all roll back, guaranteeing data consistency.
@@ -656,6 +711,27 @@ final db = await ToStore.open(
 );
 ```
 
+### Value-level encryption (ToCrypto)
+
+Full-database encryption above encrypts all table and index data and can affect overall performance. To encrypt only sensitive fields, use **ToCrypto**: it is independent of the database (no db instance required). You encode or decode values yourself before writing or after reading; the key is managed entirely by your app. Output is Base64, suitable for JSON or TEXT columns.
+
+- **key** (required): `String` or `Uint8List`. If not 32 bytes, a 32-byte key is derived via SHA-256.
+- **type** (optional): Encryption type, [ToCryptoType]: [ToCryptoType.chacha20Poly1305] or [ToCryptoType.aes256Gcm]. Default [ToCryptoType.chacha20Poly1305]. Omit for default.
+- **aad** (optional): Additional Authenticated Data — `Uint8List`. If you pass it at encode, you must pass the same bytes at decode (e.g. table name + field name for context binding). Omit for simple use.
+
+```dart
+
+const key = 'my-secret-key';
+// Encode: plain → Base64 cipher (store in DB or JSON)
+final cipher = ToCrypto.encode('sensitive data', key: key);
+// Decode when reading
+final plain = ToCrypto.decode(cipher, key: key);
+
+// Optional: bind cipher to context with aad (same aad at encode and decode)
+final aad = Uint8List.fromList(utf8.encode('users:id_number'));
+final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
+final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
+```
 
 ## Performance & Experience
 

@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
@@ -15,7 +16,7 @@ void main() async {
     onLogHandler: (message, type, label) {
       // 1. Suppress expected Non-Nullable Constraint warnings
       if (type == LogType.warn &&
-          (message.contains('Field email is required but not provided') ||
+          (message.contains('Field email is required and cannot be null') ||
               message.contains('Data validation failed for table users'))) {
         return;
       }
@@ -400,6 +401,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           _isInitializing = false;
           _lastOperationInfo =
               'DB Initialized: ${stopwatch.elapsedMilliseconds}ms';
+          _selectedSpace = widget.example.db.currentSpaceName ?? 'default';
         });
         // Fetch data if the data view is active
         if (_selectedView == AppView.dataView) {
@@ -1575,7 +1577,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         if (value.startsWith('switch_space_')) {
           final newSpace = value.substring('switch_space_'.length);
           if (newSpace != _selectedSpace) {
-            await widget.example.db.switchSpace(spaceName: newSpace);
+            await widget.example.db
+                .switchSpace(spaceName: newSpace, keepActive: true);
             setState(() {
               _selectedSpace = newSpace;
               _activeFilters.clear();

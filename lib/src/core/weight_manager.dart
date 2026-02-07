@@ -266,7 +266,8 @@ class WeightManager {
         }
 
         // Initialize index weights
-        final indexes = schema.getAllIndexes();
+        final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+        if (indexes == null) return;
         for (final index in indexes) {
           await yieldController.maybeYield();
           final indexKey = _getIndexDataKey(tableName, index.actualIndexName);

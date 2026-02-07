@@ -536,9 +536,16 @@ class TableSchema {
   }
 
   /// Validate data against table schema
-  /// If [applyConstraints] is true, it will modify the data to fit constraints (e.g., truncate strings)
-  Map<String, dynamic>? validateData(Map<String, dynamic> data,
-      {bool applyConstraints = false}) {
+  ///
+  /// - When [applyConstraints] is true, it will modify the data to fit
+  ///   constraints (e.g., truncate strings).
+  /// - When [errors] is provided, detailed validation error messages will be
+  ///   appended to it instead of only logging via [Logger].
+  Map<String, dynamic>? validateData(
+    Map<String, dynamic> data, {
+    bool applyConstraints = false,
+    List<String>? errors,
+  }) {
     // Create a new result Map
     var result = Map<String, dynamic>.from(data);
 
@@ -557,23 +564,29 @@ class TableSchema {
         result[primaryKeyName] = primaryKeyValue.trim();
       } else {
         // Unsupported type
+        final msg =
+            'Invalid primary key $primaryKeyName value type: $primaryKeyValue (should be number or string type)';
         Logger.warn(
-          'Invalid primary key $primaryKeyName value type: $primaryKeyValue (Should be number or string type)',
+          msg,
           label: 'TableSchema.validateData',
         );
+        errors?.add(msg);
         return null;
       }
     }
 
-    // Check required fields
+    // Check required (non-nullable) fields
     for (var field in fields) {
       if (!field.nullable &&
           !data.containsKey(field.name) &&
           field.name != primaryKeyName) {
+        final msg =
+            'Field ${field.name} is required but not provided for table $name';
         Logger.warn(
-          'Field ${field.name} is required but not provided',
+          msg,
           label: 'TableSchema.validateData',
         );
+        errors?.add(msg);
         return null;
       }
     }
@@ -589,9 +602,19 @@ class TableSchema {
         orElse: () => throw ArgumentError('Unknown field ${entry.key}'),
       );
 
-      // Use FieldSchema's validateValue method
-      if (!fieldSchema.validateValue(entry.value,
-          skipMaxLengthCheck: applyConstraints)) {
+      // Use FieldSchema's detailed validation helper to get error message
+      final fieldError = fieldSchema.getValidationError(
+        entry.value,
+        skipMaxLengthCheck: applyConstraints,
+      );
+      if (fieldError != null) {
+        final msg =
+            'Field ${fieldSchema.name} validation failed: $fieldError (table $name)';
+        Logger.warn(
+          msg,
+          label: 'TableSchema.validateData',
+        );
+        errors?.add(msg);
         return null;
       }
 
@@ -1413,15 +1436,22 @@ class FieldSchema {
     }
   }
 
-  /// Validate value against field constraints
-  bool validateValue(dynamic value, {bool skipMaxLengthCheck = false}) {
+  /// Get detailed validation error message for a value.
+  ///
+  /// Returns `null` when the value is valid, otherwise returns a human-readable
+  /// description of which constraint failed. This is designed for single-record
+  /// validation and does not perform any table-wide scan.
+  String? getValidationError(
+    dynamic value, {
+    bool skipMaxLengthCheck = false,
+  }) {
     if (value == null && !nullable) {
-      return false;
+      return 'Field $name is required and cannot be null';
     }
 
     // Check data type
     if (!isValidDataType(value, type)) {
-      return false;
+      return 'Field $name expects type $type but got ${value.runtimeType}';
     }
 
     // Check string length constraints
@@ -1429,24 +1459,33 @@ class FieldSchema {
       if (!skipMaxLengthCheck &&
           maxLength != null &&
           value.length > maxLength!) {
-        return false;
+        return 'Field $name length ${value.length} exceeds maxLength $maxLength';
       }
       if (minLength != null && value.length < minLength!) {
-        return false;
+        return 'Field $name length ${value.length} is less than minLength $minLength';
       }
     }
 
     // Check numeric value constraints
     if (value is num) {
       if (minValue != null && value < minValue!) {
-        return false;
+        return 'Field $name value $value is less than minValue $minValue';
       }
       if (maxValue != null && value > maxValue!) {
-        return false;
+        return 'Field $name value $value exceeds maxValue $maxValue';
       }
     }
 
-    return true;
+    return null;
+  }
+
+  /// Validate value against field constraints
+  bool validateValue(dynamic value, {bool skipMaxLengthCheck = false}) {
+    return getValidationError(
+          value,
+          skipMaxLengthCheck: skipMaxLengthCheck,
+        ) ==
+        null;
   }
 
   /// Validate value for update operation against field constraints
@@ -2234,35 +2273,11 @@ enum VectorPrecision {
   int8,
 }
 
-/// Vector index type for future use
+/// Vector index type.
 ///
-/// Specifies the algorithm used for vector indexing and similarity search.
-/// Different types offer various trade-offs between build time, query time,
-/// memory usage, and accuracy.
 enum VectorIndexType {
-  /// Flat index (brute force)
-  ///
-  /// Performs exhaustive search for exact nearest neighbors
-  /// Best accuracy but slowest for large datasets
-  flat,
-
-  /// Inverted file index
-  ///
-  /// Uses quantization and inverted file structure for faster search
-  /// Good balance of speed and accuracy
-  ivf,
-
-  /// Hierarchical navigable small world
-  ///
-  /// Graph-based index structure for efficient approximate nearest neighbor search
-  /// Excellent search speed with high recall
-  hnsw,
-
-  /// Product quantization
-  ///
-  /// Compresses vectors using product quantization for memory-efficient storage
-  /// Allows for memory-efficient similarity search
-  pq,
+  /// NGH (Node-Graph Hybrid)
+  ngh,
 }
 
 /// Vector distance metric for similarity calculations
@@ -2296,9 +2311,7 @@ enum VectorDistanceMetric {
 /// Configures how vector indexes are built and searched.
 /// This is used with [IndexSchema] when the index type is [IndexType.vector].
 class VectorIndexConfig {
-  /// Type of vector index
-  ///
-  /// Specifies the algorithm used for indexing vectors
+  /// Type of vector index.current only support [VectorIndexType.ngh].
   final VectorIndexType indexType;
 
   /// Distance metric for similarity search
@@ -2308,18 +2321,12 @@ class VectorIndexConfig {
 
   /// Additional index parameters
   ///
-  /// Algorithm-specific parameters to fine-tune the index behavior
-  /// Common parameters:
-  /// - 'M': (for HNSW) Maximum number of connections per layer
-  /// - 'efConstruction': (for HNSW) Controls index build quality
-  /// - 'efSearch': (for HNSW) Controls search accuracy/speed trade-off
-  /// - 'nlist': (for IVF) Number of clusters/cells
-  /// - 'nprobe': (for IVF) Number of cells to visit during search
+  /// Algorithm-specific parameters to fine-tune the index behavior.
   final Map<String, dynamic> parameters;
 
   /// Constructor
   const VectorIndexConfig({
-    this.indexType = VectorIndexType.flat,
+    this.indexType = VectorIndexType.ngh,
     this.distanceMetric = VectorDistanceMetric.cosine,
     this.parameters = const {},
   });
@@ -2335,21 +2342,11 @@ class VectorIndexConfig {
 
   /// Create from JSON
   factory VectorIndexConfig.fromJson(Map<String, dynamic> json) {
-    // Parse index type
     VectorIndexType getIndexType() {
       final typeStr = json['indexType'] as String?;
-      if (typeStr == null) return VectorIndexType.flat;
-
-      switch (typeStr.toLowerCase()) {
-        case 'ivf':
-          return VectorIndexType.ivf;
-        case 'hnsw':
-          return VectorIndexType.hnsw;
-        case 'pq':
-          return VectorIndexType.pq;
-        default:
-          return VectorIndexType.flat;
-      }
+      if (typeStr == null) return VectorIndexType.ngh;
+      if (typeStr.toLowerCase() == 'ngh') return VectorIndexType.ngh;
+      return VectorIndexType.ngh;
     }
 
     // Parse distance metric

@@ -221,8 +221,28 @@ final db = await ToStore.open(
 
 // 多空间架构 - 完美隔离不同用户数据
 await db.switchSpace(spaceName: 'user_123');
-
 ```
+
+### 保持登录状态与退出登录（活跃空间）
+
+多空间适合**按用户隔离数据**：每用户一个空间，登录时切换。通过**活跃空间**与**关闭选项**，可保持当前用户到下次启动，并支持退出登录。
+
+- **保持登录状态**：用户切换到自己的空间后，将其记为活跃空间，下次启动时用 default 打开即可直接进入该空间，无需「先开 default 再切换」。
+- **退出登录**：用户退出时，使用 `keepActiveSpace: false` 关闭数据库，下次启动不会自动进入上一用户空间。
+
+```dart
+
+// 登录后：切换到该用户空间并记为活跃空间（保持登录状态）
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
+
+// 可选：仅需严格使用 default 时（如仅登录页）—— 不使用已保存的活跃空间
+// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
+
+// 退出登录：关闭并清除活跃空间，下次启动使用 default 空间
+await db.close(keepActiveSpace: false);
+```
+
+
 
 ## 服务端集成
 
@@ -344,13 +364,28 @@ final customResult = await db.query('users')
 ```
 
 ### 智能存储 (Upsert)
-存在则更新，不存在则插入。
+根据 data 中的主键或唯一键判断：存在则更新，不存在则插入。不支持 where，冲突目标由 data 决定。
 
 ```dart
-await db.upsert('users', {
+// 按主键
+final result = await db.upsert('users', {
+  'id': 1,
+  'username': 'john',
   'email': 'john@example.com',
-  'name': 'John New'
-}).where('email', '=', 'john@example.com');
+});
+
+// 按唯一键（记录须包含某一唯一索引的全部字段及必填字段）
+await db.upsert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+  'age': 26,
+});
+
+// 批量 upsert
+final batchResult = await db.batchUpsert('users', [
+  {'username': 'a', 'email': 'a@example.com'},
+  {'username': 'b', 'email': 'b@example.com'},
+], allowPartialErrors: true);
 ```
 
 
@@ -575,6 +610,26 @@ await db.update('users', {
 }).where('id', '=', userId);
 ```
 
+**条件判断（如 upsert 中区分更新/插入）**：使用 `Expr.isUpdate()` / `Expr.isInsert()` 配合 `Expr.ifElse` 或 `Expr.when`，使表达式仅在更新或仅在插入时执行：
+
+```dart
+// Upsert：更新时自增，插入时设为 1（插入分支用普通值即可，仅更新路径会求值表达式）
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(
+    Expr.isUpdate(),
+    Expr.field('count') + Expr.value(1),
+    1,  // 插入分支：字面量，insert 不会对其做表达式求值
+  ),
+});
+
+// 使用 Expr.when（单分支，否则为 null）
+await db.upsert('orders', {
+  'id': orderId,
+  'updatedAt': Expr.when(Expr.isUpdate(), Expr.now(), otherwise: Expr.now()),
+});
+```
+
 ## 事务操作
 
 事务确保多个操作的原子性，要么全部成功，要么全部回滚，保证数据一致性：
@@ -656,6 +711,26 @@ final db = await ToStore.open(
 );
 ```
 
+### 价值级加密（ToCrypto）
+
+上文的全库加密会加密所有表与索引数据，可能影响整体性能。若只需加密部分敏感字段，可使用 **ToCrypto**：与数据库解耦（无需 db 实例），在写入前或读取后自行对值进行编码/解码，密钥由应用完全管理。输出为 Base64，适合存入 JSON 或 TEXT 列。
+
+- **key**（必填）：`String` 或 `Uint8List`。若非 32 字节，将用 SHA-256 派生为 32 字节。
+- **type**（可选）：加密类型 [ToCryptoType]： [ToCryptoType.chacha20Poly1305] 或 [ToCryptoType.aes256Gcm]。默认 [ToCryptoType.chacha20Poly1305]。不传则使用默认。
+- **aad**（可选）：附加认证数据，类型为 `Uint8List`。若在编码时传入，解码时必须传入相同字节（例如表名+字段名做上下文绑定）；简单用法可不传。
+
+```dart
+const key = 'my-secret-key';
+// 编码：明文 → Base64 密文（可存入 DB 或 JSON）
+final cipher = ToCrypto.encode('sensitive data', key: key);
+// 读取时解码
+final plain = ToCrypto.decode(cipher, key: key);
+
+// 可选：用 aad 绑定上下文（编码与解码须使用相同 aad）
+final aad = Uint8List.fromList(utf8.encode('users:id_number'));
+final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
+final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
+```
 
 ## 性能与体验
 

@@ -1761,6 +1761,7 @@ final class IndexTreePartitionManager {
     int effectiveOffset = offset ?? 0;
     int remaining = (limit == null || limit <= 0) ? 1 << 30 : limit;
     final out = <String>[];
+    Uint8List? lastKey;
 
     TreePagePtr leafPtr;
     if (reverse) {
@@ -1862,7 +1863,7 @@ final class IndexTreePartitionManager {
           final k = leaf.keys[i];
           if (endKeyExclusive.isNotEmpty &&
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
-            return IndexSearchResult(primaryKeys: out);
+            return IndexSearchResult(primaryKeys: out, lastKey: lastKey);
           }
           if (effectiveOffset > 0) {
             effectiveOffset--;
@@ -1871,6 +1872,7 @@ final class IndexTreePartitionManager {
           final pk = _extractPk(meta, k, leaf.values[i]);
           if (pk != null) {
             out.add(pk);
+            lastKey = Uint8List.fromList(k);
             remaining--;
           }
         }
@@ -1880,12 +1882,10 @@ final class IndexTreePartitionManager {
         for (; i >= 0 && remaining > 0; i--) {
           final k = leaf.keys[i];
           if (MemComparableKey.compare(k, startKeyInclusive) < 0) {
-            // We are before start; stop.
-            return IndexSearchResult(primaryKeys: out);
+            return IndexSearchResult(primaryKeys: out, lastKey: lastKey);
           }
           if (endKeyExclusive.isNotEmpty &&
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
-            // Skip keys beyond end.
             continue;
           }
           if (effectiveOffset > 0) {
@@ -1895,6 +1895,7 @@ final class IndexTreePartitionManager {
           final pk = _extractPk(meta, k, leaf.values[i]);
           if (pk != null) {
             out.add(pk);
+            lastKey = Uint8List.fromList(k);
             remaining--;
           }
         }
@@ -1902,7 +1903,7 @@ final class IndexTreePartitionManager {
       }
     }
 
-    return IndexSearchResult(primaryKeys: out);
+    return IndexSearchResult(primaryKeys: out, lastKey: lastKey);
   }
 
   String? _extractPk(IndexMeta meta, Uint8List key, Uint8List value) {

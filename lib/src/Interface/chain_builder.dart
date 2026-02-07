@@ -6,7 +6,6 @@ import '../query/query_condition.dart';
 import '../Interface/future_builder_mixin.dart';
 import '../model/db_result.dart';
 import '../model/expr.dart';
-import '../model/result_type.dart';
 import '../model/join_clause.dart';
 import '../model/query_result.dart';
 import '../query/query_cache.dart';
@@ -14,7 +13,6 @@ import '../query/query_executor.dart';
 
 part '../chain/delete_builder.dart';
 part '../chain/update_builder.dart';
-part '../chain/upsert_builder.dart';
 part '../chain/query_builder.dart';
 
 /// chain builder base class

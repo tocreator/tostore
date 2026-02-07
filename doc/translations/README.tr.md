@@ -223,6 +223,25 @@ final db = await ToStore.open(
 await db.switchSpace(spaceName: 'user_123');
 ```
 
+### Oturum durumunu koruma ve çıkış (aktif alan)
+
+Çok alan, **kullanıcı başına veri** için uygundur: kullanıcı başına bir alan ve girişte geçiş. **Aktif alan** ve **close** seçeneği ile yeniden başlatmalardan sonra mevcut kullanıcı korunur ve çıkış desteklenir.
+
+- **Oturum durumunu koruma**: Kullanıcı kendi alanına geçtiğinde bunu aktif alan olarak kaydedin; bir sonraki açılışta default ile doğrudan bu alan açılır («önce default aç sonra geç» gerekmez).
+- **Çıkış**: Çıkışta veritabanını `keepActiveSpace: false` ile kapatın; bir sonraki açılışta önceki kullanıcının alanı otomatik açılmaz.
+
+```dart
+
+// Girişten sonra: bu kullanıcının alanına geç ve bir sonraki açılış için hatırla (oturumu koru)
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
+
+// İsteğe bağlı: yalnızca default ile açmak için (örn. yalnızca giriş ekranı) — kayıtlı aktif alan kullanılmaz
+// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
+
+// Çıkışta: kapat ve aktif alanı temizle, bir sonraki açılış default alanı kullansın
+await db.close(keepActiveSpace: false);
+```
+
 ## Sunucu Tarafı Entegrasyonu
 
 🖥️ **Örnek**: [server_quickstart.dart](example/lib/server_quickstart.dart)
@@ -346,10 +365,14 @@ final customResult = await db.query('users')
 Varsa güncelle, yoksa ekle.
 
 ```dart
-await db.upsert('users', {
-  'email': 'john@example.com',
-  'name': 'John New'
-}).where('email', '=', 'john@example.com');
+// By primary key or unique key in data (no where)
+final result = await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
+await db.upsert('users', {'username': 'john', 'email': 'john@example.com', 'age': 26});
+// Batch upsert
+await db.batchUpsert('users', [
+  {'username': 'a', 'email': 'a@example.com'},
+  {'username': 'b', 'email': 'b@example.com'},
+], allowPartialErrors: true);
 ```
 
 
@@ -650,6 +673,26 @@ final db = await ToStore.open(
 );
 ```
 
+### Değer düzeyinde şifreleme (ToCrypto)
+
+Yukarıdaki veritabanı genelinde şifreleme tüm tablo ve indeks verilerini şifreler ve genel performansı etkileyebilir. Yalnızca hassas alanları şifrelemek için **ToCrypto** kullanın: veritabanından bağımsızdır (db örneği gerekmez). Yazmadan önce veya okuduktan sonra değerleri kendiniz kodlar/dekodlarsınız; anahtar tamamen uygulamanız tarafından yönetilir. Çıktı Base64’tür, JSON veya TEXT sütunları için uygundur.
+
+- **key** (zorunlu): `String` veya `Uint8List`. 32 bayt değilse SHA-256 ile 32 bayt anahtar türetilir.
+- **type** (isteğe bağlı): Şifreleme türü [ToCryptoType]: [ToCryptoType.chacha20Poly1305] veya [ToCryptoType.aes256Gcm]. Varsayılan [ToCryptoType.chacha20Poly1305]. Varsayılan için atlayın.
+- **aad** (isteğe bağlı): Ek kimlik doğrulama verisi — `Uint8List`. Kodlama sırasında verilmişse, çözümleme sırasında aynı baytları vermeniz gerekir (örn. bağlam bağlamak için tablo adı + alan adı). Basit kullanımda atlayabilirsiniz.
+
+```dart
+const key = 'my-secret-key';
+// Kodlama: düz metin → Base64 şifre (DB veya JSON’a kaydet)
+final cipher = ToCrypto.encode('sensitive data', key: key);
+// Okurken çöz
+final plain = ToCrypto.decode(cipher, key: key);
+
+// İsteğe bağlı: aad ile bağlam bağlama (kodlama ve çözümlemede aynı aad)
+final aad = Uint8List.fromList(utf8.encode('users:id_number'));
+final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
+final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
+```
 
 ## Performans ve Deneyim
 

@@ -446,7 +446,10 @@ class ParallelJournalManager {
 
             if (schema != null) {
               // defined indexes (explicit + implicit unique/fk)
-              for (final idx in schema.getAllIndexes()) {
+              final allIndexes =
+                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                      <IndexSchema>[];
+              for (final idx in allIndexes) {
                 final idxName = idx.actualIndexName;
                 indexNames.add(idxName);
 
@@ -628,7 +631,10 @@ class ParallelJournalManager {
                 // Execute Table Write and Index Write in Parallel
                 // Compute per-table token budgets (data vs indexes) from planned batch plan.
                 // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
-                final indexesForBudget = schema.getAllIndexes().toList();
+                final indexesForBudget =
+                    (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                            <IndexSchema>[])
+                        .toList();
                 final split = IoConcurrencyPlanner.splitPerTableBudget(
                   perTableTokens: perTableTokenBudget,
                   indexCount: indexesForBudget.length,
@@ -1710,10 +1716,11 @@ class ParallelJournalManager {
             await _dataStore.schemaManager?.getTableSchema(tableName);
         if (schema == null) continue;
 
-        final allIndexes = schema
-            .getAllIndexes()
-            .map((i) => i.actualIndexName)
-            .toList(growable: false);
+        final allIndexes =
+            (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                    <IndexSchema>[])
+                .map((i) => i.actualIndexName)
+                .toList(growable: false);
         if (allIndexes.isEmpty) continue;
 
         final flushedForTable = flushedIndexes[tableName] ?? const <String>{};
@@ -1962,7 +1969,9 @@ class ParallelJournalManager {
     final baseIndexTotalSizeInBytes = <String, int>{};
     try {
       if (schema != null) {
-        for (final idx in schema.getAllIndexes()) {
+        final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+            <IndexSchema>[];
+        for (final idx in allIndexes) {
           final idxName = idx.actualIndexName;
           indexNames.add(idxName);
           final idxMeta =
@@ -2323,8 +2332,10 @@ class ParallelJournalManager {
       if (schema == null) return refs;
 
       // Unique indexes from schema (implicit/explicit)
-      for (final idx in schema.getAllIndexes()) {
-        if (!idx.unique) continue;
+      final allIndexes =
+          _dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+              <IndexSchema>[];
+      for (final idx in allIndexes) {
         // Skip primary key check usually not needed if getAllIndexes doesn't include it or if we handle it
         if (idx.fields.length == 1 && idx.fields.first == schema.primaryKey) {
           continue;

@@ -112,7 +112,7 @@ class MigrationManager {
 
           // Compare possible structure changes after renaming
           final schemaOperations =
-              _compareSchemasAndGenerateOperations(oldSchema, newSchema);
+              await _compareSchemasAndGenerateOperations(oldSchema, newSchema);
 
           // Merge operations
           operations.addAll(schemaOperations);
@@ -524,7 +524,7 @@ class MigrationManager {
 
     // Compare schemas and generate operations
     final operations =
-        _compareSchemasAndGenerateOperations(oldSchema, newSchema);
+        await _compareSchemasAndGenerateOperations(oldSchema, newSchema);
 
     if (operations.isEmpty) {
       return null;
@@ -889,13 +889,31 @@ class MigrationManager {
   }
 
   /// Compare schemas and generate operations
-  List<MigrationOperation> _compareSchemasAndGenerateOperations(
+  Future<List<MigrationOperation>> _compareSchemasAndGenerateOperations(
     TableSchema oldSchema,
     TableSchema newSchema,
-  ) {
+  ) async {
     if (oldSchema.isGlobal != newSchema.isGlobal) {
-      throw Exception(
-          'Changing the "isGlobal" property for an existing table (${newSchema.name}) is not supported. This operation requires complex data migration between spaces and the global scope, which must be handled manually.');
+      final tableName = newSchema.name;
+      final recordCount =
+          await _dataStore.tableDataManager.getTableRecordCount(tableName);
+
+      if (recordCount != 0) {
+        Logger.warn(
+          'Attempted to change "isGlobal" for table $tableName with existing data (recordCount=$recordCount). '
+          'This requires complex data migration between spaces and the global scope and is therefore rejected.',
+          label: 'MigrationManager._compareSchemasAndGenerateOperations',
+        );
+        throw Exception(
+            'Changing the "isGlobal" property for an existing table ($tableName) with existing data is not supported. '
+            'Please perform the data migration manually, or clear the table before changing "isGlobal".');
+      }
+
+      Logger.info(
+        'Table $tableName has no data (recordCount=0), allowing "isGlobal" change '
+        'from ${oldSchema.isGlobal} to ${newSchema.isGlobal}.',
+        label: 'MigrationManager._compareSchemasAndGenerateOperations',
+      );
     }
     final operations = <MigrationOperation>[];
 

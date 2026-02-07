@@ -463,12 +463,12 @@ class ServerCRUDExamples {
       'price': 1199.99,
     }).where('name', '=', 'Laptop Pro');
 
-    // Upsert product (insert or update)
+    // Upsert product (insert or update by unique key in data)
     await _db.upsert('products', {
       'name': 'Laptop Pro',
       'price': 1099.99,
       'stock': 45,
-    }).where('name', '=', 'Laptop Pro');
+    });
   }
 
   /// Global settings examples

@@ -143,8 +143,7 @@ class MobileQuickStart {
 
   /// Set a global setting value (shared across spaces).
   static Future<DbResult> setSetting(String key, String value) {
-    return db.upsert('settings', {'key': key, 'value': value}).where(
-        'key', '=', key);
+    return db.upsert('settings', {'key': key, 'value': value});
   }
 
   /// Get a global setting value; returns null if not exists.

@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import '../handler/memcomparable.dart';
 import '../handler/encoder.dart';
+import '../handler/platform_byte_data.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
 
@@ -257,8 +258,8 @@ final class PartitionMetaPage {
     bd.setUint16(6, 0, Endian.little); // flags
     bd.setInt32(8, partitionNo, Endian.little);
     bd.setInt32(12, 0, Endian.little); // reserved
-    bd.setInt64(16, totalEntries, Endian.little);
-    bd.setInt64(24, fileSizeInBytes, Endian.little);
+    PlatformByteData.setInt64(bd, 16, totalEntries, Endian.little);
+    PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
     // [32..] reserved for future fields.
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
@@ -273,8 +274,8 @@ final class PartitionMetaPage {
     final v = bd.getUint16(4, Endian.little);
     if (v <= 0) return null;
     final pNo = bd.getInt32(8, Endian.little);
-    final total = bd.getInt64(16, Endian.little);
-    final size = bd.getInt64(24, Endian.little);
+    final total = PlatformByteData.getInt64(bd, 16, Endian.little);
+    final size = PlatformByteData.getInt64(bd, 24, Endian.little);
     int freeHead = -1;
     int freeCount = 0;
     if (bytes.length >= 40) {

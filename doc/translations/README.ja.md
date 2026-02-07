@@ -223,6 +223,25 @@ final db = await ToStore.open(
 await db.switchSpace(spaceName: 'user_123');
 ```
 
+### ログイン状態の保持とログアウト（アクティブスペース）
+
+マルチスペースは**ユーザーごとのデータ**分離に最適です。ユーザーごとに1つのスペースを使い、ログイン時に切り替えます。**アクティブスペース**と**close オプション**で、再起動後も現在のユーザーを保持し、ログアウトにも対応できます。
+
+- **ログイン状態の保持**: ユーザーが自分のスペースに切り替えたら、そのスペースをアクティブとして保存し、次回起動時に default で開けばそのスペースに直接入ります（「default を開いてから切り替え」は不要）。
+- **ログアウト**: ログアウト時は `keepActiveSpace: false` でデータベースを閉じると、次回起動時に前のユーザーのスペースが自動で開かなくなります。
+
+```dart
+
+// ログイン後: このユーザーのスペースに切り替え、次回起動用に記憶（ログイン状態の保持）
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
+
+// オプション: 厳密に default のみで開く場合（例: ログイン画面のみ）— 保存されたアクティブスペースを使わない
+// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
+
+// ログアウト時: 閉じてアクティブスペースをクリアし、次回起動は default スペース
+await db.close(keepActiveSpace: false);
+```
+
 ## サーバーサイド統合
 
 🖥️ **サンプル**: [server_quickstart.dart](example/lib/server_quickstart.dart)
@@ -345,10 +364,14 @@ final customResult = await db.query('users')
 存在すれば更新、存在しなければ挿入。
 
 ```dart
-await db.upsert('users', {
-  'email': 'john@example.com',
-  'name': 'John New'
-}).where('email', '=', 'john@example.com');
+// By primary key or unique key in data (no where)
+final result = await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
+await db.upsert('users', {'username': 'john', 'email': 'john@example.com', 'age': 26});
+// Batch upsert
+await db.batchUpsert('users', [
+  {'username': 'a', 'email': 'a@example.com'},
+  {'username': 'b', 'email': 'b@example.com'},
+], allowPartialErrors: true);
 ```
 
 
@@ -653,6 +676,26 @@ final db = await ToStore.open(
 );
 ```
 
+### 価値レベル暗号化（ToCrypto）
+
+上記のデータベース全体の暗号化は、すべてのテーブルとインデックスを暗号化するため、全体のパフォーマンスに影響する場合があります。機密フィールドのみを暗号化する場合は **ToCrypto** を使用してください。データベースに依存せず（db インスタンス不要）、書き込み前または読み取り後に自分で値をエンコード/デコードします。キーはアプリで完全に管理します。出力は Base64 で、JSON や TEXT 列に保存できます。
+
+- **key**（必須）：`String` または `Uint8List`。32 バイトでない場合は SHA-256 で 32 バイトに派生します。
+- **type**（任意）：暗号化タイプ [ToCryptoType]： [ToCryptoType.chacha20Poly1305] または [ToCryptoType.aes256Gcm]。デフォルト [ToCryptoType.chacha20Poly1305]。省略時はデフォルトを使用。
+- **aad**（任意）：追加認証データ、`Uint8List`。エンコード時に指定した場合は、デコード時にも同じバイト列を指定してください（例：テーブル名+フィールド名でコンテキストをバインド）。簡単な用途では省略可能です。
+
+```dart
+const key = 'my-secret-key';
+// エンコード：平文 → Base64 暗号文（DB や JSON に保存可能）
+final cipher = ToCrypto.encode('sensitive data', key: key);
+// 読み取り時にデコード
+final plain = ToCrypto.decode(cipher, key: key);
+
+// 任意：aad でコンテキストをバインド（エンコード・デコードで同じ aad を使用）
+final aad = Uint8List.fromList(utf8.encode('users:id_number'));
+final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
+final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
+```
 
 ## 性能と体験
 

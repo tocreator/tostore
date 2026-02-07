@@ -223,6 +223,25 @@ final db = await ToStore.open(
 await db.switchSpace(spaceName: 'user_123');
 ```
 
+### Mantener estado de sesión y cierre de sesión (espacio activo)
+
+El multi-espacio encaja bien para **datos por usuario**: un espacio por usuario y cambiar al iniciar sesión. Con el **espacio activo** y las opciones de **close** puedes mantener al usuario actual entre reinicios y soportar cierre de sesión.
+
+- **Mantener estado de sesión**: Al cambiar el usuario a su espacio, guárdalo como espacio activo para que la próxima apertura con default entre directamente en ese espacio (no hace falta «abrir default y luego cambiar»).
+- **Cierre de sesión**: Al cerrar sesión, cierra la base con `keepActiveSpace: false` para que la próxima apertura no entre automáticamente en el espacio del usuario anterior.
+
+```dart
+
+// Tras el login: cambiar al espacio de este usuario y recordarlo para la próxima apertura (mantener sesión)
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
+
+// Opcional: abrir solo en default (p. ej. solo pantalla de login) — no usar el espacio activo guardado
+// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
+
+// Al cerrar sesión: cerrar y limpiar espacio activo para que la próxima apertura use el espacio default
+await db.close(keepActiveSpace: false);
+```
+
 ## Integración del Lado del Servidor
 
 🖥️ **Ejemplo**: [server_quickstart.dart](example/lib/server_quickstart.dart)
@@ -345,10 +364,14 @@ final customResult = await db.query('users')
 Actualiza si existe, de lo contrario inserta.
 
 ```dart
-await db.upsert('users', {
-  'email': 'john@example.com',
-  'name': 'John New'
-}).where('email', '=', 'john@example.com');
+// By primary key or unique key in data (no where)
+final result = await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
+await db.upsert('users', {'username': 'john', 'email': 'john@example.com', 'age': 26});
+// Batch upsert
+await db.batchUpsert('users', [
+  {'username': 'a', 'email': 'a@example.com'},
+  {'username': 'b', 'email': 'b@example.com'},
+], allowPartialErrors: true);
 ```
 
 
@@ -653,6 +676,26 @@ final db = await ToStore.open(
 );
 ```
 
+### Cifrado a nivel de valor (ToCrypto)
+
+El cifrado de toda la base de datos anterior cifra todas las tablas e índices y puede afectar al rendimiento global. Para cifrar solo campos sensibles, use **ToCrypto**: es independiente de la base de datos (no requiere instancia db). Usted codifica o decodifica los valores antes de escribir o después de leer; la clave la gestiona por completo su aplicación. La salida es Base64, adecuada para columnas JSON o TEXT.
+
+- **key** (obligatorio): `String` o `Uint8List`. Si no son 32 bytes, se deriva una clave de 32 bytes mediante SHA-256.
+- **type** (opcional): Tipo de cifrado [ToCryptoType]: [ToCryptoType.chacha20Poly1305] o [ToCryptoType.aes256Gcm]. Por defecto [ToCryptoType.chacha20Poly1305]. Omitir para usar el predeterminado.
+- **aad** (opcional): Datos de autenticación adicionales — `Uint8List`. Si se pasa al codificar, debe pasar los mismos bytes al decodificar (p. ej. nombre de tabla + campo para vincular contexto). Omitir en uso simple.
+
+```dart
+const key = 'my-secret-key';
+// Codificar: texto plano → Base64 cifrado (guardar en DB o JSON)
+final cipher = ToCrypto.encode('sensitive data', key: key);
+// Decodificar al leer
+final plain = ToCrypto.decode(cipher, key: key);
+
+// Opcional: vincular contexto con aad (mismo aad al codificar y decodificar)
+final aad = Uint8List.fromList(utf8.encode('users:id_number'));
+final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
+final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
+```
 
 ## Rendimiento y Experiencia
 

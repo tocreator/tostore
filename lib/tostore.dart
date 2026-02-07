@@ -32,6 +32,7 @@ export 'src/model/backup_scope.dart';
 export 'src/model/expr.dart';
 export 'src/query/query_condition.dart';
 export 'src/handler/logger.dart' show LogType;
+export 'src/handler/to_crypto.dart';
 
 import 'src/Interface/chain_builder.dart';
 import 'src/Interface/data_store_interface.dart';
@@ -135,6 +136,7 @@ class ToStore implements DataStoreInterface {
   ///   schemas: [UserSchema],
   /// );
   /// ```
+  /// [applyActiveSpaceOnDefault] When true (default) and config.spaceName is default, use stored activeSpace so first open lands in last used space. Set false when you want to open strictly in default space (e.g. after logout).
   static Future<ToStore> open({
     String? dbPath,
     String? dbName,
@@ -145,6 +147,7 @@ class ToStore implements DataStoreInterface {
     Future<void> Function(ToStore db)? onOpen,
     bool reinitialize = false,
     bool noPersistOnClose = false,
+    bool applyActiveSpaceOnDefault = true,
   }) async {
     // ignore: deprecated_member_use_from_same_package
     final db = ToStore(
@@ -163,6 +166,7 @@ class ToStore implements DataStoreInterface {
       config: config,
       reinitialize: reinitialize,
       noPersistOnClose: noPersistOnClose,
+      applyActiveSpaceOnDefault: applyActiveSpaceOnDefault,
     );
     return db;
   }
@@ -199,13 +203,15 @@ class ToStore implements DataStoreInterface {
       String? dbName,
       DataStoreConfig? config,
       bool reinitialize = false,
-      bool noPersistOnClose = false}) async {
+      bool noPersistOnClose = false,
+      bool applyActiveSpaceOnDefault = true}) async {
     await _impl.initialize(
       dbPath: dbPath,
       dbName: dbName,
       config: config,
       reinitialize: reinitialize,
       noPersistOnClose: noPersistOnClose,
+      applyActiveSpaceOnDefault: applyActiveSpaceOnDefault,
     );
   }
 
@@ -325,51 +331,37 @@ class ToStore implements DataStoreInterface {
     return StreamQueryBuilder(_impl, tableName);
   }
 
-  /// auto upsert data, if exists, update, if not, insert
+  /// Upsert: if row exists (by primary key or unique index in data), update; otherwise insert.
   /// [tableName] Table name
-  /// [data] Data to upsert
+  /// [data] Data; must include pk or all fields of one unique index, plus required fields.
   ///
   /// Example:
   /// ```dart
-  /// // Using where condition
-  /// await db.upsert('users', {'name': 'John'})
-  ///   .where('email', '=', 'john@example.com');
-  ///
-  /// // Using primary key in data
-  /// await db.upsert('users', {
-  ///   'id': 1,
-  ///   'name': 'John'
-  /// });
-  ///
-  /// // Update all matching records
-  /// await db.upsert('users', {'status': 'inactive'})
-  ///   .where('lastLogin', '<', lastMonth)
-  ///   .allowUpdateAll();
-  ///
-  /// // Continue on partial errors
-  /// await db.upsert('users', {'email': 'contact@example.com'})
-  ///   .where('type', '=', 'customer')
-  ///   .allowPartialErrors();
+  /// await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
+  /// await db.upsert('users', {'username': 'john', 'email': 'john@example.com'});
   /// ```
   ///
   /// 自动存储数据，存在则更新，不存在则插入
   /// [tableName] 表名
   /// [data] 要插入或更新的数据
   @override
-  UpsertBuilder upsert(String tableName, Map<String, dynamic> data) {
-    return UpsertBuilder(_impl, tableName, data);
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) {
+    return _impl.upsert(tableName, data);
   }
 
   /// Switch space for scenarios like user switching
   /// Data isolation between spaces, global tables unaffected
   /// [spaceName] Space name, default is 'default'
+  /// [keepActive] When true, saves as active space in global config; when opening with default space, init uses it so one open lands in the right space.
   ///
   /// 切换空间，用于用户切换等场景
   /// 不同空间数据隔离，全局表数据不受影响
   /// [spaceName] 空间名称，默认为'default'
+  /// [keepActive] 为 true 时将该空间记为活跃空间，下次启动可由业务根据 activeSpace 决定初始空间
   @override
-  Future<bool> switchSpace({String spaceName = 'default'}) {
-    return _impl.switchSpace(spaceName: spaceName);
+  Future<bool> switchSpace(
+      {String spaceName = 'default', bool keepActive = true}) {
+    return _impl.switchSpace(spaceName: spaceName, keepActive: keepActive);
   }
 
   /// Update data in table
@@ -431,8 +423,34 @@ class ToStore implements DataStoreInterface {
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList,
       {bool allowPartialErrors = true}) async {
-    return await _impl.batchInsert(tableName, dataList,
-        allowPartialErrors: allowPartialErrors);
+    return await _impl.batchInsert(
+      tableName,
+      dataList,
+      allowPartialErrors: allowPartialErrors,
+    );
+  }
+
+  /// Batch upsert multiple records based on unique constraints.
+  ///
+  /// - Each record must contain all non-nullable (nullable=false) fields except the primary key,
+  ///   as well as all fields that participate in unique indexes.
+  /// - For each record, existing rows are located using unique indexes; if found, the row is updated,
+  ///   otherwise a new row is inserted.
+  /// - When the table has no unique constraints, this operation is not supported and will return an error.
+  ///
+  /// 批量 UPSERT 数据（基于唯一约束判断插入或更新）
+  /// [tableName] 表名
+  /// [dataList] 记录列表
+  /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录(默认为 true)
+  @override
+  Future<DbResult> batchUpsert(
+      String tableName, List<Map<String, dynamic>> dataList,
+      {bool allowPartialErrors = true}) async {
+    return await _impl.batchUpsert(
+      tableName,
+      dataList,
+      allowPartialErrors: allowPartialErrors,
+    );
   }
 
   /// Set key-value pair
@@ -654,13 +672,14 @@ class ToStore implements DataStoreInterface {
   }
 
   /// Close database and clean up resources
-  /// Removes current instance from instance pool
+  /// [keepActiveSpace] When false, clears active space so next launch uses default (e.g. logout). Default true.
   ///
+  /// Removes current instance from instance pool
   /// 关闭数据库并清理资源
-  /// 从实例池中移除当前实例
+  /// [keepActiveSpace] 为 false 时清除活跃空间（如退出登录），下次启动将使用 default 空间
   @override
-  Future<void> close() async {
-    await _impl.close();
+  Future<void> close({bool keepActiveSpace = true}) async {
+    await _impl.close(keepActiveSpace: keepActiveSpace);
     String? instanceKey;
     _instances.forEach((key, value) {
       if (value == this) {
@@ -761,6 +780,16 @@ class ToStore implements DataStoreInterface {
   @override
   Future<DbResult> deleteSpace(String spaceName) async {
     return await _impl.deleteSpace(spaceName);
+  }
+
+  /// List all space names (e.g. for multi-account switch or admin).
+  /// Returns sorted list; at least contains 'default'.
+  ///
+  /// 列出所有空间名称（如多账号切换、管理端）
+  /// 返回有序列表，至少包含 'default'
+  @override
+  Future<List<String>> listSpaces() async {
+    return await _impl.listSpaces();
   }
 
   /// Get unified status and diagnostics

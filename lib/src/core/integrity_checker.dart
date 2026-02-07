@@ -360,7 +360,9 @@ class IntegrityChecker {
 
       // For large-scale data, validate index metadata structure instead of full scan
       // Unique constraints are enforced at write time, so we only validate index metadata exists
-      final uniqueIndexes = schema.getAllIndexes().where((idx) => idx.unique);
+      final uniqueIndexes =
+          (_dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+              const <IndexSchema>[]);
       if (uniqueIndexes.isEmpty) {
         return true; // No unique constraints to check
       }
@@ -487,7 +489,10 @@ class IntegrityChecker {
             label: 'IntegrityChecker.validateMigration');
       } else {
         // for table with data, validate index meta data
-        for (var index in newSchema.getAllIndexes()) {
+        final allIndexes =
+            _dataStore.schemaManager?.getAllIndexesFor(newSchema) ??
+                <IndexSchema>[];
+        for (var index in allIndexes) {
           final indexMetaPath = await _dataStore.pathManager
               .getIndexMetaPath(tableName, index.actualIndexName);
 

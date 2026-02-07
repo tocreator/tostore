@@ -55,6 +55,56 @@ class FileStorageImpl implements StorageInterface {
     return '${p.normalize(path)}|$modeKey';
   }
 
+  /// Flush and close all open handles whose file paths are under [dirPath].
+  /// Used before deleting a directory to avoid "file in use" errors
+  /// (especially on Windows, where open handles block deletion).
+  Future<void> _flushAndCloseHandlesUnderDirectory(String dirPath) async {
+    try {
+      final normalizedDir = p.normalize(dirPath);
+      final String dirPrefix;
+      if (normalizedDir.endsWith(p.separator)) {
+        dirPrefix = normalizedDir;
+      } else {
+        dirPrefix = '$normalizedDir${p.separator}';
+      }
+
+      // Snapshot to avoid concurrent modification while iterating.
+      final entries = _handlePool.entries.toList();
+      final yieldController =
+          YieldController('storage_flush_dir_handles'); // best-effort
+
+      for (final e in entries) {
+        final key = e.key;
+        final raf = e.value;
+        // key format: "<normalizedPath>|<modeKey>"
+        final sepIdx = key.lastIndexOf('|');
+        if (sepIdx <= 0) continue;
+        final filePath = key.substring(0, sepIdx);
+
+        // Match both the directory itself and any child paths.
+        if (filePath != normalizedDir && !filePath.startsWith(dirPrefix)) {
+          continue;
+        }
+
+        try {
+          await _withHandleLock(key, () async {
+            try {
+              await raf.flush();
+            } catch (_) {}
+            try {
+              await raf.close();
+            } catch (_) {}
+            _handlePool.remove(key);
+            _lru.remove(key);
+            _handleLengths.remove(key);
+          });
+        } catch (_) {}
+
+        await yieldController.maybeYield();
+      }
+    } catch (_) {}
+  }
+
   bool _isRecoveryArtifact(String path) {
     final normalized = p.normalize(path).replaceAll('\\', '/');
     if (normalized.endsWith('.log')) {
@@ -105,6 +155,8 @@ class FileStorageImpl implements StorageInterface {
     try {
       final file = File(path);
       if (await file.exists()) {
+        // flush and close all open handles under the file, avoid being occupied by delete operation
+        await flushAll(path: path, closeHandles: true);
         await file.delete();
       }
     } catch (e) {
@@ -118,6 +170,8 @@ class FileStorageImpl implements StorageInterface {
     try {
       final directory = Directory(path);
       if (await directory.exists()) {
+        // first flush and close all open handles under the directory and its subpaths, avoid being occupied by delete operation
+        await _flushAndCloseHandlesUnderDirectory(path);
         await directory.delete(recursive: true);
       }
     } catch (e) {
