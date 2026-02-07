@@ -1,4 +1,4 @@
-# Upgrade Guide: v2.2.2 → v3.0
+# Upgrade Guide: v2.2.2 → v3.x
 
 [English](#english) | [简体中文](#简体中文)
 
@@ -6,9 +6,9 @@
 
 # English
 
-## Why Upgrade to v3.0?
+## Why Upgrade to v3.x?
 
-ToStore v3.0 is a major release with significant improvements:
+ToStore v3.x is a major release with significant improvements:
 
 | Feature | Description |
 |---------|-------------|
@@ -24,7 +24,7 @@ ToStore v3.0 is a major release with significant improvements:
 | **Constant-Time Index Lookups** | O(1) for primary keys and indexed fields |
 
 > [!IMPORTANT]
-> **Backward Compatibility**: v3.0 automatically migrates data from v2.x.
+> **Backward Compatibility**: v3.x automatically migrates data from v2.x.
 > **No Downgrade**: Once upgraded, data cannot be downgraded to v2.x.
 
 ---
@@ -33,12 +33,12 @@ ToStore v3.0 is a major release with significant improvements:
 
 ### 1. Add path_provider Dependency
 
-v3.0 removed the built-in `path_provider` dependency to support pure Dart environments. You must now provide the database path manually.
+v3.x removed the built-in `path_provider` dependency to support pure Dart environments. You must now provide the database path manually.
 
 ```yaml
 # pubspec.yaml
 dependencies:
-  tostore: ^3.0.0
+  tostore: ^3.x.x
   path_provider: ^2.1.0  # Add this for mobile/desktop
 ```
 
@@ -55,7 +55,7 @@ final db = ToStore(dbName: 'my_app');
 await db.initialize();
 ```
 
-**After (v3.0):**
+**After (v3.x):**
 ```dart
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -72,7 +72,41 @@ final db = await ToStore.open(
 );
 ```
 
-### 3. Deprecated APIs
+### 3. Encryption / encoding configuration
+
+v3.x replaces the old encoding flags and keys with a single `EncryptionConfig`. Use it when you need encryption or encoding.
+
+**Before (v2.x):**
+```dart
+final db = ToStore(
+  config: DataStoreConfig(
+    enableEncoding: true,
+    encodingKey: 'YourEncodingKey',
+    encryptionKey: 'YourEncryptionKey',
+  ),
+);
+```
+
+**After (v3.x):**
+```dart
+
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    encryptionConfig: EncryptionConfig(
+      encryptionType: EncryptionType.xorObfuscation,  // or aes256Gcm for AES
+      encodingKey: 'YourEncodingKey',
+      encryptionKey: 'YourEncryptionKey',
+      deviceBinding: false,  // set true for path-bound keys
+    ),
+  ),
+);
+```
+
+- **encryptionType**: `EncryptionType.none` (no encryption), `xorObfuscation` (lightweight obfuscation), `chacha20Poly1305`, or `aes256Gcm`.
+- **encodingKey** / **encryptionKey**: Same role as in v2.x; optional — keys are derived by default when not provided.
+- **deviceBinding**: When true, keys are bound to the device path.
+
+### 4. Deprecated APIs
 
 The old two-step initialization is deprecated but still works:
 
@@ -91,10 +125,10 @@ final db = await ToStore.open(...);
 
 1. **Database Path Must Match**
    - v2.2.2 default: `getApplicationDocumentsDirectory()/common/{dbName}`
-   - If you don't specify the same path, v3.0 will create a new empty database
+   - If you don't specify the same path, v3.x will create a new empty database
 
 2. **No Downgrade Support**
-   - v3.0 data format is not backward compatible
+   - v3.x data format is not backward compatible
    - Once upgraded, you cannot roll back to v2.x without data loss
 
 
@@ -102,9 +136,9 @@ final db = await ToStore.open(...);
 
 # 简体中文
 
-## 为什么升级到 v3.0？
+## 为什么升级到 v3.x？
 
-ToStore v3.0 是一个重大版本更新，包含以下重要改进：
+ToStore v3.x 是一个重大版本更新，包含以下重要改进：
 
 | 特性 | 说明 |
 |------|------|
@@ -121,7 +155,7 @@ ToStore v3.0 是一个重大版本更新，包含以下重要改进：
 
 
 > [!IMPORTANT]
-> **向下兼容**：v3.0 会自动迁移 v2.x 的数据。
+> **向下兼容**：v3.x 会自动迁移 v2.x 的数据。
 > **不可降级**：升级后数据无法降级回 v2.x。
 
 ---
@@ -130,12 +164,12 @@ ToStore v3.0 是一个重大版本更新，包含以下重要改进：
 
 ### 1. 添加 path_provider 依赖
 
-v3.0 移除了内置的 `path_provider` 依赖以支持纯 Dart 环境。现在手机端需要手动提供数据库路径。
+v3.x 移除了内置的 `path_provider` 依赖以支持纯 Dart 环境。现在手机端需要手动提供数据库路径。
 
 ```yaml
 # pubspec.yaml
 dependencies:
-  tostore: ^3.0.0
+  tostore: ^3.x.x
   path_provider: ^2.1.0  # 移动端/桌面端需要自行获取数据库存储路径
 ```
 
@@ -152,7 +186,7 @@ final db = ToStore(dbName: 'my_app');
 await db.initialize();
 ```
 
-**之后 (v3.0)：**
+**之后 (v3.x)：**
 ```dart
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -169,7 +203,42 @@ final db = await ToStore.open(
 );
 ```
 
-### 3. 已弃用的 API
+### 3. 加密 / 编码配置
+
+v3.x 用统一的 `EncryptionConfig` 替代了原来的编码开关和密钥配置。需要加密或编码时请使用该配置。
+
+**之前 (v2.x)：**
+```dart
+final db = ToStore(
+  config: DataStoreConfig(
+    enableEncoding: true,
+    encodingKey: 'YourEncodingKey',
+    encryptionKey: 'YourEncryptionKey',
+  ),
+);
+```
+
+**之后 (v3.x)：**
+```dart
+
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    encryptionConfig: EncryptionConfig(
+      encryptionType: EncryptionType.xorObfuscation,  // 或 aes256Gcm 使用 AES
+      encodingKey: 'YourEncodingKey',
+      encryptionKey: 'YourEncryptionKey',
+      deviceBinding: false,  // 设为 true 可启用路径绑定密钥
+    ),
+  ),
+);
+```
+
+- **encryptionType**：`EncryptionType.none`（不加密）、`xorObfuscation`（轻量混淆）、`chacha20Poly1305` 或 `aes256Gcm`。
+- **encodingKey** / **encryptionKey**：与 v2.x 作用相同；可选，不传时默认派生。
+- **deviceBinding**：为 true 时密钥与该设备路径特征绑定。
+
+
+### 4. 已弃用的 API
 
 旧的两步初始化方式已弃用，但仍可使用：
 
@@ -188,8 +257,8 @@ final db = await ToStore.open(...);
 
 1. **数据库路径必须一致**
    - v2.2.2 默认路径：`getApplicationDocumentsDirectory()/common/{dbName}`
-   - 如果不指定相同路径，v3.0 会创建新的空数据库
+   - 如果不指定相同路径，v3.x 会创建新的空数据库
 
 2. **不支持版本降级**
-   - v3.0 数据格式不向后兼容
+   - v3.x 数据格式不向后兼容
    - 升级后无法回退到 v2.x，否则数据会丢失

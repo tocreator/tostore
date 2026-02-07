@@ -85,7 +85,7 @@ As generative AI and spatial computing shift the center of gravity toward the ed
 ## Installation
 
 > [!IMPORTANT]
-> **Upgrading from v2.x?** Please read the [v3.0 Upgrade Guide](doc/UPGRADE_GUIDE_v3.md) for critical migration steps and breaking changes.
+> **Upgrading from v2.x?** Please read the [v3.x Upgrade Guide](doc/UPGRADE_GUIDE_v3.md) for critical migration steps and breaking changes.
 
 Add `tostore` as a dependency in your `pubspec.yaml`:
 

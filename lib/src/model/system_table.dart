@@ -20,12 +20,30 @@ class SystemTable {
     return _fkReferencesName;
   }
 
-  // is a system table
+  // is a system table (current version)
   static bool isSystemTable(String tableName) {
     return tableName == _keyValueName ||
         tableName == _globalKeyValueName ||
         tableName == _fkReferencesName;
   }
+
+  /// Names that have ever been system tables (current + deprecated).
+  /// Used by migration when [systemOnly] to decide which on-disk tables to manage:
+  /// only tables in this set are considered for create/alter/drop; all others are
+  /// treated as user tables and left untouched. This list is code-only (not from
+  /// TableSchema), so user-defined schemas cannot mark a table as system.
+  /// When deprecating a system table, add its name here so migration can drop it.
+  static const Set<String> _knownSystemTableNames = {
+    _fkReferencesName,
+    _keyValueName,
+    _globalKeyValueName,
+    // Legacy system table names (append when a system table is removed):
+    // 'legacy_sys_table',
+  };
+
+  /// True if [tableName] is a known system table (current or legacy).
+  static bool isKnownSystemTable(String tableName) =>
+      _knownSystemTableNames.contains(tableName);
 
   /// get all table schemas
   static List<TableSchema> gettableSchemas = [

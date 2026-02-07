@@ -92,6 +92,9 @@ class DataStoreImpl {
   final Future<void> Function(DataStoreImpl db)? _onOpen;
   final List<TableSchema> _userSchemas;
 
+  /// Get list of user schemas provided during initialization
+  List<TableSchema> get userSchemas => _userSchemas;
+
   bool _baseInitialized = false;
   String? _dbName;
   String? _dbPath;
@@ -847,9 +850,16 @@ class DataStoreImpl {
       }
       // Need upgrade - perform table structure migration
       else if (systemSchemaChanged || userSchemaChanged) {
+        // When only system schema changed, use systemOnly: true so migrate() only manages
+        // on-disk tables that are known system tables (SystemTable.isKnownSystemTable).
+        // User tables are never touched even when userSchemas is empty (e.g. server-side
+        // open() without schemas and runtime createTables()).
+        final systemOnly = systemSchemaChanged && !userSchemaChanged;
+
         // Perform automatic table structure migration
-        final migrationSchemas = getInitialSchemas();
-        await autoSchemaMigrate(migrationSchemas);
+        final migrationSchemas = getInitialSchemas(systemOnly: systemOnly);
+
+        await autoSchemaMigrate(migrationSchemas, systemOnly: systemOnly);
 
         if (systemSchemaChanged) {
           await schemaManager?.updateSystemSchemaHash(systemSchemas);
@@ -871,7 +881,8 @@ class DataStoreImpl {
   /// Automatic table structure migration - based on table structure hash comparison.
   /// Uses maintenance mode: user operations are suspended until migration completes
   /// to avoid conflicts with schema/data changes.
-  Future<void> autoSchemaMigrate(List<TableSchema> schemas) async {
+  Future<void> autoSchemaMigrate(List<TableSchema> schemas,
+      {bool systemOnly = false}) async {
     String backupPath = '';
     final migrationConfig = config.migrationConfig ?? const MigrationConfig();
 
@@ -918,6 +929,7 @@ class DataStoreImpl {
         await migrationManager?.migrate(
           schemas,
           batchSize: migrationConfig.batchSize,
+          systemOnly: systemOnly,
         );
 
         if (migrationConfig.validateAfterMigrate) {
@@ -3821,28 +3833,24 @@ class DataStoreImpl {
   }
 
   /// get initial user-defined and system schemas
-  List<TableSchema> getInitialSchemas() {
+  List<TableSchema> getInitialSchemas({bool systemOnly = false}) {
     final existingTableNames =
         _userSchemas.map((schema) => schema.name).toSet();
 
-    // Add system tables FIRST (before user tables)
-    // This ensures system tables (especially system_fk_references) are created/upgraded
-    // before user tables that may have foreign keys, preventing failures when
-    // updateSystemTableForTable is called during user table creation/migration.
-    //
-    // Critical for upgrade scenarios: when upgrading from old version without
-    // system_fk_references table, user tables with foreign keys will try to update
-    // the system table, which must exist first.
-    final systemTables = <TableSchema>[];
+    final tables = <TableSchema>[];
+
     for (final systemTable in SystemTable.gettableSchemas) {
       if (!existingTableNames.contains(systemTable.name)) {
-        systemTables.add(systemTable);
+        tables.add(systemTable);
       }
+    }
+    if (!systemOnly) {
+      tables.addAll(_userSchemas);
     }
 
     // Return a new list instead of mutating _userSchemas which might be unmodifiable
     // and to avoid side effects
-    return [...systemTables, ..._userSchemas];
+    return tables;
   }
 
   /// check table exists

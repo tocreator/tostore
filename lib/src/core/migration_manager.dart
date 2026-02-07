@@ -46,20 +46,37 @@ class MigrationManager {
 
   /// Execute migration from old version to new version
   Future<void> migrate(List<TableSchema> schemas,
-      {int batchSize = 1000}) async {
+      {int batchSize = 1000, bool systemOnly = false}) async {
     try {
+      var targetSchemas = schemas;
+      if (systemOnly) {
+        // Filter schemas to only include system tables
+        targetSchemas =
+            schemas.where((s) => SystemTable.isSystemTable(s.name)).toList();
+      }
+
       Logger.info(
-        'Start database migration: involving ${schemas.length} tables',
+        'Start database migration: involving ${targetSchemas.length} tables${systemOnly ? ' (systemOnly mode)' : ''}',
         label: 'MigrationManager.migrate',
       );
 
       // Performance optimization: Skip migration if no schemas
-      if (schemas.isEmpty) {
+      if (targetSchemas.isEmpty) {
         return;
       }
 
       // Get all existing tables
-      final existingTables = await _dataStore.getTableNames();
+      var existingTables = await _dataStore.getTableNames();
+      if (systemOnly) {
+        // Only consider on-disk tables that are known system tables (current or legacy).
+        // User-created tables are never in this set, so they are never dropped in systemOnly mode.
+        // This list is code-only (SystemTable._knownSystemTableNames), not from user schemas,
+        // so server-side open() without schemas and runtime createTables() do not affect it.
+        existingTables = existingTables
+            .where((t) => SystemTable.isKnownSystemTable(t))
+            .toList();
+      }
+
       final allTasks = <MigrationTask>[];
 
       // Record migration start time
@@ -67,7 +84,7 @@ class MigrationManager {
 
       // 1. First detect table renaming to avoid subsequent processing misidentifying renamed tables as new + deleted
       final detectRenameResult =
-          await _detectRenamedTables(existingTables, schemas);
+          await _detectRenamedTables(existingTables, targetSchemas);
       final renamedTables = detectRenameResult.renamedTables;
       final tablesToCreate = detectRenameResult.tablesToCreate;
       final tablesToDrop = detectRenameResult.tablesToDrop;
@@ -123,7 +140,7 @@ class MigrationManager {
       int tablesUpdated = 0;
       int tablesCreated = 0;
 
-      for (var schema in schemas) {
+      for (var schema in targetSchemas) {
         try {
           // Skip already processed renamed tables
           if (renamedTables.values.any((s) => s.name == schema.name)) {
