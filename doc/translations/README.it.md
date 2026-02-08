@@ -16,7 +16,7 @@ Mentre l'IA generativa e il calcolo spaziale spostano il baricentro verso l'edge
 
 **Resistente a interruzioni di corrente e crash**: Anche in caso di interruzione improvvisa di corrente o crash dell'applicazione, i dati possono essere recuperati automaticamente, ottenendo una perdita zero reale. Quando un'operazione sui dati risponde, i dati sono già stati salvati in modo sicuro, eliminando il rischio di perdita dei dati.
 
-**Superamento dei limiti di prestazioni**: I test di prestazioni mostrano che anche con 10 milioni di record, un tipico smartphone può avviarsi immediatamente e mostrare i risultati della query all'istante. Indipendentemente dal volume dei dati, è possibile godere di un'esperienza fluida che supera di gran lunga quella dei database tradizionali.
+**Superamento dei limiti di prestazioni**: I test mostrano che anche con oltre 100 milioni di record, un tipico smartphone può mantenere prestazioni di ricerca costanti indipendentemente dalla scala dei dati, offrendo un'esperienza che supera di gran lunga quella dei database tradizionali.
 
 
 
@@ -698,7 +698,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Specifiche di prestazione
 
-- **Velocità di avvio**: Avvio istantaneo e visualizzazione dati anche con oltre 10M di record su smartphone medi.
+- **Velocità di avvio**: Avvio istantaneo e visualizzazione dati anche con oltre 100M di record su smartphone medi.
 - **Query**: Indipendente dalla scala, recupero ultra-veloce costante a qualsiasi volume di dati.
 - **Sicurezza dei dati**: Garanzie di transazione ACID + ripristino da crash per zero perdita di dati.
 

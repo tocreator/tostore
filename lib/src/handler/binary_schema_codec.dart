@@ -103,17 +103,17 @@ class BinarySchemaCodec {
         return;
       }
       // int64 (MessagePack)
-      if (value >= -0x8000000000000000 && value < 0x8000000000000000) {
-        b.addByte(0xD3);
-        b.add(_i64be(value));
-        return;
-      }
-      // Fallback for VM big ints: encode as BigInt ext
-      _writeBigIntExt(b, BigInt.from(value));
+      // value is int, and didn't fit in smaller types, so use int64.
+      b.addByte(0xD3);
+      b.add(_i64be(value));
       return;
     }
 
     if (value is BigInt) {
+      if (value.isValidInt) {
+        _writeValue(b, value.toInt());
+        return;
+      }
       _writeBigIntExt(b, value);
       return;
     }
@@ -311,10 +311,10 @@ class BinarySchemaCodec {
       case 0:
         if (value is BigInt) {
           // Only downcast when within signed 64-bit range to avoid silent overflow.
-          const intMin = -0x8000000000000000; // -2^63
-          const intMax = 0x7FFFFFFFFFFFFFFF; // 2^63 - 1
-          final min = BigInt.from(intMin);
-          final max = BigInt.from(intMax);
+          // Only downcast when within signed 64-bit range to avoid silent overflow.
+          // Use BigInt.parse to safely represent 64-bit limits on all platforms (including web).
+          final min = BigInt.parse('-9223372036854775808'); // -2^63
+          final max = BigInt.parse('9223372036854775807'); // 2^63 - 1
           if (value >= min && value <= max) {
             return value.toInt();
           }

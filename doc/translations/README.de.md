@@ -16,7 +16,7 @@ Da generative KI und Spatial Computing das Rechenzentrum an den Rand (Edge) vers
 
 **Stromausfall- und absturzsicher**: Selbst bei einem unerwarteten Stromausfall oder Anwendungsabsturz können Daten automatisch wiederhergestellt werden, was einen echten Null-Verlust bedeutet. Sobald eine Datenoperation bestätigt wird, wurden die Daten bereits sicher gespeichert, sodass kein Risiko eines Datenverlusts besteht.
 
-**Leistungsgrenzen sprengen**: Leistungstests zeigen, dass selbst bei 10 Millionen Datensätzen ein typisches Smartphone sofort startet und Abfrageergebnisse augenblicklich anzeigt. Unabhängig vom Datenvolumen genießen Sie ein reibungsloses Erlebnis, das herkömmliche Datenbanken bei weitem übertrifft.
+**Leistungsgrenzen sprengen**: Tests zeigen, dass selbst bei über 100 Millionen Datensätzen ein typisches Smartphone eine konstante Suchleistung unabhängig vom Datenvolumen beibehält und ein Erlebnis bietet, das herkömmliche Datenbanken bei weitem übertrifft.
 
 
 
@@ -702,7 +702,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Leistungsdaten
 
-- **Startgeschwindigkeit**: Sofortiger Start und Datenanzeige selbst bei 10 Mio.+ Datensätzen auf durchschnittlichen Smartphones.
+- **Startgeschwindigkeit**: Sofortiger Start und Datenanzeige selbst bei 100 Mio.+ Datensätzen auf durchschnittlichen Smartphones.
 - **Abfrageleistung**: Skalenunabhängig, konstant blitzschneller Abruf bei jedem Datenvolumen.
 - **Datensicherheit**: ACID-Transaktionsgarantien + Crash-Recovery für null Datenverlust.
 

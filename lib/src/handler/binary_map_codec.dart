@@ -78,13 +78,9 @@ class BinaryMapCodec {
         return;
       }
       // int64 (MessagePack)
-      if (value >= -0x8000000000000000 && value < 0x8000000000000000) {
-        b.addByte(0xD3);
-        b.add(_i64be(value));
-        return;
-      }
-      // Fallback for VM big ints: encode as BigInt ext
-      _writeBigIntExt(b, BigInt.from(value));
+      // value is int, and didn't fit in smaller types, so use int64.
+      b.addByte(0xD3);
+      b.add(_i64be(value));
       return;
     }
 

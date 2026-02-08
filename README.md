@@ -16,7 +16,7 @@ As generative AI and spatial computing shift the center of gravity toward the ed
 
 **Power failure and crash resistant**: Even in the event of an unexpected power outage or application crash, data can be automatically recovered, achieving true zero loss. When a data operation responds, the data has already been safely saved, eliminating the risk of data loss.
 
-**Breaking performance limits**: Performance tests show that even with 10 million records, a typical smartphone can start immediately and display query results instantly. No matter how large the data volume, you can enjoy a smooth experience far exceeding that of traditional databases.
+**Breaking performance limits**: Performance tests show that even with 100 million+ records, a typical smartphone can maintain constant retrieval performance regardless of data scale, delivering an experience far exceeding that of traditional databases.
 
 
 
@@ -737,7 +737,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Performance Specs
 
-- **Startup Speed**: Instant startup and data display even with 10M+ records on average smartphones.
+- **Startup Speed**: Instant startup and data display even with 100M+ records on average smartphones.
 - **Query Performance**: Scale-independent, consistently blazing-fast retrieval at any data volume.
 - **Data Safety**: ACID transaction guarantees + crash recovery for zero data loss.
 

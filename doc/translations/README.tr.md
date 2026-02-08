@@ -16,7 +16,7 @@ Tostore, Dart/Flutter ekosistemindeki dağıtık vektör veritabanları için te
 
 **Güç Kesintisine ve Çökmeye Dayanıklı**: Beklenmedik bir güç kesintisi veya uygulama çökmesi durumunda bile veriler otomatik olarak kurtarılabilir ve gerçek sıfır veri kaybı elde edilir. Bir veri işlemi yanıt verdiğinde, veriler zaten güvenli bir şekilde kaydedilmiştir ve veri kaybı riski ortadan kalkar.
 
-**Performans Sınırlarını Zorlamak**: Performans testleri, 10 milyon kayıtla bile tipik bir akıllı telefonun anında başlayabildiğini ve sorgu sonuçlarını anında gösterebildiğini kanıtlamıştır. Veri hacmi ne kadar büyük olursa olsun, geleneksel veritabanlarını çok geride bırakan akıcı bir deneyimin tadını çıkarabilirsiniz.
+**Performans Sınırlarını Zorlamak**: Testler, 100 milyon+ kayıtla bile tipik bir akıllı telefonun veri ölçeğinden bağımsız sabit arama performansı koruyabildiğini ve geleneksel veritabanlarını çok geride bırakan bir deneyim sunduğunu göstermektedir.
 
 
 
@@ -698,7 +698,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Performans Spesifikasyonları
 
-- **Başlatma Hızı**: Tipik akıllı telefonlarda 10M+ kayıtla bile anında başlatma ve veri gösterimi.
+- **Başlatma Hızı**: Tipik akıllı telefonlarda 100M+ kayıtla bile anında başlatma ve veri gösterimi.
 - **Sorgu Performansı**: Ölçekten bağımsız, her veri hacminde sürekli yıldırım hızında geri çağırma.
 - **Veri Güvenliği**: Sıfır veri kaybı için ACID işlem garantileri + çökme kurtarma.
 

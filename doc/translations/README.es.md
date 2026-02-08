@@ -16,7 +16,7 @@ A medida que la IA generativa y la computación espacial desplazan el centro de 
 
 **Resistente a fallos de energía y bloqueos**: Incluso en caso de un corte de energía inesperado o un bloqueo de la aplicación, los datos pueden recuperarse automáticamente, logrando una pérdida cero real. Cuando una operación de datos responde, los datos ya se han guardado de forma segura, eliminando el riesgo de pérdida de datos.
 
-**Superando los límites de rendimiento**: Las pruebas de rendimiento muestran que incluso con 10 millones de registros, un smartphone típico puede iniciarse inmediatamente y mostrar los resultados de las consultas al instante. No importa cuán grande sea el volumen de datos, puede disfrutar de una experiencia fluida que supera con creces la de las bases de datos tradicionales.
+**Superando los límites de rendimiento**: Las pruebas muestran que incluso con más de 100 millones de registros, un smartphone típico puede mantener un rendimiento de búsqueda constante independiente del volumen de datos, ofreciendo una experiencia que supera con creces a las bases de datos tradicionales.
 
 
 
@@ -701,7 +701,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Especificaciones de Rendimiento
 
-- **Velocidad de Inicio**: Inicio instantáneo incluso con más de 10M de registros en smartphones típicos.
+- **Velocidad de Inicio**: Inicio instantáneo y visualización de datos incluso con más de 100M de registros en smartphones típicos.
 - **Rendimiento de Consulta**: Independiente de la escala, rendimiento de búsqueda ultrarrápido constante.
 - **Seguridad de Datos**: Garantías de transacción ACID + recuperación ante fallos para cero pérdida de datos.
 

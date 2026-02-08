@@ -16,7 +16,7 @@ Alors que l'IA générative et l'informatique spatiale déplacent le centre de g
 
 **Résistant aux coupures de courant et aux plantages** : Même en cas de coupure de courant inattendue ou de plantage de l'application, les données peuvent être automatiquement récupérées, réalisant une perte zéro réelle. Lorsqu'une opération sur les données répond, les données ont déjà été sauvegardées en toute sécurité, éliminant tout risque de perte de données.
 
-**Dépassement des limites de performance** : Les tests de performance montrent que même avec 10 millions d'enregistrements, un smartphone classique peut démarrer immédiatement et afficher les résultats de recherche instantanément. Quelle que soit la taille du volume de données, vous bénéficiez d'une expérience fluide qui dépasse de loin celle des bases de données traditionnelles.
+**Dépassement des limites de performance** : Les tests montrent que même avec plus de 100 millions d'enregistrements, un smartphone classique peut maintenir des performances de recherche constantes quelle que soit l'échelle des données, offrant une expérience qui dépasse de loin celle des bases de données traditionnelles.
 
 
 
@@ -701,7 +701,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Spécifications de performance
 
-- **Vitesse de démarrage** : Démarrage et affichage instantanés même avec plus de 10 millions d'enregistrements sur un smartphone moyen.
+- **Vitesse de démarrage** : Démarrage et affichage instantanés même avec plus de 100 millions d'enregistrements sur un smartphone moyen.
 - **Requêtes** : Indépendant de l'échelle, recherche ultra-rapide constante à tout volume de données.
 - **Sécurité des données** : Garanties de transaction ACID + récupération après crash pour zéro perte de données.
 

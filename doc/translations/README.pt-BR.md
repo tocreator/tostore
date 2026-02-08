@@ -16,7 +16,7 @@ O Tostore é o único mecanismo de armazenamento de alto desempenho para bancos 
 
 **Resistente a falhas de energia e travamentos**: Mesmo em caso de uma interrupção inesperada de energia ou travamento da aplicação, os dados podem ser recuperados automaticamente, alcançando uma perda zero real. Quando uma operação de dados responde, os dados já foram salvos com segurança, eliminando o risco de perda de dados.
 
-**Superando os limites de desempenho**: Testes de desempenho mostram que, mesmo com 10 milhões de registros, um smartphone típico pode iniciar imediatamente e exibir os resultados das consultas instantaneamente. Não importa quão grande seja o volume de dados, você pode desfrutar de uma experiência fluida que supera em muito a dos bancos de dados tradicionais.
+**Superando os limites de desempenho**: Testes mostram que, mesmo com mais de 100 milhões de registros, um smartphone típico pode manter desempenho de busca constante independente da escala dos dados, oferecendo uma experiência que supera em muito a dos bancos de dados tradicionais.
 
 
 
@@ -698,7 +698,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 
 ### Especificações de Desempenho
 
-- **Velocidade de Início**: Início instantâneo, mesmo com mais de 10M de registros em smartphones típicos.
+- **Velocidade de Início**: Início instantâneo e exibição de dados mesmo com mais de 100M de registros em smartphones típicos.
 - **Desempenho de Consulta**: Independente da escala, desempenho de busca ultrarrápido constante.
 - **Segurança de Dados**: Garantias de transação ACID + recuperação de falhas para zero perda de dados.
 
