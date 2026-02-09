@@ -182,7 +182,7 @@ class DataStoreConfig {
             maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         maxLogPartitionFileSize =
             maxLogPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
-        enableJournal = enableJournal ?? true,
+        enableJournal = enableJournal ?? !PlatformHandler.isWeb,
         logWriteBatchSize = logWriteBatchSize ?? _getDefaultLogWriteBatchSize(),
         writeBatchSize = writeBatchSize ?? _getDefaultWriteBatchSize(),
         maxFlushLatencyMs = maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(),

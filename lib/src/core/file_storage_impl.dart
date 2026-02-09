@@ -52,7 +52,7 @@ class FileStorageImpl implements StorageInterface {
         : (mode == FileMode.write)
             ? 'w'
             : mode.toString();
-    return '${p.normalize(path)}|$modeKey';
+    return '${p.canonicalize(path)}|$modeKey';
   }
 
   /// Flush and close all open handles whose file paths are under [dirPath].
@@ -60,7 +60,7 @@ class FileStorageImpl implements StorageInterface {
   /// (especially on Windows, where open handles block deletion).
   Future<void> _flushAndCloseHandlesUnderDirectory(String dirPath) async {
     try {
-      final normalizedDir = p.normalize(dirPath);
+      final normalizedDir = p.canonicalize(dirPath);
       final String dirPrefix;
       if (normalizedDir.endsWith(p.separator)) {
         dirPrefix = normalizedDir;
@@ -106,7 +106,7 @@ class FileStorageImpl implements StorageInterface {
   }
 
   bool _isRecoveryArtifact(String path) {
-    final normalized = p.normalize(path).replaceAll('\\', '/');
+    final normalized = p.canonicalize(path).replaceAll('\\', '/');
     if (normalized.endsWith('.log')) {
       return true; // WAL partitions and parallel journal
     }
@@ -138,13 +138,23 @@ class FileStorageImpl implements StorageInterface {
       // remove least-recently used
       final oldestKey =
           _lru.entries.reduce((a, b) => a.value.isBefore(b.value) ? a : b).key;
-      try {
-        await _handlePool[oldestKey]?.flush();
-        await _handlePool[oldestKey]?.close();
-      } catch (_) {}
-      _handlePool.remove(oldestKey);
+
+      // Remove from pool immediately to prevent new ops from checking it out
+      final rafToClose = _handlePool.remove(oldestKey);
       _lru.remove(oldestKey);
       _handleLengths.remove(oldestKey);
+
+      if (rafToClose != null) {
+        // Asynchronously close it, ensuring we respect existing locks.
+        // We use the lock queue to ensure we don't close it while in use.
+        // ignore: unawaited_futures
+        _withHandleLock(oldestKey, () async {
+          try {
+            await rafToClose.flush();
+            await rafToClose.close();
+          } catch (_) {}
+        });
+      }
     }
 
     return raf;
@@ -608,20 +618,28 @@ class FileStorageImpl implements StorageInterface {
   Stream<String> readLinesStream(String path, {int offset = 0}) {
     final controller = StreamController<String>();
 
-    File(path)
-        .openRead()
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .skip(offset)
-        .listen(
-          (line) => controller.add(line),
-          onError: (e) {
-            Logger.error('Read lines stream failed: $e',
-                label: 'FileStorageImpl');
-            controller.addError(e);
-          },
-          onDone: () => controller.close(),
-        );
+    StreamSubscription? subscription;
+
+    controller.onListen = () {
+      subscription = File(path)
+          .openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .skip(offset)
+          .listen(
+            (line) => controller.add(line),
+            onError: (e) {
+              Logger.error('Read lines stream failed: $e',
+                  label: 'FileStorageImpl');
+              controller.addError(e);
+            },
+            onDone: () => controller.close(),
+          );
+    };
+
+    controller.onCancel = () async {
+      await subscription?.cancel();
+    };
 
     return controller.stream;
   }
@@ -794,7 +812,7 @@ class FileStorageImpl implements StorageInterface {
       if (paths != null && paths.isNotEmpty) {
         final yieldController = YieldController('storage_flush_paths');
         for (final pth in paths) {
-          final normalized = p.normalize(pth);
+          final normalized = p.canonicalize(pth);
           const List<FileMode> candidateModes = [
             FileMode.write,
             FileMode.append
@@ -847,7 +865,7 @@ class FileStorageImpl implements StorageInterface {
           await yieldController.maybeYield();
         }
       } else {
-        final normalized = p.normalize(path);
+        final normalized = p.canonicalize(path);
         // Try the two common modes directly to avoid scanning the entire pool
         const List<FileMode> candidateModes = [FileMode.write, FileMode.append];
         for (final mode in candidateModes) {
@@ -895,6 +913,8 @@ class FileStorageImpl implements StorageInterface {
       await Directory(p.dirname(finalPath)).create(recursive: true);
       try {
         // Attempt atomic rename (same volume)
+        // Ensure destination file is not occupied by us
+        await flushAll(path: finalPath, closeHandles: true);
         await tmpFile.rename(finalPath);
       } on FileSystemException catch (_) {
         // Fallback: delete destination first (best-effort), then rename

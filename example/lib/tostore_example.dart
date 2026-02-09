@@ -15,21 +15,25 @@ import 'testing/log_service.dart';
 class TostoreExample {
   late ToStore db;
 
-  /// Initialize database and create tables
-  Future<void> initialize() async {
-    String dbRoot;
+  /// Get database path
+  Future<String> getDbPath() async {
     if (kIsWeb) {
-      dbRoot = 'common';
+      return 'common';
     } else {
       try {
         // Resolve app documents directory via path_provider and inject into tostore
         final docDir = await getApplicationDocumentsDirectory();
-        dbRoot = p.join(docDir.path,
+        return p.join(docDir.path,
             'common'); // tostore: ^2.2.2 version default dbPath is getApplicationDocumentsDirectory()/common
       } catch (e) {
-        dbRoot = 'common';
+        return 'common';
       }
     }
+  }
+
+  /// Initialize database and create tables
+  Future<void> initialize({String? dbPath}) async {
+    final dbRoot = dbPath ?? await getDbPath();
 
     db = await ToStore.open(
       dbPath: dbRoot,

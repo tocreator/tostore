@@ -390,9 +390,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       _lastOperationInfo = 'Initializing Database...';
     });
 
+    // Exclude getApplicationDocumentsDirectory time from stats
+    // because that's an OS/Flutter limitation, not the db engine
+    final dbPath = await widget.example.getDbPath();
+
     final stopwatch = Stopwatch()..start();
     try {
-      await widget.example.initialize();
+      await widget.example.initialize(dbPath: dbPath);
       stopwatch.stop();
       if (mounted) {
         setState(() {
