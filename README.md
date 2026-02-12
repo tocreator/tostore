@@ -753,13 +753,13 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
   <img src="doc/media/basic-demo.gif" alt="Tostore basic performance demo" width="320" />
   </p>
 
-- **Basic performance demo** (`doc/media/basic-demo.mp4`): Shows that even on an ordinary mobile device with 100M+ records, startup, paging, and search performance remain stable and smooth. As long as storage is sufficient, edge devices can sustain TB/PB-scale datasets while keeping interactive latency consistently low.
+- **Basic performance demo** (<a href="doc/media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF preview may be cropped; click the video to view the full demo. Shows that even on an ordinary mobile device with 100M+ records, startup, paging, and search performance remain stable and smooth. As long as storage is sufficient, edge devices can sustain TB/PB-scale datasets while keeping interactive latency consistently low.
 
 <p align="center">
   <img src="doc/media/disaster-recovery.gif" alt="Tostore disaster recovery stress test" width="320" />
   </p>
 
-- **Disaster recovery stress test** (`doc/media/disaster-recovery.mp4`): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, Tostore recovers extremely fast on a typical phone and does not impact startup or data availability.
+- **Disaster recovery stress test** (<a href="doc/media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, Tostore recovers extremely fast on a typical phone and does not impact startup or data availability.
 
 
 

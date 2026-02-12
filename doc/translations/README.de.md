@@ -722,8 +722,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
   <img src="../media/disaster-recovery.gif" alt="Tostore Desaster-Recovery-Stresstest" width="320" />
   </p>
 
-- **Basis-Performance-Demo** (`../media/basic-demo.mp4`): Zeigt, dass selbst auf einem durchschnittlichen Smartphone mit mehr als 100 M Datensätzen Startzeit, Blätter- und Such-Performance konstant und flüssig bleiben. Solange genügend Speicherplatz vorhanden ist, können Edge-Geräte auch TB- und PB-Skalierung tragen, ohne dass die Interaktivität spürbar einbricht.
-- **Desaster-Recovery-Stresstest** (`../media/disaster-recovery.mp4`): Unterbricht absichtlich den Prozess während intensiver Schreiblast, um Abstürze und Stromausfälle zu simulieren. Selbst wenn zehntausende Schreiboperationen abrupt abgebrochen werden, stellt Tostore die Daten auf einem typischen Smartphone sehr schnell wieder her, ohne den nächsten Start oder die Datenverfügbarkeit zu beeinträchtigen.
+- **Basis-Performance-Demo** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): Die GIF-Vorschau kann abgeschnitten sein – klicken Sie auf das Video, um die vollständige Demo zu sehen. Zeigt, dass selbst auf einem durchschnittlichen Smartphone mit mehr als 100 M Datensätzen Startzeit, Blätter- und Such-Performance konstant und flüssig bleiben. Solange genügend Speicherplatz vorhanden ist, können Edge-Geräte auch TB- und PB-Skalierung tragen, ohne dass die Interaktivität spürbar einbricht.
+- **Desaster-Recovery-Stresstest** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Unterbricht absichtlich den Prozess während intensiver Schreiblast, um Abstürze und Stromausfälle zu simulieren. Selbst wenn zehntausende Schreiboperationen abrupt abgebrochen werden, stellt Tostore die Daten auf einem typischen Smartphone sehr schnell wieder her, ohne den nächsten Start oder die Datenverfügbarkeit zu beeinträchtigen.
 
 
 

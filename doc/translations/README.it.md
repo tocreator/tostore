@@ -713,13 +713,15 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 <p align="center">
   <img src="../media/basic-demo.gif" alt="Demo di performance di base di Tostore" width="320" />
   </p>
+- **Demo di performance di base** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): L’anteprima GIF potrebbe essere ritagliata; fai clic sul video per vedere la demo completa. Mostra che, anche su uno smartphone comune con oltre 100 M di record, l’avvio dell’app, la paginazione e le ricerche restano sempre stabili e fluide. Finché lo spazio di archiviazione è sufficiente, i dispositivi edge possono gestire dataset in scala TB/PB mantenendo una latenza di interazione costantemente bassa.
+
 
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="Test di ripristino da disastro di Tostore" width="320" />
   </p>
 
-- **Demo di performance di base** (`../media/basic-demo.mp4`): Mostra che, anche su uno smartphone comune con oltre 100 M di record, l’avvio dell’app, la paginazione e le ricerche restano sempre stabili e fluide. Finché lo spazio di archiviazione è sufficiente, i dispositivi edge possono gestire dataset in scala TB/PB mantenendo una latenza di interazione costantemente bassa.
-- **Test di ripristino da disastro** (`../media/disaster-recovery.mp4`): Interrompe intenzionalmente il processo durante carichi di scrittura intensivi per simulare crash e blackout. Anche quando decine di migliaia di operazioni di scrittura vengono interrotte bruscamente, Tostore è in grado di ripristinarsi molto rapidamente su un telefono tipico, senza influire sull’avvio successivo né sulla disponibilità dei dati.
+
+- **Test di ripristino da disastro** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Interrompe intenzionalmente il processo durante carichi di scrittura intensivi per simulare crash e blackout. Anche quando decine di migliaia di operazioni di scrittura vengono interrotte bruscamente, Tostore è in grado di ripristinarsi molto rapidamente su un telefono tipico, senza influire sull’avvio successivo né sulla disponibilità dei dati.
 
 
 

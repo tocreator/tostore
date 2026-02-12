@@ -717,12 +717,15 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
   <img src="../media/basic-demo.gif" alt="Démo de performance de base de Tostore" width="320" />
   </p>
 
+
+- **Démo de performance de base** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>) : L’aperçu GIF peut être recadré ; cliquez sur la vidéo pour voir la démo complète. Montre que, même sur un smartphone classique avec plus de 100 M d’enregistrements, le démarrage de l’application, la pagination et les recherches restent stables et fluides. Tant que le stockage est suffisant, un appareil en périphérie peut supporter des volumes de données de l’ordre du To/Pio tout en conservant une latence d’interaction très basse.
+
+
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="Test de reprise après sinistre de Tostore" width="320" />
   </p>
 
-- **Démo de performance de base** (`../media/basic-demo.mp4`) : Montre que, même sur un smartphone classique avec plus de 100 M d’enregistrements, le démarrage de l’application, la pagination et les recherches restent stables et fluides. Tant que le stockage est suffisant, un appareil en périphérie peut supporter des volumes de données de l’ordre du To/Pio tout en conservant une latence d’interaction très basse.
-- **Test de reprise après sinistre** (`../media/disaster-recovery.mp4`) : Interrompt volontairement le processus pendant des charges d’écriture intensives afin de simuler des crashs et des coupures de courant. Même lorsque des dizaines de milliers d’opérations d’écriture sont brutalement arrêtées, Tostore se rétablit très rapidement sur un téléphone standard, sans affecter le démarrage suivant ni la disponibilité des données.
+- **Test de reprise après sinistre** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>) : Interrompt volontairement le processus pendant des charges d’écriture intensives afin de simuler des crashs et des coupures de courant. Même lorsque des dizaines de milliers d’opérations d’écriture sont brutalement arrêtées, Tostore se rétablit très rapidement sur un téléphone standard, sans affecter le démarrage suivant ni la disponibilité des données.
 
 
 

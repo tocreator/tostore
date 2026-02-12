@@ -713,13 +713,13 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 <p align="center">
   <img src="../media/basic-demo.gif" alt="Tostore temel performans demosu" width="320" />
   </p>
+- **Temel performans demosu** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF önizlemesi kırpılmış olabilir; tam demoyu görmek için videoya tıklayın. Sıradan bir akıllı telefonda, veri sayısı 100 M+ seviyesine çıktığında bile uygulamanın başlatma süresinin, sayfalama ve arama performansının her zaman kararlı ve akıcı kaldığını gösterir. Depolama alanı yeterli olduğu sürece, edge cihazlar TB/PB ölçeğindeki veri kümelerini işlerken dahi etkileşim gecikmesini sürekli düşük seviyede tutabilir.
 
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="Tostore felaket kurtarma stres testi" width="320" />
   </p>
 
-- **Temel performans demosu** (`../media/basic-demo.mp4`): Sıradan bir akıllı telefonda, veri sayısı 100 M+ seviyesine çıktığında bile uygulamanın başlatma süresinin, sayfalama ve arama performansının her zaman kararlı ve akıcı kaldığını gösterir. Depolama alanı yeterli olduğu sürece, edge cihazlar TB/PB ölçeğindeki veri kümelerini işlerken dahi etkileşim gecikmesini sürekli düşük seviyede tutabilir.
-- **Felaket kurtarma stres testi** (`../media/disaster-recovery.mp4`): Yoğun yazma yükü altında işlemi kasıtlı olarak defalarca yarıda keserek çökme ve elektrik kesintisi senaryolarını simüle eder. On binlerce yazma işlemi ani şekilde yarıda kalsa bile, Tostore tipik bir telefonda verileri çok hızlı biçimde geri yükler ve bir sonraki başlatmayı veya veri erişilebilirliğini olumsuz etkilemez.
+- **Felaket kurtarma stres testi** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Yoğun yazma yükü altında işlemi kasıtlı olarak defalarca yarıda keserek çökme ve elektrik kesintisi senaryolarını simüle eder. On binlerce yazma işlemi ani şekilde yarıda kalsa bile, Tostore tipik bir telefonda verileri çok hızlı biçimde geri yükler ve bir sonraki başlatmayı veya veri erişilebilirliğini olumsuz etkilemez.
 
 
 

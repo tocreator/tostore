@@ -717,12 +717,14 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
   <img src="../media/basic-demo.gif" alt="Demo básica de rendimiento de Tostore" width="320" />
   </p>
 
+
+- **Demo básica de rendimiento** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): La vista previa en GIF puede estar recortada; haz clic en el video para ver la demo completa. Muestra que, incluso en un smartphone normal con más de 100 M de registros, el arranque de la app, el paginado y las búsquedas se mantienen siempre estables y fluidas. Mientras haya almacenamiento suficiente, los dispositivos de borde pueden manejar volúmenes de datos de escala TB/PB sin degradar perceptiblemente la latencia de interacción.
+
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="Prueba de recuperación ante desastres de Tostore" width="320" />
   </p>
 
-- **Demo básica de rendimiento** (`../media/basic-demo.mp4`): Muestra que, incluso en un smartphone normal con más de 100 M de registros, el arranque de la app, el paginado y las búsquedas se mantienen siempre estables y fluidas. Mientras haya almacenamiento suficiente, los dispositivos de borde pueden manejar volúmenes de datos de escala TB/PB sin degradar perceptiblemente la latencia de interacción.
-- **Prueba de recuperación ante desastres** (`../media/disaster-recovery.mp4`): Interrumpe deliberadamente el proceso durante cargas de escritura intensivas para simular fallos y cortes de energía. Incluso quando decenas de miles de operaciones de escritura se detienen de forma abrupta, Tostore se recupera muy rápido en un teléfono típico y no afecta al siguiente arranque ni a la disponibilidad de los datos.
+- **Prueba de recuperación ante desastres** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Interrumpe deliberadamente el proceso durante cargas de escritura intensivas para simular fallos y cortes de energía. Incluso quando decenas de miles de operaciones de escritura se detienen de forma abrupta, Tostore se recupera muy rápido en un teléfono típico y no afecta al siguiente arranque ni a la disponibilidad de los datos.
 
 
 

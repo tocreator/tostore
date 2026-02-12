@@ -752,13 +752,13 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
   <img src="../media/basic-demo.gif" alt="Tostore 基础性能演示" width="320" />
   </p>
 
-- **基础性能演示**（`../media/basic-demo.mp4`）：在普通手机上，即便数据量超过亿级，应用的启动、翻页与检索性能依旧保持稳定顺滑。只要存储空间充足，在边缘设备上也可以支撑 TB、PB 级数据规模，而交互时延始终保持在可接受范围内。
+- **基础性能演示**（<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>）：GIF 预览可能显示不全，请点击视频查看完整演示。在普通手机上，即便数据量超过亿级，应用的启动、翻页与检索性能依旧保持稳定顺滑。只要存储空间充足，在边缘设备上也可以支撑 TB、PB 级数据规模，而交互时延始终保持在可接受范围内。
 
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="Tostore 灾难恢复压力测试" width="320" />
   </p>
 
-- **灾难恢复压力测试**（`../media/disaster-recovery.mp4`）：在高频写入过程中，故意反复中断进程，模拟崩溃与断电，即便有成千上万条写入操作被意外打断，Tostore 也能在普通手机上快速完成自恢复，不影响下一次启动和数据可用性。
+- **灾难恢复压力测试**（<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：在高频写入过程中，故意反复中断进程，模拟崩溃与断电，即便有成千上万条写入操作被意外打断，Tostore 也能在普通手机上快速完成自恢复，不影响下一次启动和数据可用性。
 
 
 
