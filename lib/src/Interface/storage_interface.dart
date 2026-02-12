@@ -147,4 +147,8 @@ abstract class StorageInterface {
   /// - Caller is responsible for ensuring parent directory exists.
   /// On platforms that do not support atomic rename, fallback to best-effort replace.
   Future<void> replaceFileAtomic(String tempPath, String finalPath);
+
+  /// Flush any buffered writes for the specific file path.
+  /// This ensures data durability for the given file without closing the handle necessarily.
+  Future<void> flushFile(String path);
 }

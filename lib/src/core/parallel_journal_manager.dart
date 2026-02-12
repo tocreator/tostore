@@ -44,6 +44,17 @@ class ParallelJournalManager {
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
 
+  // ── Write backpressure (measurement-based) ──
+  // Measured per-record flush cost from the last completed batch (microseconds).
+  int _perRecordFlushUs = 0;
+  // Active throttle delay per record (us); 0 when not congested.
+  // Set by _onBufferSizeChanged (1 compare + 1 assign), read by waitIfThrottled.
+  int _throttleDelayPerRecordUs = 0;
+
+  /// Minimum total delay (us) below which we skip the await entirely
+  /// to avoid micro-delay overhead. 1000us = 1ms.
+  static const int _kMinThrottleDelayUs = 1000;
+
   ParallelJournalManager(
       this._dataStore, this._walManager, this._bufferManager);
 
@@ -57,9 +68,46 @@ class ParallelJournalManager {
   /// Returns true only when actively recovering a pending batch, not just when pending batches exist
   bool get isInRecoveryMode => _isRecovering;
 
+  /// Write backpressure: called by WriteBufferManager before enqueue.
+  ///
+  /// Hot path cost: 1 multiply + 1 compare. Skips await when delay < 1ms.
+  /// [count] = 1 for single addRecord, or N for periodic batch checks.
+  Future<void> waitIfThrottled([int count = 1]) {
+    if (_throttleDelayPerRecordUs < _kMinThrottleDelayUs) {
+      return Future<void>.value();
+    }
+    final totalUs = _throttleDelayPerRecordUs * count;
+    return Future<void>.delayed(Duration(microseconds: totalUs));
+  }
+
+  /// Hard backpressure: wait until write queue length is at or below [cap].
+  /// Used by batch insert to avoid unbounded buffer growth when insert rate
+  /// exceeds flush rate. Polls [pollInterval] until condition is met or [timeout].
+  /// [timeout] prevents deadlock if flush is stuck; null = no timeout.
+  Future<void> waitUntilQueueBelow(
+    int cap, {
+    Duration pollInterval = const Duration(milliseconds: 20),
+    Duration? timeout,
+  }) async {
+    if (cap <= 0 || _bufferManager.queueLength <= cap) return;
+    final stopAt = timeout != null ? DateTime.now().add(timeout) : null;
+    while (_running && _bufferManager.queueLength > cap) {
+      if (stopAt != null && DateTime.now().isAfter(stopAt)) break;
+      await Future.delayed(pollInterval);
+    }
+  }
+
   Future<void> start() async {
     if (_running) return;
     _running = true;
+
+    // Initial per-record flush estimate from config, so throttling works
+    // immediately before the first real measurement arrives.
+    // e.g. mobile: 5000ms * 1000 / 100K = 50us per record.
+    final bs = _dataStore.config.writeBatchSize;
+    _perRecordFlushUs =
+        bs > 0 ? _dataStore.config.maxFlushLatencyMs * 1000 ~/ bs : 50;
+
     // Reconcile incomplete batch from active A/B journal if any
     List<_WalRange>? excludeRanges;
     if (_walManager.hasPendingParallelBatches) {
@@ -249,7 +297,7 @@ class ParallelJournalManager {
   Future<void> _waitTailFillWhileGrowing({
     required int targetSize,
     required int delayMs,
-    int maxExtraRounds = 3,
+    int maxExtraRounds = 5,
   }) async {
     if (delayMs <= 0) return;
     if (_bufferManager.queueLength >= targetSize) return;
@@ -445,9 +493,9 @@ class ParallelJournalManager {
             final baseIndexTotalSizeInBytes = <String, int>{};
 
             if (schema != null) {
-              // defined indexes (explicit + implicit unique/fk)
+              // B+Tree indexes only (vector indexes have separate meta).
               final allIndexes =
-                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                  _dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
                       <IndexSchema>[];
               for (final idx in allIndexes) {
                 final idxName = idx.actualIndexName;
@@ -631,13 +679,20 @@ class ParallelJournalManager {
                 // Execute Table Write and Index Write in Parallel
                 // Compute per-table token budgets (data vs indexes) from planned batch plan.
                 // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
-                final indexesForBudget =
+                //
+                // allIndexes includes vector indexes — used to decide whether to call writeChanges.
+                // btreeIndexes excludes vector indexes — used for B+Tree budget calculation.
+                // IndexManager.writeChanges internally intercepts vector-type and dispatches
+                // to VectorIndexManager, so a single entry point handles both.
+                final allIndexes =
                     (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
                             <IndexSchema>[])
                         .toList();
+                final btreeIndexCount =
+                    allIndexes.where((i) => i.type != IndexType.vector).length;
                 final split = IoConcurrencyPlanner.splitPerTableBudget(
                   perTableTokens: perTableTokenBudget,
-                  indexCount: indexesForBudget.length,
+                  indexCount: btreeIndexCount,
                 );
 
                 // 1) Table Data
@@ -648,30 +703,28 @@ class ParallelJournalManager {
                   updates: updateRecords,
                   deletes: deleteRecords,
                   batchContext: currentBatchContext,
-                  concurrency: split.tableDataTokens, // token request cap
+                  concurrency: split.tableDataTokens,
                 );
 
-                // 2) Index Data (budgeted) - IndexManager will internally split into index-level + partition-level.
+                // 2) All indexes (B+Tree + Vector) via single IndexManager entry point.
                 Future<void> indexWrite() async {
-                  if (indexesForBudget.isEmpty) return;
+                  if (allIndexes.isEmpty) return;
                   await (_dataStore.indexManager?.writeChanges(
                         tableName: table,
                         inserts: idxInserts,
                         updates: idxUpdates,
                         deletes: deleteRecords,
                         batchContext: currentBatchContext,
-                        concurrency:
-                            split.indexTokens, // token budget for index IO
+                        concurrency: split.indexTokens,
                       ) ??
                       Future.value());
                 }
 
-                if (indexesForBudget.isEmpty) {
+                if (allIndexes.isEmpty) {
                   await tableWriteFuture;
                 } else if (split.runInParallel) {
                   await Future.wait([tableWriteFuture, indexWrite()]);
                 } else {
-                  // Budget too small to run both sides concurrently; prioritize table data first.
                   await tableWriteFuture;
                   await indexWrite();
                 }
@@ -743,6 +796,18 @@ class ParallelJournalManager {
             timeout: timeout,
             continueOnError: false,
           );
+
+          // ── Backpressure: measure per-record flush cost ──
+          final batchElapsedUs = batchSw.elapsedMicroseconds;
+          if (batch.isNotEmpty) {
+            _perRecordFlushUs = batchElapsedUs ~/ batch.length;
+          }
+          // Reset throttle if queue is no longer congested after flush,
+          // so remaining operations don't wait unnecessarily.
+          if (_throttleDelayPerRecordUs > 0 &&
+              _bufferManager.queueLength <= _dataStore.config.writeBatchSize) {
+            _throttleDelayPerRecordUs = 0;
+          }
 
           final now = DateTime.now();
           final at =
@@ -817,6 +882,19 @@ class ParallelJournalManager {
 
   void _onBufferSizeChanged(int size) {
     if (!_running) return;
+
+    // ── Backpressure: O(1) — scale delay by queue backlog level ──
+    // When congested (queue > batchSize) and we have a measurement,
+    // throttle delay scales with backlog: multiplier = queue ~/ batchSize.
+    // At 2x batchSize → 2x per-record cost, at 3x → 3x, etc.
+    // When not congested or no measurement yet, throttle is 0 (disabled).
+    final batchSize = _dataStore.config.writeBatchSize;
+    if (size > batchSize && _perRecordFlushUs > 0) {
+      _throttleDelayPerRecordUs = _perRecordFlushUs * (size ~/ batchSize);
+    } else {
+      _throttleDelayPerRecordUs = 0;
+    }
+
     if (size <= 0) {
       return;
     }
@@ -1716,18 +1794,19 @@ class ParallelJournalManager {
             await _dataStore.schemaManager?.getTableSchema(tableName);
         if (schema == null) continue;
 
-        final allIndexes =
-            (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
+        // B+Tree indexes only — vector indexes have separate meta and recovery.
+        final btreeIndexNames =
+            (_dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
                     <IndexSchema>[])
                 .map((i) => i.actualIndexName)
                 .toList(growable: false);
-        if (allIndexes.isEmpty) continue;
+        if (btreeIndexNames.isEmpty) continue;
 
         final flushedForTable = flushedIndexes[tableName] ?? const <String>{};
         final plan = walData.tablePlans[tableName];
         if (plan == null) continue;
 
-        for (final indexName in allIndexes) {
+        for (final indexName in btreeIndexNames) {
           if (flushedForTable.contains(indexName)) continue;
 
           Logger.debug(
@@ -1969,9 +2048,11 @@ class ParallelJournalManager {
     final baseIndexTotalSizeInBytes = <String, int>{};
     try {
       if (schema != null) {
-        final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-            <IndexSchema>[];
-        for (final idx in allIndexes) {
+        // B+Tree indexes only — vector index meta is separate, no B+Tree IndexMeta to read.
+        final btreeIndexes =
+            _dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
+                <IndexSchema>[];
+        for (final idx in btreeIndexes) {
           final idxName = idx.actualIndexName;
           indexNames.add(idxName);
           final idxMeta =

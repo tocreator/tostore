@@ -170,6 +170,36 @@ class TostoreExample {
             IndexSchema(fields: ['updated_at'], unique: false),
           ],
         ),
+        const TableSchema(
+          name: 'embeddings',
+          primaryKeyConfig: PrimaryKeyConfig(
+            name: 'id',
+            type: PrimaryKeyType.sequential,
+          ),
+          fields: [
+            FieldSchema(name: 'name', type: DataType.text, nullable: false),
+            FieldSchema(
+              name: 'embedding',
+              type: DataType.vector,
+              vectorConfig: VectorFieldConfig(
+                dimensions: 512,
+                precision: VectorPrecision.float32,
+              ),
+            ),
+          ],
+          indexes: [
+            IndexSchema(
+              fields: ['embedding'],
+              type: IndexType.vector,
+              vectorConfig: VectorIndexConfig(
+                distanceMetric: VectorDistanceMetric.cosine,
+                maxDegree: 64,
+                efSearch: 64,
+                constructionEf: 128,
+              ),
+            ),
+          ],
+        ),
       ],
     );
   }
@@ -313,9 +343,9 @@ class TostoreExample {
     await db.restore(backupPath, deleteAfterRestore: true);
   }
 
-  /// Example: Working with vector data
+  /// Example: Working with vector data and similarity search
   Future<void> vectorExamples() async {
-    // create table structure
+    // Create table with vector field and NGH vector index
     await db.createTables([
       const TableSchema(
         name: 'embeddings',
@@ -333,34 +363,34 @@ class TostoreExample {
             name: 'embedding',
             type: DataType.vector,
             vectorConfig: VectorFieldConfig(
-              dimensions: 1536, // 1536 dimensions
-              precision: VectorPrecision.float64, // 64-bit precision
+              dimensions: 128, // 128-dimensional embeddings
+              precision: VectorPrecision.float32,
             ),
           ),
         ],
         indexes: [
+          // NGH vector index with typed configuration
           IndexSchema(
             fields: ['embedding'],
             type: IndexType.vector,
             vectorConfig: VectorIndexConfig(
-              indexType: VectorIndexType.ngh,
-              distanceMetric: VectorDistanceMetric.cosine, // Cosine similarity
-              parameters: {
-                'M': 16, // Max number of connections per layer
-                'efConstruction': 200, // Controls index quality
-                'efSearch': 100, // Controls search accuracy/speed trade-off
-              },
+              distanceMetric: VectorDistanceMetric.cosine,
+              maxDegree: 64, // Graph max neighbors (R)
+              efSearch: 64, // Search expansion factor
+              constructionEf: 128, // Construction expansion factor
             ),
           ),
         ],
       ),
     ]);
 
-    // create vector data
-    final sampleVector1 = VectorData.fromList([0.1, 0.2, 0.3, 0.4]);
-    final sampleVector2 = VectorData.fromList([0.5, 0.6, 0.7, 0.8]);
+    // Create sample vector data
+    final sampleVector1 =
+        VectorData.fromList(List.generate(128, (i) => (i * 0.01)));
+    final sampleVector2 =
+        VectorData.fromList(List.generate(128, (i) => (i * 0.02 + 0.5)));
 
-    // store documents with vector embeddings
+    // Store documents with vector embeddings
     await db.insert('embeddings', {
       'document_title': 'Introduction to vector databases',
       'embedding': sampleVector1,
@@ -371,7 +401,24 @@ class TostoreExample {
       'embedding': sampleVector2,
     });
 
-    // query stored vector data
+    // --- Vector similarity search (ANN) ---
+    final queryVector =
+        VectorData.fromList(List.generate(128, (i) => (i * 0.015)));
+
+    final searchResults = await db.vectorSearch(
+      'embeddings',
+      fieldName: 'embedding',
+      queryVector: queryVector,
+      topK: 5,
+    );
+
+    for (final r in searchResults) {
+      logService.add(
+          'match: pk=${r.primaryKey}, distance=${r.distance.toStringAsFixed(4)}, '
+          'score=${r.score.toStringAsFixed(4)}');
+    }
+
+    // --- Direct vector operations ---
     final result = await db.query('embeddings');
     final documents = result.data;
     List<VectorData> vectors = [];
@@ -381,30 +428,23 @@ class TostoreExample {
         VectorData vector =
             VectorData.fromJson(doc['embedding'] as List<dynamic>);
         vectors.add(vector);
-        doc['embedding'] = vector;
 
         logService.add(
             'document title: ${doc['document_title']}, vector dimensions: ${vector.dimensions}');
       }
     }
 
-    // at least two vectors can be compared
     if (vectors.length >= 2) {
       final vector1 = vectors[0];
       final vector2 = vectors[1];
 
-      logService.add('vector1: ${vector1.toString()}');
-      logService.add('vector2: ${vector2.toString()}');
-
-      // calculate vector similarity
+      // Calculate cosine similarity
       final similarity = vector1.cosineSimilarity(vector2);
-      logService.add('vector similarity: $similarity');
+      logService.add('cosine similarity: $similarity');
 
-      // calculate euclidean distance
+      // Calculate euclidean distance
       final distance = vector1.euclideanDistance(vector2);
-      logService.add('vector distance: $distance');
-    } else {
-      logService.add('not enough vector data for comparison');
+      logService.add('euclidean distance: $distance');
     }
   }
 
@@ -691,7 +731,26 @@ class TostoreExample {
         case DataType.datetime:
           break;
         case DataType.vector:
-        // Skip vector for now as it requires specific dimensions
+          // Generate high-quality random vector
+          if (field.vectorConfig != null) {
+            final dims = field.vectorConfig!.dimensions;
+            final values = List<double>.generate(dims, (_) {
+              // Gaussian approximation using Box-Muller transform
+              final u1 = random.nextDouble();
+              final u2 = random.nextDouble();
+              final z = sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
+              return z;
+            });
+            // Normalize to unit length for cosine similarity
+            final norm = sqrt(values.fold(0.0, (p, e) => p + e * e));
+            if (norm > 0) {
+              for (var i = 0; i < dims; i++) {
+                values[i] /= norm;
+              }
+            }
+            record[field.name] = VectorData(values);
+          }
+          break;
         case DataType.blob:
         // Skip blob for mock data generation
         case DataType.array:
@@ -722,8 +781,6 @@ class TostoreExample {
 
     // Get current max ID to ensure field values (email, username, etc.)
     // have sequential numbers matching the primary key IDs
-    // Note: This is only used for generating field values, NOT for setting primary key
-    // Primary key will be auto-generated by the database system
     int baseIndex = 0;
     if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
       try {
@@ -738,50 +795,70 @@ class TostoreExample {
           }
         }
       } catch (e) {
-        // If query fails, start from 0 (will use initial value from schema)
         logService.add(
             'Warning: Failed to query max ID for field value generation: $e',
             LogType.warn);
       }
     }
 
-    // Prepare all records at once to avoid multiple batch splits
-    // This improves performance by reducing the number of batchInsert calls
-    final records = <Map<String, dynamic>>[];
-    for (var i = 0; i < count; i++) {
-      // Use baseIndex + i + 1 to generate field values that match primary key IDs
-      // Primary key will be auto-generated by the database system
-      records.add(_generateRecord(
-        schema,
-        baseIndex + i + 1,
-        foreignKeyValues: foreignKeyValues,
-        foreignKeyModes: foreignKeyModes,
-        foreignKeyIdLists: foreignKeyIdLists,
-      ));
-      // Yield periodically to keep UI responsive during large data construction
-      if (i > 0 && i % 1000 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
+    final totalStopwatch = Stopwatch()..start();
+    final dbStopwatch = Stopwatch();
+    int processedCount = 0;
+    // Chunk size for data generation to avoid OOM
+    const int batchSize = 200000;
 
-    final stopwatch = Stopwatch()..start();
-
-    // Single batch insert call with all records
-    // The batchInsert method will handle internal batching if needed for memory efficiency
-    final result = await db.batchInsert(tableName, records);
-    if (!result.isSuccess) {
-      logService.add('Batch insert failed: ${result.message}', LogType.error);
-      return -1; // Indicate failure
-    }
-
-    stopwatch.stop();
-    final elapsed = stopwatch.elapsedMilliseconds;
     logService.add(
-        'Batch insert $count records into "$tableName" time: ${elapsed}ms');
+        'Starting batch insert of $count records into "$tableName" (Chunk size: $batchSize)...');
+
+    while (processedCount < count) {
+      final currentBatchSize = min(batchSize, count - processedCount);
+      final records = <Map<String, dynamic>>[];
+
+      // Generate data for current chunk only
+      for (var i = 0; i < currentBatchSize; i++) {
+        records.add(_generateRecord(
+          schema,
+          baseIndex + processedCount + i + 1,
+          foreignKeyValues: foreignKeyValues,
+          foreignKeyModes: foreignKeyModes,
+          foreignKeyIdLists: foreignKeyIdLists,
+        ));
+      }
+
+      // Insert current chunk (measure pure database time)
+      dbStopwatch.start();
+      final result = await db.batchInsert(tableName, records);
+      dbStopwatch.stop();
+
+      if (!result.isSuccess) {
+        logService.add(
+            'Batch insert failed at offset $processedCount: ${result.message}',
+            LogType.error);
+        return -1;
+      }
+
+      processedCount += currentBatchSize;
+
+      // Yield to keep UI responsive
+      await Future.delayed(Duration.zero);
+
+      // Clear records to free memory
+      records.clear();
+
+      logService.add('Progress: $processedCount/$count records inserted...',
+          LogType.info, true);
+    }
+
+    totalStopwatch.stop();
+    final dbElapsed = dbStopwatch.elapsedMilliseconds;
+    final totalElapsed = totalStopwatch.elapsedMilliseconds;
+
+    logService.add('Batch insert $count records into "$tableName" completed. '
+        'DB Time: ${dbElapsed}ms, Total Time: ${totalElapsed}ms');
 
     final queryResult = await db.query(tableName).count();
     logService.add('query current table "$tableName" count: $queryResult');
-    return elapsed;
+    return dbElapsed;
   }
 
   /// Adds a specified number of example records to a given table one by one.
@@ -864,9 +941,9 @@ class TostoreExample {
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
     logService.add(
-        'Finished adding $count records to "$tableName" one-by-one in ${elapsed}ms');
+        'Finished adding $count records to "$tableName" one-by-one. DB Time: ${elapsed}ms');
     final queryResult = await db.query(tableName).count();
-    logService.add('query count: $queryResult');
+    logService.add('query current table "$tableName" count: $queryResult');
     return elapsed;
   }
 
@@ -1026,6 +1103,128 @@ class TostoreExample {
     }
 
     logService.add('Transaction examples completed', LogType.info);
+  }
+
+  // --- Vector Benchmarking ---
+
+  /// Performs a benchmark of vector search operations.
+  ///
+  /// [tableName] The table to search in.
+  /// [iterations] Number of searches to perform.
+  /// [topK] Number of nearest neighbors to retrieve.
+  ///
+  /// Returns the average latency in milliseconds.
+  Future<double> vectorSearchBenchmark(
+      String tableName, int iterations, int topK) async {
+    logService.add(
+        'Starting Vector Search Benchmark: table="$tableName", iterations=$iterations, topK=$topK');
+
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add('Benchmark failed: Schema for "$tableName" not found.',
+          LogType.error);
+      return -1;
+    }
+
+    final vectorField = schema.fields.firstWhere(
+        (f) => f.type == DataType.vector,
+        orElse: () => const FieldSchema(name: '', type: DataType.text));
+
+    if (vectorField.name.isEmpty) {
+      logService.add('Benchmark failed: No vector field found in "$tableName".',
+          LogType.error);
+      return -1;
+    }
+
+    final dims = vectorField.vectorConfig?.dimensions ?? 0;
+    if (dims == 0) {
+      logService.add(
+          'Benchmark failed: Vector dimensions not configured for "${vectorField.name}".',
+          LogType.error);
+      return -1;
+    }
+
+    // Verify index existence
+    final hasVectorIndex = schema.indexes.any((idx) =>
+        idx.type == IndexType.vector && idx.fields.contains(vectorField.name));
+    if (!hasVectorIndex) {
+      logService.add(
+          'Warning: No vector index found on "${vectorField.name}". Search will be slow.',
+          LogType.warn);
+    }
+
+    final random = Random();
+    final stopwatch = Stopwatch()..start();
+    int totalResults = 0;
+    bool validationFailed = false;
+
+    logService.add('Running $iterations searches...');
+
+    for (int i = 0; i < iterations; i++) {
+      // 1. Generate random query vector (normalized)
+      final queryValues = List<double>.generate(dims, (_) {
+        final u1 = random.nextDouble();
+        final u2 = random.nextDouble();
+        return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
+      });
+      final norm = sqrt(queryValues.fold(0.0, (p, e) => p + e * e));
+      if (norm > 0) {
+        for (var j = 0; j < dims; j++) {
+          queryValues[j] /= norm;
+        }
+      }
+      final queryVector = VectorData(queryValues);
+
+      // 2. Perform search
+      final results = await db.vectorSearch(
+        tableName,
+        fieldName: vectorField.name,
+        queryVector: queryVector,
+        topK: topK,
+      );
+
+      totalResults += results.length;
+
+      // 3. Validate results (only for the first/single iteration to avoid overhead if iterations are high)
+      if (i == 0 || iterations <= 10) {
+        for (final r in results) {
+          // Validate similarity score range for Cosine (-1.0 to 1.0)
+          if (r.score < -1.0001 || r.score > 1.0001) {
+            logService.add(
+                'Validation Error: Invalid similarity score ${r.score} (expected -1.0 to 1.0 for Cosine)',
+                LogType.error);
+            validationFailed = true;
+          }
+        }
+      }
+
+      // Periodically log progress for long tests
+      if (iterations >= 1000 && (i + 1) % (iterations ~/ 10) == 0) {
+        logService.add(
+            'Progress: ${i + 1}/$iterations completed...', LogType.info, true);
+      }
+
+      // Small delay to allow UI refresh in very long loops
+      if (i % 500 == 0) {
+        await Future.delayed(Duration.zero);
+      }
+    }
+
+    stopwatch.stop();
+    final totalElapsed = stopwatch.elapsedMilliseconds;
+    final avgLatency = totalElapsed / iterations;
+
+    logService.add('---------------------------------------');
+    logService.add('Vector Search Benchmark Completed:');
+    logService.add('- Total Latency: ${totalElapsed}ms');
+    logService.add('- Average Latency: ${avgLatency.toStringAsFixed(3)}ms');
+    logService.add(
+        '- Results Count (Avg): ${(totalResults / iterations).toStringAsFixed(1)}');
+    logService.add(
+        '- Status: ${validationFailed ? "FAILED (Check logs)" : "PASSED"}');
+    logService.add('---------------------------------------');
+
+    return avgLatency;
   }
 }
 

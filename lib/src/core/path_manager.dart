@@ -254,6 +254,62 @@ class PathManager {
     return pathJoin(tablePath, 'stats.json');
   }
 
+  // ==================================
+  // NGH vector index path methods
+  // ==================================
+
+  /// Root path for an NGH vector index.
+  Future<String> getNghIndexPath(String tableName, String indexName) async {
+    final indexPath = await getIndexPath(tableName, indexName);
+    return pathJoin(indexPath, 'ngh');
+  }
+
+  /// NGH index metadata file.
+  Future<String> getNghMetaPath(String tableName, String indexName) async {
+    final nghPath = await getNghIndexPath(tableName, indexName);
+    return pathJoin(nghPath, 'meta.json');
+  }
+
+  /// NGH PQ codebook file.
+  Future<String> getNghCodebookPath(String tableName, String indexName) async {
+    final nghPath = await getNghIndexPath(tableName, indexName);
+    return pathJoin(nghPath, 'codebook.ngh');
+  }
+
+  /// NGH graph partition directory path.
+  Future<String> _nghPartitionDirPath(
+      String tableName, String indexName, String category, int dirIndex) async {
+    final nghPath = await getNghIndexPath(tableName, indexName);
+    return pathJoin(nghPath, category, 'dir_$dirIndex');
+  }
+
+  /// NGH graph partition file path by partitionNo.
+  Future<String> getNghGraphPartitionPath(
+      String tableName, String indexName, int partitionNo) async {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    final dir =
+        await _nghPartitionDirPath(tableName, indexName, 'graph', dirIndex);
+    return pathJoin(dir, 'p$partitionNo.ngh');
+  }
+
+  /// NGH PQ-code partition file path by partitionNo.
+  Future<String> getNghPqCodePartitionPath(
+      String tableName, String indexName, int partitionNo) async {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    final dir =
+        await _nghPartitionDirPath(tableName, indexName, 'pqcode', dirIndex);
+    return pathJoin(dir, 'p$partitionNo.ngh');
+  }
+
+  /// NGH raw-vector partition file path by partitionNo.
+  Future<String> getNghRawVectorPartitionPath(
+      String tableName, String indexName, int partitionNo) async {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    final dir =
+        await _nghPartitionDirPath(tableName, indexName, 'rawvec', dirIndex);
+    return pathJoin(dir, 'p$partitionNo.ngh');
+  }
+
   //==================================
   // cache path methods (sync methods)
   //==================================

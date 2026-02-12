@@ -92,6 +92,9 @@ abstract class DataStoreInterface {
   Future<bool> switchSpace(
       {String spaceName = 'default', bool keepActive = true});
 
+  /// flush data
+  Future<void> flush({bool flushStorage = true});
+
   /// close data store engine
   /// [keepActiveSpace] when false, clears active space so next launch uses default (e.g. logout). Default true.
   Future<void> close({bool keepActiveSpace = true});

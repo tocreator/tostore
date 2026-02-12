@@ -37,6 +37,7 @@ export 'src/handler/to_crypto.dart';
 import 'src/Interface/chain_builder.dart';
 import 'src/Interface/data_store_interface.dart';
 import 'src/Interface/status_provider.dart';
+import 'src/model/query_result.dart';
 import 'src/model/transaction_result.dart';
 import 'src/model/data_store_config.dart';
 import 'src/core/data_store_impl.dart';
@@ -347,6 +348,51 @@ class ToStore implements DataStoreInterface {
   @override
   Future<DbResult> upsert(String tableName, Map<String, dynamic> data) {
     return _impl.upsert(tableName, data);
+  }
+
+  /// Perform approximate nearest neighbor (ANN) vector similarity search.
+  ///
+  /// Searches the NGH vector index on [fieldName] in [tableName] for the
+  /// top-[topK] records most similar to [queryVector].
+  ///
+  /// Returns [VectorSearchResult] list sorted by similarity score.
+  ///
+  /// Example:
+  /// ```dart
+  /// final results = await db.vectorSearch(
+  ///   'articles',
+  ///   fieldName: 'embedding',
+  ///   queryVector: VectorData([0.1, 0.2, ...]),
+  ///   topK: 10,
+  /// );
+  /// for (final r in results) {
+  ///   print('pk=${r.primaryKey}, score=${r.score}');
+  /// }
+  /// ```
+  ///
+  /// 向量相似度搜索
+  /// [tableName] 表名
+  /// [fieldName] 向量字段名称
+  /// [queryVector] 查询向量
+  /// [topK] 返回结果数量
+  /// [beamWidth] 搜索宽度
+  /// [distanceThreshold] 距离阈值
+  Future<List<VectorSearchResult>> vectorSearch(
+    String tableName, {
+    required String fieldName,
+    required VectorData queryVector,
+    int topK = 10,
+    int? efSearch,
+    double? distanceThreshold,
+  }) {
+    return _impl.vectorSearch(
+      tableName,
+      fieldName: fieldName,
+      queryVector: queryVector,
+      topK: topK,
+      efSearch: efSearch,
+      distanceThreshold: distanceThreshold,
+    );
   }
 
   /// Switch space for scenarios like user switching
@@ -669,6 +715,16 @@ class ToStore implements DataStoreInterface {
   @override
   Future<void> setVersion(int version) async {
     return await _impl.setVersion(version);
+  }
+
+  /// Flush pending writes to disk.
+  /// [flushStorage] When true (default), also flush underlying storage buffers.
+  ///
+  /// 将待落盘的数据刷入磁盘。
+  /// [flushStorage] 为 true（默认）时，同时刷新底层存储缓冲区。
+  @override
+  Future<void> flush({bool flushStorage = true}) async {
+    await _impl.flush(flushStorage: flushStorage);
   }
 
   /// Close database and clean up resources

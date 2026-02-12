@@ -8,6 +8,8 @@ import '../Interface/storage_interface.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/logger.dart';
 import '../handler/common.dart';
+import 'overflow_manager.dart';
+
 import '../handler/memcomparable.dart';
 import '../handler/encoder.dart';
 import '../model/data_store_config.dart';
@@ -804,6 +806,42 @@ final class TableTreePartitionManager {
       return cur;
     }
 
+    final dirtyOverflowPaths = <String>{};
+
+    // Pre-calculate overflow requirements and cache encoded records.
+    final Map<String, Uint8List> preEncoded = {};
+    int totalOverflowChunks = 0;
+
+    for (final op in opList) {
+      await yc.maybeYield();
+      if (op.type == _OpType.put) {
+        final rec = Map<String, dynamic>.from(op.record);
+        rec.remove(schema.primaryKey);
+        final encoded = BinarySchemaCodec.encodeRecord(rec, fieldStruct);
+        preEncoded[op.pk] = encoded;
+
+        if (_dataStore.overflowManager
+            .shouldExternalize(meta.btreePageSize, encoded.length)) {
+          totalOverflowChunks += _dataStore.overflowManager.estimatePageCount(
+            valueLen: encoded.length,
+            pageSize: meta.btreePageSize,
+            encryptionKeyId: encryptionKeyId,
+          );
+        }
+      }
+    }
+
+    OverflowBatchAllocator? overflowAllocator;
+    if (totalOverflowChunks > 0) {
+      overflowAllocator = await _dataStore.overflowManager.startBatchAllocation(
+        totalChunks: totalOverflowChunks,
+        tableName: tableName,
+        pageSize: meta.btreePageSize,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: false,
+      );
+    }
     for (final op in opList) {
       await yc.maybeYield();
       final keyBytes = op.pkBytes;
@@ -861,9 +899,8 @@ final class TableTreePartitionManager {
         lastDeleteLeafPtr = leafPtr;
         continue;
       } else {
-        final rec = Map<String, dynamic>.from(op.record);
-        rec.remove(schema.primaryKey);
-        final encoded = BinarySchemaCodec.encodeRecord(rec, fieldStruct);
+        // Encoded value is already cached.
+        final encoded = preEncoded[op.pk]!;
 
         final oldIdx = leaf.find(keyBytes);
         final existed = oldIdx != null;
@@ -881,6 +918,10 @@ final class TableTreePartitionManager {
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
               );
+              final overflowPath = await _dataStore.pathManager
+                  .getOverflowPartitionFilePathByNo(
+                      tableName, oldSv.ref!.overflowPartitionNo);
+              dirtyOverflowPaths.add(overflowPath);
             }
           } catch (_) {}
         }
@@ -894,7 +935,13 @@ final class TableTreePartitionManager {
             pageSize: meta.btreePageSize,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
+            flush: false,
+            allocator: overflowAllocator,
           );
+          final overflowPath = await _dataStore.pathManager
+              .getOverflowPartitionFilePathByNo(
+                  tableName, ref.overflowPartitionNo);
+          dirtyOverflowPaths.add(overflowPath);
           stored = StoredValue.overflow(ref).encode();
         } else {
           stored = StoredValue.inline(encoded).encode();
@@ -968,6 +1015,12 @@ final class TableTreePartitionManager {
         _dataStore.compactionManager
             .enqueueTable(tableName, hint: lastDeleteLeafPtr);
       } catch (_) {}
+    }
+
+    if (dirtyOverflowPaths.isNotEmpty) {
+      for (final path in dirtyOverflowPaths) {
+        await _storage.flushFile(path);
+      }
     }
 
     // ---- Encode dirty pages into staged writes (once per page) ----

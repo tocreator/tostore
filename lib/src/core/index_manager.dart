@@ -480,16 +480,36 @@ class IndexManager {
         return;
       }
 
-      // Clear index data
+      // Clear all index data (files + caches).
       final indexesToReset = _dataStore.schemaManager
               ?.getAllIndexesFor(schema)
               .map((i) => i.actualIndexName)
               .toList() ??
           const <String>[];
 
+      // Add internal mapping B+Tree indexes for vector indexes only.
+      // These use virtual names (__nid2pk, __pk2nid) and are NOT in the schema index list.
+      final allIndexesToReset = <String>[];
+      // Add main indexes
+      allIndexesToReset.addAll(indexesToReset);
+      // Add mapping indexes only for vector indexes (using dedicated method for efficiency)
+      final vectorIndexes =
+          _dataStore.schemaManager?.getVectorIndexesFor(schema) ??
+              const <IndexSchema>[];
+      for (final indexSchema in vectorIndexes) {
+        final indexName = indexSchema.actualIndexName;
+        for (final suffix in ['__nid2pk', '__pk2nid']) {
+          allIndexesToReset.add('$indexName$suffix');
+        }
+      }
+
+      // Clear vector index caches (vector files are under the index directory tree
+      // which gets deleted below, so no separate file cleanup needed).
+      _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+
       // Clear index data from memory and files
       final yieldController = YieldController('IndexManager.resetIndexes');
-      for (final indexName in indexesToReset) {
+      for (final indexName in allIndexesToReset) {
         // Remove from cache
         _indexMetaCache.remove([tableName, indexName]);
         _indexDataCache.remove([tableName, indexName]);
@@ -508,9 +528,10 @@ class IndexManager {
         }
       }
 
-      // Collect all indexes to rebuild
-      final indexesToBuild = _dataStore.schemaManager?.getAllIndexesFor(schema);
-      if (indexesToBuild == null) return;
+      // Collect B+Tree indexes to rebuild (vector indexes are managed separately).
+      final indexesToBuild =
+          _dataStore.schemaManager?.getBtreeIndexesFor(schema);
+      if (indexesToBuild == null || indexesToBuild.isEmpty) return;
 
       // Use optimized batch index building mechanism
       await _rebuildTableIndexes(tableName, schema, indexesToBuild);
@@ -1395,19 +1416,45 @@ class IndexManager {
         .removeWhere((i) => i.fields.length == 1 && i.fields.first == pkName);
     if (targets.isEmpty) return;
 
-    // Compute per-index deltas.
-    final idxTasks = <Future<void> Function()>[];
+    // Single pass: split vector vs B+Tree indexes, count B+Tree for budget.
+    Future<void>? vectorFuture;
+    final btreeTargets = <IndexSchema>[];
+    for (final idx in targets) {
+      if (idx.type == IndexType.vector) {
+        // Dispatch once to VectorIndexManager (runs in parallel with B+Tree).
+        if (vectorFuture == null && _dataStore.vectorIndexManager != null) {
+          vectorFuture = _dataStore.vectorIndexManager!.writeChanges(
+            tableName: tableName,
+            inserts: insertsCopy,
+            deletes: deletesCopy,
+            batchContext: batchContext,
+            concurrency: concurrency,
+          );
+        }
+      } else {
+        btreeTargets.add(idx);
+      }
+    }
+
+    if (btreeTargets.isEmpty) {
+      if (vectorFuture != null) await vectorFuture;
+      return;
+    }
+
+    // Budget for B+Tree indexes only.
     final bool hasExplicitBudget = (concurrency != null && concurrency > 0);
     final IndexWriteBudget? budget = hasExplicitBudget
         ? IoConcurrencyPlanner.planIndexWriteBudget(
             budgetTokens: concurrency,
-            indexCount: targets.length,
-            // Non-unique indexes are far more likely to touch many partitions; avoid per-index=1.
-            minPartitionTokensPerIndex: targets.any((i) => !i.unique) ? 2 : 1,
+            indexCount: btreeTargets.length,
+            minPartitionTokensPerIndex:
+                btreeTargets.any((i) => !i.unique) ? 2 : 1,
           )
         : null;
 
-    for (final idx in targets) {
+    final idxTasks = <Future<void> Function()>[];
+
+    for (final idx in btreeTargets) {
       final indexName = idx.actualIndexName;
       // Skip indexes that are already fully flushed (used during recovery)
       if (skipIndexes != null && skipIndexes.contains(indexName)) {
@@ -1539,25 +1586,24 @@ class IndexManager {
       });
     }
 
-    if (idxTasks.isEmpty) return;
+    if (idxTasks.isEmpty) {
+      if (vectorFuture != null) await vectorFuture;
+      return;
+    }
 
-    // Execute per-index tasks. If caller provides a token budget, we use a balanced
-    // index-level concurrency to preserve partition-level parallelism.
+    // Execute B+Tree index tasks in parallel with the already-running vector future.
     final int idxLevelConcurrency =
-        hasExplicitBudget ? min(targets.length, budget!.indexConcurrency) : 1;
+        hasExplicitBudget ? min(idxTasks.length, budget!.indexConcurrency) : 1;
 
-    // Calculate a dynamic timeout based on writeBatchSize AND maxPartitionFileSize.
+    // Dynamic timeout based on writeBatchSize AND maxPartitionFileSize.
     final int batchSize = _dataStore.config.writeBatchSize;
     final int maxFileSize = _dataStore.config.maxPartitionFileSize;
-
-    final int batchSeconds = (batchSize / 50).ceil();
-    final int ioSeconds = (maxFileSize / (100 * 1024)).ceil();
-
-    final timeout = Duration(seconds: 30 + batchSeconds + ioSeconds);
+    final timeout = Duration(
+        seconds: 30 + (batchSize / 50).ceil() + (maxFileSize ~/ (100 * 1024)));
 
     if (InternalConfig.showLoggerInternalLabel) {
       Logger.debug(
-        'Index persistence: table=$tableName, totalIndexes=${idxTasks.length}, concurrency=$idxLevelConcurrency, timeout=$timeout',
+        'Index persistence: table=$tableName, btreeIndexes=${idxTasks.length}, concurrency=$idxLevelConcurrency, timeout=$timeout',
         label: 'IndexManager',
       );
     }
@@ -1569,6 +1615,9 @@ class IndexManager {
       continueOnError: false,
       timeout: timeout,
     );
+
+    // Await vector index write that was dispatched in parallel with B+Tree tasks.
+    if (vectorFuture != null) await vectorFuture;
   }
 
   /// Searches an index using a structured condition, with optimizations for performance and memory.
@@ -1938,91 +1987,81 @@ class IndexManager {
       if (opUpper == 'LIKE' && condition.value is String) {
         final pattern = condition.value as String;
 
-        // Find the effective prefix (stop at first wildcard % or _)
-        int wildcardIndex = -1;
         final firstPercent = pattern.indexOf('%');
-        final firstUnderscore = pattern.indexOf('_');
+        final prefixEnd = (firstPercent > 0)
+            ? firstPercent
+            : (firstPercent == -1 && pattern.isNotEmpty ? pattern.length : 0);
+        if (prefixEnd <= 0) {
+          return IndexSearchResult.tableScan();
+        }
+        final prefix = pattern.substring(0, prefixEnd);
 
-        if (firstPercent != -1 && firstUnderscore != -1) {
-          wildcardIndex = min(firstPercent, firstUnderscore);
-        } else if (firstPercent != -1) {
-          wildcardIndex = firstPercent;
-        } else {
-          wildcardIndex = firstUnderscore;
+        String? incrementString(String s) {
+          if (s.isEmpty) return null;
+          final codeUnits = List<int>.from(s.codeUnits);
+          for (int i = codeUnits.length - 1; i >= 0; i--) {
+            if (codeUnits[i] < 0xFFFF) {
+              codeUnits[i]++;
+              return String.fromCharCodes(codeUnits);
+            }
+            codeUnits.removeLast();
+          }
+          return null;
         }
 
-        if (wildcardIndex > 0 || (wildcardIndex == -1 && pattern.isNotEmpty)) {
-          final prefix = (wildcardIndex != -1)
-              ? pattern.substring(0, wildcardIndex)
-              : pattern;
-
-          String? incrementString(String s) {
-            if (s.isEmpty) return null;
-            final codeUnits = List<int>.from(s.codeUnits);
-            for (int i = codeUnits.length - 1; i >= 0; i--) {
-              if (codeUnits[i] < 0xFFFF) {
-                codeUnits[i]++;
-                return String.fromCharCodes(codeUnits);
-              }
-              codeUnits.removeLast();
-            }
-            return null;
+        // Single-field index: encode full key. Composite: encode first field only for range.
+        Uint8List? startBytes = encodePrefix(prefix);
+        Uint8List? endBytes;
+        if (prefix.isNotEmpty) {
+          final nextPrefix = incrementString(prefix);
+          if (nextPrefix != null) {
+            endBytes = encodePrefix(nextPrefix);
           }
+        }
 
-          // Single-field index: encode full key. Composite: encode first field only for range.
-          Uint8List? startBytes = encodePrefix(prefix);
-          Uint8List? endBytes;
-          if (prefix.isNotEmpty) {
-            final nextPrefix = incrementString(prefix);
-            if (nextPrefix != null) {
-              endBytes = encodePrefix(nextPrefix);
-            }
-          }
-
-          // Composite index: encodePrefix(prefix) returns null (needs n components). Use first field only.
-          if (startBytes == null && fields.isNotEmpty) {
-            final c0 = schema.encodeFieldComponentToMemComparable(
-              fields[0],
-              prefix,
-              truncateText: truncateText,
-            );
-            if (c0 != null) {
-              startBytes = MemComparableKey.encodeTuple([c0]);
-              if (prefix.isNotEmpty) {
-                final nextPrefix = incrementString(prefix);
-                if (nextPrefix != null) {
-                  final c0End = schema.encodeFieldComponentToMemComparable(
-                    fields[0],
-                    nextPrefix,
-                    truncateText: truncateText,
-                  );
-                  if (c0End != null) {
-                    endBytes = MemComparableKey.encodeTuple([c0End]);
-                  }
+        // Composite index: encodePrefix(prefix) returns null (needs n components). Use first field only.
+        if (startBytes == null && fields.isNotEmpty) {
+          final c0 = schema.encodeFieldComponentToMemComparable(
+            fields[0],
+            prefix,
+            truncateText: truncateText,
+          );
+          if (c0 != null) {
+            startBytes = MemComparableKey.encodeTuple([c0]);
+            if (prefix.isNotEmpty) {
+              final nextPrefix = incrementString(prefix);
+              if (nextPrefix != null) {
+                final c0End = schema.encodeFieldComponentToMemComparable(
+                  fields[0],
+                  nextPrefix,
+                  truncateText: truncateText,
+                );
+                if (c0End != null) {
+                  endBytes = MemComparableKey.encodeTuple([c0End]);
                 }
               }
             }
           }
+        }
 
-          if (startBytes != null) {
-            final start = applyCursorStart(startBytes);
-            final end = applyCursorEnd(endBytes ?? Uint8List(0));
+        if (startBytes != null) {
+          final start = applyCursorStart(startBytes);
+          final end = applyCursorEnd(endBytes ?? Uint8List(0));
 
-            if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
-              return IndexSearchResult.empty();
-            }
-
-            return await _dataStore.indexTreePartitionManager.searchByKeyRange(
-              tableName: tableName,
-              indexName: indexName,
-              meta: meta,
-              startKeyInclusive: start,
-              endKeyExclusive: end,
-              reverse: reverse,
-              limit: limit,
-              offset: effectiveOffset,
-            );
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            return IndexSearchResult.empty();
           }
+
+          return await _dataStore.indexTreePartitionManager.searchByKeyRange(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: start,
+            endKeyExclusive: end,
+            reverse: reverse,
+            limit: limit,
+            offset: effectiveOffset,
+          );
         }
         return IndexSearchResult.tableScan();
       }

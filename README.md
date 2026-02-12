@@ -283,7 +283,7 @@ await db.createTables([
         type: IndexType.vector,              // Vector index
         fields: ['spatial_features'],
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.hnsw,   // HNSW algorithm for efficient ANN
+          indexType: VectorIndexType.ngh,    // NGH algorithm for efficient ANN
           distanceMetric: VectorDistanceMetric.cosine,
           parameters: {
             'M': 16,
@@ -746,6 +746,20 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 - 📱 **Example Project**: A complete Flutter app example is provided in the `example` directory.
 - 🚀 **Production**: Use Release mode for performance far exceeding Debug mode.
 - ✅ **Standard Tests**: All core functionalities have passed standard integration tests.
+
+### Demo Videos
+
+<p align="center">
+  <img src="doc/media/basic-demo.gif" alt="Tostore basic performance demo" width="320" />
+  </p>
+
+- **Basic performance demo** (`doc/media/basic-demo.mp4`): Shows that even on an ordinary mobile device with 100M+ records, startup, paging, and search performance remain stable and smooth. As long as storage is sufficient, edge devices can sustain TB/PB-scale datasets while keeping interactive latency consistently low.
+
+<p align="center">
+  <img src="doc/media/disaster-recovery.gif" alt="Tostore disaster recovery stress test" width="320" />
+  </p>
+
+- **Disaster recovery stress test** (`doc/media/disaster-recovery.mp4`): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, Tostore recovers extremely fast on a typical phone and does not impact startup or data availability.
 
 
 

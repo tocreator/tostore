@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Added atomic condition judgment expressions for conditional updates and logic in expressions
 
 ### Changed
+- Intelligent workload scheduling for more stable behavior under very large data volumes
 - Adjusted `upsert` API: removed chained query conditions; use atomic condition expressions for conditional upsert logic
 - `switchSpace` and `close`: added `keepActive` / `keepActiveSpace` options to manage active space for “keep login state” and “logout” scenarios, avoiding extra open-then-switch flow; opening with default space can use stored active space so the first open lands in the last used space
 - Optimized constraint and migration prompt wording and consistency

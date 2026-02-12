@@ -557,6 +557,18 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
+  @override
+  Future<void> flushFile(String path) async {
+    await _initCompleter.future;
+    try {
+      final normalizedPath = _normalizePath(path);
+      await _flushPath(normalizedPath);
+    } catch (e) {
+      Logger.error('Flush file failed: $e', label: 'WebStorageImpl.flushFile');
+      rethrow;
+    }
+  }
+
   /// Update copyFile to use FileInfo
   @override
   Future<void> copyFile(String sourcePath, String targetPath) async {

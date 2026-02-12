@@ -156,6 +156,16 @@ class SchemaManager {
     return entry.uniqueIndexes;
   }
 
+  /// Get all non-vector (B+Tree / hash / bitmap) indexes for a table.
+  ///
+  /// Use this instead of [getAllIndexesFor] when the caller assumes
+  /// B+Tree-compatible index operations (create, rebuild, write, integrity check).
+  List<IndexSchema> getBtreeIndexesFor(TableSchema schema) {
+    final entry = _indexListCache[schema.name] ?? _buildIndexListCache(schema);
+    _indexListCache[schema.name] = entry;
+    return entry.btreeIndexes;
+  }
+
   /// Get all vector indexes for a table.
   ///
   /// When a table has no vector index, this returns an empty list and
@@ -1042,10 +1052,14 @@ class _IndexListCacheEntry {
   final List<IndexSchema> uniqueIndexes;
   final List<IndexSchema> vectorIndexes;
 
+  /// All non-vector indexes (btree / hash / bitmap).
+  final List<IndexSchema> btreeIndexes;
+
   const _IndexListCacheEntry({
     required this.allIndexes,
     required this.uniqueIndexes,
     required this.vectorIndexes,
+    required this.btreeIndexes,
   });
 }
 
@@ -1062,11 +1076,13 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
       allIndexes: emptyList,
       uniqueIndexes: emptyList,
       vectorIndexes: emptyList,
+      btreeIndexes: emptyList,
     );
   }
 
   final unique = <IndexSchema>[];
   final vector = <IndexSchema>[];
+  final btree = <IndexSchema>[];
 
   for (final idx in all) {
     if (idx.unique) {
@@ -1074,6 +1090,8 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     }
     if (idx.type == IndexType.vector) {
       vector.add(idx);
+    } else {
+      btree.add(idx);
     }
   }
 
@@ -1082,5 +1100,6 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     allIndexes: List<IndexSchema>.unmodifiable(all),
     uniqueIndexes: List<IndexSchema>.unmodifiable(unique),
     vectorIndexes: List<IndexSchema>.unmodifiable(vector),
+    btreeIndexes: List<IndexSchema>.unmodifiable(btree),
   );
 }

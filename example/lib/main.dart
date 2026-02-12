@@ -109,8 +109,15 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   String _selectedSpace = 'default';
 
   // State for Data View
-  final List<String> _tableNames = ['users', 'posts', 'comments', 'settings'];
+  final List<String> _tableNames = [
+    'users',
+    'posts',
+    'comments',
+    'embeddings',
+    'settings'
+  ];
   String _selectedTable = 'users';
+  bool _hasVectorSupport = false;
   List<Map<String, dynamic>> _tableData = [];
   List<String> _tableColumns = [];
   int _currentPage = 1;
@@ -192,10 +199,13 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         if (!_tableColumns.contains(_primaryKey)) {
           _tableColumns.insert(0, _primaryKey!);
         }
+        _hasVectorSupport =
+            schema.indexes.any((idx) => idx.type == IndexType.vector);
       } else {
         // Fallback for tables without explicit schema (like kv store)
         _tableColumns = [];
         _primaryKey = 'key';
+        _hasVectorSupport = false;
       }
 
       // Base queries for data and count
@@ -241,6 +251,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         }
 
         final int offset = (_currentPage - 1) * _pageSize;
+        if (!mounted) return;
         if (offset > maxOffset) {
           _showOffsetLimitWarning(offset, maxOffset);
           setState(() => _isDataLoading = false);
@@ -248,6 +259,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         }
 
         final result = await dataQuery.limit(_pageSize).offset(offset);
+        if (!mounted) return;
         setState(() {
           _tableData = result.data;
           _nextCursor = result.nextCursor;
@@ -286,6 +298,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         }
 
         final result = await q;
+        if (!mounted) return;
 
         setState(() {
           _tableData = result.data;
@@ -810,6 +823,8 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                     _showCustomDeleteDialog();
                   } else if (value == 'clear_current_table') {
                     _confirmClearCurrentTable();
+                  } else if (value == 'vector_search') {
+                    _showVectorSearchBenchmarkDialog();
                   }
                 },
                 itemBuilder: (context) => [
@@ -834,6 +849,19 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                       ],
                     ),
                   ),
+                  if (_hasVectorSupport) const PopupMenuDivider(),
+                  if (_hasVectorSupport)
+                    const PopupMenuItem(
+                      value: 'vector_search',
+                      child: Row(
+                        children: [
+                          Icon(Icons.query_stats,
+                              size: 18, color: Color(0xff0aa6e8)),
+                          SizedBox(width: 8),
+                          Text('Vector Search'),
+                        ],
+                      ),
+                    ),
                   const PopupMenuDivider(),
                   const PopupMenuItem(
                     value: 'clear_current_table',
@@ -1614,6 +1642,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
               await widget.example.db.clear('posts');
               await widget.example.db.clear('users');
               await widget.example.db.clear('settings');
+              await widget.example.db.clear('embeddings');
               _updateOperationInfo('All tables cleared.');
               _fetchTableData(resetPage: true);
             } finally {
@@ -1692,6 +1721,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       barrierDismissible: false,
       builder: (context) => const ConcurrencyTestDialog(),
     );
+    if (!mounted) return;
 
     if (config != null) {
       _updateOperationInfo('Running Custom Concurrency Test...');
@@ -1721,6 +1751,39 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     }
   }
 
+  Future<void> _showVectorSearchBenchmarkDialog() async {
+    final result = await showDialog<Map<String, int>>(
+      context: context,
+      builder: (context) => const VectorSearchDialog(),
+    );
+    if (!mounted) return;
+
+    if (result != null) {
+      final iterations = result['iterations'] ?? 1;
+      final topK = result['topK'] ?? 10;
+
+      setState(() {
+        _isTesting = true;
+        _lastOperationInfo =
+            'Running $iterations vector search iterations (Top-$topK)...';
+      });
+
+      try {
+        await widget.example
+            .vectorSearchBenchmark(_selectedTable, iterations, topK);
+      } catch (e) {
+        logService.add('Benchmark failed: $e', LogType.error);
+        _updateOperationInfo('❌ Vector search benchmark failed.');
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isTesting = false;
+          });
+        }
+      }
+    }
+  }
+
   Future<void> _showAddDataDialog() async {
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
@@ -1730,6 +1793,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         db: widget.example.db,
       ),
     );
+    if (!mounted) return;
 
     if (result != null) {
       final count = result['count'] as int;
@@ -1879,6 +1943,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         initialData: rowData,
       ),
     );
+    if (!mounted) return;
 
     if (updatedData != null) {
       setState(() {
@@ -1938,6 +2003,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       context: context,
       builder: (context) => BatchUpdateDialog(schema: schema),
     );
+    if (!mounted) return;
 
     if (updateInfo != null) {
       final fieldToUpdate = updateInfo['field'] as String;
@@ -2003,6 +2069,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
       context: context,
       builder: (context) => CustomDeleteDialog(schema: schema),
     );
+    if (!mounted) return;
 
     if (result != null) {
       final field = result['field'] as String;
@@ -2033,6 +2100,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
           ],
         ),
       );
+      if (!mounted) return;
 
       if (confirmed ?? false) {
         setState(() {
@@ -2083,6 +2151,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         existingFilters: _activeFilters,
       ),
     );
+    if (!mounted) return;
 
     if (newFilters != null) {
       setState(() {
@@ -2113,6 +2182,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
         ],
       ),
     );
+    if (!mounted) return;
 
     if (confirmed ?? false) {
       setState(() {
@@ -2525,38 +2595,9 @@ class _AddDataDialogState extends State<AddDataDialog> {
     }
   }
 
-  void _onAdd() {
+  void _onAdd() async {
     final count = int.tryParse(_controller.text);
     if (count != null && count > 0) {
-      // Check maximum batch size limit
-      const int maxBatchSize = 1000000;
-      if (count > maxBatchSize) {
-        showDialog(
-          context: context,
-          builder: (context) => AlertDialog(
-            alignment: Alignment.topCenter,
-            title: const Row(
-              children: [
-                Icon(Icons.warning_amber_rounded, color: Colors.orange),
-                SizedBox(width: 8),
-                Text('Batch Size Warning', style: TextStyle(fontSize: 20)),
-              ],
-            ),
-            content: Text(
-              'The requested count ($count) exceeds the maximum allowed batch size ($maxBatchSize). '
-              'Please reduce the count and try again.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('OK'),
-              ),
-            ],
-          ),
-        );
-        return;
-      }
-
       // Check if there are foreign keys but the main table has no data
       if (_missingForeignKeyTables.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -3585,4 +3626,123 @@ class _FilterCondition {
     required this.operator,
     required this.valueController,
   });
+}
+
+class VectorSearchDialog extends StatefulWidget {
+  const VectorSearchDialog({super.key});
+
+  @override
+  State<VectorSearchDialog> createState() => _VectorSearchDialogState();
+}
+
+class _VectorSearchDialogState extends State<VectorSearchDialog> {
+  int _iterations = 1;
+  int _topK = 10;
+  final _customController = TextEditingController(text: '1');
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.query_stats, color: Color(0xff0aa6e8)),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Vector Search Benchmark',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Search Config',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            const Text('Top-K (Number of neighbors):'),
+            Slider(
+              value: _topK.toDouble(),
+              min: 1,
+              max: 100,
+              divisions: 99,
+              label: _topK.toString(),
+              activeColor: const Color(0xff0aa6e8),
+              onChanged: (v) => setState(() => _topK = v.toInt()),
+            ),
+            Center(child: Text('$_topK results per search')),
+            const SizedBox(height: 24),
+            const Text('Iterations:',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [1, 100, 1000, 10000].map((count) {
+                final isSelected = _iterations == count;
+                return ChoiceChip(
+                  label: Text(count == 1 ? 'Single' : count.toString()),
+                  selected: isSelected,
+                  selectedColor: const Color(0xff0aa6e8),
+                  labelStyle: TextStyle(
+                    color: isSelected ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() {
+                        _iterations = count;
+                        _customController.text = count.toString();
+                      });
+                    }
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _customController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Custom Iterations',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.repeat),
+              ),
+              onChanged: (v) {
+                final val = int.tryParse(v);
+                if (val != null && val > 0) {
+                  setState(() => _iterations = val);
+                }
+              },
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Total searches to perform. Results will be averaged to measure latency.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            Navigator.of(context).pop({
+              'iterations': _iterations,
+              'topK': _topK,
+            });
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xff0aa6e8),
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Start Benchmark'),
+        ),
+      ],
+    );
+  }
 }

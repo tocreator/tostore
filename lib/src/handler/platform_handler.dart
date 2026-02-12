@@ -101,54 +101,33 @@ class PlatformHandler {
     final cores = processorCores;
 
     if (isServerEnvironment) {
-      // For servers, dynamically reserve cores based on the total number of cores.
-      // This prevents system overload on high-core-count machines.
-      int reservedCores;
-      if (cores <= 10) {
-        reservedCores = 1;
-      } else if (cores <= 15) {
-        reservedCores = 2;
-      } else if (cores <= 30) {
-        reservedCores = 3;
-      } else {
-        reservedCores = 4;
-      }
-
-      int baseConcurrency = cores - reservedCores;
-
-      // Memory-aware cap: estimate ~80MB per concurrent task
-      // For very high concurrency, we need to consider memory limits
-      return baseConcurrency.clamp(1, 96);
+      // For servers, utilize all available cores.
+      // YieldController inside the engine will handle any necessary execution pauses.
+      return cores.clamp(10, 128);
     } else if (isDesktop) {
-      // For desktops, use half the cores, but at least 2.
-      // Increase max cap to 16 for high-core desktops (e.g., 16-core systems)
-      // This better utilizes modern desktop hardware while still being conservative
-      return (cores / 2).round().clamp(2, 16);
+      // For desktops, utilize all available cores.
+      // Modern OS schedulers and YieldController ensure UI responsiveness.
+      return cores.clamp(8, 64);
     } else if (isMobile) {
-      // For mobile, be more conservative: use cores but cap at 4
-      // Mobile devices have limited memory and battery constraints
-      return cores.clamp(1, 4);
+      // For mobile, utilize all cores but cap at 8 to avoid excessive memory/thermal pressure.
+      return cores.clamp(6, 16);
     } else {
-      // For web and unknown platforms, be very conservative
-      return cores.clamp(1, 4);
+      // For web and unknown platforms, use cores but cap at 6.
+      return cores.clamp(3, 8);
     }
   }
 
   /// Detect if it's a server environment
   static bool get isServerEnvironment {
     // Server environment detection strategy:
-    // 1. Check if it's a Linux or macOS system (servers typically use these systems)
-    // 2. Check if it has large amount of memory (servers typically have more memory)
-    // 3. Check processor core count (servers typically have multiple cores)
+    // 1. Linux systems are almost always servers or high-performance environments in this context.
+    // 2. Windows/macOS with high core counts (>=12) often act as workstations or build servers.
     if (isLinux) {
-      // Linux server is likely a database server
       return true;
-    } else if (isMacOS && processorCores >= 8) {
-      // Mac servers typically have more processor cores
+    } else if ((isWindows || isMacOS) && processorCores >= 12) {
       return true;
     }
 
-    // Not a clear server environment
     return false;
   }
 

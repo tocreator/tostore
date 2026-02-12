@@ -1682,10 +1682,60 @@ final class IndexTreePartitionManager {
     if (v.isEmpty || v[0] != 0) return null;
     if (v.length <= 1) return null;
     try {
-      return utf8.decode(v.sublist(1), allowMalformed: true);
+      final pk = utf8.decode(v.sublist(1), allowMalformed: true);
+      return pk;
     } catch (_) {
       return null;
     }
+  }
+
+  /// Batch lookup PKs for unique index keys. Returns one PK per key (null if not found).
+  /// Groups by leaf to minimize leaf reads; tree descent is still per-key.
+  Future<List<String?>> lookupUniquePrimaryKeysBatch({
+    required String tableName,
+    required String indexName,
+    required IndexMeta meta,
+    required List<Uint8List> uniqueKeys,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    if (uniqueKeys.isEmpty) return const [];
+    final firstLeaf = meta.btreeFirstLeaf;
+    if (firstLeaf.isNull) {
+      return List<String?>.filled(uniqueKeys.length, null, growable: false);
+    }
+    final leafPtrToKeyIndices = <String, List<int>>{};
+    for (int i = 0; i < uniqueKeys.length; i++) {
+      var leafPtr = await _locateLeafForKey(
+        tableName,
+        indexName,
+        meta,
+        uniqueKeys[i],
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      if (leafPtr.isNull) leafPtr = firstLeaf;
+      leafPtrToKeyIndices.putIfAbsent(keyOfPtr(leafPtr), () => <int>[]).add(i);
+    }
+    final result =
+        List<String?>.filled(uniqueKeys.length, null, growable: false);
+    for (final entry in leafPtrToKeyIndices.entries) {
+      final parts = entry.key.split(':');
+      final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
+      final leaf = await _readLeaf(tableName, indexName, meta, ptr,
+          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+      for (final idx in entry.value) {
+        final key = uniqueKeys[idx];
+        final slot = leaf.find(key);
+        if (slot == null) continue;
+        final v = leaf.values[slot];
+        if (v.isEmpty || v[0] != 0 || v.length <= 1) continue;
+        try {
+          result[idx] = utf8.decode(v.sublist(1), allowMalformed: true);
+        } catch (_) {}
+      }
+    }
+    return result;
   }
 
   /// Batch existence check for unique keys (bool per key).

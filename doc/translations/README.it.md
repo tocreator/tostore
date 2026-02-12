@@ -282,7 +282,7 @@ await db.createTables([
         type: IndexType.vector,              // Indice vettoriale
         fields: ['spatial_features'],
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.hnsw,   // Algoritmo HNSW per ANN efficiente
+          indexType: VectorIndexType.ngh,   // Algoritmo NGH per ANN efficiente
           distanceMetric: VectorDistanceMetric.cosine,
           parameters: {
             'M': 16,
@@ -707,6 +707,19 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 - 📱 **Progetto esempio**: Un esempio completo di app Flutter è fornito nella directory `example`.
 - 🚀 **Produzione**: Usa la modalità Release per prestazioni di gran lunga superiori alla modalità Debug.
 - ✅ **Test standard**: Tutte le funzionalità core hanno superato i test di integrazione standard.
+
+### Video dimostrativi
+
+<p align="center">
+  <img src="../media/basic-demo.gif" alt="Demo di performance di base di Tostore" width="320" />
+  </p>
+
+<p align="center">
+  <img src="../media/disaster-recovery.gif" alt="Test di ripristino da disastro di Tostore" width="320" />
+  </p>
+
+- **Demo di performance di base** (`../media/basic-demo.mp4`): Mostra che, anche su uno smartphone comune con oltre 100 M di record, l’avvio dell’app, la paginazione e le ricerche restano sempre stabili e fluide. Finché lo spazio di archiviazione è sufficiente, i dispositivi edge possono gestire dataset in scala TB/PB mantenendo una latenza di interazione costantemente bassa.
+- **Test di ripristino da disastro** (`../media/disaster-recovery.mp4`): Interrompe intenzionalmente il processo durante carichi di scrittura intensivi per simulare crash e blackout. Anche quando decine di migliaia di operazioni di scrittura vengono interrotte bruscamente, Tostore è in grado di ripristinarsi molto rapidamente su un telefono tipico, senza influire sull’avvio successivo né sulla disponibilità dei dati.
 
 
 

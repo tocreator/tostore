@@ -184,7 +184,8 @@ class DataStoreConfig {
             maxLogPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
         enableJournal = enableJournal ?? !PlatformHandler.isWeb,
         logWriteBatchSize = logWriteBatchSize ?? _getDefaultLogWriteBatchSize(),
-        writeBatchSize = writeBatchSize ?? _getDefaultWriteBatchSize(),
+        writeBatchSize =
+            writeBatchSize ?? _getWriteBatchSize(cacheMemoryBudgetMB),
         maxFlushLatencyMs = maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(),
         parallelJournalMaxFileSize = parallelJournalMaxFileSize ??
             _getDefaultParallelJournalMaxFileSize(),
@@ -409,33 +410,38 @@ class DataStoreConfig {
     return true; // native defaults to persisting WAL/journal/meta at commit
   }
 
-  static int _getDefaultWriteBatchSize() {
-    final int concurrency = PlatformHandler.recommendedConcurrency;
-    final int partitionSize = _getDefaultMaxPartitionFileSize();
+  static int _getWriteBatchSize(int? cacheMemoryBudgetMB) {
+    final int cores = PlatformHandler.processorCores;
 
-    // Heuristic: target enough items to saturate available concurrency
-    // while keeping each partition's contribution balanced.
-    // Assume average record size is ~512 bytes for mobile/web, ~1KB elsewhere.
-    final int avgRecordSize =
-        (PlatformHandler.isMobile || PlatformHandler.isWeb) ? 512 : 1024;
+    // Scale factor based on cores: more cores = more parallel flush capacity
+    // For mobile, each core contributes 50k
+    // For desktop/server, each core contributes 100k
+    final int coreFactor =
+        (PlatformHandler.isMobile || PlatformHandler.isWeb) ? 50000 : 100000;
 
-    // Items needed to fill one partition
-    final int itemsPerPartition = (partitionSize / avgRecordSize).ceil();
+    // Base batch size (e.g., 50k) + per-core bonus
+    int targetBatchSize = 50000 + (cores * coreFactor);
 
-    // We want enough data to potentially touch at least 'concurrency' partitions
-    // to maximize parallel flush throughput.
-    // Factor of 1.5 to 2.0 provides buffer for uneven distribution.
-    final int targetBatchSize = (itemsPerPartition * concurrency * 1.5).ceil();
+    // Memory weighting: If user provides a large memory budget, scale up the batch size.
+    // Heuristic: for every 1GB above 1GB, increase batch size by 50%
+    if (cacheMemoryBudgetMB != null && cacheMemoryBudgetMB > 1024) {
+      final double memoryMultiplier =
+          1.0 + (cacheMemoryBudgetMB - 1024) / 1024.0;
+      targetBatchSize = (targetBatchSize * memoryMultiplier).round();
+    }
 
     if (PlatformHandler.isWeb) {
-      return targetBatchSize.clamp(1000, 5000);
+      // Web: very conservative due to browser main-thread and memory limits
+      return (targetBatchSize / 10).round().clamp(1000, 10000);
     } else if (PlatformHandler.isMobile) {
+      // Mobile: 100k - 200k
       return targetBatchSize.clamp(100000, 200000);
     } else if (PlatformHandler.isServerEnvironment) {
-      return targetBatchSize.clamp(100000, 500000);
+      // Server: 200k - 1M (High throughput focus)
+      return targetBatchSize.clamp(200000, 1000000);
     } else {
-      // Desktop
-      return targetBatchSize.clamp(20000, 100000);
+      // Desktop: 100k - 200k
+      return targetBatchSize.clamp(100000, 200000);
     }
   }
 
@@ -966,11 +972,25 @@ class EncryptionConfig {
   /// For portable data scenarios, leave this as false and provide explicit keys.
   final bool deviceBinding;
 
+  /// Whether to encrypt vector index data (NGH graph pages, PQ codes, raw vectors).
+  ///
+  /// Defaults to `false` for maximum vector search performance.
+  /// Vector embeddings are derived mathematical representations that are extremely
+  /// difficult to reverse-engineer into original data. The original sensitive data
+  /// is protected by table-level encryption.
+  ///
+  /// Set to `true` only when strict compliance requirements mandate full encryption
+  /// of all stored data including derived embeddings. Enabling this will add
+  /// encryption/decryption overhead to every vector index page read/write operation,
+  /// which can significantly impact search latency.
+  final bool encryptVectorIndex;
+
   const EncryptionConfig({
     this.encryptionType = EncryptionType.xorObfuscation,
     this.encodingKey,
     this.encryptionKey,
     this.deviceBinding = false,
+    this.encryptVectorIndex = false,
   });
 
   /// Generate encoding key based on configuration
@@ -1054,6 +1074,7 @@ class EncryptionConfig {
       deviceBinding: json['deviceBinding'] as bool? ??
           json['pathBinding'] as bool? ??
           false, // Backward compatibility
+      encryptVectorIndex: json['encryptVectorIndex'] as bool? ?? false,
     );
   }
 
@@ -1064,6 +1085,7 @@ class EncryptionConfig {
       if (encodingKey != null) 'encodingKey': encodingKey,
       if (encryptionKey != null) 'encryptionKey': encryptionKey,
       'deviceBinding': deviceBinding,
+      'encryptVectorIndex': encryptVectorIndex,
     };
   }
 
@@ -1073,12 +1095,14 @@ class EncryptionConfig {
     String? encodingKey,
     String? encryptionKey,
     bool? deviceBinding,
+    bool? encryptVectorIndex,
   }) {
     return EncryptionConfig(
       encryptionType: encryptionType ?? this.encryptionType,
       encodingKey: encodingKey ?? this.encodingKey,
       encryptionKey: encryptionKey ?? this.encryptionKey,
       deviceBinding: deviceBinding ?? this.deviceBinding,
+      encryptVectorIndex: encryptVectorIndex ?? this.encryptVectorIndex,
     );
   }
 

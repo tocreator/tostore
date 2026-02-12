@@ -43,13 +43,20 @@ final class CacheManager {
       }
     });
 
-    // Index data (data cache + B+Tree pages)
+    // Index data (data cache + B+Tree pages + NGH vector pages)
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
       try {
-        // Then evict page cache (B+Tree pages)
+        // Evict B+Tree page cache
         await _dataStore.indexTreePartitionManager.evictPageCache(ratio: 0.3);
       } catch (e) {
         Logger.warn('Evict index page cache failed: $e',
+            label: 'CacheManager.indexData');
+      }
+      try {
+        // Evict NGH vector index caches
+        await _dataStore.vectorIndexManager?.evictCache(ratio: 0.3);
+      } catch (e) {
+        Logger.warn('Evict vector index cache failed: $e',
             label: 'CacheManager.indexData');
       }
     });
@@ -217,6 +224,9 @@ final class CacheManager {
       // Best-effort: remove index meta cache (coarse-grained).
       await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
       _dataStore.indexTreePartitionManager.clearPageCacheForTable(tableName);
+
+      // Clear vector index caches for this table.
+      _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
     } catch (e) {
       Logger.error(
         'Invalidate table cache failed: $e\n'

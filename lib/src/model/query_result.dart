@@ -140,3 +140,27 @@ class QueryResult<T> {
     );
   }
 }
+
+/// Result of a vector similarity search, returned to the user.
+class VectorSearchResult {
+  /// Primary key of the matching record.
+  final String primaryKey;
+
+  /// Distance from the query vector (lower = more similar for L2/cosine).
+  final double distance;
+
+  /// Similarity score normalised to [0, 1] (higher = more similar).
+  final double score;
+
+  VectorSearchResult({
+    required this.primaryKey,
+    required this.distance,
+    required this.score,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'primaryKey': primaryKey,
+        'distance': distance,
+        'score': score,
+      };
+}

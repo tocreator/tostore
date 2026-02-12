@@ -123,9 +123,12 @@ class _IsolatePool {
       _updateTaskStats(isolateId, taskTime);
     }
 
-    // Since we removed error handling from isolate, we only expect successful results
-    // Any errors will be handled by ComputeManager's fallback mechanism
-    task.completer.complete(result['result']);
+    // Check for error from isolate
+    if (result.containsKey('error')) {
+      task.completer.completeError(result['error'], result['stackTrace']);
+    } else {
+      task.completer.complete(result['result']);
+    }
 
     _isIdle[isolateId] = true;
     _dispatchTask(); // Isolate is free, try to process next task from global queue.
@@ -172,17 +175,10 @@ class _IsolatePool {
 
   /// execute a task, select the optimal isolate based on performance data
   Future<R> execute<Q, R>(FutureOr<R> Function(Q) function, Q message) async {
-    // If the pool isn't initialized yet, run the first task(s) on the main thread
-    // to avoid startup latency. Kick off initialization in the background for subsequent tasks.
-    if (!_isInitialized) {
-      // Don't await this. Let it run in the background.
-      _ensureInitialized();
-      // Execute the function directly on the main thread for immediate responsiveness.
-      return function(message);
-    }
-
-    // If we are here, the pool is initialized, so we can proceed with dispatching to an isolate.
-    // This await ensures that if initialization is in progress, we wait for it to complete.
+    // Always wait for pool initialization before dispatching.
+    // The first call pays ~100ms for isolate startup, but avoids running
+    // CPU-heavy tasks (e.g. PQ training) on the main thread where async
+    // yield contention can inflate 2s of compute to 300s.
     await _ensureInitialized();
 
     // timer for performance analysis

@@ -488,9 +488,10 @@ class IntegrityChecker {
             'Table[$tableName] is a new table or has no data written yet, skipping data file validation, only validating table structure',
             label: 'IntegrityChecker.validateMigration');
       } else {
-        // for table with data, validate index meta data
+        // for table with data, validate B+Tree index meta data
+        // (vector indexes use separate meta paths managed by VectorIndexManager)
         final allIndexes =
-            _dataStore.schemaManager?.getAllIndexesFor(newSchema) ??
+            _dataStore.schemaManager?.getBtreeIndexesFor(newSchema) ??
                 <IndexSchema>[];
         for (var index in allIndexes) {
           final indexMetaPath = await _dataStore.pathManager

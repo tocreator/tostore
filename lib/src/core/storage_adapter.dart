@@ -899,6 +899,11 @@ class StorageAdapter implements StorageInterface {
   }
 
   @override
+  Future<void> flushFile(String path) async {
+    return _storage.flushFile(path);
+  }
+
+  @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
     // Prevent concurrent flushes which could thrash IO

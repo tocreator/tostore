@@ -282,7 +282,7 @@ await db.createTables([
         type: IndexType.vector,              // 벡터 인덱스
         fields: ['spatial_features'],
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.hnsw,   // 효율적인 근접 검색을 위한 HNSW 알고리즘
+          indexType: VectorIndexType.ngh,   // 효율적인 근접 검색을 위한 NGH 알고리즘
           distanceMetric: VectorDistanceMetric.cosine,
           parameters: {
             'M': 16,
@@ -710,6 +710,19 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 - 📱 **예제 프로젝트**: `example` 디렉터리에 전체 Flutter 앱 예제가 제공됩니다.
 - 🚀 **프로덕션 환경**: 성능이 월등한 Release 모드로 빌드하여 배포하는 것을 권장합니다.
 - ✅ **표준 테스트**: 모든 핵심 기능은 표준 통합 테스트를 통과했습니다.
+
+### 데모 영상
+
+<p align="center">
+  <img src="../media/basic-demo.gif" alt="Tostore 기본 성능 데모" width="320" />
+  </p>
+
+<p align="center">
+  <img src="../media/disaster-recovery.gif" alt="Tostore 재해 복구 스트레스 테스트" width="320" />
+  </p>
+
+- **기본 성능 데모** (`../media/basic-demo.mp4`): 일반적인 스마트폰에서 데이터가 1억 건 이상인 상황에서도 앱의 시작 속도, 페이지 이동, 검색 성능이 항상 안정적이고 부드럽게 유지되는 모습을 확인할 수 있습니다. 저장 용량만 충분하다면, 에지 디바이스에서도 TB/PB 규모의 데이터셋을 다루면서도 상호작용 지연을 일관되게 낮게 유지할 수 있습니다.
+- **재해 복구 스트레스 테스트** (`../media/disaster-recovery.mp4`): 집약적인 쓰기 작업 도중에 프로세스를 의도적으로 반복 종료하여 충돌 및 정전 상황을 시뮬레이션합니다. 수만 건에 이르는 쓰기 작업이 중간에 끊기더라도, Tostore는 일반적인 스마트폰에서 매우 빠르게 자체 복구를 완료하며, 이후 앱 시작이나 데이터 가용성에 영향을 주지 않습니다.
 
 
 

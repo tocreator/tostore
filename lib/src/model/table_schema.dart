@@ -2306,68 +2306,122 @@ enum VectorDistanceMetric {
   cosine,
 }
 
-/// Vector Index Configuration (for future vector search capabilities)
+/// Vector Index Configuration for NGH (Node-Graph Hybrid) vector search.
 ///
 /// Configures how vector indexes are built and searched.
 /// This is used with [IndexSchema] when the index type is [IndexType.vector].
+///
+/// Example:
+/// ```dart
+/// VectorIndexConfig(
+///   distanceMetric: VectorDistanceMetric.cosine,
+///   maxDegree: 64,
+///   efSearch: 64,
+///   constructionEf: 128,
+/// )
+/// ```
 class VectorIndexConfig {
-  /// Type of vector index.current only support [VectorIndexType.ngh].
+  /// Type of vector index. Currently only supports [VectorIndexType.ngh].
   final VectorIndexType indexType;
 
-  /// Distance metric for similarity search
+  /// Distance metric for similarity search.
   ///
-  /// Specifies how similarity between vectors is calculated
+  /// - [VectorDistanceMetric.l2]: Euclidean distance (lower = more similar)
+  /// - [VectorDistanceMetric.cosine]: Cosine similarity (higher = more similar)
+  /// - [VectorDistanceMetric.innerProduct]: Dot product (higher = more similar)
   final VectorDistanceMetric distanceMetric;
 
-  /// Additional index parameters
+  /// Maximum out-degree per graph node (R).
   ///
-  /// Algorithm-specific parameters to fine-tune the index behavior.
-  final Map<String, dynamic> parameters;
+  /// Higher values improve recall but increase memory and construction time.
+  /// Recommended: 32 for mobile/edge, 64 for desktop/server.
+  final int? maxDegree;
+
+  /// Search expansion factor (ef_search).
+  ///
+  /// Controls the search quality–speed trade-off. Higher values improve
+  /// recall at the cost of latency. Standard ANN terminology.
+  final int? efSearch;
+
+  /// Expansion factor during graph construction (ef_construction).
+  ///
+  /// Higher values build a better-quality graph but take longer.
+  /// Typical range: 64–256.
+  final int? constructionEf;
+
+  /// Diversity parameter for Robust Prune (α ≥ 1.0).
+  ///
+  /// Higher values produce more diverse neighbor selections, improving recall
+  /// for high-dimensional data. Default 1.2.
+  final double? pruneAlpha;
+
+  /// Number of PQ sub-spaces (M).
+  ///
+  /// If null, automatically calculated as `dimensions / 8` (clamped to [8, 128]).
+  /// Must evenly divide the vector dimensions.
+  final int? pqSubspaces;
 
   /// Constructor
   const VectorIndexConfig({
     this.indexType = VectorIndexType.ngh,
     this.distanceMetric = VectorDistanceMetric.cosine,
-    this.parameters = const {},
+    this.maxDegree,
+    this.efSearch,
+    this.constructionEf,
+    this.pruneAlpha,
+    this.pqSubspaces,
   });
 
   /// Convert to JSON
   Map<String, dynamic> toJson() {
     return {
-      'indexType': indexType.toString().split('.').last,
-      'distanceMetric': distanceMetric.toString().split('.').last,
-      'parameters': parameters,
+      'indexType': indexType.name,
+      'distanceMetric': distanceMetric.name,
+      if (maxDegree != null) 'maxDegree': maxDegree,
+      if (efSearch != null) 'efSearch': efSearch,
+      if (constructionEf != null) 'constructionEf': constructionEf,
+      if (pruneAlpha != null) 'pruneAlpha': pruneAlpha,
+      if (pqSubspaces != null) 'pqSubspaces': pqSubspaces,
     };
   }
 
   /// Create from JSON
   factory VectorIndexConfig.fromJson(Map<String, dynamic> json) {
-    VectorIndexType getIndexType() {
-      final typeStr = json['indexType'] as String?;
-      if (typeStr == null) return VectorIndexType.ngh;
-      if (typeStr.toLowerCase() == 'ngh') return VectorIndexType.ngh;
-      return VectorIndexType.ngh;
+    VectorIndexType indexType = VectorIndexType.ngh;
+    final typeStr = json['indexType'] as String?;
+    if (typeStr != null && typeStr.toLowerCase() == 'ngh') {
+      indexType = VectorIndexType.ngh;
     }
 
-    // Parse distance metric
-    VectorDistanceMetric getDistanceMetric() {
-      final metricStr = json['distanceMetric'] as String?;
-      if (metricStr == null) return VectorDistanceMetric.cosine;
-
+    VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
+    final metricStr = json['distanceMetric'] as String?;
+    if (metricStr != null) {
       switch (metricStr.toLowerCase()) {
         case 'l2':
-          return VectorDistanceMetric.l2;
+          distanceMetric = VectorDistanceMetric.l2;
+          break;
         case 'innerproduct':
-          return VectorDistanceMetric.innerProduct;
-        default:
-          return VectorDistanceMetric.cosine;
+          distanceMetric = VectorDistanceMetric.innerProduct;
+          break;
       }
     }
 
+    // Support both flat fields and legacy nested 'parameters' map
+    final params = json['parameters'] as Map<String, dynamic>? ?? json;
+
     return VectorIndexConfig(
-      indexType: getIndexType(),
-      distanceMetric: getDistanceMetric(),
-      parameters: json['parameters'] as Map<String, dynamic>? ?? {},
+      indexType: indexType,
+      distanceMetric: distanceMetric,
+      maxDegree: (params['maxDegree'] as num?)?.toInt() ??
+          (json['maxDegree'] as num?)?.toInt(),
+      efSearch: (params['efSearch'] as num?)?.toInt() ??
+          (json['efSearch'] as num?)?.toInt(),
+      constructionEf: (params['constructionEf'] as num?)?.toInt() ??
+          (json['constructionEf'] as num?)?.toInt(),
+      pruneAlpha: (params['pruneAlpha'] as num?)?.toDouble() ??
+          (json['pruneAlpha'] as num?)?.toDouble(),
+      pqSubspaces: (params['pqSubspaces'] as num?)?.toInt() ??
+          (json['pqSubspaces'] as num?)?.toInt(),
     );
   }
 }

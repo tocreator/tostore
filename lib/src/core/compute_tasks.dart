@@ -15,6 +15,8 @@ import '../handler/encoder.dart';
 import '../model/encoder_config.dart';
 import 'dart:typed_data';
 
+import '../core/vector_quantizer.dart';
+
 /// Table similarity calculation request
 class TableSimilarityRequest {
   /// Old table schema
@@ -642,7 +644,6 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
 
     var modifiedRecords = List<Map<String, dynamic>>.from(request.records);
 
-    // Create YieldController for async loop processing
     // Create YieldController for async loop processing
     final yieldController = YieldController('ProcessMigrationRecords',
         budgetMs: request.yieldDurationMs);
@@ -1594,4 +1595,598 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   }
 
   return BatchBTreePageEncodeResult(out, pageRedoBytes);
+}
+
+// ============================================================================
+// NGH Vector Index Compute Tasks
+// ============================================================================
+
+/// Request for PQ codebook training in an isolate.
+class PqTrainRequest {
+  /// Flat list of training vectors, each [dimensions] float32 values.
+  final List<Float32List> samples;
+  final int dimensions;
+  final int subspaces;
+  final int numCentroids;
+  final int iterations;
+
+  PqTrainRequest({
+    required this.samples,
+    required this.dimensions,
+    required this.subspaces,
+    this.numCentroids = 256,
+    this.iterations = 20,
+  });
+}
+
+/// Result of PQ codebook training.
+class PqTrainResult {
+  final int subspaces;
+  final int centroids;
+  final int subDimensions;
+  final Float32List data;
+
+  PqTrainResult({
+    required this.subspaces,
+    required this.centroids,
+    required this.subDimensions,
+    required this.data,
+  });
+}
+
+/// Request for PQ codebook training with flattened data (faster transfer).
+class PqTrainRequestFlat {
+  final Float32List flatSamples;
+  final int sampleCount;
+  final int dimensions;
+  final int subspaces;
+  final int numCentroids;
+  final int iterations;
+
+  PqTrainRequestFlat({
+    required this.flatSamples,
+    required this.sampleCount,
+    required this.dimensions,
+    required this.subspaces,
+    required this.numCentroids,
+    this.iterations = 20,
+  });
+}
+
+/// Train PQ codebook (Flattened) — runs in isolate for large sample sets.
+Future<PqTrainResult> trainPqCodebookFlat(PqTrainRequestFlat request) async {
+  final dimensions = request.dimensions;
+  final subspaces = request.subspaces;
+  final subDim = dimensions ~/ subspaces;
+  final n = request.sampleCount;
+  final k = min(request.numCentroids, n);
+  final data = Float32List(subspaces * k * subDim);
+  final rng = Random(42);
+
+  // Data is already flattened
+  final flatData = request.flatSamples;
+
+  // Use SIMD optimization if dimensions allow (multiple of 4 floats / 128 bits)
+  final useSimd = (subDim % 4 == 0);
+
+  if (useSimd) {
+    // ---------------------------------------------------------
+    // SIMD Path (4x faster)
+    // ---------------------------------------------------------
+    for (int m = 0; m < subspaces; m++) {
+      final subStart = m * subDim;
+
+      // Extract sub-vectors from flatData to a contiguous block for this subspace
+      // Layout: [v0_sub0, v1_sub0, ... ]
+      final subData = Float32List(n * subDim);
+      for (int i = 0; i < n; i++) {
+        for (int d = 0; d < subDim; d++) {
+          subData[i * subDim + d] = flatData[i * dimensions + subStart + d];
+        }
+      }
+      final flatSimd = Float32x4List.view(subData.buffer);
+
+      // Centroids (k * subDim)
+      final centers = Float32List(k * subDim);
+      final firstIdx = rng.nextInt(n);
+      for (int d = 0; d < subDim; d++) {
+        centers[d] = subData[firstIdx * subDim + d];
+      }
+
+      var centersSimd = Float32x4List.view(centers.buffer);
+
+      // K-means++ Init
+      if (k > 1) {
+        final minDists = Float64List(n);
+        for (int i = 0; i < n; i++) {
+          minDists[i] = double.infinity;
+        }
+
+        for (int c = 1; c < k; c++) {
+          final prevCOff = (c - 1) * (subDim ~/ 4); // Index in SimdList
+          double totalDist = 0;
+          for (int i = 0; i < n; i++) {
+            final iOff = i * (subDim ~/ 4);
+            double dist = 0;
+            for (int sd = 0; sd < subDim ~/ 4; sd++) {
+              final diff = flatSimd[iOff + sd] - centersSimd[prevCOff + sd];
+              final mag = diff * diff;
+              dist += mag.x + mag.y + mag.z + mag.w;
+            }
+
+            if (dist < minDists[i]) minDists[i] = dist;
+            totalDist += minDists[i];
+          }
+
+          int selected = n - 1;
+          if (totalDist > 0) {
+            double threshold = rng.nextDouble() * totalDist;
+            for (int i = 0; i < n; i++) {
+              threshold -= minDists[i];
+              if (threshold <= 0) {
+                selected = i;
+                break;
+              }
+            }
+          }
+
+          final srcOff = selected * subDim;
+          final dstOff = c * subDim;
+          for (int d = 0; d < subDim; d++) {
+            centers[dstOff + d] = subData[srcOff + d];
+          }
+        }
+      }
+
+      // Iterations
+      final assignments = Int32List(n);
+      final counts = Int32List(k);
+      final sums = Float32List(k * subDim);
+      final iterations = request.iterations > 0 ? request.iterations : 10;
+
+      for (int iter = 0; iter < iterations; iter++) {
+        // Refresh view if needed
+        centersSimd = Float32x4List.view(centers.buffer);
+
+        for (int i = 0; i < n; i++) {
+          int bestIdx = 0;
+          double bestDist = double.infinity;
+          final iOff = i * (subDim ~/ 4);
+
+          for (int c = 0; c < k; c++) {
+            double dist = 0;
+            final cOff = c * (subDim ~/ 4);
+
+            for (int sd = 0; sd < subDim ~/ 4; sd++) {
+              final diff = flatSimd[iOff + sd] - centersSimd[cOff + sd];
+              final mag = diff * diff;
+              dist += mag.x + mag.y + mag.z + mag.w;
+            }
+
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestIdx = c;
+            }
+          }
+          assignments[i] = bestIdx;
+        }
+
+        sums.fillRange(0, sums.length, 0);
+        counts.fillRange(0, counts.length, 0);
+
+        for (int i = 0; i < n; i++) {
+          final c = assignments[i];
+          counts[c]++;
+          final cOff = c * subDim;
+          final iOff = i * subDim; // Flat scalar access
+          for (int d = 0; d < subDim; d++) {
+            sums[cOff + d] += subData[iOff + d];
+          }
+        }
+
+        bool changed = false;
+        for (int c = 0; c < k; c++) {
+          if (counts[c] == 0) continue;
+          final cOff = c * subDim;
+          final inv = 1.0 / counts[c];
+          for (int d = 0; d < subDim; d++) {
+            final newVal = sums[cOff + d] * inv;
+            if ((centers[cOff + d] - newVal).abs() > 1e-6) changed = true;
+            centers[cOff + d] = newVal;
+          }
+        }
+        if (!changed) break;
+      }
+
+      // Copy centers to result data
+      data.setRange(m * k * subDim, (m + 1) * k * subDim, centers);
+    }
+  } else {
+    // ---------------------------------------------------------
+    // Fallback Path (Standard) - Flattened
+    // ---------------------------------------------------------
+    for (int m = 0; m < subspaces; m++) {
+      final subStart = m * subDim;
+
+      // Extract sub-vectors to contiguous array
+      final subData = Float32List(n * subDim);
+      for (int i = 0; i < n; i++) {
+        for (int d = 0; d < subDim; d++) {
+          subData[i * subDim + d] = flatData[i * dimensions + subStart + d];
+        }
+      }
+
+      final centers = Float32List(k * subDim);
+      final firstIdx = rng.nextInt(n);
+      for (int d = 0; d < subDim; d++) {
+        centers[d] = subData[firstIdx * subDim + d];
+      }
+
+      if (k > 1) {
+        final minDists = Float64List(n);
+        for (int i = 0; i < n; i++) {
+          minDists[i] = double.infinity;
+        }
+
+        for (int c = 1; c < k; c++) {
+          final prevOff = (c - 1) * subDim;
+          double totalDist = 0;
+          for (int i = 0; i < n; i++) {
+            final iOff = i * subDim;
+            double dist = 0;
+            for (int d = 0; d < subDim; d++) {
+              final diff = subData[iOff + d] - centers[prevOff + d];
+              dist += diff * diff;
+            }
+            if (dist < minDists[i]) minDists[i] = dist;
+            totalDist += minDists[i];
+          }
+          int selected = n - 1;
+          if (totalDist > 0) {
+            double threshold = rng.nextDouble() * totalDist;
+            for (int i = 0; i < n; i++) {
+              threshold -= minDists[i];
+              if (threshold <= 0) {
+                selected = i;
+                break;
+              }
+            }
+          }
+          final srcOff = selected * subDim;
+          final dstOff = c * subDim;
+          for (int d = 0; d < subDim; d++) {
+            centers[dstOff + d] = subData[srcOff + d];
+          }
+        }
+      }
+
+      final assignments = Int32List(n);
+      final counts = Int32List(k);
+      final sums = Float32List(k * subDim);
+      final iterations = request.iterations > 0 ? request.iterations : 10;
+
+      for (int iter = 0; iter < iterations; iter++) {
+        for (int i = 0; i < n; i++) {
+          int bestIdx = 0;
+          double bestDist = double.infinity;
+          final iOff = i * subDim;
+
+          for (int c = 0; c < k; c++) {
+            double dist = 0;
+            final cOff = c * subDim;
+            for (int d = 0; d < subDim; d++) {
+              final diff = subData[iOff + d] - centers[cOff + d];
+              dist += diff * diff;
+            }
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestIdx = c;
+            }
+          }
+          assignments[i] = bestIdx;
+        }
+
+        sums.fillRange(0, sums.length, 0);
+        counts.fillRange(0, counts.length, 0);
+
+        for (int i = 0; i < n; i++) {
+          final c = assignments[i];
+          counts[c]++;
+          final cOff = c * subDim;
+          final iOff = i * subDim;
+          for (int d = 0; d < subDim; d++) {
+            sums[cOff + d] += subData[iOff + d];
+          }
+        }
+
+        bool changed = false;
+        for (int c = 0; c < k; c++) {
+          if (counts[c] == 0) continue;
+          final cOff = c * subDim;
+          final inv = 1.0 / counts[c];
+          for (int d = 0; d < subDim; d++) {
+            final newVal = sums[cOff + d] * inv;
+            if ((centers[cOff + d] - newVal).abs() > 1e-6) changed = true;
+            centers[cOff + d] = newVal;
+          }
+        }
+        if (!changed) break;
+      }
+      data.setRange(m * k * subDim, (m + 1) * k * subDim, centers);
+    }
+  }
+
+  return PqTrainResult(
+    subspaces: subspaces,
+    centroids: k,
+    subDimensions: subDim,
+    data: data,
+  );
+}
+
+/// Request to train a single subspace (passed to isolate).
+class PqTrainSubspaceRequest {
+  final Float32List subSamples; // Flattened [n * subDim]
+  final int n;
+  final int subDim;
+  final int k;
+  final int iterations;
+  final int subspaceIndex;
+
+  PqTrainSubspaceRequest({
+    required this.subSamples,
+    required this.n,
+    required this.subDim,
+    required this.k,
+    required this.iterations,
+    required this.subspaceIndex,
+  });
+}
+
+/// Result of training a single subspace.
+class PqSubspaceResult {
+  final int subspaceIndex;
+  final Float32List centroids; // Flattened [k * subDim]
+
+  PqSubspaceResult(this.subspaceIndex, this.centroids);
+}
+
+/// Train a single subspace using optimized K-Means (Dot Product).
+Future<PqSubspaceResult> trainPqSubspace(PqTrainSubspaceRequest request) async {
+  final n = request.n;
+  final subDim = request.subDim;
+  final k = request.k;
+  final data = request.subSamples; // Flattened (n * subDim)
+  final centroids = Float32List(k * subDim);
+  final rng = Random(42 + request.subspaceIndex);
+
+  // Initialize centroids (Random selection)
+  // Better initialization (K-Means++) is expensive for just 10 iterations,
+  // random is often sufficient for PQ residuals.
+  for (int c = 0; c < k; c++) {
+    final randIdx = rng.nextInt(n);
+    final srcOff = randIdx * subDim;
+    final dstOff = c * subDim;
+    for (int d = 0; d < subDim; d++) {
+      centroids[dstOff + d] = data[srcOff + d];
+    }
+  }
+
+  // Buffers
+  final assignments = Int32List(n);
+  final counts = Int32List(k);
+  final sums = Float32List(k * subDim);
+  final centroidNorms = Float32List(k); // |c|^2
+
+  // Pre-check for SIMD suitability
+  final useSimd = (subDim % 4 == 0);
+  // Optional: Pre-convert data to Float32x4List if useSimd?
+  // But creating views is cheap.
+
+  for (int iter = 0; iter < request.iterations; iter++) {
+    // 1. Precompute centroid norms: |c|^2
+    for (int c = 0; c < k; c++) {
+      double norm = 0;
+      final cOff = c * subDim;
+      for (int d = 0; d < subDim; d++) {
+        final val = centroids[cOff + d];
+        norm += val * val;
+      }
+      centroidNorms[c] = norm * 0.5; // We maximize (x·c - 0.5|c|^2)
+    }
+
+    // 2. Assignment Step
+    // Maximize: x·c - 0.5|c|^2
+    // Equivalent to Minimizing: |x|^2 - 2x·c + |c|^2
+
+    // We can't easily optimize the dot product with generic SIMD in Dart
+    // without loop unrolling or manual intrinsics, but basic loop is okay.
+
+    if (useSimd) {
+      final dataSimd = Float32x4List.view(data.buffer);
+      final centroidsSimd = Float32x4List.view(centroids.buffer);
+      final dim4 = subDim ~/ 4;
+
+      for (int i = 0; i < n; i++) {
+        final iOff4 = i * dim4;
+        double bestScore = -double.infinity;
+        int bestIdx = 0;
+
+        for (int c = 0; c < k; c++) {
+          final cOff4 = c * dim4;
+          double dot = 0;
+          // Manual unroll for common sizes (e.g. 192/4 = 48)? No, compiler handles it.
+          for (int d = 0; d < dim4; d++) {
+            final v4 = dataSimd[iOff4 + d];
+            final c4 = centroidsSimd[cOff4 + d];
+            final res = v4 * c4;
+            dot += res.x + res.y + res.z + res.w;
+          }
+
+          final score = dot - centroidNorms[c];
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = c;
+          }
+        }
+        assignments[i] = bestIdx;
+      }
+    } else {
+      // Scalar path
+      for (int i = 0; i < n; i++) {
+        final iOff = i * subDim;
+        double bestScore = -double.infinity;
+        int bestIdx = 0;
+
+        for (int c = 0; c < k; c++) {
+          final cOff = c * subDim;
+          double dot = 0;
+          for (int d = 0; d < subDim; d++) {
+            dot += data[iOff + d] * centroids[cOff + d];
+          }
+          final score = dot - centroidNorms[c];
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = c;
+          }
+        }
+        assignments[i] = bestIdx;
+      }
+    }
+
+    // 3. Update Step
+    sums.fillRange(0, sums.length, 0);
+    counts.fillRange(0, counts.length, 0);
+
+    for (int i = 0; i < n; i++) {
+      final c = assignments[i];
+      counts[c]++;
+      final cOff = c * subDim;
+      final iOff = i * subDim;
+      for (int d = 0; d < subDim; d++) {
+        sums[cOff + d] += data[iOff + d];
+      }
+    }
+
+    bool changed = false;
+    for (int c = 0; c < k; c++) {
+      if (counts[c] == 0) continue;
+      final cOff = c * subDim;
+      final inv = 1.0 / counts[c];
+      for (int d = 0; d < subDim; d++) {
+        final newVal = sums[cOff + d] * inv;
+        // Naive convergence check on first dim
+        if ((centroids[cOff + d] - newVal).abs() > 1e-4) changed = true;
+        centroids[cOff + d] = newVal;
+      }
+    }
+    if (!changed) break;
+  }
+  return PqSubspaceResult(request.subspaceIndex, centroids);
+}
+
+/// Request for batch PQ encoding in an isolate.
+class BatchPqEncodeRequest {
+  final List<Float32List> vectors;
+  final Float32List codebookData;
+  final int subspaces;
+  final int centroids;
+  final int subDimensions;
+
+  BatchPqEncodeRequest({
+    required this.vectors,
+    required this.codebookData,
+    required this.subspaces,
+    required this.centroids,
+    required this.subDimensions,
+  });
+}
+
+/// Result of batch PQ encoding.
+class BatchPqEncodeResult {
+  final List<Uint8List> codes;
+  BatchPqEncodeResult(this.codes);
+}
+
+/// Batch PQ encode — runs in isolate for large batches.
+Future<BatchPqEncodeResult> batchPqEncode(BatchPqEncodeRequest request) async {
+  final subspaces = request.subspaces;
+  final centroids = request.centroids;
+  final subDim = request.subDimensions;
+  final cb = request.codebookData;
+  final yc = YieldController('PQ.batchEncode.isolate', checkInterval: 50);
+
+  final codes = List<Uint8List>.generate(request.vectors.length, (vi) {
+    final vec = request.vectors[vi];
+    final code = Uint8List(subspaces);
+    for (int m = 0; m < subspaces; m++) {
+      final subStart = m * subDim;
+      int bestIdx = 0;
+      double bestDist = double.infinity;
+      final cbOff = m * centroids * subDim;
+      for (int c = 0; c < centroids; c++) {
+        double dist = 0;
+        final cOff = cbOff + c * subDim;
+        for (int d = 0; d < subDim; d++) {
+          final diff = vec[subStart + d] - cb[cOff + d];
+          dist += diff * diff;
+        }
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = c;
+        }
+      }
+      code[m] = bestIdx;
+    }
+    return code;
+  }, growable: false);
+
+  await yc.maybeYield(); // single yield after batch
+  return BatchPqEncodeResult(codes);
+}
+
+// ============================================================================
+// NGH: Isolate-only quantization (no file I/O). Graph insert + flush on main.
+// ============================================================================
+
+/// Arguments for [quantizeVectorsForNghTask]. Isolate receives only data; no paths/storage.
+class QuantizeVectorsForNghArgs {
+  final int pqSubspaces;
+  final int pqCentroids;
+  final int pqSubDimensions;
+  final Float32List pqData;
+  final List<Float32List> vectors;
+
+  QuantizeVectorsForNghArgs({
+    required this.pqSubspaces,
+    required this.pqCentroids,
+    required this.pqSubDimensions,
+    required this.pqData,
+    required this.vectors,
+  });
+}
+
+/// Result of [quantizeVectorsForNghTask]. Only PQ codes; no file I/O in isolate.
+class QuantizeVectorsForNghResult {
+  final List<Uint8List> pqCodes;
+
+  QuantizeVectorsForNghResult({required this.pqCodes});
+}
+
+/// Isolate task: PQ encode vectors only. No file read/write; safe to run in isolate.
+Future<QuantizeVectorsForNghResult> quantizeVectorsForNghTask(
+    QuantizeVectorsForNghArgs args) async {
+  if (args.vectors.isEmpty) {
+    return QuantizeVectorsForNghResult(pqCodes: []);
+  }
+  final codebook = PqCodebook(
+    subspaces: args.pqSubspaces,
+    centroids: args.pqCentroids,
+    subDimensions: args.pqSubDimensions,
+    data: args.pqData,
+  );
+  final quantizer = VectorQuantizer(codebook);
+  final pqCodes =
+      args.vectors.map((v) => quantizer.encode(v)).toList(growable: false);
+  return QuantizeVectorsForNghResult(pqCodes: pqCodes);
 }

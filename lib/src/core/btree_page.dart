@@ -35,6 +35,23 @@ enum BTreePageType {
   ///
   /// IMPORTANT: appended at end to preserve on-disk enum indices.
   overflow,
+
+  // ── NGH Vector Index Page Types ──
+
+  /// NGH per-file metadata page (pageNo=0 in each partition file).
+  nghMeta,
+
+  /// NGH graph page containing fixed-size node slots with neighbor lists.
+  nghGraph,
+
+  /// NGH PQ-code page containing densely packed product-quantisation codes.
+  nghPqCode,
+
+  /// NGH raw-vector page containing full-precision vectors for re-ranking.
+  nghRawVector,
+
+  /// NGH PQ codebook page containing trained centroid vectors.
+  nghCodebook,
 }
 
 // ============================================================================
@@ -180,7 +197,7 @@ final class BTreePageIO {
     final total = BTreePageHeader.size + encodedPayload.length;
     if (total > pageSize) {
       throw StateError(
-        'Page overflow: total=$total > pageSize=$pageSize '
+        'Page overflow ($type): total=$total > pageSize=$pageSize '
         '(header=${BTreePageHeader.size}, payload=${encodedPayload.length}, '
         'overflow=${total - pageSize} bytes). '
         'This indicates the page size estimation was inaccurate. '

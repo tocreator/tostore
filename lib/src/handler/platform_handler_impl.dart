@@ -168,12 +168,12 @@ class PlatformHandlerImpl implements PlatformInterface {
   bool get isServerEnvironment {
     if (_cachedIsServerEnvironment == null) {
       try {
-        // Server environment detection strategy
+        // Server environment detection strategy:
+        // 1. Linux systems are almost always servers or high-performance environments in this context.
+        // 2. Windows/macOS with high core counts (>=12) often act as workstations or build servers.
         if (isLinux) {
-          // Linux server may be a database server
           _cachedIsServerEnvironment = true;
-        } else if (isMacOS && processorCores >= 8) {
-          // Mac server usually has more processor cores
+        } else if ((isWindows || isMacOS) && processorCores >= 12) {
           _cachedIsServerEnvironment = true;
         } else {
           _cachedIsServerEnvironment = false;

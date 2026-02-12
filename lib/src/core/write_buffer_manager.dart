@@ -514,6 +514,8 @@ class WriteBufferManager {
     // to the queue because the INSERT entry is already there and will be flushed with
     // the updated data. This preserves primary key ordering and prevents duplicate processing.
     if (!skipQueueEnqueue) {
+      // Write backpressure: measured-delay throttle (1 multiply + 1 compare)
+      await _dataStore.parallelJournalManager.waitIfThrottled();
       // Update record count statistics (awaited to ensure consistency)
       if (updateStats) {
         await _dataStore.tableDataManager
@@ -561,9 +563,19 @@ class WriteBufferManager {
     final buf = _ensureTable(tableName);
     final yieldController =
         YieldController('WriteBufferManager.addInsertBatch');
+    final batchSize = _dataStore.config.writeBatchSize;
+    final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
+    const int emitChunk = 1000;
 
     for (int i = 0; i < recordIds.length; i++) {
       await yieldController.maybeYield();
+      if (i % emitChunk == 0) {
+        await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
+        await _dataStore.parallelJournalManager.waitUntilQueueBelow(
+          backpressureCap,
+          timeout: const Duration(seconds: 120),
+        );
+      }
       final recordId = recordIds[i];
       final entry = entries[i];
       final uniqueKeys = uniqueKeysList[i];
@@ -634,6 +646,9 @@ class WriteBufferManager {
         operationType: BufferOperationType.insert,
         walPointer: wp,
       ));
+      if ((i + 1) % emitChunk == 0 || i == recordIds.length - 1) {
+        _emitSizeChanged();
+      }
     }
 
     _emitSizeChanged();

@@ -7,6 +7,7 @@ import 'package:path/path.dart' as path;
 
 import '../Interface/status_provider.dart';
 import '../model/buffer_entry.dart';
+import '../model/query_result.dart';
 import 'lock_manager.dart';
 import 'backup_manager.dart';
 import '../handler/common.dart';
@@ -26,6 +27,7 @@ import '../model/data_store_config.dart';
 import 'memory_manager.dart';
 import 'table_data_manager.dart';
 import 'index_manager.dart';
+import 'vector_index_manager.dart';
 import 'foreign_key_manager.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/table_info.dart';
@@ -119,6 +121,7 @@ class DataStoreImpl {
   DataStoreConfig? _config;
 
   IndexManager? _indexManager;
+  VectorIndexManager? _vectorIndexManager;
   QueryOptimizer? _queryOptimizer;
   QueryExecutor? _queryExecutor;
   ForeignKeyManager? _foreignKeyManager;
@@ -327,6 +330,9 @@ class DataStoreImpl {
   }
 
   IndexManager? get indexManager => _indexManager;
+
+  /// Get vector index manager
+  VectorIndexManager? get vectorIndexManager => _vectorIndexManager;
 
   /// Get memory manager
   MemoryManager? get memoryManager => _memoryManager;
@@ -672,6 +678,7 @@ class DataStoreImpl {
 
       directoryManager = DirectoryManager(this);
       _indexManager = IndexManager(this);
+      _vectorIndexManager = VectorIndexManager(this);
       indexTreePartitionManager = IndexTreePartitionManager(this);
       tableTreePartitionManager = TableTreePartitionManager(this);
       _tableDataManager = TableDataManager(this);
@@ -989,6 +996,25 @@ class DataStoreImpl {
     }
   }
 
+  Future<void> flush({bool flushStorage = true}) async {
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
+    await TransactionContext.runAsSystemOperation(() async {
+      try {
+        await parallelJournalManager.flushCompletely();
+      } catch (_) {}
+      try {
+        await walManager.flushQueueCompletely();
+      } catch (_) {}
+      if (flushStorage) {
+        try {
+          await storage.flushAll();
+        } catch (_) {}
+      }
+    });
+  }
+
   /// Close database
   /// Close database
   /// [persistChanges]: when true, save buffers/caches to disk (default behavior).
@@ -1093,6 +1119,8 @@ class DataStoreImpl {
       // Clear instance variables
       _queryOptimizer = null;
       _indexManager = null;
+      _vectorIndexManager?.clearAllCaches();
+      _vectorIndexManager = null;
       _queryExecutor = null;
       _integrityChecker = null;
       _keyManager = null;
@@ -1183,10 +1211,11 @@ class DataStoreImpl {
         // Write schema file
         await schemaManager?.saveTableSchema(schema.name, schemaValid);
 
-        // Create all indexes (explicit, unique, and foreign key)
-        final allIndexes =
-            schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
-        for (var index in allIndexes) {
+        // Create B+Tree indexes (explicit, unique, and foreign key).
+        // Vector indexes are managed by VectorIndexManager (lazy init on first write).
+        final btreeIndexes =
+            schemaManager?.getBtreeIndexesFor(schema) ?? <IndexSchema>[];
+        for (var index in btreeIndexes) {
           await _indexManager?.createIndex(schema.name, index);
         }
 
@@ -4229,10 +4258,8 @@ class DataStoreImpl {
       }
 
       try {
-        // Process records in batches to maintain memory efficiency
-        // Use larger batches for throughput; YieldController keeps UI responsive.
-        // For very large batches, cap to avoid excessive transient structures.
-        final int batchSize = 20000;
+        // Process records in small batches to provide frequent "heartbeats" for
+        final int batchSize = 1000;
 
         for (int start = 0;
             start < recordsToProcess.length;
@@ -5106,6 +5133,44 @@ class DataStoreImpl {
       Logger.error('Query by field failed: $e', label: 'DataStore.queryBy');
       rethrow;
     }
+  }
+
+  /// Perform approximate nearest neighbor (ANN) vector similarity search.
+  ///
+  /// Searches the NGH vector index on [fieldName] in [tableName] to find
+  /// the top-[topK] records most similar to [queryVector].
+  ///
+  /// Returns a list of [VectorSearchResult] sorted by similarity
+  /// (highest score first). Each entry contains the matching record's
+  /// primary key, distance, and normalised score.
+  ///
+  /// Example:
+  /// ```dart
+  /// final results = await db.vectorSearch(
+  ///   'articles',
+  ///   fieldName: 'embedding',
+  ///   queryVector: VectorData([0.1, 0.2, ...]),
+  ///   topK: 10,
+  /// );
+  /// ```
+  Future<List<VectorSearchResult>> vectorSearch(
+    String tableName, {
+    required String fieldName,
+    required VectorData queryVector,
+    int topK = 10,
+    int? efSearch,
+    double? distanceThreshold,
+  }) async {
+    await ensureInitialized();
+    if (_vectorIndexManager == null) return const [];
+    return _vectorIndexManager!.vectorSearch(
+      tableName: tableName,
+      fieldName: fieldName,
+      queryVector: queryVector,
+      topK: topK,
+      efSearch: efSearch,
+      distanceThreshold: distanceThreshold,
+    );
   }
 
   /// Switch space

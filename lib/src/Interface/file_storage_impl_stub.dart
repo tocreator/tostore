@@ -139,6 +139,11 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<void> flushFile(String path) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');

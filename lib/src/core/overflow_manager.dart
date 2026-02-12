@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -27,6 +28,13 @@ final class OverflowManager {
 
   static const int _defaultPartitionNo = 0;
 
+  // Locks to prevent concurrent metadata updates (race on free list/file size).
+  final Map<String, SimpleLock> _locks = {};
+
+  SimpleLock _getLock(String path) {
+    return _locks.putIfAbsent(path, () => SimpleLock());
+  }
+
   // Marker to help future debugging (not a public guarantee).
   static const String _label = 'OverflowManager';
 
@@ -40,25 +48,61 @@ final class OverflowManager {
     return valueLen >= _thresholdForPageSize(pageSize);
   }
 
+  int estimatePageCount({
+    required int valueLen,
+    required int pageSize,
+    int? encryptionKeyId,
+  }) {
+    final maxChunk = _maxChunkLen(pageSize, encryptionKeyId: encryptionKeyId);
+    return (valueLen + maxChunk - 1) ~/ maxChunk;
+  }
+
+  Future<OverflowBatchAllocator> startBatchAllocation({
+    required int totalChunks,
+    required String tableName,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    bool flush = true,
+  }) async {
+    final path = await _overflowPath(tableName, _defaultPartitionNo);
+    return _getLock(path).synchronized(() async {
+      await _ensureFileInitialized(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: _defaultPartitionNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: flush,
+      );
+
+      final pages = await _allocatePageNos(
+        count: totalChunks,
+        path: path,
+        pageSize: pageSize,
+        partitionNo: _defaultPartitionNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: flush,
+      );
+      return OverflowBatchAllocator(pages);
+    });
+  }
+
   Future<ValueRef> putLargeValue({
     required String tableName,
     required Uint8List valueBytes,
     required int pageSize,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool flush = true,
+    OverflowBatchAllocator? allocator,
   }) async {
     if (valueBytes.isEmpty) {
       throw ArgumentError.value(valueBytes.length, 'valueBytes', 'must be > 0');
     }
 
     final path = await _overflowPath(tableName, _defaultPartitionNo);
-    await _ensureFileInitialized(
-      path: path,
-      pageSize: pageSize,
-      partitionNo: _defaultPartitionNo,
-      encryptionKey: encryptionKey,
-      encryptionKeyId: encryptionKeyId,
-    );
 
     final crc = Crc32.of(valueBytes);
     final maxChunk = _maxChunkLen(
@@ -68,14 +112,30 @@ final class OverflowManager {
     final chunks = _splitIntoChunks(valueBytes, maxChunk);
 
     // Optimized batch allocation:
-    final pageNos = await _allocatePageNos(
-      count: chunks.length,
-      path: path,
-      pageSize: pageSize,
-      partitionNo: _defaultPartitionNo,
-      encryptionKey: encryptionKey,
-      encryptionKeyId: encryptionKeyId,
-    );
+    final List<int> pageNos;
+    if (allocator != null) {
+      pageNos = allocator.next(chunks.length);
+    } else {
+      pageNos = await _getLock(path).synchronized(() async {
+        await _ensureFileInitialized(
+          path: path,
+          pageSize: pageSize,
+          partitionNo: _defaultPartitionNo,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: flush,
+        );
+        return await _allocatePageNos(
+          count: chunks.length,
+          path: path,
+          pageSize: pageSize,
+          partitionNo: _defaultPartitionNo,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: flush,
+        );
+      });
+    }
 
     final writes = <ByteWrite>[];
     for (int i = 0; i < pageNos.length; i++) {
@@ -99,7 +159,7 @@ final class OverflowManager {
     }
 
     // IMPORTANT: write overflow pages first (reference safety).
-    await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+    await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
 
     return ValueRef.overflow(
       overflowPartitionNo: _defaultPartitionNo,
@@ -122,92 +182,96 @@ final class OverflowManager {
     final path = await _overflowPath(tableName, ref.overflowPartitionNo);
     if (!await _dataStore.storage.existsFile(path)) return;
 
-    // 1. Follow the chain to collect all page numbers.
-    final pageNos = <int>[];
-    int curPageNo = ref.startPageNo;
-    int guard = 0;
-    while (curPageNo > 0) {
-      if (guard++ > 1 << 20) break; // cycle safety
-      pageNos.add(curPageNo);
+    await _getLock(path).synchronized(() async {
+      // 1. Follow the chain to collect all page numbers.
+      final pageNos = <int>[];
+      int curPageNo = ref.startPageNo;
+      int guard = 0;
+      while (curPageNo > 0) {
+        if (guard++ > 1 << 20) break; // cycle safety
+        pageNos.add(curPageNo);
 
-      // We only need to read the nextPageNo to follow the chain.
-      // Reading the whole page is slightly expensive but safer for CRC/type checks.
-      final pageBytes = await _dataStore.storage
-          .readAsBytesAt(path, curPageNo * pageSize, length: pageSize);
-      if (pageBytes.isEmpty) break;
-      try {
-        final parsed = BTreePageIO.parsePageBytes(pageBytes);
-        if (parsed.type != BTreePageType.overflow) break;
-        final decodedPayload = BTreePageCodec.decodePayload(
-          parsed.encodedPayload,
+        // We only need to read the nextPageNo to follow the chain.
+        // Reading the whole page is slightly expensive but safer for CRC/type checks.
+        final pageBytes = await _dataStore.storage
+            .readAsBytesAt(path, curPageNo * pageSize, length: pageSize);
+        if (pageBytes.isEmpty) break;
+        try {
+          final parsed = BTreePageIO.parsePageBytes(pageBytes);
+          if (parsed.type != BTreePageType.overflow) break;
+          final decodedPayload = BTreePageCodec.decodePayload(
+            parsed.encodedPayload,
+            config: _dataStore.config,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            aad: _aadForOverflowPage(ref.overflowPartitionNo, curPageNo),
+          );
+          final page = OverflowPage.tryDecodePayload(decodedPayload);
+          if (page == null) break;
+          curPageNo = page.nextPageNo;
+        } catch (_) {
+          break; // stop on corruption
+        }
+      }
+
+      if (pageNos.isEmpty) return;
+
+      // 2. Read meta to get current freelist head.
+      final meta = await _readMeta(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: ref.overflowPartitionNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+
+      // 3. Chain these pages and link the last one to current freelist head.
+      final writes = <ByteWrite>[];
+      int nextInFree = meta.freeListHeadPageNo;
+      // We iterate backwards so the first page of the chain points to the rest,
+      // and the last page points to the old head.
+      for (int i = pageNos.length - 1; i >= 0; i--) {
+        final pn = pageNos[i];
+        final freePage = FreePage(nextFreePageNo: nextInFree);
+        final payload = freePage.encodePayload();
+        final encodedPayload = BTreePageCodec.encodePayload(
+          payload,
           config: _dataStore.config,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
-          aad: _aadForOverflowPage(ref.overflowPartitionNo, curPageNo),
+          aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
         );
-        final page = OverflowPage.tryDecodePayload(decodedPayload);
-        if (page == null) break;
-        curPageNo = page.nextPageNo;
-      } catch (_) {
-        break; // stop on corruption
+        final pageBytes = BTreePageIO.buildPageBytes(
+          type: BTreePageType.free,
+          encodedPayload: encodedPayload,
+          pageSize: pageSize,
+        );
+        writes.add(ByteWrite(offset: pn * pageSize, bytes: pageBytes));
+        nextInFree = pn;
       }
-    }
 
-    if (pageNos.isEmpty) return;
+      // 4. Write all free pages.
+      await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: false);
 
-    // 2. Read meta to get current freelist head.
-    final meta = await _readMeta(
-      path: path,
-      pageSize: pageSize,
-      partitionNo: ref.overflowPartitionNo,
-      encryptionKey: encryptionKey,
-      encryptionKeyId: encryptionKeyId,
-    );
-
-    // 3. Chain these pages and link the last one to current freelist head.
-    final writes = <ByteWrite>[];
-    int nextInFree = meta.freeListHeadPageNo;
-    // We iterate backwards so the first page of the chain points to the rest,
-    // and the last page points to the old head.
-    for (int i = pageNos.length - 1; i >= 0; i--) {
-      final pn = pageNos[i];
-      final freePage = FreePage(nextFreePageNo: nextInFree);
-      final payload = freePage.encodePayload();
-      final encodedPayload = BTreePageCodec.encodePayload(
-        payload,
-        config: _dataStore.config,
+      // 5. Update meta.
+      final newMeta = PartitionMetaPage(
+        partitionNo: meta.partitionNo,
+        totalEntries: meta.totalEntries,
+        fileSizeInBytes: meta.fileSizeInBytes,
+        freeListHeadPageNo:
+            pageNos.first, // The first page in our reconstructed chain
+        freePageCount: meta.freePageCount + pageNos.length,
+      );
+      await _writeMeta(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: ref.overflowPartitionNo,
+        meta: newMeta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
-        aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
+        flush: false,
       );
-      final pageBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.free,
-        encodedPayload: encodedPayload,
-        pageSize: pageSize,
-      );
-      writes.add(ByteWrite(offset: pn * pageSize, bytes: pageBytes));
-      nextInFree = pn;
-    }
-
-    // 4. Update the batch of free pages.
-    await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
-
-    // 5. Update meta page.
-    final updatedMeta = PartitionMetaPage(
-      partitionNo: meta.partitionNo,
-      totalEntries: meta.totalEntries,
-      fileSizeInBytes: meta.fileSizeInBytes,
-      freeListHeadPageNo: nextInFree,
-      freePageCount: meta.freePageCount + pageNos.length,
-    );
-    await _writeMeta(
-      path: path,
-      pageSize: pageSize,
-      partitionNo: ref.overflowPartitionNo,
-      meta: updatedMeta,
-      encryptionKey: encryptionKey,
-      encryptionKeyId: encryptionKeyId,
-    );
+    });
   }
 
   Future<Uint8List> getLargeValue({
@@ -330,6 +394,7 @@ final class OverflowManager {
     required int partitionNo,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool flush = true,
   }) async {
     await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
     if (await _dataStore.storage.existsFile(path)) {
@@ -358,7 +423,7 @@ final class OverflowManager {
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
-    await _dataStore.storage.writeAsBytesAt(path, 0, page0, flush: true);
+    await _dataStore.storage.writeAsBytesAt(path, 0, page0, flush: flush);
   }
 
   Future<PartitionMetaPage> _readMeta({
@@ -395,6 +460,7 @@ final class OverflowManager {
     required PartitionMetaPage meta,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool flush = true,
   }) async {
     final payload = meta.encodePayload();
     final encodedPayload = BTreePageCodec.encodePayload(
@@ -409,7 +475,7 @@ final class OverflowManager {
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
-    await _dataStore.storage.writeAsBytesAt(path, 0, page0, flush: true);
+    await _dataStore.storage.writeAsBytesAt(path, 0, page0, flush: flush);
   }
 
   Future<List<int>> _allocatePageNos({
@@ -419,6 +485,7 @@ final class OverflowManager {
     required int partitionNo,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool flush = true,
   }) async {
     if (count <= 0) return const [];
 
@@ -491,8 +558,48 @@ final class OverflowManager {
       meta: updatedMeta,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      flush: flush,
     );
 
     return result;
+  }
+}
+
+/// Helper to allocate overflow pages in bulk.
+class OverflowBatchAllocator {
+  final List<int> _pages;
+  int _consumed = 0;
+
+  OverflowBatchAllocator(this._pages);
+
+  List<int> next(int count) {
+    if (_consumed + count > _pages.length) {
+      throw StateError(
+          'Batch allocator exhausted: needed $count, available ${_pages.length - _consumed}');
+    }
+    final range = _pages.sublist(_consumed, _consumed + count);
+    _consumed += count;
+    return range;
+  }
+}
+
+/// A simple async lock to serialize operations.
+class SimpleLock {
+  Future<void>? _last;
+
+  Future<T> synchronized<T>(Future<T> Function() callback) async {
+    final prev = _last;
+    final completer = Completer<void>();
+    _last = completer.future;
+    if (prev != null) {
+      try {
+        await prev;
+      } catch (_) {}
+    }
+    try {
+      return await callback();
+    } finally {
+      completer.complete();
+    }
   }
 }

@@ -389,28 +389,30 @@ class FileStorageImpl implements StorageInterface {
     return await file.readAsBytes();
   }
 
+  static bool _isFileNotFound(Object e) {
+    final s = e.toString();
+    return s.contains('PathNotFoundException') ||
+        s.contains('No such file or directory') ||
+        s.contains('errno = 2');
+  }
+
   @override
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    final key = _poolKey(path, FileMode.read);
     try {
-      final file = File(path);
-      if (!await file.exists()) return Uint8List(0);
-
-      final fileSize = await file.length();
-      if (start >= fileSize) return Uint8List(0);
-
-      final end = length != null
-          ? (start + length > fileSize ? fileSize : start + length)
-          : fileSize;
-
-      // Use openRead with start and end to read only the needed portion
-      final stream = file.openRead(start, end);
-      final bytes = <int>[];
-      await for (final chunk in stream) {
-        bytes.addAll(chunk);
-      }
-
-      return Uint8List.fromList(bytes);
+      return await _withHandleLock<Uint8List>(key, () async {
+        final raf = await _getHandle(path, FileMode.read);
+        final fileSize = await raf.length();
+        if (start >= fileSize) return Uint8List(0);
+        final readLen = length != null
+            ? (start + length > fileSize ? fileSize - start : length)
+            : fileSize - start;
+        if (readLen <= 0) return Uint8List(0);
+        await raf.setPosition(start);
+        return await raf.read(readLen);
+      });
     } catch (e) {
+      if (_isFileNotFound(e)) return Uint8List(0);
       Logger.error('Read bytes at offset failed: $e', label: 'FileStorageImpl');
       return Uint8List(0);
     }
@@ -802,6 +804,37 @@ class FileStorageImpl implements StorageInterface {
     } catch (e) {
       Logger.error('Read as lines failed: $e', label: 'FileStorageImpl');
       return [];
+    }
+  }
+
+  @override
+  Future<void> flushFile(String path) async {
+    try {
+      final normalizedPath = p.canonicalize(path);
+      // Iterate over all open handles and find those matching the path
+      final entries = _handlePool.entries.toList();
+      for (final e in entries) {
+        final key = e.key;
+        final raf = e.value;
+        // key format: "<normalizedPath>|<modeKey>"
+        final sepIdx = key.lastIndexOf('|');
+        if (sepIdx <= 0) continue;
+        final filePath = key.substring(0, sepIdx);
+
+        if (filePath == normalizedPath) {
+          await _withHandleLock(key, () async {
+            try {
+              await raf.flush();
+            } catch (e) {
+              Logger.warn('Flush file handle failed for $path: $e',
+                  label: 'FileStorageImpl.flushFile');
+            }
+          });
+        }
+      }
+    } catch (e) {
+      Logger.error('Flush file failed: $e', label: 'FileStorageImpl.flushFile');
+      rethrow;
     }
   }
 

@@ -265,8 +265,8 @@ class WeightManager {
           );
         }
 
-        // Initialize index weights
-        final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+        // Initialize B+Tree index weights (vector index weights are separate).
+        final indexes = _dataStore.schemaManager?.getBtreeIndexesFor(schema);
         if (indexes == null) return;
         for (final index in indexes) {
           await yieldController.maybeYield();

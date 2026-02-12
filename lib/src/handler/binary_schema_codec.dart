@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/table_schema.dart' show VectorData;
 import 'platform_byte_data.dart';
 
 /// A compact binary codec for records using schema-based encoding.
@@ -131,6 +132,13 @@ class BinarySchemaCodec {
 
     if (value is Uint8List) {
       _writeBinary(b, value);
+      return;
+    }
+
+    // VectorData: encode as binary (Float64List bytes) for compact storage.
+    if (value is VectorData) {
+      final f64 = Float64List.fromList(value.values);
+      _writeBinary(b, f64.buffer.asUint8List());
       return;
     }
 
@@ -339,6 +347,14 @@ class BinarySchemaCodec {
             return value;
           }
         }
+        return value;
+
+      // DataType.vector
+      case 8:
+        if (value is Uint8List) {
+          return VectorData.fromBytes(value);
+        }
+        if (value is VectorData) return value;
         return value;
 
       default:
