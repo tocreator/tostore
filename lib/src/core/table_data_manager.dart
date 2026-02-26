@@ -13,6 +13,7 @@ import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
+import '../model/query_aggregation.dart';
 import 'data_store_impl.dart';
 import '../model/meta_info.dart';
 import 'crontab_manager.dart';
@@ -3192,6 +3193,9 @@ class TableDataManager {
     List<String>? orderBy,
     String? startAfterPrimaryKey,
     bool Function(Map<String, dynamic>)? filter,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     // Increment table access weight for caching optimization
     _dataStore.weightManager?.incrementAccess(
@@ -3201,7 +3205,10 @@ class TableDataManager {
     );
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      return TableScanResult(records: const []);
+      return TableScanResult(
+          records: const [],
+          count: onlyCount ? 0 : null,
+          aggregateResult: null);
     }
     final primaryKey = schema.primaryKey;
     final pkMatcher =
@@ -3229,10 +3236,8 @@ class TableDataManager {
       return true;
     }
 
-    // Always apply recordMatches to ensure WriteBuffer deletions are filtered out
-    // during the scan (preserving the limit), even if matcher/filter are null.
-    // ignore: unnecessary_nullable_for_final_variable_declarations
-    final bool Function(Map<String, dynamic>)? recordPredicate = recordMatches;
+    // Assign to local val so that it satisfies function pointer constraints
+    final bool Function(Map<String, dynamic>) recordPredicate = recordMatches;
 
     // Parse Sort Order first as it is needed by fast paths
     bool isPkOrder = true;
@@ -3297,7 +3302,7 @@ class TableDataManager {
       final keys =
           pkEqValue != null ? [pkEqValue] : pkInValues!.toSet().toList();
       if (keys.isEmpty) {
-        return TableScanResult(records: []);
+        return TableScanResult(records: [], count: onlyCount ? 0 : null);
       }
 
       final batchRes = await queryRecordsBatch(tableName, keys);
@@ -3323,7 +3328,8 @@ class TableDataManager {
       // Apply Offset/Limit in memory
       if (offset != null && offset > 0) {
         if (offset >= filtered.length) {
-          return TableScanResult(records: const []);
+          return TableScanResult(
+              records: const [], count: onlyCount ? 0 : null);
         }
         filtered.removeRange(0, offset);
       }
@@ -3331,14 +3337,26 @@ class TableDataManager {
         filtered.removeRange(limit, filtered.length);
       }
 
+      if (aggregations != null && aggregations.isNotEmpty) {
+        final agg = QueryAggregator(aggregations, groupBy: groupBy);
+        for (final r in filtered) {
+          agg.accumulate(r);
+        }
+        return TableScanResult(
+          records: const [],
+          aggregateResult: agg.result,
+        );
+      }
+
       return TableScanResult(
-        records: filtered,
+        records: onlyCount ? const [] : filtered,
+        count: onlyCount ? filtered.length : null,
       );
     }
 
     final fileMeta = await getTableMeta(tableName);
     if (fileMeta == null || fileMeta.totalRecords <= 0) {
-      return TableScanResult(records: const []);
+      return TableScanResult(records: const [], count: onlyCount ? 0 : null);
     }
 
     final rangeMgr = _dataStore.tableTreePartitionManager;
@@ -3502,22 +3520,58 @@ class TableDataManager {
     if (endKeyBytes.isNotEmpty &&
         startKeyBytes.isNotEmpty &&
         MemComparableKey.compare(startKeyBytes, endKeyBytes) >= 0) {
-      return TableScanResult(records: []);
+      return TableScanResult(records: [], count: onlyCount ? 0 : null);
     }
 
     // PK-ordered scan: can stop early at offset+limit.
     if (isPkOrder) {
-      // New global B+Tree: PK range scan should NOT be partition-loop driven.
-      // Delegate to the partition manager to scan the global leaf chain once.
-      final out = await rangeMgr.scanRecordsByPrimaryKeyRange(
-        tableName: tableName,
-        startKeyInclusive: startKeyBytes,
-        endKeyExclusive: endKeyBytes,
-        reverse: reverse,
-        limit: (needCount < 0) ? null : needCount,
-        recordPredicate: recordPredicate,
-      );
-      return TableScanResult(records: out);
+      if (onlyCount) {
+        int totalCount = 0;
+        await rangeMgr.forEachRecordByPrimaryKeyRange(
+          tableName: tableName,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          reverse: reverse,
+          limit: (needCount < 0) ? null : needCount,
+          recordPredicate: recordPredicate,
+          onRecord: (r) {
+            totalCount++;
+            return true;
+          },
+        );
+        int finalCount = totalCount;
+        if (offset != null && offset > 0) {
+          finalCount = max(0, finalCount - offset);
+        }
+        return TableScanResult(records: const [], count: finalCount);
+      } else if (aggregations != null && aggregations.isNotEmpty) {
+        final agg = QueryAggregator(aggregations, groupBy: groupBy);
+        await rangeMgr.forEachRecordByPrimaryKeyRange(
+          tableName: tableName,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          reverse: reverse,
+          limit: (needCount < 0) ? null : needCount,
+          recordPredicate: recordPredicate,
+          onRecord: (r) {
+            agg.accumulate(r);
+            return true;
+          },
+        );
+        return TableScanResult(records: const [], aggregateResult: agg.result);
+      } else {
+        // New global B+Tree: PK range scan should NOT be partition-loop driven.
+        // Delegate to the partition manager to scan the global leaf chain once.
+        final out = await rangeMgr.scanRecordsByPrimaryKeyRange(
+          tableName: tableName,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          reverse: reverse,
+          limit: (needCount < 0) ? null : needCount,
+          recordPredicate: recordPredicate,
+        );
+        return TableScanResult(records: out);
+      }
     }
 
     // Non-PK orderBy: must scan all target partitions, then do in-memory topK sort (bounded by offset+limit).
@@ -3564,6 +3618,20 @@ class TableDataManager {
       // Note: Sorting is handled by the upper layer (QueryExecutor._applySort),
       // so we skip sorting here to avoid redundant operations and improve performance.
       // Only need to handle reverse partition scanning based on sort direction.
+      if (onlyCount) {
+        int finalCount = out.length;
+        if (offset != null && offset > 0) {
+          finalCount = max(0, finalCount - offset);
+        }
+        return TableScanResult(records: const [], count: finalCount);
+      }
+      if (aggregations != null && aggregations.isNotEmpty) {
+        return TableScanResult(
+          records: const [],
+          aggregateResult:
+              calculateAggregateResult(out, aggregations, groupBy: groupBy),
+        );
+      }
       return TableScanResult(records: out);
     }
 
@@ -3604,7 +3672,7 @@ class TableDataManager {
       });
 
       if (tasks.isEmpty) {
-        return TableScanResult(records: []);
+        return TableScanResult(records: [], count: onlyCount ? 0 : null);
       }
 
       final effectiveConcurrency = min(queryConcurrency, tasks.length);
@@ -3638,7 +3706,32 @@ class TableDataManager {
       lease?.release();
     }
 
-    return TableScanResult(records: globalTop.toSortedList());
+    final sortedList = globalTop.toSortedList();
+    if (onlyCount) {
+      int finalCount = sortedList.length;
+      if (offset != null && offset > 0) {
+        finalCount = max(0, finalCount - offset);
+      }
+      return TableScanResult(records: const [], count: finalCount);
+    }
+    if (aggregations != null && aggregations.isNotEmpty) {
+      return TableScanResult(
+        records: const [],
+        aggregateResult: calculateAggregateResult(sortedList, aggregations,
+            groupBy: groupBy),
+      );
+    }
+    return TableScanResult(records: sortedList);
+  }
+
+  dynamic calculateAggregateResult(
+      List<Map<String, dynamic>> records, List<QueryAggregation> aggregations,
+      {List<String>? groupBy}) {
+    final agg = QueryAggregator(aggregations, groupBy: groupBy);
+    for (final r in records) {
+      agg.accumulate(r);
+    }
+    return agg.result;
   }
 }
 

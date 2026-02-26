@@ -3,7 +3,7 @@
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | Türkçe
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
@@ -389,6 +389,22 @@ final orders = await db.query('orders')
 // Kayıtları say
 final count = await db.query('users').count();
 
+// Toplama fonksiyonları
+final totalAge = await db.query('users').where('age', '>', 18).sum('age');
+final avgAge = await db.query('users').avg('age');
+final maxAge = await db.query('users').max('age');
+final minAge = await db.query('users').min('age');
+
+// Gruplama ve filtreleme
+final result = await db.query('orders')
+    .select(['status', Agg.sum('amount', alias: 'total')])
+    .groupBy(['status'])
+    .having(Agg.sum('amount'), '>', 1000)
+    .limit(20);
+
+// Benzersiz değer sorgusu
+final uniqueCities = await db.query('users').distinct(['city']);
+
 // Akış sorgusu (büyük veriler için uygun)
 db.streamQuery('users').listen((data) => print(data));
 ```
@@ -755,6 +771,6 @@ Tostore, yapay zeka çağında veri altyapısını güçlendirmek için aktif ol
 
 ## Lisans
 
-Bu proje MIT Lisansı altındadır - ayrıntılar için [LICENSE](LICENSE) dosyasına bakın.
+Bu proje Apache License 2.0 altındadır - ayrıntılar için [LICENSE](LICENSE) dosyasına bakın.
 
 ---

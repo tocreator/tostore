@@ -3,7 +3,7 @@
 [English](../../README.md) | 简体中文 | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
@@ -400,8 +400,24 @@ final orders = await db.query('orders')
 
 ### 流式处理与统计
 ```dart
-// 统计表记录数
+// 统计记录数
 final count = await db.query('users').count();
+
+// 聚合函数
+final totalAge = await db.query('users').where('age', '>', 18).sum('age');
+final avgAge = await db.query('users').avg('age');
+final maxAge = await db.query('users').max('age');
+final minAge = await db.query('users').min('age');
+
+// 分组统计与过滤
+final result = await db.query('orders')
+    .select(['status', Agg.sum('amount', alias: 'total')])
+    .groupBy(['status'])
+    .having(Agg.sum('amount'), '>', 1000)
+    .limit(20);
+
+// 去重查询
+final uniqueCities = await db.query('users').distinct(['city']);
 
 // 流式查询 (适用于海量数据)
 db.streamQuery('users').listen((data) => print(data));
@@ -795,7 +811,7 @@ Tostore 正在积极开发以下功能，进一步增强在AI时代的数据基�
 
 ## 许可证
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
+本项目采用 Apache License 2.0 许可证 - 详见 [LICENSE](LICENSE) 文件
 
 ---
 

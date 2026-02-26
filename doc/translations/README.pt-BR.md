@@ -3,7 +3,7 @@
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | Português (Brasil) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
@@ -389,6 +389,22 @@ final orders = await db.query('orders')
 // Contar registros
 final count = await db.query('users').count();
 
+// Funções de agregação
+final totalAge = await db.query('users').where('age', '>', 18).sum('age');
+final avgAge = await db.query('users').avg('age');
+final maxAge = await db.query('users').max('age');
+final minAge = await db.query('users').min('age');
+
+// Agrupamento e filtragem
+final result = await db.query('orders')
+    .select(['status', Agg.sum('amount', alias: 'total')])
+    .groupBy(['status'])
+    .having(Agg.sum('amount'), '>', 1000)
+    .limit(20);
+
+// Consulta de valores distintos
+final uniqueCities = await db.query('users').distinct(['city']);
+
 // Consulta por fluxo (adequada para dados massivos)
 db.streamQuery('users').listen((data) => print(data));
 ```
@@ -758,6 +774,6 @@ O Tostore está desenvolvendo ativamente recursos para aprimorar a infraestrutur
 
 ## Licença
 
-Este projeto está sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
+Este projeto está sob a Licença Apache 2.0 - veja o arquivo [LICENSE](LICENSE) para detalhes.
 
 ---

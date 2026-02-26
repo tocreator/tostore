@@ -24,6 +24,8 @@ import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
 import '../core/workload_scheduler.dart';
 
+import '../model/query_aggregation.dart';
+
 /// query executor
 class QueryExecutor {
   final DataStoreImpl _dataStore;
@@ -67,6 +69,9 @@ class QueryExecutor {
     List<JoinClause>? joins,
     bool enableQueryCache = false,
     Duration? queryCacheExpiry,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     final optimizer = _dataStore.getQueryOptimizer();
     if (optimizer == null) {
@@ -102,6 +107,9 @@ class QueryExecutor {
       joins: joins,
       enableQueryCache: enableQueryCache,
       queryCacheExpiry: queryCacheExpiry,
+      onlyCount: onlyCount,
+      aggregations: aggregations,
+      groupBy: groupBy,
     );
   }
 
@@ -237,6 +245,9 @@ class QueryExecutor {
     List<JoinClause>? joins,
     bool enableQueryCache = false,
     Duration? queryCacheExpiry,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     try {
       // Cursor and offset are mutually exclusive at the API level.
@@ -303,34 +314,62 @@ class QueryExecutor {
       }
 
       bool isDefaultLimitApplied = false;
-      final int effectiveLimit;
+      int? effectiveLimit;
+
       if (limit != null) {
         effectiveLimit = limit;
       } else {
-        final int defaultLimit = _dataStore.config.defaultQueryLimit;
-        if (defaultLimit <= 0) {
-          // Safety: never allow unbounded reads in ultra-large datasets.
-          // Caller must specify limit() or configure defaultQueryLimit (> 0).
-          throw BusinessError(
-            'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
-            type: BusinessErrorType.dbError,
-            data: {
-              'table': tableName,
-              'defaultQueryLimit': _dataStore.config.defaultQueryLimit,
-            },
-          );
+        if (aggregations != null && aggregations.isNotEmpty) {
+          // Aggregations (sum/avg/min/max) need all matching data for correct
+          // results. These are stream-computed and will not cause OOM.
+          effectiveLimit = null;
+        } else {
+          // Both normal queries and count() with conditions use defaultQueryLimit
+          // as a safety cap. count() without conditions already uses metadata
+          // (handled in QueryBuilder.count()) and never reaches this path.
+          final int defaultLimit = _dataStore.config.defaultQueryLimit;
+          if (defaultLimit <= 0) {
+            if (onlyCount) {
+              // count() is stream-computed (no record loading), safe without limit.
+              effectiveLimit = null;
+            } else {
+              // Safety: never allow unbounded reads in ultra-large datasets.
+              throw BusinessError(
+                'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
+                type: BusinessErrorType.dbError,
+                data: {
+                  'table': tableName,
+                  'defaultQueryLimit': _dataStore.config.defaultQueryLimit,
+                },
+              );
+            }
+          } else {
+            effectiveLimit = defaultLimit;
+            isDefaultLimitApplied = true;
+          }
         }
-        effectiveLimit = defaultLimit;
-        isDefaultLimitApplied = true;
       }
-      if (effectiveLimit <= 0) {
+
+      if (effectiveLimit != null && effectiveLimit <= 0) {
         return const ExecuteResult.empty();
       }
 
       // Fetch one extra record to detect whether there are more results.
       // This is valuable even when cursor pagination is not supported, so the caller
       // can still know if there is another page beyond [limit].
-      final int fetchLimit = effectiveLimit + 1;
+      final int? fetchLimit =
+          effectiveLimit != null ? effectiveLimit + 1 : null;
+
+      // count() never needs ordering – stripping orderBy forces the fast PK-scan
+      // path (B+Tree Stream Scan) instead of the TopKHeap sorting path.
+      if (onlyCount) {
+        orderBy = null;
+      } else if ((aggregations != null && aggregations.isNotEmpty) &&
+          effectiveLimit == null &&
+          effectiveOffset == 0) {
+        // Unbounded aggregations without offsets are not affected by ordering.
+        orderBy = null;
+      }
 
       final stopwatch = Stopwatch()..start();
 
@@ -431,14 +470,13 @@ class QueryExecutor {
         cursorToken: cursorToken,
       );
 
-      // Execute query plan
       final planResult = await _executeQueryPlan(
         plan,
         tableName,
         condition,
         schemas,
         matcher,
-        limit: fetchLimit,
+        limit: onlyCount ? effectiveLimit : fetchLimit,
         offset: effectiveOffset,
         orderBy: effectiveOrderBy,
         enableQueryCache: enableQueryCache,
@@ -446,7 +484,34 @@ class QueryExecutor {
         cursor: cursor,
         cursorToken: cursorToken,
         cursorMode: cursorMode,
+        onlyCount: onlyCount,
+        aggregations: aggregations,
+        groupBy: groupBy,
       );
+
+      if (onlyCount) {
+        stopwatch.stop();
+        int? tableTotalCount;
+        try {
+          tableTotalCount =
+              await _dataStore.tableDataManager.getTableRecordCount(tableName);
+        } catch (_) {}
+        return ExecuteResult(
+          records: const [],
+          count: planResult.count,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+          tableTotalCount: tableTotalCount,
+        );
+      }
+
+      if (aggregations != null && aggregations.isNotEmpty) {
+        stopwatch.stop();
+        return ExecuteResult(
+          records: const [],
+          aggregateResult: planResult.aggregateResult,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        );
+      }
 
       List<Map<String, dynamic>> results = planResult.records.toList();
 
@@ -515,19 +580,21 @@ class QueryExecutor {
       // CRITICAL: Apply limit truncation BEFORE pagination status check.
       // Buffer merging may have returned more records than needed, so we must truncate here.
       // Always keep at most (limit+1) records for hasMore/hasPrev detection.
-      final int targetLimit = effectiveLimit + 1;
-      if (results.length > targetLimit) {
-        results = results.take(targetLimit).toList();
-      }
+      if (effectiveLimit != null) {
+        final int targetLimit = effectiveLimit + 1;
+        if (results.length > targetLimit) {
+          results = results.take(targetLimit).toList();
+        }
 
-      // If we reached the default limit and have extra records, warn the user about truncation.
-      if (isDefaultLimitApplied && results.length > effectiveLimit) {
-        Logger.info(
-          'Query results for table "$tableName" reached the default limit of $effectiveLimit. '
-          'Some records may have been truncated. To prevent memory issues with many records, '
-          'please explicitly call .limit() if you need more data.',
-          label: 'QueryExecutor',
-        );
+        // If we reached the default limit and have extra records, warn the user about truncation.
+        if (isDefaultLimitApplied && results.length > effectiveLimit) {
+          Logger.info(
+            'Query results for table "$tableName" reached the default limit of $effectiveLimit. '
+            'Some records may have been truncated. To prevent memory issues with many records, '
+            'please explicitly call .limit() if you need more data.',
+            label: 'QueryExecutor',
+          );
+        }
       }
 
       // Pagination status (internal use for cursor generation)
@@ -538,10 +605,12 @@ class QueryExecutor {
 
       if (effectiveIsBackward) {
         // Backward scan: was there more "above" the cursor?
-        hasPrev = results.length > effectiveLimit;
-        if (hasPrev) {
-          results
-              .removeLast(); // Remove the extra record (furthest from cursor)
+        if (effectiveLimit != null) {
+          hasPrev = results.length > effectiveLimit;
+          if (hasPrev) {
+            results
+                .removeLast(); // Remove the extra record (furthest from cursor)
+          }
         }
 
         // Reverse results back to requested order (scan was reverse direction)
@@ -550,9 +619,11 @@ class QueryExecutor {
         hasMore = hasToken || (effectiveOffset > 0);
       } else {
         // Forward scan: was there more "below"?
-        hasMore = results.length > effectiveLimit;
-        if (hasMore) {
-          results.removeLast(); // Remove the extra record
+        if (effectiveLimit != null) {
+          hasMore = results.length > effectiveLimit;
+          if (hasMore) {
+            results.removeLast(); // Remove the extra record
+          }
         }
         hasPrev = hasToken || (effectiveOffset > 0);
       }
@@ -637,10 +708,13 @@ class QueryExecutor {
     String? cursor,
     _QueryCursorToken? cursorToken,
     _CursorMode? cursorMode,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      return PlanExecutionResult([]);
+      return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
 
     // For sort-key cursor mode, build a keyset filter that will be applied during
@@ -667,6 +741,8 @@ class QueryExecutor {
         limit: limit,
         offset: offset,
         cursor: cursor,
+        aggregations: aggregations,
+        groupBy: groupBy,
       );
       final ck = _buildQueryCacheKey(cacheKey);
       final entry = _queryCache.get(ck);
@@ -688,6 +764,15 @@ class QueryExecutor {
           final filteredResults = await _dataStore.tableDataManager
               .mergeConsistency(tableName, updatedResults,
                   matcher: matcher, limit: limit);
+          if (onlyCount) {
+            return PlanExecutionResult(const [], filteredResults.length, null);
+          }
+          if (aggregations != null && aggregations.isNotEmpty) {
+            final aggRes = _dataStore.tableDataManager.calculateAggregateResult(
+                filteredResults, aggregations,
+                groupBy: groupBy);
+            return PlanExecutionResult(const [], null, aggRes);
+          }
           return PlanExecutionResult(filteredResults);
         }
       }
@@ -698,6 +783,8 @@ class QueryExecutor {
     final int localViewId = _dataStore.readViewManager.registerReadView();
     try {
       List<Map<String, dynamic>> results;
+      int? totalCount;
+      dynamic aggregateResult;
       final operation = plan.operation;
       switch (operation.type) {
         case QueryOperationType.tableScan:
@@ -714,8 +801,13 @@ class QueryExecutor {
             orderBy: orderBy,
             startAfterPrimaryKey: startAfterPk,
             filter: cursorFilter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
           );
           results = scanRes.records;
+          totalCount = scanRes.count;
+          aggregateResult = scanRes.aggregateResult;
           break;
         case QueryOperationType.indexScan:
           final opVal = operation.value;
@@ -734,7 +826,7 @@ class QueryExecutor {
             plan: plan,
             orderBy: orderBy,
           );
-          results = await _performIndexScan(
+          final indexRes = await _performIndexScan(
             tableName,
             operation.indexName!,
             cond,
@@ -745,7 +837,13 @@ class QueryExecutor {
             startAfterIndexKey: startAfterIndexKey,
             reverse: reverse,
             filter: cursorFilter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
           );
+          results = indexRes.records;
+          totalCount = indexRes.count;
+          aggregateResult = indexRes.aggregateResult;
           break;
         case QueryOperationType.union:
           final opVal = operation.value;
@@ -777,7 +875,7 @@ class QueryExecutor {
             orderBy: orderBy,
           );
 
-          final unionRecords = await _performUnionPlans(
+          final unionRes = await _performUnionPlans(
             tableName,
             plans,
             schemas,
@@ -787,9 +885,32 @@ class QueryExecutor {
             startAfterPrimaryKey: startAfterPk,
             startAfterIndexKey: startAfterIndexKey,
             reverse: reverse,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
           );
-          results = unionRecords;
+          results = unionRes.records;
+          totalCount = unionRes.count;
+          aggregateResult = unionRes.aggregateResult;
           break;
+      }
+
+      if (onlyCount) {
+        // The tree scan only counts flushed (committed) records.
+        // Unflushed write-buffer records must also be counted for consistency.
+        final bufferMerged = await _dataStore.tableDataManager.mergeConsistency(
+          tableName,
+          const <Map<String, dynamic>>[],
+          matcher: matcher,
+          limit: limit,
+        );
+        final bufferCount = bufferMerged.length;
+        final treeCount = totalCount ?? 0;
+        return PlanExecutionResult(const [], treeCount + bufferCount, null);
+      }
+
+      if (aggregations != null && aggregations.isNotEmpty) {
+        return PlanExecutionResult(const [], null, aggregateResult);
       }
 
       final bool hasSorting = orderBy != null && orderBy.isNotEmpty;
@@ -834,7 +955,7 @@ class QueryExecutor {
 
             final idxName = cursorToken.indexName!;
             // Find index schema match.
-            // Note: indexName in token is the actual name.
+            // Note: indexName in token is really the actual name.
             IndexSchema? idx;
             try {
               final allIndexes =
@@ -921,6 +1042,8 @@ class QueryExecutor {
           limit: limit,
           offset: offset,
           cursor: cursor,
+          aggregations: aggregations,
+          groupBy: groupBy,
         );
 
         final int maxBytes = _queryCache.maxByteThreshold;
@@ -937,7 +1060,7 @@ class QueryExecutor {
         }
       }
 
-      return PlanExecutionResult(results);
+      return PlanExecutionResult(results, totalCount);
     } finally {
       _dataStore.readViewManager.releaseReadView(localViewId);
     }
@@ -947,7 +1070,7 @@ class QueryExecutor {
   ///
   /// Each child plan is executed with its own predicate matcher so that range-partition
   /// pruning remains effective even when the original query contains nested OR.
-  Future<List<Map<String, dynamic>>> _performUnionPlans(
+  Future<TableScanResult> _performUnionPlans(
     String tableName,
     List<QueryPlan> plans,
     Map<String, TableSchema> schemas, {
@@ -957,10 +1080,15 @@ class QueryExecutor {
     String? startAfterPrimaryKey,
     Uint8List? startAfterIndexKey,
     bool reverse = false,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     final tblSchema = schemas[tableName] ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
-    if (tblSchema == null) return const [];
+    if (tblSchema == null) {
+      return TableScanResult(records: const [], count: onlyCount ? 0 : null);
+    }
 
     int effectiveOffset = offset ?? 0;
     if (effectiveOffset < 0) effectiveOffset = 0;
@@ -1021,6 +1149,8 @@ class QueryExecutor {
                   offset: 0,
                   orderBy: orderBy,
                   startAfterPrimaryKey: startAfterPrimaryKey,
+                  aggregations: null,
+                  groupBy: null,
                 );
                 return scan.records;
               case QueryOperationType.indexScan:
@@ -1032,7 +1162,7 @@ class QueryExecutor {
                                 'OR')) // OR in index scan? unexpected but handle op.value correctly
                     ? (vv['where'] ?? vv) as Map<String, dynamic>
                     : const <String, dynamic>{};
-                return await _performIndexScan(
+                return (await _performIndexScan(
                   tableName,
                   op.indexName!,
                   cond,
@@ -1042,19 +1172,26 @@ class QueryExecutor {
                   orderBy: orderBy,
                   startAfterIndexKey: startAfterIndexKey,
                   reverse: reverse,
-                );
+                  onlyCount:
+                      false, // Must fetch records to deduplicate in UNION
+                  aggregations: aggregations,
+                  groupBy: groupBy,
+                ))
+                    .records;
               case QueryOperationType.union:
                 final vv = op.value;
                 final children = (vv is Map<String, dynamic>)
                     ? (vv['children'] as List?)
                     : null;
-                if (children == null || children.isEmpty) return const [];
+                if (children == null || children.isEmpty) {
+                  return const <Map<String, dynamic>>[];
+                }
                 final subPlans = <QueryPlan>[];
                 for (final c in children) {
                   if (c is QueryPlan) subPlans.add(c);
                 }
-                if (subPlans.isEmpty) return const [];
-                return await _performUnionPlans(
+                if (subPlans.isEmpty) return const <Map<String, dynamic>>[];
+                return (await _performUnionPlans(
                   tableName,
                   subPlans,
                   schemas,
@@ -1064,7 +1201,12 @@ class QueryExecutor {
                   startAfterPrimaryKey: startAfterPrimaryKey,
                   startAfterIndexKey: startAfterIndexKey,
                   reverse: reverse,
-                );
+                  onlyCount:
+                      false, // Must fetch records to deduplicate in UNION
+                  aggregations: aggregations,
+                  groupBy: groupBy,
+                ))
+                    .records;
             }
           },
       ];
@@ -1100,7 +1242,33 @@ class QueryExecutor {
           await ValueMatcher.sortMapList(out, [pk], [true], schemas, tableName);
     }
 
-    return out;
+    if (onlyCount) {
+      int finalCount = out.length;
+      if (offset != null && offset > 0) {
+        finalCount = max(0, finalCount - offset);
+      }
+      return TableScanResult(records: const [], count: finalCount);
+    }
+
+    if (aggregations != null && aggregations.isNotEmpty) {
+      final aggRes = _dataStore.tableDataManager
+          .calculateAggregateResult(out, aggregations, groupBy: groupBy);
+      return TableScanResult(records: const [], aggregateResult: aggRes);
+    }
+
+    // 4. Apply manual offset/limit if needed.
+    // Since UNION branches can overlap, the actual total count retrieved might exceed limit.
+    if (effectiveOffset > 0) {
+      if (effectiveOffset >= out.length) {
+        return TableScanResult(records: const []);
+      }
+      out = out.sublist(effectiveOffset);
+    }
+    if (limit != null && out.length > limit) {
+      out = out.sublist(0, limit);
+    }
+
+    return TableScanResult(records: out);
   }
 
   /// Execute table join operation
@@ -1471,6 +1639,9 @@ class QueryExecutor {
     List<String>? orderBy,
     String? startAfterPrimaryKey,
     bool Function(Map<String, dynamic>)? filter,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     try {
       return await _dataStore.tableDataManager.searchTableData(
@@ -1481,6 +1652,9 @@ class QueryExecutor {
         orderBy: orderBy,
         startAfterPrimaryKey: startAfterPrimaryKey,
         filter: filter,
+        onlyCount: onlyCount,
+        aggregations: aggregations,
+        groupBy: groupBy,
       );
     } catch (e) {
       Logger.error('Table scan failed: $e',
@@ -1490,7 +1664,7 @@ class QueryExecutor {
   }
 
   /// perform index scan
-  Future<List<Map<String, dynamic>>> _performIndexScan(
+  Future<TableScanResult> _performIndexScan(
     String tableName,
     String indexName,
     Map<String, dynamic> conditions,
@@ -1501,11 +1675,14 @@ class QueryExecutor {
     Uint8List? startAfterIndexKey,
     bool reverse = false,
     bool Function(Map<String, dynamic>)? filter,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
   }) async {
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        return [];
+        return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
 
       // Index name used by storage is already the actual index name.
@@ -1541,9 +1718,14 @@ class QueryExecutor {
           indexCondition = IndexCondition.fromMap({'SCAN': true});
         } else {
           // Fallback to table scan if the condition value for the index is not provided.
-          final res = await _performTableScan(tableName, matcher,
-              limit: limit, offset: offset, orderBy: orderBy, filter: filter);
-          return res.records;
+          return await _performTableScan(tableName, matcher,
+              limit: limit,
+              offset: offset,
+              orderBy: orderBy,
+              filter: filter,
+              onlyCount: onlyCount,
+              aggregations: aggregations,
+              groupBy: groupBy);
         }
       } else {
         final indexConditionValue =
@@ -1570,19 +1752,30 @@ class QueryExecutor {
 
       // Safety: avoid unbounded index reads that can OOM on large tables.
       // Higher-level executor applies default limits; if it doesn't, we fall back to a bounded table scan.
-      if (limit == null) {
-        final res = await _performTableScan(tableName, matcher,
-            limit: limit, offset: offset, orderBy: orderBy, filter: filter);
-        return res.records;
+      if (!onlyCount && limit == null) {
+        return await _performTableScan(tableName, matcher,
+            limit: limit,
+            offset: offset,
+            orderBy: orderBy,
+            filter: filter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy);
       }
-      if (limit <= 0) return const [];
+      if (!onlyCount && limit != null && limit <= 0) {
+        return TableScanResult(records: const []);
+      }
 
-      final targetNeed = effectiveOffset + limit;
-      if (targetNeed <= 0) return const [];
+      final targetNeed = effectiveOffset + (limit ?? 0);
+      if (!onlyCount && targetNeed <= 0) {
+        return TableScanResult(records: const []);
+      }
 
       final tblSchema =
           await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (tblSchema == null) return [];
+      if (tblSchema == null) {
+        return TableScanResult(records: const [], count: onlyCount ? 0 : null);
+      }
       final pkMatcher =
           ValueMatcher.getMatcher(tblSchema.getPrimaryKeyMatcherType());
 
@@ -1627,20 +1820,50 @@ class QueryExecutor {
 
       // Hard guard against pathological non-progress loops.
       const int maxLoops = 1000000;
+      // Index scan batch size for memory-efficient iteration, particularly useful when counting.
+      const int countBatchSize = 1000;
 
       Uint8List? resumeKey = startAfterIndexKey;
 
-      // -------------------- Case A: orderBy aligns with index => streaming, can stop early --------------------
-      if (!hasOrderBy || orderByAligned) {
+      // -------------------- Case A: orderBy aligns with index or no sort needed => streaming, can stop early --------------------
+      final aggregator = aggregations != null && aggregations.isNotEmpty
+          ? QueryAggregator(aggregations, groupBy: groupBy)
+          : null;
+      if ((onlyCount || (aggregations != null && aggregations.isNotEmpty)) ||
+          !hasOrderBy ||
+          orderByAligned) {
         final out = <Map<String, dynamic>>[];
+        int outCount = 0;
         int loops = 0;
-        while (out.length < targetNeed) {
+        // For onlyCount/aggregations: if targetNeed > 0, stop when count reaches it;
+        // if targetNeed <= 0, scan all matching records (unbounded).
+        bool shouldContinue() {
+          if (onlyCount) {
+            return targetNeed <= 0 || outCount < targetNeed;
+          }
+          if (aggregations != null && aggregations.isNotEmpty) {
+            return true; // aggregations always scan all
+          }
+          return out.length < targetNeed;
+        }
+
+        while (shouldContinue()) {
           await yieldController.maybeYield();
           loops++;
           if (loops > maxLoops) break;
 
-          final int remaining = targetNeed - out.length;
-          final int batch = remaining;
+          final int remaining;
+          if (onlyCount) {
+            remaining = (targetNeed > 0)
+                ? min(countBatchSize, targetNeed - outCount)
+                : countBatchSize;
+          } else if (aggregations != null && aggregations.isNotEmpty) {
+            remaining = countBatchSize;
+          } else {
+            remaining = targetNeed - out.length;
+          }
+          final int batch =
+              remaining > countBatchSize ? countBatchSize : remaining;
 
           final indexResults = await _indexManager.searchIndex(
             tableName,
@@ -1654,9 +1877,14 @@ class QueryExecutor {
           );
 
           if (indexResults.requiresTableScan) {
-            final res = await _performTableScan(tableName, matcher,
-                limit: limit, offset: offset, orderBy: orderBy, filter: filter);
-            return res.records;
+            return await _performTableScan(tableName, matcher,
+                limit: limit,
+                offset: offset,
+                orderBy: orderBy,
+                filter: filter,
+                onlyCount: onlyCount,
+                aggregations: aggregations,
+                groupBy: groupBy);
           }
 
           final pks = indexResults.primaryKeys;
@@ -1684,9 +1912,17 @@ class QueryExecutor {
 
           if (pks.isNotEmpty) {
             for (final pk in pks) {
-              if (out.length >= targetNeed) break;
+              // Early break when target count reached
+              if (onlyCount && targetNeed > 0 && outCount >= targetNeed) break;
+              if (!(onlyCount ||
+                      (aggregations != null && aggregations.isNotEmpty)) &&
+                  out.length >= targetNeed) {
+                break;
+              }
               final rec = recordByPk[pk];
-              if (rec == null) continue;
+              if (rec == null) {
+                continue;
+              }
 
               final be = _dataStore.writeBufferManager
                   .getBufferedRecord(tableName, pk);
@@ -1695,7 +1931,13 @@ class QueryExecutor {
               }
               if ((matcher == null || matcher.matches(rec)) &&
                   (filter == null || filter(rec))) {
-                out.add(rec);
+                if (onlyCount) {
+                  outCount++;
+                } else if (aggregator != null) {
+                  aggregator.accumulate(rec);
+                } else {
+                  out.add(rec);
+                }
               }
             }
           }
@@ -1742,7 +1984,20 @@ class QueryExecutor {
             }
           }
         }
-        return out;
+        if (onlyCount) {
+          int finalCount = outCount;
+          if (offset != null && offset > 0) {
+            finalCount = max(0, finalCount - offset);
+          }
+          return TableScanResult(records: const [], count: finalCount);
+        }
+        if (aggregations != null && aggregations.isNotEmpty) {
+          return TableScanResult(
+            records: const [],
+            aggregateResult: aggregator!.result,
+          );
+        }
+        return TableScanResult(records: out);
       }
 
       // -------------------- Case B: orderBy does NOT align with index => full scan + topK --------------------
@@ -1796,7 +2051,8 @@ class QueryExecutor {
       }
 
       final selector = TopKHeap<Map<String, dynamic>>(
-          k: targetNeed, compare: compareRecords);
+          k: onlyCount ? 1 : targetNeed, compare: compareRecords);
+      int fullOutCount = 0;
 
       int loops = 0;
       while (true) {
@@ -1804,7 +2060,7 @@ class QueryExecutor {
         loops++;
         if (loops > maxLoops) break;
 
-        final int batch = targetNeed;
+        final int batch = onlyCount ? countBatchSize : targetNeed;
 
         final indexResults = await _indexManager.searchIndex(
           tableName,
@@ -1818,9 +2074,12 @@ class QueryExecutor {
         );
 
         if (indexResults.requiresTableScan) {
-          final res = await _performTableScan(tableName, matcher,
-              limit: limit, offset: offset, orderBy: orderBy, filter: filter);
-          return res.records;
+          return await _performTableScan(tableName, matcher,
+              limit: limit,
+              offset: offset,
+              orderBy: orderBy,
+              filter: filter,
+              onlyCount: onlyCount);
         }
 
         final pks = indexResults.primaryKeys;
@@ -1855,7 +2114,11 @@ class QueryExecutor {
             }
             if ((matcher == null || matcher.matches(rec)) &&
                 (filter == null || filter(rec))) {
-              selector.offer(rec);
+              if (onlyCount) {
+                fullOutCount++;
+              } else {
+                selector.offer(rec);
+              }
             }
           }
         }
@@ -1874,13 +2137,23 @@ class QueryExecutor {
         }
       }
 
-      return selector.toSortedList();
+      if (onlyCount) {
+        int finalCount = fullOutCount;
+        if (offset != null && offset > 0) {
+          finalCount = max(0, finalCount - offset);
+        }
+        return TableScanResult(records: const [], count: finalCount);
+      }
+      return TableScanResult(records: selector.toSortedList());
     } catch (e) {
       Logger.error('Index scan failed: $e',
           label: 'QueryExecutor._performIndexScan');
-      final res = await _performTableScan(tableName, matcher,
-          limit: limit, offset: offset, orderBy: orderBy, filter: filter);
-      return res.records;
+      return await _performTableScan(tableName, matcher,
+          limit: limit,
+          offset: offset,
+          orderBy: orderBy,
+          filter: filter,
+          onlyCount: onlyCount);
     }
   }
 
@@ -2845,15 +3118,21 @@ final class _QueryCacheEntry {
 
 class TableScanResult {
   final List<Map<String, dynamic>> records;
+  final int? count;
+  final dynamic aggregateResult;
 
   TableScanResult({
     required this.records,
+    this.count,
+    this.aggregateResult,
   });
 }
 
 class PlanExecutionResult {
   final List<Map<String, dynamic>> records;
-  PlanExecutionResult(this.records);
+  final int? count;
+  final dynamic aggregateResult;
+  PlanExecutionResult(this.records, [this.count, this.aggregateResult]);
 }
 
 class ExecuteResult {
@@ -2865,6 +3144,8 @@ class ExecuteResult {
 
   final int? executionTimeMs;
   final int? tableTotalCount;
+  final int? count;
+  final dynamic aggregateResult;
 
   const ExecuteResult({
     required this.records,
@@ -2874,6 +3155,8 @@ class ExecuteResult {
     this.hasPrev = false,
     this.executionTimeMs,
     this.tableTotalCount,
+    this.count,
+    this.aggregateResult,
   });
 
   const ExecuteResult.empty()
@@ -2883,7 +3166,9 @@ class ExecuteResult {
         hasMore = false,
         hasPrev = false,
         executionTimeMs = null,
-        tableTotalCount = null;
+        tableTotalCount = null,
+        count = null,
+        aggregateResult = null;
 }
 
 enum _CursorMode {

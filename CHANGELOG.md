@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.0.6
+
+### Added
+- Added aggregation functions: `sum()`, `avg()`, `min()`, `max()`
+- Added `groupBy()`, `having()`, `distinct()` query support
+- Added `Agg` helper for inline aggregation in `select()`
+
+### Fixed
+- Fixed `count()` consistency with write buffer and index scan paths
+- Fixed type cast error in aggregation return values
+
+### Changed
+- Changed license from MIT to Apache License 2.0
+- Optimized `watch()` with adaptive debounce to coalesce high-frequency data change notifications, avoiding redundant re-queries under burst writes
+
 ## 3.0.5
 
 ### Added

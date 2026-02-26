@@ -3,7 +3,7 @@
 English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/translations/README.ja.md) | [한국어](doc/translations/README.ko.md) | [Español](doc/translations/README.es.md) | [Português (Brasil)](doc/translations/README.pt-BR.md) | [Русский](doc/translations/README.ru.md) | [Deutsch](doc/translations/README.de.md) | [Français](doc/translations/README.fr.md) | [Italiano](doc/translations/README.it.md) | [Türkçe](doc/translations/README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
@@ -403,6 +403,22 @@ final orders = await db.query('orders')
 // Count records
 final count = await db.query('users').count();
 
+// Aggregate functions
+final totalAge = await db.query('users').where('age', '>', 18).sum('age');
+final avgAge = await db.query('users').avg('age');
+final maxAge = await db.query('users').max('age');
+final minAge = await db.query('users').min('age');
+
+// Group and filter
+final result = await db.query('orders')
+    .select(['status', Agg.sum('amount', alias: 'total')])
+    .groupBy(['status'])
+    .having(Agg.sum('amount'), '>', 1000)
+    .limit(20);
+
+// Distinct query
+final uniqueCities = await db.query('users').distinct(['city']);
+
 // Streaming query (suitable for massive data)
 db.streamQuery('users').listen((data) => print(data));
 ```
@@ -795,6 +811,6 @@ Tostore is actively developing features to further enhance AI-era data infrastru
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
 ---

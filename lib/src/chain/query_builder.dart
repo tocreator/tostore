@@ -5,6 +5,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     with FutureBuilderMixin<QueryResult<Map<String, dynamic>>> {
   Future<ExecuteResult>? _future;
   List<String>? _selectedFields;
+  List<QueryAggregation> _extraAggregations = []; // To store inline Agg objects
 
   // related query related properties
   final List<JoinClause> _joins = [];
@@ -15,6 +16,15 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   // query cache control
   bool _enableQueryCache = false;
   Duration? _queryCacheExpiry;
+
+  // distinct modifier
+  bool _distinct = false;
+  List<String>? _distinctFields;
+
+  // For groupby and having
+  List<String>? _groupByFields;
+  QueryCondition? _havingCondition;
+  List<QueryAggregation>? _aggregations;
 
   QueryBuilder(super.db, super.tableName);
 
@@ -27,9 +37,62 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     _invalidateFuture();
   }
 
-  /// select specific fields to return
-  QueryBuilder select(List<String> fields) {
-    _selectedFields = fields;
+  /// Specified query returns specific fields. Can also accept `QueryAggregation` via `Agg` factory.
+  /// Note: The original generic [fields] was `List<String>`. To support `Agg` blending,
+  /// this is changed to `List<dynamic>`.
+  QueryBuilder select(List<dynamic> fields) {
+    _selectedFields = [];
+    _extraAggregations = [];
+    for (final field in fields) {
+      if (field is String) {
+        _selectedFields!.add(field);
+      } else if (field is QueryAggregation) {
+        _extraAggregations.add(field);
+      } else {
+        throw ArgumentError(
+            'Select field must be a String or QueryAggregation (Agg)');
+      }
+    }
+    _onChanged();
+    return this;
+  }
+
+  /// select fields and aggregations simultaneously
+  QueryBuilder selectAgg(List<dynamic> items) {
+    _selectedFields = [];
+    _aggregations = [];
+    for (var item in items) {
+      if (item is String) {
+        _selectedFields!.add(item);
+      } else if (item is QueryAggregation) {
+        _aggregations!.add(item);
+      } else {
+        throw ArgumentError(
+            'Items in selectAgg must be String or QueryAggregation');
+      }
+    }
+    _onChanged();
+    return this;
+  }
+
+  /// group by fields
+  QueryBuilder groupBy(List<String> fields) {
+    _groupByFields = fields;
+    _onChanged();
+    return this;
+  }
+
+  /// having condition for groups
+  QueryBuilder having(QueryCondition condition) {
+    _havingCondition = condition;
+    _onChanged();
+    return this;
+  }
+
+  /// distinct modifier. to query results
+  QueryBuilder distinct([List<String>? fields]) {
+    _distinct = true;
+    _distinctFields = fields;
     _onChanged();
     return this;
   }
@@ -185,14 +248,47 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
   /// get record count
   Future<int> count() async {
-    // if there are no conditions, get total count from metadata
-    if (queryCondition.isEmpty) {
+    // if there are no conditions and no joins, get total count from metadata
+    if (queryCondition.isEmpty &&
+        _joins.isEmpty &&
+        _pendingForeignKeyJoins?.isEmpty != false) {
       return await _db.tableDataManager.getTableRecordCount(_tableName);
+    }
+
+    if (_joins.isEmpty &&
+        (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
+      final result = await _executeQuery(onlyCount: true);
+      return result.count ?? result.records.length;
     }
 
     // otherwise, execute query and calculate count of records
     final results = await this;
     return results.data.length;
+  }
+
+  /// Calculate the sum of a specific field
+  Future<num?> sum(String field) async =>
+      await _aggregate(QueryAggregationType.sum, field) as num?;
+
+  /// Calculate the average of a specific field
+  Future<num?> avg(String field) async =>
+      await _aggregate(QueryAggregationType.avg, field) as num?;
+
+  /// Find the minimum value of a specific field
+  Future<num?> min(String field) async =>
+      await _aggregate(QueryAggregationType.min, field) as num?;
+
+  /// Find the maximum value of a specific field
+  Future<num?> max(String field) async =>
+      await _aggregate(QueryAggregationType.max, field) as num?;
+
+  Future<dynamic> _aggregate(QueryAggregationType type, String field) async {
+    // If there are joins, aggregation might be slightly more complex,
+    // but the query executor supports pushing it down.
+    final result = await _executeQuery(
+      extraAggregations: [QueryAggregation(type: type, field: field)],
+    );
+    return result.aggregateResult;
   }
 
   @override
@@ -222,10 +318,22 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   }
 
   /// Watch for changes matching this query
+  ///
+  /// Uses the async query execution as a natural debounce window:
+  /// while a re-query is in progress, incoming change notifications
+  /// are coalesced via a boolean flag instead of spawning new queries.
+  /// This keeps overhead at zero (no Timer, no extra allocations) and
+  /// is self-adaptive — the slower the query, the more events are batched.
   Stream<List<Map<String, dynamic>>> watch() {
     // Create a controller to manage the stream
     late StreamController<List<Map<String, dynamic>>> controller;
     StreamSubscription? subscription;
+
+    // Debounce state – shared between the onListen closure and the
+    // notification callback.  Only accessed on the main isolate so no
+    // synchronisation is needed.
+    bool queryPending = false;
+    bool needsRefresh = false;
 
     controller = StreamController<List<Map<String, dynamic>>>(
       onListen: () async {
@@ -246,13 +354,29 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
           _tableName,
           queryCondition,
           (event) async {
-            // Re-execute query on change
+            // A query is already in flight — just mark that the result
+            // will be stale so we re-query once it finishes.
+            if (queryPending) {
+              needsRefresh = true;
+              return;
+            }
+
+            queryPending = true;
             try {
-              _invalidateFuture();
-              final newData = await this;
-              controller.add(newData.data);
+              do {
+                needsRefresh = false;
+                _invalidateFuture();
+                final newData = await this;
+                if (!controller.isClosed) {
+                  controller.add(newData.data);
+                }
+              } while (needsRefresh && !controller.isClosed);
             } catch (e) {
-              controller.addError(e);
+              if (!controller.isClosed) {
+                controller.addError(e);
+              }
+            } finally {
+              queryPending = false;
             }
           },
         );
@@ -266,7 +390,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   }
 
   /// execute query
-  Future<ExecuteResult> _executeQuery() async {
+  Future<ExecuteResult> _executeQuery({
+    bool onlyCount = false,
+    List<QueryAggregation>? extraAggregations,
+  }) async {
     await _db.ensureInitialized();
 
     // Resolve pending foreign key joins
@@ -275,7 +402,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       await _resolveForeignKeyJoins();
     }
 
-    // Directly use QueryExecutor to execute query (optimizer runs inside executor).
+    // Execute Query including extra inline aggregations defined in select()
+    final combinedAggs = <QueryAggregation>[];
+    if (_aggregations != null) combinedAggs.addAll(_aggregations!);
+    if (extraAggregations != null) combinedAggs.addAll(extraAggregations);
+    combinedAggs.addAll(_extraAggregations);
+
     final result = await _db.getQueryExecutor()?.execute(
               _tableName,
               condition: queryCondition,
@@ -285,15 +417,23 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               cursor: _cursor,
               joins: _joins,
               enableQueryCache: _enableQueryCache,
-              queryCacheExpiry: _queryCacheExpiry,
+              queryCacheExpiry: _enableQueryCache ? _queryCacheExpiry : null,
+              onlyCount: onlyCount,
+              aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
+              groupBy: _groupByFields,
             ) ??
         const ExecuteResult.empty();
 
     List<Map<String, dynamic>> results = result.records;
 
+    // If query executor returned a list of aggregated results, use it instead of regular records
+    if (result.aggregateResult is List) {
+      results = List<Map<String, dynamic>>.from(result.aggregateResult);
+    }
+
     // process related query results, ensure consistent field naming format
     if (_joins.isNotEmpty) {
-      final processed = _processManyTableResults(results);
+      final processed = _processManyTableResults(results, aggs: combinedAggs);
       return ExecuteResult(
         records: processed,
         nextCursor: result.nextCursor,
@@ -307,8 +447,19 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     // if fields are specified, only return selected fields
     if (_selectedFields != null && _selectedFields!.isNotEmpty) {
-      final filtered = results.map((record) {
+      results = results.map((record) {
         final filteredRecord = <String, dynamic>{};
+
+        // If we have aggregated results, preserve all aggregated fields
+        if (combinedAggs.isNotEmpty) {
+          for (final agg in combinedAggs) {
+            final aggName = agg.outputName;
+            if (record.containsKey(aggName)) {
+              filteredRecord[aggName] = record[aggName];
+            }
+          }
+        }
+
         for (final field in _selectedFields!) {
           // handle field alias (e.g. "name as username")
           final fieldName =
@@ -348,15 +499,41 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         }
         return filteredRecord;
       }).toList();
-      return ExecuteResult(
-        records: filtered,
-        nextCursor: result.nextCursor,
-        prevCursor: result.prevCursor,
-        hasMore: result.hasMore,
-        hasPrev: result.hasPrev,
-        executionTimeMs: result.executionTimeMs,
-        tableTotalCount: result.tableTotalCount,
-      );
+    }
+
+    // apply distinct modifier if requested
+    if (_distinct && results.isNotEmpty) {
+      final seen = <String, bool>{};
+      final distinctResults = <Map<String, dynamic>>[];
+      final fieldsToCheck = _distinctFields ??
+          (_selectedFields != null && _selectedFields!.isNotEmpty
+              ? _selectedFields!.map(_getFieldAlias).toList()
+              : results.first.keys.toList());
+
+      final yieldController = YieldController('QueryBuilder.distinct');
+      for (final r in results) {
+        await yieldController.maybeYield();
+        final sig = fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
+        if (!seen.containsKey(sig)) {
+          seen[sig] = true;
+          distinctResults.add(r);
+        }
+      }
+      results = distinctResults;
+    }
+
+    // apply having condition post-processing if necessary
+    if (_havingCondition != null) {
+      final passedGroups = <Map<String, dynamic>>[];
+      final yieldController = YieldController('QueryBuilder.having');
+      for (final groupRow in results) {
+        await yieldController.maybeYield();
+        if (_havingCondition!.matches(groupRow)) {
+          passedGroups.add(groupRow);
+        }
+      }
+
+      results = passedGroups;
     }
 
     return ExecuteResult(
@@ -367,18 +544,33 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
       tableTotalCount: result.tableTotalCount,
+      count: result.count ?? results.length,
+      aggregateResult: result.aggregateResult,
     );
   }
 
   /// Process multiple table query results, ensure consistent field naming format
   List<Map<String, dynamic>> _processManyTableResults(
-      List<Map<String, dynamic>> results) {
+      List<Map<String, dynamic>> results,
+      {List<QueryAggregation>? aggs}) {
     final processedResults = <Map<String, dynamic>>[];
 
     // if fields are specified, use field selection processing
     if (_selectedFields != null && _selectedFields!.isNotEmpty) {
+      final processedSelects = <Map<String, dynamic>>[];
       for (final record in results) {
         final filteredRecord = <String, dynamic>{};
+
+        // If we have aggregated results, preserve all aggregated fields
+        if (aggs != null && aggs.isNotEmpty) {
+          for (final agg in aggs) {
+            final aggName = agg.outputName;
+            if (record.containsKey(aggName)) {
+              filteredRecord[aggName] = record[aggName];
+            }
+          }
+        }
+
         for (final field in _selectedFields!) {
           // handle field alias (e.g. "name as username")
           // detect AS keyword in case-insensitive way
@@ -418,59 +610,60 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             filteredRecord[aliasName] = fieldValue;
           }
         }
-        processedResults.add(filteredRecord);
+        processedSelects.add(filteredRecord);
       }
-    } else {
-      // when no fields are specified, collect and process field name conflicts
-      for (final record in results) {
-        // create new record
-        final normalizedRecord = <String, dynamic>{};
+      return processedSelects;
+    }
 
-        // collect all field names and corresponding table names
-        final Map<String, Set<String>> fieldToTablesMap = {};
-        for (final key in record.keys) {
-          if (key.contains('.')) {
-            final parts = key.split('.');
-            final tableName = parts[0];
-            final columnName = parts[1];
+    // when no fields are specified, collect and process field name conflicts
+    for (final record in results) {
+      // create new record
+      final normalizedRecord = <String, dynamic>{};
 
-            if (!fieldToTablesMap.containsKey(columnName)) {
-              fieldToTablesMap[columnName] = {};
-            }
-            fieldToTablesMap[columnName]!.add(tableName);
+      // collect all field names and corresponding table names
+      final Map<String, Set<String>> fieldToTablesMap = {};
+      for (final key in record.keys) {
+        if (key.contains('.')) {
+          final parts = key.split('.');
+          final tableName = parts[0];
+          final columnName = parts[1];
+
+          if (!fieldToTablesMap.containsKey(columnName)) {
+            fieldToTablesMap[columnName] = {};
           }
+          fieldToTablesMap[columnName]!.add(tableName);
         }
+      }
 
-        // find fields with conflicts (a field name appears in multiple tables)
-        final Set<String> conflictFields = {};
-        for (final entry in fieldToTablesMap.entries) {
-          if (entry.value.length > 1) {
-            conflictFields.add(entry.key);
-          }
+      // find fields with conflicts (a field name appears in multiple tables)
+      final Set<String> conflictFields = {};
+      for (final entry in fieldToTablesMap.entries) {
+        if (entry.value.length > 1) {
+          conflictFields.add(entry.key);
         }
+      }
 
-        //  handle all fields, keep table name prefix for conflict fields
-        for (final key in record.keys) {
-          if (key.contains('.')) {
-            // handle field with table name prefix
-            final parts = key.split('.');
-            final columnName = parts[1];
+      //  handle all fields, keep table name prefix for conflict fields
+      for (final key in record.keys) {
+        if (key.contains('.')) {
+          // handle field with table name prefix
+          final parts = key.split('.');
+          final columnName = parts[1];
 
-            if (conflictFields.contains(columnName)) {
-              // field has conflict, keep table name prefix
-              normalizedRecord[key] = record[key];
-            } else {
-              // no conflict, use field name without prefix
-              normalizedRecord[columnName] = record[key];
-            }
-          } else {
-            // copy field without prefix
+          if (conflictFields.contains(columnName)) {
+            // field has conflict, keep table name prefix
             normalizedRecord[key] = record[key];
+          } else {
+            // no conflict, use field name without prefix
+            normalizedRecord[columnName] = record[key];
           }
+        } else {
+          // copy field without prefix
+          normalizedRecord[key] = record[key];
         }
-
-        processedResults.add(normalizedRecord);
       }
+
+      processedResults.add(normalizedRecord);
     }
 
     return processedResults;

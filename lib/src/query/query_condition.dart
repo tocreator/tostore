@@ -54,6 +54,13 @@ class QueryCondition {
   /// Expose the root for external evaluators
   ConditionNode get rootNode => _root;
 
+  /// Check if a single record matches this query condition
+  bool matches(Map<String, dynamic> record) {
+    if (isEmpty) return true;
+    final matcher = ConditionRecordMatcher.prepare(this, {}, '');
+    return matcher.matches(record);
+  }
+
   /// Create a copy of a query condition
   QueryCondition clone() {
     final copy = QueryCondition();

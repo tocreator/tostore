@@ -30,6 +30,7 @@ export 'src/model/result_type.dart';
 export 'src/model/transaction_result.dart';
 export 'src/model/backup_scope.dart';
 export 'src/model/expr.dart';
+export 'src/model/query_aggregation.dart';
 export 'src/query/query_condition.dart';
 export 'src/handler/logger.dart' show LogType;
 export 'src/handler/to_crypto.dart';

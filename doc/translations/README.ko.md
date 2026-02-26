@@ -3,7 +3,7 @@
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | 한국어 | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Türkçe](README.tr.md)
 
 [![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
 [![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
 
@@ -389,6 +389,22 @@ final orders = await db.query('orders')
 // 레코드 수 집계
 final count = await db.query('users').count();
 
+// 집계 함수
+final totalAge = await db.query('users').where('age', '>', 18).sum('age');
+final avgAge = await db.query('users').avg('age');
+final maxAge = await db.query('users').max('age');
+final minAge = await db.query('users').min('age');
+
+// 그룹별 집계 및 필터링
+final result = await db.query('orders')
+    .select(['status', Agg.sum('amount', alias: 'total')])
+    .groupBy(['status'])
+    .having(Agg.sum('amount'), '>', 1000)
+    .limit(20);
+
+// 중복 제거
+final uniqueCities = await db.query('users').distinct(['city']);
+
 // 스트리밍 쿼리 (대규모 데이터에 적합)
 db.streamQuery('users').listen((data) => print(data));
 ```
@@ -759,6 +775,6 @@ Tostore는 AI 시대의 데이터 인프라 역량을 강화하기 위해 다음
 
 ## 라이선스
 
-이 프로젝트는 MIT 라이선스를 따릅니다 - 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
+이 프로젝트는 Apache License 2.0을 따릅니다 - 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
 
 ---

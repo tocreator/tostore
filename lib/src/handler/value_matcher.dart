@@ -283,16 +283,19 @@ class ValueMatcher {
   }
 
   static int _unsupportedMatcher(dynamic a, dynamic b) {
-    // Final fallback for unsupported or mismatched types.
-    // Handles nulls first for safety.
+    // Handling for dynamic/unknown types (useful for aggregations like HAVING)
     if (a == null || b == null) {
       return (a == b) ? 0 : (a == null ? -1 : 1);
     }
-    // If types are different, convert to string for a deterministic comparison.
+    if (a is num && b is num) return a.compareTo(b);
+    if (a is String && b is String) return a.compareTo(b);
+    if (a is bool && b is bool) return (a == b) ? 0 : (a ? 1 : -1);
+    if (a is DateTime && b is DateTime) return a.compareTo(b);
+
+    // If types are different or unsupported, convert to string for a deterministic comparison.
     try {
       return a.toString().compareTo(b.toString());
     } catch (e) {
-      // This should be rare, but as a last resort, we declare them not equal.
       Logger.warn('Unsupported comparison failed between $a and $b. Error: $e',
           label: 'ValueMatcher._unsupportedMatcher');
       return -1;

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import '../model/query_aggregation.dart';
 import '../model/join_clause.dart';
 import 'query_condition.dart';
 
@@ -11,6 +12,8 @@ class QueryCacheKey {
   final int? offset;
   final String? cursor;
   final List<JoinClause>? joins;
+  final List<QueryAggregation>? aggregations;
+  final List<String>? groupBy;
 
   /// Cache the result of toString to avoid repeated calculation
   String? _cachedString;
@@ -23,6 +26,8 @@ class QueryCacheKey {
     this.offset,
     this.cursor,
     this.joins,
+    this.aggregations,
+    this.groupBy,
   });
 
   @override
@@ -44,6 +49,15 @@ class QueryCacheKey {
       if (limit != null) keyData['limit'] = limit;
       if (offset != null) keyData['offset'] = offset;
       if (cursor != null && cursor!.isNotEmpty) keyData['cursor'] = cursor;
+      if (aggregations != null && aggregations!.isNotEmpty) {
+        keyData['aggregations'] = aggregations!
+            .map((a) =>
+                {'type': a.type.toString(), 'field': a.field, 'alias': a.alias})
+            .toList();
+      }
+      if (groupBy != null && groupBy!.isNotEmpty) {
+        keyData['groupBy'] = groupBy;
+      }
 
       if (joins != null && joins!.isNotEmpty) {
         keyData['joins'] = joins!
@@ -92,6 +106,15 @@ class QueryCacheKey {
     if (limit != null) keyData['limit'] = limit;
     if (offset != null) keyData['offset'] = offset;
     if (cursor != null && cursor!.isNotEmpty) keyData['cursor'] = cursor;
+    if (aggregations != null && aggregations!.isNotEmpty) {
+      keyData['aggregations'] = aggregations!
+          .map((a) =>
+              {'type': a.type.toString(), 'field': a.field, 'alias': a.alias})
+          .toList();
+    }
+    if (groupBy != null && groupBy!.isNotEmpty) {
+      keyData['groupBy'] = groupBy;
+    }
 
     if (joins != null && joins!.isNotEmpty) {
       keyData['joins'] = joins!
