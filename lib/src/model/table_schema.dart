@@ -545,7 +545,13 @@ class TableSchema {
     Map<String, dynamic> data, {
     bool applyConstraints = false,
     List<String>? errors,
+    bool trustedConvertedValues = false,
+    Map<String, FieldSchema>? fieldMap,
   }) {
+    // In batch scenarios, callers can build and pass a shared fieldMap to avoid
+    // reconstructing it for every record; for non-batch calls we build a local map here.
+    final fieldMapLocal = fieldMap ?? {for (final f in fields) f.name: f};
+
     // Create a new result Map
     var result = Map<String, dynamic>.from(data);
 
@@ -597,15 +603,16 @@ class TableSchema {
       if (entry.key == primaryKeyName) continue;
 
       // Find field definition
-      final fieldSchema = fields.firstWhere(
-        (col) => col.name == entry.key,
-        orElse: () => throw ArgumentError('Unknown field ${entry.key}'),
-      );
+      final fieldSchema = fieldMapLocal[entry.key];
+      if (fieldSchema == null) {
+        throw ArgumentError('Unknown field ${entry.key}');
+      }
 
       // Use FieldSchema's detailed validation helper to get error message
       final fieldError = fieldSchema.getValidationError(
         entry.value,
         skipMaxLengthCheck: applyConstraints,
+        trustedConvertedValue: trustedConvertedValues,
       );
       if (fieldError != null) {
         final msg =
@@ -1444,13 +1451,16 @@ class FieldSchema {
   String? getValidationError(
     dynamic value, {
     bool skipMaxLengthCheck = false,
+    bool trustedConvertedValue = false,
   }) {
     if (value == null && !nullable) {
       return 'Field $name is required and cannot be null';
     }
 
-    // Check data type
-    if (!isValidDataType(value, type)) {
+    // Check data type. For values that have already gone through FieldSchema.convertValue
+    // (e.g. bulk insert paths), callers can set [trustedConvertedValue] to true to skip
+    // expensive deep checks such as DateTime.parse, relying on the converter instead.
+    if (!trustedConvertedValue && !isValidDataType(value, type)) {
       return 'Field $name expects type $type but got ${value.runtimeType}';
     }
 

@@ -1629,6 +1629,7 @@ class DataStoreImpl {
     bool skipPrimaryKeyOrderCheck = false,
     bool skipPrimaryKeyFormatCheck = false,
     List<String>? validationErrors,
+    Map<String, FieldSchema>? fieldMap,
   }) async {
     try {
       final primaryKey = schema.primaryKey;
@@ -1715,11 +1716,15 @@ class DataStoreImpl {
         result[field.name] = field.convertValue(value);
       }
 
-      // 3. validate data using schema constraints and apply constraints if needed
+      // 3. validate data using schema constraints and apply constraints if needed.
+      // Values in [result] have already gone through FieldSchema.convertValue,
+      // so we can safely skip the most expensive deep type checks here.
       final validatedResult = schema.validateData(
         result,
         applyConstraints: true,
         errors: validationErrors,
+        trustedConvertedValues: true,
+        fieldMap: fieldMap,
       );
       if (validatedResult == null) {
         Logger.warn(
@@ -1770,7 +1775,8 @@ class DataStoreImpl {
   }
 
   UniquePlan planUniqueForInsert(
-      String tableName, TableSchema schema, Map<String, dynamic> data) {
+      String tableName, TableSchema schema, Map<String, dynamic> data,
+      {List<IndexSchema>? uniqueIndexes}) {
     final refs = <UniqueKeyRef>[];
     final pk = schema.primaryKey;
     final pkVal = data[pk];
@@ -1779,8 +1785,9 @@ class DataStoreImpl {
       refs.add(UniqueKeyRef('pk', pkVal.toString()));
     }
 
-    final allIndexes =
-        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    final allIndexes = uniqueIndexes ??
+        schemaManager?.getUniqueIndexesFor(schema) ??
+        <IndexSchema>[];
     for (final idx in allIndexes) {
       // use actualIndexName which handles both explicit and implicit names
       final canKey = schema.createCanonicalIndexKey(idx.fields, data);
@@ -4153,6 +4160,17 @@ class DataStoreImpl {
 
       final TableSchema tableSchema = schema;
       final primaryKey = tableSchema.primaryKey;
+      // Cache unique indexes for this table once per batch to avoid repeated
+      // schemaManager lookups inside the hot record loop.
+      final uniqueIndexesForTable =
+          schemaManager?.getUniqueIndexesFor(tableSchema) ?? <IndexSchema>[];
+      // Whether table has secondary (non-PK) unique indexes.
+      final bool hasSecondaryUniqueIndexes = uniqueIndexesForTable.isNotEmpty;
+      // Build a single fieldName -> FieldSchema map per table for this batch and
+      // reuse it across all records to avoid per-record reconstruction cost.
+      final fieldMapForValidation = {
+        for (final f in tableSchema.fields) f.name: f
+      };
 
       // Snapshot table meta once: avoids repeated meta reads in hot loops.
       final tableMeta = await tableDataManager.getTableMeta(tableName);
@@ -4160,6 +4178,14 @@ class DataStoreImpl {
       final bool hasCommittedData =
           tableMeta != null && tableMeta.totalRecords > 0;
       final bool skipDiskUniqueChecks = !hasCommittedData;
+      // Disk unique checks are only needed when:
+      // - the table uses custom primary keys (type == none), which rely on index-based
+      //   uniqueness enforcement, or
+      // - the table defines secondary unique indexes.
+      final bool needDiskUniqueCheck = !skipDiskUniqueChecks &&
+          _indexManager != null &&
+          (tableSchema.primaryKeyConfig.type == PrimaryKeyType.none ||
+              hasSecondaryUniqueIndexes);
 
       // PK order validation optimization: compare against the last partition maxKey once.
       dynamic lastMaxKey = tableMeta?.maxAutoIncrementId;
@@ -4187,7 +4213,6 @@ class DataStoreImpl {
           if (last.isNotEmpty) lastMaxKey = last.first[primaryKey];
         } catch (_) {}
       }
-      final bool needPkOrderCheck = requireStrictPkOrder && lastMaxKey != null;
 
       // FK validation is expensive; skip completely when table has no enabled FKs.
       final bool hasForeignKeys = _foreignKeyManager != null &&
@@ -4202,11 +4227,20 @@ class DataStoreImpl {
       final List<String> validationErrorsForResult = [];
       // Track records whose primary key was auto-generated in this batch
       final Set<Map<String, dynamic>> autoPkRecords = <Map<String, dynamic>>{};
+      // Track whether any record in this batch has a user-provided primary key.
+      bool hasUserProvidedPrimaryKey = false;
 
       // Batch assign primary keys if needed, to improve performance.
       if (tableSchema.primaryKeyConfig.type != PrimaryKeyType.none) {
-        final recordsNeedingPk =
-            recordsToProcess.where((r) => r[primaryKey] == null).toList();
+        final recordsNeedingPk = <Map<String, dynamic>>[];
+        for (final r in recordsToProcess) {
+          final pkVal = r[primaryKey];
+          if (pkVal == null) {
+            recordsNeedingPk.add(r);
+          } else {
+            hasUserProvidedPrimaryKey = true;
+          }
+        }
 
         if (recordsNeedingPk.isNotEmpty) {
           final newIds = await tableDataManager.getBatchIds(
@@ -4244,6 +4278,19 @@ class DataStoreImpl {
             }
           }
         }
+      }
+
+      // For purely auto-generated sequential primary keys, we can safely skip the
+      // expensive PK order check against lastMaxKey: the ID generator already
+      // guarantees monotonic increasing values that are greater than existing
+      // committed data. We only need strict order enforcement when the user
+      // supplies their own PK values for sequential PK tables, or for other
+      // non-sequential ordered PK types.
+      bool needPkOrderCheck = requireStrictPkOrder && lastMaxKey != null;
+      if (needPkOrderCheck &&
+          tableSchema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
+          !hasUserProvidedPrimaryKey) {
+        needPkOrderCheck = false;
       }
 
       // If all records were filtered out due to PK generation failure and partial errors are allowed,
@@ -4286,9 +4333,7 @@ class DataStoreImpl {
             // Batch disk unique check (committed state only).
             // - Avoids per-record checkUniqueConstraints()
             // - Avoids searchIndex() for insert-only uniqueness
-            if (!skipDiskUniqueChecks &&
-                _indexManager != null &&
-                batchRecordsForBuffer.isNotEmpty) {
+            if (needDiskUniqueCheck && batchRecordsForBuffer.isNotEmpty) {
               try {
                 // The disk batch unique check can become expensive for very large batches
                 // (e.g., 10w+ inserts) because it may need to locate many leaves.
@@ -4454,6 +4499,11 @@ class DataStoreImpl {
             return hadFailures;
           }
 
+          // Reuse a single validation error buffer across records to reduce
+          // per-record allocation overhead. This buffer is only used within
+          // this batch and does not escape.
+          final recordErrors = <String>[];
+
           for (int j = start; j < end; j++) {
             final record = recordsToProcess[j];
             await yieldController.maybeYield();
@@ -4466,7 +4516,7 @@ class DataStoreImpl {
 
               while (!finishedRecord) {
                 // Validate and process data (may be re-run once if we correct PK)
-                final recordErrors = <String>[];
+                recordErrors.clear();
                 final validData = await _validateAndProcessData(
                   tableSchema,
                   record,
@@ -4474,6 +4524,7 @@ class DataStoreImpl {
                   skipPrimaryKeyOrderCheck: true,
                   skipPrimaryKeyFormatCheck: isAutoPk,
                   validationErrors: recordErrors,
+                  fieldMap: fieldMapForValidation,
                 );
 
                 if (validData == null) {
@@ -4604,8 +4655,12 @@ class DataStoreImpl {
                 }
 
                 // Plan unique locks + refs for atomic check+reserve
-                final planIns =
-                    planUniqueForInsert(tableName, tableSchema, validData);
+                final planIns = planUniqueForInsert(
+                  tableName,
+                  tableSchema,
+                  validData,
+                  uniqueIndexes: uniqueIndexesForTable,
+                );
 
                 // Reservation based: try reserve unique keys first
                 final recordId = validData[primaryKey].toString();
