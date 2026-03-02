@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // Kayıtları say
 final count = await db.query('users').count();
 
+// Tablonun veritabanı schema'sında tanımlı olup olmadığını kontrol et (Space bağımsız)
+// Not: bu, tablonun veri içerdiği anlamına GELMEZ
+final usersTableDefined = await db.tableExists('users');
+
+// Koşullara göre yüksek verimli varlık kontrolü (tam kayıtları yüklemeden)
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // Toplama fonksiyonları
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

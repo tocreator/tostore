@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 - Added aggregation functions: `sum()`, `avg()`, `min()`, `max()`
 - Added `groupBy()`, `having()`, `distinct()` query support
 - Added `Agg` helper for inline aggregation in `select()`
+- Added `tableExists` API to check whether a table is defined in the database schema (space‑agnostic)
+- Added `query('table').exists()` chain API for efficient existence checks based on conditions without loading full records
 
 ### Fixed
 - Fixed `count()` consistency with write buffer and index scan paths

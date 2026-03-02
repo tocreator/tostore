@@ -403,6 +403,15 @@ final orders = await db.query('orders')
 // Count records
 final count = await db.query('users').count();
 
+// Check if a table has been defined in the current database (space-agnostic).
+// Note: this does NOT indicate whether the table has data.
+final usersTableDefined = await db.tableExists('users');
+
+// Efficient existence check based on conditions (no full record loading).
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // Aggregate functions
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

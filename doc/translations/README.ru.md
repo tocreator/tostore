@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // Подсчет записей
 final count = await db.query('users').count();
 
+// Проверить, определена ли таблица в schema базы данных (не зависит от Space)
+// Примечание: это НЕ означает, что в таблице есть данные
+final usersTableDefined = await db.tableExists('users');
+
+// Эффективная проверка существования по условиям (без загрузки всех записей)
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // Агрегатные функции
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

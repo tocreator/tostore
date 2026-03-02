@@ -646,6 +646,18 @@ class ToStore implements DataStoreInterface {
     return await _impl.clear(tableName);
   }
 
+  /// Check if a table has been defined in the current database (space‑agnostic).
+  ///
+  /// This method only checks whether the table structure exists and can be used,
+  /// not whether the table contains any rows.
+  ///
+  /// 检查当前数据库中是否已经存在指定表的结构定义（与 Space 无关），仅代表该表可以被使用，
+  /// 不代表表中是否已有数据。
+  @override
+  Future<bool> tableExists(String tableName) async {
+    return await _impl.tableExists(tableName);
+  }
+
   /// Get table schema
   /// [tableName] Table name
   ///

@@ -403,6 +403,15 @@ final orders = await db.query('orders')
 // 统计记录数
 final count = await db.query('users').count();
 
+// 检查当前数据库中是否已经存在名为 'users' 的表结构（与 Space 无关）
+// 注意：这不代表该表有数据
+final usersTableDefined = await db.tableExists('users');
+
+// 基于条件的高效存在性检查（不读取完整记录）
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // 聚合函数
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

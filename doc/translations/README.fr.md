@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // Compter les enregistrements
 final count = await db.query('users').count();
 
+// Vérifier si la table est définie dans le schéma de la base de données (indépendant de l'espace)
+// Remarque : cela n'indique PAS si la table contient des données
+final usersTableDefined = await db.tableExists('users');
+
+// Vérification d'existence efficace basée sur des conditions (sans charger les enregistrements complets)
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // Fonctions d'agrégation
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

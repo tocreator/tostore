@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // 레코드 수 집계
 final count = await db.query('users').count();
 
+// 테이블이 데이터베이스 schema(테이블 구조 메타데이터)에 정의되어 있는지 확인 (Space와 무관)
+// 주의: 이는 테이블에 데이터가 있다는 의미가 아닙니다
+final usersTableDefined = await db.tableExists('users');
+
+// 조건 기반 고효율 존재성 체크 (전체 레코드를 로드하지 않음)
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // 집계 함수
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

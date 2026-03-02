@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // レコード数のカウント
 final count = await db.query('users').count();
 
+// テーブルがデータベース schema（テーブル構造メタデータ）に定義されているかを確認（Space 非依存）
+// 注意: これはテーブルにデータがあることを意味しません
+final usersTableDefined = await db.tableExists('users');
+
+// 条件に基づく効率的な存在チェック（全レコードを読み込まない）
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // 集計関数
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');

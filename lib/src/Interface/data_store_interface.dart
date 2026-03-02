@@ -80,6 +80,9 @@ abstract class DataStoreInterface {
   /// clear table
   Future<DbResult> clear(String tableName);
 
+  /// Check if a table has been defined in the current database (space‑agnostic).
+  Future<bool> tableExists(String tableName);
+
   /// get table schema
   Future<TableSchema?> getTableSchema(String tableName);
 

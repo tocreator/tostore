@@ -266,6 +266,36 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return results.data.length;
   }
 
+  /// Efficient existence check.
+  ///
+  /// For simple single-table queries, this uses a count-only execution plan with
+  /// a limit of 1 so the engine can short‑circuit as soon as the first match is
+  /// found. For join queries, it falls back to fetching at most one record.
+  Future<bool> exists() async {
+    // No conditions, no joins: use table metadata for O(1) check.
+    if (queryCondition.isEmpty &&
+        _joins.isEmpty &&
+        _pendingForeignKeyJoins?.isEmpty != false) {
+      final total = await _db.tableDataManager.getTableRecordCount(_tableName);
+      return total > 0;
+    }
+
+    // Single-table query: use count-only path with limit 1 for early-exit.
+    if (_joins.isEmpty &&
+        (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
+      // Temporarily cap limit to 1 so executor can stop as soon as a match is seen.
+      limit(1);
+      final result = await _executeQuery(onlyCount: true);
+      final count = result.count ?? result.records.length;
+      return count > 0;
+    }
+
+    // Join or complex query: fall back to fetching at most one row.
+    limit(1);
+    final results = await this;
+    return results.data.isNotEmpty;
+  }
+
   /// Calculate the sum of a specific field
   Future<num?> sum(String field) async =>
       await _aggregate(QueryAggregationType.sum, field) as num?;

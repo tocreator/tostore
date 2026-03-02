@@ -29,7 +29,7 @@ class SchemaManager {
   /// - Populated when a schema is cached or first requested via getter.
   /// - Cleared together with schema cache on:
   ///   - explicit table cache invalidation
-  ///   - global schema cache clear / eviction
+  ///   - schema cache clear / eviction
   final Map<String, _IndexListCacheEntry> _indexListCache =
       <String, _IndexListCacheEntry>{};
 

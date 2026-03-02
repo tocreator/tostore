@@ -389,6 +389,15 @@ final orders = await db.query('orders')
 // Conteggio record
 final count = await db.query('users').count();
 
+// Verifica se la tabella è definita nello schema del database (indipendente dallo Space)
+// Nota: questo NON indica se la tabella contiene dati
+final usersTableDefined = await db.tableExists('users');
+
+// Controllo di esistenza efficiente basato su condizioni (senza caricare record completi)
+final emailExists = await db.query('users')
+    .where('email', '=', 'test@example.com')
+    .exists();
+
 // Funzioni di aggregazione
 final totalAge = await db.query('users').where('age', '>', 18).sum('age');
 final avgAge = await db.query('users').avg('age');
