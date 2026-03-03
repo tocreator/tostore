@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Added `Agg` helper for inline aggregation in `select()`
 - Added `tableExists` API to check whether a table is defined in the database schema (space‑agnostic)
 - Added `query('table').exists()` chain API for efficient existence checks based on conditions without loading full records
+- Added table schema TTL configuration and automatic expiration cleanup for time-based data
 
 ### Fixed
 - Fixed `count()` consistency with write buffer and index scan paths

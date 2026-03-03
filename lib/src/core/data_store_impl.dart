@@ -73,6 +73,7 @@ import 'table_tree_partition_manager.dart';
 import 'index_tree_partition_manager.dart';
 import 'compaction_manager.dart';
 import 'overflow_manager.dart';
+import 'ttl_cleanup_manager.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -85,6 +86,10 @@ class DataStoreImpl {
   static final _heavyUpdateQueue = Queue<Completer<void>>();
 
   static final Map<String, DataStoreImpl> _instances = {};
+
+  // Internal reserved field for TTL ingest-time source (ISO8601 datetime string).
+  static const String _systemIngestTsMsField = '_system_ingest_ts_ms';
+
   Completer<void> _initCompleter = Completer<void>();
   bool _isInitialized = false;
   bool _initializing = false;
@@ -175,6 +180,9 @@ class DataStoreImpl {
     }
     return _tableDataManager!;
   }
+
+  // TTL cleanup manager
+  late TtlCleanupManager _ttlCleanupManager;
 
   // WAL/write buffering/parallel journal managers
   // Not `final` so that they can be recreated on `initialize(reinitialize: true)`.
@@ -336,6 +344,19 @@ class DataStoreImpl {
 
   /// Get memory manager
   MemoryManager? get memoryManager => _memoryManager;
+
+  /// TTL cache hooks for schema/cache managers.
+  void upsertTtlPlanForSchema(TableSchema schema) {
+    _ttlCleanupManager.upsertPlanForSchema(schema);
+  }
+
+  void removeTtlPlanForTable(String tableName) {
+    _ttlCleanupManager.removePlanForTable(tableName);
+  }
+
+  void clearAllTtlPlanCache() {
+    _ttlCleanupManager.invalidatePlanCache();
+  }
 
   /// Get foreign key manager
   ForeignKeyManager? get foreignKeyManager => _foreignKeyManager;
@@ -697,6 +718,7 @@ class DataStoreImpl {
       readViewManager = ReadViewManager(this);
       compactionManager = CompactionManager(this);
       overflowManager = OverflowManager(this);
+      _ttlCleanupManager = TtlCleanupManager(this);
 
       cacheManager = CacheManager(this);
       notificationManager = NotificationManager([
@@ -757,6 +779,7 @@ class DataStoreImpl {
         if (!isMigrationInstance) {
           // await loadDataToCache();
           CrontabManager.start();
+          _ttlCleanupManager.registerCleanupTask();
 
           // Database open callback
           await _onOpen?.call(this);
@@ -801,6 +824,41 @@ class DataStoreImpl {
     return _userSchemas
         .where((schema) => !SystemTable.isSystemTable(schema.name))
         .toList(growable: false);
+  }
+
+  String? _resolveTtlSourceField(TableTtlConfig? ttl) {
+    if (ttl == null) return null;
+    final source = ttl.sourceField;
+    if (source == null || source.isEmpty) {
+      return _systemIngestTsMsField;
+    }
+    return source;
+  }
+
+  bool _isTtlConfigEquivalent(TableTtlConfig? a, TableTtlConfig? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    final aSource = (a.sourceField == null || a.sourceField!.isEmpty)
+        ? null
+        : a.sourceField;
+    final bSource = (b.sourceField == null || b.sourceField!.isEmpty)
+        ? null
+        : b.sourceField;
+    return a.ttlMs == b.ttlMs && aSource == bSource;
+  }
+
+  TableSchema _copySchemaWithTtlConfig(
+      TableSchema schema, TableTtlConfig? ttlConfig) {
+    return TableSchema(
+      name: schema.name,
+      primaryKeyConfig: schema.primaryKeyConfig,
+      fields: schema.fields,
+      indexes: schema.indexes,
+      foreignKeys: schema.foreignKeys,
+      isGlobal: schema.isGlobal,
+      tableId: schema.tableId,
+      ttlConfig: ttlConfig,
+    );
   }
 
   /// Setup tables and handle upgrades
@@ -913,8 +971,15 @@ class DataStoreImpl {
     String backupPath = '';
     final migrationConfig = config.migrationConfig ?? const MigrationConfig();
 
+    final reservedSystemTableNames = SystemTable.knownSystemTableNames;
     for (var schema in schemas) {
-      if (!schema.validateTableSchema()) {
+      if (!schema.validateTableSchema(
+        reservedTableNames: reservedSystemTableNames,
+        allowReservedTableNames: SystemTable.isKnownSystemTable(schema.name),
+        allowInternalTableNamePrefix:
+            SystemTable.isKnownSystemTable(schema.name),
+        allowOtherInternalFields: SystemTable.isKnownSystemTable(schema.name),
+      )) {
         throw const BusinessError(
           'Invalid table structure',
           type: BusinessErrorType.schemaError,
@@ -1112,6 +1177,7 @@ class DataStoreImpl {
       readViewManager.dispose();
       compactionManager.dispose();
       cacheManager.clear();
+      _ttlCleanupManager.unregisterCleanupTask();
 
       // Clean up memory manager resources
       _memoryManager?.dispose();
@@ -1175,7 +1241,17 @@ class DataStoreImpl {
 
       try {
         // Validate primary key configuration and field types
-        if (!schemaValid.validateTableSchema()) {
+        final reservedSystemTableNames = SystemTable.knownSystemTableNames;
+        final bool isSystemTableName =
+            SystemTable.isKnownSystemTable(schema.name);
+        final bool allowSystemSchema =
+            isSystemTableName && TransactionContext.isSystemOperation();
+        if (!schemaValid.validateTableSchema(
+          reservedTableNames: reservedSystemTableNames,
+          allowReservedTableNames: allowSystemSchema,
+          allowInternalTableNamePrefix: allowSystemSchema,
+          allowOtherInternalFields: allowSystemSchema,
+        )) {
           throw BusinessError(
             'The structure of table ${schema.name} is invalid, please check primary key configuration and index fields',
             type: BusinessErrorType.schemaError,
@@ -1214,7 +1290,7 @@ class DataStoreImpl {
         // Create B+Tree indexes (explicit, unique, and foreign key).
         // Vector indexes are managed by VectorIndexManager (lazy init on first write).
         final btreeIndexes =
-            schemaManager?.getBtreeIndexesFor(schema) ?? <IndexSchema>[];
+            schemaManager?.getBtreeIndexesFor(schemaValid) ?? <IndexSchema>[];
         for (var index in btreeIndexes) {
           await _indexManager?.createIndex(schema.name, index);
         }
@@ -5547,6 +5623,94 @@ class DataStoreImpl {
       lastModified: tableDataManager.getLastModifiedTime(tableName),
       createdAt: createdAt,
     );
+  }
+
+  Future<void> setTableTtlConfig(
+    String tableName,
+    TableTtlConfig? ttlConfig, {
+    TableTtlConfig? previousTtlConfig,
+    bool updateSchema = true,
+    bool syncIndexes = true,
+  }) async {
+    final schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      throw BusinessError(
+        'Table $tableName not found',
+        type: BusinessErrorType.schemaError,
+      );
+    }
+
+    final schemaChanged = !_isTtlConfigEquivalent(schema.ttlConfig, ttlConfig);
+    if (!schemaChanged && !syncIndexes) {
+      return;
+    }
+
+    var updatedSchema =
+        schemaChanged ? _copySchemaWithTtlConfig(schema, ttlConfig) : schema;
+
+    final reservedSystemTableNames = SystemTable.knownSystemTableNames;
+    final bool isSystemTableName = SystemTable.isKnownSystemTable(tableName);
+    final bool allowSystemSchema =
+        isSystemTableName && TransactionContext.isSystemOperation();
+
+    if (!updatedSchema.validateTableSchema(
+      reservedTableNames: reservedSystemTableNames,
+      allowReservedTableNames: allowSystemSchema,
+      allowInternalTableNamePrefix: allowSystemSchema,
+      allowOtherInternalFields: allowSystemSchema,
+    )) {
+      throw BusinessError(
+        'Invalid TTL configuration for table $tableName',
+        type: BusinessErrorType.schemaError,
+      );
+    }
+
+    if (updateSchema && schemaChanged) {
+      await schemaManager?.saveTableSchema(tableName, updatedSchema);
+    }
+
+    if (!syncIndexes) {
+      return;
+    }
+
+    final oldSchemaForCoverage = previousTtlConfig != null
+        ? _copySchemaWithTtlConfig(schema, previousTtlConfig)
+        : schema;
+
+    final oldSourceField =
+        _resolveTtlSourceField(previousTtlConfig ?? schema.ttlConfig);
+    final newSourceField = _resolveTtlSourceField(updatedSchema.ttlConfig);
+
+    final oldSchemaIndexes = oldSchemaForCoverage.getAllIndexes();
+    final newSchemaIndexes = updatedSchema.getAllIndexes();
+
+    if (oldSourceField != null && oldSourceField != newSourceField) {
+      final stillCovered = newSchemaIndexes.any(
+        (i) => i.fields.isNotEmpty && i.fields.first == oldSourceField,
+      );
+      if (!stillCovered) {
+        await indexManager?.removeIndex(tableName, indexName: oldSourceField);
+      }
+    }
+
+    if (newSourceField != null && newSourceField != oldSourceField) {
+      final existedBefore = oldSchemaIndexes.any(
+        (i) => i.fields.isNotEmpty && i.fields.first == newSourceField,
+      );
+      if (!existedBefore) {
+        await indexManager?.createIndex(
+          tableName,
+          IndexSchema(indexName: newSourceField, fields: [newSourceField]),
+        );
+      }
+    }
+
+    if (newSourceField != null) {
+      await indexManager?.createIndex(
+        tableName,
+        IndexSchema(indexName: newSourceField, fields: [newSourceField]),
+      );
+    }
   }
 
   /// Add field to table

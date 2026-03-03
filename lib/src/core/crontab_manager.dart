@@ -32,6 +32,10 @@ class CrontabManager {
   // Whether already started
   bool _isStarted = false;
 
+  // Background work leases: when non-empty, the scheduler should avoid
+  // entering idle-sleep even if there has been no recent activity.
+  static final Set<String> _backgroundWorkLeases = <String>{};
+
   CrontabManager._() {
     // Initialize all interval groups
     for (var interval in ExecuteInterval.values) {
@@ -74,6 +78,18 @@ class CrontabManager {
     // Otherwise re-optimize check interval since global composition changed
     _instance._optimizeCheckInterval();
     _restartTimer();
+  }
+
+  /// Acquire a background work lease. While at least one lease is active,
+  /// the scheduler will avoid entering idle-sleep even if there has been
+  /// no recent activity.
+  static void acquireBackgroundWorkLease(String id) {
+    _backgroundWorkLeases.add(id);
+  }
+
+  /// Release a previously acquired background work lease.
+  static void releaseBackgroundWorkLease(String id) {
+    _backgroundWorkLeases.remove(id);
   }
 
   /// Optimize check interval
@@ -240,8 +256,9 @@ class CrontabManager {
         final now = DateTime.now();
         final elapsed = now.difference(_lastActivityAt);
         if (elapsed >= _idleTimeout) {
-          if (_hasAnyCallbacks()) {
-            // Pause main timer; callbacks remain registered
+          if (_hasAnyCallbacks() && _backgroundWorkLeases.isEmpty) {
+            // Pause main timer; callbacks remain registered.
+            // When background work leases are active, keep scheduler alive.
             _timer?.cancel();
             _timer = null;
             _isStarted = false;

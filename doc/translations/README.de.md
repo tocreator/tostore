@@ -342,6 +342,35 @@ final freshUserData = await db.query('users')
 
 Tostore bietet eine Vielzahl fortgeschrittener Funktionen für komplexe Geschäftsanforderungen:
 
+### Tabellenbasiertes TTL (zeitbasierte automatische Löschung)
+
+Für Logs, Events und andere zeitbasierte Daten können Sie auf Tabellenebene ein TTL über `ttlConfig` definieren. Abgelaufene Daten werden im Hintergrund in kleinen Batches automatisch bereinigt, ohne dass Geschäftslogik alle Datensätze manuell durchlaufen muss:
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7 Tage aufbewahren
+    // Wenn sourceField weggelassen wird, verwendet die Engine die Schreibzeit
+    // und verwaltet die dafür benötigten Indizes automatisch.
+    // Optional: Wenn ein benutzerdefiniertes sourceField verwendet wird, muss es:
+    // 1) den Typ DataType.datetime haben
+    // 2) nicht-nullbar sein (nullable: false)
+    // 3) DefaultValueType.currentTimestamp als defaultValueType verwenden
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### Verschachtelte Abfragen & Benutzerdefinierte Filterung
 Unterstützt unendliche Verschachtelung von Bedingungen und flexible benutzerdefinierte Funktionen.
 

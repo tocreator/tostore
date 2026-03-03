@@ -343,6 +343,35 @@ final freshUserData = await db.query('users')
 
 Tostore предоставляет богатый набор продвинутых функций для сложных бизнес-требований:
 
+### TTL на уровне таблицы (автоматическое истечение по времени)
+
+Для логов, событий и других данных, которые должны автоматически удаляться по времени, можно задать TTL на уровне таблицы с помощью `ttlConfig`. Истёкшие данные очищаются в фоновом режиме небольшими пакетами, без необходимости вручную обходить записи в бизнес-коде:
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // хранить 7 дней
+    // Если sourceField опущен, движок использует время записи
+    // и автоматически управляет необходимым индексом.
+    // Дополнительно: если задаёте собственное sourceField, поле должно:
+    // 1) иметь тип DataType.datetime
+    // 2) быть NOT NULL (nullable: false)
+    // 3) использовать DefaultValueType.currentTimestamp как defaultValueType
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### Вложенные запросы и настраиваемая фильтрация
 Поддержка неограниченной вложенности условий и гибких пользовательских функций.
 

@@ -342,6 +342,35 @@ final freshUserData = await db.query('users')
 
 Tostore は、複雑なビジネス要件を満たす様々な高度な機能を提供しています：
 
+### テーブル単位 TTL（時間ベースの自動期限切れ）
+
+ログやイベントなど、一定期間後に自動的に期限切れにしたい時系列データに対しては、テーブル定義の `ttlConfig` でテーブル単位 TTL を指定できます。期限切れになったデータは、ビジネスコード側でレコードを手動で総なめすることなく、バックグラウンドで小さなバッチに分けて自動クリーンアップされます。
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7日間保持
+    // sourceField を省略した場合、エンジンは書き込み時刻を基準に
+    // 必要なインデックスを自動的に管理します。
+    // 任意で sourceField を明示する場合は、次の条件をすべて満たす必要があります：
+    // 1) フィールド型が DataType.datetime であること
+    // 2) nullable: false （NULL 不可）であること
+    // 3) defaultValueType が DefaultValueType.currentTimestamp であること
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### 複雑なクエリのネストとカスタムフィルタ
 無限の条件ネストと柔軟なカスタム関数をサポート。
 

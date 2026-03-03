@@ -4,9 +4,26 @@ library;
 
 import 'dart:typed_data';
 
+/// Single index search entry combining primary key and raw index key bytes.
+class IndexSearchEntry {
+  final String primaryKey;
+  final Uint8List keyBytes;
+
+  const IndexSearchEntry({
+    required this.primaryKey,
+    required this.keyBytes,
+  });
+}
+
 class IndexSearchResult {
   /// Primary keys that match the index condition.
   final List<String> primaryKeys;
+
+  /// Optional combined entries (pk + keyBytes), aligned with [primaryKeys].
+  ///
+  /// When non-null, [entries] and [primaryKeys] share the same ordering and
+  /// length. Callers that need raw index keys should prefer [entries].
+  final List<IndexSearchEntry>? entries;
 
   /// The last scanned index key (raw bytes) returned by the underlying range scan.
   ///
@@ -35,6 +52,7 @@ class IndexSearchResult {
   /// Creates an instance of an index search result.
   IndexSearchResult({
     required this.primaryKeys,
+    this.entries,
     this.lastKey,
     this.requiresTableScan = false,
     this.indexWasUsed = true,
@@ -45,6 +63,7 @@ class IndexSearchResult {
   factory IndexSearchResult.tableScan() {
     return IndexSearchResult(
       primaryKeys: const [],
+      entries: null,
       lastKey: null,
       requiresTableScan: true,
       indexWasUsed: false,
@@ -56,6 +75,7 @@ class IndexSearchResult {
   factory IndexSearchResult.empty() {
     return IndexSearchResult(
       primaryKeys: const [],
+      entries: null,
       lastKey: null,
       requiresTableScan: false,
       indexWasUsed: true,

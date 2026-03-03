@@ -342,6 +342,35 @@ final freshUserData = await db.query('users')
 
 Tostore는 복잡한 비즈니스 요구 사항을 충족하기 위해 다양한 고급 기능을 제공합니다:
 
+### 테이블 단위 TTL (시간 기반 자동 만료)
+
+로그, 이벤트, 시계열 형태의 데이터처럼 일정 기간 이후 자동으로 폐기되어야 하는 데이터는 `ttlConfig` 를 통해 테이블 단위 TTL을 정의할 수 있습니다. 만료된 데이터는 백그라운드에서 작은 배치로 자동 정리되며, 비즈니스 코드에서 직접 전체 레코드를 순회할 필요가 없습니다:
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7일 보관
+    // sourceField 를 생략하면 엔진이 기록 시각을 기준으로
+    // 필요한 인덱스를 자동으로 관리합니다.
+    // 선택 사항: 사용자 정의 sourceField 를 지정하는 경우 다음 조건을 만족해야 합니다.
+    // 1) DataType.datetime 타입
+    // 2) nullable: false (NULL 허용 안 함)
+    // 3) defaultValueType 이 DefaultValueType.currentTimestamp 여야 함
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### 복잡한 쿼리 중첩 및 맞춤형 필터링
 무제한 조건 중첩과 유연한 맞춤형 함수를 지원합니다.
 

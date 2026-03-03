@@ -9,6 +9,14 @@ import 'business_error.dart';
 
 /// table schema
 class TableSchema {
+  /// Internal prefix reserved for engine-level/system tables and fields.
+  /// Business projects may use `system_` as a prefix; only `_system_` is treated
+  /// as reserved by the engine.
+  static const String internalSystemPrefix = '_system_';
+
+  /// Internal virtual field name for TTL ingest-time source.
+  static const String internalTtlIngestTsMsField = '_system_ingest_ts_ms';
+
   /// Table name
   final String name;
 
@@ -30,6 +38,11 @@ class TableSchema {
   /// Table unique identifier, used for rename detection
   final String? tableId;
 
+  /// Table-level TTL config.
+  /// - null: TTL disabled
+  /// - sourceField == null: use internal `_system_ingest_ts_ms`
+  final TableTtlConfig? ttlConfig;
+
   // Default constructor
   const TableSchema({
     required this.name,
@@ -39,6 +52,7 @@ class TableSchema {
     this.foreignKeys = const [],
     this.isGlobal = false,
     this.tableId,
+    this.ttlConfig,
   });
 
   /// Get primary key name
@@ -134,6 +148,29 @@ class TableSchema {
       }
     }
 
+    // 2.5 Add implicit TTL source index (for efficient expiration cleanup)
+    final ttl = ttlConfig;
+    final ttlField = (ttl != null)
+        ? ((ttl.sourceField == null || ttl.sourceField!.isEmpty)
+            ? internalTtlIngestTsMsField
+            : ttl.sourceField!)
+        : null;
+    if (ttlField != null) {
+      final alreadyCovered = allIndexes
+          .any((i) => i.fields.isNotEmpty && i.fields.first == ttlField);
+      if (!alreadyCovered) {
+        final ttlIndex = IndexSchema(
+          indexName: ttlField,
+          fields: [ttlField],
+          unique: false,
+        );
+        if (!existingIndexNames.contains(ttlIndex.actualIndexName)) {
+          allIndexes.add(ttlIndex);
+          existingIndexNames.add(ttlIndex.actualIndexName);
+        }
+      }
+    }
+
     // 3. Add implicit foreign key indexes
     for (final fk in foreignKeys) {
       if (!fk.enabled || !fk.autoCreateIndex) continue;
@@ -177,12 +214,17 @@ class TableSchema {
   }
 
   /// Validate table schema
-  bool validateTableSchema() {
+  bool validateTableSchema({
+    Set<String> reservedTableNames = const <String>{},
+    bool allowReservedTableNames = false,
+    bool allowInternalTableNamePrefix = false,
+    bool allowOtherInternalFields = false,
+  }) {
     // validate name format
     final nameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
 
     // validate name format
-    if (!nameRegex.hasMatch(name) && name.isEmpty) {
+    if (name.isEmpty || !nameRegex.hasMatch(name)) {
       Logger.warn(
         'Invalid table name format',
         label: 'TableSchema.validateTable',
@@ -190,8 +232,27 @@ class TableSchema {
       return false;
     }
 
+    // Reserve exact table names for system tables (published names must remain stable).
+    if (!allowReservedTableNames && reservedTableNames.contains(name)) {
+      Logger.error(
+        'Table name $name is reserved for system tables',
+        label: 'TableSchema.validateTableSchema',
+      );
+      return false;
+    }
+
+    // Reserve internal prefix for engine/system tables.
+    if (!allowInternalTableNamePrefix &&
+        name.startsWith(internalSystemPrefix)) {
+      Logger.error(
+        'Table name $name is reserved for internal tables (prefix: $internalSystemPrefix)',
+        label: 'TableSchema.validateTableSchema',
+      );
+      return false;
+    }
+
     // validate primary key name format
-    if (!nameRegex.hasMatch(primaryKey) && primaryKey.isEmpty) {
+    if (primaryKey.isEmpty || !nameRegex.hasMatch(primaryKey)) {
       Logger.warn(
         'Invalid primary key name format',
         label: 'TableSchema.validateTable',
@@ -207,6 +268,27 @@ class TableSchema {
           label: 'TableSchema.validateTable',
         );
         return false;
+      }
+
+      // Reserve internal prefix for engine fields.
+      // Business systems may use `system_` prefix, so we only reserve `_system_`.
+      // `_system_ingest_ts_ms` is a virtual/internal TTL field and MUST NOT
+      // appear in persisted table schema (it is never user-defined).
+      if (field.name.startsWith(internalSystemPrefix)) {
+        if (field.name == internalTtlIngestTsMsField) {
+          Logger.error(
+            'Field ${field.name} is reserved for internal TTL management and cannot be user-defined',
+            label: 'TableSchema.validateTableSchema',
+          );
+          return false;
+        }
+        if (!allowOtherInternalFields) {
+          Logger.error(
+            'Field ${field.name} is reserved for internal system fields (prefix: $internalSystemPrefix)',
+            label: 'TableSchema.validateTableSchema',
+          );
+          return false;
+        }
       }
 
       // Field should not have the same name as the primary key
@@ -249,6 +331,16 @@ class TableSchema {
       if (!validateForeignKey(fk)) {
         return false;
       }
+    }
+
+    // Validate table TTL configuration
+    final ttl = ttlConfig;
+    if (ttl != null && !ttl.validateFor(this)) {
+      Logger.error(
+        'Invalid TTL configuration for table $name',
+        label: 'TableSchema.validateTableSchema',
+      );
+      return false;
     }
 
     return true;
@@ -425,6 +517,8 @@ class TableSchema {
   /// Validate index fields
   bool validateIndexFields(IndexSchema index) {
     final primaryKeyName = primaryKeyConfig.name;
+    final bool usesInternalTtlSource = ttlConfig != null &&
+        (ttlConfig!.sourceField == null || ttlConfig!.sourceField!.isEmpty);
 
     // Primary-key-only index is redundant:
     // table data itself is range-partitioned by primary key.
@@ -439,6 +533,11 @@ class TableSchema {
     for (final fieldName in index.fields) {
       // Check if the field is the primary key
       if (fieldName == primaryKeyName) {
+        continue;
+      }
+
+      // Virtual TTL ingest-time field: may not exist in user field list.
+      if (fieldName == internalTtlIngestTsMsField && usesInternalTtlSource) {
         continue;
       }
 
@@ -464,6 +563,7 @@ class TableSchema {
     List<ForeignKeySchema>? foreignKeys,
     bool? isGlobal,
     String? tableId,
+    TableTtlConfig? ttlConfig,
   }) {
     return TableSchema(
       name: name ?? this.name,
@@ -473,6 +573,7 @@ class TableSchema {
       foreignKeys: foreignKeys ?? this.foreignKeys,
       isGlobal: isGlobal ?? this.isGlobal,
       tableId: tableId ?? this.tableId,
+      ttlConfig: ttlConfig ?? this.ttlConfig,
     );
   }
 
@@ -485,6 +586,7 @@ class TableSchema {
       'foreignKeys': foreignKeys.map((fk) => fk.toJson()).toList(),
       'isGlobal': isGlobal,
       if (tableId != null) 'tableId': tableId,
+      if (ttlConfig != null) 'ttlConfig': ttlConfig!.toJson(),
     };
   }
 
@@ -532,6 +634,9 @@ class TableSchema {
           [],
       isGlobal: json['isGlobal'] as bool? ?? false,
       tableId: json['tableId'] as String?,
+      ttlConfig: json['ttlConfig'] is Map<String, dynamic>
+          ? TableTtlConfig.fromJson(json['ttlConfig'] as Map<String, dynamic>)
+          : null,
     );
   }
 
@@ -682,6 +787,13 @@ class TableSchema {
     if (fieldName == primaryKey) {
       return getPrimaryKeyMatcherType();
     }
+
+    // Backward compatibility: for internal TTL source field, treat it as datetime
+    // even when legacy schema snapshots have not materialized this field yet.
+    if (fieldName == internalTtlIngestTsMsField) {
+      return MatcherType.datetime;
+    }
+
     try {
       final field = fields.firstWhere((f) => f.name == fieldName);
       return field.getMatcherType();
@@ -854,6 +966,20 @@ class TableSchema {
       _addPrimaryKeyConfigToBuffer(byteBuffer, schema.primaryKeyConfig);
 
       byteBuffer.addByte(schema.isGlobal ? 1 : 0);
+
+      // Write TTL config
+      if (schema.ttlConfig != null) {
+        byteBuffer.addByte(1);
+        _addStringToBuffer(byteBuffer, schema.ttlConfig!.ttlMs.toString());
+        if (schema.ttlConfig!.sourceField != null) {
+          byteBuffer.addByte(1);
+          _addStringToBuffer(byteBuffer, schema.ttlConfig!.sourceField!);
+        } else {
+          byteBuffer.addByte(0);
+        }
+      } else {
+        byteBuffer.addByte(0);
+      }
 
       // Write field information - Sort to ensure consistency
       final sortedFields = List<FieldSchema>.from(schema.fields)
@@ -1675,6 +1801,100 @@ class IndexSchema {
       type: type ?? this.type,
       vectorConfig: vectorConfig ?? this.vectorConfig,
     );
+  }
+}
+
+/// Table TTL configuration.
+///
+/// - [ttlMs] is the TTL duration in milliseconds and must be > 0.
+/// - [sourceField] is optional:
+///   - null => use internal `_system_ingest_ts_ms`
+///   - non-null => must point to a non-nullable `DataType.datetime` field
+///
+/// Note:
+/// For custom sourceField, `defaultValueType` must be
+/// `DefaultValueType.currentTimestamp` to ensure automatic timestamp filling
+/// when callers omit this field on insert paths.
+class TableTtlConfig {
+  final int ttlMs;
+  final String? sourceField;
+
+  const TableTtlConfig({
+    required this.ttlMs,
+    this.sourceField,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'ttlMs': ttlMs,
+      if (sourceField != null) 'sourceField': sourceField,
+    };
+  }
+
+  factory TableTtlConfig.fromJson(Map<String, dynamic> json) {
+    return TableTtlConfig(
+      ttlMs: (json['ttlMs'] as num?)?.toInt() ?? 0,
+      sourceField: json['sourceField'] as String?,
+    );
+  }
+
+  TableTtlConfig copyWith({
+    int? ttlMs,
+    String? sourceField,
+    bool clearSourceField = false,
+  }) {
+    return TableTtlConfig(
+      ttlMs: ttlMs ?? this.ttlMs,
+      sourceField: clearSourceField ? null : (sourceField ?? this.sourceField),
+    );
+  }
+
+  bool validateFor(TableSchema schema) {
+    if (ttlMs <= 0) {
+      Logger.error('ttlMs must be greater than 0', label: 'TableTtlConfig');
+      return false;
+    }
+
+    final field = sourceField;
+    if (field == null || field.isEmpty) {
+      return true;
+    }
+
+    final matched = schema.fields.where((f) => f.name == field);
+    if (matched.isEmpty) {
+      Logger.error(
+        'sourceField $field does not exist in table ${schema.name}',
+        label: 'TableTtlConfig',
+      );
+      return false;
+    }
+
+    final fieldSchema = matched.first;
+    if (fieldSchema.type != DataType.datetime) {
+      Logger.error(
+        'sourceField $field must be DataType.datetime, got ${fieldSchema.type}',
+        label: 'TableTtlConfig',
+      );
+      return false;
+    }
+
+    if (fieldSchema.nullable) {
+      Logger.error(
+        'sourceField $field must be non-nullable for TTL',
+        label: 'TableTtlConfig',
+      );
+      return false;
+    }
+
+    if (fieldSchema.defaultValueType != DefaultValueType.currentTimestamp) {
+      Logger.error(
+        'sourceField $field must use DefaultValueType.currentTimestamp for TTL',
+        label: 'TableTtlConfig',
+      );
+      return false;
+    }
+
+    return true;
   }
 }
 

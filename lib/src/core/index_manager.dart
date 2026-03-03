@@ -1477,6 +1477,20 @@ class IndexManager {
         final bool isUnique = meta.isUnique;
         final fields = meta.fields;
 
+        // Internal TTL virtual index: single-field index on `_system_ingest_ts_ms`
+        // when table-level TTL uses the internal ingest-time source (sourceField == null/empty).
+        // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
+        final bool usesInternalTtlSource = schema.ttlConfig != null &&
+            (schema.ttlConfig!.sourceField == null ||
+                schema.ttlConfig!.sourceField!.isEmpty);
+        final bool isInternalTtlIndex = usesInternalTtlSource &&
+            fields.length == 1 &&
+            fields.first == TableSchema.internalTtlIngestTsMsField;
+
+        // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
+        final String? batchIngestIso =
+            isInternalTtlIndex ? DateTime.now().toIso8601String() : null;
+
         Uint8List encodeUniquePutValue(String pk) {
           final b = utf8.encode(pk);
           final out = Uint8List(1 + b.length);
@@ -1491,10 +1505,34 @@ class IndexManager {
 
         Uint8List? encodeIdxKey(
           Map<String, dynamic> record,
-          String pkValue,
-        ) =>
-            encodeIndexKeyFromRecord(
-                schema: schema, meta: meta!, record: record, pkValue: pkValue);
+          String pkValue, {
+          required bool forInsert,
+        }) {
+          if (isInternalTtlIndex) {
+            if (!forInsert || batchIngestIso == null) {
+              // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
+              return null;
+            }
+            final ttlComp = schema.encodeFieldComponentToMemComparable(
+              TableSchema.internalTtlIngestTsMsField,
+              batchIngestIso,
+              truncateText: false,
+            );
+            if (ttlComp == null) return null;
+            final ttlComps = <Uint8List>[ttlComp];
+            if (!isUnique) {
+              ttlComps.add(schema.encodePrimaryKeyComponent(pkValue));
+            }
+            return MemComparableKey.encodeTuple(ttlComps);
+          }
+
+          return encodeIndexKeyFromRecord(
+            schema: schema,
+            meta: meta!,
+            record: record,
+            pkValue: pkValue,
+          );
+        }
 
         final deltas = <DataBlockEntry>[];
 
@@ -1506,7 +1544,7 @@ class IndexManager {
           await yieldControl.maybeYield();
           final pk = r[pkName]?.toString();
           if (pk == null || pk.isEmpty) continue;
-          final k = encodeIdxKey(r, pk);
+          final k = encodeIdxKey(r, pk, forInsert: true);
           if (k == null || k.isEmpty) continue;
           final v =
               isUnique ? encodeUniquePutValue(pk) : encodeNonUniquePutValue();
@@ -1518,7 +1556,7 @@ class IndexManager {
           await yieldControl.maybeYield();
           final pk = r[pkName]?.toString();
           if (pk == null || pk.isEmpty) continue;
-          final k = encodeIdxKey(r, pk);
+          final k = encodeIdxKey(r, pk, forInsert: false);
           if (k == null || k.isEmpty) continue;
           deltas.add(DataBlockEntry(k, encodeDeleteValue()));
         }
@@ -1549,8 +1587,8 @@ class IndexManager {
             if (!u.affectsIndexedFields(fields.toSet())) continue;
           } catch (_) {}
 
-          final oldKey = encodeIdxKey(oldRecord, pk);
-          final newKey = encodeIdxKey(newRecord, pk);
+          final oldKey = encodeIdxKey(oldRecord, pk, forInsert: false);
+          final newKey = encodeIdxKey(newRecord, pk, forInsert: false);
 
           if (oldKey != null &&
               newKey != null &&

@@ -783,6 +783,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
           }
           break;
 
+        case MigrationType.setTableTtlConfig:
+          // TTL config changes do not directly mutate record payload.
+          break;
+
         case MigrationType.addForeignKey:
           // Foreign key addition does not affect record data
           // Data validation for foreign key constraints is handled at migration execution level

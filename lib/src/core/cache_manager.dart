@@ -173,6 +173,8 @@ final class CacheManager {
       _dataStore.weightManager?.clearMemory();
     } catch (_) {}
 
+    _dataStore.clearAllTtlPlanCache();
+
     // Fire-and-forget async clears.
     Future(() async {
       try {
@@ -196,6 +198,7 @@ final class CacheManager {
       await _dataStore.schemaManager?.clearSchemaCache();
       await _dataStore.indexManager?.clearIndexMetaCache();
       _dataStore.weightManager?.clearMemory();
+      _dataStore.clearAllTtlPlanCache();
 
       Logger.debug('Base path change completed, caches cleared',
           label: 'CacheManager.onBasePathChanged');

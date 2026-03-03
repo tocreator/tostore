@@ -136,6 +136,11 @@ class DataStoreConfig {
   /// Time-to-live for transaction metadata in milliseconds
   final int transactionMetaTtlMs;
 
+  /// Unified database-level TTL cleanup polling interval in milliseconds.
+  ///
+  /// To avoid excessive polling pressure, values lower than 5 minutes are clamped to 300000.
+  final int ttlCleanupIntervalMs;
+
   /// The budgeted duration in milliseconds to yield execution for UI thread responsiveness during intensive tasks.
   /// Defaults to 8ms for client (UI) platforms, 50ms for server.
   final int yieldDurationMs;
@@ -174,6 +179,7 @@ class DataStoreConfig {
     this.enableTransactionCleanup = true,
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
+    int? ttlCleanupIntervalMs,
     int? maxConcurrentPartitionMaintenances,
     int? defaultQueryLimit,
     int? maxQueryOffset,
@@ -212,6 +218,7 @@ class DataStoreConfig {
             _getDefaultTransactionIsolationLevel(),
         transactionCleanupIntervalMs = transactionCleanupIntervalMs ?? 600000,
         transactionMetaTtlMs = transactionMetaTtlMs ?? 600000,
+        ttlCleanupIntervalMs = max(ttlCleanupIntervalMs ?? 300000, 300000),
         yieldDurationMs = yieldDurationMs ?? _getDefaultYieldDurationMs();
 
   /// Default yield duration based on platform constraint
@@ -589,6 +596,7 @@ class DataStoreConfig {
       transactionCleanupIntervalMs:
           json['transactionCleanupIntervalMs'] as int?,
       transactionMetaTtlMs: json['transactionMetaTtlMs'] as int?,
+      ttlCleanupIntervalMs: json['ttlCleanupIntervalMs'] as int?,
       maxConcurrentPartitionMaintenances:
           json['maxConcurrentPartitionMaintenances'] as int?,
       defaultQueryLimit: (json['defaultQueryLimit'] is int)
@@ -640,6 +648,7 @@ class DataStoreConfig {
       'enableTransactionCleanup': enableTransactionCleanup,
       'transactionCleanupIntervalMs': transactionCleanupIntervalMs,
       'transactionMetaTtlMs': transactionMetaTtlMs,
+      'ttlCleanupIntervalMs': ttlCleanupIntervalMs,
       'defaultQueryLimit': defaultQueryLimit,
       'maxQueryOffset': maxQueryOffset,
       'yieldDurationMs': yieldDurationMs,
@@ -681,6 +690,7 @@ class DataStoreConfig {
     bool? enableTransactionCleanup,
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
+    int? ttlCleanupIntervalMs,
     int? maxConcurrentPartitionMaintenances,
     int? defaultQueryLimit,
     int? maxQueryOffset,
@@ -729,6 +739,8 @@ class DataStoreConfig {
       transactionCleanupIntervalMs:
           transactionCleanupIntervalMs ?? this.transactionCleanupIntervalMs,
       transactionMetaTtlMs: transactionMetaTtlMs ?? this.transactionMetaTtlMs,
+      ttlCleanupIntervalMs:
+          max(ttlCleanupIntervalMs ?? this.ttlCleanupIntervalMs, 300000),
       defaultQueryLimit: defaultQueryLimit ?? this.defaultQueryLimit,
       maxQueryOffset: maxQueryOffset ?? this.maxQueryOffset,
       yieldDurationMs: yieldDurationMs ?? this.yieldDurationMs,

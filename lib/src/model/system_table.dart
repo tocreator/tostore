@@ -45,6 +45,10 @@ class SystemTable {
   static bool isKnownSystemTable(String tableName) =>
       _knownSystemTableNames.contains(tableName);
 
+  /// All known system table names (current + deprecated).
+  /// This is a const set and must remain stable across versions.
+  static Set<String> get knownSystemTableNames => _knownSystemTableNames;
+
   /// get all table schemas
   static List<TableSchema> gettableSchemas = [
     _fkReferencesTable(),

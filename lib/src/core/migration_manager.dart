@@ -757,6 +757,15 @@ class MigrationManager {
         }
         break;
 
+      case MigrationType.setTableTtlConfig:
+        await _dataStore.setTableTtlConfig(
+          tableName,
+          operation.ttlConfig,
+          updateSchema: true,
+          syncIndexes: false,
+        );
+        break;
+
       case MigrationType.addForeignKey:
         // Add foreign key to table schema
         final schema =
@@ -929,6 +938,14 @@ class MigrationManager {
       ));
     }
 
+    if (_isTtlConfigChanged(oldSchema.ttlConfig, newSchema.ttlConfig)) {
+      operations.add(MigrationOperation(
+        type: MigrationType.setTableTtlConfig,
+        ttlConfig: newSchema.ttlConfig,
+        oldTtlConfig: oldSchema.ttlConfig,
+      ));
+    }
+
     // Check indexes changes
     _compareIndexes(oldSchema, newSchema, operations);
 
@@ -1018,6 +1035,22 @@ class MigrationManager {
 
     // all conditions are not met, config is not changed
     return false;
+  }
+
+  bool _isTtlConfigChanged(TableTtlConfig? oldTtl, TableTtlConfig? newTtl) {
+    if (identical(oldTtl, newTtl)) return false;
+    if (oldTtl == null || newTtl == null) return oldTtl != newTtl;
+
+    final oldSource =
+        (oldTtl.sourceField == null || oldTtl.sourceField!.isEmpty)
+            ? null
+            : oldTtl.sourceField;
+    final newSource =
+        (newTtl.sourceField == null || newTtl.sourceField!.isEmpty)
+            ? null
+            : newTtl.sourceField;
+
+    return oldTtl.ttlMs != newTtl.ttlMs || oldSource != newSource;
   }
 
   /// Compare fields and generate operations
@@ -1934,6 +1967,14 @@ class MigrationManager {
                 unique: operation.unique ?? false,
               ),
             );
+          } else if (operation.type == MigrationType.setTableTtlConfig) {
+            await migrationInstance.setTableTtlConfig(
+              currentTableName,
+              operation.ttlConfig,
+              previousTtlConfig: operation.oldTtlConfig,
+              updateSchema: false,
+              syncIndexes: true,
+            );
           } else if (operation.type == MigrationType.dropTable) {
             await migrationInstance.dropTable(task.tableName,
                 isMigration: true);
@@ -2034,15 +2075,16 @@ class MigrationManager {
     // Define operation type priority
     final typePriority = {
       MigrationType.setPrimaryKeyConfig: 1,
-      MigrationType.renameTable: 2,
-      MigrationType.addField: 3,
-      MigrationType.modifyField: 4,
-      MigrationType.renameField: 5,
-      MigrationType.removeField: 6,
-      MigrationType.addIndex: 7,
-      MigrationType.modifyIndex: 8,
-      MigrationType.removeIndex: 9,
-      MigrationType.dropTable: 10,
+      MigrationType.setTableTtlConfig: 2,
+      MigrationType.renameTable: 3,
+      MigrationType.addField: 4,
+      MigrationType.modifyField: 5,
+      MigrationType.renameField: 6,
+      MigrationType.removeField: 7,
+      MigrationType.addIndex: 8,
+      MigrationType.modifyIndex: 9,
+      MigrationType.removeIndex: 10,
+      MigrationType.dropTable: 11,
     };
 
     // Sort operations by priority

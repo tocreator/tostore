@@ -345,6 +345,35 @@ final freshUserData = await db.query('users')
 
 Tostore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
 
+### 表级 TTL（按时间自动过期清理）
+
+对于日志、埋点、时序等按时间淘汰的数据，可以在表结构中通过 `ttlConfig` 定义表级 TTL，到期数据将由引擎在后台自动清理，无需业务端手动清理维护：
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 保留 7 天
+    // sourceField 省略时，默认自动创建索引；
+    // 可选：自定义 sourceField 时必须：
+    // 1）字段类型为 DataType.datetime
+    // 2）字段不可为空（nullable: false）
+    // 3）字段 defaultValueType 必须为 DefaultValueType.currentTimestamp
+    // sourceField: 'created_at',
+  ),
+);
+```
+
+
 ### 复杂查询嵌套与自定义过滤
 支持无限层级的条件嵌套和灵活的自定义函数。
 

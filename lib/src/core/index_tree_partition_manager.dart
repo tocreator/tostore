@@ -1811,6 +1811,7 @@ final class IndexTreePartitionManager {
     int effectiveOffset = offset ?? 0;
     int remaining = (limit == null || limit <= 0) ? 1 << 30 : limit;
     final out = <String>[];
+    final entriesOut = <IndexSearchEntry>[];
     Uint8List? lastKey;
 
     TreePagePtr leafPtr;
@@ -1921,8 +1922,10 @@ final class IndexTreePartitionManager {
           }
           final pk = _extractPk(meta, k, leaf.values[i]);
           if (pk != null) {
+            final keyCopy = Uint8List.fromList(k);
             out.add(pk);
-            lastKey = Uint8List.fromList(k);
+            entriesOut.add(IndexSearchEntry(primaryKey: pk, keyBytes: keyCopy));
+            lastKey = keyCopy;
             remaining--;
           }
         }
@@ -1944,8 +1947,10 @@ final class IndexTreePartitionManager {
           }
           final pk = _extractPk(meta, k, leaf.values[i]);
           if (pk != null) {
+            final keyCopy = Uint8List.fromList(k);
             out.add(pk);
-            lastKey = Uint8List.fromList(k);
+            entriesOut.add(IndexSearchEntry(primaryKey: pk, keyBytes: keyCopy));
+            lastKey = keyCopy;
             remaining--;
           }
         }
@@ -1953,7 +1958,11 @@ final class IndexTreePartitionManager {
       }
     }
 
-    return IndexSearchResult(primaryKeys: out, lastKey: lastKey);
+    return IndexSearchResult(
+      primaryKeys: out,
+      entries: entriesOut.isEmpty ? null : entriesOut,
+      lastKey: lastKey,
+    );
   }
 
   String? _extractPk(IndexMeta meta, Uint8List key, Uint8List value) {

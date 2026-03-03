@@ -161,6 +161,24 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
+  /// Set table-level TTL config
+  SchemaBuilder setTtlConfig(TableTtlConfig config) {
+    _operations.add(MigrationOperation(
+      type: MigrationType.setTableTtlConfig,
+      ttlConfig: config,
+    ));
+    return this;
+  }
+
+  /// Disable table-level TTL config
+  SchemaBuilder disableTtl() {
+    _operations.add(const MigrationOperation(
+      type: MigrationType.setTableTtlConfig,
+      ttlConfig: null,
+    ));
+    return this;
+  }
+
   /// Add foreign key to table
   SchemaBuilder addForeignKey({
     String? name,

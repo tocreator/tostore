@@ -343,6 +343,35 @@ final freshUserData = await db.query('users')
 
 Tostore fornisce un ricco set di funzionalità avanzate per requisiti aziendali complessi:
 
+### TTL a livello di tabella (scadenza automatica basata sul tempo)
+
+Per log, eventi e altri dati che devono scadere automaticamente in base al tempo, puoi definire un TTL a livello di tabella tramite `ttlConfig`. I dati scaduti vengono puliti in background in piccoli batch, senza dover iterare manualmente tutti i record nella logica applicativa:
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // conservare per 7 giorni
+    // Quando sourceField è omesso, il motore usa l'orario di scrittura
+    // e gestisce automaticamente l'indice necessario.
+    // Opzionale: se definisci un sourceField personalizzato, il campo deve:
+    // 1) avere tipo DataType.datetime
+    // 2) essere non nullo (nullable: false)
+    // 3) usare DefaultValueType.currentTimestamp come defaultValueType
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### Query annidate e filtraggio personalizzato
 Supporta l'annidamento infinito di condizioni e funzioni personalizzate flessibili.
 

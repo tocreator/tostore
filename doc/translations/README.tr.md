@@ -343,6 +343,35 @@ final freshUserData = await db.query('users')
 
 Tostore, karmaşık iş gereksinimleri için zengin bir gelişmiş özellikler seti sunar:
 
+### Tablo düzeyinde TTL (zamana dayalı otomatik silme)
+
+Loglar, olaylar ve belirli bir süre sonunda otomatik olarak silinmesi gereken zaman serisi verileri için `ttlConfig` ile tablo düzeyinde TTL tanımlayabilirsiniz. Süresi dolan veriler, iş kodunuzun tüm kayıtları tek tek dolaşmasına gerek kalmadan, arka planda küçük partiler halinde otomatik olarak temizlenir:
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7 gün sakla
+    // sourceField belirtilmediğinde, motor yazma zamanını kullanır
+    // ve gerekli indeksi otomatik olarak yönetir.
+    // Opsiyonel: özel bir sourceField tanımladığınızda alanın:
+    // 1) DataType.datetime tipinde
+    // 2) nullable: false (NULL kabul etmez)
+    // 3) defaultValueType olarak DefaultValueType.currentTimestamp kullanması gerekir
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### İçe İçe Sorgular ve Özel Filtreleme
 Koşulların sonsuz iç içe geçmesini ve esnek özel işlevleri destekler.
 

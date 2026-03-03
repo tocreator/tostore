@@ -492,6 +492,9 @@ class SchemaManager {
 
       // Cache the new schema
       cacheTableSchema(tableName, schema);
+
+      // Precise TTL cache update (no global invalidate).
+      _dataStore.upsertTtlPlanForSchema(schema);
     } catch (e) {
       Logger.error('Failed to save table schema: $tableName, $e',
           label: 'SchemaManager.saveTableSchema');
@@ -593,6 +596,9 @@ class SchemaManager {
         meta.tablePartitionMap.remove(tableName);
         await saveSchemaStructure();
         removeCachedTableSchema(tableName);
+
+        // Precise TTL cache delete for dropped schema.
+        _dataStore.removeTtlPlanForTable(tableName);
       }
 
       return success;

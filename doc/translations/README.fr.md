@@ -342,6 +342,35 @@ final freshUserData = await db.query('users')
 
 Tostore offre un riche ensemble de fonctionnalités avancées :
 
+### TTL au niveau de la table (expiration automatique basée sur le temps)
+
+Pour les journaux, événements et autres données temporelles qui doivent expirer automatiquement, vous pouvez définir un TTL au niveau de la table via `ttlConfig`. Les données expirées sont nettoyées en arrière-plan par petits lots, sans qu'il soit nécessaire de parcourir manuellement les enregistrements dans votre code métier :
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      createIndex: true,
+      defaultValueType: DefaultValueType.currentTimestamp,
+    ),
+  ],
+  ttlConfig: TableTtlConfig(
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // conserver 7 jours
+    // Lorsque sourceField est omis, le moteur utilise l'heure d'écriture
+    // et gère automatiquement l'index nécessaire.
+    // Optionnel : si vous fournissez un sourceField personnalisé, il doit :
+    // 1) être de type DataType.datetime
+    // 2) être non nullable (nullable: false)
+    // 3) utiliser DefaultValueType.currentTimestamp comme defaultValueType
+    // sourceField: 'created_at',
+  ),
+);
+```
+
 ### Requêtes imbriquées et filtrage personnalisé
 Supporte l'imbrication infinie de conditions et des fonctions personnalisées flexibles.
 
