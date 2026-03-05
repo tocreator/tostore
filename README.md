@@ -727,6 +727,22 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### Pure Memory Mode
+
+For scenarios like data caching, temporary computation, or diskless environments without persisting to disk, you can initialize a pure in-memory database using ToStore.memory(). In this mode, all data (including schemas, indexes, and key-value pairs) is kept strictly in memory.
+
+```dart
+// Initialize database in pure memory mode
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// All operations (CRUD and search) are instantly executed in memory
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+// Note: Data created in memory mode is completely lost upon application closure or restart.
+```
+
 ## Security Configuration
 
 **Data Security Mechanisms**:

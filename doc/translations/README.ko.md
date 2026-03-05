@@ -693,6 +693,24 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### 순수 메모리 모드 (Memory Mode)
+
+데이터 캐싱, 임시 계산 또는 디스크에 유지할 필요가 없는 시나리오의 경우 `ToStore.memory()`를 사용하여 순수 인메모리 데이터베이스를 초기화할 수 있습니다. 이 모드에서는 모든 데이터(스키마, 인덱스 및 키-값 쌍 포함)가 메모리에만 유지됩니다.
+
+**참고**: 메모리 모드에서 생성된 데이터는 애플리케이션을 닫거나 다시 시작하면 완전히 손실됩니다.
+
+```dart
+// 순수 메모리 모드로 데이터베이스 초기화
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// 모든 작업(CRUD 및 검색)이 메모리에서 즉시 실행됩니다.
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## 보안 구성
 
 **데이터 보안 메커니즈**:

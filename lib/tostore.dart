@@ -173,6 +173,57 @@ class ToStore implements DataStoreInterface {
     return db;
   }
 
+  /// Open a pure in-memory database instance (no file IO).
+  ///
+  /// - No WAL, no recovery, no meta/config persistence.
+  /// - All data lives in memory (TreeCache-based).
+  ///
+  /// Use this for testing, ephemeral session stores, or ultra-fast in-process caches.
+  static Future<ToStore> memory({
+    String? dbName,
+    DataStoreConfig? config,
+    List<TableSchema> schemas = const [],
+    Future<void> Function(ToStore db)? onConfigure,
+    Future<void> Function(ToStore db)? onCreate,
+    Future<void> Function(ToStore db)? onOpen,
+    bool reinitialize = false,
+  }) async {
+    final base = config ?? DataStoreConfig();
+    final effectiveName = dbName ?? base.dbName;
+
+    // Force memory-mode invariants.
+    final memConfig = base.copyWith(
+      persistenceMode: PersistenceMode.memory,
+      dbPath: '__memory__',
+      dbName: effectiveName,
+      enableJournal: false,
+      persistRecoveryOnCommit: false,
+      recoveryFlushPolicy: RecoveryFlushPolicy.off,
+    );
+
+    // ignore: deprecated_member_use_from_same_package
+    final db = ToStore(
+      dbPath: '__memory__',
+      dbName: effectiveName,
+      config: memConfig,
+      schemas: schemas,
+      onConfigure: onConfigure,
+      onCreate: onCreate,
+      onOpen: onOpen,
+    );
+
+    // ignore: deprecated_member_use_from_same_package
+    await db.initialize(
+      dbPath: '__memory__',
+      dbName: effectiveName,
+      config: memConfig,
+      reinitialize: reinitialize,
+      noPersistOnClose: true,
+      applyActiveSpaceOnDefault: false,
+    );
+    return db;
+  }
+
   /// Initialize database
   /// Ensure the engine is fully initialized before any operations.
   ///

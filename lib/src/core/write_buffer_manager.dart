@@ -72,9 +72,11 @@ class BatchCheckContext {
     // 1. Check ALL keys first
     for (final uk in uniqueKeys) {
       if (_hasUniqueKeyOwnedByOther(uk, recordId)) {
+        final inferredFields =
+            uk.indexName.isNotEmpty ? [uk.indexName] : const <String>[];
         throw UniqueViolation(
           tableName: tableName,
-          fields: [],
+          fields: inferredFields,
           value: uk.compositeKey,
           indexName: uk.indexName,
         );
@@ -1374,9 +1376,11 @@ class WriteBufferManager {
       if (hasUniqueKeyOwnedByOther(
           tableName, uk.indexName, uk.compositeKey, recordId,
           transactionId: transactionId, internalKey: internalKeys[i])) {
+        final inferredFields =
+            uk.indexName.isNotEmpty ? [uk.indexName] : const <String>[];
         throw UniqueViolation(
           tableName: tableName,
-          fields: [], // Caller can fill this if needed, or we just throw simple error
+          fields: inferredFields,
           value: uk.compositeKey,
           indexName: uk.indexName,
         );

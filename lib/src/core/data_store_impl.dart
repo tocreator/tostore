@@ -5,6 +5,7 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:path/path.dart' as path;
 
+import '../Interface/noop_storage_impl.dart';
 import '../Interface/status_provider.dart';
 import '../model/buffer_entry.dart';
 import '../model/query_result.dart';
@@ -634,8 +635,17 @@ class DataStoreImpl {
       // Initialize YieldController global limit
       YieldController.globalSettings.targetBudgetMs = _config!.yieldDurationMs;
 
-      // Resolve the final database path
-      _instancePath = await getDatabasePath(dbPath: _dbPath, dbName: _dbName);
+      final bool isMemoryMode =
+          _config!.persistenceMode == PersistenceMode.memory;
+
+      // Resolve the final database path (file mode only).
+      // Memory mode must not touch filesystem.
+      if (!isMemoryMode) {
+        _instancePath = await getDatabasePath(dbPath: _dbPath, dbName: _dbName);
+      } else {
+        final n = _dbName ?? _config!.dbName;
+        _instancePath = 'memory://$n';
+      }
 
       _config =
           _config!.copyWith(dbPath: _dbPath, dbName: _dbName ?? config?.dbName);
@@ -658,7 +668,9 @@ class DataStoreImpl {
       // Ensure _currentSpaceName is synchronized with config.spaceName
       _currentSpaceName = _config!.spaceName;
 
-      storage = StorageAdapter();
+      storage = isMemoryMode
+          ? StorageAdapter.forStorage(const NoopStorageImpl())
+          : StorageAdapter();
       lockManager = LockManager();
 
       // Configure storage runtime and flush policy based on DataStoreConfig
@@ -678,15 +690,35 @@ class DataStoreImpl {
 
       transactionManager = TransactionManager(this);
 
-      await Future.wait([
-        getGlobalConfig(),
-        getSpaceConfig(),
-        _memoryManager!.initialize(_config!, this),
-        Future(() async => await transactionManager!.initialize()),
-      ]);
+      if (!isMemoryMode) {
+        await Future.wait([
+          getGlobalConfig(),
+          getSpaceConfig(),
+          _memoryManager!.initialize(_config!, this),
+          Future(() async => await transactionManager!.initialize()),
+        ]);
+      } else {
+        // In memory mode, pre-cache all known schemas so that SchemaManager
+        // can serve getTableSchema() without touching storage.
+        if (isMemoryMode) {
+          for (final s in SystemTable.gettableSchemas) {
+            schemaManager?.cacheTableSchema(s.name, s);
+          }
+          for (final s in _userSchemas) {
+            schemaManager?.cacheTableSchema(s.name, s);
+          }
+        }
+        await Future.wait([
+          _memoryManager!.initialize(_config!, this),
+          Future(() async => await transactionManager!.initialize()),
+        ]);
+      }
 
-      // When opening with default space (first open only), use stored activeSpace so one open lands in the right space. Skip when re-initializing after switchSpace(spaceName: 'default').
-      if (applyActiveSpaceOnDefault && _config!.spaceName == 'default') {
+      // When opening with default space (first open only), use stored activeSpace so one open lands in the right space.
+      // Memory mode does not persist global config, so skip.
+      if (!isMemoryMode &&
+          applyActiveSpaceOnDefault &&
+          _config!.spaceName == 'default') {
         final globalConfig = await getGlobalConfig();
         final active = globalConfig?.activeSpace;
         if (active != null && active != 'default') {
@@ -730,44 +762,47 @@ class DataStoreImpl {
       // This allows internal operations (like updating system tables, resuming pending ops)
       // to proceed even if _isInitialized is false, while external user operations must wait
       await TransactionContext.runAsSystemOperation(() async {
-        if (!isMigrationInstance) {
-          // Run database version upgrades
-          await versionUpgradeManager?.runDatabaseUpgradesIfNeeded();
-        }
+        if (!isMemoryMode) {
+          if (!isMigrationInstance) {
+            // Run database version upgrades
+            await versionUpgradeManager?.runDatabaseUpgradesIfNeeded();
+          }
 
-        // NOW initialize KeyManager for ALL instances (including migration instances)
-        await _keyManager!.initialize();
+          // NOW initialize KeyManager for ALL instances (including migration instances)
+          await _keyManager!.initialize();
 
-        // Initialize WeightManager
-        if (_weightManager != null) {
-          await _weightManager!.initialize();
+          // Initialize WeightManager
+          if (_weightManager != null) {
+            await _weightManager!.initialize();
+          }
         }
 
         // Mark base initialization complete AFTER KeyManager is initialized
         _baseInitialized = true;
+        if (!isMemoryMode) {
+          // Prepare temp directory for crash-safe writes (native only)
+          await _resetTempDir();
 
-        // Prepare temp directory for crash-safe writes (native only)
-        await _resetTempDir();
+          if (!isMigrationInstance) {
+            await walManager.initializeAndRecover();
+            await parallelJournalManager.start();
 
-        if (!isMigrationInstance) {
-          await walManager.initializeAndRecover();
-          await parallelJournalManager.start();
+            await _resumePendingLargeDeletes();
+            await _resumePendingLargeUpdates();
 
-          await _resumePendingLargeDeletes();
-          await _resumePendingLargeUpdates();
+            // Recover unfinished transactions (commit plans or rollbacks)
+            await transactionManager!.recoverUnfinishedTransactionsOnStartup();
 
-          // Recover unfinished transactions (commit plans or rollbacks)
-          await transactionManager!.recoverUnfinishedTransactionsOnStartup();
+            // Resume pending table-level clear/drop operations before WAL replay.
+            await _resumePendingTableOps();
+            // Execute old structure migration if needed
+            await _migrateOldStructureIfNeeded();
 
-          // Resume pending table-level clear/drop operations before WAL replay.
-          await _resumePendingTableOps();
-          // Execute old structure migration if needed
-          await _migrateOldStructureIfNeeded();
+            // Initialize migration manager, restore unfinished migration tasks
+            await migrationManager?.initialize();
 
-          // Initialize migration manager, restore unfinished migration tasks
-          await migrationManager?.initialize();
-
-          await _startSetupAndUpgrade();
+            await _startSetupAndUpgrade();
+          }
         }
 
         _isInitialized = true;
@@ -2027,6 +2062,17 @@ class DataStoreImpl {
   Future<String> backup(
       {bool compress = true,
       BackupScope scope = BackupScope.currentSpaceWithGlobal}) async {
+    // In pure memory mode, backup has no persistence semantics.
+    // Avoid creating fake paths or touching storage; just log and return empty.
+    if (_config?.persistenceMode == PersistenceMode.memory) {
+      Logger.warn(
+        'Backup is not supported in memory persistence mode. '
+        'This operation will be a no-op and return empty path.',
+        label: 'DataStoreImpl.backup',
+      );
+      return '';
+    }
+
     try {
       // 1. Save all pending data and runtime metadata to ensure a consistent backup point.
       await saveAllCacheBeforeExit();
@@ -2050,6 +2096,16 @@ class DataStoreImpl {
   Future<bool> restore(String backupPath,
       {bool deleteAfterRestore = false,
       bool cleanupBeforeRestore = true}) async {
+    // In pure memory mode, there is nothing to restore from disk.
+    if (_config?.persistenceMode == PersistenceMode.memory) {
+      Logger.warn(
+        'Restore is not supported in memory persistence mode. '
+        'This operation will be a no-op and return false.',
+        label: 'DataStoreImpl.restore',
+      );
+      return false;
+    }
+
     if (!_baseInitialized) {
       await ensureInitialized();
     }
@@ -3120,8 +3176,10 @@ class DataStoreImpl {
         }
       }
 
-      //   clear application layer cache
-      await cacheManager.invalidateCache(tableName);
+      // clear application layer cache
+      // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
+      // especially in memory mode where schema may be in-memory only.
+      await cacheManager.invalidateCache(tableName, invalidateSchema: false);
 
       //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
       await tableDataManager.clearTable(tableName);

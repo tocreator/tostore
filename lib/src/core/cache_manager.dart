@@ -142,7 +142,7 @@ final class CacheManager {
   // -------------------- Space / lifecycle --------------------
 
   /// Clear in-memory caches synchronously (used on close).
-  void clear() {
+  void clear({bool includeSchema = true}) {
     _statsCache.clear();
 
     try {
@@ -166,7 +166,9 @@ final class CacheManager {
     } catch (_) {}
 
     try {
-      _dataStore.schemaManager?.clearSchemaCacheSync();
+      if (includeSchema) {
+        _dataStore.schemaManager?.clearSchemaCacheSync();
+      }
     } catch (_) {}
 
     try {
@@ -210,7 +212,10 @@ final class CacheManager {
   }
 
   /// Invalidate all caches of a table
-  Future<void> invalidateCache(String tableName) async {
+  Future<void> invalidateCache(
+    String tableName, {
+    bool invalidateSchema = true,
+  }) async {
     try {
       _statsCache.remove(tableName);
 
@@ -219,7 +224,9 @@ final class CacheManager {
       _dataStore.tableDataManager.removeRecordCountCache(tableName);
       _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
       _dataStore.tableTreePartitionManager.clearPageCacheForTable(tableName);
-      _dataStore.schemaManager?.removeCachedTableSchema(tableName);
+      if (invalidateSchema) {
+        _dataStore.schemaManager?.removeCachedTableSchema(tableName);
+      }
 
       // Conservative: invalidate all queries on this table.
       _markQueryCacheDirty(tableName);

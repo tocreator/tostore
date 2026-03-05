@@ -690,6 +690,24 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### Modo de Memória Puro (Memory Mode)
+
+Para cenários como cache de dados, computações temporárias ou ambientes sem disco em que a persistência em disco não é necessária, você pode inicializar um banco de dados totalmente em memória usando `ToStore.memory()`. Neste modo, todos os dados (incluindo esquemas, índices e pares chave-valor) são mantidos estritamente na memória.
+
+**Nota**: Os dados criados no modo de memória são completamente perdidos após o fechamento ou reinicialização do aplicativo.
+
+```dart
+// Inicializa o banco de dados no modo de memória pura
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// Todas as operações (CRUD e pesquisa) são executadas instantaneamente na memória
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## Configuração de Segurança
 
 **Mecanismos de Segurança de Dados**:

@@ -22,8 +22,13 @@ class UniqueViolation {
   /// Returns a user-friendly message describing the violation,
   /// including the field names and the conflicting value.
   String get message {
-    final fieldsStr = fields.join(', ');
-    return "Unique constraint violation on '$tableName' ($fieldsStr) with value: $value";
+    final bool hasFields = fields.isNotEmpty;
+    final String fieldsStr = hasFields ? fields.join(', ') : '';
+
+    // Optional fields segment, only shown when we know the fields that participate in the constraint
+    final String fieldsSegment = hasFields ? " ($fieldsStr)" : '';
+
+    return "Unique constraint violation on '$tableName'$fieldsSegment with value: $value";
   }
 
   @override

@@ -690,6 +690,24 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### Saf Bellek Modu (Memory Mode)
+
+Veri önbelleğe alma, geçici hesaplamalar veya diske kalıcılık gerektirmeyen disksiz ortamlar gibi senaryolar için `ToStore.memory()` kullanarak tamamen bellek içi bir veritabanı başlatabilirsiniz. Bu modda, tüm veriler (şemalar, dizinler ve anahtar-değer çiftleri dahil) kesinlikle bellekte tutulur.
+
+**Not**: Bellek modunda oluşturulan veriler, uygulama kapatıldığında veya yeniden başlatıldığında tamamen kaybolur.
+
+```dart
+// Veritabanını saf bellek modunda başlat
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// Tüm işlemler (CRUD ve arama) anında bellekte yürütülür
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## Güvenlik Yapılandırması
 
 **Veri Güvenliği Mekanizmaları**:

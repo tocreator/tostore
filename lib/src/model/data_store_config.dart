@@ -18,6 +18,12 @@ class DataStoreConfig {
   /// current space name
   final String spaceName;
 
+  /// Persistence mode (file-backed vs pure in-memory).
+  ///
+  /// Note: Prefer switching mode via factory methods (e.g. `ToStore.open()` / `ToStore.memory()`)
+  /// instead of setting this directly in user code.
+  final PersistenceMode persistenceMode;
+
   /// compression level
   final int compressionLevel;
 
@@ -146,6 +152,7 @@ class DataStoreConfig {
   final int yieldDurationMs;
 
   DataStoreConfig({
+    this.persistenceMode = PersistenceMode.file,
     this.dbPath,
     this.dbName = 'default',
     this.spaceName = 'default',
@@ -483,6 +490,21 @@ class DataStoreConfig {
 
   /// from json create config
   factory DataStoreConfig.fromJson(Map<String, dynamic> json) {
+    // Parse persistence mode (default: file)
+    PersistenceMode parsedPersistenceMode = PersistenceMode.file;
+    final pm = json['persistenceMode'];
+    if (pm is String) {
+      switch (pm.toLowerCase()) {
+        case 'memory':
+          parsedPersistenceMode = PersistenceMode.memory;
+          break;
+        case 'file':
+        default:
+          parsedPersistenceMode = PersistenceMode.file;
+          break;
+      }
+    }
+
     // Parse isolation level
     TransactionIsolationLevel? parsedIsolation;
     final isoVal = json['transactionIsolationLevel'];
@@ -551,6 +573,7 @@ class DataStoreConfig {
     }
 
     return DataStoreConfig(
+      persistenceMode: parsedPersistenceMode,
       dbPath: json['dbPath'] as String?,
       dbName: json['dbName'] as String? ?? 'default',
       spaceName: json['spaceName'] as String? ?? 'default',
@@ -612,6 +635,7 @@ class DataStoreConfig {
   /// convert to json
   Map<String, dynamic> toJson() {
     return {
+      'persistenceMode': persistenceMode.toString().split('.').last,
       'dbPath': dbPath,
       'dbName': dbName,
       'spaceName': spaceName,
@@ -657,6 +681,7 @@ class DataStoreConfig {
 
   /// create new config instance
   DataStoreConfig copyWith({
+    PersistenceMode? persistenceMode,
     String? dbPath,
     String? dbName,
     String? spaceName,
@@ -697,6 +722,7 @@ class DataStoreConfig {
     int? yieldDurationMs,
   }) {
     return DataStoreConfig(
+      persistenceMode: persistenceMode ?? this.persistenceMode,
       dbPath: dbPath ?? this.dbPath,
       dbName: dbName ?? this.dbName,
       spaceName: spaceName ?? this.spaceName,
@@ -746,6 +772,15 @@ class DataStoreConfig {
       yieldDurationMs: yieldDurationMs ?? this.yieldDurationMs,
     );
   }
+}
+
+/// Persistence mode for the engine.
+///
+/// - [file]: Default durable mode backed by platform storage (files/web storage).
+/// - [memory]: Pure in-memory mode. No file IO (including WAL/meta/config).
+enum PersistenceMode {
+  file,
+  memory,
 }
 
 /// Distributed node configuration

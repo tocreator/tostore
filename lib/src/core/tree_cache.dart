@@ -330,24 +330,6 @@ class TreeCache<T> {
     }
   }
 
-  /// Scan all entries under a prefix (best-effort, async-yielding).
-  ///
-  /// This is a convenience wrapper over [scanRange] with `endKey = null`.
-  Future<void> scan(
-    dynamic prefix, {
-    bool reverse = false,
-    int? limit,
-    required bool Function(List<dynamic> keyPath, T value) onEntry,
-  }) async {
-    await scanRange(
-      prefix,
-      null,
-      reverse: reverse,
-      limit: limit,
-      onEntry: onEntry,
-    );
-  }
-
   Future<void> cleanup({double removeRatio = 0.3}) async {
     if (removeRatio <= 0) return;
     if (removeRatio > 1) removeRatio = 1;

@@ -25,6 +25,7 @@ import 'table_data_manager.dart';
 import '../model/id_generator.dart';
 import 'tree_cache.dart';
 import '../model/index_entry.dart';
+import '../model/data_store_config.dart';
 import 'io_concurrency_planner.dart';
 import 'transaction_context.dart';
 import 'weight_manager.dart';
@@ -157,6 +158,13 @@ class IndexManager {
           const <IndexSchema>[];
       if (indexes.isEmpty) return;
 
+      final bool isMemoryMode =
+          _dataStore.config.persistenceMode == PersistenceMode.memory;
+      // In memory mode, _indexDataCache is the committed index store, not an optional cache.
+      // Always apply mutations so search/uniqueness never fall back to disk.
+      final bool shouldWrite =
+          force || _dataStore.isGlobalPrewarming || isMemoryMode;
+
       for (final index in indexes) {
         if (index.type == IndexType.vector) continue;
         final indexName = index.actualIndexName;
@@ -187,9 +195,7 @@ class IndexManager {
 
             final dynamic removeKey =
                 index.unique ? compositeKey : <dynamic>[...compositeKey, pk];
-            if (_indexDataCache.containsKey(removeKey) ||
-                force ||
-                _dataStore.isGlobalPrewarming) {
+            if (shouldWrite || _indexDataCache.containsKey(removeKey)) {
               _indexDataCache.remove(removeKey);
             }
           }
@@ -213,17 +219,13 @@ class IndexManager {
 
             if (index.unique) {
               // Unique: key is index fields; value is PK.
-              if (_indexDataCache.containsKey(compositeKey) ||
-                  force ||
-                  _dataStore.isGlobalPrewarming) {
+              if (shouldWrite || _indexDataCache.containsKey(compositeKey)) {
                 _indexDataCache.put(compositeKey, pk);
               }
             } else {
               // Non-unique: key includes PK; value is a bool marker.
               final fullKey = <dynamic>[...compositeKey, pk];
-              if (_indexDataCache.containsKey(fullKey) ||
-                  force ||
-                  _dataStore.isGlobalPrewarming) {
+              if (shouldWrite || _indexDataCache.containsKey(fullKey)) {
                 _indexDataCache.put(fullKey, true, size: pk.length + 1);
               }
             }
@@ -277,7 +279,209 @@ class IndexManager {
       final mt = schema.getFieldMatcherType(field);
       matchers.add(ValueMatcher.getMatcher(mt));
     }
+    // Non-unique index key order is (fields..., pk). The trailing PK comparator
+    // must match schema primary-key ordering or cursor paging can break.
+    if (!indexSchema.unique) {
+      matchers.add(ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()));
+    }
     _indexFieldMatchers[key] = matchers;
+  }
+
+  /// Memory-mode index scan based on [_indexDataCache].
+  ///
+  /// This reuses the historical "full cache scan" semantics to keep cursor paging
+  /// consistent between forward/reverse scans, by applying start/end bounds using
+  /// MemComparable encoded keys inside the scan callback (not via TreeCache seek).
+  Future<IndexSearchResult> _scanIndexDataCacheRange({
+    required String tableName,
+    required String indexName,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    required bool reverse,
+    required bool isUnique,
+    int? limit,
+    int? offset,
+    required TableSchema schema,
+  }) async {
+    // OPTIMIZATION: Decode bounds to seek in TreeCache.
+    List<dynamic>? rangeStart;
+    List<dynamic>? rangeEnd;
+    try {
+      if (startKeyInclusive.isNotEmpty) {
+        final decoded = MemComparableKey.decodeTuple(startKeyInclusive);
+        rangeStart = [tableName, indexName, ...decoded];
+      }
+      if (endKeyExclusive.isNotEmpty) {
+        final decoded = MemComparableKey.decodeTuple(endKeyExclusive);
+        rangeEnd = [tableName, indexName, ...decoded];
+      }
+    } catch (_) {
+      rangeStart = null;
+      rangeEnd = null;
+    }
+
+    _registerIndexComparator(tableName, indexName, schema);
+
+    int scannedCount = 0;
+    int addedCount = 0;
+
+    final prefixKey = <dynamic>[tableName, indexName];
+    final results = <String>[];
+    Uint8List? lastKey;
+
+    // Safety check on bounds validity vs prefix.
+    if (rangeStart != null &&
+        (rangeStart.length < 2 ||
+            rangeStart[0] != tableName ||
+            rangeStart[1] != indexName)) {
+      rangeStart = null;
+    }
+    if (rangeEnd != null &&
+        (rangeEnd.length < 2 ||
+            rangeEnd[0] != tableName ||
+            rangeEnd[1] != indexName)) {
+      rangeEnd = null;
+    }
+
+    // Resolve index schema for encoding key components (truncateText for non-unique).
+    final indexSchema = schema.indexes.firstWhere(
+      (i) => i.actualIndexName == indexName,
+      orElse: () => IndexSchema(indexName: '', fields: const []),
+    );
+    final int fieldCount = indexSchema.fields.length;
+    final bool truncateText = !isUnique;
+
+    await _indexDataCache.scanRange(
+      rangeStart ?? prefixKey,
+      rangeEnd,
+      reverse: reverse,
+      onEntry: (key, val) {
+        if (key.length < 2 || key[0] != tableName || key[1] != indexName) {
+          return false;
+        }
+
+        final keyValues =
+            key.sublist(2); // index field native values + pk? (non-unique)
+
+        // Safety: if schema mismatch, keep scanning but skip this entry.
+        if (fieldCount <= 0 || keyValues.length < fieldCount) return true;
+
+        // Always encode key for cursor paging (fields..., [pk]).
+        final comps = <Uint8List>[];
+        for (int i = 0; i < fieldCount; i++) {
+          final c = schema.encodeFieldComponentToMemComparable(
+            indexSchema.fields[i],
+            keyValues[i],
+            truncateText: truncateText,
+          );
+          if (c == null) return true;
+          comps.add(c);
+        }
+
+        if (!isUnique) {
+          final pkRaw = keyValues.isNotEmpty ? keyValues.last : null;
+          if (pkRaw != null) {
+            comps.add(schema.encodePrimaryKeyComponent(pkRaw.toString()));
+          }
+        }
+
+        if (comps.isEmpty) return true;
+        final encodedKey = MemComparableKey.encodeTuple(comps);
+
+        // Apply inclusive/exclusive bounds (same as old full-cache logic).
+        if (startKeyInclusive.isNotEmpty) {
+          if (MemComparableKey.compare(encodedKey, startKeyInclusive) < 0) {
+            return reverse ? false : true;
+          }
+        }
+        if (endKeyExclusive.isNotEmpty) {
+          if (MemComparableKey.compare(encodedKey, endKeyExclusive) >= 0) {
+            return reverse ? true : false;
+          }
+        }
+
+        lastKey = encodedKey;
+
+        scannedCount++;
+        if (offset != null && scannedCount <= offset) return true;
+
+        String? pk;
+        if (isUnique) {
+          pk = val is String ? val : val?.toString();
+        } else {
+          pk = key.isNotEmpty ? key.last?.toString() : null;
+        }
+
+        if (pk != null && pk.isNotEmpty) {
+          results.add(pk);
+          addedCount++;
+        }
+
+        if (limit != null && addedCount >= limit) return false;
+        return true;
+      },
+    );
+
+    return IndexSearchResult(primaryKeys: results, lastKey: lastKey);
+  }
+
+  Future<IndexSearchResult> _searchIndexByKeyRangeLogical({
+    required String tableName,
+    required String indexName,
+    required IndexMeta meta,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    required bool reverse,
+    int? limit,
+    int? offset,
+  }) async {
+    final isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+    if (!isMemoryMode) {
+      return _dataStore.indexTreePartitionManager.searchByKeyRange(
+        tableName: tableName,
+        indexName: indexName,
+        meta: meta,
+        startKeyInclusive: startKeyInclusive,
+        endKeyExclusive: endKeyExclusive,
+        reverse: reverse,
+        limit: limit,
+        offset: offset,
+      );
+    }
+
+    // Memory mode: index data cache is the primary index store.
+    // Use in-memory TreeCache scan to preserve cursor paging semantics.
+    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) return IndexSearchResult.tableScan();
+    return _scanIndexDataCacheRange(
+      tableName: tableName,
+      indexName: indexName,
+      startKeyInclusive: startKeyInclusive,
+      endKeyExclusive: endKeyExclusive,
+      reverse: reverse,
+      isUnique: meta.isUnique,
+      limit: limit,
+      offset: offset,
+      schema: schema,
+    );
+  }
+
+  Future<String?> _lookupUniquePrimaryKeyLogical({
+    required String tableName,
+    required String indexName,
+    required IndexMeta meta,
+    required Uint8List uniqueKey,
+  }) async {
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+    if (isMemoryMode) return null;
+    return _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+      tableName: tableName,
+      indexName: indexName,
+      meta: meta,
+      uniqueKey: uniqueKey,
+    );
   }
 
   /// Get index metadata
@@ -314,10 +518,43 @@ class IndexManager {
   Future<IndexMeta?> _doLoadIndexMeta(
       String tableName, String indexName) async {
     try {
+      final bool isMemoryMode =
+          _dataStore.config.persistenceMode == PersistenceMode.memory;
+
       // Cache miss, load from file
       final metaPath =
           await _dataStore.pathManager.getIndexMetaPath(tableName, indexName);
       if (!await _dataStore.storage.existsFile(metaPath)) {
+        // In pure memory mode, index metadata files may never be created on disk.
+        // Synthesize an in-memory IndexMeta from the consolidated index list
+        // (includes implicit indexes like TTL / foreign keys).
+        if (isMemoryMode) {
+          try {
+            final schema =
+                await _dataStore.schemaManager?.getTableSchema(tableName);
+            if (schema != null) {
+              final allIndexes =
+                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+                      const <IndexSchema>[];
+              final idx = allIndexes.firstWhere(
+                (i) => i.actualIndexName == indexName,
+                orElse: () => IndexSchema(indexName: '', fields: const []),
+              );
+              if (idx.fields.isNotEmpty) {
+                final meta = IndexMeta.createEmpty(
+                  name: indexName,
+                  tableName: tableName,
+                  fields: idx.fields,
+                  isUnique: idx.unique,
+                );
+                _indexMetaCache.put([tableName, indexName], meta);
+                return meta;
+              }
+            }
+          } catch (_) {
+            // Fallback: no meta available; let caller decide (usually tableScan).
+          }
+        }
         return null;
       }
 
@@ -562,6 +799,9 @@ class IndexManager {
       final primaryKey = schema.primaryKey;
       final primaryValue = data[primaryKey];
 
+      final bool isMemoryMode =
+          _dataStore.config.persistenceMode == PersistenceMode.memory;
+
       // Prepare write buffer overlay for fast-path uniqueness in current batch
       final writeBuf = _dataStore.writeBufferManager;
       final String? currentTxId =
@@ -609,15 +849,10 @@ class IndexManager {
           }
         } catch (_) {}
 
-        // 1) Persisted check: use tree-partitioned table data.
-        try {
-          final exists = await _dataStore.tableTreePartitionManager
-              .existsPrimaryKey(tableName, pkStr);
-          if (exists) {
-            Logger.warn(
-              "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
-              label: 'IndexManager.checkUniqueConstraints',
-            );
+        if (isMemoryMode) {
+          // Memory mode: table TreeCache is the committed store.
+          if (_dataStore.tableDataManager
+              .hasLiveTableRecord(tableName, pkStr)) {
             return UniqueViolation(
               tableName: tableName,
               fields: [primaryKey],
@@ -625,18 +860,36 @@ class IndexManager {
               indexName: 'pk',
             );
           }
-        } catch (e) {
-          Logger.warn(
-            'Primary key unique check failed for pk=$pkStr, error: $e',
-            label: 'IndexManager.checkUniqueConstraints',
-          );
-          // Still treat as violation for safety, but with error info
-          return UniqueViolation(
-            tableName: tableName,
-            fields: [primaryKey],
-            value: primaryValue,
-            indexName: 'pk',
-          );
+        } else {
+          // 1) Persisted check: use tree-partitioned table data.
+          try {
+            final exists = await _dataStore.tableTreePartitionManager
+                .existsPrimaryKey(tableName, pkStr);
+            if (exists) {
+              Logger.warn(
+                "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
+                label: 'IndexManager.checkUniqueConstraints',
+              );
+              return UniqueViolation(
+                tableName: tableName,
+                fields: [primaryKey],
+                value: primaryValue,
+                indexName: 'pk',
+              );
+            }
+          } catch (e) {
+            Logger.warn(
+              'Primary key unique check failed for pk=$pkStr, error: $e',
+              label: 'IndexManager.checkUniqueConstraints',
+            );
+            // Still treat as violation for safety, but with error info
+            return UniqueViolation(
+              tableName: tableName,
+              fields: [primaryKey],
+              value: primaryValue,
+              indexName: 'pk',
+            );
+          }
         }
       }
 
@@ -727,6 +980,37 @@ class IndexManager {
 
       if (constraintsToCheckOnDisk.isEmpty) return null;
 
+      // Memory mode: validate against the committed in-memory index store and avoid any disk channel.
+      if (isMemoryMode) {
+        for (final c in constraintsToCheckOnDisk) {
+          // Build native composite key: [tableName, indexName, ...fieldValues]
+          final dynamic v = c.value;
+          final List<dynamic>? vals = (c.fields.length == 1)
+              ? <dynamic>[v]
+              : (v is List && v.length == c.fields.length ? v : null);
+          if (vals == null) continue;
+
+          _registerIndexComparator(tableName, c.indexName, schema);
+          final cacheKey = <dynamic>[tableName, c.indexName, ...vals];
+          final existing = _indexDataCache.get(cacheKey);
+          if (existing is String && existing.isNotEmpty) {
+            // Update: same record reusing its own unique value is OK.
+            if (isUpdate &&
+                selfStoreIndexStr != null &&
+                existing == selfStoreIndexStr) {
+              continue;
+            }
+            return UniqueViolation(
+              tableName: tableName,
+              fields: c.fields,
+              value: c.value,
+              indexName: c.indexName,
+            );
+          }
+        }
+        return null;
+      }
+
       // 3. Execute disk checks using existsUniqueKeysBatch (fast BinaryFuseFilter + grouped I/O)
       try {
         // Group constraints by index name for batch processing
@@ -809,8 +1093,7 @@ class IndexManager {
               // Use lookupUniquePrimaryKey to get the actual PK owning this unique key.
               // If the PK matches the current record's PK, it's not a violation (self-update).
               try {
-                final existingPk = await _dataStore.indexTreePartitionManager
-                    .lookupUniquePrimaryKey(
+                final existingPk = await _lookupUniquePrimaryKeyLogical(
                   tableName: tableName,
                   indexName: indexName,
                   meta: meta,
@@ -880,6 +1163,9 @@ class IndexManager {
           growable: false);
     }
 
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+
     final primaryKey = schema.primaryKey;
     final String? txId =
         transactionId ?? TransactionContext.getCurrentTransactionId();
@@ -915,11 +1201,24 @@ class IndexManager {
       }
 
       if (pkList.isNotEmpty) {
-        final existing =
-            await _dataStore.tableTreePartitionManager.existingPrimaryKeysBatch(
-          tableName,
-          pkList,
-        );
+        final Set<String> existing;
+        if (isMemoryMode) {
+          // Memory mode: table TreeCache is the committed store.
+          final set = <String>{};
+          for (final pk in pkList) {
+            await yieldController.maybeYield();
+            if (_dataStore.tableDataManager.hasLiveTableRecord(tableName, pk)) {
+              set.add(pk);
+            }
+          }
+          existing = set;
+        } else {
+          existing = await _dataStore.tableTreePartitionManager
+              .existingPrimaryKeysBatch(
+            tableName,
+            pkList,
+          );
+        }
 
         if (existing.isNotEmpty) {
           for (int i = 0; i < records.length; i++) {
@@ -993,6 +1292,45 @@ class IndexManager {
             indexName: indexName,
           );
         }
+      }
+
+      // Memory mode: validate against committed in-memory index store and skip disk checks.
+      if (isMemoryMode) {
+        _registerIndexComparator(tableName, indexName, schema);
+        for (int i = 0; i < records.length; i++) {
+          await yieldController.maybeYield();
+          if (violations[i] != null) continue;
+          final r = records[i];
+          final recordId = r[primaryKey]?.toString();
+          if (recordId == null || recordId.isEmpty) continue;
+
+          final vals = <dynamic>[];
+          bool ok = true;
+          for (final f in idx.fields) {
+            final v = r[f];
+            if (v == null) {
+              ok = false;
+              break;
+            }
+            vals.add(v);
+          }
+          if (!ok) continue;
+
+          final cacheKey = <dynamic>[tableName, indexName, ...vals];
+          final existingPk = _indexDataCache.get(cacheKey);
+          if (existingPk is String &&
+              existingPk.isNotEmpty &&
+              existingPk != recordId) {
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: (idx.fields.length == 1) ? vals.first : vals,
+              indexName: indexName,
+            );
+          }
+        }
+        // Continue to next index (no disk path).
+        continue;
       }
 
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
@@ -1699,7 +2037,12 @@ class IndexManager {
 
       final meta = await getIndexMeta(tableName, indexName);
       if (meta == null) return IndexSearchResult.tableScan();
-      if (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull) {
+      final bool isMemoryMode =
+          _dataStore.config.persistenceMode == PersistenceMode.memory;
+      // In memory mode, the primary index store is [_indexDataCache], so B+Tree
+      // pointers/entry counts may be unset or stale. We still allow searching.
+      if (!isMemoryMode &&
+          (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull)) {
         return IndexSearchResult.empty();
       }
 
@@ -1801,7 +2144,8 @@ class IndexManager {
           if (isUnique) {
             final val = _indexDataCache.get(compositePrefix);
             if (val == null) {
-              return null;
+              // Memory mode must not fall back to disk; cache miss means "not found".
+              return isMemoryMode ? IndexSearchResult.empty() : null;
             }
             if (val is String) {
               return IndexSearchResult(primaryKeys: [val]);
@@ -1875,8 +2219,10 @@ class IndexManager {
 
         if (isUnique) {
           if (hasCursorKey) return IndexSearchResult.empty();
-          final pk =
-              await _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+          // Memory mode: unique index must be served from _indexDataCache (already checked above).
+          if (isMemoryMode) return IndexSearchResult.empty();
+
+          final pk = await _lookupUniquePrimaryKeyLogical(
             tableName: tableName,
             indexName: indexName,
             meta: meta,
@@ -1900,7 +2246,7 @@ class IndexManager {
             MemComparableKey.compare(start, endEffective) >= 0) {
           return IndexSearchResult.empty();
         }
-        final res = await _dataStore.indexTreePartitionManager.searchByKeyRange(
+        final res = await _searchIndexByKeyRangeLogical(
           tableName: tableName,
           indexName: indexName,
           meta: meta,
@@ -1944,7 +2290,7 @@ class IndexManager {
             MemComparableKey.compare(start, endEffective) >= 0) {
           return IndexSearchResult.empty();
         }
-        return _dataStore.indexTreePartitionManager.searchByKeyRange(
+        return _searchIndexByKeyRangeLogical(
           tableName: tableName,
           indexName: indexName,
           meta: meta,
@@ -1988,7 +2334,7 @@ class IndexManager {
           return IndexSearchResult.empty();
         }
 
-        return _dataStore.indexTreePartitionManager.searchByKeyRange(
+        return _searchIndexByKeyRangeLogical(
           tableName: tableName,
           indexName: indexName,
           meta: meta,
@@ -2009,7 +2355,7 @@ class IndexManager {
           return IndexSearchResult.empty();
         }
 
-        return await _dataStore.indexTreePartitionManager.searchByKeyRange(
+        return await _searchIndexByKeyRangeLogical(
           tableName: tableName,
           indexName: indexName,
           meta: meta,
@@ -2090,7 +2436,7 @@ class IndexManager {
             return IndexSearchResult.empty();
           }
 
-          return await _dataStore.indexTreePartitionManager.searchByKeyRange(
+          return await _searchIndexByKeyRangeLogical(
             tableName: tableName,
             indexName: indexName,
             meta: meta,
@@ -2175,24 +2521,37 @@ class IndexManager {
               // For unique index, if cursor > prefix, 'start' will be > 'prefix', so we skip.
               if (MemComparableKey.compare(start, prefix) > 0) continue;
 
-              final pk = await _dataStore.indexTreePartitionManager
-                  .lookupUniquePrimaryKey(
-                tableName: tableName,
-                indexName: indexName,
-                meta: meta,
-                uniqueKey: prefix,
-              );
-              if (pk != null) {
-                out.add(pk);
+              // Memory mode: serve unique lookup from _indexDataCache only (no disk fallback).
+              if (isMemoryMode) {
                 if (nativeVal != null) {
-                  final compositeKey = [tableName, indexName, ...nativeVal];
-                  _indexDataCache.put(compositeKey, pk);
+                  final compositeKey = <dynamic>[
+                    tableName,
+                    indexName,
+                    ...nativeVal
+                  ];
+                  final pk = _indexDataCache.get(compositeKey);
+                  if (pk is String && pk.isNotEmpty) {
+                    out.add(pk);
+                  }
+                }
+              } else {
+                final pk = await _lookupUniquePrimaryKeyLogical(
+                  tableName: tableName,
+                  indexName: indexName,
+                  meta: meta,
+                  uniqueKey: prefix,
+                );
+                if (pk != null) {
+                  out.add(pk);
+                  if (nativeVal != null) {
+                    final compositeKey = [tableName, indexName, ...nativeVal];
+                    _indexDataCache.put(compositeKey, pk);
+                  }
                 }
               }
             } else {
               // Range Scan
-              final res =
-                  await _dataStore.indexTreePartitionManager.searchByKeyRange(
+              final res = await _searchIndexByKeyRangeLogical(
                 tableName: tableName,
                 indexName: indexName,
                 meta: meta,

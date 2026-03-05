@@ -693,6 +693,24 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### Reiner In-Memory-Modus (Memory Mode)
+
+Für Szenarien wie Daten-Caching, temporäre Berechnungen oder laufwerkslose Umgebungen, bei denen keine Persistenz auf der Festplatte erforderlich ist, können Sie eine reine In-Memory-Datenbank mithilfe von `ToStore.memory()` initialisieren. In diesem Modus werden alle Daten (einschließlich Schemata, Indizes und Schlüssel-Wert-Paare) streng im Speicher gehalten.
+
+**Hinweis**: Daten, die im Memory-Modus erstellt wurden, gehen beim Schließen oder Neustarten der Anwendung vollständig verloren.
+
+```dart
+// Datenbank im reinen Memory-Modus initialisieren
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// Alle Vorgänge (CRUD und Suche) werden sofort im Speicher ausgeführt
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## Sicherheitskonfiguration
 
 **Datensicherheitsmechanismen**:

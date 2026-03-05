@@ -17,6 +17,7 @@ import 'tree_cache.dart';
 class TransactionManager {
   final DataStoreImpl _dataStore;
   DataStoreConfig get _config => _dataStore.config;
+  bool get _isMemoryMode => _config.persistenceMode == PersistenceMode.memory;
 
   TransactionMainMeta? _mainMetaCache;
   final Map<int, TransactionPartitionMeta> _partitionMetaCache = {};
@@ -139,12 +140,15 @@ class TransactionManager {
       return;
     }
     try {
-      final path = _dataStore.pathManager.getTransactionMainMetaPath();
-      if (await _dataStore.storage.existsFile(path)) {
-        final content = await _dataStore.storage.readAsString(path);
-        if (content != null && content.isNotEmpty) {
-          _mainMetaCache = TransactionMainMeta.fromJson(
-              jsonDecode(content) as Map<String, dynamic>);
+      // Memory mode must not touch storage; transaction meta is in-memory only.
+      if (!_isMemoryMode) {
+        final path = _dataStore.pathManager.getTransactionMainMetaPath();
+        if (await _dataStore.storage.existsFile(path)) {
+          final content = await _dataStore.storage.readAsString(path);
+          if (content != null && content.isNotEmpty) {
+            _mainMetaCache = TransactionMainMeta.fromJson(
+                jsonDecode(content) as Map<String, dynamic>);
+          }
         }
       }
     } catch (e) {
@@ -195,26 +199,29 @@ class TransactionManager {
     final txId =
         _dataStore.pathManager.buildTransactionId(partitionIndex, unique);
 
-    // Ensure current partition is marked active
-    _mainMetaCache!.activePartitions.add(partitionIndex);
-    await _persistMainMeta(flush: false);
+    if (!_isMemoryMode) {
+      // Ensure current partition is marked active
+      _mainMetaCache!.activePartitions.add(partitionIndex);
+      await _persistMainMeta(flush: false);
 
-    // Increment total transaction count for this partition and write begin status
-    final meta = await _loadPartitionMeta(partitionIndex);
-    meta.totalCount += 1;
-    await _persistPartitionMeta(meta, flush: false);
+      // Increment total transaction count for this partition and write begin status
+      final meta = await _loadPartitionMeta(partitionIndex);
+      meta.totalCount += 1;
+      await _persistPartitionMeta(meta, flush: false);
 
-    final dirIndex = partitionIndex ~/ _dataStore.maxEntriesPerDir;
-    await _dataStore.storage.ensureDirectoryExists(_dataStore.pathManager
-        .getTransactionPartitionDirPath(dirIndex, partitionIndex));
-    final statusPath = _dataStore.pathManager
-        .getTransactionPartitionStatusLogPathById(txId, dirIndex);
-    final statusLine = '${jsonEncode({
-          'transactionId': txId,
-          'event': 'begin',
-          'timestamp': DateTime.now().toIso8601String(),
-        })}\n';
-    await _dataStore.storage.appendString(statusPath, statusLine, flush: false);
+      final dirIndex = partitionIndex ~/ _dataStore.maxEntriesPerDir;
+      await _dataStore.storage.ensureDirectoryExists(_dataStore.pathManager
+          .getTransactionPartitionDirPath(dirIndex, partitionIndex));
+      final statusPath = _dataStore.pathManager
+          .getTransactionPartitionStatusLogPathById(txId, dirIndex);
+      final statusLine = '${jsonEncode({
+            'transactionId': txId,
+            'event': 'begin',
+            'timestamp': DateTime.now().toIso8601String(),
+          })}\n';
+      await _dataStore.storage
+          .appendString(statusPath, statusLine, flush: false);
+    }
 
     // Track active transaction in memory for fast checks
     _activeTransactions.add(txId);
@@ -225,6 +232,22 @@ class TransactionManager {
 
   /// Mark transaction committed; optionally persist recovery artifacts depending on policy, then remove transaction data.
   Future<void> commit(String transactionId, {bool? persistRecovery}) async {
+    if (_isMemoryMode) {
+      // No persistence / recovery artifacts in memory mode.
+      _activeTransactions.remove(transactionId);
+      _txnStatusCache[transactionId] = true;
+      _txnWriteSets.remove(transactionId);
+      _txnHeavyDeletes.remove(transactionId);
+      _txnHeavyUpdates.remove(transactionId);
+      _txnCascadeDeletes.remove(transactionId);
+      _txnCascadeUpdates.remove(transactionId);
+      try {
+        await _dataStore.writeBufferManager
+            .removeTransactionUniqueKeys(transactionId);
+      } catch (_) {}
+      return;
+    }
+
     final pIndex =
         _dataStore.pathManager.parseTransactionPartitionIndex(transactionId);
     if (pIndex < 0) return;
@@ -422,6 +445,7 @@ class TransactionManager {
 
   /// Persist compact commit plan for crash recovery
   Future<void> persistCommitPlan(TransactionCommitPlan plan) async {
+    if (_isMemoryMode) return;
     try {
       // Unified storage with cross-partition continuation when hitting size threshold
       final currentIndex = _dataStore.pathManager
@@ -524,6 +548,7 @@ class TransactionManager {
 
   /// Load commit plan (unified: from partition append-only log, early return on first match)
   Future<TransactionCommitPlan?> loadCommitPlan(String transactionId) async {
+    if (_isMemoryMode) return null;
     // Try file first
     try {
       int currentIndex =
@@ -781,6 +806,14 @@ class TransactionManager {
   /// Load plan application progress from status.log
   Future<Map<String, Map<String, int>>> _loadPlanProgress(
       String transactionId) async {
+    if (_isMemoryMode) {
+      return {
+        // Use mutable maps in memory mode to allow in-place progress updates.
+        'inserts': <String, int>{},
+        'updates': <String, int>{},
+        'deletes': <String, int>{},
+      };
+    }
     final inserts = <String, int>{};
     final updates = <String, int>{};
     final deletes = <String, int>{};
@@ -829,6 +862,7 @@ class TransactionManager {
       Map<String, int> insertsApplied,
       Map<String, int> updatesApplied,
       Map<String, int> deletesApplied) async {
+    if (_isMemoryMode) return;
     try {
       final pIndex =
           _dataStore.pathManager.parseTransactionPartitionIndex(transactionId);
@@ -853,6 +887,7 @@ class TransactionManager {
 
   /// Recovery: continue unfinished transactions by applying plans or rolling back
   Future<void> recoverUnfinishedTransactionsOnStartup() async {
+    if (_isMemoryMode) return;
     try {
       await initialize();
       await for (final txId in streamUnfinishedTransactions()) {
@@ -880,6 +915,20 @@ class TransactionManager {
 
   /// Mark transaction rolled back; the caller should already have applied the compensating operations
   Future<void> rollback(String transactionId) async {
+    if (_isMemoryMode) {
+      _activeTransactions.remove(transactionId);
+      _txnStatusCache[transactionId] = false;
+      _txnWriteSets.remove(transactionId);
+      _txnHeavyDeletes.remove(transactionId);
+      _txnHeavyUpdates.remove(transactionId);
+      _txnCascadeDeletes.remove(transactionId);
+      _txnCascadeUpdates.remove(transactionId);
+      try {
+        await _dataStore.writeBufferManager
+            .removeTransactionUniqueKeys(transactionId);
+      } catch (_) {}
+      return;
+    }
     final pIndex =
         _dataStore.pathManager.parseTransactionPartitionIndex(transactionId);
     if (pIndex < 0) return;
@@ -1100,6 +1149,7 @@ class TransactionManager {
 
   /// Rotate partition if size exceeds threshold.
   Future<void> rotateIfNeeded() async {
+    if (_isMemoryMode) return;
     await initialize();
     final pIndex = _mainMetaCache!.currentPartitionIndex;
     final dirIndex = _dirIndexForPartition(pIndex);
@@ -1118,6 +1168,11 @@ class TransactionManager {
 
   Future<TransactionPartitionMeta> _loadPartitionMeta(
       int partitionIndex) async {
+    if (_isMemoryMode) {
+      // In memory mode, partition meta is not persisted; keep a minimal in-memory record.
+      return _partitionMetaCache.putIfAbsent(partitionIndex,
+          () => TransactionPartitionMeta(partitionIndex: partitionIndex));
+    }
     final cached = _partitionMetaCache[partitionIndex];
     if (cached != null) return cached;
     final dirIndex = _dirIndexForPartition(partitionIndex);
@@ -1148,6 +1203,10 @@ class TransactionManager {
 
   Future<void> _persistPartitionMeta(TransactionPartitionMeta meta,
       {bool flush = false}) async {
+    if (_isMemoryMode) {
+      _partitionMetaCache[meta.partitionIndex] = meta;
+      return;
+    }
     final dirIndex = _dirIndexForPartition(meta.partitionIndex);
     await _dataStore.storage.ensureDirectoryExists(_dataStore.pathManager
         .getTransactionPartitionDirPath(dirIndex, meta.partitionIndex));
@@ -1159,6 +1218,7 @@ class TransactionManager {
   }
 
   Future<void> _persistMainMeta({bool flush = false}) async {
+    if (_isMemoryMode) return;
     final path = _dataStore.pathManager.getTransactionMainMetaPath();
     await _dataStore.storage.writeAsString(
         path, jsonEncode(_mainMetaCache!.toJson()),
@@ -1166,6 +1226,7 @@ class TransactionManager {
   }
 
   Future<void> _maybeCleanupPartition(int partitionIndex) async {
+    if (_isMemoryMode) return;
     final meta = await _loadPartitionMeta(partitionIndex);
     if (meta.finishedCount >= meta.totalCount && meta.totalCount > 0) {
       // Never delete the latest active partition to avoid race with concurrent appends

@@ -127,6 +127,14 @@ class PathManager {
       return _tablePathCache[tableName]!;
     }
 
+    // In-memory mode: synthesize a stable in-memory path without directory lookup.
+    if (dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final synthetic =
+          'memory://${dataStore.currentSpaceName}/tables/$tableName';
+      _tablePathCache[tableName] = synthetic;
+      return synthetic;
+    }
+
     // get table directory info using DirectoryManager
     final tablePath =
         await dataStore.directoryManager?.getTablePathIfExists(tableName);

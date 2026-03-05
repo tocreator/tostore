@@ -693,6 +693,24 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+### 完全インメモリモード (Memory Mode)
+
+データキャッシング、一時的な計算、ディスクへの永続化が不要なシナリオなどでは、`ToStore.memory()`を使用して完全なインメモリデータベースを初期化できます。このモードでは、すべてのデータ（スキーマ、インデックス、Key-Valueペアを含む）がメモリ内のみに保持されます。
+
+**注意**: インメモリモードで作成されたデータは、アプリケーションを閉じるか再起動すると完全に失われます。
+
+```dart
+// インメモリモードでデータベースを初期化
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// すべての操作（CRUDおよび検索）はメモリ内で瞬時に実行されます
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## セキュリティ設定
 
 **データセキュリティメカニズム**：

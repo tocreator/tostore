@@ -438,6 +438,10 @@ class TableDataManager {
   /// Persist runtime metadata (statistics and max IDs) with throttling.
   /// When [force] is true, persist immediately if anything is dirty.
   Future<void> persistRuntimeMetaIfNeeded({bool force = false}) async {
+    // Memory mode must not persist any metadata/config to storage.
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return;
+    }
     try {
       final now = DateTime.now();
       final int minIntervalMs = _dataStore.config.maxFlushLatencyMs;
@@ -593,6 +597,10 @@ class TableDataManager {
 
   /// Save statistics to configuration
   Future<void> _saveStatisticsToConfig() async {
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      _needSaveStats = false;
+      return;
+    }
     try {
       final config = await _dataStore.getSpaceConfig();
       if (config != null) {
@@ -970,6 +978,57 @@ class TableDataManager {
       return;
     }
 
+    // -------------------- Memory mode: TreeCache-only (no WAL, no write queue, no IO) --------------------
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final BufferOperationType finalOperation = operationType;
+
+      if (finalOperation == BufferOperationType.delete) {
+        removeTableRecord(tableName, recordId);
+        // Best-effort stats.
+        final cur = _tableRecordCounts[tableName];
+        if (cur != null && cur > 0) {
+          _tableRecordCounts[tableName] = cur - 1;
+        }
+      } else {
+        // Insert/Update both materialize the full record in the table record cache.
+        // Use force=true so memory mode treats cache as the primary store.
+        cacheTableRecord(tableName, recordId, data, schema, force: true);
+        if (finalOperation == BufferOperationType.insert) {
+          _tableRecordCounts[tableName] =
+              (_tableRecordCounts[tableName] ?? 0) + 1;
+        }
+      }
+
+      // Update index cache
+      if (_dataStore.indexManager != null) {
+        Map<String, dynamic>? indexOldData;
+        Map<String, dynamic>? indexNewData;
+
+        if (finalOperation == BufferOperationType.insert) {
+          indexOldData = null;
+          indexNewData = data;
+        } else if (finalOperation == BufferOperationType.update) {
+          indexOldData = oldValues;
+          indexNewData = data;
+        } else if (finalOperation == BufferOperationType.delete) {
+          indexOldData = data;
+          indexNewData = null;
+        }
+
+        if (indexOldData != null || indexNewData != null) {
+          // Fire and forget, don't block main flow
+          await _dataStore.indexManager!.updateIndexDataCache(
+            tableName,
+            recordId,
+            indexOldData,
+            indexNewData,
+            force: true,
+          );
+        }
+      }
+      return;
+    }
+
     // WAL + write buffer path
     final BufferOperationType finalOperation = operationType;
 
@@ -1123,6 +1182,57 @@ class TableDataManager {
       }
 
       return (successRecordIds: success, failedRecordIds: failed);
+    }
+
+    // -------------------- Memory mode: TreeCache-only batch insert (no WAL, no write queue, no IO) --------------------
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final successIds = <String>[];
+      final failedIds = <String>[];
+      final yieldController =
+          YieldController('TableDataManager.addInsertBatchToBuffer.memory');
+
+      // Ensure comparator is registered once.
+      _registerTableComparator(tableName, schema);
+
+      for (int i = 0; i < records.length; i++) {
+        await yieldController.maybeYield();
+        final r = records[i];
+        final recordId = r[pkName]?.toString();
+        if (recordId == null || recordId.isEmpty) {
+          continue;
+        }
+        try {
+          // Primary store write.
+          cacheTableRecord(tableName, recordId, r, schema, force: true);
+
+          // Primary index write.
+          if (_dataStore.indexManager != null) {
+            await _dataStore.indexManager!.updateIndexDataCache(
+              tableName,
+              recordId,
+              null,
+              r,
+              force: true,
+            );
+          }
+
+          successIds.add(recordId);
+        } catch (e) {
+          Logger.warn(
+            'Memory batch insert failed: table=$tableName pk=$recordId err=$e',
+            label: 'TableDataManager.addInsertBatchToBuffer.memory',
+          );
+          failedIds.add(recordId);
+        }
+      }
+
+      if (successIds.isNotEmpty) {
+        _tableRecordCounts[tableName] =
+            (_tableRecordCounts[tableName] ?? 0) + successIds.length;
+        _needSaveStats = true;
+      }
+
+      return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
     // WAL + write buffer path (non-transactional or applying commit)
@@ -1708,6 +1818,9 @@ class TableDataManager {
 
   /// save id range info
   Future<void> _saveIdRange(String tableName) async {
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return;
+    }
     final generator = _idGenerators[tableName];
     if (generator is SequentialIdGenerator && generator.isDistributed) {
       // get current max id value
@@ -1985,8 +2098,9 @@ class TableDataManager {
     }
   }
 
-  /// Stream records from a table using global B+Tree leaf chain traversal.
-  /// This method efficiently streams all records while overlaying buffer and transaction data.
+  /// Stream records from a table.
+  /// - File mode: traverse global B+Tree leaf chain + overlay buffer/transactions.
+  /// - Memory mode: traverse in‑memory TreeCache logical range + overlay buffer/transactions.
   Stream<Map<String, dynamic>> streamRecords(String tableName,
       {Uint8List? customKey, int? customKeyId}) async* {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -1996,28 +2110,31 @@ class TableDataManager {
       return;
     }
     final primaryKey = schema.primaryKey;
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    final fileMeta = await getTableMeta(tableName);
-    if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
-      // Empty table or no B+Tree: only yield buffer/transaction data
-      final yieldController =
-          YieldController('TableDataManager.streamRecords_empty');
-      final overlay = await mergeConsistency(
-        tableName,
-        [],
-      );
-      for (final r in overlay) {
-        await yieldController.maybeYield();
-        if (!isDeletedRecord(r)) yield r;
+    // Fast path for empty tables (no partitions yet): only merge buffer/txn overlay.
+    if (!isMemoryMode) {
+      final fileMeta = await getTableMeta(tableName);
+      if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
+        final yieldController =
+            YieldController('TableDataManager.streamRecords_empty');
+        final overlay = await mergeConsistency(
+          tableName,
+          [],
+        );
+        for (final r in overlay) {
+          await yieldController.maybeYield();
+          if (!isDeletedRecord(r)) yield r;
+        }
+        return;
       }
-      return;
     }
 
-    final rangeManager = _dataStore.tableTreePartitionManager;
     final yieldController =
         YieldController('TableDataManager.streamRecords', checkInterval: 50);
 
-    // Track keys we've already processed from file stream to avoid duplicate lookups
+    // Track keys we've already processed from base stream to avoid duplicate lookups
     final Set<String> processedKeys = <String>{};
 
     // Get current transaction ID for transaction overlay
@@ -2026,22 +2143,11 @@ class TableDataManager {
     // Register read view for consistent snapshot
     final viewId = _dataStore.readViewManager.registerReadView();
     try {
-      // Stream from global B+Tree leaf chain
-      await for (final record in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: tableName,
-        startKeyInclusive: Uint8List(0), // Start from beginning
-        endKeyExclusive: Uint8List(0), // No end limit
-        reverse: false,
-        limit: null,
-        encryptionKey: customKey,
-        encryptionKeyId: customKeyId,
-      )) {
-        await yieldController.maybeYield();
-
+      // Helper: apply buffer/transaction overlay for a base record and return final visible record (or null).
+      Map<String, dynamic>? applyOverlay(Map<String, dynamic> record) {
         final pk = record[primaryKey]?.toString();
-        if (pk == null || pk.isEmpty) continue;
+        if (pk == null || pk.isEmpty) return null;
 
-        // Mark this key as processed from file
         processedKeys.add(pk);
 
         // Check buffer for updates/deletes (O(1) lookup)
@@ -2049,14 +2155,12 @@ class TableDataManager {
             _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
         if (bufferEntry != null) {
           if (bufferEntry.operation == BufferOperationType.delete) {
-            // Deleted in buffer, skip
-            continue;
+            return null;
           }
-          // Updated in buffer, use buffer version
           if (!isDeletedRecord(bufferEntry.data)) {
-            yield bufferEntry.data;
+            return bufferEntry.data;
           }
-          continue;
+          return null;
         }
 
         // Check transaction for updates/deletes (O(1) lookup)
@@ -2065,31 +2169,96 @@ class TableDataManager {
           final txOp = defOps?[pk];
           if (txOp != null) {
             if (txOp.type == BufferOperationType.delete) {
-              // Deleted in transaction, skip
-              continue;
+              return null;
             }
-            // Updated in transaction, use transaction version
             final txRecord = Map<String, dynamic>.from(txOp.data);
             txRecord.remove('_oldValues');
             if (!isDeletedRecord(txRecord)) {
-              yield txRecord;
+              return txRecord;
             }
-            continue;
+            return null;
           }
         }
 
-        // No buffer/transaction overlay, yield file record
         if (!isDeletedRecord(record)) {
+          return record;
+        }
+        return null;
+      }
+
+      if (!isMemoryMode) {
+        // File mode: stream from global B+Tree leaf chain.
+        final rangeManager = _dataStore.tableTreePartitionManager;
+        await for (final record in rangeManager.streamRecordsByPrimaryKeyRange(
+          tableName: tableName,
+          startKeyInclusive: Uint8List(0),
+          endKeyExclusive: Uint8List(0),
+          reverse: false,
+          limit: null,
+          encryptionKey: customKey,
+          encryptionKeyId: customKeyId,
+        )) {
+          await yieldController.maybeYield();
+          final merged = applyOverlay(record);
+          if (merged != null) {
+            yield merged;
+          }
+        }
+      } else {
+        // Memory mode: use logical TreeCache range scan + StreamController to preserve streaming semantics.
+        final pkMatcher =
+            ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+
+        bool recordPredicate(Map<String, dynamic> r) {
+          // For streamRecords we only need to skip tombstones here;
+          // buffer/txn deletes are handled in overlay logic.
+          return !isDeletedRecord(r);
+        }
+
+        final controller = StreamController<Map<String, dynamic>>();
+
+        () async {
+          try {
+            await _forEachRecordByPrimaryKeyRangeLogical(
+              tableName: tableName,
+              schema: schema,
+              primaryKey: primaryKey,
+              pkMatcher: pkMatcher,
+              reverse: false,
+              limit: null,
+              recordPredicate: recordPredicate,
+              startKeyInclusive: Uint8List(0),
+              endKeyExclusive: Uint8List(0),
+              rangeMin: null,
+              rangeMax: null,
+              includeMin: true,
+              includeMax: true,
+              cursorPk: null,
+              onRecord: (r) {
+                final merged = applyOverlay(r);
+                if (merged != null) {
+                  controller.add(merged);
+                }
+                return true;
+              },
+            );
+          } catch (e, stack) {
+            controller.addError(e, stack);
+          } finally {
+            await controller.close();
+          }
+        }();
+
+        await for (final record in controller.stream) {
+          await yieldController.maybeYield();
           yield record;
         }
       }
 
-      // After streaming file records, yield buffer/transaction inserts that weren't in file
-      // Collect all buffer insert keys
+      // After streaming base records, yield buffer/transaction inserts that weren't in base stream.
       final bufferInsertKeys = _dataStore.writeBufferManager
           .getBufferedInsertKeys(tableName, reverse: false);
 
-      // Process transaction inserts
       final Set<String> txInsertKeys = <String>{};
       if (currentTxId != null) {
         final defOps = _txnDeferredOps[currentTxId]?[tableName];
@@ -2105,15 +2274,13 @@ class TableDataManager {
         }
       }
 
-      // Yield buffer inserts that weren't processed from file
       for (final key in bufferInsertKeys) {
         if (processedKeys.contains(key)) {
-          continue; // Already processed from file
+          continue;
         }
 
         await yieldController.maybeYield();
 
-        // Check if shadowed by transaction DELETE
         bool shadowedByDelete = false;
         if (currentTxId != null) {
           final defOps = _txnDeferredOps[currentTxId]?[tableName];
@@ -2133,10 +2300,9 @@ class TableDataManager {
         }
       }
 
-      // Yield transaction inserts that weren't processed from file or buffer
       for (final key in txInsertKeys) {
         if (processedKeys.contains(key)) {
-          continue; // Already processed from file
+          continue;
         }
 
         await yieldController.maybeYield();
@@ -3185,6 +3351,207 @@ class TableDataManager {
     );
   }
 
+  Future<void> _forEachRecordByPrimaryKeyRangeLogical({
+    required String tableName,
+    required TableSchema schema,
+    required String primaryKey,
+    required MatcherFunction pkMatcher,
+    required bool reverse,
+    required int? limit,
+    required bool Function(Map<String, dynamic>) recordPredicate,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    dynamic rangeMin,
+    dynamic rangeMax,
+    bool includeMin = true,
+    bool includeMax = true,
+    String? cursorPk,
+    required bool Function(Map<String, dynamic>) onRecord,
+  }) async {
+    final isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+
+    if (!isMemoryMode) {
+      await _dataStore.tableTreePartitionManager.forEachRecordByPrimaryKeyRange(
+        tableName: tableName,
+        startKeyInclusive: startKeyInclusive,
+        endKeyExclusive: endKeyExclusive,
+        reverse: reverse,
+        limit: limit,
+        recordPredicate: recordPredicate,
+        onRecord: (r) => onRecord(r),
+      );
+      return;
+    }
+
+    _registerTableComparator(tableName, schema);
+
+    int yielded = 0;
+    final int? hardLimit = limit;
+    final String? cursor =
+        cursorPk != null && cursorPk.isNotEmpty ? cursorPk : null;
+
+    dynamic lowBoundPk = rangeMin;
+    dynamic highBoundPk = rangeMax;
+
+    if (cursor != null) {
+      if (!reverse) {
+        // ASC: start from max(rangeMin, cursor) after
+        if (lowBoundPk == null) {
+          lowBoundPk = cursor;
+        } else if (pkMatcher(lowBoundPk, cursor) < 0) {
+          lowBoundPk = cursor;
+        }
+      } else {
+        // DESC: start from min(rangeMax, cursor) before
+        if (highBoundPk == null) {
+          highBoundPk = cursor;
+        } else if (pkMatcher(highBoundPk, cursor) > 0) {
+          highBoundPk = cursor;
+        }
+      }
+    }
+
+    // Calculate the physical start and end keys for TreeCache, only used to limit the B+Tree scan range
+    late final List<dynamic> startKeyPath;
+    List<dynamic>? endKeyPath;
+
+    if (!reverse) {
+      // ASC: start from lowBoundPk (if any) until highBoundPk (if any)
+      if (lowBoundPk != null) {
+        startKeyPath = [tableName, lowBoundPk];
+      } else {
+        startKeyPath = [tableName];
+      }
+
+      if (highBoundPk != null) {
+        endKeyPath = [tableName, highBoundPk];
+      } else {
+        endKeyPath = null;
+      }
+    } else {
+      // DESC: start from rangeMin (if any, otherwise tableName prefix)，
+      // end at highBoundPk (the smaller value of rangeMax/cursor)
+      if (lowBoundPk != null) {
+        startKeyPath = [tableName, lowBoundPk];
+      } else {
+        startKeyPath = [tableName];
+      }
+
+      if (highBoundPk != null) {
+        endKeyPath = [tableName, highBoundPk];
+      } else {
+        endKeyPath = null;
+      }
+    }
+
+    bool checkRange(dynamic pkNative) {
+      if (rangeMin != null) {
+        final c = pkMatcher(pkNative, rangeMin);
+        if (c < 0 || (c == 0 && !includeMin)) return false;
+      }
+      if (rangeMax != null) {
+        final c = pkMatcher(pkNative, rangeMax);
+        if (c > 0 || (c == 0 && !includeMax)) return false;
+      }
+      if (cursor != null) {
+        final cc = pkMatcher(pkNative, cursor);
+        if (!reverse) {
+          if (cc <= 0) return false;
+        } else {
+          if (cc >= 0) return false;
+        }
+      }
+      return true;
+    }
+
+    await _tableRecordCache.scanRange(
+      startKeyPath,
+      endKeyPath,
+      reverse: reverse,
+      limit: null,
+      onEntry: (path, value) {
+        final rec = value;
+        if (isDeletedRecord(rec)) return true;
+
+        final dynamic pkNative = rec[primaryKey];
+        if (pkNative == null) return true;
+
+        if (!checkRange(pkNative)) return true;
+        if (!recordPredicate(rec)) return true;
+
+        if (!onRecord(rec)) {
+          return false;
+        }
+
+        if (hardLimit != null) {
+          yielded++;
+          if (yielded >= hardLimit) {
+            return false;
+          }
+        }
+        return true;
+      },
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> _scanRecordsByPrimaryKeyRangeLogical({
+    required String tableName,
+    required TableSchema schema,
+    required String primaryKey,
+    required MatcherFunction pkMatcher,
+    required bool reverse,
+    required int? limit,
+    required bool Function(Map<String, dynamic>) recordPredicate,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    dynamic rangeMin,
+    dynamic rangeMax,
+    bool includeMin = true,
+    bool includeMax = true,
+    String? cursorPk,
+  }) async {
+    final rangeMgr = _dataStore.tableTreePartitionManager;
+    final isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+
+    if (!isMemoryMode) {
+      return rangeMgr.scanRecordsByPrimaryKeyRange(
+        tableName: tableName,
+        startKeyInclusive: startKeyInclusive,
+        endKeyExclusive: endKeyExclusive,
+        reverse: reverse,
+        limit: limit,
+        recordPredicate: recordPredicate,
+      );
+    }
+
+    _registerTableComparator(tableName, schema);
+
+    final out = <Map<String, dynamic>>[];
+    await _forEachRecordByPrimaryKeyRangeLogical(
+      tableName: tableName,
+      schema: schema,
+      primaryKey: primaryKey,
+      pkMatcher: pkMatcher,
+      reverse: reverse,
+      limit: limit,
+      recordPredicate: recordPredicate,
+      startKeyInclusive: startKeyInclusive,
+      endKeyExclusive: endKeyExclusive,
+      rangeMin: rangeMin,
+      rangeMax: rangeMax,
+      includeMin: includeMin,
+      includeMax: includeMax,
+      cursorPk: cursorPk,
+      onRecord: (r) {
+        out.add(r);
+        return true;
+      },
+    );
+    return out;
+  }
+
   Future<TableScanResult> searchTableData(
     String tableName,
     ConditionRecordMatcher? matcher, {
@@ -3354,12 +3721,18 @@ class TableDataManager {
       );
     }
 
-    final fileMeta = await getTableMeta(tableName);
-    if (fileMeta == null || fileMeta.totalRecords <= 0) {
-      return TableScanResult(records: const [], count: onlyCount ? 0 : null);
-    }
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    final rangeMgr = _dataStore.tableTreePartitionManager;
+    if (!isMemoryMode) {
+      final fileMeta = await getTableMeta(tableName);
+      if (fileMeta == null || fileMeta.totalRecords <= 0) {
+        return TableScanResult(
+          records: const [],
+          count: onlyCount ? 0 : null,
+        );
+      }
+    }
 
     int effectiveOffset = offset ?? 0;
     if (effectiveOffset < 0) effectiveOffset = 0;
@@ -3527,13 +3900,21 @@ class TableDataManager {
     if (isPkOrder) {
       if (onlyCount) {
         int totalCount = 0;
-        await rangeMgr.forEachRecordByPrimaryKeyRange(
+        await _forEachRecordByPrimaryKeyRangeLogical(
           tableName: tableName,
-          startKeyInclusive: startKeyBytes,
-          endKeyExclusive: endKeyBytes,
+          schema: schema,
+          primaryKey: primaryKey,
+          pkMatcher: pkMatcher,
           reverse: reverse,
           limit: (needCount < 0) ? null : needCount,
           recordPredicate: recordPredicate,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          rangeMin: rangeMin,
+          rangeMax: rangeMax,
+          includeMin: includeMin,
+          includeMax: includeMax,
+          cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
           onRecord: (r) {
             totalCount++;
             return true;
@@ -3546,13 +3927,21 @@ class TableDataManager {
         return TableScanResult(records: const [], count: finalCount);
       } else if (aggregations != null && aggregations.isNotEmpty) {
         final agg = QueryAggregator(aggregations, groupBy: groupBy);
-        await rangeMgr.forEachRecordByPrimaryKeyRange(
+        await _forEachRecordByPrimaryKeyRangeLogical(
           tableName: tableName,
-          startKeyInclusive: startKeyBytes,
-          endKeyExclusive: endKeyBytes,
+          schema: schema,
+          primaryKey: primaryKey,
+          pkMatcher: pkMatcher,
           reverse: reverse,
           limit: (needCount < 0) ? null : needCount,
           recordPredicate: recordPredicate,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          rangeMin: rangeMin,
+          rangeMax: rangeMax,
+          includeMin: includeMin,
+          includeMax: includeMax,
+          cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
           onRecord: (r) {
             agg.accumulate(r);
             return true;
@@ -3560,15 +3949,21 @@ class TableDataManager {
         );
         return TableScanResult(records: const [], aggregateResult: agg.result);
       } else {
-        // New global B+Tree: PK range scan should NOT be partition-loop driven.
-        // Delegate to the partition manager to scan the global leaf chain once.
-        final out = await rangeMgr.scanRecordsByPrimaryKeyRange(
+        final out = await _scanRecordsByPrimaryKeyRangeLogical(
           tableName: tableName,
-          startKeyInclusive: startKeyBytes,
-          endKeyExclusive: endKeyBytes,
+          schema: schema,
+          primaryKey: primaryKey,
+          pkMatcher: pkMatcher,
           reverse: reverse,
           limit: (needCount < 0) ? null : needCount,
           recordPredicate: recordPredicate,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          rangeMin: rangeMin,
+          rangeMax: rangeMax,
+          includeMin: includeMin,
+          includeMax: includeMax,
+          cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
         );
         return TableScanResult(records: out);
       }
@@ -3607,13 +4002,21 @@ class TableDataManager {
     final out = <Map<String, dynamic>>[];
     if (needCount <= 0) {
       // No limit provided: fall back to full collection (may be large).
-      out.addAll(await rangeMgr.scanRecordsByPrimaryKeyRange(
+      out.addAll(await _scanRecordsByPrimaryKeyRangeLogical(
         tableName: tableName,
-        startKeyInclusive: startKeyBytes,
-        endKeyExclusive: endKeyBytes,
+        schema: schema,
+        primaryKey: primaryKey,
+        pkMatcher: pkMatcher,
         reverse: false,
         limit: null,
         recordPredicate: recordPredicate,
+        startKeyInclusive: startKeyBytes,
+        endKeyExclusive: endKeyBytes,
+        rangeMin: rangeMin,
+        rangeMax: rangeMax,
+        includeMin: includeMin,
+        includeMax: includeMax,
+        cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
       ));
       // Note: Sorting is handled by the upper layer (QueryExecutor._applySort),
       // so we skip sorting here to avoid redundant operations and improve performance.
@@ -3656,13 +4059,21 @@ class TableDataManager {
       tasks.add(() async {
         final localTop = TopKHeap<Map<String, dynamic>>(
             k: needCount, compare: compareRecords);
-        await rangeMgr.forEachRecordByPrimaryKeyRange(
+        await _forEachRecordByPrimaryKeyRangeLogical(
           tableName: tableName,
-          startKeyInclusive: startKeyBytes,
-          endKeyExclusive: endKeyBytes,
+          schema: schema,
+          primaryKey: primaryKey,
+          pkMatcher: pkMatcher,
           reverse: false,
           limit: null,
           recordPredicate: recordPredicate,
+          startKeyInclusive: startKeyBytes,
+          endKeyExclusive: endKeyBytes,
+          rangeMin: rangeMin,
+          rangeMax: rangeMax,
+          includeMin: includeMin,
+          includeMax: includeMax,
+          cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
           onRecord: (r) {
             localTop.offer(r);
             return true;

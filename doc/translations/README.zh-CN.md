@@ -727,6 +727,25 @@ final txResult2 = await db.transaction(() async {
 }, rollbackOnError: true);
 ```
 
+
+### 纯内存模式 (Memory Mode)
+
+对于数据缓存、临时计算或不需要持久化到磁盘等场景，可以使用 ToStore.memory() 初始化一个纯内存数据库。在该模式下，所有数据（包括表结构、索引和键值对）均仅保存在内存中。
+
+**注意**：纯内存模式下产生的数据在应用关闭或重启后将完全丢失。
+
+```dart
+// 使用纯内存模式初始化数据库
+final db = await ToStore.memory(
+  schemas: [],
+);
+
+// 所有的增删改查及搜索都将在内存中以极速完成
+await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+
+```
+
+
 ## 安全配置
 
 **数据安全机制**：

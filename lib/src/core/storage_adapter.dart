@@ -43,18 +43,27 @@ class StorageAdapter implements StorageInterface {
   static const String _listOpPrefix = 'list-';
   static const String _deleteOpPrefix = 'delete-';
   static const String _writeOpSerializePrefix = 'write-serialize-';
-  StorageAdapter()
+  StorageAdapter({StorageInterface? overrideStorage})
       : _lockManager = LockManager(
             baseLockTimeout: 300000, enableDeadlockDetection: true) {
-    if (PlatformHandler.isWeb) {
-      _storage = WebStorageImpl('db');
+    if (overrideStorage != null) {
+      _storage = overrideStorage;
     } else {
-      _storage = FileStorageImpl();
+      if (PlatformHandler.isWeb) {
+        _storage = WebStorageImpl('db');
+      } else {
+        _storage = FileStorageImpl();
+      }
     }
 
     // Register instance for global flush operations
     _instances.add(this);
   }
+
+  /// Create a storage adapter with a provided storage implementation.
+  /// Used for pure in-memory mode (no IO) and testing.
+  StorageAdapter.forStorage(StorageInterface storage)
+      : this(overrideStorage: storage);
 
   /// Unified configuration entry to reduce initialization redundancy
   Future<void> configure(

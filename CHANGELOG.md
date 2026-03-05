@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - Added `tableExists` API to check whether a table is defined in the database schema (space‑agnostic)
 - Added `query('table').exists()` chain API for efficient existence checks based on conditions without loading full records
 - Added table schema TTL configuration and automatic expiration cleanup for time-based data
+- Added pure memory mode (`ToStore.memory()`), providing ultra-high performance for scenarios like data caching, temporary computation, or diskless environments
 
 ### Fixed
 - Fixed `count()` consistency with write buffer and index scan paths
