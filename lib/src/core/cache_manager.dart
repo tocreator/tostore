@@ -3,7 +3,7 @@ import 'dart:async';
 import '../handler/logger.dart';
 import '../model/table_statistics.dart';
 import 'data_store_impl.dart';
-import 'memory_manager.dart';
+import 'resource_manager.dart';
 
 /// Central cache facade.
 ///
@@ -22,7 +22,7 @@ final class CacheManager {
   }
 
   void _registerMemoryCallbacks() {
-    final mm = _dataStore.memoryManager;
+    final mm = _dataStore.resourceManager;
     if (mm == null) return;
 
     // Table data (hot records + B+Tree pages)

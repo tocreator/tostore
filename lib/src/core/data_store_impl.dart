@@ -25,7 +25,7 @@ import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import 'cache_manager.dart';
 import '../model/data_store_config.dart';
-import 'memory_manager.dart';
+import 'resource_manager.dart';
 import 'table_data_manager.dart';
 import 'index_manager.dart';
 import 'vector_index_manager.dart';
@@ -144,7 +144,7 @@ class DataStoreImpl {
   DirectoryManager? directoryManager;
   LockManager? lockManager;
   TransactionManager? transactionManager;
-  MemoryManager? _memoryManager;
+  ResourceManager? _resourceManager;
 
   // Transaction zone key
   static const Symbol _txnZoneKey = #to_txn_zone;
@@ -343,8 +343,8 @@ class DataStoreImpl {
   /// Get vector index manager
   VectorIndexManager? get vectorIndexManager => _vectorIndexManager;
 
-  /// Get memory manager
-  MemoryManager? get memoryManager => _memoryManager;
+  /// Get resource manager
+  ResourceManager? get resourceManager => _resourceManager;
 
   /// TTL cache hooks for schema/cache managers.
   void upsertTtlPlanForSchema(TableSchema schema) {
@@ -562,11 +562,7 @@ class DataStoreImpl {
     }
 
     // Normalize path separators for cross-platform consistency.
-    rootPath = rootPath.replaceAll(r'\', '/');
-    // Remove any trailing slashes to prevent duplication.
-    while (rootPath.endsWith('/')) {
-      rootPath = rootPath.substring(0, rootPath.length - 1);
-    }
+    rootPath = path.canonicalize(rootPath);
 
     return pathJoin(rootPath, 'db', effectiveDbName);
   }
@@ -682,8 +678,8 @@ class DataStoreImpl {
       schemaManager = SchemaManager(this);
       _pathManager = PathManager(this);
 
-      // Initialize memory manager
-      _memoryManager = MemoryManager();
+      // Initialize resource manager
+      _resourceManager = ResourceManager();
 
       // Create key manager instance but don't initialize yet
       _keyManager = KeyManager(this);
@@ -694,7 +690,7 @@ class DataStoreImpl {
         await Future.wait([
           getGlobalConfig(),
           getSpaceConfig(),
-          _memoryManager!.initialize(_config!, this),
+          _resourceManager!.initialize(_config!, this),
           Future(() async => await transactionManager!.initialize()),
         ]);
       } else {
@@ -709,7 +705,7 @@ class DataStoreImpl {
           }
         }
         await Future.wait([
-          _memoryManager!.initialize(_config!, this),
+          _resourceManager!.initialize(_config!, this),
           Future(() async => await transactionManager!.initialize()),
         ]);
       }
@@ -1162,11 +1158,6 @@ class DataStoreImpl {
             Logger.error('Stop journal manager without flush failed: $e',
                 label: 'DataStoreImpl.close');
           }
-          // Minimize IO: only ensure buffers of open handles are flushed to avoid handle
-          // competition with subsequent directory deletion/replacement.
-          try {
-            await storage.flushAll(closeHandles: true);
-          } catch (_) {}
         }
 
         // Regardless of persistChanges, ensure WAL append queue is quiescent before closing storage,
@@ -1199,10 +1190,18 @@ class DataStoreImpl {
           }
         }
 
+        CrontabManager.dispose();
+
+        // Ensure all handles are deeply flushed and closed to release file locks on Windows
+        // This MUST be the absolute last storage instruction before `storage.close()`
+        // so that late background savers (like walManager.flushQueueCompletely) do not reopen handles.
+        try {
+          await storage.flushAll(closeHandles: true);
+        } catch (_) {}
+
         if (closeStorage) {
           await storage.close(isMigrationInstance: isMigrationInstance);
         }
-        CrontabManager.dispose();
       });
 
       // After storage closed, old lockManager no longer used; new instance will create a fresh lock manager
@@ -1214,8 +1213,8 @@ class DataStoreImpl {
       cacheManager.clear();
       _ttlCleanupManager.unregisterCleanupTask();
 
-      // Clean up memory manager resources
-      _memoryManager?.dispose();
+      // Clean up resource manager resources
+      _resourceManager?.dispose();
 
       // Clear instance variables
       _queryOptimizer = null;
@@ -1228,7 +1227,7 @@ class DataStoreImpl {
       migrationManager = null;
       schemaManager = null;
       _tableDataManager = null;
-      _memoryManager = null;
+      _resourceManager = null;
 
       _globalConfigCache = null;
       _spaceConfigCache = null;
@@ -1525,6 +1524,15 @@ class DataStoreImpl {
     // Need to be fully initialized
     if (!_isInitialized) {
       await ensureInitialized();
+    }
+
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'Insert operation blocked: System resources are critically low.',
+      );
     }
 
     // Capture transaction id once for performance and consistent visibility rules
@@ -1993,6 +2001,16 @@ class DataStoreImpl {
   Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
     await ensureInitialized();
+
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'Upsert operation blocked: System resources are critically low.',
+      );
+    }
+
     final schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return finish(DbResult.error(
@@ -2202,6 +2220,15 @@ class DataStoreImpl {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
     await ensureInitialized();
 
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'update operation blocked: System resources are critically low.',
+      );
+    }
+
     // Capture transaction id once
     final String? txId = Zone.current[_txnZoneKey] as String?;
 
@@ -2242,7 +2269,7 @@ class DataStoreImpl {
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
-          memoryManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
+          _resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
 
       final schemas = {tableName: schema};
       final matcher =
@@ -2399,7 +2426,7 @@ class DataStoreImpl {
 
           // Determine the batch size threshold based on record cache size, with a 200MB default.
           final effectiveRecordCacheSize =
-              memoryManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
+              resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
           final maxBatchMemorySizeInBytes = effectiveRecordCacheSize * 0.2;
 
           // Calculate max partitions in a batch based on memory limits and max partition file size.
@@ -3229,6 +3256,15 @@ class DataStoreImpl {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
     await ensureInitialized();
 
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'Delete operation blocked: System resources are critically low.',
+      );
+    }
+
     // check if condition is empty, avoid accidental deletion of all records
     if (condition.isEmpty) {
       if (!allowAll) {
@@ -3269,7 +3305,7 @@ class DataStoreImpl {
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
-          memoryManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
+          resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
 
       // get table schema
       final schema = await schemaManager?.getTableSchema(tableName);
@@ -3563,7 +3599,7 @@ class DataStoreImpl {
 
           // Determine the batch size threshold based on record cache size, with a 200MB default.
           final effectiveRecordCacheSize =
-              memoryManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
+              resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
           final maxBatchMemorySizeInBytes = effectiveRecordCacheSize * 0.2;
 
           // Calculate max partitions in a batch based on memory limits and max partition file size.
@@ -4275,6 +4311,22 @@ class DataStoreImpl {
       String tableName, List<Map<String, dynamic>> records,
       {bool allowPartialErrors = true}) async {
     await ensureInitialized();
+
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'Insert operation blocked: System resources are critically low.',
+      );
+    }
+
+    if (records.isEmpty) {
+      return DbResult.success(
+        message: 'No records to insert',
+        successKeys: [],
+      );
+    }
 
     // Capture transaction id once
     final String? txId = Zone.current[_txnZoneKey] as String?;
@@ -5055,6 +5107,21 @@ class DataStoreImpl {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
     await ensureInitialized();
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'upsert operation blocked: System resources are critically low.',
+      );
+    }
+
+    if (records.isEmpty) {
+      return DbResult.success(
+        message: 'No records to insert',
+        successKeys: [],
+      );
+    }
 
     TableSchema? schema;
     try {
@@ -5456,6 +5523,7 @@ class DataStoreImpl {
 
       // Clear caches
       await cacheManager.onBasePathChanged();
+      await storage.flushAll(closeHandles: true);
 
       // Reinitialize database; do not apply activeSpace-on-default so switching to default stays default
       _isInitialized = false;
@@ -6693,7 +6761,7 @@ class _DbStatusImpl implements DbStatus {
 
   @override
   Future<MemoryInfo> memory() async {
-    if (_db._memoryManager == null) {
+    if (_db._resourceManager == null) {
       // Return empty/default memory info if manager not initialized
       return const MemoryInfo(
         totalThresholdMB: 0,
@@ -6710,7 +6778,7 @@ class _DbStatusImpl implements DbStatus {
         isLowMemoryMode: false,
       );
     }
-    return await _db._memoryManager!.getMemoryInfo();
+    return await _db._resourceManager!.getMemoryInfo();
   }
 
   @override
@@ -6740,7 +6808,7 @@ class _DbStatusImpl implements DbStatus {
       encryptionType: encryptionType.name,
       isEncryptionEnabled: encryptionType != EncryptionType.none,
       cacheMemoryBudgetMB: _db.config.cacheMemoryBudgetMB ?? 0,
-      isMemoryManaged: _db._memoryManager != null,
+      isMemoryManaged: _db._resourceManager != null,
       maxParallelWorkers: _db.config.maxConcurrency,
       flushPolicy: StorageAdapter.flushPolicy.name,
     );

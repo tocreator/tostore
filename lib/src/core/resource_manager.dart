@@ -3,18 +3,29 @@ import 'dart:math';
 
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
-
 import '../model/data_store_config.dart';
 import '../model/memory_info.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 
-/// Memory manager responsible for dynamically allocating and monitoring cache usage based on available system memory
-class MemoryManager {
+/// Resource status representing the health of system resources (Memory and Disk)
+enum ResourceStatus {
+  /// Resources are healthy
+  normal,
+
+  /// Resources are low, triggers cache cleanup
+  warning,
+
+  /// Resources are critically low, triggers write blocking to prevent data loss
+  critical,
+}
+
+/// Resource manager responsible for dynamically monitoring system memory and disk space
+class ResourceManager {
   /// Singleton implementation
-  static final MemoryManager _instance = MemoryManager._internal();
-  factory MemoryManager() => _instance;
-  MemoryManager._internal();
+  static final ResourceManager _instance = ResourceManager._internal();
+  factory ResourceManager() => _instance;
+  ResourceManager._internal();
 
   /// Memory configuration threshold, default is 75% of available system memory
   int _memoryThresholdInMB = 0;
@@ -37,8 +48,8 @@ class MemoryManager {
   /// Last cache clear time
   DateTime _lastCacheClearTime = DateTime.now();
 
-  /// Low memory mode flag
-  bool _isLowMemoryMode = false;
+  /// Current resource status
+  ResourceStatus _status = ResourceStatus.normal;
 
   /// Initialization flag
   bool _initialized = false;
@@ -58,7 +69,7 @@ class MemoryManager {
   /// Flag to prevent re-entrant cache cleanup
   bool _isCleaning = false;
 
-  /// Initialize memory manager
+  /// Initialize resource manager
   Future<void> initialize(
       DataStoreConfig config, DataStoreImpl dataStore) async {
     if (_initialized) return;
@@ -72,8 +83,8 @@ class MemoryManager {
     // Calculate cache sizes
     _calculateCacheSizes();
 
-    // Register memory monitoring task
-    _registerMemoryMonitor();
+    // Register resource monitoring task
+    _registerResourceMonitor();
 
     _initialized = true;
   }
@@ -105,7 +116,7 @@ class MemoryManager {
           max(_memoryThresholdInMB, _getMinimumMemoryThreshold());
     } catch (e) {
       Logger.error('Failed to configure memory threshold: $e',
-          label: 'MemoryManager._configureMemoryThreshold');
+          label: 'ResourceManager._configureMemoryThreshold');
       // Set default threshold
       _memoryThresholdInMB = _getDefaultMemoryThreshold();
     }
@@ -135,64 +146,85 @@ class MemoryManager {
     }
   }
 
-  /// Register memory monitoring periodic task
-  void _registerMemoryMonitor() {
-    // Use CrontabManager to register memory monitoring task
+  /// Register resource monitoring periodic task
+  void _registerResourceMonitor() {
+    // Use CrontabManager to register resource monitoring task
     CrontabManager.addCallback(
         ExecuteInterval.seconds10, // 10 seconds interval
-        _checkMemoryUsage);
+        _checkResourceUsage);
   }
 
-  /// Check memory usage
-  Future<void> _checkMemoryUsage() async {
+  /// Check resource usage (Memory and Disk) and trigger cleanup if needed
+  Future<void> _checkResourceUsage() async {
     try {
-      final availableMemoryMB =
-          await PlatformHandler.getAvailableSystemMemoryMB();
-      final systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
+      await _updateResourceStatus();
 
-      // When available memory is less than 10% of system memory, trigger cache cleanup
-      if (availableMemoryMB < systemMemoryMB * 0.1) {
-        if (!_isLowMemoryMode) {
-          Logger.warn(
-              'Low memory detected! Available: $availableMemoryMB MB, System: $systemMemoryMB MB',
-              label: 'MemoryManager._checkMemoryUsage');
-          _isLowMemoryMode = true;
-        }
+      // Trigger cleanup if warning or higher
+      if (_status != ResourceStatus.normal) {
         _triggerCacheEviction();
-      } else if (_isLowMemoryMode && availableMemoryMB > systemMemoryMB * 0.2) {
-        // When available memory is greater than 20% of system memory, exit low memory mode;
-        _isLowMemoryMode = false;
       }
     } catch (e) {
-      Logger.error('Failed to check memory usage: $e',
-          label: 'MemoryManager._checkMemoryUsage');
+      Logger.error('Failed to check resource usage: $e',
+          label: 'ResourceManager._checkResourceUsage');
     }
   }
 
-  /// Check memory usage immediately (without cache delay)
-  Future<bool> _checkMemoryUsageImmediate() async {
-    try {
-      // Force refresh to bypass platform caching
-      final availableMemoryMB =
-          await PlatformHandler.getAvailableSystemMemoryMB(forceRefresh: true);
-      final systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
+  /// Update internal resource status based on current metrics
+  Future<void> _updateResourceStatus() async {
+    final availableMemoryMB =
+        await PlatformHandler.getAvailableSystemMemoryMB();
+    final systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
+    final availableDiskMB = await _getAvailableDiskSpace();
 
-      // Update low memory mode status
-      if (availableMemoryMB < systemMemoryMB * 0.1) {
-        _isLowMemoryMode = true;
-        return false; // Memory still insufficient
-      } else if (availableMemoryMB > systemMemoryMB * 0.2) {
-        // Available memory is now sufficient, exit low memory mode
-        _isLowMemoryMode = false;
-        return true; // Memory is now sufficient
+    // Determine memory status
+    ResourceStatus memoryStatus = ResourceStatus.normal;
+    if (availableMemoryMB < systemMemoryMB * 0.02 || availableMemoryMB < 32) {
+      memoryStatus = ResourceStatus.critical;
+    } else if (availableMemoryMB < systemMemoryMB * 0.1) {
+      memoryStatus = ResourceStatus.warning;
+    }
+
+    // Determine disk status
+    ResourceStatus diskStatus = ResourceStatus.normal;
+    if (availableDiskMB < 20) {
+      diskStatus = ResourceStatus.critical;
+    } else if (availableDiskMB < 100) {
+      diskStatus = ResourceStatus.warning;
+    }
+
+    // Combined status (take the most severe)
+    final newStatus =
+        ResourceStatus.values[max(memoryStatus.index, diskStatus.index)];
+
+    if (newStatus != _status) {
+      if (newStatus == ResourceStatus.critical) {
+        Logger.error(
+            'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+            label: 'ResourceManager._updateResourceStatus');
+      } else if (newStatus == ResourceStatus.warning) {
+        Logger.warn(
+            'Low resources detected! Triggering cache eviction. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+            label: 'ResourceManager._updateResourceStatus');
+      } else {
+        Logger.info('Resources recovered to normal levels.',
+            label: 'ResourceManager._updateResourceStatus');
       }
+      _status = newStatus;
+    }
+  }
 
-      // If memory is in between thresholds, keep current mode
-      return !_isLowMemoryMode;
+  /// Get current available disk space for the database path
+  Future<double> _getAvailableDiskSpace() async {
+    if (_dataStore == null || _dataStore!.instancePath == null) {
+      return 10240.0; // 10GB safe default
+    }
+    try {
+      final int mb =
+          await PlatformHandler.getDiskFreeSpaceMB(_dataStore!.instancePath!);
+      return mb.toDouble();
     } catch (e) {
-      Logger.error('Failed to check immediate memory usage: $e',
-          label: 'MemoryManager._checkMemoryUsageImmediate');
-      return false; // Default to assume memory is still insufficient
+      Logger.warn('Failed to get disk space: $e', label: 'ResourceManager');
+      return 10240.0;
     }
   }
 
@@ -217,28 +249,27 @@ class MemoryManager {
       try {
         // Clean up cache in order of priority, from low priority to high priority
         await _evictCacheAndCheck(MemoryQuotaType.tableData);
-        if (!_isLowMemoryMode) return;
+        if (_status == ResourceStatus.normal) return;
 
         await _evictCacheAndCheck(MemoryQuotaType.queryResult);
-        if (!_isLowMemoryMode) return;
+        if (_status == ResourceStatus.normal) return;
 
         await _evictCacheAndCheck(MemoryQuotaType.indexData);
       } catch (e) {
         Logger.error('An error occurred during cache eviction process: $e',
-            label: 'MemoryManager._triggerCacheEviction');
+            label: 'ResourceManager._triggerCacheEviction');
       } finally {
         _isCleaning = false;
       }
     });
   }
 
-  /// Evict a specific cache type and then check the memory status.
+  /// Evict a specific cache type and then refresh the resource status.
   Future<void> _evictCacheAndCheck(MemoryQuotaType cacheType) async {
     await _evictCacheByType(cacheType);
-    final isMemorySufficient = await _checkMemoryUsageImmediate();
-    if (isMemorySufficient) {
-      _isLowMemoryMode = false;
-    }
+
+    // Refresh status after eviction without re-triggering eviction process
+    await _updateResourceStatus();
   }
 
   /// Execute specific type cache cleanup
@@ -265,11 +296,11 @@ class MemoryManager {
         double freedMB = freedBytes / (1024 * 1024);
         Logger.debug(
             'Cache eviction for ${cacheType.name}: freed ${freedMB.toStringAsFixed(2)}MB (${((beforeSize - afterSize) * 100 / beforeSize).toStringAsFixed(1)}%)',
-            label: 'MemoryManager._evictCacheByType');
+            label: 'ResourceManager._evictCacheByType');
       }
     } catch (e) {
       Logger.error('Error in cache eviction callback for ${cacheType.name}: $e',
-          label: 'MemoryManager._evictCacheByType');
+          label: 'ResourceManager._evictCacheByType');
     }
   }
 
@@ -300,7 +331,7 @@ class MemoryManager {
       }
     } catch (e) {
       Logger.error('Failed to get current cache size for ${cacheType.name}: $e',
-          label: 'MemoryManager._getCurrentCacheSizeByType');
+          label: 'ResourceManager._getCurrentCacheSizeByType');
       return 0;
     }
   }
@@ -350,8 +381,14 @@ class MemoryManager {
   /// Get memory threshold (MB)
   int getMemoryThresholdMB() => _memoryThresholdInMB;
 
-  /// Get current low memory mode status
-  bool get isLowMemoryMode => _isLowMemoryMode;
+  /// Get current resource status
+  ResourceStatus get status => _status;
+
+  /// Whether write operations should be blocked
+  bool get isWriteBlocked => _status == ResourceStatus.critical;
+
+  /// Whether resources are low (warning or critical), triggers cache cleanup
+  bool get isLowMemoryMode => _status != ResourceStatus.normal;
 
   /// Get current memory and cache usage information
   Future<MemoryInfo> getMemoryInfo() async {
@@ -371,7 +408,7 @@ class MemoryManager {
       schemaCacheLimit: _schemaCacheSize,
       metaCacheUsage: await _getCurrentCacheSizeByType(MemoryQuotaType.meta),
       metaCacheLimit: _metaCacheSize,
-      isLowMemoryMode: _isLowMemoryMode,
+      isLowMemoryMode: _status != ResourceStatus.normal,
     );
   }
 

@@ -54,6 +54,12 @@ class PlatformHandlerImpl implements PlatformInterface {
   }
 
   @override
+  Future<int> getDiskFreeSpaceMB(String path) async {
+    // Web platform fallback to safe default (e.g., 10GB) to avoid blocking operations
+    return 10240;
+  }
+
+  @override
   Future<String> getPathApp() async {
     return '';
   }

@@ -50,11 +50,11 @@ final class IndexTreePartitionManager {
 
   IndexTreePartitionManager(this._dataStore) {
     // Initialize page caches using memory manager quota
-    final memoryManager = _dataStore.memoryManager;
-    final indexQuota =
-        memoryManager?.getIndexCacheSize() ?? (128 * 1024 * 1024);
+    final resourceManager = _dataStore.resourceManager;
+    final indexCacheSize =
+        resourceManager?.getIndexCacheSize() ?? (128 * 1024 * 1024);
     // Allocate 30% of index cache for B+Tree pages (15% for leaf, 15% for internal)
-    final int pageCacheSize = (indexQuota * 0.30).toInt();
+    final int pageCacheSize = (indexCacheSize * 0.30).toInt();
     final int leafCacheSize = (pageCacheSize * 0.50).toInt();
     final int internalCacheSize = pageCacheSize - leafCacheSize;
 

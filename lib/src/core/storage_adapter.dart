@@ -80,17 +80,18 @@ class StorageAdapter implements StorageInterface {
 
   /// generate lock resource name for resource path
   String _getLockResource(String filePath) {
-    // normalize path, remove unnecessary separators
-    final normalizedPath = path.normalize(filePath);
+    // Canonicalize ensure consistent representation (case, separators, dots)
+    final canonicalPath = path.canonicalize(filePath);
 
-    // use hash to handle long path, avoid lock resource name too long
-    if (normalizedPath.length > 128) {
+    // use hash to handle long path, avoid lock resource name too long.
+    // Increased limit to 384 to support deep hierarchical locking on Windows.
+    if (canonicalPath.length > 384) {
       // Use more stable hash method and add prefix for better identification
-      final hash = normalizedPath.hashCode.abs();
+      final hash = canonicalPath.hashCode.abs();
       return 'path-hash-$hash';
     }
 
-    return 'path-$normalizedPath';
+    return 'path-$canonicalPath';
   }
 
   /// generate write serialization lock resource name for resource path

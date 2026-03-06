@@ -37,6 +37,9 @@ abstract class PlatformInterface {
   /// @param forceRefresh Whether to force a refresh of the memory information (bypass cache)
   Future<int> getAvailableSystemMemoryMB({bool forceRefresh = false});
 
+  /// Get available disk space in MB for the given path
+  Future<int> getDiskFreeSpaceMB(String path);
+
   /// Get app save directory, for data, config, etc.
   Future<String> getPathApp();
 

@@ -61,6 +61,10 @@ class PlatformHandler {
     return memoryMB / 1024.0;
   }
 
+  /// Get available disk space in MB for the given path
+  static Future<int> getDiskFreeSpaceMB(String path) =>
+      _instance.getDiskFreeSpaceMB(path);
+
   /// Get app save directory, for data, config, etc.
   static Future<String> getPathApp() => _instance.getPathApp();
 

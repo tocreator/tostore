@@ -4,6 +4,7 @@ import 'package:path/path.dart' as path;
 import 'package:archive/archive_io.dart';
 import '../Interface/platform_interface.dart';
 import '../handler/logger.dart';
+import 'system_ffi_helper.dart';
 
 /// Native platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
@@ -295,6 +296,14 @@ class PlatformHandlerImpl implements PlatformInterface {
 
     int memoryMB;
     try {
+      // Try FFI first (extremely fast, <1ms)
+      memoryMB = SystemFfiHelper.getTotalMemoryMB();
+      if (memoryMB > 0) {
+        _cachedSystemMemoryMB = memoryMB;
+        _lastSystemMemoryFetch = now;
+        return memoryMB;
+      }
+
       if (isWindows) {
         memoryMB = await _getWindowsMemory();
       } else if (isLinux) {
@@ -331,6 +340,14 @@ class PlatformHandlerImpl implements PlatformInterface {
 
     int memoryMB;
     try {
+      // Try FFI first (extremely fast, <1ms)
+      memoryMB = SystemFfiHelper.getAvailableMemoryMB();
+      if (memoryMB > 0) {
+        _cachedAvailableSystemMemoryMB = memoryMB;
+        _lastAvailableSystemMemoryFetch = now;
+        return memoryMB;
+      }
+
       if (isWindows) {
         memoryMB = await _getWindowsAvailableMemory();
       } else if (isLinux) {
@@ -351,6 +368,68 @@ class PlatformHandlerImpl implements PlatformInterface {
     _cachedAvailableSystemMemoryMB = memoryMB;
     _lastAvailableSystemMemoryFetch = now;
     return memoryMB;
+  }
+
+  /// Get available disk space in MB for the given path
+  @override
+  Future<int> getDiskFreeSpaceMB(String path) async {
+    try {
+      // Try FFI first (extremely fast, <1ms)
+      int freeMB = SystemFfiHelper.getDiskFreeSpaceMB(path);
+      if (freeMB > 0) return freeMB;
+
+      // Fallback
+      int fallbackMB;
+      if (isWindows) {
+        fallbackMB = await _getWindowsDiskFreeSpace(path);
+      } else {
+        fallbackMB = await _getPosixDiskFreeSpace(path);
+      }
+
+      if (fallbackMB > 0) return fallbackMB;
+    } catch (e) {
+      Logger.error('Failed to get disk free space for $path: $e',
+          label: 'PlatformHandlerImpl.getDiskFreeSpaceMB');
+    }
+    // Safe default: 10GB if all detection methods fail or are unsupported
+    return 10240;
+  }
+
+  /// Get Windows disk free space (fallback)
+  Future<int> _getWindowsDiskFreeSpace(String pathStr) async {
+    try {
+      // Use PowerShell to get free space
+      final result = await Process.run('powershell', [
+        '-Command',
+        '(([WmiSearcher]"Select FreeSpace from Win32_LogicalDisk where DeviceID=\'${pathStr.substring(0, 2)}\'").Get() | Select-Object -First 1).FreeSpace / 1MB'
+      ]);
+
+      if (result.exitCode == 0 && result.stdout != null) {
+        final val = double.tryParse((result.stdout as String).trim());
+        if (val != null) return val.round();
+      }
+    } catch (_) {}
+    return 0;
+  }
+
+  /// Get Posix disk free space (fallback)
+  Future<int> _getPosixDiskFreeSpace(String pathStr) async {
+    try {
+      // Use df command
+      final result = await Process.run('df', ['-k', pathStr]);
+      if (result.exitCode == 0 && result.stdout != null) {
+        final lines = (result.stdout as String).trim().split('\n');
+        if (lines.length > 1) {
+          final parts = lines[1].split(RegExp(r'\s+'));
+          if (parts.length > 3) {
+            // Usually the 4th column is available blocks in 1K
+            final kb = int.tryParse(parts[3]);
+            if (kb != null) return (kb / 1024).round();
+          }
+        }
+      }
+    } catch (_) {}
+    return 0;
   }
 
   /// Get app save directory, for data, config, etc.
@@ -464,7 +543,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   /// Get Windows system memory
   Future<int> _getWindowsMemory() async {
     try {
-      // Use PowerShell to get system memory information
+      // Fallback: Use PowerShell to get system memory information
       final result = await Process.run('powershell', [
         '-Command',
         '(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB'
@@ -498,7 +577,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   /// Get Windows available memory
   Future<int> _getWindowsAvailableMemory() async {
     try {
-      // Use PowerShell to get available memory information
+      // Fallback: Use PowerShell to get available memory information
       final result = await Process.run('powershell', [
         '-Command',
         '(Get-Counter "\\Memory\\Available MBytes").CounterSamples[0].CookedValue'

@@ -75,11 +75,11 @@ final class TableTreePartitionManager {
 
   TableTreePartitionManager(this._dataStore) {
     // Initialize page caches using memory manager quota
-    final memoryManager = _dataStore.memoryManager;
-    final tableQuota =
-        memoryManager?.getTableDataCacheSize() ?? (128 * 1024 * 1024);
+    final resourceManager = _dataStore.resourceManager;
+    final recordCacheSize =
+        resourceManager?.getTableDataCacheSize() ?? (128 * 1024 * 1024);
     // Allocate 30% of table cache for B+Tree pages (15% for leaf, 15% for internal)
-    final int pageCacheSize = (tableQuota * 0.30).toInt();
+    final int pageCacheSize = (recordCacheSize * 0.30).toInt();
     final int leafCacheSize = (pageCacheSize * 0.50).toInt();
     final int internalCacheSize = pageCacheSize - leafCacheSize;
 

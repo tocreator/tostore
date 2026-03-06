@@ -132,7 +132,7 @@ class TableDataManager {
 
   TableDataManager(this._dataStore) {
     // Initialize table record cache (table data quota).
-    final mem = _dataStore.memoryManager;
+    final mem = _dataStore.resourceManager;
     // Initialize table metadata cache (meta quota slice).
     final int metaQuota = mem?.getMetaCacheSize() ?? (64 * 1024 * 1024);
     // Meta quota is shared by multiple caches (index meta, footers, etc.).

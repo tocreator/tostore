@@ -13,7 +13,7 @@ class SchemaManager {
   SchemaMeta? _schemaMeta; // Cache schema meta
 
   /// Hot schema cache (TableSchema) using [TreeCache].
-  /// Managed by MemoryManager quota: [MemoryQuotaType.schema].
+  /// Managed by ResourceManager quota: [MemoryQuotaType.schema].
   TreeCache<TableSchema>? _tableSchemaCache;
 
   /// Per-table index cache derived from [TableSchema].
@@ -47,7 +47,7 @@ class SchemaManager {
     if (existing != null) return existing;
 
     final int maxBytes =
-        _dataStore.memoryManager?.getSchemaCacheSize() ?? (50 * 1024 * 1024);
+        _dataStore.resourceManager?.getSchemaCacheSize() ?? (50 * 1024 * 1024);
     final int minBytes = 50 * 1024 * 1024;
 
     final cache = TreeCache<TableSchema>(

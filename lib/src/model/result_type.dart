@@ -43,6 +43,9 @@ enum ResultType {
   /// Index already exists
   indexExists(-14, 'Index already exists'),
 
+  /// System resources exhausted (Memory/Disk)
+  resourceExhausted(-15, 'System resources exhausted (Memory/Disk)'),
+
   // System errors (-90 ~ -99)
   /// System error
   ioError(-90, 'System error'),

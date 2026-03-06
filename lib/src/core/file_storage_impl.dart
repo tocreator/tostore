@@ -3,7 +3,6 @@ import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:convert';
 import 'dart:collection';
 import 'dart:typed_data';
-import '../handler/common.dart';
 
 import '../Interface/storage_interface.dart';
 import '../handler/logger.dart';
@@ -51,7 +50,9 @@ class FileStorageImpl implements StorageInterface {
         ? 'a'
         : (mode == FileMode.write)
             ? 'w'
-            : mode.toString();
+            : (mode == FileMode.read)
+                ? 'r'
+                : mode.toString();
     return '${p.canonicalize(path)}|$modeKey';
   }
 
@@ -78,7 +79,9 @@ class FileStorageImpl implements StorageInterface {
         final raf = e.value;
         // key format: "<normalizedPath>|<modeKey>"
         final sepIdx = key.lastIndexOf('|');
-        if (sepIdx <= 0) continue;
+        if (sepIdx <= 0) {
+          continue;
+        }
         final filePath = key.substring(0, sepIdx);
 
         // Match both the directory itself and any child paths.
@@ -103,18 +106,6 @@ class FileStorageImpl implements StorageInterface {
         await yieldController.maybeYield();
       }
     } catch (_) {}
-  }
-
-  bool _isRecoveryArtifact(String path) {
-    final normalized = p.canonicalize(path).replaceAll('\\', '/');
-    if (normalized.endsWith('.log')) {
-      return true; // WAL partitions and parallel journal
-    }
-    if (normalized.endsWith('/wal/meta.json') ||
-        normalized.contains('/wal/meta.json')) {
-      return true; // WAL meta
-    }
-    return false;
   }
 
   Future<RandomAccessFile> _getHandle(String path, FileMode mode) async {
@@ -146,7 +137,6 @@ class FileStorageImpl implements StorageInterface {
 
       if (rafToClose != null) {
         // Asynchronously close it, ensuring we respect existing locks.
-        // We use the lock queue to ensure we don't close it while in use.
         // ignore: unawaited_futures
         _withHandleLock(oldestKey, () async {
           try {
@@ -165,9 +155,26 @@ class FileStorageImpl implements StorageInterface {
     try {
       final file = File(path);
       if (await file.exists()) {
-        // flush and close all open handles under the file, avoid being occupied by delete operation
         await flushAll(path: path, closeHandles: true);
-        await file.delete();
+
+        if (Platform.isWindows) {
+          const retryDelays = [100, 300, 800, 1500];
+          for (int attempt = 0; attempt <= retryDelays.length; attempt++) {
+            try {
+              await file.delete();
+              return;
+            } on FileSystemException catch (_) {
+              if (attempt >= retryDelays.length) {
+                rethrow;
+              }
+              await flushAll(path: path, closeHandles: true);
+              await Future.delayed(
+                  Duration(milliseconds: retryDelays[attempt]));
+            }
+          }
+        } else {
+          await file.delete();
+        }
       }
     } catch (e) {
       Logger.error('Delete file failed: $e', label: 'FileStorageImpl');
@@ -180,9 +187,26 @@ class FileStorageImpl implements StorageInterface {
     try {
       final directory = Directory(path);
       if (await directory.exists()) {
-        // first flush and close all open handles under the directory and its subpaths, avoid being occupied by delete operation
         await _flushAndCloseHandlesUnderDirectory(path);
-        await directory.delete(recursive: true);
+
+        if (Platform.isWindows) {
+          const retryDelays = [200, 500, 1000, 2000];
+          for (int attempt = 0; attempt <= retryDelays.length; attempt++) {
+            try {
+              await directory.delete(recursive: true);
+              return;
+            } on FileSystemException catch (_) {
+              if (attempt >= retryDelays.length) {
+                rethrow;
+              }
+              await _flushAndCloseHandlesUnderDirectory(path);
+              await Future.delayed(
+                  Duration(milliseconds: retryDelays[attempt]));
+            }
+          }
+        } else {
+          await directory.delete(recursive: true);
+        }
       }
     } catch (e) {
       Logger.error('Delete directory failed: $e', label: 'FileStorageImpl');
@@ -218,7 +242,9 @@ class FileStorageImpl implements StorageInterface {
       {bool recursive = false}) async {
     try {
       final dir = Directory(path);
-      if (!await dir.exists()) return [];
+      if (!await dir.exists()) {
+        return [];
+      }
 
       final entries = <String>[];
       await for (final entity in dir.list(recursive: recursive)) {
@@ -249,8 +275,6 @@ class FileStorageImpl implements StorageInterface {
           await _withHandleLock(key, () async {
             try {
               await raf.flush();
-            } catch (_) {}
-            try {
               await raf.close();
             } catch (_) {}
           });
@@ -276,51 +300,27 @@ class FileStorageImpl implements StorageInterface {
         return;
       }
 
-      // Serialize operations on the same file (by logical key) to avoid
-      // concurrent async ops.
       final key = _poolKey(path, FileMode.write);
-      final usePooled = _isRecoveryArtifact(path);
       await _withHandleLock(key, () async {
-        if (usePooled) {
-          final raf = await _getHandle(path, FileMode.write);
-          try {
-            await raf.truncate(0);
-            await raf.setPosition(0);
-            await raf.writeString(content);
-            if (flush) {
-              await raf.flush();
-            }
-            // Update cached length precisely using current file position
-            try {
-              final pos = await raf.position();
-              _handleLengths[key] = pos;
-            } catch (_) {}
-          } finally {
-            if (flush && closeHandleAfterFlush) {
-              try {
-                await raf.close();
-              } catch (_) {}
-              _handlePool.remove(key);
-              _lru.remove(key);
-              _handleLengths.remove(key);
-            }
+        final raf = await _getHandle(path, FileMode.write);
+        try {
+          await raf.truncate(0);
+          await raf.setPosition(0);
+          await raf.writeString(content);
+          if (flush) {
+            await raf.flush();
           }
-        } else {
-          // Non-recovery artifact: use a short-lived handle (flush applies).
-          final file = File(path);
-          await file.parent.create(recursive: true);
-          final raf = await file.open(mode: FileMode.write);
           try {
-            await raf.truncate(0);
-            await raf.setPosition(0);
-            await raf.writeString(content);
-            if (flush) {
-              await raf.flush();
-            }
-          } finally {
+            _handleLengths[key] = await raf.position();
+          } catch (_) {}
+        } finally {
+          if (flush && closeHandleAfterFlush) {
             try {
               await raf.close();
             } catch (_) {}
+            _handlePool.remove(key);
+            _lru.remove(key);
+            _handleLengths.remove(key);
           }
         }
       });
@@ -335,44 +335,24 @@ class FileStorageImpl implements StorageInterface {
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     try {
       final key = _poolKey(path, FileMode.write);
-      final usePooled = _isRecoveryArtifact(path);
       await _withHandleLock(key, () async {
-        if (usePooled) {
-          final raf = await _getHandle(path, FileMode.write);
-          try {
-            await raf.truncate(0);
-            await raf.setPosition(0);
-            await raf.writeFrom(bytes);
-            if (flush) {
-              await raf.flush();
-            }
-            _handleLengths[key] = bytes.length;
-          } finally {
-            if (flush && closeHandleAfterFlush) {
-              try {
-                await raf.close();
-              } catch (_) {}
-              _handlePool.remove(key);
-              _lru.remove(key);
-              _handleLengths.remove(key);
-            }
+        final raf = await _getHandle(path, FileMode.write);
+        try {
+          await raf.truncate(0);
+          await raf.setPosition(0);
+          await raf.writeFrom(bytes);
+          if (flush) {
+            await raf.flush();
           }
-        } else {
-          // Non-recovery artifact: short-lived handle; flush applies if requested.
-          final file = File(path);
-          await file.parent.create(recursive: true);
-          final raf = await file.open(mode: FileMode.write);
-          try {
-            await raf.truncate(0);
-            await raf.setPosition(0);
-            await raf.writeFrom(bytes);
-            if (flush) {
-              await raf.flush();
-            }
-          } finally {
+          _handleLengths[key] = bytes.length;
+        } finally {
+          if (flush && closeHandleAfterFlush) {
             try {
               await raf.close();
             } catch (_) {}
+            _handlePool.remove(key);
+            _lru.remove(key);
+            _handleLengths.remove(key);
           }
         }
       });
@@ -385,7 +365,9 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<Uint8List> readAsBytes(String path) async {
     final file = File(path);
-    if (!await file.exists()) return Uint8List(0);
+    if (!await file.exists()) {
+      return Uint8List(0);
+    }
     return await file.readAsBytes();
   }
 
@@ -403,16 +385,22 @@ class FileStorageImpl implements StorageInterface {
       return await _withHandleLock<Uint8List>(key, () async {
         final raf = await _getHandle(path, FileMode.read);
         final fileSize = await raf.length();
-        if (start >= fileSize) return Uint8List(0);
+        if (start >= fileSize) {
+          return Uint8List(0);
+        }
         final readLen = length != null
             ? (start + length > fileSize ? fileSize - start : length)
             : fileSize - start;
-        if (readLen <= 0) return Uint8List(0);
+        if (readLen <= 0) {
+          return Uint8List(0);
+        }
         await raf.setPosition(start);
         return await raf.read(readLen);
       });
     } catch (e) {
-      if (_isFileNotFound(e)) return Uint8List(0);
+      if (_isFileNotFound(e)) {
+        return Uint8List(0);
+      }
       Logger.error('Read bytes at offset failed: $e', label: 'FileStorageImpl');
       return Uint8List(0);
     }
@@ -426,7 +414,9 @@ class FileStorageImpl implements StorageInterface {
     bool flush = true,
     bool closeHandleAfterFlush = false,
   }) async {
-    if (bytes.isEmpty) return;
+    if (bytes.isEmpty) {
+      return;
+    }
     await writeManyAsBytesAt(
       path,
       <ByteWrite>[ByteWrite(offset: start, bytes: bytes)],
@@ -442,9 +432,9 @@ class FileStorageImpl implements StorageInterface {
     bool flush = true,
     bool closeHandleAfterFlush = false,
   }) async {
-    if (writes.isEmpty) return;
-
-    // Validate and copy for sorting without mutating caller list.
+    if (writes.isEmpty) {
+      return;
+    }
     final items = <_WriteSpan>[
       for (int i = 0; i < writes.length; i++)
         _WriteSpan(offset: writes[i].offset, bytes: writes[i].bytes, order: i),
@@ -454,24 +444,20 @@ class FileStorageImpl implements StorageInterface {
         throw ArgumentError.value(s.offset, 'offset', 'must be >= 0');
       }
     }
-
-    // Sort by offset; tie-break by original order for determinism.
     items.sort((a, b) {
       final c = a.offset.compareTo(b.offset);
       return c != 0 ? c : a.order.compareTo(b.order);
     });
-
-    // Strict overlap check (database-grade determinism).
     int lastEnd = -1;
     for (final s in items) {
-      if (s.bytes.isEmpty) continue;
+      if (s.bytes.isEmpty) {
+        continue;
+      }
       if (lastEnd >= 0 && s.offset < lastEnd) {
-        throw StateError(
-            'Overlapping write spans for $path: offset=${s.offset} < lastEnd=$lastEnd');
+        throw StateError('Overlapping write spans for $path');
       }
       lastEnd = s.offset + s.bytes.length;
     }
-
     try {
       // Always use pooled handle for random writes to enable delayed flush batching.
       // Use FileMode.append to avoid truncation while allowing random access seeking.
@@ -488,23 +474,23 @@ class FileStorageImpl implements StorageInterface {
             }
             _handleLengths[key] = cachedLen;
           }
-
           int currentPos = -1;
           int maxEnd = cachedLen;
-
           for (final s in items) {
             final data = s.bytes;
-            if (data.isEmpty) continue;
-
+            if (data.isEmpty) {
+              continue;
+            }
             if (currentPos != s.offset) {
               await raf.setPosition(s.offset);
               currentPos = s.offset;
             }
             await raf.writeFrom(data);
             currentPos += data.length;
-            if (currentPos > maxEnd) maxEnd = currentPos;
+            if (currentPos > maxEnd) {
+              maxEnd = currentPos;
+            }
           }
-
           if (flush) {
             await raf.flush();
           }
@@ -523,7 +509,7 @@ class FileStorageImpl implements StorageInterface {
         }
       });
     } catch (e) {
-      Logger.error('Write bytes at offsets failed: $e',
+      Logger.error('Write many bytes at offsets failed: $e',
           label: 'FileStorageImpl.writeManyAsBytesAt');
       rethrow;
     }
@@ -533,7 +519,9 @@ class FileStorageImpl implements StorageInterface {
   Future<String?> readAsString(String path) async {
     try {
       final file = File(path);
-      if (!await file.exists()) return null;
+      if (!await file.exists()) {
+        return null;
+      }
       return await file.readAsString();
     } catch (e) {
       Logger.error('Read string failed: $e', label: 'FileStorageImpl');
@@ -545,8 +533,9 @@ class FileStorageImpl implements StorageInterface {
   Future<DateTime?> getFileCreationTime(String path) async {
     try {
       final file = File(path);
-      if (!await file.exists()) return null;
-
+      if (!await file.exists()) {
+        return null;
+      }
       final stat = await file.stat();
       return stat.modified;
     } catch (e) {
@@ -559,14 +548,18 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<int> getFileSize(String path) async {
     final file = File(path);
-    if (!await file.exists()) return 0;
+    if (!await file.exists()) {
+      return 0;
+    }
     return await file.length();
   }
 
   @override
   Future<DateTime?> getFileModifiedTime(String path) async {
     final file = File(path);
-    if (!await file.exists()) return null;
+    if (!await file.exists()) {
+      return null;
+    }
     return await file.lastModified();
   }
 
@@ -582,12 +575,12 @@ class FileStorageImpl implements StorageInterface {
       await for (final entity in sourceDir.list(recursive: true)) {
         if (entity is File) {
           final relativePath = entity.path.substring(sourcePath.length);
-          final newPath = pathJoin(destinationPath, relativePath);
+          final newPath = p.join(destinationPath, relativePath);
           await Directory(p.dirname(newPath)).create(recursive: true);
           await entity.copy(newPath);
         } else if (entity is Directory) {
           final relativePath = entity.path.substring(sourcePath.length);
-          final newDirPath = pathJoin(destinationPath, relativePath);
+          final newDirPath = p.join(destinationPath, relativePath);
           await Directory(newDirPath).create(recursive: true);
         }
       }
@@ -603,12 +596,9 @@ class FileStorageImpl implements StorageInterface {
     try {
       final srcFile = File(sourcePath);
       if (!await srcFile.exists()) {
-        Logger.error('Source file does not exist',
-            label: 'FileStorageImpl.copyFile');
         return;
       }
-      final destDir = Directory(p.dirname(destinationPath));
-      await destDir.create(recursive: true);
+      await Directory(p.dirname(destinationPath)).create(recursive: true);
       await srcFile.copy(destinationPath);
     } catch (e) {
       Logger.error('Copy file failed: $e', label: 'FileStorageImpl.copyFile');
@@ -618,30 +608,57 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   Stream<String> readLinesStream(String path, {int offset = 0}) {
-    final controller = StreamController<String>();
+    late StreamController<String> controller;
 
-    StreamSubscription? subscription;
+    controller = StreamController<String>(
+      onListen: () async {
+        try {
+          final file = File(path);
+          if (!await file.exists()) {
+            await controller.close();
+            return;
+          }
+          final key = _poolKey(path, FileMode.read);
 
-    controller.onListen = () {
-      subscription = File(path)
-          .openRead()
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .skip(offset)
-          .listen(
-            (line) => controller.add(line),
-            onError: (e) {
-              Logger.error('Read lines stream failed: $e',
-                  label: 'FileStorageImpl');
-              controller.addError(e);
-            },
-            onDone: () => controller.close(),
-          );
-    };
+          await _withHandleLock(key, () async {
+            try {
+              final raf = await _getHandle(path, FileMode.read);
+              await raf.setPosition(offset);
+              final length = await raf.length();
+              final List<int> buffer = [];
+              const int chunkSize = 64 * 1024;
 
-    controller.onCancel = () async {
-      await subscription?.cancel();
-    };
+              while ((await raf.position()) < length && !controller.isClosed) {
+                final bytes = await raf.read(chunkSize);
+                if (bytes.isEmpty) {
+                  break;
+                }
+                for (int i = 0; i < bytes.length; i++) {
+                  if (bytes[i] == 10) {
+                    controller.add(utf8.decode(buffer));
+                    buffer.clear();
+                  } else if (bytes[i] != 13) {
+                    buffer.add(bytes[i]);
+                  }
+                }
+              }
+              if (buffer.isNotEmpty && !controller.isClosed) {
+                controller.add(utf8.decode(buffer));
+              }
+            } finally {
+              if (!controller.isClosed) {
+                await controller.close();
+              }
+            }
+          });
+        } catch (e) {
+          if (!controller.isClosed) {
+            controller.addError(e);
+            await controller.close();
+          }
+        }
+      },
+    );
 
     return controller.stream;
   }
@@ -649,186 +666,113 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<void> writeLinesStream(String path, Stream<String> lines,
       {bool append = false}) async {
-    try {
-      final file = File(path);
-      await file.parent.create(recursive: true);
-      final sink =
-          file.openWrite(mode: append ? FileMode.append : FileMode.write);
-
+    final mode = append ? FileMode.append : FileMode.write;
+    final key = _poolKey(path, mode);
+    await _withHandleLock(key, () async {
       try {
-        await for (final line in lines) {
-          sink.writeln(line);
+        final raf = await _getHandle(path, mode);
+        if (!append) {
+          await raf.setPosition(0);
         }
-        await sink.flush();
-      } finally {
-        await sink.close();
+        await for (final line in lines) {
+          await raf.writeString('$line\n');
+        }
+        await raf.flush();
+      } catch (e) {
+        Logger.error('Write lines stream failed: $path, error: $e',
+            label: 'FileStorageImpl');
+        rethrow;
       }
-    } catch (e) {
-      Logger.error('Write lines stream failed: $e', label: 'FileStorageImpl');
-      rethrow;
-    }
+    });
   }
 
-  /// Creates directory if it doesn't already exist
   @override
   Future<void> ensureDirectoryExists(String path) async {
-    try {
-      final directory = Directory(path);
-      if (!await directory.exists()) {
-        await directory.create(recursive: true);
-      }
-    } catch (e) {
-      Logger.error('Ensure directory exists failed: $e',
-          label: 'FileStorageImpl.ensureDirectoryExists');
-      rethrow;
-    }
+    await Directory(path).create(recursive: true);
   }
 
   @override
   Future<int> appendBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
-    try {
-      final key = _poolKey(path, FileMode.append);
-      return await _withHandleLock<int>(key, () async {
-        final raf = await _getHandle(path, FileMode.append);
-        try {
-          // Initialize cached length lazily to avoid repeated length() calls
-          int? cached = _handleLengths[key];
-          if (cached == null) {
-            try {
-              cached = await raf.length();
-            } catch (_) {
-              cached = 0;
-            }
-            _handleLengths[key] = cached;
-          }
-          final offset = cached;
-          // IMPORTANT: Do not assume file position is at EOF.
-          // Other operations (e.g., random writes) may have moved it.
-          try {
-            await raf.setPosition(offset);
-          } catch (_) {}
-          await raf.writeFrom(bytes);
-          if (flush) {
-            await raf.flush();
-          }
-          _handleLengths[key] = cached + bytes.length;
-          if (flush && closeHandleAfterFlush) {
-            try {
-              await raf.close();
-            } catch (_) {}
-            _handlePool.remove(key);
-            _lru.remove(key);
-            _handleLengths.remove(key);
-          }
-          return offset;
-        } catch (e) {
-          _handleLengths.remove(key);
-          rethrow;
-        }
-      });
-    } catch (e) {
-      Logger.error('Append bytes failed: $e', label: 'FileStorageImpl');
-      rethrow;
-    }
+    final key = _poolKey(path, FileMode.append);
+    return await _withHandleLock<int>(key, () async {
+      final raf = await _getHandle(path, FileMode.append);
+      int? cached = _handleLengths[key];
+      if (cached == null) {
+        cached = await raf.length();
+        _handleLengths[key] = cached;
+      }
+      final offset = cached;
+      await raf.setPosition(offset);
+      await raf.writeFrom(bytes);
+      if (flush) {
+        await raf.flush();
+      }
+      _handleLengths[key] = offset + bytes.length;
+      if (flush && closeHandleAfterFlush) {
+        await raf.close();
+        _handlePool.remove(key);
+        _lru.remove(key);
+        _handleLengths.remove(key);
+      }
+      return offset;
+    });
   }
 
   @override
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
-    try {
-      final key = _poolKey(path, FileMode.append);
-      return await _withHandleLock<int>(key, () async {
-        final raf = await _getHandle(path, FileMode.append);
-        try {
-          // Initialize cached length lazily to avoid repeated length() calls
-          int? cached = _handleLengths[key];
-          if (cached == null) {
-            try {
-              cached = await raf.length();
-            } catch (_) {
-              cached = 0;
-            }
-            _handleLengths[key] = cached;
-          }
-          final offset = cached;
-          // IMPORTANT: Do not assume file position is at EOF.
-          try {
-            await raf.setPosition(offset);
-          } catch (_) {}
-          await raf.writeString(content);
-          if (flush) {
-            await raf.flush();
-          }
-          // Update cached length using current file position for accuracy
-          try {
-            final pos = await raf.position();
-            _handleLengths[key] = pos;
-          } catch (_) {
-            // Fallback to approximate increment by content bytes if position() fails
-            try {
-              _handleLengths[key] = offset + utf8.encode(content).length;
-            } catch (_) {}
-          }
-          return offset;
-        } finally {
-          if (flush && closeHandleAfterFlush) {
-            try {
-              await raf.close();
-            } catch (_) {}
-            _handlePool.remove(key);
-            _lru.remove(key);
-            _handleLengths.remove(key);
-          }
-        }
-      });
-    } catch (e) {
-      Logger.error('Append string failed: $e', label: 'FileStorageImpl');
-      rethrow;
-    }
+    final key = _poolKey(path, FileMode.append);
+    return await _withHandleLock<int>(key, () async {
+      final raf = await _getHandle(path, FileMode.append);
+      int? cached = _handleLengths[key];
+      if (cached == null) {
+        cached = await raf.length();
+        _handleLengths[key] = cached;
+      }
+      final offset = cached;
+      await raf.setPosition(offset);
+      await raf.writeString(content);
+      if (flush) {
+        await raf.flush();
+      }
+      try {
+        _handleLengths[key] = await raf.position();
+      } catch (_) {}
+      if (flush && closeHandleAfterFlush) {
+        await raf.close();
+        _handlePool.remove(key);
+        _lru.remove(key);
+        _handleLengths.remove(key);
+      }
+      return offset;
+    });
   }
 
   @override
   Future<List<String>> readAsLines(String path, {int offset = 0}) async {
-    try {
-      final file = File(path);
-      if (!await file.exists()) {
-        return [];
-      }
-      // openRead can create a read stream starting from a specified byte offset
-      return file
-          .openRead(offset)
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .toList();
-    } catch (e) {
-      Logger.error('Read as lines failed: $e', label: 'FileStorageImpl');
-      return [];
-    }
+    final stream = readLinesStream(path, offset: offset);
+    return await stream.toList();
   }
 
   @override
   Future<void> flushFile(String path) async {
     try {
       final normalizedPath = p.canonicalize(path);
-      // Iterate over all open handles and find those matching the path
       final entries = _handlePool.entries.toList();
       for (final e in entries) {
         final key = e.key;
         final raf = e.value;
-        // key format: "<normalizedPath>|<modeKey>"
         final sepIdx = key.lastIndexOf('|');
-        if (sepIdx <= 0) continue;
+        if (sepIdx <= 0) {
+          continue;
+        }
         final filePath = key.substring(0, sepIdx);
-
         if (filePath == normalizedPath) {
           await _withHandleLock(key, () async {
             try {
               await raf.flush();
-            } catch (e) {
-              Logger.warn('Flush file handle failed for $path: $e',
-                  label: 'FileStorageImpl.flushFile');
-            }
+            } catch (_) {}
           });
         }
       }
@@ -841,71 +785,16 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
+    const candidateModes = [FileMode.read, FileMode.write, FileMode.append];
     try {
       if (paths != null && paths.isNotEmpty) {
         final yieldController = YieldController('storage_flush_paths');
         for (final pth in paths) {
           final normalized = p.canonicalize(pth);
-          const List<FileMode> candidateModes = [
-            FileMode.write,
-            FileMode.append
-          ];
           for (final mode in candidateModes) {
             final key = _poolKey(normalized, mode);
             final raf = _handlePool[key];
             if (raf != null) {
-              try {
-                await _withHandleLock(key, () async {
-                  try {
-                    await raf.flush();
-                  } catch (_) {}
-                  if (closeHandles) {
-                    try {
-                      await raf.close();
-                    } catch (_) {}
-                    _handlePool.remove(key);
-                    _lru.remove(key);
-                    _handleLengths.remove(key);
-                  }
-                });
-              } catch (_) {}
-            }
-          }
-          await yieldController.maybeYield();
-        }
-      } else if (path == null) {
-        // Snapshot current handles to avoid concurrent modification during eviction/open
-        final entries = _handlePool.entries.toList();
-        final yieldController = YieldController('storage_flush_all');
-        for (final e in entries) {
-          final key = e.key;
-          final raf = e.value;
-          try {
-            await _withHandleLock(key, () async {
-              try {
-                await raf.flush();
-              } catch (_) {}
-              if (closeHandles) {
-                try {
-                  await raf.close();
-                } catch (_) {}
-                _handlePool.remove(key);
-                _lru.remove(key);
-                _handleLengths.remove(key);
-              }
-            });
-          } catch (_) {}
-          await yieldController.maybeYield();
-        }
-      } else {
-        final normalized = p.canonicalize(path);
-        // Try the two common modes directly to avoid scanning the entire pool
-        const List<FileMode> candidateModes = [FileMode.write, FileMode.append];
-        for (final mode in candidateModes) {
-          final key = _poolKey(normalized, mode);
-          final raf = _handlePool[key];
-          if (raf != null) {
-            try {
               await _withHandleLock(key, () async {
                 try {
                   await raf.flush();
@@ -919,7 +808,51 @@ class FileStorageImpl implements StorageInterface {
                   _handleLengths.remove(key);
                 }
               });
+            }
+          }
+          await yieldController.maybeYield();
+        }
+      } else if (path == null) {
+        // Snapshot current handles to avoid concurrent modification during eviction/open
+        final entries = _handlePool.entries.toList();
+        final yieldController = YieldController('storage_flush_all');
+        for (final e in entries) {
+          final key = e.key;
+          final raf = e.value;
+          await _withHandleLock(key, () async {
+            try {
+              await raf.flush();
             } catch (_) {}
+            if (closeHandles) {
+              try {
+                await raf.close();
+              } catch (_) {}
+              _handlePool.remove(key);
+              _lru.remove(key);
+              _handleLengths.remove(key);
+            }
+          });
+          await yieldController.maybeYield();
+        }
+      } else {
+        final normalized = p.canonicalize(path);
+        for (final mode in candidateModes) {
+          final key = _poolKey(normalized, mode);
+          final raf = _handlePool[key];
+          if (raf != null) {
+            await _withHandleLock(key, () async {
+              try {
+                await raf.flush();
+              } catch (_) {}
+              if (closeHandles) {
+                try {
+                  await raf.close();
+                } catch (_) {}
+                _handlePool.remove(key);
+                _lru.remove(key);
+                _handleLengths.remove(key);
+              }
+            });
           }
         }
       }
@@ -940,24 +873,68 @@ class FileStorageImpl implements StorageInterface {
     try {
       final tmpFile = File(tempPath);
       if (!await tmpFile.exists()) {
-        throw FileSystemException('Temp file does not exist', tempPath);
+        throw FileSystemException('Temporary file does not exist', tempPath);
       }
-      // Ensure destination directory exists
-      await Directory(p.dirname(finalPath)).create(recursive: true);
-      try {
-        // Attempt atomic rename (same volume)
-        // Ensure destination file is not occupied by us
-        await flushAll(path: finalPath, closeHandles: true);
-        await tmpFile.rename(finalPath);
-      } on FileSystemException catch (_) {
-        // Fallback: delete destination first (best-effort), then rename
+      await flushAll(path: finalPath, closeHandles: true);
+      await flushAll(path: tempPath, closeHandles: true);
+
+      const retryDelays = [50, 150, 400, 800, 1500];
+      for (int attempt = 0; attempt <= retryDelays.length; attempt++) {
         try {
-          final dst = File(finalPath);
-          if (await dst.exists()) {
-            await dst.delete();
+          if (Platform.isWindows) {
+            final dst = File(finalPath);
+            if (await dst.exists()) {
+              try {
+                await dst.delete();
+              } catch (e) {
+                // If delete fails on Windows, it's often due to a lingering handle.
+                // Try one more aggressive flush before giving up on this attempt.
+                await flushAll(path: finalPath, closeHandles: true);
+                if (attempt >= retryDelays.length) rethrow;
+              }
+            } else {
+              await dst.parent.create(recursive: true);
+            }
+          } else {
+            await File(finalPath).parent.create(recursive: true);
           }
-        } catch (_) {}
-        await tmpFile.rename(finalPath);
+
+          // Before rename, ensure no one else opened a handle in the tiny window
+          if (Platform.isWindows) {
+            await flushAll(path: finalPath, closeHandles: true);
+            await flushAll(path: tempPath, closeHandles: true);
+          }
+
+          // Try to rename
+          try {
+            await tmpFile.rename(finalPath);
+          } catch (e) {
+            if (Platform.isWindows &&
+                e is FileSystemException &&
+                (e.osError?.errorCode == 32 || e.osError?.errorCode == 5)) {
+              // On Windows, sharing violations (32) or access denied (5)
+              // often mean handles are still closing.
+              await flushAll(path: finalPath, closeHandles: true);
+              await flushAll(path: tempPath, closeHandles: true);
+              await Future.delayed(const Duration(milliseconds: 20));
+              await tmpFile.rename(finalPath);
+            } else {
+              rethrow;
+            }
+          }
+          return;
+        } on FileSystemException catch (e) {
+          if (attempt >= retryDelays.length) {
+            rethrow;
+          }
+          // Log transient error but continue retrying
+          Logger.warn('Atomic replace transient failure (attempt $attempt): $e',
+              label: 'FileStorageImpl');
+
+          await flushAll(path: finalPath, closeHandles: true);
+          await flushAll(path: tempPath, closeHandles: true);
+          await Future.delayed(Duration(milliseconds: retryDelays[attempt]));
+        }
       }
     } catch (e) {
       Logger.error('Atomic replace failed: $e', label: 'FileStorageImpl');

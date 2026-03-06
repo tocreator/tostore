@@ -39,8 +39,8 @@ class QueryExecutor {
     this._dataStore,
     this._indexManager,
   ) {
-    final mem = _dataStore.memoryManager;
-    final int maxBytes = mem?.getQueryCacheSize() ?? (50 * 1024 * 1024);
+    final res = _dataStore.resourceManager;
+    final int maxBytes = res?.getQueryCacheSize() ?? (50 * 1024 * 1024);
     _queryCache = TreeCache<_QueryCacheEntry>(
       sizeCalculator: (e) => e.sizeBytes,
       maxByteThreshold: maxBytes,

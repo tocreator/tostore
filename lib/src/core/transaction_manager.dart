@@ -159,8 +159,8 @@ class TransactionManager {
     // Initialize TreeCache for recent committed writes (SSI index)
     // Key format: [tableName, pk], Value: lastCommitTimeMillis (int)
     // Using TreeCache for automatic LRU eviction in large-scale data scenarios
-    final memoryManager = _dataStore.memoryManager;
-    final cacheSize = memoryManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
+    final resourceManager = _dataStore.resourceManager;
+    final cacheSize = resourceManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
     // Allocate 10% of meta cache for transaction SSI index
     final int maxBytes = (cacheSize * 0.10).toInt();
     _recentCommittedWrites = TreeCache<int>(

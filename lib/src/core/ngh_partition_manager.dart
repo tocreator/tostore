@@ -93,7 +93,7 @@ final class NghPartitionManager {
 
   NghPartitionManager(this._dataStore) {
     final indexBudget =
-        _dataStore.memoryManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
+        _dataStore.resourceManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
     _initCaches(indexBudget);
   }
 
@@ -300,7 +300,7 @@ final class NghPartitionManager {
       if (_graphPageCache.isFullyCached(prefix)) return;
       if (meta.totalVectors <= 0) return;
       final indexBudget =
-          _dataStore.memoryManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
+          _dataStore.resourceManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
       final nghBudget = (indexBudget * 0.15).round();
       // Use single-cache budget so preloaded data fits in each of graph/pq
       // caches and is not evicted by cleanup (each cache has max nghBudget).

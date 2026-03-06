@@ -4,6 +4,7 @@ import '../handler/logger.dart';
 import 'crontab_manager.dart';
 import 'transaction_context.dart';
 import 'dart:math';
+import 'package:path/path.dart' as p;
 
 /// Database lock manager optimized for large-scale scenarios
 ///
@@ -36,6 +37,10 @@ class LockManager {
 
   /// Hierarchical lock tracking for better granularity
   final Map<String, Set<String>> _resourceHierarchy = {};
+
+  /// Tracks number of active locks (any type) in descendant paths for hierarchical locking.
+  /// Key is a path prefix (directory), value is the sum of locks held by descendants.
+  final Map<String, int> _descendantLockCounts = {};
 
   /// Deadlock detection cycle counter
   int _deadlockDetectionCycle = 0;
@@ -571,6 +576,9 @@ class LockManager {
       // Grant the lock
       resource.addLock(request);
 
+      // --- Hierarchical Locking: Update parent counts ---
+      _updateDescendantCounts(request.resource, 1);
+
       // Only complete if not already completed to avoid "Future already completed" error
       if (!request.completer.isCompleted) {
         try {
@@ -597,18 +605,61 @@ class LockManager {
       return false;
     }
 
-    // If no active locks, can always grant
+    // --- Hierarchical Locking Check ---
+
+    // 1. Ancestor Check: Cannot grant ANY lock if any parent directory has an EXCLUSIVE lock.
+    // Example: If 'a/b' has an exclusive lock, we cannot grant shared/exclusive lock on 'a/b/c'.
+    String resourceName = request.resource;
+    String? prefix;
+    String path = resourceName;
+
+    if (resourceName.startsWith('path-') &&
+        !resourceName.startsWith('path-hash-')) {
+      prefix = 'path-';
+      path = resourceName.substring(5);
+    }
+
+    if (prefix != null) {
+      String parentPath = p.dirname(path);
+      // Loop until we reach root or no further parents
+      while (parentPath != path &&
+          parentPath != '.' &&
+          parentPath != '/' &&
+          parentPath.length > 1) {
+        final parentResourceName = '$prefix$parentPath';
+        final parentResource = _activeLocks[parentResourceName];
+        if (parentResource != null && parentResource.exclusiveLock != null) {
+          return false;
+        }
+        final nextParent = p.dirname(parentPath);
+        if (nextParent == parentPath) break;
+        parentPath = nextParent;
+      }
+    }
+
+    // 2. Descendant Check: Cannot grant EXCLUSIVE lock if any descendant has ANY lock.
+    // Example: If 'a/b/c' has a shared lock, we cannot grant exclusive lock on 'a/b'.
+    if (request.lockType == LockType.exclusive) {
+      final descendantCount = _descendantLockCounts[request.resource] ?? 0;
+      if (descendantCount > 0) {
+        // There are active locks in sub-paths
+        return false;
+      }
+    }
+
+    // --- Standard Resource-level Check ---
+    // If no active locks at this exact path, can grant (given it passed hierarchical checks above)
     if (resource.sharedLocks.isEmpty && resource.exclusiveLock == null) {
       return true;
     }
 
     switch (request.lockType) {
       case LockType.shared:
-        // Shared lock can be granted if there's no exclusive lock
+        // Shared lock can be granted if there's no exclusive lock at this exact path
         return resource.exclusiveLock == null;
 
       case LockType.exclusive:
-        // Exclusive lock can only be granted if there are no active locks
+        // Exclusive lock can only be granted if there are no active locks at this exact path
         return resource.sharedLocks.isEmpty && resource.exclusiveLock == null;
     }
   }
@@ -722,6 +773,9 @@ class LockManager {
 
     // Remove the lock
     lockResource.removeLock(request);
+
+    // --- Hierarchical Locking: Update parent counts ---
+    _updateDescendantCounts(resource, -1);
 
     // Remove from resource queue if still there
     final resourceQueue = _resourceQueues[resource];
@@ -1036,6 +1090,39 @@ class LockManager {
     // Remove unified management task from crontab manager
     CrontabManager.removeCallback(
         ExecuteInterval.minutes5, _unifiedManagementTask);
+  }
+
+  /// Update lock counts for all parent paths of [path]
+  void _updateDescendantCounts(String resource, int delta) {
+    String? prefix;
+    String path = resource;
+
+    if (resource.startsWith('path-') && !resource.startsWith('path-hash-')) {
+      prefix = 'path-';
+      path = resource.substring(5);
+    }
+
+    if (prefix != null) {
+      String parentPath = p.dirname(path);
+      while (parentPath != path &&
+          parentPath != '.' &&
+          parentPath != '/' &&
+          parentPath.length > 1) {
+        final parentResourceName = '$prefix$parentPath';
+        final count = (_descendantLockCounts[parentResourceName] ?? 0) + delta;
+
+        if (count <= 0) {
+          _descendantLockCounts.remove(parentResourceName);
+          _processResourceQueue(parentResourceName);
+        } else {
+          _descendantLockCounts[parentResourceName] = count;
+        }
+
+        final nextParent = p.dirname(parentPath);
+        if (nextParent == parentPath) break;
+        parentPath = nextParent;
+      }
+    }
   }
 }
 

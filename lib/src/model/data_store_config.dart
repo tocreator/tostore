@@ -264,13 +264,13 @@ class DataStoreConfig {
     if (PlatformHandler.isWeb) {
       return 1000;
     } else if (PlatformHandler.isMobile) {
-      return 2000;
+      return 10000;
     } else if (PlatformHandler.isServerEnvironment) {
       // Server: higher throughput
-      return 10000;
+      return 100000;
     } else {
       // Desktop
-      return 5000;
+      return 20000;
     }
   }
 

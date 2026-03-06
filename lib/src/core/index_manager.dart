@@ -56,18 +56,17 @@ class IndexManager {
       '$tableName#$indexName';
 
   IndexManager(this._dataStore) {
-    final memoryManager = _dataStore.memoryManager;
-    final indexCacheSize = memoryManager?.getIndexCacheSize() ??
-        100 * 1024 * 1024; // Default 100MB
+    final res = _dataStore.resourceManager;
+    final int maxBytes = res?.getIndexCacheSize() ?? (50 * 1024 * 1024);
     final metaCacheSize =
-        memoryManager?.getMetaCacheSize() ?? 100 * 1024 * 1024; // Default 100MB
+        res?.getMetaCacheSize() ?? 100 * 1024 * 1024; // Default 100MB
     final indexMetaCacheSize =
         (metaCacheSize * 0.25).toInt(); // 25% of meta cache
 
     // Initialize index data cache
     _indexDataCache = TreeCache<dynamic>(
       sizeCalculator: _estimateIndexDataSize,
-      maxByteThreshold: (indexCacheSize * 0.70).toInt(),
+      maxByteThreshold: (maxBytes * 0.70).toInt(),
       minByteThreshold: 150 * 1024 * 1024,
       groupDepth: 2,
       comparatorFactory: _indexComparatorFactory,
@@ -2231,7 +2230,7 @@ class IndexManager {
           if (pk == null) return IndexSearchResult.empty();
 
           // Hotspot populate: Use Native Key (if not disabled)
-          if (!(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+          if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
             _indexDataCache.put([tableName, indexName, ...nativeVal], pk);
           }
 
@@ -2259,7 +2258,7 @@ class IndexManager {
 
         if (!isUnique && limit == null && offset == null && !hasCursorKey) {
           // Hotspot populate (non-unique): cache one entry per PK.
-          if (!(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+          if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
             final prefixKey = <dynamic>[tableName, indexName, ...nativeVal];
             final yc = YieldController('IndexManager.hotspotPopulateNonUnique');
             for (final pk in res.primaryKeys) {
@@ -2566,7 +2565,7 @@ class IndexManager {
               if (!usedCache &&
                   nativeVal != null &&
                   !hasCursorKey &&
-                  !(_dataStore.memoryManager?.isLowMemoryMode ?? false)) {
+                  !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
                 if (isUnique) {
                   if (res.primaryKeys.isNotEmpty) {
                     _indexDataCache.put([tableName, indexName, ...nativeVal],
