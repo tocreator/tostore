@@ -807,9 +807,6 @@ class TostoreExample {
     // Chunk size for data generation to avoid OOM
     const int batchSize = 200000;
 
-    logService.add(
-        'Starting batch insert of $count records into "$tableName" (Chunk size: $batchSize)...');
-
     while (processedCount < count) {
       final currentBatchSize = min(batchSize, count - processedCount);
       final records = <Map<String, dynamic>>[];
@@ -855,9 +852,6 @@ class TostoreExample {
 
     logService.add('Batch insert $count records into "$tableName" completed. '
         'DB Time: ${dbElapsed}ms, Total Time: ${totalElapsed}ms');
-
-    final queryResult = await db.query(tableName).count();
-    logService.add('query current table "$tableName" count: $queryResult');
     return dbElapsed;
   }
 
@@ -869,8 +863,6 @@ class TostoreExample {
     Map<String, ForeignKeyMode>? foreignKeyModes,
     Map<String, List<dynamic>>? foreignKeyIdLists,
   }) async {
-    logService
-        .add('Starting to add $count records to "$tableName" one by one...');
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
       logService.add(
@@ -906,7 +898,6 @@ class TostoreExample {
     }
 
     // Pre-generate data to measure insert performance accurately (excluding data generation time)
-    logService.add('Generating $count records for one-by-one insertion...');
     final records = <Map<String, dynamic>>[];
     for (var i = 0; i < count; i++) {
       records.add(_generateRecord(
@@ -942,8 +933,6 @@ class TostoreExample {
     final elapsed = stopwatch.elapsedMilliseconds;
     logService.add(
         'Finished adding $count records to "$tableName" one-by-one. DB Time: ${elapsed}ms');
-    final queryResult = await db.query(tableName).count();
-    logService.add('query current table "$tableName" count: $queryResult');
     return elapsed;
   }
 

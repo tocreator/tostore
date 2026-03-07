@@ -547,7 +547,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       final result = await Process.run('powershell', [
         '-Command',
         '(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB'
-      ]);
+      ]).timeout(const Duration(seconds: 2));
 
       if (result.exitCode == 0 && result.stdout != null) {
         // Parse the result (PowerShell returns MB value with decimal point)
@@ -581,7 +581,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       final result = await Process.run('powershell', [
         '-Command',
         '(Get-Counter "\\Memory\\Available MBytes").CounterSamples[0].CookedValue'
-      ]);
+      ]).timeout(const Duration(seconds: 2));
 
       if (result.exitCode == 0 && result.stdout != null) {
         final memoryMB = double.tryParse((result.stdout as String).trim());
@@ -594,7 +594,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       final fallbackResult = await Process.run('powershell', [
         '-Command',
         '(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1KB'
-      ]);
+      ]).timeout(const Duration(seconds: 2));
 
       if (fallbackResult.exitCode == 0 && fallbackResult.stdout != null) {
         final memoryKB =
@@ -836,19 +836,6 @@ class PlatformHandlerImpl implements PlatformInterface {
         }
       }
 
-      // If direct file reading fails, use command line tool
-      final result = await Process.run('cat', ['/proc/meminfo']);
-      if (result.exitCode == 0 && result.stdout != null) {
-        final contents = result.stdout as String;
-        final memTotalMatch =
-            RegExp(r'MemTotal:\s+(\d+) kB').firstMatch(contents);
-
-        if (memTotalMatch != null) {
-          final memKB = int.tryParse(memTotalMatch.group(1) ?? '0') ?? 0;
-          return (memKB / 1024).round(); // Convert to MB
-        }
-      }
-
       // Core count estimate
       return processorCores <= 4 ? 2048 : 4096;
     } catch (e) {
@@ -889,20 +876,6 @@ class PlatformHandlerImpl implements PlatformInterface {
 
           return ((memFreeKB + buffersKB + cachedKB) / 1024)
               .round(); // Convert to MB
-        }
-      }
-
-      // If file reading fails, try using command line tool
-      final result = await Process.run('cat', ['/proc/meminfo']);
-      if (result.exitCode == 0 && result.stdout != null) {
-        final contents = result.stdout as String;
-
-        final memAvailableMatch =
-            RegExp(r'MemAvailable:\s+(\d+) kB').firstMatch(contents);
-
-        if (memAvailableMatch != null) {
-          final memKB = int.tryParse(memAvailableMatch.group(1) ?? '0') ?? 0;
-          return (memKB / 1024).round(); // Convert to MB
         }
       }
 

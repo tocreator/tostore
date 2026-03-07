@@ -233,20 +233,11 @@ class SystemFfiHelper {
   }
 
   static int _getPosixAvailableMemory() {
-    if (_libc == null || !_isPosix) return 0;
-    final sysinfoFunc = _libc!.lookupFunction<Int32 Function(Pointer<SYSINFO>),
-        int Function(Pointer<SYSINFO>)>('sysinfo');
-
-    final info = calloc<SYSINFO>();
-    try {
-      if (sysinfoFunc(info) == 0) {
-        final avail =
-            (info.ref.freeram + info.ref.bufferram) * info.ref.memUnit;
-        return (avail / (1024 * 1024)).round();
-      }
-    } finally {
-      calloc.free(info);
-    }
+    // sysinfo() does not provide 'cached' memory, which is a major part
+    // of available memory on Linux/Android. Using freeram + bufferram
+    // drastically underestimates available memory (e.g., 100MB instead of 1000MB).
+    // Therefore, we must return 0 here to force fallback to /proc/meminfo parsing
+    // in platform_handler_impl.dart.
     return 0;
   }
 
@@ -299,11 +290,11 @@ base class MEMORYSTATUSEX extends Struct {
 base class SYSINFO extends Struct {
   @Long()
   external int uptime;
-  @Uint64()
+  @UnsignedLong()
   external int loads1;
-  @Uint64()
+  @UnsignedLong()
   external int loads5;
-  @Uint64()
+  @UnsignedLong()
   external int loads15;
   @UnsignedLong()
   external int totalram;
