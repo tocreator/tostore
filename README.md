@@ -2,7 +2,9 @@
   <img src="doc/resource/logo-tostore.svg" width="400" alt="Tostore">
 </p>
 
-<hr>
+<p align="center">
+  <img src="doc/resource/divider.svg" width="600">
+</p>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
