@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="doc/resource/logo-tostore.svg" width="400" alt="Tostore Logo">
+  <img src="doc/resource/logo-tostore.svg" width="400" alt="Tostore">
 </p>
+
+<hr>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
@@ -16,8 +18,19 @@
 </p>
 
 <p align="center">
-  English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/translations/README.ja.md) | [한국어](doc/translations/README.ko.md) | [Español](doc/translations/README.es.md) | [Português (Brasil)](doc/translations/README.pt-BR.md) | [Русский](doc/translations/README.ru.md) | [Deutsch](doc/translations/README.de.md) | [Français](doc/translations/README.fr.md) | [Italiano](doc/translations/README.it.md) | [Türkçe](doc/translations/README.tr.md)
+  English | 
+  <a href="doc/translations/README.zh-CN.md">简体中文</a> | 
+  <a href="doc/translations/README.ja.md">日本語</a> | 
+  <a href="doc/translations/README.ko.md">한국어</a> | 
+  <a href="doc/translations/README.es.md">Español</a> | 
+  <a href="doc/translations/README.pt-BR.md">Português (Brasil)</a> | 
+  <a href="doc/translations/README.ru.md">Русский</a> | 
+  <a href="doc/translations/README.de.md">Deutsch</a> | 
+  <a href="doc/translations/README.fr.md">Français</a> | 
+  <a href="doc/translations/README.it.md">Italiano</a> | 
+  <a href="doc/translations/README.tr.md">Türkçe</a>
 </p>
+
 
 
 
