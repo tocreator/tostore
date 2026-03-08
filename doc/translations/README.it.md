@@ -1,11 +1,24 @@
-# Tostore
+<p align="center">
+  <img src="../resource/logo-tostore.svg" width="400" alt="Tostore Logo">
+</p>
 
-[English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | Italiano | [Türkçe](README.tr.md)
+<p align="center">
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
+  <a href="https://pub.dev/packages/tostore/score"><img src="https://img.shields.io/pub/points/tostore.svg" alt="Pub Points"></a>
+  <a href="https://pub.dev/packages/tostore/likes"><img src="https://img.shields.io/pub/likes/tostore.svg" alt="Pub Likes"></a>
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/dm/tostore.svg" alt="Monthly Downloads"></a>
+</p>
 
-[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
-[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+<p align="center">
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/badge/Platform-Multi--Platform-02569B?logo=dart" alt="Platform"></a>
+  <img src="https://img.shields.io/badge/Architecture-Neural--Distributed-orange" alt="Architecture">
+</p>
+
+<p align="center">
+  [English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Русский](README.ru.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | Italiano | [Türkçe](README.tr.md)
+</p>
+
 
 
 ## Perché scegliere Tostore?
@@ -827,8 +840,3 @@ Tostore sta sviluppando attivamente funzionalità per migliorare ulteriormente l
 - 💬 **Discussione**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
-## Licenza
-
-Questo progetto è distribuito sotto licenza Apache License 2.0 - vedi il file [LICENSE](LICENSE) per i dettagli.
-
----

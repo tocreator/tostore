@@ -1,11 +1,24 @@
-# Tostore
+<p align="center">
+  <img src="doc/resource/logo-tostore.svg" width="400" alt="Tostore Logo">
+</p>
 
-English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/translations/README.ja.md) | [한국어](doc/translations/README.ko.md) | [Español](doc/translations/README.es.md) | [Português (Brasil)](doc/translations/README.pt-BR.md) | [Русский](doc/translations/README.ru.md) | [Deutsch](doc/translations/README.de.md) | [Français](doc/translations/README.fr.md) | [Italiano](doc/translations/README.it.md) | [Türkçe](doc/translations/README.tr.md)
+<p align="center">
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
+  <a href="https://pub.dev/packages/tostore/score"><img src="https://img.shields.io/pub/points/tostore.svg" alt="Pub Points"></a>
+  <a href="https://pub.dev/packages/tostore/likes"><img src="https://img.shields.io/pub/likes/tostore.svg" alt="Pub Likes"></a>
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/dm/tostore.svg" alt="Monthly Downloads"></a>
+</p>
 
-[![pub package](https://img.shields.io/pub/v/tostore.svg)](https://pub.dev/packages/tostore)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Platform](https://img.shields.io/badge/Platform-Flutter-02569B?logo=flutter)](https://flutter.dev)
-[![Dart Version](https://img.shields.io/badge/Dart-3.5+-00B4AB.svg?logo=dart)](https://dart.dev)
+<p align="center">
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/badge/Platform-Multi--Platform-02569B?logo=dart" alt="Platform"></a>
+  <img src="https://img.shields.io/badge/Architecture-Neural--Distributed-orange" alt="Architecture">
+</p>
+
+<p align="center">
+  English | [简体中文](doc/translations/README.zh-CN.md) | [日本語](doc/translations/README.ja.md) | [한국어](doc/translations/README.ko.md) | [Español](doc/translations/README.es.md) | [Português (Brasil)](doc/translations/README.pt-BR.md) | [Русский](doc/translations/README.ru.md) | [Deutsch](doc/translations/README.de.md) | [Français](doc/translations/README.fr.md) | [Italiano](doc/translations/README.it.md) | [Türkçe](doc/translations/README.tr.md)
+</p>
+
 
 
 ## Why Choose Tostore?
@@ -863,8 +876,4 @@ Tostore is actively developing features to further enhance AI-era data infrastru
 - 💬 **Discussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
-## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
----

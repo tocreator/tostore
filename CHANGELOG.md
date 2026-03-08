@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 3.0.6
+## 3.0.7
 
 ### Added
 - Added aggregation functions: `sum()`, `avg()`, `min()`, `max()`
