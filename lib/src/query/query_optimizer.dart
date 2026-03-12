@@ -617,7 +617,10 @@ class QueryOptimizer {
     // We adapt to table size to model the "rare match" risk for large datasets.
     double nonUniqueEqSel() {
       final s = 1.0 / max(100.0, sqrt(totalRows.toDouble()));
-      return s.clamp(1.0 / totalRows, 0.1);
+      final lower = 1.0 / totalRows;
+      const upper = 0.1;
+      if (lower > upper) return lower;
+      return s.clamp(lower, upper);
     }
 
     bool isUniqueSingleField(String field) {
