@@ -861,6 +861,8 @@ class ParallelJournalManager {
                   label: 'ParallelJournalManager');
             }
           }
+        } else {
+          await _dataStore.storage.flushAll();
         }
         await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
       } catch (e, s) {

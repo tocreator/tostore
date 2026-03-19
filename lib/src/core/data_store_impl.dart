@@ -646,6 +646,13 @@ class DataStoreImpl {
       _config =
           _config!.copyWith(dbPath: _dbPath, dbName: _dbName ?? config?.dbName);
 
+      if (PlatformHandler.isWeb && _config!.enableJournal) {
+        Logger.warn(
+          'Web does not support enableJournal efficiently. Keeping it on can noticeably slow writes and startup. Recommended: set DataStoreConfig(enableJournal: false).',
+          label: 'DataStore.initialize',
+        );
+      }
+
       // Initialize global workload scheduler using maxIoConcurrency as total token capacity.
       // This allows higher I/O parallelism while CPU tasks are naturally limited by isolate count.
       workloadScheduler =
@@ -1959,6 +1966,28 @@ class DataStoreImpl {
     return null;
   }
 
+  String? _buildUpsertLockResource(
+    String tableName,
+    TableSchema schema,
+    Map<String, dynamic> data,
+    List<IndexSchema> uniqueIndexes,
+  ) {
+    final pk = schema.primaryKey;
+    final pkVal = data[pk];
+    if (pkVal != null && pkVal.toString().trim().isNotEmpty) {
+      return 'upsert:$tableName:pk:${pkVal.toString()}';
+    }
+    for (final idx in uniqueIndexes) {
+      if (idx.fields.every((f) => data.containsKey(f) && data[f] != null)) {
+        final canKey = schema.createCanonicalIndexKey(idx.fields, data);
+        if (canKey != null && canKey.isNotEmpty) {
+          return 'upsert:$tableName:uniq:${idx.actualIndexName}:$canKey';
+        }
+      }
+    }
+    return null;
+  }
+
   /// Validate upsert record: must contain all non-nullable fields + pk or a complete unique index.
   /// Returns null on valid, or error message.
   String? _validateUpsertRecord(
@@ -2053,7 +2082,33 @@ class DataStoreImpl {
         failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
       ));
     }
+    final String? txId = Zone.current[_txnZoneKey] as String?;
+    final String? upsertLockResource =
+        _buildUpsertLockResource(tableName, schema, data, uniqueIndexes);
+    String? upsertLockOpId;
+    final existingTxnUpsertLock = txId != null && upsertLockResource != null
+        ? TransactionContext.getExclusiveLocks()[upsertLockResource]
+        : null;
     try {
+      if (lockManager != null &&
+          upsertLockResource != null &&
+          existingTxnUpsertLock == null) {
+        upsertLockOpId = GlobalIdGenerator.generate('upsert_target_');
+        final acquired = await lockManager!
+            .acquireExclusiveLock(upsertLockResource, upsertLockOpId);
+        if (!acquired) {
+          return finish(DbResult.error(
+            type: ResultType.dbError,
+            message: 'Lock conflict on upsert target',
+            failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
+          ));
+        }
+        if (txId != null) {
+          TransactionContext.registerExclusiveLock(
+              upsertLockResource, upsertLockOpId);
+        }
+      }
+
       // Pass data directly: updateInternal handles ExprNode; insert() will validate/process.
       final updateResult = await updateInternal(
         tableName,
@@ -2073,6 +2128,15 @@ class DataStoreImpl {
         message: 'Upsert failed: $e',
         failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
       ));
+    } finally {
+      try {
+        if (lockManager != null &&
+            txId == null &&
+            upsertLockResource != null &&
+            upsertLockOpId != null) {
+          lockManager!.releaseExclusiveLock(upsertLockResource, upsertLockOpId);
+        }
+      } catch (_) {}
     }
   }
 
@@ -5579,7 +5643,9 @@ class DataStoreImpl {
       // 1) Flush WAL queue and persist metadata to ensure durability.
       try {
         await walManager.flushQueueCompletely();
-        await walManager.persistMeta(flush: true);
+        if (config.enableJournal) {
+          await walManager.persistMeta(flush: true);
+        }
       } catch (e) {
         Logger.error('Flush WAL queue failed: $e',
             label: 'DataStoreImpl.saveAllCacheBeforeExit');

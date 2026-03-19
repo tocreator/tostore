@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.0.9
+
+### Changed
+- Optimized `upsert` handling for concurrently executed records when the primary key and unique key contain the same value
+- Optimized WebAssembly build support on the Web platform
+
 ## 3.0.8
 
 ### Added

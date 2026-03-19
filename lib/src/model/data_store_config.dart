@@ -602,7 +602,7 @@ class DataStoreConfig {
       prewarmThresholdMB: json['prewarmThresholdMB'] as int?,
       maxLogPartitionFileSize: json['maxLogPartitionFileSize'] as int?,
       logPartitionCycle: json['logPartitionCycle'] as int? ?? 900000,
-      enableJournal: json['enableJournal'] as bool? ?? true,
+      enableJournal: json['enableJournal'] as bool? ?? !PlatformHandler.isWeb,
       logWriteBatchSize: json['logWriteBatchSize'] as int?,
       writeBatchSize: json['writeBatchSize'] as int?,
       maxFlushLatencyMs: json['maxFlushLatencyMs'] as int?,

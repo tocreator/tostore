@@ -1,8 +1,9 @@
+import 'dart:math';
+
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
-import 'package:path/path.dart' as p;
-import 'dart:math';
 
 import 'testing/log_service.dart';
 
@@ -41,7 +42,6 @@ class TostoreExample {
       config: DataStoreConfig(
         enableLog: true,
         logLevel: LogLevel.debug,
-        enableJournal: true,
         encryptionConfig: const EncryptionConfig(
           encryptionType: EncryptionType.none,
         ),

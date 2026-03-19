@@ -16,6 +16,7 @@ import 'yield_controller.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import '../handler/encoder.dart';
+import '../handler/platform_handler.dart';
 
 /// Pending parallel batch metadata recorded in WAL meta for recovery
 class PendingParallelBatch {
@@ -480,6 +481,20 @@ class WalManager {
     }
     _initFuture = () async {
       try {
+        // Web storage cannot rely on append-style WAL durability when journaling
+        // is disabled, so startup should ignore stale recovery metadata entirely.
+        if (!_config.enableJournal && PlatformHandler.isWeb) {
+          _meta = WalMeta.initial(startPartitionIndex: 0);
+          _directoryMapping = null;
+          _currentPartitionDirIndex = 0;
+          _current = const WalPointer(partitionIndex: 0, entrySeq: 0);
+          _appended = const WalPointer(partitionIndex: 0, entrySeq: 0);
+          _currentPartitionSizeLoaded = true;
+          _currentPartitionSizeApprox = 0;
+          _initialized = true;
+          return;
+        }
+
         final metaPath = _dataStore.pathManager
             .getWalMainMetaPath(spaceName: _dataStore.currentSpaceName);
         final backupPath = _dataStore.pathManager
@@ -1428,6 +1443,7 @@ class WalManager {
     int? offset,
     int? startPartitionNo, // null means start from beginning
   }) async {
+    if (!_config.enableJournal) return;
     if (!_initialized) {
       await initializeAndRecover();
     }
@@ -1452,6 +1468,7 @@ class WalManager {
     required int? lastProcessedPartitionNo,
     required int deletedSoFar,
   }) async {
+    if (!_config.enableJournal) return;
     final m = _meta.largeDeletes[opId];
     if (m == null) return;
     m.lastProcessedPartitionNo = lastProcessedPartitionNo;
@@ -1461,6 +1478,7 @@ class WalManager {
 
   /// Complete and remove a large delete operation from WAL meta.
   Future<void> completeLargeDelete(String opId) async {
+    if (!_config.enableJournal) return;
     final m = _meta.largeDeletes[opId];
     if (m == null) return;
     m.status = 'completed';
@@ -1480,6 +1498,7 @@ class WalManager {
     int? offset,
     int? startPartitionNo, // null means start from beginning
   }) async {
+    if (!_config.enableJournal) return;
     if (!_initialized) {
       await initializeAndRecover();
     }
@@ -1505,6 +1524,7 @@ class WalManager {
     required int? lastProcessedPartitionNo,
     required int updatedSoFar,
   }) async {
+    if (!_config.enableJournal) return;
     final m = _meta.largeUpdates[opId];
     if (m == null) return;
     m.lastProcessedPartitionNo = lastProcessedPartitionNo;
@@ -1514,6 +1534,7 @@ class WalManager {
 
   /// Complete and remove a large update operation from WAL meta.
   Future<void> completeLargeUpdate(String opId) async {
+    if (!_config.enableJournal) return;
     final m = _meta.largeUpdates[opId];
     if (m == null) return;
     m.status = 'completed';
@@ -1524,6 +1545,7 @@ class WalManager {
 
   /// Cancel and remove a large update operation from WAL meta (e.g., on transaction rollback).
   Future<void> cancelLargeUpdate(String opId) async {
+    if (!_config.enableJournal) return;
     final m = _meta.largeUpdates[opId];
     if (m == null) return;
     // Remove immediately without marking as completed
@@ -1535,6 +1557,7 @@ class WalManager {
   ///
   /// The caller is responsible for generating a unique [opId].
   Future<void> registerTableOp(TableOpMeta op) async {
+    if (!_config.enableJournal) return;
     if (!_initialized) {
       await initializeAndRecover();
     }
@@ -1557,6 +1580,7 @@ class WalManager {
   /// removed later by [_pruneTableOpsUpToCheckpoint] when checkpoint advances
   /// past the cutoff.
   Future<void> completeTableOp(String opId) async {
+    if (!_config.enableJournal) return;
     final op = _meta.tableOps[opId];
     if (op == null) return;
     _meta.tableOps[opId] = op.copyWith(completed: true);

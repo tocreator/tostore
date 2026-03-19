@@ -110,9 +110,7 @@ class WebStorageImpl implements StorageInterface {
       );
 
       final request = index.getAllKeys(range);
-      final allKeys = await _wrapRequest<JSArray>(request);
-      final allPathsSet = allKeys.toDart
-          .cast<String>()
+      final allPathsSet = (await _wrapStringListRequest(request))
           .where((key) => !key.contains('.block'))
           .toSet();
 
@@ -205,8 +203,7 @@ class WebStorageImpl implements StorageInterface {
 
       // Get all keys in this directory
       final request = index.getAllKeys(range);
-      final keys = await _wrapRequest<JSArray>(request);
-      final filePaths = keys.toDart.cast<String>().toList();
+      final filePaths = await _wrapStringListRequest(request);
 
       // Delete all files within this directory
       for (var filePath in filePaths) {
@@ -248,7 +245,7 @@ class WebStorageImpl implements StorageInterface {
           _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
       final store = transaction.objectStore(_fileStore);
 
-      final result = await _wrapRequest<JSAny?>(store.get(normalizedPath.toJS));
+      final result = await _wrapRequest(store.get(normalizedPath.toJS));
       return result != null;
     } catch (e) {
       Logger.error('Check file exists failed: $e', label: 'WebStorageAdapter');
@@ -280,8 +277,7 @@ class WebStorageImpl implements StorageInterface {
 
       final request =
           index.getAllKeys(range, 1); // limit to only one key for performance
-      final keys = await _wrapRequest<JSArray>(request);
-      final existsOnDisk = keys.toDart.isNotEmpty;
+      final existsOnDisk = (await _wrapStringListRequest(request)).isNotEmpty;
 
       if (existsOnDisk) return true;
 
@@ -305,11 +301,11 @@ class WebStorageImpl implements StorageInterface {
   }
 
   /// wrap IndexedDB request to Future
-  Future<T> _wrapRequest<T>(IDBRequest request) {
-    final completer = Completer<T>();
+  Future<JSAny?> _wrapRequest(IDBRequest request) {
+    final completer = Completer<JSAny?>();
 
     request.onsuccess = ((Event event) {
-      completer.complete(request.result as T);
+      completer.complete(request.result);
     }).toJS;
 
     request.onerror = ((Event event) {
@@ -317,6 +313,17 @@ class WebStorageImpl implements StorageInterface {
     }).toJS;
 
     return completer.future;
+  }
+
+  Future<dynamic> _wrapRequestDartified(IDBRequest request) async {
+    final result = await _wrapRequest(request);
+    return result?.dartify();
+  }
+
+  Future<List<String>> _wrapStringListRequest(IDBRequest request) async {
+    final result = await _wrapRequestDartified(request);
+    if (result is! List) return const [];
+    return result.cast<String>().toList();
   }
 
   /// close database connection
@@ -391,10 +398,14 @@ class WebStorageImpl implements StorageInterface {
     final transaction =
         _db!.transaction([_fileStore].jsify() as JSArray, 'readonly');
     final store = transaction.objectStore(_fileStore);
-    final result = await _wrapRequest<JSAny?>(store.get(normalizedPath.toJS));
-    if (result == null) return null;
-    final json = _deepConvert(result.dartify());
-    return FileInfo.fromJson(json);
+    final json = await _wrapRequestDartified(store.get(normalizedPath.toJS));
+    if (json == null) return null;
+    final converted = _deepConvert(json);
+    if (converted is! Map) {
+      throw StateError(
+          'Unexpected file info payload: ${converted.runtimeType}');
+    }
+    return FileInfo.fromJson(converted.cast<String, dynamic>());
   }
 
   /// Update readAsString to decode from stored bytes
@@ -682,7 +693,7 @@ class WebStorageImpl implements StorageInterface {
     if (data is Uint8List) {
       return data;
     } else if (data is List) {
-      return Uint8List.fromList(List<int>.from(data));
+      return Uint8List.fromList(_normalizeByteList(data));
     } else {
       throw Exception('Unexpected data type: ${data.runtimeType}');
     }
@@ -693,10 +704,25 @@ class WebStorageImpl implements StorageInterface {
     if (data is Uint8List) {
       return data.toList();
     } else if (data is List) {
-      return List<int>.from(data);
+      return _normalizeByteList(data);
     } else {
       throw Exception('Unexpected data type: ${data.runtimeType}');
     }
+  }
+
+  List<int> _normalizeByteList(List<dynamic> data) {
+    return List<int>.generate(data.length, (index) {
+      final value = _normalizeNumericValue(data[index]);
+      if (value is! int) {
+        throw FormatException(
+            'Invalid byte value at index $index: ${data[index]}');
+      }
+      if (value < 0 || value > 255) {
+        throw FormatException(
+            'Byte value out of range at index $index: $value');
+      }
+      return value;
+    }, growable: false);
   }
 
   // enhance type conversion method
@@ -705,22 +731,21 @@ class WebStorageImpl implements StorageInterface {
       return _convertJsMap(value.cast<dynamic, dynamic>());
     } else if (value is List) {
       return _convertJsList(value);
+    } else if (value is num) {
+      return _normalizeNumericValue(value);
     }
     return value;
   }
 
+  dynamic _normalizeNumericValue(num value) {
+    if (value is int) return value;
+    if (!value.isFinite || value.isNaN) return value;
+    final intValue = value.toInt();
+    return value == intValue ? intValue : value;
+  }
+
   List<dynamic> _convertJsList(List<dynamic> list) {
-    return list.map((e) {
-      if (e is JSArray) {
-        return Uint8List.fromList(List<int>.from(e.toDart));
-      } else if (e is List) {
-        // Handle regular List as well - recursively convert nested lists
-        return _convertJsList(e);
-      } else if (e is Map) {
-        return _convertJsMap(e);
-      }
-      return e;
-    }).toList();
+    return list.map(_deepConvert).toList();
   }
 
   Map<String, dynamic> _convertJsMap(Map<dynamic, dynamic> raw) {
@@ -728,31 +753,20 @@ class WebStorageImpl implements StorageInterface {
       final key = k is String ? k : k.toString();
       // Special handling for the 'data' field
       if (key == 'data') {
-        if (v is JSArray) {
-          // Directly convert JSArray to Uint8List for 'data' field and return immediately
-          return MapEntry(key, Uint8List.fromList(List<int>.from(v.toDart)));
-        } else if (v is List) {
+        final normalized = _deepConvert(v);
+        if (normalized is List) {
           // Handle regular List as well
-          return MapEntry(key, Uint8List.fromList(List<int>.from(v)));
-        } else if (v is Uint8List) {
+          return MapEntry(
+              key, Uint8List.fromList(_normalizeByteList(normalized)));
+        } else if (normalized is Uint8List) {
           // Already a Uint8List, return as is
-          return MapEntry(key, v);
+          return MapEntry(key, normalized);
         } else {
-          return MapEntry(key, v);
+          return MapEntry(key, normalized);
         }
       }
 
-      dynamic value = v;
-      // Process other nested structures
-      if (value is JSArray) {
-        value = Uint8List.fromList(List<int>.from(value.toDart));
-      } else if (value is List) {
-        // For non-data fields, convert nested lists recursively
-        value = _convertJsList(value);
-      } else if (value is Map) {
-        value = _convertJsMap(value);
-      }
-      return MapEntry(key, value);
+      return MapEntry(key, _deepConvert(v));
     });
   }
 
