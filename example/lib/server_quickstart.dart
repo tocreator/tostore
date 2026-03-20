@@ -3,7 +3,7 @@ import 'dart:developer';
 import 'package:tostore/tostore.dart';
 
 /// Server Quick Start Example
-/// Demonstrates how to integrate and use Tostore in server-side applications
+/// Demonstrates how to integrate and use ToStore in server-side applications
 /// with distributed database capabilities and enterprise features
 ///
 

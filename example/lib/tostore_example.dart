@@ -7,13 +7,13 @@ import 'package:tostore/tostore.dart';
 
 import 'testing/log_service.dart';
 
-/// This example demonstrates the core features of Tostore using a user management system
+/// This example demonstrates the core features of ToStore using a user management system
 /// with global settings. It shows how to:
 /// - Create tables (both regular and global)
 /// - Work with multi-space architecture
 /// - Distributed example
 /// - Handle global data
-class TostoreExample {
+class ToStoreExample {
   late ToStore db;
 
   /// Get database path

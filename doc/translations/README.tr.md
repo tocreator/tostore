@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="Tostore">
-</p>
-
-<p align="center">
-  <img src="../resource/divider.svg" width="600">
-</p>
+<h1 align="center">
+  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+</h1>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
@@ -36,11 +32,11 @@
 
 
 
-## Neden Tostore'u Seçmelisiniz?
+## Neden ToStore'u Seçmelisiniz?
 
-Tostore, Dart/Flutter ekosistemindeki dağıtık vektör veritabanları için tek yüksek performanslı depolama motorudur. Sinir ağı benzeri bir mimari kullanarak, düğümler arası akıllı birbirine bağlanabilirlik ve iş birliği sunarak sonsuz yatay ölçeklenebilirliği destekler. Esnek bir veri topolojisi ağı oluşturur ve şema değişikliklerinin hassas tanımlanmasını, şifreleme korumasını ve çok alanlı (multi-space) veri izolasyonunu sağlar. Tostore, uç paralel işleme için çok çekirdekli işlemcilerden tam olarak yararlanır ve mobil uç (edge) cihazlardan buluta kadar yerel olarak platformlar arası iş birliğini destekler. Çeşitli dağıtık birincil anahtar algoritmaları ile sürükleyici sanal gerçeklik, çok modlu etkileşim, mekansal hesaplama, üretken yapay zeka ve semantik vektör uzayı modelleme gibi senaryolar için güçlü bir veri temeli sağlar.
+ToStore, Dart/Flutter ekosistemindeki dağıtık vektör veritabanları için tek yüksek performanslı depolama motorudur. Sinir ağı benzeri bir mimari kullanarak, düğümler arası akıllı birbirine bağlanabilirlik ve iş birliği sunarak sonsuz yatay ölçeklenebilirliği destekler. Esnek bir veri topolojisi ağı oluşturur ve şema değişikliklerinin hassas tanımlanmasını, şifreleme korumasını ve çok alanlı (multi-space) veri izolasyonunu sağlar. ToStore, uç paralel işleme için çok çekirdekli işlemcilerden tam olarak yararlanır ve mobil uç (edge) cihazlardan buluta kadar yerel olarak platformlar arası iş birliğini destekler. Çeşitli dağıtık birincil anahtar algoritmaları ile sürükleyici sanal gerçeklik, çok modlu etkileşim, mekansal hesaplama, üretken yapay zeka ve semantik vektör uzayı modelleme gibi senaryolar için güçlü bir veri temeli sağlar.
 
-Üretken yapay zeka ve mekansal hesaplama, hesaplama ağırlık merkezini uç (edge) noktalara kaydırdıkça, terminal cihazları sadece içerik görüntüleyiciler olmaktan çıkıp yerel üretim, çevresel algılama ve gerçek zamanlı karar verme merkezlerine dönüşüyor. Geleneksel tek dosyalı gömülü veritabanları mimari tasarımları gereği kısıtlıdır ve akıllı uygulamaların yüksek eşzamanlı yazma, devasa vektör geri çağırma ve bulut-uç iş birliğine dayalı üretim gibi anında yanıt gereksinimlerini karşılamakta zorlanırlar. Tostore, uç cihazlar için doğmuştur; onlara karmaşık yerel yapay zeka üretimini ve büyük ölçekli veri akışını destekleyecek kadar dağıtık depolama yetenekleri kazandırarak, bulut ve uç arasında gerçek bir derin iş birliği sağlar.
+Üretken yapay zeka ve mekansal hesaplama, hesaplama ağırlık merkezini uç (edge) noktalara kaydırdıkça, terminal cihazları sadece içerik görüntüleyiciler olmaktan çıkıp yerel üretim, çevresel algılama ve gerçek zamanlı karar verme merkezlerine dönüşüyor. Geleneksel tek dosyalı gömülü veritabanları mimari tasarımları gereği kısıtlıdır ve akıllı uygulamaların yüksek eşzamanlı yazma, devasa vektör geri çağırma ve bulut-uç iş birliğine dayalı üretim gibi anında yanıt gereksinimlerini karşılamakta zorlanırlar. ToStore, uç cihazlar için doğmuştur; onlara karmaşık yerel yapay zeka üretimini ve büyük ölçekli veri akışını destekleyecek kadar dağıtık depolama yetenekleri kazandırarak, bulut ve uç arasında gerçek bir derin iş birliği sağlar.
 
 **Güç Kesintisine ve Çökmeye Dayanıklı**: Beklenmedik bir güç kesintisi veya uygulama çökmesi durumunda bile veriler otomatik olarak kurtarılabilir ve gerçek sıfır veri kaybı elde edilir. Bir veri işlemi yanıt verdiğinde, veriler zaten güvenli bir şekilde kaydedilmiştir ve veri kaybı riski ortadan kalkar.
 
@@ -49,12 +45,12 @@ Tostore, Dart/Flutter ekosistemindeki dağıtık vektör veritabanları için te
 
 
 
-...... Parmak uçlarınızdan bulut uygulamalarına kadar, Tostore veri hesaplama gücünü serbest bırakmanıza ve geleceği güçlendirmenize yardımcı olur ......
+...... Parmak uçlarınızdan bulut uygulamalarına kadar, ToStore veri hesaplama gücünü serbest bırakmanıza ve geleceği güçlendirmenize yardımcı olur ......
 
 
 
 
-## Tostore Özellikleri
+## ToStore Özellikleri
 
 - 🌐 **Sorunsuz Tüm Platform Desteği**
   - Mobil uygulamalardan bulut sunucularına kadar tüm platformlarda aynı kodu çalıştırın.
@@ -369,7 +365,7 @@ final freshUserData = await db.query('users')
 
 ## Gelişmiş Kullanım
 
-Tostore, karmaşık iş gereksinimleri için zengin bir gelişmiş özellikler seti sunar:
+ToStore, karmaşık iş gereksinimleri için zengin bir gelişmiş özellikler seti sunar:
 
 ### Tablo düzeyinde TTL (zamana dayalı otomatik silme)
 
@@ -479,7 +475,7 @@ db.streamQuery('users').listen((data) => print(data));
 
 ### Sorgular ve Verimli Sayfalandırma
 
-Tostore, farklı veri ölçeklerine uygun çift modlu sayfalandırma desteği sunar:
+ToStore, farklı veri ölçeklerine uygun çift modlu sayfalandırma desteği sunar:
 
 #### 1. Ofset Modu
 Küçük veri kümeleri için veya belirli bir sayfaya atlamak gerektiğinde uygundur.
@@ -617,7 +613,7 @@ await for (final record in db.streamQuery('vector_data')
 
 ## Birincil Anahtar Örnekleri
 
-Tostore çeşitli dağıtık birincil anahtar algoritmaları sağlar:
+ToStore çeşitli dağıtık birincil anahtar algoritmaları sağlar:
 
 - **Sıralı** (PrimaryKeyType.sequential): 238978991
 - **Zaman Damgası Tabanlı** (PrimaryKeyType.timestampBased): 1306866018836946
@@ -811,27 +807,27 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ### Demo videoları
 
 <p align="center">
-  <img src="../media/basic-demo.gif" alt="Tostore temel performans demosu" width="320" />
+  <img src="../media/basic-demo.gif" alt="ToStore temel performans demosu" width="320" />
   </p>
 - **Temel performans demosu** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF önizlemesi kırpılmış olabilir; tam demoyu görmek için videoya tıklayın. Sıradan bir akıllı telefonda, veri sayısı 100 M+ seviyesine çıktığında bile uygulamanın başlatma süresinin, sayfalama ve arama performansının her zaman kararlı ve akıcı kaldığını gösterir. Depolama alanı yeterli olduğu sürece, edge cihazlar TB/PB ölçeğindeki veri kümelerini işlerken dahi etkileşim gecikmesini sürekli düşük seviyede tutabilir.
 
 <p align="center">
-  <img src="../media/disaster-recovery.gif" alt="Tostore felaket kurtarma stres testi" width="320" />
+  <img src="../media/disaster-recovery.gif" alt="ToStore felaket kurtarma stres testi" width="320" />
   </p>
 
-- **Felaket kurtarma stres testi** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Yoğun yazma yükü altında işlemi kasıtlı olarak defalarca yarıda keserek çökme ve elektrik kesintisi senaryolarını simüle eder. On binlerce yazma işlemi ani şekilde yarıda kalsa bile, Tostore tipik bir telefonda verileri çok hızlı biçimde geri yükler ve bir sonraki başlatmayı veya veri erişilebilirliğini olumsuz etkilemez.
+- **Felaket kurtarma stres testi** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Yoğun yazma yükü altında işlemi kasıtlı olarak defalarca yarıda keserek çökme ve elektrik kesintisi senaryolarını simüle eder. On binlerce yazma işlemi ani şekilde yarıda kalsa bile, ToStore tipik bir telefonda verileri çok hızlı biçimde geri yükler ve bir sonraki başlatmayı veya veri erişilebilirliğini olumsuz etkilemez.
 
 
 
 
-Tostore size yardımcı oluyorsa lütfen bize bir ⭐️ verin
+ToStore size yardımcı oluyorsa lütfen bize bir ⭐️ verin
 
 
 
 
 ## Yol Haritası (Roadmap)
 
-Tostore, yapay zeka çağında veri altyapısını güçlendirmek için aktif olarak özellikler geliştirmektedir:
+ToStore, yapay zeka çağında veri altyapısını güçlendirmek için aktif olarak özellikler geliştirmektedir:
 
 - **Yüksek Boyutlu Vektörler**: Vektör geri çağırma ve semantik arama algoritmaları ekleniyor.
 - **Çok Modlu Veriler**: Ham verilerden özellik vektörlerine kadar uçtan uca işleme sağlanıyor.
@@ -851,5 +847,4 @@ Tostore, yapay zeka çağında veri altyapısını güçlendirmek için aktif ol
 - 📖 **Dokümantasyon**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Geri Bildirim**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Tartışma**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
 

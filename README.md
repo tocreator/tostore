@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="doc/resource/logo-tostore.svg" width="400" alt="Tostore">
-</p>
-
-<p align="center">
-  <img src="doc/resource/divider.svg" width="600">
-</p>
+<h1 align="center">
+  <img src="doc/resource/logo-tostore.svg" width="400" alt="ToStore">
+</h1>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
@@ -36,11 +32,11 @@
 
 
 
-## Why Choose Tostore?
+## Why Choose ToStore?
 
-Tostore is the only high-performance storage engine for distributed vector databases in the Dart/Flutter ecosystem. Utilizing a neural-network-like architecture, it features intelligent interconnectivity and collaboration between nodes, supporting infinite horizontal scaling. It builds a flexible data topology network and provides precise schema change identification, encryption protection, and multi-space data isolation. Tostore fully leverages multi-core CPUs for extreme parallel processing and naturally supports cross-platform collaboration from mobile edge devices to the cloud. With various distributed primary key algorithms, it provides a powerful data foundation for scenarios such as immersive AR/VR fusion, multi-modal interaction, spatial computing, generative AI, and semantic vector space modeling.
+ToStore is the only high-performance storage engine for distributed vector databases in the Dart/Flutter ecosystem. Utilizing a neural-network-like architecture, it features intelligent interconnectivity and collaboration between nodes, supporting infinite horizontal scaling. It builds a flexible data topology network and provides precise schema change identification, encryption protection, and multi-space data isolation. ToStore fully leverages multi-core CPUs for extreme parallel processing and naturally supports cross-platform collaboration from mobile edge devices to the cloud. With various distributed primary key algorithms, it provides a powerful data foundation for scenarios such as immersive AR/VR fusion, multi-modal interaction, spatial computing, generative AI, and semantic vector space modeling.
 
-As generative AI and spatial computing shift the center of gravity toward the edge, terminal devices are evolving from mere content displays into cores for local generation, environmental perception, and real-time decision-making. Traditional single-file embedded databases are limited by their architectural design, often struggling to support the immediate response requirements of intelligent applications when facing high-concurrency writes, massive vector retrieval, and cloud-edge collaborative generation. Tostore is born for edge devices, empowering them with distributed storage capabilities sufficient to support complex local AI generation and large-scale data flow, truly achieving deep collaboration between the cloud and the edge.
+As generative AI and spatial computing shift the center of gravity toward the edge, terminal devices are evolving from mere content displays into cores for local generation, environmental perception, and real-time decision-making. Traditional single-file embedded databases are limited by their architectural design, often struggling to support the immediate response requirements of intelligent applications when facing high-concurrency writes, massive vector retrieval, and cloud-edge collaborative generation. ToStore is born for edge devices, empowering them with distributed storage capabilities sufficient to support complex local AI generation and large-scale data flow, truly achieving deep collaboration between the cloud and the edge.
 
 **Power failure and crash resistant**: Even in the event of an unexpected power outage or application crash, data can be automatically recovered, achieving true zero loss. When a data operation responds, the data has already been safely saved, eliminating the risk of data loss.
 
@@ -49,7 +45,7 @@ As generative AI and spatial computing shift the center of gravity toward the ed
 
 
 
-...... From fingertips to cloud applications, Tostore helps you release data computing power and empower the future ......
+...... From fingertips to cloud applications, ToStore helps you release data computing power and empower the future ......
 
 
 
@@ -370,7 +366,7 @@ final freshUserData = await db.query('users')
 
 ## Advanced Usage
 
-Tostore provides a rich set of advanced features for complex business requirements:
+ToStore provides a rich set of advanced features for complex business requirements:
 
 ### Table-level TTL (automatic time-based expiration)
 
@@ -496,7 +492,7 @@ db.streamQuery('users').listen((data) => print(data));
 > [!TIP]
 > **Use `limit` for better performance**: It is highly recommended to always specify a `limit`. If omitted, the engine defaults to a limit of 1000 records. While the core engine is fast, fetching and serializing 1000 records can cause unnecessary latency in UI-sensitive applications.
 
-Tostore offers dual-mode pagination support to fit different data scales and performance needs:
+ToStore offers dual-mode pagination support to fit different data scales and performance needs:
 
 #### 1. Offset Mode
 Suitable for small datasets (e.g., under 10k records) or when specific page jumping is required.
@@ -634,7 +630,7 @@ await for (final record in db.streamQuery('vector_data')
 
 ## Primary Key Examples
 
-Tostore provides various distributed primary key algorithms for different scenarios:
+ToStore provides various distributed primary key algorithms for different scenarios:
 
 - **Sequential** (PrimaryKeyType.sequential): 238978991
 - **Timestamp-Based** (PrimaryKeyType.timestampBased): 1306866018836946
@@ -848,28 +844,28 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ### Demo Videos
 
 <p align="center">
-  <img src="doc/media/basic-demo.gif" alt="Tostore basic performance demo" width="320" />
+  <img src="doc/media/basic-demo.gif" alt="ToStore basic performance demo" width="320" />
   </p>
 
 - **Basic performance demo** (<a href="doc/media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF preview may be cropped; click the video to view the full demo. Shows that even on an ordinary mobile device with 100M+ records, startup, paging, and search performance remain stable and smooth. As long as storage is sufficient, edge devices can sustain TB/PB-scale datasets while keeping interactive latency consistently low.
 
 <p align="center">
-  <img src="doc/media/disaster-recovery.gif" alt="Tostore disaster recovery stress test" width="320" />
+  <img src="doc/media/disaster-recovery.gif" alt="ToStore disaster recovery stress test" width="320" />
   </p>
 
-- **Disaster recovery stress test** (<a href="doc/media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, Tostore recovers extremely fast on a typical phone and does not impact startup or data availability.
+- **Disaster recovery stress test** (<a href="doc/media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, ToStore recovers extremely fast on a typical phone and does not impact startup or data availability.
 
 
 
 
-If Tostore helps you, please give us a ⭐️
+If ToStore helps you, please give us a ⭐️
 
 
 
 
 ## Roadmap
 
-Tostore is actively developing features to further enhance AI-era data infrastructure:
+ToStore is actively developing features to further enhance AI-era data infrastructure:
 
 - **High-Dimensional Vectors**: Adding vector retrieval and semantic search algorithms.
 - **Multi-modal Data**: Providing end-to-end processing from raw data to feature vectors.
@@ -889,6 +885,5 @@ Tostore is actively developing features to further enhance AI-era data infrastru
 - 📖 **Documentation**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Feedback**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Discussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
 
 

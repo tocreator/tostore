@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="Tostore">
-</p>
-
-<p align="center">
-  <img src="../resource/divider.svg" width="600">
-</p>
+<h1 align="center">
+  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+</h1>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
@@ -36,11 +32,11 @@
 
 
 
-## ¿Por qué elegir Tostore?
+## ¿Por qué elegir ToStore?
 
-Tostore es el único motor de almacenamiento de alto rendimiento para bases de datos vectoriales distribuidas en el ecosistema Dart/Flutter. Utilizando una arquitectura de tipo red neuronal, presenta una interconectividad e inteligencia de colaboración entre nodos, permitiendo una escalabilidad horizontal infinita. Construye una red de topología de datos flexible y proporciona una identificación precisa de cambios de esquema, protección por cifrado y aislamiento de datos multiespacio. Tostore aprovecha al máximo las CPUs multinúcleo para un procesamiento paralelo extremo y soporta de forma nativa la colaboración multiplataforma desde dispositivos de borde (edge) móviles hasta la nube. Con varios algoritmos de claves primarias distribuidas, proporciona una base de datos potente para escenarios como la realidad virtual inmersiva, la interacción multimodal, la computación espacial, la IA generativa y el modelado de espacios vectoriales semánticos.
+ToStore es el único motor de almacenamiento de alto rendimiento para bases de datos vectoriales distribuidas en el ecosistema Dart/Flutter. Utilizando una arquitectura de tipo red neuronal, presenta una interconectividad e inteligencia de colaboración entre nodos, permitiendo una escalabilidad horizontal infinita. Construye una red de topología de datos flexible y proporciona una identificación precisa de cambios de esquema, protección por cifrado y aislamiento de datos multiespacio. ToStore aprovecha al máximo las CPUs multinúcleo para un procesamiento paralelo extremo y soporta de forma nativa la colaboración multiplataforma desde dispositivos de borde (edge) móviles hasta la nube. Con varios algoritmos de claves primarias distribuidas, proporciona una base de datos potente para escenarios como la realidad virtual inmersiva, la interacción multimodal, la computación espacial, la IA generativa y el modelado de espacios vectoriales semánticos.
 
-A medida que la IA generativa y la computación espacial desplazan el centro de gravedad hacia el borde (edge), los dispositivos terminales están evolucionando de ser meros visualizadores de contenido a núcleos de generación local, percepción ambiental y toma de decisiones en tiempo real. Las bases de datos integradas tradicionales de un solo archivo están limitadas por su diseño arquitectónico, a menudo luchando para soportar los requisitos de respuesta inmediata de las aplicaciones inteligentes ante escrituras de alta concurrencia, recuperación de vectores masivos y generación colaborativa nube-borde. Tostore nace para dispositivos de borde, dotándolos de capacidades de almacenamiento distribuido suficientes para soportar la generación local de IA compleja y el flujo de datos a gran escala, logrando una verdadera colaboración profunda entre la nube y el borde.
+A medida que la IA generativa y la computación espacial desplazan el centro de gravedad hacia el borde (edge), los dispositivos terminales están evolucionando de ser meros visualizadores de contenido a núcleos de generación local, percepción ambiental y toma de decisiones en tiempo real. Las bases de datos integradas tradicionales de un solo archivo están limitadas por su diseño arquitectónico, a menudo luchando para soportar los requisitos de respuesta inmediata de las aplicaciones inteligentes ante escrituras de alta concurrencia, recuperación de vectores masivos y generación colaborativa nube-borde. ToStore nace para dispositivos de borde, dotándolos de capacidades de almacenamiento distribuido suficientes para soportar la generación local de IA compleja y el flujo de datos a gran escala, logrando una verdadera colaboración profunda entre la nube y el borde.
 
 **Resistente a fallos de energía y bloqueos**: Incluso en caso de un corte de energía inesperado o un bloqueo de la aplicación, los datos pueden recuperarse automáticamente, logrando una pérdida cero real. Cuando una operación de datos responde, los datos ya se han guardado de forma segura, eliminando el riesgo de pérdida de datos.
 
@@ -49,12 +45,12 @@ A medida que la IA generativa y la computación espacial desplazan el centro de 
 
 
 
-...... Desde la punta de los dedos hasta las aplicaciones en la nube, Tostore le ayuda a liberar la potencia de cálculo de datos y a potenciar el futuro ......
+...... Desde la punta de los dedos hasta las aplicaciones en la nube, ToStore le ayuda a liberar la potencia de cálculo de datos y a potenciar el futuro ......
 
 
 
 
-## Características de Tostore
+## Características de ToStore
 
 - 🌐 **Soporte total multiplataforma sin fisuras**
   - Ejecute el mismo código en todas las plataformas, desde aplicaciones móviles hasta servidores en la nube.
@@ -368,7 +364,7 @@ final freshUserData = await db.query('users')
 
 ## Uso Avanzado
 
-Tostore proporciona un conjunto rico de características avanzadas para requisitos complejos:
+ToStore proporciona un conjunto rico de características avanzadas para requisitos complejos:
 
 ### TTL a nivel de tabla (expiración automática por tiempo)
 
@@ -482,7 +478,7 @@ db.streamQuery('users').listen((data) => print(data));
 > [!TIP]
 > **Especifique `limit` explícitamente para un mejor rendimiento**: Se recomienda encarecidamente especificar siempre un `limit` al realizar consultas. Si se omite, el motor limita por defecto a 1000 registros. Aunque la consulta principal es extremadamente rápida, la serialización de una gran cantidad de registros en aplicaciones sensibles a la interfaz de usuario puede causar una latencia innecesaria.
 
-Tostore ofrece soporte de paginación de modo dual:
+ToStore ofrece soporte de paginación de modo dual:
 
 #### 1. Modo Offset (Desplazamiento)
 Adecuado para conjuntos de datos pequeños o cuando se requiere saltar a una página específica.
@@ -620,7 +616,7 @@ await for (final record in db.streamQuery('vector_data')
 
 ## Ejemplos de Claves Primarias
 
-Tostore proporciona varios algoritmos de claves primarias distribuidas:
+ToStore proporciona varios algoritmos de claves primarias distribuidas:
 
 - **Secuencial** (PrimaryKeyType.sequential): 238978991
 - **Basada en marca de tiempo** (PrimaryKeyType.timestampBased): 1306866018836946
@@ -814,29 +810,29 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ### Vídeos de demostración
 
 <p align="center">
-  <img src="../media/basic-demo.gif" alt="Demo básica de rendimiento de Tostore" width="320" />
+  <img src="../media/basic-demo.gif" alt="Demo básica de rendimiento de ToStore" width="320" />
   </p>
 
 
 - **Demo básica de rendimiento** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): La vista previa en GIF puede estar recortada; haz clic en el video para ver la demo completa. Muestra que, incluso en un smartphone normal con más de 100 M de registros, el arranque de la app, el paginado y las búsquedas se mantienen siempre estables y fluidas. Mientras haya almacenamiento suficiente, los dispositivos de borde pueden manejar volúmenes de datos de escala TB/PB sin degradar perceptiblemente la latencia de interacción.
 
 <p align="center">
-  <img src="../media/disaster-recovery.gif" alt="Prueba de recuperación ante desastres de Tostore" width="320" />
+  <img src="../media/disaster-recovery.gif" alt="Prueba de recuperación ante desastres de ToStore" width="320" />
   </p>
 
-- **Prueba de recuperación ante desastres** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Interrumpe deliberadamente el proceso durante cargas de escritura intensivas para simular fallos y cortes de energía. Incluso quando decenas de miles de operaciones de escritura se detienen de forma abrupta, Tostore se recupera muy rápido en un teléfono típico y no afecta al siguiente arranque ni a la disponibilidad de los datos.
+- **Prueba de recuperación ante desastres** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Interrumpe deliberadamente el proceso durante cargas de escritura intensivas para simular fallos y cortes de energía. Incluso quando decenas de miles de operaciones de escritura se detienen de forma abrupta, ToStore se recupera muy rápido en un teléfono típico y no afecta al siguiente arranque ni a la disponibilidad de los datos.
 
 
 
 
-Si Tostore le ayuda, por favor danos una ⭐️
+Si ToStore le ayuda, por favor danos una ⭐️
 
 
 
 
 ## Hoja de Ruta (Roadmap)
 
-Tostore está desarrollando activamente características para mejorar la infraestructura de datos en la era de la IA:
+ToStore está desarrollando activamente características para mejorar la infraestructura de datos en la era de la IA:
 
 - **Vectores de Alta Dimensión**: Añadiendo recuperación de vectores y algoritmos de búsqueda semántica.
 - **Datos Multimodales**: Proporcionando procesamiento de extremo a extremo desde datos brutos hasta vectores de características.
@@ -856,5 +852,4 @@ Tostore está desarrollando activamente características para mejorar la infraes
 - 📖 **Documentación**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Feedback**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Discusión**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
 

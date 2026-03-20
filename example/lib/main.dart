@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
+
 import 'testing/database_tester.dart';
 import 'testing/log_service.dart';
-import 'tostore_example.dart' show ForeignKeyMode, TostoreExample;
+import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
 
 /// Simple UI to run examples
 void main() async {
@@ -54,7 +55,7 @@ void main() async {
     },
   );
 
-  final example = TostoreExample();
+  final example = ToStoreExample();
 
   // The example app will now run even if initialization fails,
   // allowing the user to see the error logs in the ListView.
@@ -63,19 +64,19 @@ void main() async {
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key, required this.example});
-  final TostoreExample example;
+  final ToStoreExample example;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Tostore Example',
+      title: 'ToStore Example',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff0aa6e8)),
         useMaterial3: true,
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
-      home: TostoreExamplePage(example: example),
+      home: ToStoreExamplePage(example: example),
     );
   }
 }
@@ -84,14 +85,17 @@ enum AppView { dataView, benchmark }
 
 enum PaginationMode { offset, cursor }
 
-class TostoreExamplePage extends StatefulWidget {
-  const TostoreExamplePage({super.key, required this.example});
-  final TostoreExample example;
+class ToStoreExamplePage extends StatefulWidget {
+  const ToStoreExamplePage({super.key, required this.example});
+  final ToStoreExample example;
   @override
-  State<TostoreExamplePage> createState() => _TostoreExamplePageState();
+  State<ToStoreExamplePage> createState() => _ToStoreExamplePageState();
 }
 
-class _TostoreExamplePageState extends State<TostoreExamplePage> {
+class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
+  static const bool _isWasmBuild =
+      bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
+
   final TextEditingController _searchController = TextEditingController();
   late final PageController _pageViewController;
 
@@ -554,7 +558,7 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
     return Scaffold(
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
-        title: const Text('Tostore Demo'),
+        title: const Text('ToStore Demo'),
         actions: [
           _buildMoreActionsButton(),
         ],
@@ -1244,14 +1248,20 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
                 children: [
                   SizedBox(
                     width: buttonWidth,
-                    child: _buildActionButton(
-                      text: 'Concurrency Test',
-                      onPressed: !_isDbInitialized || _isTesting
-                          ? null
-                          : () {
-                              _checkAndExpandLogPanel();
-                              _showConcurrencyTestDialog();
-                            },
+                    child: Tooltip(
+                      message: _isWasmBuild
+                          ? 'Concurrency Test is unavailable on WebAssembly builds'
+                          : 'Run configurable concurrency test',
+                      child: _buildActionButton(
+                        text: 'Concurrency Test',
+                        onPressed:
+                            !_isDbInitialized || _isTesting || _isWasmBuild
+                                ? null
+                                : () {
+                                    _checkAndExpandLogPanel();
+                                    _showConcurrencyTestDialog();
+                                  },
+                      ),
                     ),
                   ),
                   SizedBox(
@@ -1716,6 +1726,15 @@ class _TostoreExamplePageState extends State<TostoreExamplePage> {
   }
 
   Future<void> _showConcurrencyTestDialog() async {
+    if (_isWasmBuild) {
+      logService.add(
+        '❌ Concurrency Test is disabled on WebAssembly builds.',
+        LogType.warn,
+      );
+      _updateOperationInfo('❌ Concurrency Test Disabled on WebAssembly');
+      return;
+    }
+
     final config = await showDialog<Map<String, Map<String, int>>>(
       context: context,
       barrierDismissible: false,

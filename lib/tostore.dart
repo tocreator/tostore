@@ -1,4 +1,4 @@
-/// Tostore is a high-performance distributed data storage engine that builds intelligent data networks
+/// ToStore is a high-performance distributed data storage engine that builds intelligent data networks
 /// using multi-partition parallel mechanisms and interconnected topologies.
 ///
 /// Key features:
@@ -8,48 +8,48 @@
 /// - Cross-platform support from mobile edge devices to cloud servers
 /// - Multiple distributed primary key algorithms and horizontal node expansion
 ///
-/// Tostore provides a distributed data foundation for immersive virtual-real fusion,
+/// ToStore provides a distributed data foundation for immersive virtual-real fusion,
 /// multimodal interaction, 3D spatial features, generative AI, and semantic vector space modeling.
 library tostore;
 
 import 'dart:async';
 
-export 'src/model/table_schema.dart';
-export 'src/model/business_error.dart';
-export 'src/model/data_store_config.dart';
-export 'src/model/table_info.dart';
-export 'src/model/log_config.dart';
-export 'src/model/space_info.dart';
-export 'src/model/memory_info.dart';
-export 'src/model/config_info.dart';
-export 'src/Interface/status_provider.dart';
-export 'src/model/db_result.dart';
-export 'src/model/query_result.dart';
-export 'src/model/migration_task.dart';
-export 'src/model/result_type.dart';
-export 'src/model/transaction_result.dart';
-export 'src/model/backup_scope.dart';
-export 'src/model/expr.dart';
-export 'src/model/query_aggregation.dart';
-export 'src/query/query_condition.dart';
-export 'src/handler/logger.dart' show LogType;
-export 'src/handler/to_crypto.dart';
-
 import 'src/Interface/chain_builder.dart';
 import 'src/Interface/data_store_interface.dart';
 import 'src/Interface/status_provider.dart';
-import 'src/model/query_result.dart';
-import 'src/model/transaction_result.dart';
-import 'src/model/data_store_config.dart';
-import 'src/core/data_store_impl.dart';
-import 'src/model/db_result.dart';
-import 'src/model/migration_task.dart';
-import 'src/model/table_info.dart';
-import 'src/model/table_schema.dart';
-import 'src/model/space_info.dart';
 import 'src/chain/schema_builder.dart';
 import 'src/chain/stream_query_builder.dart';
+import 'src/core/data_store_impl.dart';
 import 'src/model/backup_scope.dart';
+import 'src/model/data_store_config.dart';
+import 'src/model/db_result.dart';
+import 'src/model/migration_task.dart';
+import 'src/model/query_result.dart';
+import 'src/model/space_info.dart';
+import 'src/model/table_info.dart';
+import 'src/model/table_schema.dart';
+import 'src/model/transaction_result.dart';
+
+export 'src/Interface/status_provider.dart';
+export 'src/handler/logger.dart' show LogType;
+export 'src/handler/to_crypto.dart';
+export 'src/model/backup_scope.dart';
+export 'src/model/business_error.dart';
+export 'src/model/config_info.dart';
+export 'src/model/data_store_config.dart';
+export 'src/model/db_result.dart';
+export 'src/model/expr.dart';
+export 'src/model/log_config.dart';
+export 'src/model/memory_info.dart';
+export 'src/model/migration_task.dart';
+export 'src/model/query_aggregation.dart';
+export 'src/model/query_result.dart';
+export 'src/model/result_type.dart';
+export 'src/model/space_info.dart';
+export 'src/model/table_info.dart';
+export 'src/model/table_schema.dart';
+export 'src/model/transaction_result.dart';
+export 'src/query/query_condition.dart';
 
 /// High-performance storage engine
 /// Features:

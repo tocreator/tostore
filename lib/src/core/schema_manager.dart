@@ -1,9 +1,11 @@
 import 'dart:convert';
+
 import 'package:path/path.dart' show dirname;
-import '../model/meta_info.dart';
-import '../model/table_schema.dart';
-import '../model/system_table.dart';
+
 import '../handler/logger.dart';
+import '../model/meta_info.dart';
+import '../model/system_table.dart';
+import '../model/table_schema.dart';
 import 'data_store_impl.dart';
 import 'tree_cache.dart';
 
@@ -979,7 +981,7 @@ class SchemaManager {
     return oldHash != newHash;
   }
 
-  /// High-performance check if user-defined table schema has changed (based on Tostore(schemas: []))
+  /// High-performance check if user-defined table schema has changed (based on ToStore(schemas: []))
   Future<bool> isSchemaChanged(List<TableSchema> schemas) async {
     try {
       final meta = await getSchemaMeta();

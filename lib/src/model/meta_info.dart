@@ -567,7 +567,7 @@ class SchemaMeta {
   /// timestamps
   final Timestamps timestamps;
 
-  /// user-defined table schema hash (Tostore(schemas: []))
+  /// user-defined table schema hash (ToStore(schemas: []))
   final String? userSchemaHash;
 
   /// system table schema hash

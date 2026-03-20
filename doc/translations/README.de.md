@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="Tostore">
-</p>
-
-<p align="center">
-  <img src="../resource/divider.svg" width="600">
-</p>
+<h1 align="center">
+  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+</h1>
 
 <p align="center">
   <a href="https://pub.dev/packages/tostore"><img src="https://img.shields.io/pub/v/tostore.svg" alt="pub package"></a>
@@ -36,11 +32,11 @@
 
 
 
-## Warum Tostore wählen?
+## Warum ToStore wählen?
 
-Tostore ist die einzige Hochleistungs-Speicher-Engine für verteilte Vektordatenbanken im Dart/Flutter-Ökosystem. Basierend auf einer neuronalen netzwerkähnlichen Architektur bietet es eine intelligente Vernetzung und Zusammenarbeit zwischen den Knoten und unterstützt eine unendliche horizontale Skalierung. Es baut ein flexibles Datentopologie-Netzwerk auf und bietet präzise Identifizierung von Schemaänderungen, Verschlüsselungsschutz sowie Multi-Space-Datentrennung. Tostore nutzt Multi-Core-CPUs für extrem parallele Verarbeitung voll aus und unterstützt nativ die plattformübergreifende Zusammenarbeit von mobilen Edge-Geräten bis hin zur Cloud. Mit verschiedenen verteilten Primärschlüssel-Algorithmen bietet es eine leistungsstarke Datengrundlage für Szenarien wie immersive Virtual Reality, multimodale Interaktion, Spatial Computing, generative KI und semantische Vektorraumodellierung.
+ToStore ist die einzige Hochleistungs-Speicher-Engine für verteilte Vektordatenbanken im Dart/Flutter-Ökosystem. Basierend auf einer neuronalen netzwerkähnlichen Architektur bietet es eine intelligente Vernetzung und Zusammenarbeit zwischen den Knoten und unterstützt eine unendliche horizontale Skalierung. Es baut ein flexibles Datentopologie-Netzwerk auf und bietet präzise Identifizierung von Schemaänderungen, Verschlüsselungsschutz sowie Multi-Space-Datentrennung. ToStore nutzt Multi-Core-CPUs für extrem parallele Verarbeitung voll aus und unterstützt nativ die plattformübergreifende Zusammenarbeit von mobilen Edge-Geräten bis hin zur Cloud. Mit verschiedenen verteilten Primärschlüssel-Algorithmen bietet es eine leistungsstarke Datengrundlage für Szenarien wie immersive Virtual Reality, multimodale Interaktion, Spatial Computing, generative KI und semantische Vektorraumodellierung.
 
-Da generative KI und Spatial Computing das Rechenzentrum an den Rand (Edge) verschieben, entwickeln sich Endgeräte von reinen Inhaltsanzeigen zu Kernpunkten für lokale Generierung, Umgebungswahrnehmung und Echtzeit-Entscheidungsfindung. Traditionelle eingebettete Datenbanken mit nur einer Datei sind durch ihr Architekturdesign begrenzt und haben oft Schwierigkeiten, die unmittelbaren Reaktionsanforderungen intelligenter Anwendungen bei hohen parallelen Schreibvorgängen, massiver Vektorsuche und Cloud-Edge-kollaborativer Generierung zu unterstützen. Tostore wurde für Edge-Geräte entwickelt und verleiht ihnen verteilte Speicherfähigkeiten, die ausreichen, um komplexe lokale KI-Generierung und großflächigen Datenfluss zu unterstützen – eine echte tiefe Zusammenarbeit zwischen Cloud und Edge.
+Da generative KI und Spatial Computing das Rechenzentrum an den Rand (Edge) verschieben, entwickeln sich Endgeräte von reinen Inhaltsanzeigen zu Kernpunkten für lokale Generierung, Umgebungswahrnehmung und Echtzeit-Entscheidungsfindung. Traditionelle eingebettete Datenbanken mit nur einer Datei sind durch ihr Architekturdesign begrenzt und haben oft Schwierigkeiten, die unmittelbaren Reaktionsanforderungen intelligenter Anwendungen bei hohen parallelen Schreibvorgängen, massiver Vektorsuche und Cloud-Edge-kollaborativer Generierung zu unterstützen. ToStore wurde für Edge-Geräte entwickelt und verleiht ihnen verteilte Speicherfähigkeiten, die ausreichen, um komplexe lokale KI-Generierung und großflächigen Datenfluss zu unterstützen – eine echte tiefe Zusammenarbeit zwischen Cloud und Edge.
 
 **Stromausfall- und absturzsicher**: Selbst bei einem unerwarteten Stromausfall oder Anwendungsabsturz können Daten automatisch wiederhergestellt werden, was einen echten Null-Verlust bedeutet. Sobald eine Datenoperation bestätigt wird, wurden die Daten bereits sicher gespeichert, sodass kein Risiko eines Datenverlusts besteht.
 
@@ -49,12 +45,12 @@ Da generative KI und Spatial Computing das Rechenzentrum an den Rand (Edge) vers
 
 
 
-...... Von den Fingerspitzen bis zu Cloud-Anwendungen hilft Tostore Ihnen, die Datenrechenleistung freizusetzen und die Zukunft zu gestalten ......
+...... Von den Fingerspitzen bis zu Cloud-Anwendungen hilft ToStore Ihnen, die Datenrechenleistung freizusetzen und die Zukunft zu gestalten ......
 
 
 
 
-## Tostore-Funktionen
+## ToStore-Funktionen
 
 - 🌐 **Nahtlose Unterstützung aller Plattformen**
   - Führen Sie denselben Code auf allen Plattformen aus, von mobilen Apps bis hin zu Cloud-Servern.
@@ -368,7 +364,7 @@ final freshUserData = await db.query('users')
 
 ## Fortgeschrittene Nutzung
 
-Tostore bietet eine Vielzahl fortgeschrittener Funktionen für komplexe Geschäftsanforderungen:
+ToStore bietet eine Vielzahl fortgeschrittener Funktionen für komplexe Geschäftsanforderungen:
 
 ### Tabellenbasiertes TTL (zeitbasierte automatische Löschung)
 
@@ -482,7 +478,7 @@ db.streamQuery('users').listen((data) => print(data));
 > [!TIP]
 > **Explizites `limit` für beste Performance**: Es wird dringend empfohlen, bei Abfragen immer ein `limit` anzugeben. Wenn es weggelassen wird, begrenzt die Engine standardmäßig auf 1000 Datensätze. Obwohl der Kern der Abfrage extrem schnell ist, kann die Serialisierung einer großen Anzahl von Datensätzen in UI-sensitiven Anwendungen zu unnötigen Zeitverzögerungen führen.
 
-Tostore bietet Unterstützung für Dual-Mode-Paginierung passend zu verschiedenen Datenskalen:
+ToStore bietet Unterstützung für Dual-Mode-Paginierung passend zu verschiedenen Datenskalen:
 
 #### 1. Offset-Modus
 Geeignet für kleine Datensätze (z.B. unter 10k Datensätzen) oder wenn spezifische Seitensprünge erforderlich sind.
@@ -620,7 +616,7 @@ await for (final record in db.streamQuery('vector_data')
 
 ## Primärschlüssel-Beispiele
 
-Tostore bietet verschiedene verteilte Primärschlüssel-Algorithmen:
+ToStore bietet verschiedene verteilte Primärschlüssel-Algorithmen:
 
 - **Sequentiell** (PrimaryKeyType.sequential): 238978991
 - **Zeitstempel-basiert** (PrimaryKeyType.timestampBased): 1306866018836946
@@ -815,27 +811,27 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ### Demo-Videos
 
 <p align="center">
-  <img src="../media/basic-demo.gif" alt="Tostore Basis-Performance-Demo" width="320" />
+  <img src="../media/basic-demo.gif" alt="ToStore Basis-Performance-Demo" width="320" />
   </p>
 
 <p align="center">
-  <img src="../media/disaster-recovery.gif" alt="Tostore Desaster-Recovery-Stresstest" width="320" />
+  <img src="../media/disaster-recovery.gif" alt="ToStore Desaster-Recovery-Stresstest" width="320" />
   </p>
 
 - **Basis-Performance-Demo** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): Die GIF-Vorschau kann abgeschnitten sein – klicken Sie auf das Video, um die vollständige Demo zu sehen. Zeigt, dass selbst auf einem durchschnittlichen Smartphone mit mehr als 100 M Datensätzen Startzeit, Blätter- und Such-Performance konstant und flüssig bleiben. Solange genügend Speicherplatz vorhanden ist, können Edge-Geräte auch TB- und PB-Skalierung tragen, ohne dass die Interaktivität spürbar einbricht.
-- **Desaster-Recovery-Stresstest** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Unterbricht absichtlich den Prozess während intensiver Schreiblast, um Abstürze und Stromausfälle zu simulieren. Selbst wenn zehntausende Schreiboperationen abrupt abgebrochen werden, stellt Tostore die Daten auf einem typischen Smartphone sehr schnell wieder her, ohne den nächsten Start oder die Datenverfügbarkeit zu beeinträchtigen.
+- **Desaster-Recovery-Stresstest** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Unterbricht absichtlich den Prozess während intensiver Schreiblast, um Abstürze und Stromausfälle zu simulieren. Selbst wenn zehntausende Schreiboperationen abrupt abgebrochen werden, stellt ToStore die Daten auf einem typischen Smartphone sehr schnell wieder her, ohne den nächsten Start oder die Datenverfügbarkeit zu beeinträchtigen.
 
 
 
 
-Falls Tostore Ihnen hilft, geben Sie uns bitte ein ⭐️
+Falls ToStore Ihnen hilft, geben Sie uns bitte ein ⭐️
 
 
 
 
 ## Roadmap
 
-Tostore entwickelt aktiv Funktionen zur weiteren Stärkung der Dateninfrastruktur im KI-Zeitalter:
+ToStore entwickelt aktiv Funktionen zur weiteren Stärkung der Dateninfrastruktur im KI-Zeitalter:
 
 - **Hochdimensionale Vektoren**: Hinzufügen von Vektorabruf und semantischen Suchalgorithmen.
 - **Multimodale Daten**: Bereitstellung von Ende-zu-Ende-Verarbeitung von Rohdaten zu Merkmalsvektoren.
@@ -855,5 +851,4 @@ Tostore entwickelt aktiv Funktionen zur weiteren Stärkung der Dateninfrastruktu
 - 📖 **Dokumentation**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Feedback**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Diskussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
 

@@ -1,12 +1,17 @@
 import 'dart:async';
 import 'dart:math';
+
 import 'package:tostore/tostore.dart';
 
 import 'log_service.dart';
 
-/// A comprehensive testing suite for validating Tostore's core functionalities.
+/// A comprehensive testing suite for validating ToStore's core functionalities.
 /// It covers basic CRUD, upsert, joins, multi-space, and various edge cases.
 class DatabaseTester {
+  static const bool _isWasmBuild =
+      bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
+  // These tests currently pull in code paths that break dart2wasm/wasm-opt.
+
   final ToStore db;
   final LogService log;
   final Function(String) _updateLastOperation;
@@ -76,19 +81,21 @@ class DatabaseTester {
         {'name': 'Upsert Logic', 'test': _testUpsert},
         {'name': 'JOIN Queries', 'test': _testJoinQueries},
         {'name': 'Multi-Space Isolation', 'test': _testMultiSpace},
-        {
-          'name': 'Advanced Queries & Edge Cases',
-          'test': _testAdvancedQueriesAndEdgeCases
-        },
-        {'name': 'Count Verification', 'test': _testCountVerification},
-        {'name': 'Backup & Restore', 'test': _testBackupAndRestore},
         {'name': 'Foreign Key Operations', 'test': _testForeignKeyOperations},
         {'name': 'Expression Operations', 'test': _testExpressionOperations},
         {'name': 'Transaction Operations', 'test': _testTransactionOperations},
-        {
-          'name': 'Concurrency Stress Test',
-          'test': () => runConfigurableConcurrencyTest(_baseConcurrencyConfig)
-        },
+        {'name': 'Backup & Restore', 'test': _testBackupAndRestore},
+        if (!_isWasmBuild) ...[
+          {
+            'name': 'Advanced Queries & Edge Cases',
+            'test': _testAdvancedQueriesAndEdgeCases
+          },
+          {'name': 'Count Verification', 'test': _testCountVerification},
+          {
+            'name': 'Concurrency Stress Test',
+            'test': () => runConfigurableConcurrencyTest(_baseConcurrencyConfig)
+          },
+        ],
       ];
 
       for (var i = 0; i < tests.length; i++) {
@@ -670,6 +677,14 @@ class DatabaseTester {
   Future<bool> runConfigurableConcurrencyTest(
       Map<String, Map<String, int>> config,
       {int verificationSampleSize = 10}) async {
+    if (_isWasmBuild) {
+      log.add(
+          '❌ Concurrency Stress Test is skipped on WebAssembly due to dart2wasm/wasm-opt compatibility.',
+          LogType.warn);
+      _updateLastOperation('❌ Concurrency Test Skipped on WebAssembly');
+      return false;
+    }
+
     log.add(
         '--- Testing: Configurable Concurrency Stress Test (users & settings) ---',
         LogType.debug);
@@ -701,9 +716,7 @@ class DatabaseTester {
       Future<List<Map<String, dynamic>>> prepareAndGenerateOpsForTable({
         required String tableName,
         required Map<String, int> tableConfig,
-        required ({Future<DbResult> future, Map<String, dynamic> data})
-                Function(int i)
-            insertGenerator,
+        required _GeneratedDbOperation Function(int i) insertGenerator,
         required Map<String, dynamic> updateData,
         required List<Map<String, dynamic>> itemsToInsert,
         required List<Map<String, dynamic>> itemsToUpdate,
@@ -843,7 +856,10 @@ class DatabaseTester {
             'email': 'cc_user_$i@test.com',
             'age': 20 + i,
           };
-          return (future: db.insert('users', data), data: data);
+          return _GeneratedDbOperation(
+            future: db.insert('users', data),
+            data: data,
+          );
         },
         updateData: {'age': 999},
         nameField: 'username',
@@ -861,7 +877,10 @@ class DatabaseTester {
             'key': 'cc_setting_$i',
             'value': 'value_$i',
           };
-          return (future: db.insert('settings', data), data: data);
+          return _GeneratedDbOperation(
+            future: db.insert('settings', data),
+            data: data,
+          );
         },
         updateData: {'value': 'updated_value'},
         idField: 'key',
@@ -929,12 +948,12 @@ class DatabaseTester {
       List<T> getHeadTailSample<T>(List<T> list) {
         final sampleSize = verificationSampleSize;
         if (list.isEmpty || list.length <= sampleSize) {
-          return list;
+          return List<T>.from(list);
         }
         final half = (sampleSize / 2).ceil();
         final head = list.sublist(0, half);
         final tail = list.sublist(list.length - half);
-        return {...head, ...tail}.toList();
+        return <T>[...head, ...tail];
       }
 
       _updateLastOperation('Verifying data integrity for users...');
@@ -1821,4 +1840,14 @@ class DatabaseTester {
     }
     return isTestPassed;
   }
+}
+
+class _GeneratedDbOperation {
+  final Future<DbResult> future;
+  final Map<String, dynamic> data;
+
+  const _GeneratedDbOperation({
+    required this.future,
+    required this.data,
+  });
 }
