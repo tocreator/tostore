@@ -4142,9 +4142,16 @@ class DataStoreImpl {
   }
 
   TransactionErrorType _classifyTransactionErrorOrUnknown(Object e) {
+    if (e is TimeoutException) return TransactionErrorType.timeout;
+
+    final businessClassification = _classifyBusinessTransactionError(e);
+    if (businessClassification != null) {
+      return businessClassification;
+    }
+
     final msg = e.toString().toLowerCase();
     if (msg.contains('timeout')) return TransactionErrorType.timeout;
-    if (msg.contains('io') || msg.contains('filesystem')) {
+    if (_looksLikeIoFailure(e, msg)) {
       return TransactionErrorType.io;
     }
     if (msg.contains('unique') ||
@@ -4152,8 +4159,76 @@ class DataStoreImpl {
         msg.contains('integrity')) {
       return TransactionErrorType.integrityViolation;
     }
-    if (msg.contains('lock')) return TransactionErrorType.conflict;
+    if (msg.contains('lock') || msg.contains('conflict')) {
+      return TransactionErrorType.conflict;
+    }
     return TransactionErrorType.unknown;
+  }
+
+  bool _looksLikeIoFailure(Object e, String msg) {
+    final typeName = e.runtimeType.toString().toLowerCase();
+    return typeName.contains('filesystemexception') ||
+        typeName.contains('ioexception') ||
+        typeName.contains('socketexception') ||
+        msg.contains('filesystem') ||
+        msg.contains('file system') ||
+        msg.contains('io error') ||
+        msg.contains('i/o') ||
+        msg.contains('disk');
+  }
+
+  TransactionErrorType? _classifyBusinessTransactionError(Object e) {
+    if (e is! BusinessError) return null;
+
+    final resultType = _extractResultTypeFromBusinessError(e);
+    if (resultType != null) {
+      return _mapResultTypeToTransactionError(resultType);
+    }
+
+    switch (e.type) {
+      case BusinessErrorType.duplicateKey:
+      case BusinessErrorType.duplicateValue:
+      case BusinessErrorType.uniqueError:
+      case BusinessErrorType.primaryKeyError:
+        return TransactionErrorType.integrityViolation;
+      default:
+        return TransactionErrorType.operationError;
+    }
+  }
+
+  ResultType? _extractResultTypeFromBusinessError(BusinessError error) {
+    final data = error.data;
+    if (data is! Map) return null;
+
+    final code = data['code'];
+    if (code is! int) return null;
+
+    return ResultType.fromCode(code);
+  }
+
+  TransactionErrorType _mapResultTypeToTransactionError(ResultType type) {
+    switch (type) {
+      case ResultType.uniqueViolation:
+      case ResultType.primaryKeyViolation:
+      case ResultType.foreignKeyViolation:
+      case ResultType.notNullViolation:
+        return TransactionErrorType.integrityViolation;
+      case ResultType.timeout:
+        return TransactionErrorType.timeout;
+      case ResultType.ioError:
+        return TransactionErrorType.io;
+      case ResultType.success:
+      case ResultType.partialSuccess:
+      case ResultType.unknown:
+      case ResultType.validationFailed:
+      case ResultType.notFound:
+      case ResultType.tableExists:
+      case ResultType.fieldExists:
+      case ResultType.indexExists:
+      case ResultType.resourceExhausted:
+      case ResultType.dbError:
+        return TransactionErrorType.operationError;
+    }
   }
 
   /// drop table

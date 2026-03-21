@@ -11,12 +11,25 @@ enum TransactionStatus {
 ///
 /// Only contains error types that can be reliably identified in actual operation, otherwise it is unknown.
 enum TransactionErrorType {
+  /// Generic operation failure inside a transaction.
   operationError,
+
+  /// Integrity or constraint violation such as unique/foreign-key conflicts.
   integrityViolation,
+
+  /// Transaction execution or wait timed out.
   timeout,
+
+  /// Storage or filesystem I/O failure.
   io,
+
+  /// Locking or serialization conflict.
   conflict,
+
+  /// Transaction was actively aborted by the caller.
   userAbort,
+
+  /// Error cause could not be classified reliably.
   unknown,
 }
 
