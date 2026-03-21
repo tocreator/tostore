@@ -463,7 +463,7 @@ class ToStoreExample {
         distributedNodeConfig: const DistributedNodeConfig(
           enableDistributed: true, // enable distributed mode
           clusterId: 1, // configure cluster id
-          centralServerUrl: 'http://127.0.0.1:8080',
+          centralServerUrl: 'https://127.0.0.1:8080',
           accessToken: 'b7628a4f9b4d269b98649129',
         ),
         enableLog: true, // enable log

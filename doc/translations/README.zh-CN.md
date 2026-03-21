@@ -33,80 +33,67 @@
 
 
 
+## 快速导航
+
+- [为什么选择 ToStore？](#why-tostore) | [ToStore特性](#key-features) | [安装](#installation) | [快速开始](#quick-start)
+- [表结构定义](#schema-definition) | [移动、桌面等频繁启动场景集成](#mobile-integration) | [服务端集成](#server-integration)
+- [向量字段、向量索引与向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [查询与高效分页](#query-pagination) | [外键与级联约束](#foreign-keys) | [查询操作符](#query-operators)
+- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [错误码与错误处理](#error-handling)
+- [安全配置](#security-config) | [性能与体验](#performance) | [更多资源](#more-resources)
+
+
+<a id="why-tostore"></a>
 ## 为什么选择 ToStore？
 
-ToStore 是Dart/Flutter生态中唯一的分布式向量数据库高性能存储引擎。采用类神经网络式架构，节点间智能互联协同，支持无限节点水平扩展，构建灵活的数据拓扑网络，提供精准的表结构变动识别、加密保护以及多空间数据隔离，充分利用多核心CPU实现极致并行处理，天然支持从移动边缘设备到云端的跨平台协同，具备多种分布式主键算法，为沉浸式虚实融合、多模态交互、空间计算、生成式AI、语义向量空间建模等场景提供强大的数据基座。
+ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎。原生支持分布式体系、融合向量检索与结构化多模态数据存储，以及边云跨平台协同。基于类神经网络式的底层架构，节点具备较高自治性，可互联协同与弹性水平扩展，构建灵活的数据拓扑网络。具备 ACID 事务、级联外键、复杂条件查询、JOIN、表级 TTL、聚合计算等基础，内置多种分布式主键算法与原子性表达式，同时提供表结构变动识别、加密保护、多空间数据隔离、资源感知智能负载调度与灾难崩溃自愈恢复等能力。
 
-随着生成式AI与空间计算驱动计算重心向边缘偏移，终端设备正由单纯的内容展示器演变为局部生成、环境感知与实时决策的核心。传统的单文件嵌入式数据库受限于架构设计，在面对高并发写入、海量向量检索以及云边协同生成时，往往难以支撑智能化应用对极致响应的要求。ToStore 专为边缘设备而生，赋予了边缘端足以支撑复杂AI局部生成与大规模数据流转的分布式存储能力，真正实现云端与边缘的深度协同。
+随着计算重心持续向端侧边缘智能偏移，智能体、传感器等各类终端设备不再只是单纯的“内容展示器”，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。传统数据库方案受限于底层架构及拼接式扩展，在面对高并发写入、海量数据、向量检索以及云边协同生成时，越来越难以支撑边云智能化应用对低延迟与稳定性的要求。
 
-**不怕断电，不怕崩溃**：即使意外断电或应用崩溃，数据也能自动恢复，真正做到零丢失。当数据操作响应时，数据已经安全保存，无需担心数据丢失的风险。
-
-**性能突破极限**：实测普通手机在亿级以上数据量下也能保持恒定检索能力，不会随着数据规模影响，带来远超传统数据库的使用体验。
+ToStore 赋予边缘端支撑海量数据、复杂 AI 局部生成与大规模数据流转的分布式能力，边云节点深度智能协同，为沉浸式虚实融合、多模态交互、语义向量、空间建模等场景提供可靠的数据基座。
 
 
 
 
-......  从指尖到云端应用，ToStore助你释放数据算力，赋能未来 ......
-
-
-
-
+<a id="key-features"></a>
 ## ToStore特性
 
-- 🌐 **全平台无缝支持**
-  - 从移动应用到云端服务器，一套代码全平台运行
-  - 智能适配不同平台存储后端（IndexedDB、文件系统等）
-  - 统一API接口，跨平台数据同步无忧
-  - 边缘设备到云端服务器的无缝数据流动
-  - 边缘设备本地向量计算，减少网络延迟与云端依赖
+- 🌐 **统一的跨平台数据引擎**
+  - 支持移动端、桌面端、Web 与服务端使用同一套 API
+  - 可适配 IndexedDB、文件系统等不同平台存储后端
+  - 适合从本地存储到边云协同的数据链路
 
-- 🧠 **神经网络式分布式架构**
-  - 类神经网络互联节点拓扑结构，高效组织数据流
-  - 高性能数据分区机制实现真正分布式处理
-  - 智能工作负载动态平衡，资源利用最大化
-  - 无限节点水平扩展，轻松构建复杂数据网络
+- 🧠 **类神经网络式分布式架构**
+  - 节点具备较高自治性，可互联协同构建灵活的数据拓扑
+  - 支持节点协作与弹性水平扩展
+  - 适合边缘设备与云端节点的混合部署
 
-- ⚡ **极致并行处理能力**
-  - Isolate实现真正并行读写，CPU多核心全速运行
-  - 智能资源调度，自动平衡负载，最大化发挥多核心性能
-  - 多节点计算网络协同工作，任务处理效率倍增
-  - 资源感知的调度框架，自动优化执行计划，避免资源竞争
-  - 流式查询接口轻松处理海量数据集
+- ⚡ **并行执行与资源调度**
+  - 基于 Isolate 并行处理与任务拆分
+  - 资源感知智能负载调度，高可用
+  - 多节点并行协同计算，降低任务执行耗时
 
-- 🔑 **多样化分布式主键算法**
-  - 顺序递增算法 - 自由调整随机步长，隐藏业务规模
-  - 时间戳基础算法 - 高并发场景下的最佳选择
-  - 日期前缀算法 - 完美支持时间范围数据展示
-  - 短码算法 - 生成短小易读的唯一标识符
+- 🔍 **结构化查询与向量检索**
+  - 支持复杂条件查询、JOIN、聚合计算与表级 TTL
+  - 支持向量字段、向量索引与近邻检索
+  - 结构化数据与向量数据可在同一引擎内协同使用
 
-- 🔄 **智能模式迁移与数据完整性**
-  - 精准识别表字段重命名，数据零丢失
-  - 毫秒级自动检测表结构变动并完成数据迁移
-  - 零停机升级，业务无感知
-  - 复杂结构变更的安全迁移策略
-  - 外键约束自动验证，支持级联操作，确保数据引用完整性
+- 🔑 **主键、索引与模式演进**
+  - 内置顺序递增、时间戳、日期前缀、短码等主键算法
+  - 支持唯一索引、组合索引、向量索引与外键约束
+  - 智能识别表结构变动，自动完成数据迁移
 
-- 🛡️ **企业级数据安全与持久性**
-  - 双重保障机制：数据变更实时记录，确保永不丢失
-  - 崩溃自动恢复：意外断电或崩溃后自动恢复未完成操作，数据零丢失
-  - 数据一致性保障：多个操作要么全部成功，要么全部回滚，保证数据准确
-  - 原子计算更新：表达式系统支持复杂计算，原子执行避免并发冲突
-  - 即时安全落盘：操作成功响应时，数据已安全保存，无需等待
-  - ChaCha20Poly1305高强度加密算法保护敏感数据
-  - 端到端加密，存储与传输全程安全
+- 🛡️ **事务、安全与恢复**
+  - 提供 ACID 事务、原子表达式更新与级联外键
+  - 支持崩溃恢复、提交落盘与数据一致性保障
+  - 支持 ChaCha20-Poly1305 与 AES-256-GCM 加密
 
-- 🚀 **智能缓存与检索性能**
-  - 多层级智能缓存机制，极速数据检索
-  - 与存储引擎深度融合的缓存策略
-  - 自适应扩展，数据规模增长下保持稳定性能
-  - 实时数据变动通知，查询结果自动更新
-
-- 🔄 **智能数据工作流**
-  - 多空间架构，数据隔离兼具全局共享
-  - 跨计算节点的智能工作负载分配
-  - 为大规模数据训练和分析提供稳固底座
+- 🔄 **多空间与数据工作流**
+  - 支持按空间隔离数据，可配置全局共享数据
+  - 支持查询条件实时监听、多层级智能缓存与游标分页
+  - 适合多用户、本地优先、离线协同等应用场景
 
 
+<a id="installation"></a>
 ## 安装
 
 > [!IMPORTANT]
@@ -119,12 +106,14 @@ dependencies:
   tostore: any # 请使用最新版本
 ```
 
+<a id="quick-start"></a>
 ## 快速开始
 
 > [!IMPORTANT]
-> **定义表结构是首要步骤**：在进行增删改查之前，必须先定义表结构。具体的定义方式取决于您的场景：
-> - **移动端/桌面端**：推荐[静态定义](#频繁启动场景集成)。
-> - **服务端**：推荐[动态创建](#服务端集成方案)。
+> **定义表结构是首要步骤**：在进行增删改查之前，必须先定义表结构。当然仅使用键值对存储的忽略。具体的定义方式取决于您的场景：
+> - 表结构定义与约束说明见 [表结构定义](#schema-definition)。
+> - **移动端/桌面端**：[频繁启动场景集成](#mobile-integration) 在初始化实例时传入 `schemas`。
+> - **服务端**： [服务端集成](#server-integration) 推荐在运行时通过调用 `createTables`创建。
 
 ```dart
 // 1. 初始化数据库
@@ -158,17 +147,20 @@ db.query('users').where('age', '>', 18).watch().listen((users) {
 适用于不需要定义结构化表的场景，简单实用，内置了高性能的键值对存储，可用于存储配置信息、状态等零散数据。不同空间（Space）的数据是天然隔离的，可设置全局共享。
 
 ```dart
-// 1. 设置键值对 (支持 String, int, bool, double, Map, List 等)
+// 初始化数据库
+final db = await ToStore.open();
+
+// 设置键值对 (支持 String, int, bool, double, Map, List 等)
 await db.setValue('theme', 'dark');
 await db.setValue('login_attempts', 3);
 
-// 2. 获取数据
+// 获取数据
 final theme = await db.getValue('theme'); // 'dark'
 
-// 3. 删除数据
+// 删除数据
 await db.removeValue('theme');
 
-// 4. 全局键值对 (跨 Space 共享)
+// 全局键值对 (跨 Space 共享)
 // 在不同空间切换后，默认键值对数据会自动失效。使用 isGlobal: true 可以实现全局共享。
 await db.setValue('app_version', '1.0.0', isGlobal: true);
 final version = await db.getValue('app_version', isGlobal: true);
@@ -176,75 +168,115 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 
 
-## 频繁启动场景集成
+<a id="schema-definition"></a>
+## 表结构定义
+下文移动端与服务端示例都会复用这里的 `appSchemas`。
 
-📱 **示例**：[mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+### TableSchema 结构总览
 
 ```dart
-// 适用移动应用、桌面客户端等频繁启动场景的表结构定义方式
-// 精准识别表结构变动，自动升级迁移数据，零代码维护
-final db = await ToStore.open(
-  schemas: [
-    const TableSchema(
-            name: 'global_settings',
-            isGlobal: true,  // 设置为全局表，所有空间可访问
-            fields: [],
+const userSchema = TableSchema(
+  name: 'users', // 表名，必填
+  tableId: 'users', // 表的唯一标识，可选，用于100%识别表重命名，省略也有99.9%精准识别率
+  primaryKeyConfig: PrimaryKeyConfig(
+    name: 'id', // 主键字段名，默认 id
+    type: PrimaryKeyType.sequential, // 主键自动生成类型
+    sequentialConfig: SequentialIdConfig(
+      initialValue: 1000, // 顺序主键起始值
+      increment: 1, // 顺序主键步长
+      useRandomIncrement: false, // 是否启用随机步长
     ),
-    const TableSchema(
-      name: 'users', // 表名
-      tableId: "users",  // 表名唯一标识，可选，用于100%识别重命名需求，省略也可达到99.99%以上的精准识别率
-      primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id',       // 主键名称
-      ),
-      fields: [        // 字段定义（不含主键）
-        FieldSchema(
-          name: 'username', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true, // 自动创建唯一索引
-          fieldId: 'username',  // 字段唯一标识，可选
-        ),
-        FieldSchema(
-          name: 'email', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true // 自动创建唯一索引
-        ),
-        FieldSchema(
-          name: 'last_login', 
-          type: DataType.datetime,
-          createIndex: true // 自动创建索引
-        ),
-      ],
-      // 组合索引示例
-      indexes: [
-        IndexSchema(fields: ['username', 'last_login']),
-      ],
+  ),
+  fields: [
+    FieldSchema(
+      name: 'username', // 字段名，必填
+      type: DataType.text, // 字段数据类型，必填
+      nullable: false, // 是否允许为 null
+      minLength: 3, // 最小长度
+      maxLength: 32, // 最大长度
+      unique: true, // 是否唯一
+      fieldId: 'username', // 字段唯一标识，可选，用于识别字段重命名
+      comment: '登录名', // 字段注释，可选，比如用于备注用途
     ),
-    // 外键约束定义示例
-    TableSchema(
-      name: 'posts',
-      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
-      fields: [
-        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
-        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
-        const FieldSchema(name: 'content', type: DataType.text),
-      ],
-      foreignKeys: [
-        ForeignKeySchema(
-          name: 'fk_posts_user',
-          fields: ['user_id'],              // 当前表的字段
-          referencedTable: 'users',         // 引用的表
-          referencedFields: ['id'],         // 引用的字段
-          onDelete: ForeignKeyCascadeAction.cascade,  // 删除时级联删除，users表的记录删除后会自动删除posts表的数据
-          onUpdate: ForeignKeyCascadeAction.cascade,  // 更新时级联更新
-        ),
-      ],
+    FieldSchema(
+      name: 'status',
+      type: DataType.integer,
+      minValue: 0, // 数值下限
+      maxValue: 150, // 数值上限
+      defaultValue: 0, // 静态默认值
+      createIndex: true,  // 快捷创建索引，提升检索性能
+    ),
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      defaultValueType: DefaultValueType.currentTimestamp, // 自动填充当前时间
+      createIndex: true,
     ),
   ],
+  indexes: const [
+    IndexSchema(
+      indexName: 'idx_users_status_created_at', // 索引名，可选
+      fields: ['status', 'created_at'], // 复合索引字段列表
+      unique: false, // 是否唯一索引
+      type: IndexType.btree, // 索引类型：btree/hash/bitmap/vector
+    ),
+  ],
+  foreignKeys: const [], // 外键约束列表，可选；完整示例见下文“外键与级联约束”
+  isGlobal: false, // 是否为全局表；true 时可跨 Space 全局共享
+  ttlConfig: null, // 表级 TTL，可选；完整示例见下文“表级 TTL”
 );
 
-// 多空间架构 - 完美隔离不同用户数据
+const appSchemas = [userSchema];
+```
+
+`DataType` 支持 `integer`、`bigInt`、`double`、`text`、`blob`、`boolean`、`datetime`、`array`、`json`、`vector`；`PrimaryKeyType` 支持 `none`、`sequential`、`timestampBased`、`datePrefixed`、`shortCode`。
+
+### 约束与自动校验
+
+通过 `FieldSchema` 可以直接把常见校验规则写入 schema，而不是在 UI、接口或服务层重复维护同一套逻辑：
+
+- `nullable: false`：非空约束
+- `minLength` / `maxLength`：文本长度约束
+- `minValue` / `maxValue`：整数或浮点数范围约束
+- `defaultValue` / `defaultValueType`：静态默认值与动态默认值
+- `unique`：唯一约束
+- `createIndex`：为高频查询过滤、排序或关联字段创建索引，提升检索性能
+- `fieldId` / `tableId`：辅助识别字段或表重命名，便于迁移
+
+这些约束会在数据写入路径中统一校验，减少业务层重复实现非空、长度、范围和默认值逻辑。
+
+其中，`unique: true` 及会自动生成单字段唯一索引，`createIndex: true` 、外键会自动生成单字段普通索引；`indexes` 更适合定义组合索引、命名索引或向量索引。
+
+
+
+
+### 选择接入方式
+
+- **移动端/桌面端**：适合在初始化实例直接把 `appSchemas` 传入 `ToStore.open(...)`
+- **服务端**：适合在进程运行时动态创建 schema，调用 `createTables(appSchemas)`
+
+
+<a id="mobile-integration"></a>
+## 移动、桌面等频繁启动场景集成
+
+📱 **示例**：[mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+
+```dart
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+// Android / iOS 需要先解析应用可写目录，再显式传入 dbPath
+final docDir = await getApplicationDocumentsDirectory();
+final dbRoot = p.join(docDir.path, 'common');
+
+// 复用上文定义好的 appSchemas
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+);
+
+// 多空间架构 - 隔离不同用户数据
 await db.switchSpace(spaceName: 'user_123');
 ```
 
@@ -269,60 +301,18 @@ await db.close(keepActiveSpace: false);
 
 
 
+<a id="server-integration"></a>
 ## 服务端集成
 
-🖥️ **示例**：[server_quickstart.dart](example/lib/server_quickstart.dart)
+🖥️ **示例**：[server_quickstart.dart](../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
 
-// 服务端运行时批量创建表结构 - 适合持续运行场景 （单个表创建为 db.createTable）
-await db.createTables([
-  // 三维空间特征向量存储表结构
-  const TableSchema(
-    name: 'spatial_embeddings',                // 表名
-    primaryKeyConfig: PrimaryKeyConfig(
-      name: 'id',                            // 主键名
-      type: PrimaryKeyType.timestampBased,   // 时间戳主键类型，适合高并发写入
-    ),
-    fields: [
-      FieldSchema(
-        name: 'video_name',
-        type: DataType.text,
-        nullable: false,
-      ),
-      FieldSchema(
-        name: 'spatial_features',
-        type: DataType.vector,                // 向量存储类型
-        vectorConfig: VectorFieldConfig(
-          dimensions: 1024,                   // 适配空间特征的高维向量
-          precision: VectorPrecision.float32, // 平衡精度和存储空间
-        ),
-      ),
-    ],
-    indexes: [
-      IndexSchema(
-        fields: ['video_name'],
-        unique: true,
-      ),
-      IndexSchema(
-        type: IndexType.vector,              // 向量索引
-        fields: ['spatial_features'],
-        vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,   // NGH算法，高效近邻检索算法
-          distanceMetric: VectorDistanceMetric.cosine,
-          parameters: {
-            'M': 16,                         // 每层最大连接数
-            'efConstruction': 200,           // 构建质量参数
-          },
-        ),
-      ),
-    ],
-  ),
-  // 其它表...
-]);
+// 服务启动时创建或校验表结构
+await db.createTables(appSchemas);
 
-// 在线表结构更新 - 业务无感知
+// 在线表结构更新
 final taskId = await db.updateSchema('users')
   .renameTable('users_new')                // 修改表名
   .modifyField(
@@ -335,7 +325,7 @@ final taskId = await db.updateSchema('users')
   .removeField('deprecated_field')         // 删除字段
   .addField('created_at', type: DataType.datetime)  // 添加字段
   .removeIndex(fields: ['age'])            // 删除索引
-  .setPrimaryKeyConfig(                    // 更改主键配置
+  .setPrimaryKeyConfig(                    // 更改主键类型，注意必须数据为空，不然会警告迁移数据
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
     
@@ -345,7 +335,7 @@ print('迁移进度: ${status?.progressPercentage}%');
 
 
 // 手动查询缓存管理 (服务端)
-// 针对主键及索引的等值查询、IN 查询，由于引擎性能卓越，通常无须额外手动维护查询缓存。
+// 对于主键或索引的等值查询、IN 查询，这些耗时极低，无须额外手动维护查询缓存。
 
 // 手动缓存一个查询结果5分钟。若不提供时长，则缓存永不过期。
 final activeUsers = await db.query('users')
@@ -366,10 +356,90 @@ final freshUserData = await db.query('users')
 
 
 
+
+
+<a id="advanced-usage"></a>
 ## 进阶用法
 
 ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
 
+
+<a id="vector-advanced"></a>
+### 向量字段、向量索引与向量检索
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'embeddings',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.timestampBased,
+    ),
+    fields: [
+      FieldSchema(
+        name: 'document_title',
+        type: DataType.text,
+        nullable: false,
+      ),
+      FieldSchema(
+        name: 'embedding',
+        type: DataType.vector,  // 声明向量类型
+        nullable: false,
+        vectorConfig: VectorFieldConfig(
+          dimensions: 128, // 向量维度；写入和查询时的向量长度都必须一致
+          precision: VectorPrecision.float32, // 存储精度；float32 通常兼顾精度与空间占用
+        ),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['embedding'], // 要建立向量索引的字段
+        type: IndexType.vector,  // 构建向量索引
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,  // 向量索引类型；当前内置为 NGH
+          distanceMetric: VectorDistanceMetric.cosine, // 距离度量；适合归一化后的 embedding
+          maxDegree: 32, // 图中每个节点保留的最大邻居数；越大召回通常越高，但更耗内存
+          efSearch: 64, // 查询扩展因子；越大召回通常越高，但查询更慢
+          constructionEf: 128, // 建索引扩展因子；越大索引质量通常越高，但构建更慢
+        ),
+      ),
+    ],
+  ),
+]);
+
+final queryVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // 长度需与 dimensions 一致
+
+// 向量检索
+final results = await db.vectorSearch(
+  'embeddings', // 表名
+  fieldName: 'embedding', // 向量字段名
+  queryVector: queryVector, // 查询向量
+  topK: 5, // 返回最相近的前 5 条记录
+  efSearch: 64, // 可覆盖索引中的查询扩展因子；越大通常召回越高，但延迟也更高
+);
+
+for (final r in results) {
+  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+}
+```
+
+参数说明：
+
+- `dimensions`：向量维度，必须与实际写入的 embedding 长度一致。
+- `precision`：向量存储精度，常见可选值有 `float64`、`float32`、`int8`；精度越高，存储开销通常越大。
+- `distanceMetric`：相似度度量方式；`cosine` 常用于语义 embedding，`l2` 适合欧氏距离场景，`innerProduct` 适合点积检索。
+- `maxDegree`：NGH 图索引中每个节点保留的邻居上限，增大后通常可提升召回率，但会增加内存占用和构建成本。
+- `efSearch`：查询阶段扩展宽度，增大后通常可提升召回率，但会增加查询延迟。索引配置里可设置默认值，`vectorSearch(...)` 时也可以按单次查询覆盖。
+- `constructionEf`：索引构建阶段扩展宽度，增大后通常可提升索引质量，但会增加建索引耗时。
+- `topK`：返回结果数量。
+
+结果说明：
+
+- `score`：归一化后的相似度分数，范围通常在 `0 ~ 1`，值越大表示越相近。
+- `distance`：距离值；对 `l2` / `cosine` 场景通常越小表示越相近。
+
+<a id="ttl-config"></a>
 ### 表级 TTL（按时间自动过期清理）
 
 对于日志、埋点、时序等按时间淘汰的数据，可以在表结构中通过 `ttlConfig` 定义表级 TTL，到期数据将由引擎在后台自动清理，无需业务端手动清理维护：
@@ -488,6 +558,7 @@ db.streamQuery('users').listen((data) => print(data));
 
 
 
+<a id="query-pagination"></a>
 ### 查询与高效分页
 
 > [!TIP]
@@ -507,8 +578,8 @@ final result = await db.query('users')
 > [!TIP]
 > 当 `offset` 非常大时，数据库需要扫描并丢弃大量记录，性能会线性下降。建议深度翻页时使用 **Cursor 模式**。
 
-#### 2. 高性能游标分页 (Cursor Mode)
-**推荐用于海量数据和无限滚动场景**。利用 `nextCursor` 实现 O(1) 级别的性能，确保无论翻到多少页，查询速度始终恒定。
+#### 2. 游标分页 (Cursor Mode)
+适合海量数据和无限滚动场景。利用 `nextCursor` 从当前位置继续读取，可避免深度翻页时 `offset` 带来的额外扫描。
 
 > [!IMPORTANT]
 > 对于部分复杂的查询或针对未索引字段进行排序时，引擎可能会回退到全表扫描并返回 `null` 游标（即暂不支持该特定查询的分页）。
@@ -535,12 +606,54 @@ final prevPage = await db.query('users')
 
 | 特性 | Offset 模式 | Cursor 模式 |
 | :--- | :--- | :--- |
-| **查询性能** | 随页数增加而下降 | **始终恒定 (O(1))** |
+| **查询性能** | 随页数增加而下降 | 深度翻页时始终恒定 |
 | **适用范围** | 少量数据、精确跳转 | **海量数据、无限滚动** |
-| **数据一致性** | 数据变动后可能导致跳行 | **完美避免数据变动导致的重复或遗漏** |
+| **数据一致性** | 数据变动后可能导致跳行 | 避免数据变动导致的重复或遗漏 |
 
 
 
+
+<a id="foreign-keys"></a>
+### 外键与级联约束
+
+使用外键约束可以保证引用完整性，并配置级联更新、级联删除等行为。外键约束会在写入和更新时校验引用关系；如果启用了级联策略，关联记录变化时会同步处理引用数据，减少业务层手动维护的一致性逻辑。
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'users',
+    primaryKeyConfig: PrimaryKeyConfig(name: 'id'),
+    fields: [
+      FieldSchema(name: 'username', type: DataType.text, nullable: false),
+    ],
+  ),
+  TableSchema(
+    name: 'posts',
+    primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+    fields: [
+      const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+      const FieldSchema(name: 'content', type: DataType.text),
+    ],
+    foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // 当前表的字段
+          referencedTable: 'users',         // 引用的表
+          referencedFields: ['id'],         // 引用的字段
+          onDelete: ForeignKeyCascadeAction.cascade,  // 删除时级联删除，users表的记录删除后会自动删除posts表的数据
+          onUpdate: ForeignKeyCascadeAction.cascade,  // 更新时级联更新
+        ),
+    ],
+  ),
+]);
+```
+
+
+
+
+
+<a id="query-operators"></a>
 ### 查询操作符
 
 所有 `where(field, operator, value)` 条件支持以下操作符（大小写不敏感）：
@@ -597,6 +710,7 @@ final users = await db.query('users')
     .limit(20);
 ```
 
+<a id="distributed-architecture"></a>
 ## 分布式架构
 
 ```dart
@@ -606,29 +720,30 @@ final db = await ToStore.open(
     distributedNodeConfig: const DistributedNodeConfig(
       enableDistributed: true,            // 启用分布式模式
       clusterId: 1,                       // 集群ID，配置集群归属
-      centralServerUrl: 'http://127.0.0.1:8080',
+      centralServerUrl: 'https://127.0.0.1:8080',
       accessToken: 'b7628a4f9b4d269b98649129'
     )
   )
 );
 
-// 高性能批量插入
+// 批量插入
 await db.batchInsert('vector_data', [
   {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
   {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
   // ... 向量数据记录一次性高效插入
 ]);
 
-// 流式处理大数据集 - 内存占用恒定
+// 流式处理大数据集
 await for (final record in db.streamQuery('vector_data')
   .where('vector_name', '=', 'face_2366')
   .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
   .stream) {
-  // 即使是TB级数据，也能高效处理而不占用大量内存
+  // 逐条处理结果，避免一次性加载整批数据
   print(record);
 }
 ```
 
+<a id="primary-key-examples"></a>
 ## 主键类型示例
 
 ToStore提供多种分布式主键算法，支持各种业务场景：
@@ -657,6 +772,7 @@ await db.createTables([
 ```
 
 
+<a id="atomic-expressions"></a>
 ## 表达式原子操作
 
 表达式系统提供类型安全的原子字段更新，所有计算在数据库层面原子执行，避免并发冲突：
@@ -709,6 +825,7 @@ await db.upsert('orders', {
 });
 ```
 
+<a id="transactions"></a>
 ## 事务操作
 
 事务确保多个操作的原子性，要么全部成功，要么全部回滚，保证数据一致性：
@@ -753,6 +870,75 @@ final txResult2 = await db.transaction(() async {
 ```
 
 
+<a id="error-handling"></a>
+### 错误码与错误处理
+
+ToStore 对外同时提供两层错误信息：
+
+- `ResultType`：粗粒度状态码，兼容现有基于数值或枚举的判断逻辑
+- `DbErrorCode`：更稳定、可直接用于分支处理的公开错误码
+- `errorDetails` / `txResult.error?.details`：结构化上下文，例如 `table`、`field`、`fields`、`value`
+
+```dart
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
+
+if (!result.isSuccess) {
+  switch (result.errorCode) {
+    case DbErrorCode.tableNotFound:
+      print('表不存在: ${result.errorDetails['table']}');
+      break;
+    case DbErrorCode.fieldRequired:
+    case DbErrorCode.fieldTooLong:
+    case DbErrorCode.fieldTooShort:
+    case DbErrorCode.valueTooSmall:
+    case DbErrorCode.valueTooLarge:
+      print('字段校验失败: ${result.errorDetails['field']}');
+      print('详细信息: ${result.errorDetails}');
+      break;
+    case DbErrorCode.primaryKeyViolation:
+    case DbErrorCode.uniqueViolation:
+      print('唯一约束冲突: ${result.errorDetails['fields']}');
+      break;
+    case DbErrorCode.foreignKeyViolation:
+      print('外键约束失败，请先检查引用数据是否存在');
+      break;
+    case DbErrorCode.resourceExhausted:
+      print('系统资源不足，建议稍后重试');
+      break;
+    default:
+      print('错误码: ${result.errorCodeValue}, 消息: ${result.message}');
+  }
+}
+```
+
+```dart
+final txResult = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+  });
+});
+
+if (txResult.isFailed) {
+  print('事务错误类型: ${txResult.error?.type}');
+  print('事务错误码: ${txResult.error?.code.value}');
+  print('事务错误详情: ${txResult.error?.details}');
+}
+```
+
+常见错误码示例：
+
+- `DbErrorCode.tableNotFound`：目标表不存在，通常说明 schema 尚未创建或表名写错
+- `DbErrorCode.fieldRequired`：必填字段缺失或传入了不允许的 `null`
+- `DbErrorCode.primaryKeyViolation`：主键冲突
+- `DbErrorCode.uniqueViolation`：唯一索引冲突
+- `DbErrorCode.foreignKeyViolation`：外键引用不满足约束
+- `DbErrorCode.resourceExhausted`：系统资源不足，建议降载或重试
+- `DbErrorCode.dbError`：底层数据库或存储异常，建议记录日志并进行兜底处理
+
 ### 纯内存模式 (Memory Mode)
 
 对于数据缓存、临时计算或不需要持久化到磁盘等场景，可以使用 ToStore.memory() 初始化一个纯内存数据库。在该模式下，所有数据（包括表结构、索引和键值对）均仅保存在内存中。
@@ -771,13 +957,9 @@ await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
 ```
 
 
+<a id="security-config"></a>
 ## 安全配置
 
-**数据安全机制**：
-- 双重保障机制确保数据永不丢失
-- 崩溃后自动恢复未完成操作
-- 操作成功时数据已安全保存
-- 高强度加密算法保护敏感数据
 
 > [!WARNING]
 > **密钥管理**：**`encodingKey`** 可随意修改，修改后引擎会自动迁移数据，无需担心数据不可恢复。**`encryptionKey`** 不可随意变更，变更后旧数据将无法解密（除非执行数据迁移）。请勿硬编码敏感密钥，建议从安全服务端获取。
@@ -797,13 +979,13 @@ final db = await ToStore.open(
       
       // 设备绑定 (Path-based binding)
       // 开启后密钥将与数据库文件路径、设备特征深度绑定。数据在不同物理路径下无法解密。
-      // 优点：极大地提升了暴力拷贝数据库文件的安全性。
+      // 优点：可提升数据库文件被直接拷贝时的保护效果。
       // 缺点：如果应用安装路径发生变化及设备特征发生变化，数据将无法还原。
       deviceBinding: false, 
     ),
     // 启用崩溃恢复日志 (Write-Ahead Logging)，默认开启
     enableJournal: true, 
-    // 事务提交时是否强制刷新数据到磁盘，追求极致性能可设为 false（交由后台自动刷新）
+    // 事务提交时是否强制刷新数据到磁盘，如需降低同步刷新开销可设为 false（交由后台自动刷新）
     persistRecoveryOnCommit: true,
   ),
 );
@@ -830,13 +1012,10 @@ final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
 final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
+
+
+<a id="performance"></a>
 ## 性能与体验
-
-### 性能表现
-
-- **启动速度**：实测普通手机在亿级数据量下也能立即启动，即时展示数据
-- **查询性能**：不会随着数据规模影响，恒定保持极速检索能力
-- **数据安全**：ACID事务保障 + 崩溃恢复机制，数据零丢失
 
 ### 体验建议
 
@@ -844,46 +1023,36 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 - 🚀 **生产环境**：建议打包release版本，release模式下性能远超调试模式
 - ✅ **标准测试**：所有基础、核心功能都通过了标准测试
 
-### 视频演示
+### 基准测试
 
 <p align="center">
   <img src="../media/basic-demo.gif" alt="ToStore 基础性能演示" width="320" />
   </p>
 
-- **基础性能演示**（<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>）：GIF 预览可能显示不全，请点击视频查看完整演示。在普通手机上，即便数据量超过亿级，应用的启动、翻页与检索性能依旧保持稳定顺滑。只要存储空间充足，在边缘设备上也可以支撑 TB、PB 级数据规模，而交互时延始终保持在可接受范围内。
+- **基础性能演示**（<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>）：GIF 预览可能显示不全，请点击视频查看完整演示。在普通手机上，即便数据量超过亿级，应用的启动、翻页与检索性能依旧保持稳定顺滑。
 
 <p align="center">
   <img src="../media/disaster-recovery.gif" alt="ToStore 灾难恢复压力测试" width="320" />
   </p>
 
-- **灾难恢复压力测试**（<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：在高频写入过程中，故意反复中断进程，模拟崩溃与断电，即便有成千上万条写入操作被意外打断，ToStore 也能在普通手机上快速完成自恢复，不影响下一次启动和数据可用性。
+- **灾难恢复压力测试**（<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：在高频写入过程中，故意反复中断进程，模拟崩溃与断电，ToStore 能够快速完成自恢复。
 
 
 
 
 如果 ToStore 对您有所帮助，请给我们一个 ⭐️
+这是对开源的最大支持，非常感谢
 
 
 
 
 
-## 未来规划
-
-ToStore 正在积极开发以下功能，进一步增强在AI时代的数据基础设施能力：
-
-- **高维向量**：增加向量检索、语义搜索算法
-- **多模态数据**：提供从原始数据到特征向量的端到端处理
-- **图数据结构**：支持知识图谱和复杂关系网络的高效存储和查询
+> **推荐**：前端应用开发可考虑使用 [ToApp 开发框架](https://github.com/tocreator/toapp)，提供全栈开发解决方案，自动化、一体化处理数据请求、加载、存储、缓存和展示。
 
 
 
 
-
-> **推荐**：移动应用开发者可考虑使用 [Toway 框架](https://github.com/tocreator/toway)，提供全栈解决方案，自动处理数据请求、加载、存储、缓存和展示。
-
-
-
-
+<a id="more-resources"></a>
 ## 更多资源
 
 - 📖 **文档**：[Wiki](https://github.com/tocreator/tostore)

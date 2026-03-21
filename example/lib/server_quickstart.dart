@@ -49,7 +49,7 @@ class ServerDatabaseConfig {
   static const String dbName = 'server_example';
   static const String encodingKey = 'ServerEncodingKey';
   static const String encryptionKey = 'ServerEncryptionKey';
-  static const String centralServerUrl = 'http://127.0.0.1:8080';
+  static const String centralServerUrl = 'https://127.0.0.1:8080';
   static const String accessToken = 'b7628a4f9b4d269b98649129';
 
   /// Get database configuration
