@@ -30,100 +30,84 @@
 </p>
 
 
+## クイックナビゲーション
+
+- [なぜToStoreなのか？](#why-tostore) | [主な機能](#key-features) | [インストール](#installation) | [クイックスタート](#quick-start)
+- [スキーマ定義](#schema-definition) | [モバイル/デスクトップ統合](#mobile-integration) | [サーバー側統合](#server-integration)
+- [ベクトルとANN検索](#vector-advanced) | [テーブルレベルTTL](#ttl-config) | [クエリとページネーション](#query-pagination) | [外部キー](#foreign-keys) | [クエリ演算子](#query-operators)
+- [分散アーキテクチャ](#distributed-architecture) | [主キーの例](#primary-key-examples) | [アトミックな式操作](#atomic-expressions) | [トランザクション](#transactions) | [エラー処理](#error-handling)
+- [セキュリティ構成](#security-config) | [パフォーマンス](#performance) | [リソース](#more-resources)
 
 
-## なぜ ToStore を選ぶのか？
+<a id="why-tostore"></a>
+## なぜ ToStore なのか？
 
-ToStore は、Dart/Flutter エコシステムにおいて唯一の高性能な分散型ベクトルデータベース・ストレージエンジンです。ニューラルネットワーク型のアーキテクチャを採用し、ノード間のインテリジェントな相互接続と協調を実現。無限の水平スケーリングをサポートし、柔軟なデータトポロジーネットワークを構築します。正確なスキーマ変更の識別、暗号化保護、マルチスペースによるデータ隔離を提供します。マルチコア CPU を最大限に活用した超並列処理を実現し、モバイルエッジデバイスからクラウドまでのクロスプラットフォーム協調をネイティブにサポート。多彩な分散主鍵アルゴリズムを備え、没入型 AR/VR、マルチモーダルインタラクション、空間コンピューティング、生成 AI、意味的ベクトル空間モデリングなどのシナリオに強力なデータ基盤を提供します。
+ToStore は、AGI 時代とエッジインテリジェンスのシナリオ向けに設計された近代的なデータエンジンです。分散システム、マルチモーダル融合、リレーショナル構造化データ、高次元ベクトル、および非構造化データの保存をネイティブにサポートしています。ニューラルネットワークのような基盤アーキテクチャに基づき、ノードは高い自律性と弾力的な水平スケーラビリティを備え、エッジとクラウドを横断するシームレスなクロスプラットフォームの連携を実現する柔軟なデータトポロジネットワークを構築します。ACID トランザクション、複雑なリレーションクエリ（JOIN、連鎖外部キー）、テーブルレベルの TTL、集計計算などの機能を備えています。また、複数の分散主キーアルゴリズム、アトミックな式、スキーマ変更の識別、暗号化保護、マルチスペースデータ分離、リソース対応のインテリジェントな負荷分散、および災害時やクラッシュ時の自己修復機能を備えています。
 
-生成 AI と空間コンピューティングにより計算の重心がエッジへ移行する中、端末デバイスは単なるコンテンツ表示器から、ローカル生成、環境認識、リアルタイム意思決定の中核へと進化しています。従来の単一ファイル型の組み込みデータベースは、そのアーキテクチャ設計上の制限から、高頻度の書き込みや大規模なベクトル検索、クラウド・エッジ協調生成などの場面おいて、インテリジェント・アプリケーションが求める究極のレスポンス要件を支えきれないことが多々あります。ToStore はエッジデバイスのために生まれ、複雑な AI ローカル生成や大規模なデータ流通を支えるのに十分な分散ストレージ能力をエッジ端に付与し、クラウドとエッジの真の深化協調を実現します。
+コンピューティングの重心がエッジインテリジェンスへとシフトし続ける中で、エージェントやセンサーなどの様々な端末は単なる「コンテンツ表示装置」ではなく、ローカル生成、環境認識、リアルタイムの意思決定、およびデータ連携を担うインテリジェントノードになりつつあります。従来のデータベースソリューションは、基盤アーキテクチャやアドオン型の拡張に制限され、高頻度の書き込み、膨大なデータ、ベクトル検索、および連携生成に直面した際、エッジインテリジェンスアプリケーションが求める低遅延と安定性を満たすことが困難になっています。
 
-**停電やクラッシュに強い**：予期せぬ停電やアプリケーションのクラッシュが発生しても、データは自動的に復旧され、真のデータ損失ゼロを実現します。データ操作の応答があった時点でデータは安全に保存されており、損失のリスクを心配する必要はありません。
-
-**性能の限界を突破**：実測では一般的なスマートフォンでも1億件以上のデータ量で恒定的な検索性能を維持し、データ規模に依存しない体験を実現。従来のデータベースを遥かに凌駕する使い心地を提供します。
-
+ToStore は、膨大なデータ、複雑なローカル AI 生成、および大規模なデータフローをサポートする分散機能をエッジに提供します。エッジとクラウドのノード間の深層的な連携により、没入型の AR/VR 融合、マルチモーダル対話、セマンティックベクトル、空間モデリングなどのシナリオに対して信頼性の高いデータ基盤を提供します。
 
 
+<a id="key-features"></a>
+## 主な機能
 
-...... 指先からクラウドアプリケーションまで、ToStore はデータ演算力を解放し、未来を支えます ......
+- 🌐 **統合されたクロスプラットフォームデータエンジン**
+  - モバイル、デスクトップ、Web、およびサーバー向けの統合 API。
+  - リレーショナル構造化データ、高次元ベクトル、および非構造化データの保存をサポート。
+  - ローカルストレージからエッジ・クラウド連携まで、あらゆるデータサイクルに対応。
 
+- 🧠 **ニューラルネットワークのような分散アーキテクチャ**
+  - ノードの高い自律性；相互接続された連携により柔軟なデータトポロジを構築。
+  - ノードの連携と弾力的な水平スケーラビリティをサポート。
+  - エッジインテリジェントノードとクラウド間の深層接続。
 
+- ⚡ **並列実行とリソーススケジューリング**
+  - リソース対応型のインテリジェントな負荷分散による高可用性を実現。
+  - マルチノード並列連携計算とタスクの細分化。
 
+- 🔍 **構造化クエリとベクトル検索**
+  - 複雑な条件クエリ、JOIN、集計計算、およびテーブルレベルの TTL をサポート。
+  - ベクトルフィールド、ベクトルインデックス、および近傍検索（ANN）をサポート。
+  - 構造化データとベクトルデータを同一エンジン内で連携して使用可能。
 
-## ToStore の特徴
+- 🔑 **主キー、インデックス、およびスキーマの進化**
+  - 順次増分、タイムスタンプ、日付プレフィックス、および短縮コードの主キーアルゴリズムを内蔵。
+  - ユニークインデックス、複合インデックス、ベクトルインデックス、および外部キー制約をサポート。
+  - スキーマ変更をインテリジェントに認識し、データ移行を自動化。
 
-- 🌐 **全プラットフォーム。シームレスなサポート**
-  - モバイルアプリからクラウドサーバーまで、一つのコードで全プラットフォーム動作。
-  - プラットフォームごとのストレージバックエンド（IndexedDB、ファイルシステムなど）にインテリジェントに適応。
-  - 統一された API インターフェースにより、クロスプラットフォームのデータ同期も安心。
-  - エッジデバイスからクラウドサーバーへのシームレスなデータフロー。
-  - エッジデバイス上でのローカルベクトル計算により、ネットワーク遅延とクラウド依存を低減。
+- 🛡️ **トランザクション、セキュリティ、およびリカバリ**
+  - ACID トランザクション、アトミックな式の更新、および連鎖外部キーを提供。
+  - クラッシュリカバリ、永続化フラッシュ、およびデータ整合性を保証。
+  - ChaCha20-Poly1305 および AES-256-GCM 暗号化をサポート。
 
-- 🧠 **ニューラルネットワーク型分散アーキテクチャ**
-  - ノードが相互接続されたニューラルネットワークのようなトポロジー構造により、効率的なデータフローを組織。
-  - 高性能なデータパーティショニングメカニズムによる真の分散処理。
-  - インテリジェントな動的ワークロードバランスにより、リソース利用を最大化。
-  - ノードの無限な水平拡張により、複雑なデータネットワークを容易に構築。
-
-- ⚡ **究極の並列処理能力**
-  - Isolate による真の並列読み書きを実現し、マルチコア CPU をフル活用。
-  - インテリジェントなリソーススケジューリングにより、負荷を自動分散し、マルチコア性能を最大化。
-  - マルチノード計算ネットワークの協調動作により、タスク処理効率が倍増。
-  - リソース認識型ススケジューリングフレームワークにより、実行計画を自動最適化し、リソース競合を回避。
-  - ストリーミングクエリインターフェースにより、大規模なデータセットも容易に処理。
-
-- 🔑 **多様な分散主鍵（プライマリキー）アルゴリズム**
-  - 順次増加アルゴリズム - ランダムなステップ幅を自由に調整し、ビジネス規模を隠蔽。
-  - タイムスタンプベースアルゴリズム - 高並列シナリオに最適な選択。
-  - 日付プレフィックスアルゴリズム - 時間範囲データ表示を完璧にサポート。
-  - 短縮コードアルゴリズム - 短く読みやすい一意の識別子を生成。
-
-- 🔄 **インテリジェントなスキーマ移行とデータ整合性**
-  - テーブルフィールドの名称変更を正確に識別し、データ損失ゼロ。
-  - ミリ秒単位でスキーマ変更を自動検出し、データ移行を完了。
-  - サービスを停止することなくアップグレード可能（ゼロダウンタイム）。
-  - 複雑な構造変更に対する安全な移行戦略。
-  - 外部キー制約の自動検証とカスケード操作のサポートにより、参照整合性を確保。
-
-- 🛡️ **エンタープライズ級のデータセキュリティと永続性**
-  - 二重保護メカニズム：データ変更をリアルタイムに記録し、紛失を防止。
-  - クラッシュ自動復旧：予期せぬ停電やクラッシュ後の未完了操作を自動復旧し、データ損失ゼロ。
-  - データ一貫性の保証：一連操作の全成功か全ロールバックを保証し、データの正確性を維持。
-  - アトミック演算更新：式（Expression）システムによる複雑な計算をアトミックに実行し、並行衝突を回避。
-  - 即時安全な永続化：操作が成功応答した時点で、データは安全に保存済み。
-  - 高強度な ChaCha20Poly1305 暗号化アルゴリズムにより機密データを保護。
-  - ストレージから転送まで全行程を保護するエンドツーエンド暗号化。
-
-- 🚀 **インテリジェントキャッシュと検索性能**
-  - 多層構造のインテリジェントキャッシュメカニズムによる超高速なデータ検索。
-  - ストレージエンジンと深く統合されたキャッシュ戦略。
-  - 適応型スケーリングにより、データ規模が拡大しても安定した性能を維持。
-  - リアルタイムなデータ変更通知により、クエリ結果を自動更新。
-
-- 🔄 **インテリジェントなデータワークフロー**
-  - マルチスペースアーキテクチャによるデータ隔離とグローバル共有の両立。
-  - 計算ノード間でのインテリジェントなワークロード分散。
-  - 大規模なデータトレーニングと分析のための強固な基盤を提供。
+- 🔄 **マルチスペースとデータワークフロー**
+  - スペースによるデータ分離とグローバル共有の設定をサポート。
+  - クエリのリアルタイムリスナー、マルチレベルのインテリジェントキャッシュ、およびカーソルページネーション。
+  - マルチユーザー、ローカル優先、オフライン連携アプリケーションに最適。
 
 
+<a id="installation"></a>
 ## インストール
 
 > [!IMPORTANT]
-> **v2.x からアップグレードしますか？** 重要な移行手順と重大な変更については、[v3.0 アップグレードガイド](../UPGRADE_GUIDE_v3.md) をお読みください。
+> **v2.x からアップグレードしますか？** 重要な移行手順と重大な変更については、[v3.x アップグレードガイド](../UPGRADE_GUIDE_v3.md) をお読みください。
 
-`pubspec.yaml` に `tostore` 依存関係を追加します：
+`pubspec.yaml` に `tostore` を依存関係として追加します。
 
 ```yaml
 dependencies:
   tostore: any # 最新バージョンを使用してください
 ```
 
+<a id="quick-start"></a>
 ## クイックスタート
 
 > [!IMPORTANT]
-> **テーブルスキーマの定義が最初のステップです**: CRUD 操作を行う前に、テーブルスキーマを定義する必要があります。具体的な定義方法はシナリオによって異なります。
-> - **モバイル/デスクトップ**: [頻繁な起動シナリオでの統合](#頻繁な起動シナリオでの統合)（静的定義）を推奨します。
-> - **サーバーサイド**: [サーバーサイド統合](#サーバーサイド統合)（動的作成）を推奨します。
+> **テーブルスキーマの定義が最初のステップです**：CRUD操作を実行する前に、テーブルスキーマを定義する必要があります（KVストレージのみを使用する場合を除く）。具体的な定義方法は、シナリオによって異なります。
+> - 定義と制約の詳細については、[スキーマ定義](#schema-definition) を参照してください。
+> - **モバイル/デスクトップ**：インスタンスの初期化時に `schemas` を渡します。詳細は [モバイル/デスクトップ統合](#mobile-integration) を参照してください。
+> - **サーバー側**：実行時に `createTables` を使用します。詳細は [サーバー側統合](#server-integration) を参照してください。
 
 ```dart
 // 1. データベースの初期化
@@ -136,7 +120,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. メソッドチェーンによるクエリ（[クエリ演算子](#クエリ演算子)参照。=, !=, >, <, LIKE, IN などをサポート）
+// 3. チェーンクエリ（詳細は[クエリ演算子](#query-operators)を参照; =, !=, >, <, LIKE, IN などをサポート）
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -147,228 +131,299 @@ final users = await db.query('users')
 await db.update('users', {'age': 26}).where('username', '=', 'John');
 await db.delete('users').where('username', '=', 'John');
 
-// 5. リアルタイム・リスニング (データ変更時に UI を自動更新)
+// 5. リアルタイムリスニング (データ変更時に UI が自動的に更新されます)
 db.query('users').where('age', '>', 18).watch().listen((users) {
-  print('条件に一致するユーザーが更新されました: $users');
+  print('一致するユーザーが更新されました: $users');
 });
 ```
 
-### キーバリューストア (KV)
-構造化されたテーブルを定義する必要がないシナリオに適した、シンプルで実用的な機能です。高性能な KV ストアが組み込まれており、設定情報や状態などの断片的なデータの保存に使用できます。異なるスペース（Space）のデータはネイティブに隔離されていますが、グローバル共有を設定することも可能です。
+### キー値ストレージ (KV)
+構造化されたテーブルを必要としないシナリオに適しています。シンプルで実用的であり、設定やステータスなどの散在するデータ向けに高性能なKVストアを内蔵しています。異なるスペースのデータはデフォルトで分離されていますが、グローバル共有に設定することも可能です。
 
 ```dart
-// 1. キーバリューの設定 (String, int, bool, double, Map, List などをサポート)
+// データベースの初期化
+final db = await ToStore.open();
+
+// キー値ペアの設定 (String, int, bool, double, Map, List などをサポート)
 await db.setValue('theme', 'dark');
 await db.setValue('login_attempts', 3);
 
-// 2. データの取得
+// データの取得
 final theme = await db.getValue('theme'); // 'dark'
 
-// 3. データの削除
+// データの削除
 await db.removeValue('theme');
 
-// 4. グローバル・キーバリュー (Space を跨いで共有)
-// 通常の KV データはスペースごとに独立しています。isGlobal: true を使用するとグローバル共有が可能です。
+// グローバルキー値 (スペース間で共有)
+// 通常のKVデータはスペースを切り替えると無効になります。グローバル共有には isGlobal: true を使用します。
 await db.setValue('app_version', '1.0.0', isGlobal: true);
 final version = await db.getValue('app_version', isGlobal: true);
 ```
 
 
+<a id="schema-definition"></a>
+## スキーマ定義
+以下のモバイルおよびサーバー側の例では、ここで定義された `appSchemas` を再利用します。
 
-## 頻繁な起動シナリオでの統合
-
-📱 **サンプル**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
+### TableSchema の概要
 
 ```dart
-// モバイルアプリやデスクトップクライアントなど、頻繁に起動されるシナリオに適したスキーマ定義方法
-// スキーマ変更を正確に識別し、自動アップグレードとデータ移行をコードなしで実現
-final db = await ToStore.open(
-  schemas: [
-    const TableSchema(
-            name: 'global_settings',
-            isGlobal: true,  // グローバルテーブルとして設定、全スペースからアクセス可能
-            fields: [],
+const userSchema = TableSchema(
+  name: 'users', // テーブル名、必須
+  tableId: 'users', // ユニーク識別子、オプション；テーブルのリネームを100%正確に識別するために使用
+  primaryKeyConfig: PrimaryKeyConfig(
+    name: 'id', // 主キーフィールド名、デフォルトは 'id'
+    type: PrimaryKeyType.sequential, // 自動生成タイプ
+    sequentialConfig: SequentialIdConfig(
+      initialValue: 1000, // 開始値
+      increment: 1, // ステップサイズ
+      useRandomIncrement: false, // ランダム増分を使用するかどうか
     ),
-    const TableSchema(
-      name: 'users', // テーブル名
-      tableId: "users",  // テーブルの一意識別子。リネームを100%識別するために使用（省略可）
-      primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id',       // プライマリキー名
-      ),
-      fields: [        // フィールド定義（プライマリキーを除く）
-        FieldSchema(
-          name: 'username', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true, // 自動的に一意インデックスを作成
-          fieldId: 'username',  // フィールドの一意識別子（オプション）
-        ),
-        FieldSchema(
-          name: 'email', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true // 自動的に一意インデックスを作成
-        ),
-        FieldSchema(
-          name: 'last_login', 
-          type: DataType.datetime,
-          createIndex: true // 自動的にインデックスを作成
-        ),
-      ],
-      // 複合インデックスの例
-      indexes: [
-        IndexSchema(fields: ['username', 'last_login']),
-      ],
+  ),
+  fields: [
+    FieldSchema(
+      name: 'username', // フィールド名、必須
+      type: DataType.text, // データタイプ、必須
+      nullable: false, // nullを許可するかどうか
+      minLength: 3, // 最小長
+      maxLength: 32, // 最大長
+      unique: true, // ユニーク制約
+      fieldId: 'username', // フィールドの一意の識別子、オプション；リネームの識別に、
+      comment: 'ログイン名', // オプションのコメント
     ),
-    // 外部キー制約の定義例
-    TableSchema(
-      name: 'posts',
-      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
-      fields: [
-        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
-        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
-        const FieldSchema(name: 'content', type: DataType.text),
-      ],
-      foreignKeys: [
-        ForeignKeySchema(
-          name: 'fk_posts_user',
-          fields: ['user_id'],              // 現在のテーブルのフィールド
-          referencedTable: 'users',         // 参照先のテーブル
-          referencedFields: ['id'],         // 参照先のフィールド
-          onDelete: ForeignKeyCascadeAction.cascade,  // 削除時のカスケード削除
-          onUpdate: ForeignKeyCascadeAction.cascade,  // 更新時のカスケード更新
-        ),
-      ],
+    FieldSchema(
+      name: 'status',
+      type: DataType.integer,
+      minValue: 0, // 下限
+      maxValue: 150, // 上限
+      defaultValue: 0, // 静的デフォルト値
+      createIndex: true,  // インデックスをショートカットで作成し、パフォーマンスを向上
+    ),
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      defaultValueType: DefaultValueType.currentTimestamp, // 現在時刻で自動入力
+      createIndex: true,
     ),
   ],
+  indexes: const [
+    IndexSchema(
+      indexName: 'idx_users_status_created_at', // オプションのインデックス名
+      fields: ['status', 'created_at'], // 複合インデックスフィールド
+      unique: false, // ユニークインデックスかどうか
+      type: IndexType.btree, // インデックスタイプ：btree/hash/bitmap/vector
+    ),
+  ],
+  foreignKeys: const [], // オプションの外部キー制約；詳細は「外部キー」セクションを参照
+  isGlobal: false, // グローバルテーブルかどうか；すべてのスペースでアクセス可能
+  ttlConfig: null, // テーブルレベルの TTL；詳細は「テーブルレベル TTL」セクションを参照
 );
 
-// マルチスペースアーキテクチャ - 異なるユーザーのデータを完璧に隔離
+const appSchemas = [userSchema];
+```
+
+`DataType` は `integer`、`bigInt`、`double`、`text`、`blob`、`boolean`、`datetime`、`array`、`json`、`vector` をサポートしています。`PrimaryKeyType` は `none`、`sequential`、`timestampBased`、`datePrefixed`、`shortCode` をサポートしています。
+
+### 制約と自動検証
+
+`FieldSchema` を使用して、一般的な検証ルールをスキーマに直接記述することができ、UI やサービス層での重複したロジックを避けることができます。
+
+- `nullable: false`：非 null 制約。
+- `minLength` / `maxLength`：テキスト長の制約。
+- `minValue` / `maxValue`：数値範囲の制約。
+- `defaultValue` / `defaultValueType`：静的および動的なデフォルト値。
+- `unique`：ユニーク制約。
+- `createIndex`：高頻度のフィルタリング、ソート、または結合用のインデックスを作成。
+- `fieldId` / `tableId`：移行時のテーブルやフィールドのリネーム識別の補助。
+
+これらの制約はデータの書き込み時に検証され、ビジネス層での重複した実装を減らします。`unique: true` は自動的に一意のインデックスを生成し、`createIndex: true` や外部キーは自動的に標準のインデックスを生成します。複合インデックスやベクトルインデックスには `indexes` を使用します。
+
+
+### 統合方法の選択
+
+- **モバイル/デスクトップ**：`appSchemas` を直接 `ToStore.open(...)` に渡すのが最適です。
+- **サーバー側**：実行時に `createTables(appSchemas)` を介して動的にスキーマを作成するのが最適です。
+
+
+<a id="mobile-integration"></a>
+## モバイル/デスクトップ統合
+
+📱 **例**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+
+```dart
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+// Android/iOS: 書き込み可能なディレクトリを先に解決し、dbPath として渡します
+final docDir = await getApplicationDocumentsDirectory();
+final dbRoot = p.join(docDir.path, 'common');
+
+// 上記で定義した appSchemas を再利用
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+);
+
+// マルチスペースアーキテクチャ - 異なるユーザーのデータを分離
 await db.switchSpace(spaceName: 'user_123');
 ```
 
 ### ログイン状態の保持とログアウト（アクティブスペース）
 
-マルチスペースは**ユーザーごとのデータ**分離に最適です。ユーザーごとに1つのスペースを使い、ログイン時に切り替えます。**アクティブスペース**と**close オプション**で、再起動後も現在のユーザーを保持し、ログアウトにも対応できます。
+マルチスペースは**ユーザーデータの分離**に最適です。ユーザーごとに1つのスペースを割り当て、ログイン時に切り替えます。**アクティブスペース**と**クローズオプション**を使用すると、アプリの再起動後も現在のユーザーを保持し、クリーンなログアウトをサポートできます。
 
-- **ログイン状態の保持**: ユーザーが自分のスペースに切り替えたら、そのスペースをアクティブとして保存し、次回起動時に default で開けばそのスペースに直接入ります（「default を開いてから切り替え」は不要）。
-- **ログアウト**: ログアウト時は `keepActiveSpace: false` でデータベースを閉じると、次回起動時に前のユーザーのスペースが自動で開かなくなります。
+- **ログイン状態の保持**：ユーザーが自分のスペースに切り替える際、それをアクティブとしてマークします。次回の起動時はデフォルトでそのスペースに直接入ることができ、「デフォルトを開いてから切り替える」手順を避けることができます。
+- **ログアウト**：ユーザーがログアウトする際は、`keepActiveSpace: false` でデータベースを閉じます。次回の起動時に前のユーザーのスペースが自動的に開かれることはありません。
 
 ```dart
-
-// ログイン後: このユーザーのスペースに切り替え、次回起動用に記憶（ログイン状態の保持）
+// ログイン後：ユーザーのスペースに切り替え、アクティブとしてマーク（ログイン状態の保持）
 await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
 
-// オプション: 厳密に default のみで開く場合（例: ログイン画面のみ）— 保存されたアクティブスペースを使わない
+// オプション：デフォルトのスペースのみを厳密に使用する場合（例：ログイン画面のみ）
 // final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
 
-// ログアウト時: 閉じてアクティブスペースをクリアし、次回起動は default スペース
+// ログアウト時：データベースを閉じ、アクティブスペースをクリアして次回起動時にデフォルトを使用
 await db.close(keepActiveSpace: false);
 ```
 
-## サーバーサイド統合
 
-🖥️ **サンプル**: [server_quickstart.dart](example/lib/server_quickstart.dart)
+<a id="server-integration"></a>
+## サーバー側統合
+
+🖥️ **例**: [server_quickstart.dart](../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
 
-// サーバー実行時のスキーマ一括作成 - 継続的な実行シナリオに適しています
-await db.createTables([
-  // 3次元空間特徴ベクトル保存用テーブル
-  const TableSchema(
-    name: 'spatial_embeddings',
-    primaryKeyConfig: PrimaryKeyConfig(
-      name: 'id',
-      type: PrimaryKeyType.timestampBased,   // 高並列書き込みに適したタイムスタンプ型 PK
-    ),
-    fields: [
-      FieldSchema(
-        name: 'video_name',
-        type: DataType.text,
-        nullable: false,
-      ),
-      FieldSchema(
-        name: 'spatial_features',
-        type: DataType.vector,                // ベクトル保存型
-        vectorConfig: VectorFieldConfig(
-          dimensions: 1024,                   // 高次元ベクトル
-          precision: VectorPrecision.float32, 
-        ),
-      ),
-    ],
-    indexes: [
-      IndexSchema(
-        fields: ['video_name'],
-        unique: true,
-      ),
-      IndexSchema(
-        type: IndexType.vector,              // ベクトルインデックス
-        fields: ['spatial_features'],
-        vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,   // 高効率な近傍検索を実現する NGH アルゴリズム
-          distanceMetric: VectorDistanceMetric.cosine,
-          parameters: {
-            'M': 16,
-            'efConstruction': 200,
-          },
-        ),
-      ),
-    ],
-  ),
-  // その他のテーブル...
-]);
+// サーバー起動時にテーブル構造を作成または検証
+await db.createTables(appSchemas);
 
-// オンライン・スキーマ・アップデート - サービスを止めずに更新
+// オンラインスキーマの更新
 final taskId = await db.updateSchema('users')
-  .renameTable('users_new')                // テーブル名の変更
+  .renameTable('users_new')                // テーブル名を変更
   .modifyField(
     'username',
     minLength: 5,
     maxLength: 20,
     unique: true
-  )                                        // フィールド属性の変更
-  .renameField('old_name', 'new_name')     // フィールド名の変更
-  .removeField('deprecated_field')         // フィールドの削除
-  .addField('created_at', type: DataType.datetime)  // フィールドの追加
-  .removeIndex(fields: ['age'])            // インデックスの削除
-  .setPrimaryKeyConfig(                    // プライマリキー設定の変更
+  )                                        // フィールド属性を変更
+  .renameField('old_name', 'new_name')     // フィールド名を変更
+  .removeField('deprecated_field')         // フィールドを削除
+  .addField('created_at', type: DataType.datetime)  // フィールドを追加
+  .removeIndex(fields: ['age'])            // インデックスを削除
+  .setPrimaryKeyConfig(                    // 主キータイプを変更；データが空である必要があります
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
     
-// 移行進捗の監視
+// 移行の進捗を監視
 final status = await db.queryMigrationTaskStatus(taskId);
-print('移行進捗: ${status?.progressPercentage}%');
+print('移行の進捗: ${status?.progressPercentage}%');
 
 
-// 手動クエリキャッシュ管理 (サーバーサイド)
-// 主キーやインデックスによる等値クエリ、INクエリについては、エンジン性能が非常に高く最適化されているため、通常は手動でクエリキャッシュを管理する必要はありません。
+// 手動クエリキャッシュ管理 (サーバー側)
+主キーやインデックス付きフィールドに対する等価またはINクエリは非常に高速なため、手動のキャッシュ管理は通常不要です。
 
-// クエリ結果を5分間手動でキャッシュ。
+// クエリ結果を5分間手動でキャッシュ。期間を指定しない場合は無期限になります。
 final activeUsers = await db.query('users')
     .where('is_active', '=', true)
     .useQueryCache(const Duration(minutes: 5));
 
-// 関連データが変更された際、特定のキャッシュを無効化して整合性を確保。
+// データ変更時に特定のキャッシュを無効化し、一貫性を確保
 await db.query('users')
     .where('is_active', '=', true)
     .clearQueryCache();
 
-// 常に最新データを取得する必要があるクエリでは、キャッシュを明示的に無効化。
+// リアルタイムのデータを必要とするクエリでキャッシュを明示的に無効化
 final freshUserData = await db.query('users')
     .where('is_active', '=', true)
     .noQueryCache();
 ```
 
 
+<a id="advanced-usage"></a>
+## 進階的な使い方
 
-## 高度な使い方
+ToStore は、複雑なビジネス要件を満たすための豊富な機能を提供します。
 
-ToStore は、複雑なビジネス要件を満たす様々な高度な機能を提供しています：
 
-### テーブル単位 TTL（時間ベースの自動期限切れ）
+<a id="vector-advanced"></a>
+### ベクトルと ANN 検索
 
-ログやイベントなど、一定期間後に自動的に期限切れにしたい時系列データに対しては、テーブル定義の `ttlConfig` でテーブル単位 TTL を指定できます。期限切れになったデータは、ビジネスコード側でレコードを手動で総なめすることなく、バックグラウンドで小さなバッチに分けて自動クリーンアップされます。
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'embeddings',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.timestampBased,
+    ),
+    fields: [
+      FieldSchema(
+        name: 'document_title',
+        type: DataType.text,
+        nullable: false,
+      ),
+      FieldSchema(
+        name: 'embedding',
+        type: DataType.vector,  // ベクトル型を宣言
+        nullable: false,
+        vectorConfig: VectorFieldConfig(
+          dimensions: 128, // ベクトルの次元；書き込み時とクエリ時で一致させる必要があります
+          precision: VectorPrecision.float32, // 精度；float32 は精度とスペースのバランスが良いです
+        ),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['embedding'], // インデックスを作成するフィールド
+        type: IndexType.vector,  // ベクトルインデックスを構築
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,  // インデックスアルゴリズム；内蔵の NGH
+          distanceMetric: VectorDistanceMetric.cosine, // メトリック；正規化された埋め込みに最適
+          maxDegree: 32, // 各ノードの最大近傍数；大きくすると再現率は上がりますがメモリを消費します
+          efSearch: 64, // 検索拡張係数；大きくすると精度は上がりますが遅くなります
+          constructionEf: 128, // インデックス品質係数；大きくすると高品質になりますが構築が遅くなります
+        ),
+      ),
+    ],
+  ),
+]);
+
+final queryVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // 次元を一致させる必要があります
+
+// ベクトル検索
+final results = await db.vectorSearch(
+  'embeddings', 
+  fieldName: 'embedding', 
+  queryVector: queryVector, 
+  topK: 5, // 上位 5 件を返す
+  efSearch: 64, // デフォルトの検索拡張係数を上書き
+);
+
+for (final r in results) {
+  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+}
+```
+
+**パラメータの説明**:
+- `dimensions`: 入力埋め込みの幅と一致させる必要があります。
+- `precision`: オプションの `float64`、`float32`、`int8`; 高精度にするとストレージコストが増加します。
+- `distanceMetric`: セマンティックな類似性には `cosine`、ユークリッド距離には `l2`、内積検索には `innerProduct` を選択。
+- `maxDegree`: NGH グラフ内の最大近傍数。
+- `efSearch`: 検索時の拡張幅。
+- `topK`: 返す結果の数。
+
+**結果の説明**:
+- `score`: 正規化された類似度スコア (0 から 1)；大きいほど類似度が高い。
+- `distance`: `l2` や `cosine` では、距離が大きいほど類似度が低くなります。
+
+
+<a id="ttl-config"></a>
+### テーブルレベル TTL (自動有効期限)
+
+ログやイベントなどの時系列データについては、スキーマで `ttlConfig` を定義します。期限切れのデータはバックグラウンドで自動的にクリーンアップされます。
 
 ```dart
 const TableSchema(
@@ -384,22 +439,22 @@ const TableSchema(
   ],
   ttlConfig: TableTtlConfig(
     ttlMs: 7 * 24 * 60 * 60 * 1000, // 7日間保持
-    // sourceField を省略した場合、エンジンは書き込み時刻を基準に
-    // 必要なインデックスを自動的に管理します。
-    // 任意で sourceField を明示する場合は、次の条件をすべて満たす必要があります：
-    // 1) フィールド型が DataType.datetime であること
-    // 2) nullable: false （NULL 不可）であること
-    // 3) defaultValueType が DefaultValueType.currentTimestamp であること
+    // sourceField: 指定しない場合は自動的に作成されたインデックスが使用されます
+    // カスタム sourceField の要件:
+    // 1) DataType.datetime
+    // 2) 非 null (nullable: false)
+    // 3) デフォルト値が DefaultValueType.currentTimestamp
     // sourceField: 'created_at',
   ),
 );
 ```
 
-### 複雑なクエリのネストとカスタムフィルタ
-無限の条件ネストと柔軟なカスタム関数をサポート。
+
+### クエリの入れ子とカスタムフィルタリング
+無限のレベルの入れ子と柔軟なカスタム関数をサポートしています。
 
 ```dart
-// 条件のネスト：(type = 'app' OR (id >= 123 OR fans >= 200))
+// 条件の入れ子: (type = 'app' OR (id >= 123 OR fans >= 200))
 final idCondition = QueryCondition().where('id', '>=', 123).or().where('fans', '>=', 200);
 
 final result = await db.query('users')
@@ -410,25 +465,36 @@ final result = await db.query('users')
 
 // カスタム条件関数
 final customResult = await db.query('users')
-    .whereCustom((record) => record['tags']?.contains('オススメ') ?? false);
+    .whereCustom((record) => record['tags']?.contains('おすすめ') ?? false);
 ```
 
-### インテリジェント・アップサート (Upsert)
-存在すれば更新、存在しなければ挿入。
+### 挿入と更新の自動切り替え (Upsert)
+PK またはユニークキーが存在する場合は更新し、存在しない場合は挿入します。`where` はサポートされません。競合の対象はデータによって決まります。
 
 ```dart
-// By primary key or unique key in data (no where)
-final result = await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
-await db.upsert('users', {'username': 'john', 'email': 'john@example.com', 'age': 26});
-// Batch upsert
-await db.batchUpsert('users', [
+// 主キーによる
+final result = await db.upsert('users', {
+  'id': 1,
+  'username': 'john',
+  'email': 'john@example.com',
+});
+
+// ユニークキーによる（ユニークインデックスの全フィールドと必須フィールドが含まれている必要があります）
+await db.upsert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+  'age': 26,
+});
+
+// 一括 upsert
+final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},
 ], allowPartialErrors: true);
 ```
 
 
-### テーブル結合とフィールド選択
+### 結合 (JOIN) とフィールド選択
 ```dart
 final orders = await db.query('orders')
     .select(['orders.id', 'users.name as user_name'])
@@ -437,16 +503,15 @@ final orders = await db.query('orders')
     .limit(20);
 ```
 
-### ストリーミングと統計
+### ストリーミングと集計
 ```dart
-// レコード数のカウント
+// レコードのカウント
 final count = await db.query('users').count();
 
-// テーブルがデータベース schema（テーブル構造メタデータ）に定義されているかを確認（Space 非依存）
-// 注意: これはテーブルにデータがあることを意味しません
+// テーブルが存在するかチェック (スペースに依存しない)
 final usersTableDefined = await db.tableExists('users');
 
-// 条件に基づく効率的な存在チェック（全レコードを読み込まない）
+// 効率的なデータの存在確認（レコード全体を読み込まない）
 final emailExists = await db.query('users')
     .where('email', '=', 'test@example.com')
     .exists();
@@ -457,80 +522,117 @@ final avgAge = await db.query('users').avg('age');
 final maxAge = await db.query('users').max('age');
 final minAge = await db.query('users').min('age');
 
-// グループ集計とフィルタ
+// グループ化とフィルタリング
 final result = await db.query('orders')
     .select(['status', Agg.sum('amount', alias: 'total')])
     .groupBy(['status'])
     .having(Agg.sum('amount'), '>', 1000)
     .limit(20);
 
-// 重複排除
+// 重複除外クエリ
 final uniqueCities = await db.query('users').distinct(['city']);
 
-// ストリーミングクエリ (大規模データに最適)
+// ストリーミング (膨大なデータに最適)
 db.streamQuery('users').listen((data) => print(data));
 ```
 
 
-
-### クエリと効率的なページング
+<a id="query-pagination"></a>
+### クエリと効率的なページネーション
 
 > [!TIP]
-> **最高のパフォーマンスを実現するために `limit` を指定してください**: クエリ時には常に `limit` を明示的に指定することを強く推奨します。省略した場合はデフォルトで1000件に制限されます。エンジン自体のクエリは非常に高速ですが、UIに関わるアプリケーションで大量のレコードをシリアライズすると、不必要なレイテンシが発生する可能性があります。
+> **最高のパフォーマンスを得るために `limit` を明示的に指定してください**：常に `limit` を指定することを強く推奨します。省略した場合、エンジンはデフォルトで 1000 レコードに制限します。コアは高速ですが、アプリ層で大量のデータをシリアライズすると不必要な遅延が発生する可能性があります。
 
-ToStore は、データ規模とパフォーマンス要件に応じて選択可能な2つのページングモードを提供します：
+ToStore は、データの規模に合わせて 2 つのページネーションモードを提供します。
 
-#### 1. オフセット・モード (Offset Mode)
-データ量が少ない場合や、特定のページ番号に正確にジャンプする必要がある場合に適しています。
+#### 1. オフセットモード
+小規模なデータセット（1万件未満）や、特定のページへのジャンプが必要な場合に最適です。
 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
     .offset(40) // 最初の40件をスキップ
-    .limit(20); // 20件取得
+    .limit(20); // 20件を取得
 ```
 > [!TIP]
-> `offset` が非常に大きくなると、データベースは大量のレコードをスキャンして破棄する必要があり、パフォーマンスが低下します。深い階層のページングには **カーソル・モード** を推奨します。
+> `offset` が大きくなると、DB がレコードをスキャンして破棄する必要があるため、パフォーマンスは直線的に低下します。深い階層のページには **カーソルモード** を使用してください。
 
-#### 2. 高性能カーソル・モード (Cursor Mode)
-**大規模データや無限スクロールに適しています**。`nextCursor` を利用することで O(1) レベルの性能を実現し、ページ数に関わらず一定의 クエリ速度を保証します。
+#### 2. カーソルモード
+**膨大なデータと無限スクロールに推奨されます**。`nextCursor` を使用して現在の位置から読み取りを再開するため、大きなオフセットに伴うオーバーヘッドを回避できます。
 
 > [!IMPORTANT]
-> 未インデックスのフィールドでソートした場合や、一部の複雑なクエリでは、エンジンは全表スキャンにフォールバックして `null` カーソルを返すことがあります（その特定のクエリでのページングは現在サポートされていないことを意味します）。
+> 複雑なクエリやインデックスのないフィールドでのソートの場合、エンジンは全テーブルスキャンにフォールバックし、`null` カーソルを返すことがあります（その特定のクエリではページネーションがサポートされていないことを示します）。
 
 ```dart
-// 1ページ目のクエリ
+// 1ページ目
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// 返されたカーソルを使用して次のページを取得
+// カーソルを使用して次のページを取得
 if (page1.nextCursor != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // カーソルの位置へ直接 seek
+      .cursor(page1.nextCursor); // その位置に直接シークします
 }
 
-// 同様に prevCursor を使用して前のページへ戻る
+// prevCursor を使用して効率的に戻る
 final prevPage = await db.query('users')
     .limit(20)
     .cursor(page2.prevCursor);
 ```
 
-| 特徴 | オフセット・モード | カーソル・モード |
+| 機能 | オフセットモード | カーソルモード |
 | :--- | :--- | :--- |
-| **クエリ性能** | ページ数と共に低下 | **常に一定 (O(1))** |
-| **適用範囲** | 小規模データ、特定ページへの遷移 | **大規模データ、無限スクロール** |
-| **データ一貫性** | データ変更により行が飛ぶ場合がある | **変更による重複や漏れを完璧に回避** |
+| **パフォーマンス** | ページが進むにつれて低下 | **常に一定 (O(1))** |
+| **ユースケース** | 小規模データ、ページジャンプ | **膨大なデータ、無限スクロール** |
+| **一貫性** | データの変更により重複や欠落が生じる可能性がある | **データの変更による不整合を回避** |
 
 
+<a id="foreign-keys"></a>
+### 外部キーと連鎖操作
 
+参照整合性を強制し、連鎖的な更新や削除を構成します。制約は書き込み時にチェックされます。連鎖ポリシーは関連データを自動的に処理するため、アプリ内での整合性ロジックを減らすことができます。
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'users',
+    primaryKeyConfig: PrimaryKeyConfig(name: 'id'),
+    fields: [
+      FieldSchema(name: 'username', type: DataType.text, nullable: false),
+    ],
+  ),
+  TableSchema(
+    name: 'posts',
+    primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+    fields: [
+      const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+      const FieldSchema(name: 'content', type: DataType.text),
+    ],
+    foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // 現在のテーブルのフィールド
+          referencedTable: 'users',         // 参照先のテーブル
+          referencedFields: ['id'],         // 参照先のフィールド
+          onDelete: ForeignKeyCascadeAction.cascade,  // 連鎖削除
+          onUpdate: ForeignKeyCascadeAction.cascade,  // 連鎖更新
+        ),
+    ],
+  ),
+]);
+```
+
+
+<a id="query-operators"></a>
 ### クエリ演算子
 
-`where(field, operator, value)` で使用できる演算子（大文字小文字無視）は以下のとおりです。
+すべての `where(field, operator, value)` 条件は、以下の演算子をサポートしています（大文字小文字を区別しません）。
 
-| 演算子 | 説明 | 例 / 値の型 |
+| 演算子 | 説明 | 例 / 型 |
 | :--- | :--- | :--- |
 | `=` | 等しい | `where('status', '=', 'active')` |
 | `!=`, `<>` | 等しくない | `where('role', '!=', 'guest')` |
@@ -538,17 +640,17 @@ final prevPage = await db.query('users')
 | `>=` | 以上 | `where('score', '>=', 60)` |
 | `<` | より小さい | `where('price', '<', 100)` |
 | `<=` | 以下 | `where('quantity', '<=', 10)` |
-| `IN` | リストに含む | `where('id', 'IN', ['a','b','c'])` — value: `List` |
-| `NOT IN` | リストに含まない | `where('status', 'NOT IN', ['banned'])` — value: `List` |
-| `BETWEEN` | 範囲（両端含む） | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
-| `LIKE` | パターン一致（`%` 任意、`_` 1文字） | `where('name', 'LIKE', '%John%')` — value: `String` |
-| `NOT LIKE` | パターン不一致 | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
-| `IS` | null である | `where('deleted_at', 'IS', null)` — value: `null` |
-| `IS NOT` | null でない | `where('email', 'IS NOT', null)` — value: `null` |
+| `IN` | リストに含まれる | `where('id', 'IN', ['a','b','c'])` — 型: `List` |
+| `NOT IN` | リストに含まれない | `where('status', 'NOT IN', ['banned'])` — 型: `List` |
+| `BETWEEN` | 範囲内 | `where('age', 'BETWEEN', [18, 65])` — 型: `[開始, 終了]` |
+| `LIKE` | パターンマッチ (`%` は任意, `_` は一文字) | `where('name', 'LIKE', '%John%')` — 型: `String` |
+| `NOT LIKE` | パターン不一致 | `where('email', 'NOT LIKE', '%@test.com')` — 型: `String` |
+| `IS` | null である | `where('deleted_at', 'IS', null)` — 型: `null` |
+| `IS NOT` | null でない | `where('email', 'IS NOT', null)` — 型: `null` |
 
-### セマンティッククエリメソッド（推奨）
+### セマンティックなクエリメソッド (推奨)
 
-演算子文字列を手で書かず、IDE の補完を活用するため、セマンティックメソッドの利用を推奨します。
+セマンティックなメソッドを使用すると、手動での演算子文字列入力を避け、より良い IDE サポートを利用できます。
 
 ```dart
 // 比較
@@ -559,22 +661,22 @@ db.query('users').whereGreaterThanOrEqualTo('score', 60);
 db.query('users').whereLessThan('price', 100);
 db.query('users').whereLessThanOrEqualTo('quantity', 10);
 
-// 所属・範囲
+// 集合と範囲
 db.query('users').whereIn('id', ['id1', 'id2']);
 db.query('users').whereNotIn('status', ['banned', 'pending']);
 db.query('users').whereBetween('age', 18, 65);
 
-// null 判定
+// Null チェック
 db.query('users').whereNull('deleted_at');
 db.query('users').whereNotNull('email');
 
-// パターン
+// パターンマッチング
 db.query('users').whereLike('name', '%John%');
 db.query('users').whereNotLike('email', '%@temp.');
 db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
 db.query('users').whereNotContains('title', 'draft');
 
-// .where('age', '>', 18).where('name', 'like', '%John%') と同等
+// 次と等価: .where('age', '>', 18).where('name', 'like', '%John%')
 final users = await db.query('users')
     .whereGreaterThan('age', 18)
     .whereLike('username', '%John%')
@@ -582,49 +684,53 @@ final users = await db.query('users')
     .limit(20);
 ```
 
+
+<a id="distributed-architecture"></a>
 ## 分散アーキテクチャ
 
 ```dart
-// 分散ノードの設定
+// 分散ノードの構成
 final db = await ToStore.open(
   config: DataStoreConfig(
     distributedNodeConfig: const DistributedNodeConfig(
-      enableDistributed: true,
-      clusterId: 1,
-      centralServerUrl: 'http://127.0.0.1:8080',
+      enableDistributed: true,            // 分散モードを有効にする
+      clusterId: 1,                       // クラスター ID
+      centralServerUrl: 'https://127.0.0.1:8080',
       accessToken: 'b7628a4f9b4d269b98649129'
     )
   )
 );
 
-// 高性能な一括挿入 (Batch Insert)
+// 高性能な一括挿入
 await db.batchInsert('vector_data', [
   {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
   {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
-  // ... 大量のレコードを効率よく挿入
+  // ... 効率的な一括挿入
 ]);
 
-// 大規模データセットのストリーミング処理 - メモリ消費を一定に維持
+// 大規模データセットのストリーミング
 await for (final record in db.streamQuery('vector_data')
   .where('vector_name', '=', 'face_2366')
   .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
   .stream) {
-  // TB級のデータでも、メモリを圧迫せずに効率的に処理可能
+  // メモリのスパイクを避けるために、レコードを順次処理します
   print(record);
 }
 ```
 
-## プライマリキーの種類と例
 
-ToStore は、様々なシナリオに対応する多彩な分散プライマリキーアルゴリズムを提供しています：
+<a id="primary-key-examples"></a>
+## 主キー
 
-- **順次増加型** (PrimaryKeyType.sequential)：238978991
-- **タイムスタンプ型** (PrimaryKeyType.timestampBased)：1306866018836946
-- **日付プレフィックス型** (PrimaryKeyType.datePrefixed)：20250530182215887631
-- **短縮コード型** (PrimaryKeyType.shortCode)：9eXrF0qeXZ
+ToStore は、様々なシナリオに対応するために多様な分散主キーアルゴリズムを提供しています。
+
+- **順次増分** (PrimaryKeyType.sequential): 238978991
+- **タイムスタンプベース** (PrimaryKeyType.timestampBased): 1306866018836946
+- **日付プレフィックス** (PrimaryKeyType.datePrefixed): 20250530182215887631
+- **短縮コード** (PrimaryKeyType.shortCode): 9eXrF0qeXZ
 
 ```dart
-// 順次増加型プライマリキーの設定例
+// 順次主キーの構成例
 await db.createTables([
   const TableSchema(
     name: 'users',
@@ -633,7 +739,7 @@ await db.createTables([
       sequentialConfig: SequentialIdConfig(
         initialValue: 10000,
         increment: 50,
-        useRandomIncrement: true, // ランダムな歩進でビジネス規模を隠蔽
+        useRandomIncrement: true, // ビジネスボリュームの隠蔽
       ),
     ),
     fields: [/* フィールド定義 */]
@@ -642,49 +748,72 @@ await db.createTables([
 ```
 
 
-## 式（Expression）によるアトミック操作
+<a id="atomic-expressions"></a>
+## アトミックな式操作
 
-式システムは、型安全なアトミック・フィールド更新を提供します。全ての計算はデータベース層でアトミックに実行され、並行衝突を回避します：
+式システムは、型安全でアトミックなフィールド更新を提供します。すべての計算はデータベースレベルで実行され、同時実行の不整合を防止します。
 
 ```dart
-// シンプルな加算：balance = balance + 100
+// 単純な増分: balance = balance + 100
 await db.update('accounts', {
   'balance': Expr.field('balance') + Expr.value(100),
 }).where('id', '=', accountId);
 
-// 複雑な計算：total = price * quantity + tax
+// 複雑な計算: total = price * quantity + tax
 await db.update('orders', {
-  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
+  'total': (Expr.field('price') * Expr.field('quantity')) + Expr.field('tax'),
 }).where('id', '=', orderId);
 
-// ネストされた計算：finalPrice = ((price * quantity) + tax) * (1 - discount)
+// 入れ子の括弧
 await db.update('orders', {
   'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
                  (Expr.value(1) - Expr.field('discount')),
 }).where('id', '=', orderId);
 
-// 関数を使用：price = min(price, maxPrice)
+// 関数: price = min(price, maxPrice)
 await db.update('products', {
   'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
 }).where('id', '=', productId);
 
-// タイムスタンプ：updatedAt = now()
+// タイムスタンプ
 await db.update('users', {
   'updatedAt': Expr.now(),
 }).where('id', '=', userId);
 ```
 
-## トランザクション
-
-トランザクションは複数の操作のアトミック性を保証し、一連の操作が全て成功するか、全てロールバックされることを確実にします。
-
-**トランザクションの特徴**：
-- 複数操作のアトミックな実行。
-- クラッシュ後の未完了操作の自動復旧。
-- コミット成功時にデータが安全に永続化。
+**条件付き式 (例: Upsert 時)**: `Expr.isUpdate()` / `Expr.isInsert()` を `Expr.ifElse` や `Expr.when` と組み合わせて、更新時または挿入時にのみロジックを実行します。
 
 ```dart
-// 基本的なトランザクション - 複数操作のアトミック・コミット
+// Upsert: 更新時に増分し、挿入時に1をセットする
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(
+    Expr.isUpdate(),
+    Expr.field('count') + Expr.value(1),
+    1, // 挿入ブランチ: リテラル値。評価対象外。
+  ),
+});
+
+// Expr.when を使用
+await db.upsert('orders', {
+  'id': orderId,
+  'updatedAt': Expr.when(Expr.isUpdate(), Expr.now(), otherwise: Expr.now()),
+});
+```
+
+
+<a id="transactions"></a>
+## トランザクション
+
+トランザクションは原子性を保証します。すべての操作が成功するか、すべてがロールバックされるかのいずれかとなり、絶対的な一貫性を維持します。
+
+**トランザクションの特徴**:
+- マルチステップ操作のアトミックなコミット。
+- クラッシュ後の未完了タスクの自動リカバリ。
+- コミット成功時にデータが安全に永続化されます。
+
+```dart
+// 基本的なトランザクション
 final txResult = await db.transaction(() async {
   // ユーザーの挿入
   await db.insert('users', {
@@ -693,162 +822,173 @@ final txResult = await db.transaction(() async {
     'fans': 100,
   });
   
-  // 式によるアトミック更新
+  // 式によるアトミックな更新
   await db.update('users', {
     'fans': Expr.field('fans') + Expr.value(50),
   }).where('username', '=', 'john');
   
-  // 途中で失敗した場合、全ての変更が自動的にロールバックされます
+  // ここでの失敗は、すべての変更の自動ロールバックをトリガーします。
 });
 
 if (txResult.isSuccess) {
-  print('トランザクション成功');
+  print('トランザクションがコミットされました');
 } else {
-  print('トランザクション・ロールバック: ${txResult.error?.message}');
+  print('トランザクションがロールバックされました: ${txResult.error?.message}');
 }
 
-// エラー時の自動ロールバック
+// 例外時の自動ロールバック
 final txResult2 = await db.transaction(() async {
   await db.insert('users', {
     'username': 'jane',
     'email': 'jane@example.com',
   });
-  throw Exception('ビジネスロジックエラー'); // ロールバックをトリガー
+  throw Exception('Business Failure'); 
 }, rollbackOnError: true);
 ```
 
-### 完全インメモリモード (Memory Mode)
 
-データキャッシング、一時的な計算、ディスクへの永続化が不要なシナリオなどでは、`ToStore.memory()`を使用して完全なインメモリデータベースを初期化できます。このモードでは、すべてのデータ（スキーマ、インデックス、Key-Valueペアを含む）がメモリ内のみに保持されます。
+<a id="error-handling"></a>
+### エラー処理
 
-**注意**: インメモリモードで作成されたデータは、アプリケーションを閉じるか再起動すると完全に失われます。
+ToStore は、データ操作に対して統一されたレスポンスモデルを使用します。
+- `ResultType`: 分岐ロジックに使用できる安定したステータス列挙型。
+- `result.code`: `ResultType` に対応する数値コード。
+- `result.message`: エラーの読みやすい説明。
+- `successKeys` / `failedKeys`: 一括操作時などの主キーのリスト。
 
 ```dart
-// インメモリモードでデータベースを初期化
-final db = await ToStore.memory(
-  schemas: [],
-);
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
 
-// すべての操作（CRUDおよび検索）はメモリ内で瞬時に実行されます
-await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
+if (!result.isSuccess) {
+  switch (result.type) {
+    case ResultType.notFound:
+      print('リソースが見つかりませんでした: ${result.message}');
+      break;
+    case ResultType.notNullViolation:
+    case ResultType.validationFailed:
+      print('検証に失敗しました: ${result.message}');
+      break;
+    case ResultType.uniqueViolation:
+      print('競合が発生しました: ${result.message}');
+      break;
+    default:
+      print('コード: ${result.code}, メッセージ: ${result.message}');
+  }
+}
+```
 
+**一般的なステータスコード**:
+成功は 0、負の値はエラーを表します。
+- `ResultType.success` (0)
+- `ResultType.partialSuccess` (1)
+- `ResultType.uniqueViolation` (-2)
+- `ResultType.primaryKeyViolation` (-3)
+- `ResultType.foreignKeyViolation` (-4)
+- `ResultType.notNullViolation` (-5)
+- `ResultType.validationFailed` (-6)
+- `ResultType.notFound` (-11)
+- `ResultType.resourceExhausted` (-15)
+
+
+### 純メモリモード
+
+データキャッシュやディスクレス環境の場合は、`ToStore.memory()` を使用します。すべてのデータ（スキーマ、インデックス、KV）は RAM 内に保持されます。
+
+**注意**: データはアプリの終了または再起動時に失われます。
+
+```dart
+// インメモリデータベースの初期化
+final db = await ToStore.memory(schemas: []);
+
+// すべての操作がほぼ即座に完了します
+await db.insert('temp_cache', {'key': 'session_1', 'value': 'admin'});
 ```
 
 
-## セキュリティ設定
-
-**データセキュリティメカニズム**：
-- データの紛失を完全に防止する二重保護。
-- 未完了操作の自動復旧機能。
-- 操作完了時の即時永続化。
-- 高強度な暗号化による機密データ保護。
+<a id="security-config"></a>
+## セキュリティ構成
 
 > [!WARNING]
-> **キー管理**: **`encodingKey`** は自由に変更可能です。変更時はエンジンが自動でデータを移行するため、データ消失の心配はありません。**`encryptionKey`** は任意に変更しないでください。変更すると既存データが復号できなくなります（データ移行を除く）。キーをコード内にハードコードせず、セキュアなサーバーから取得することを推奨します。
+> **キー管理**: **`encodingKey`** は変更可能です。エンジンが自動的にデータを移行します。**`encryptionKey`** は非常に重要です。変更すると、移行なしで古いデータを読み取ることができなくなります。機密キーをハードコードしないでください。
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
-      // 対応アルゴリズム：none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      // サポート: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // エンコーディングキー（自由に変更可能、変更時はデータを自動移行）
+      // 符号化キー (データの自動移行が可能)
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // 重要データ暗号化キー（任意に変更不可、変更すると旧データが復号不可、移行を除く）
+      // 暗号化キー (非常に重要、移行なしでの変更不可)
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
-      // デバイス連結 (Path-based binding)
-      // 有効にすると、キーがパスやデバイス特性に紐付けられます。
-      // 物理的なファイルコピーへの耐性が高まりますが、アプリの設置パス変更などでデータが復元できなくなる点に注意。
+      // デバイスバインディング (パスベース)
+      // キーを DB のパスとデバイスの特性に紐付けます。
+      // DB ファイルが移動された場合に復号を防ぎます。
       deviceBinding: false, 
     ),
-    // WAL (Write-Ahead Logging) の有効化（デフォルト：有効）
-    enableJournal: true, 
-    // コミット時に強制的にディスク同期（パフォーマンス重視の場合は false も可）
-    persistRecoveryOnCommit: true,
+    enableJournal: true, // ライトアヘッドロギング (WAL)
+    persistRecoveryOnCommit: true, // コミット時に強制フラッシュ
   ),
 );
 ```
 
-### 価値レベル暗号化（ToCrypto）
+### フィールドレベルの暗号化 (ToCrypto)
 
-上記のデータベース全体の暗号化は、すべてのテーブルとインデックスを暗号化するため、全体のパフォーマンスに影響する場合があります。機密フィールドのみを暗号化する場合は **ToCrypto** を使用してください。データベースに依存せず（db インスタンス不要）、書き込み前または読み取り後に自分で値をエンコード/デコードします。キーはアプリで完全に管理します。出力は Base64 で、JSON や TEXT 列に保存できます。
-
-- **key**（必須）：`String` または `Uint8List`。32 バイトでない場合は SHA-256 で 32 バイトに派生します。
-- **type**（任意）：暗号化タイプ [ToCryptoType]： [ToCryptoType.chacha20Poly1305] または [ToCryptoType.aes256Gcm]。デフォルト [ToCryptoType.chacha20Poly1305]。省略時はデフォルトを使用。
-- **aad**（任意）：追加認証データ、`Uint8List`。エンコード時に指定した場合は、デコード時にも同じバイト列を指定してください（例：テーブル名+フィールド名でコンテキストをバインド）。簡単な用途では省略可能です。
+データベース全体の暗号化はパフォーマンスに影響を与える可能性があります。特定の機密フィールドには **ToCrypto** を使用します。DB インスタンスを必要とせず、Base64 出力で値をエンコード/デコードするスタンドアロンのユーティリティで、JSON や TEXT カラムに最適です。
 
 ```dart
 const key = 'my-secret-key';
-// エンコード：平文 → Base64 暗号文（DB や JSON に保存可能）
-final cipher = ToCrypto.encode('sensitive data', key: key);
-// 読み取り時にデコード
+// エンコード: プレーンテキスト -> Base64 暗号文
+final cipher = ToCrypto.encode('機密データ', key: key);
+// デコード
 final plain = ToCrypto.decode(cipher, key: key);
 
-// 任意：aad でコンテキストをバインド（エンコード・デコードで同じ aad を使用）
+// オプション: AAD によるコンテキストバインディング (デコード時にも一致させる必要があります)
 final aad = Uint8List.fromList(utf8.encode('users:id_number'));
 final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
 final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
-## 性能と体験
 
-### 性能仕様
+<a id="performance"></a>
+## パフォーマンス
 
-- **起動速度**：1億件のデータ量でも、一般的なスマートフォンで即座に起動・表示。
-- **検索性能**：データ規模に依存せず、常に超高速な検索性能を維持。
-- **データ安全**：ACIDトランザクション保証 + クラッシュリカバリでデータ損失ゼロ。
+### ベストプラクティス
+- 📱 **サンプルプロジェクト**: Flutter アプリの完全な例については、`example` ディレクトリを参照してください。
+- 🚀 **実稼働環境**: リリースモードでのパフォーマンスはデバッグモードを大幅に上回ります。
+- ✅ **標準化**: すべてのコア機能は包括的なテストスイートによってカバーされています。
 
-### 推奨事項
-
-- 📱 **サンプルプロジェクト**：`example` ディレクトリに完全な Flutter アプリのサンプルがあります。
-- 🚀 **本番環境**：デバッグモードより遥かに高速な「リリースモード」でのビルドを推奨します。
-- ✅ **標準テスト**：全てのコア機能が標準テストをクリアしています。
-
-### デモ動画
+### ベンチマーク
 
 <p align="center">
-  <img src="../media/basic-demo.gif" alt="ToStore 基本パフォーマンスデモ" width="320" />
-  </p>
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore パフォーマンスデモ" width="320" />
+</p>
 
-- **基本パフォーマンスデモ**（<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>）：GIF プレビューは一部が省略される場合があります。全編は動画をクリックしてご覧ください。一般的なスマートフォン上で、データ件数が 1 億件を超えてもアプリの起動・ページング・検索性能が終始安定して滑らかなことを確認できます。ストレージ容量さえ足りていれば、エッジデバイス上でも TB〜PB 級のデータスケールを支えつつ、インタラクションのレイテンシを低く保つことができます。
+- **パフォーマンスショーケース**: 1億件以上のレコードがあっても、標準的なモバイルデバイス上で起動、スクロール、検索がスムーズに維持されます。 ( [動画](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4) を参照)
 
 <p align="center">
-  <img src="../media/disaster-recovery.gif" alt="ToStore 障害復旧ストレステスト" width="320" />
-  </p>
-  
-- **障害復旧ストレステスト**（<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：大量書き込み処理の最中にあえてプロセスを何度も強制終了し、クラッシュや停電を再現します。数万件規模の書き込みが途中で中断されても、ToStore は一般的なスマートフォン上で非常に高速に自己復旧し、次回起動やデータ可用性に悪影響を与えません。
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.gif" alt="ToStore 災害復旧" width="320" />
+</p>
+
+- **災害復旧**: 高頻度の書き込み中に電源が切れたりプロセスが強制終了されたりしても、ToStore は迅速に自己修復します。 ( [動画](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4) を参照)
 
 
+ToStore がお役に立てたなら、ぜひ ⭐️ をお願いします！それはオープンソースに対する最大のサポートです。
+
+---
+
+> **推奨**: フロントエンド開発には [ToApp Framework](https://github.com/tocreator/toapp) の使用をご検討ください。データリクエスト、読み込み、保存、キャッシュ、および状態管理を自動化するフルスタックソリューションを提供します。
 
 
-ToStore がお役に立てれば、ぜひ ⭐️ をお願いします。
-
-
-
-
-## ロードマップ
-
-ToStore は、AI 時代のデータインフラを強化するために以下の機能を開発中です：
-
-- **高次元ベクトル**：ベクトル検索と意味的検索アルゴリズムの追加。
-- **マルチモーダルデータ**：生データから特徴ベクトルまでのエンドツーエンド処理。
-- **グラフ構造**：ナレッジグラフや複雑なリレーションネットワークの効率的な保存と検索。
-
-
-
-
-
-> **推奨**：モバイル開発の方には、データのリクエスト、読み込み、保存、キャッシュ、表示を自動化するフルスタック・ソリューション [Toway Framework](https://github.com/tocreator/toway) もお勧めします。
-
-
-
-
+<a id="more-resources"></a>
 ## リソース
 
 - 📖 **ドキュメント**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **フィードバック**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
-- 💬 **議論**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
+- 💬 **ディスカッション**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)

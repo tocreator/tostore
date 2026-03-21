@@ -48,9 +48,10 @@ class IntegrityChecker {
         limit: sampleSize,
       )) {
         try {
-          if (!_validateRecord(data, schema)) {
+          final List<String> recordErrors = [];
+          if (!_validateRecord(data, schema, errors: recordErrors)) {
             Logger.error(
-                'Table structure validation failed: record at start does not match schema',
+                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}',
                 label: 'IntegrityChecker.checkTableStructure');
             return false;
           }
@@ -71,9 +72,10 @@ class IntegrityChecker {
         limit: sampleSize,
       )) {
         try {
-          if (!_validateRecord(data, schema)) {
+          final List<String> recordErrors = [];
+          if (!_validateRecord(data, schema, errors: recordErrors)) {
             Logger.error(
-                'Table structure validation failed: record at end does not match schema',
+                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}',
                 label: 'IntegrityChecker.checkTableStructure');
             return false;
           }
@@ -411,11 +413,17 @@ class IntegrityChecker {
   }
 
   /// validate record
-  bool _validateRecord(Map<String, dynamic> data, TableSchema schema) {
+  bool _validateRecord(Map<String, dynamic> data, TableSchema schema,
+      {List<String>? errors}) {
+    bool isValid = true;
+
     // check required fields
     for (var field in schema.fields) {
       if (!field.nullable && !data.containsKey(field.name)) {
-        return false;
+        if (errors != null) {
+          errors.add('Field ${field.name} is required but missing');
+        }
+        isValid = false;
       }
     }
 
@@ -431,7 +439,11 @@ class IntegrityChecker {
                 value is String ||
                 value is BigInt ||
                 value is num)) {
-          return false;
+          if (errors != null) {
+            errors.add(
+                'Primary key ${entry.key} has invalid type: ${value.runtimeType} (expected int, String, BigInt, or num)');
+          }
+          isValid = false;
         }
         continue; // primary key validation passed, continue to process next field
       }
@@ -444,7 +456,20 @@ class IntegrityChecker {
         );
 
         if (!field.isValidDataType(entry.value, field.type)) {
-          return false;
+          if (errors != null) {
+            errors.add(
+                'Field ${entry.key} has invalid type: ${entry.value.runtimeType} (expected ${field.type})');
+          }
+          isValid = false;
+        } else {
+          // Check other constraints if type is valid
+          final fieldError = field.getValidationError(entry.value);
+          if (fieldError != null) {
+            if (errors != null) {
+              errors.add(fieldError);
+            }
+            isValid = false;
+          }
         }
       } catch (e) {
         // if field not found but not primary key field, record warning but not stop validation
@@ -456,7 +481,7 @@ class IntegrityChecker {
       }
     }
 
-    return true;
+    return isValid;
   }
 
   /// efficient migration validation method
@@ -568,16 +593,17 @@ class IntegrityChecker {
           )) {
             try {
               // validate record structure
-              if (!_validateRecord(record, newSchema)) {
+              final List<String> recordErrors = [];
+              if (!_validateRecord(record, newSchema, errors: recordErrors)) {
                 Logger.error(
-                    'Record structure validation failed: Record does not meet new table structure requirements',
+                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}',
                     label: 'IntegrityChecker.validateMigration');
                 return false;
               }
               validatedCount++;
             } catch (recordError) {
               Logger.error(
-                  'Record structure validation exception: $recordError',
+                  'Record structure validation exception for table [$tableName]: $recordError',
                   label: 'IntegrityChecker.validateMigration');
               return false;
             }
@@ -593,16 +619,17 @@ class IntegrityChecker {
           )) {
             try {
               // validate record structure
-              if (!_validateRecord(record, newSchema)) {
+              final List<String> recordErrors = [];
+              if (!_validateRecord(record, newSchema, errors: recordErrors)) {
                 Logger.error(
-                    'Record structure validation failed: Record does not meet new table structure requirements',
+                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}',
                     label: 'IntegrityChecker.validateMigration');
                 return false;
               }
               validatedCount++;
             } catch (recordError) {
               Logger.error(
-                  'Record structure validation exception: $recordError',
+                  'Record structure validation exception for table [$tableName]: $recordError',
                   label: 'IntegrityChecker.validateMigration');
               return false;
             }

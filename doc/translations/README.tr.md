@@ -30,100 +30,84 @@
 </p>
 
 
+## Hızlı Gezinti
+
+- [Neden ToStore?](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum](#installation) | [Hızlı Başlangıç](#quick-start)
+- [Şema Tanımlama](#schema-definition) | [Mobil/Masaüstü Entegrasyonu](#mobile-integration) | [Sunucu Tarafı Entegrasyonu](#server-integration)
+- [Vektör ve ANN Arama](#vector-advanced) | [Tablo Düzeyinde TTL](#ttl-config) | [Sorgu ve Sayfalama](#query-pagination) | [Yabancı Anahtarlar](#foreign-keys) | [Sorgu İşleçleri](#query-operators)
+- [Dağıtık Mimari](#distributed-architecture) | [Birincil Anahtar Örnekleri](#primary-key-examples) | [Atomik İfade İşlemleri](#atomic-expressions) | [İşlemler (Transactions)](#transactions) | [Hata Yönetimi](#error-handling)
+- [Güvenlik Yapılandırması](#security-config) | [Performans](#performance) | [Kaynaklar](#more-resources)
 
 
-## Neden ToStore'u Seçmelisiniz?
+<a id="why-tostore"></a>
+## Neden ToStore?
 
-ToStore, Dart/Flutter ekosistemindeki dağıtık vektör veritabanları için tek yüksek performanslı depolama motorudur. Sinir ağı benzeri bir mimari kullanarak, düğümler arası akıllı birbirine bağlanabilirlik ve iş birliği sunarak sonsuz yatay ölçeklenebilirliği destekler. Esnek bir veri topolojisi ağı oluşturur ve şema değişikliklerinin hassas tanımlanmasını, şifreleme korumasını ve çok alanlı (multi-space) veri izolasyonunu sağlar. ToStore, uç paralel işleme için çok çekirdekli işlemcilerden tam olarak yararlanır ve mobil uç (edge) cihazlardan buluta kadar yerel olarak platformlar arası iş birliğini destekler. Çeşitli dağıtık birincil anahtar algoritmaları ile sürükleyici sanal gerçeklik, çok modlu etkileşim, mekansal hesaplama, üretken yapay zeka ve semantik vektör uzayı modelleme gibi senaryolar için güçlü bir veri temeli sağlar.
+ToStore, AGI çağı ve uç zeka (edge intelligence) senaryoları için tasarlanmış modern bir veri motorudur. Dağıtık sistemleri, çok modlu füzyonu, ilişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı yerel olarak destekler. Sinir ağı benzeri bir temel mimariye dayanan düğümler, yüksek özerkliğe ve esnek yatay ölçeklenebilirliğe sahiptir ve uç ile bulut arasında birden fazla platformda sorunsuz iş birliği için esnek bir veri topolojisi ağı oluşturur. ACID işlemlerini, karmaşık ilişkisel sorguları (JOIN, kademeli yabancı anahtarlar), tablo düzeyinde TTL'yi ve toplama hesaplamalarını sunar. Birden fazla dağıtık birincil anahtar algoritmasını, atomik ifadeleri, şema değişikliği tanımlamayı, şifreleme korumasını, çoklu alan veri izolasyonunu, kaynağa duyarlı akıllı yük planlamasını ve felaket/çökme sonrası otomatik kurtarmayı içerir.
 
-Üretken yapay zeka ve mekansal hesaplama, hesaplama ağırlık merkezini uç (edge) noktalara kaydırdıkça, terminal cihazları sadece içerik görüntüleyiciler olmaktan çıkıp yerel üretim, çevresel algılama ve gerçek zamanlı karar verme merkezlerine dönüşüyor. Geleneksel tek dosyalı gömülü veritabanları mimari tasarımları gereği kısıtlıdır ve akıllı uygulamaların yüksek eşzamanlı yazma, devasa vektör geri çağırma ve bulut-uç iş birliğine dayalı üretim gibi anında yanıt gereksinimlerini karşılamakta zorlanırlar. ToStore, uç cihazlar için doğmuştur; onlara karmaşık yerel yapay zeka üretimini ve büyük ölçekli veri akışını destekleyecek kadar dağıtık depolama yetenekleri kazandırarak, bulut ve uç arasında gerçek bir derin iş birliği sağlar.
+Bilişimin ağırlık merkezi uç zekaya doğru kaymaya devam ederken, temsilciler ve sensörler gibi çeşitli terminaller artık sadece "içerik görüntüleme" cihazları değil; yerel üretim, çevre algılama, gerçek zamanlı karar verme ve veri iş birliğinden sorumlu akıllı düğümler haline gelmektedir. Temel mimarileri ve eklenti tipi uzantılarıyla sınırlı olan geleneksel veritabanı çözümleri, yüksek frekanslı yazmalar, devasa veriler, vektör arama ve iş birliğine dayalı üretimle karşılaşıldığında uç zeka ve bulut uygulamalarının gerektirdiği düşük gecikme ve kararlılık gereksinimlerini karşılamakta zorlanmaktadır.
 
-**Güç Kesintisine ve Çökmeye Dayanıklı**: Beklenmedik bir güç kesintisi veya uygulama çökmesi durumunda bile veriler otomatik olarak kurtarılabilir ve gerçek sıfır veri kaybı elde edilir. Bir veri işlemi yanıt verdiğinde, veriler zaten güvenli bir şekilde kaydedilmiştir ve veri kaybı riski ortadan kalkar.
-
-**Performans Sınırlarını Zorlamak**: Testler, 100 milyon+ kayıtla bile tipik bir akıllı telefonun veri ölçeğinden bağımsız sabit arama performansı koruyabildiğini ve geleneksel veritabanlarını çok geride bırakan bir deneyim sunduğunu göstermektedir.
-
+ToStore, devasa verileri, karmaşık yerel yapay zeka üretimini ve büyük ölçekli veri akışlarını desteklemek için uca yeterli dağıtık yetenekler kazandırır. Uç ve bulut düğümleri arasındaki derin akıllı iş birliği; sürükleyici AR/VR füzyonu, çok modlu etkileşim, anlamsal vektörler ve mekansal modelleme gibi senaryolar için güvenilir bir veri temeli sağlar.
 
 
+<a id="key-features"></a>
+## Temel Özellikler
 
-...... Parmak uçlarınızdan bulut uygulamalarına kadar, ToStore veri hesaplama gücünü serbest bırakmanıza ve geleceği güçlendirmenize yardımcı olur ......
-
-
-
-
-## ToStore Özellikleri
-
-- 🌐 **Sorunsuz Tüm Platform Desteği**
-  - Mobil uygulamalardan bulut sunucularına kadar tüm platformlarda aynı kodu çalıştırın.
-  - Farklı platform depolama arka uçlarına (IndexedDB, dosya sistemi vb.) akıllıca uyum sağlar.
-  - Endişesiz platformlar arası veri senkronizasyonu için birleşik API arayüzü.
-  - Uç cihazlardan bulut sunucularına kesintisiz veri akışı.
-  - Uç cihazlarda yerel vektör hesaplama, ağ gecikmesini ve bulut bağımlılığını azaltır.
+- 🌐 **Birleşik Çoklu Platform Veri Motoru**
+  - Mobil, Masaüstü, Web ve Sunucu için birleşik API.
+  - İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı destekler.
+  - Yerel depolamadan uç-bulut iş birliğine kadar veri yaşam döngüleri için idealdir.
 
 - 🧠 **Sinir Ağı Benzeri Dağıtık Mimari**
-  - Veri akışının verimli organizasyonu için birbirine bağlı düğüm topolojisi yapısı.
-  - Gerçek dağıtık işleme için yüksek performanslı veri bölümlendirme mekanizması.
-  - Kaynak kullanımını maksimize etmek için akıllı dinamik iş yükü dengeleme.
-  - Karmaşık veri ağlarını kolayca oluşturmak için düğümlerin sonsuz yatay ölçeklenmesi.
+  - Düğümlerin yüksek özerkliği; birbirine bağlı iş birliği esnek veri topolojileri oluşturur.
+  - Düğüm iş birliğini ve esnek yatay ölçeklenebilirliği destekler.
+  - Akıllı uç düğümleri ve bulut arasında derin ara bağlantı.
 
-- ⚡ **Üst Düzey Paralel İşleme Yeteneği**
-  - İzolatlar (Isolates) kullanarak gerçek paralel okuma/yazma, çok çekirdekli işlemcilerde tam hızda çalışma.
-  - Akıllı kaynak planlaması, çok çekirdekli performansı maksimize etmek için yükü otomatik olarak dengeler.
-  - İş birliğine dayalı çok düğümlü hesaplama ağı, görev işleme verimliliğini ikiye katlar.
-  - Kaynağa duyarlı planlama çerçevesi, kaynak çekişmesini önlemek için yürütme planlarını otomatik olarak optimize eder.
-  - Akışlı (streaming) sorgu arayüzü, devasa veri kümelerini kolaylıkla yönetir.
+- ⚡ **Paralel Yürütme ve Kaynak Planlama**
+  - Yüksek kullanılabilirlik ile kaynağa duyarlı akıllı yük planlaması.
+  - Çok düğümlü paralel iş birliğine dayalı bilgi işlem ve görev ayrıştırma.
 
-- 🔑 **Çeşitli Dağıtık Birincil Anahtar Algoritmaları**
-  - Sıralı Artış Algoritması - İş hacmini gizlemek için rastgele adım boyutlarını serbestçe ayarlayın.
-  - Zaman Damgası (Timestamp) Tabanlı Algoritma - Yüksek eşzamanlılık senaryoları için en iyi seçim.
-  - Tarih Öneki Algoritması - Zaman aralığı veri gösterimi için mükemmel destek.
-  - Kısa Kod Algoritması - Kısa, okunması kolay benzersiz tanımlayıcılar oluşturur.
+- 🔍 **Yapılandırılmış Sorgu ve Vektör Arama**
+  - Karmaşık koşullu sorguları, JOIN'leri, toplama hesaplamalarını ve tablo düzeyinde TTL'yi destekler.
+  - Vektör alanlarını, vektör indekslerini ve Yakın Komşu (ANN) aramasını destekler.
+  - Yapılandırılmış ve vektör verileri aynı motor içinde iş birliği içinde kullanılabilir.
 
-- 🔄 **Akıllı Şema Migrasyonu ve Veri Bütünlüğü**
-  - Yeniden adlandırılan tablo alanlarını sıfır veri kaybıyla hassas bir şekilde tanımlar.
-  - Şema değişikliklerinin otomatik tespiti ve milisaniyeler içinde veri migrasyonu.
-  - İşletme için fark edilmeyen, kesintisiz güncellemeler.
-  - Karmaşık yapı değişiklikleri için güvenli migrasyon stratejileri.
-  - Referans bütünlüğünü sağlayan kaskad desteğiyle otomatik yabancı anahtar kısıtlama doğrulaması.
+- 🔑 **Birincil Anahtarlar, İndeksleme ve Şema Gelişimi**
+  - Yerleşik ardışık artış, zaman damgası, tarih ön eki ve kısa kod PK algoritmaları.
+  - Benzersiz indeksleri, bileşik indeksleri, vektör indekslerini ve yabancı anahtar kısıtlamalarını destekler.
+  - Şema değişikliklerini akıllıca tanımlar ve veri geçişini otomatikleştirir.
 
-- 🛡️ **Kurumsal Düzeyde Güvenlik ve Dayanıklılık**
-  - Çift koruma mekanizması: Veri değişikliklerinin gerçek zamanlı günlüğü hiçbir şeyin kaybolmamasını sağlar.
-  - Otomatik çökme kurtarma: Güç kesintisi veya çökme sonrası tamamlanmamış işlemleri otomatik olarak sürdürür.
-  - Veri tutarlılığı garantisi: İşlemler ya tamamen başarılı olur ya da tamamen geri alınır (rollback).
-  - Atomik hesaplamalı güncellemeler: İfade sistemi, eşzamanlılık çatışmalarını önlemek için atomik olarak yürütülen karmaşık hesaplamaları destekler.
-  - Anında güvenli kalıcılık: İşlem başarılı olduğunda veriler güvenli bir şekilde kaydedilir.
-  - Yüksek dirençli ChaCha20Poly1305 şifreleme algoritması hassas verileri korur.
-  - Tüm depolama ve iletim boyunca güvenlik için uçtan uca şifreleme.
+- 🛡️ **İşlemler, Güvenlik ve Kurtarma**
+  - ACID işlemlerini, atomik ifade güncellemelerini ve kademeli yabancı anahtarları sunar.
+  - Çökme kurtarma, kalıcı flaş yazma ve veri tutarlılığı garantilerini destekler.
+  - ChaCha20-Poly1305 ve AES-256-GCM şifrelemeyi destekler.
 
-- 🚀 **Akıllı Önbellek ve Geri Çağırma Performansı**
-  - Ultra hızlı veri geri çağırma için çok seviyeli akıllı önbellek mekanizması.
-  - Depolama motoruyla derinlemesine entegre edilmiş önbellek stratejileri.
-  - Uyarlanabilir ölçekleme, veri ölçeği büyüdükçe kararlı performansı korur.
-  - Sorgu sonuçlarının otomatik güncellenmesi ile gerçek zamanlı veri değişikliği bildirimleri.
-
-- 🔄 **Akıllı Veri İş Akışı**
-  - Çok alanlı mimari, küresel paylaşımla birlikte veri izolasyonu sağlar.
-  - Hesaplama düğümleri arasında akıllı iş yükü dağıtımı.
-  - Büyük ölçekli veri eğitimi ve analizi için sağlam bir temel sağlar.
+- 🔄 **Çoklu Alan (Multi-Space) ve Veri İş Akışı**
+  - Yapılandırılabilir küresel paylaşımla Alanlar (Spaces) aracılığıyla veri izolasyonunu destekler.
+  - Gerçek zamanlı sorgu dinleyicileri, çok seviyeli akıllı önbelleğe alma ve imleç sayfalama.
+  - Çok kullanıcılı, yerel öncelikli ve çevrimdışı iş birliği uygulamaları için mükemmeldir.
 
 
+<a id="installation"></a>
 ## Kurulum
 
 > [!IMPORTANT]
-> **v2.x sürümünden mi yükseltiyorsunuz?** Kritik geçiş adımları ve önemli değişiklikler için lütfen [v3.0 Yükseltme Kılavuzu](../UPGRADE_GUIDE_v3.md) dosyasını okuyun.
+> **v2.x'ten mi yükseltiyorsunuz?** Kritik geçiş adımları ve önemli değişiklikler için [v3.x Yükseltme Kılavuzunu](../UPGRADE_GUIDE_v3.md) okuyun.
 
-`pubspec.yaml` dosyanıza `tostore` bağımlılığını ekleyin:
+`pubspec.yaml` dosyanıza bağımlılık olarak `tostore` ekleyin:
 
 ```yaml
 dependencies:
-  tostore: any # Lütfen en güncel sürümü kullanın
+  tostore: any # En son sürümü kullanın
 ```
 
+<a id="quick-start"></a>
 ## Hızlı Başlangıç
 
 > [!IMPORTANT]
-> **Tablo şemasını tanımlamak ilk adımdır**: CRUD işlemlerini gerçekleştirmeden önce tablo şemasını tanımlamalısınız. Özel tanımlama yöntemi senaryonuza bağlıdır:
-> - **Mobil/Masaüstü**: [Sık Başlatılan Senaryolar İçin Entegrasyon](#sık-başlatılan-senaryolar-için-entegrasyon) (Statik Tanımlama) önerilir.
-> - **Sunucu Tarafı**: [Sunucu Tarafı Entegrasyonu](#sunucu-tarafı-entegrasyonu) (Dinamik Oluşturma) önerilir.
+> **Tablo şemasını tanımlamak ilk adımdır**: CRUD işlemlerini gerçekleştirmeden önce tablo şemasını tanımlamanız gerekir (yalnızca KV depolama kullanmıyorsanız).
+> - Tanımlar ve kısıtlamalar hakkında ayrıntılar için [Şema Tanımlama](#schema-definition) bölümüne bakın.
+> - **Mobil/Masaüstü**: Örneği başlatırken `schemas` parametresini geçirin; bkz. [Mobil Entegrasyon](#mobile-integration).
+> - **Sunucu**: Çalışma zamanında `createTables` kullanın; bkz. [Sunucu Entegrasyonu](#server-integration).
 
 ```dart
 // 1. Veritabanını başlatın
@@ -136,715 +120,389 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Zincirleme sorgular ([sorgu operatörleri](#sorgu-operatörleri), =, !=, >, <, LIKE, IN vb. destekler)
+// 3. Zincirleme Sorgulamalar ([Sorgu İşleçleri](#query-operators) kısmına bakın; =, !=, >, <, LIKE, IN vb. destekler)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
     .orderByDesc('age')
-    .limit(10);
+    .limit(20);
 
 // 4. Güncelleme ve Silme
 await db.update('users', {'age': 26}).where('username', '=', 'John');
 await db.delete('users').where('username', '=', 'John');
 
-// 5. Gerçek zamanlı dinleme (Arayüz otomatik güncellenir)
+// 5. Gerçek zamanlı dinleme (Veri değiştiğinde UI otomatik olarak güncellenir)
 db.query('users').where('age', '>', 18).watch().listen((users) {
   print('Eşleşen kullanıcılar güncellendi: $users');
 });
 ```
 
-### Anahtar-Değer (KV) Depolama
-Yapılandırılmış tabloların tanımlanmasını gerektirmeyen senaryolar için uygundur. Basit, pratiktir ve yapılandırmalar, durumlar ve diğer dağınık veriler için yerleşik yüksek performanslı bir KV mağazası içerir. Farklı Alanlardaki (Spaces) veriler doğal olarak izoledir ancak küresel paylaşım için ayarlanabilir.
+### Anahtar-Değer Depolama (KV)
+Yapılandırılmış tablolara ihtiyaç duymayan senaryolar için uygundur. Basit ve pratiktir; yapılandırma, durum ve diğer dağınık veriler için yerleşik yüksek performanslı bir KV deposu içerir. Farklı Alanlardaki (Space) veriler varsayılan olarak izoledir ancak küresel paylaşım için yapılandırılabilir.
 
 ```dart
-// 1. Anahtar-değer çiftlerini ayarlayın (String, int, bool, double, Map, List vb. destekler)
+final db = await ToStore.open();
+
+// Anahtar-değer çiftlerini ayarlayın (String, int, bool, double, Map, List vb. destekler)
 await db.setValue('theme', 'dark');
 await db.setValue('login_attempts', 3);
 
-// 2. Veriyi alın
+// Veriyi al
 final theme = await db.getValue('theme'); // 'dark'
 
-// 3. Veriyi silin
+// Veriyi sil
 await db.removeValue('theme');
 
-// 4. Küresel anahtar-değer (Alanlar arası paylaşılır)
-// KV verileri varsayılan olarak alana özeldir. Paylaşım için isGlobal: true kullanın.
+// Küresel anahtar-değer (Alanlar arası paylaşılır)
 await db.setValue('app_version', '1.0.0', isGlobal: true);
 final version = await db.getValue('app_version', isGlobal: true);
 ```
 
 
+<a id="schema-definition"></a>
+## Şema Tanımlama
 
-## Sık Başlatılan Senaryolar İçin Entegrasyon
-
-📱 **Örnek**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
-
-```dart
-// Mobil ve masaüstü uygulamaları için uygun şema tanımı.
-// Şema değişikliklerini hassas bir şekilde tanımlar ve verileri otomatik olarak taşır.
-final db = await ToStore.open(
-  schemas: [
-    const TableSchema(
-            name: 'global_settings',
-            isGlobal: true,  // Tüm alanlar tarafından erişilebilen küresel tablo
-            fields: [],
-    ),
-    const TableSchema(
-      name: 'users', // Tablo adı
-      tableId: "users",  // %100 yeniden adlandırma tespiti için benzersiz tanımlayıcı
-      primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id',       // Birincil anahtar adı
-      ),
-      fields: [        // Alan tanımları (birincil anahtar hariç)
-        FieldSchema(
-          name: 'username', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true, // Otomatik olarak benzersiz bir dizin oluşturur
-          fieldId: 'username',  // Benzersiz alan tanımlayıcı
-        ),
-        FieldSchema(
-          name: 'email', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true // Otomatik olarak benzersiz bir dizin oluşturur
-        ),
-        FieldSchema(
-          name: 'last_login', 
-          type: DataType.datetime,
-          createIndex: true // Otomatik olarak bir dizin oluşturur (idx_last_login)
-        ),
-      ],
-      // Bileşik dizin örneği
-      indexes: [
-        IndexSchema(fields: ['username', 'last_login']),
-      ],
-    ),
-    // Yabancı anahtar kısıtlaması örneği
-    TableSchema(
-      name: 'posts',
-      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
-      fields: [
-        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
-        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
-        const FieldSchema(name: 'content', type: DataType.text),
-      ],
-      foreignKeys: [
-        ForeignKeySchema(
-          name: 'fk_posts_user',
-          fields: ['user_id'],              // Mevcut tablo alanları
-          referencedTable: 'users',         // Referans alınan tablo
-          referencedFields: ['id'],         // Referans alınan alanlar
-          onDelete: ForeignKeyCascadeAction.cascade,  // Kaskad silme
-          onUpdate: ForeignKeyCascadeAction.cascade,  // Kaskad güncelleme
-        ),
-      ],
-    ),
-  ],
-);
-
-// Çok alanlı mimari - farklı kullanıcıların verilerinin mükemmel izolasyonu
-await db.switchSpace(spaceName: 'user_123');
-```
-
-### Oturum durumunu koruma ve çıkış (aktif alan)
-
-Çok alan, **kullanıcı başına veri** için uygundur: kullanıcı başına bir alan ve girişte geçiş. **Aktif alan** ve **close** seçeneği ile yeniden başlatmalardan sonra mevcut kullanıcı korunur ve çıkış desteklenir.
-
-- **Oturum durumunu koruma**: Kullanıcı kendi alanına geçtiğinde bunu aktif alan olarak kaydedin; bir sonraki açılışta default ile doğrudan bu alan açılır («önce default aç sonra geç» gerekmez).
-- **Çıkış**: Çıkışta veritabanını `keepActiveSpace: false` ile kapatın; bir sonraki açılışta önceki kullanıcının alanı otomatik açılmaz.
+### TableSchema Genel Bakış
 
 ```dart
-
-// Girişten sonra: bu kullanıcının alanına geç ve bir sonraki açılış için hatırla (oturumu koru)
-await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
-
-// İsteğe bağlı: yalnızca default ile açmak için (örn. yalnızca giriş ekranı) — kayıtlı aktif alan kullanılmaz
-// final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
-
-// Çıkışta: kapat ve aktif alanı temizle, bir sonraki açılış default alanı kullansın
-await db.close(keepActiveSpace: false);
-```
-
-## Sunucu Tarafı Entegrasyonu
-
-🖥️ **Örnek**: [server_quickstart.dart](example/lib/server_quickstart.dart)
-
-```dart
-final db = await ToStore.open();
-
-// Çalışma zamanında toplu şema oluşturma
-await db.createTables([
-  // 3D mekansal özellik vektör depolama tablosu
-  const TableSchema(
-    name: 'spatial_embeddings',
-    primaryKeyConfig: PrimaryKeyConfig(
-      name: 'id',
-      type: PrimaryKeyType.timestampBased,   // Yüksek eşzamanlılık için zaman damgası PK
+const userSchema = TableSchema(
+  name: 'users', // Tablo adı, zorunlu
+  tableId: 'users', // Benzersiz kimlik, isteğe bağlı; yeniden adlandırmayı %100 doğru algılamak için
+  primaryKeyConfig: PrimaryKeyConfig(
+    name: 'id', // PK alan adı, varsayılan 'id'
+    type: PrimaryKeyType.sequential, 
+    sequentialConfig: SequentialIdConfig(
+      initialValue: 1000, 
+      increment: 1, 
+      useRandomIncrement: false, 
     ),
-    fields: [
-      FieldSchema(
-        name: 'video_name',
-        type: DataType.text,
-        nullable: false,
-      ),
-      FieldSchema(
-        name: 'spatial_features',
-        type: DataType.vector,                // Vektör depolama türü
-        vectorConfig: VectorFieldConfig(
-          dimensions: 1024,                   // Yüksek boyutlu vektör
-          precision: VectorPrecision.float32, 
-        ),
-      ),
-    ],
-    indexes: [
-      IndexSchema(
-        fields: ['video_name'],
-        unique: true,
-      ),
-      IndexSchema(
-        type: IndexType.vector,              // Vektör dizini
-        fields: ['spatial_features'],
-        vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,   // Verimli ANN için NGH algoritması
-          distanceMetric: VectorDistanceMetric.cosine,
-          parameters: {
-            'M': 16,
-            'efConstruction': 200,
-          },
-        ),
-      ),
-    ],
   ),
-  // Diğer tablolar...
-]);
-
-// Çevrimiçi Şema Güncellemeleri - İşletme için kesintisiz
-final taskId = await db.updateSchema('users')
-  .renameTable('users_new')                // Tabloyu yeniden adlandır
-  .modifyField(
-    'username',
-    minLength: 5,
-    maxLength: 20,
-    unique: true
-  )                                        // Alan özelliklerini değiştir
-  .renameField('old_name', 'new_name')     // Alanı yeniden adlandır
-  .removeField('deprecated_field')         // Alanı kaldır
-  .addField('created_at', type: DataType.datetime)  // Alan ekle
-  .removeIndex(fields: ['age'])            // Dizini kaldır
-  .setPrimaryKeyConfig(                    // PK yapılandırmasını değiştir
-    const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
-  );
-    
-// Migrasyon ilerlemesini izleyin
-final status = await db.queryMigrationTaskStatus(taskId);
-print('Migrasyon ilerlemesi: ${status?.progressPercentage}%');
-
-
-// Manuel Sorgu Önbelleği Yönetimi (Sunucu Tarafı)
-// İstemci platformlarında otomatik olarak yönetilir.
-// Sunucu veya büyük ölçekli veriler için hassas kontrol için bu API'leri kullanın.
-
-// Bir sorgu sonucunu manuel olarak 5 dakika boyunca önbelleğe alın.
-final activeUsers = await db.query('users')
-    .where('is_active', '=', true)
-    .useQueryCache(const Duration(minutes: 5));
-
-// Veriler değiştiğinde belirli önbelleği geçersiz kılın.
-await db.query('users')
-    .where('is_active', '=', true)
-    .clearQueryCache();
-
-// Gerçek zamanlı veri gerektiren sorgular için önbelleği açıkça devre dışı bırakın.
-final freshUserData = await db.query('users')
-    .where('is_active', '=', true)
-    .noQueryCache();
-```
-
-
-
-## Gelişmiş Kullanım
-
-ToStore, karmaşık iş gereksinimleri için zengin bir gelişmiş özellikler seti sunar:
-
-### Tablo düzeyinde TTL (zamana dayalı otomatik silme)
-
-Loglar, olaylar ve belirli bir süre sonunda otomatik olarak silinmesi gereken zaman serisi verileri için `ttlConfig` ile tablo düzeyinde TTL tanımlayabilirsiniz. Süresi dolan veriler, iş kodunuzun tüm kayıtları tek tek dolaşmasına gerek kalmadan, arka planda küçük partiler halinde otomatik olarak temizlenir:
-
-```dart
-const TableSchema(
-  name: 'event_logs',
   fields: [
+    FieldSchema(
+      name: 'username',
+      type: DataType.text,
+      nullable: false,
+      minLength: 3,
+      maxLength: 32,
+      unique: true,
+      fieldId: 'username', 
+      comment: 'Giriş adı', 
+    ),
+    FieldSchema(
+      name: 'status',
+      type: DataType.integer,
+      minValue: 0,
+      maxValue: 150,
+      defaultValue: 0,
+      createIndex: true, // Performans için indeks oluşturur
+    ),
     FieldSchema(
       name: 'created_at',
       type: DataType.datetime,
       nullable: false,
+      defaultValueType: DefaultValueType.currentTimestamp, // Otomatik zaman damgası
       createIndex: true,
-      defaultValueType: DefaultValueType.currentTimestamp,
     ),
   ],
-  ttlConfig: TableTtlConfig(
-    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7 gün sakla
-    // sourceField belirtilmediğinde, motor yazma zamanını kullanır
-    // ve gerekli indeksi otomatik olarak yönetir.
-    // Opsiyonel: özel bir sourceField tanımladığınızda alanın:
-    // 1) DataType.datetime tipinde
-    // 2) nullable: false (NULL kabul etmez)
-    // 3) defaultValueType olarak DefaultValueType.currentTimestamp kullanması gerekir
-    // sourceField: 'created_at',
-  ),
+  indexes: const [
+    IndexSchema(
+      indexName: 'idx_users_status_created_at',
+      fields: ['status', 'created_at'],
+      unique: false,
+      type: IndexType.btree,
+    ),
+  ],
+  foreignKeys: const [], // Yabancı anahtar kısıtlamaları (ilgili bölüme bakın)
+  isGlobal: false, // Küresel tablo (tüm Alanlarda erişilebilir)
+  ttlConfig: null, // Tablo düzeyinde TTL (ilgili bölüme bakın)
 );
 ```
 
-### İçe İçe Sorgular ve Özel Filtreleme
-Koşulların sonsuz iç içe geçmesini ve esnek özel işlevleri destekler.
+`DataType`; `integer`, `bigInt`, `double`, `text`, `blob`, `boolean`, `datetime`, `array`, `json`, `vector` tiplerini destekler. 
+
+### Kısıtlamalar ve Otomatik Doğrulama
+
+Genel doğrulama kurallarını `FieldSchema` aracılığıyla doğrudan şemaya yazabilirsiniz:
+
+- `nullable: false`: Null olmayan kısıtlaması.
+- `minLength` / `maxLength`: Metin uzunluğu kısıtlamaları.
+- `minValue` / `maxValue`: Sayısal aralık kısıtlamaları.
+- `defaultValue`: Varsayılan değerler.
+- `unique`: Benzersizlik (benzersiz bir indeks oluşturur).
+- `createIndex`: Sık kullanılan filtreler veya sıralama için bir indeks oluşturur.
+
+
+<a id="mobile-integration"></a>
+## Mobil/Masaüstü Entegrasyonu
 
 ```dart
-// Koşul iç içe geçirme: (type = 'app' OR (id >= 123 OR fans >= 200))
-final idCondition = QueryCondition().where('id', '>=', 123).or().where('fans', '>=', 200);
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
-final result = await db.query('users')
-    .condition(
-        QueryCondition().whereEqual('type', 'app').or().condition(idCondition)
-    )
-    .limit(20);
+final docDir = await getApplicationDocumentsDirectory();
+final dbRoot = p.join(docDir.path, 'common');
 
-// Özel koşul işlevi
-final customResult = await db.query('users')
-    .whereCustom((record) => record['tags']?.contains('önerilen') ?? false);
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+);
+
+// Çoklu Alan - Farklı kullanıcıların verilerini izole edin
+await db.switchSpace(spaceName: 'user_123');
 ```
 
-### Akıllı Upsert
-Varsa güncelle, yoksa ekle.
+### Giriş Durumunu Koruma ve Oturum Kapatma (Aktif Alan)
+
+Yeniden başlatmanın ardından mevcut kullanıcıyı korumak için **Aktif Alan (Active Space)** kullanın.
+
+- **Korumak**: Alanı değiştirirken aktif olarak işaretleyin (`keepActive: true`).
+- **Oturum Kapatma**: Veritabanını `keepActiveSpace: false` ile kapatın.
 
 ```dart
-// By primary key or unique key in data (no where)
-final result = await db.upsert('users', {'id': 1, 'username': 'john', 'email': 'john@example.com'});
-await db.upsert('users', {'username': 'john', 'email': 'john@example.com', 'age': 26});
-// Batch upsert
-await db.batchUpsert('users', [
-  {'username': 'a', 'email': 'a@example.com'},
-  {'username': 'b', 'email': 'b@example.com'},
-], allowPartialErrors: true);
+// Giriş sonrası: Kullanıcı alanını aktif olarak kaydedin
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
+
+// Oturum kapatma: Bir sonraki başlatma için aktif alanı temizleyin
+await db.close(keepActiveSpace: false);
 ```
 
 
-### Birleştirmeler (Joins) ve Alan Seçimi
+<a id="server-integration"></a>
+## Sunucu Tarafı Entegrasyonu
+
+```dart
+final db = await ToStore.open();
+
+// Başlangıçta tablo yapısını oluşturun veya doğrulayın
+await db.createTables(appSchemas);
+
+// Çevrimiçi şema güncellemeleri
+final taskId = await db.updateSchema('users')
+  .renameTable('users_new')
+  .modifyField('username', minLength: 5, unique: true)
+  .renameField('old', 'new')
+  .removeField('deprecated')
+  .addField('created_at', type: DataType.datetime)
+  .removeIndex(fields: ['age']);
+    
+// Geçiş ilerlemesini izleme
+final status = await db.queryMigrationTaskStatus(taskId);
+print('İlerleme: ${status?.progressPercentage}%');
+
+
+// Manuel Sorgu Önbelleği Yönetimi
+final activeUsers = await db.query('users')
+    .where('is_active', '=', true)
+    .useQueryCache(const Duration(minutes: 5));
+
+// Belirli önbelleği geçersiz kılın
+await db.query('users').where('is_active', '=', true).clearQueryCache();
+```
+
+
+<a id="advanced-usage"></a>
+## Gelişmiş Kullanım
+
+
+<a id="vector-advanced"></a>
+### Vektör ve ANN Arama
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'embeddings',
+    fields: [
+      FieldSchema(name: 'document_title', type: DataType.text, nullable: false),
+      FieldSchema(
+        name: 'embedding',
+        type: DataType.vector,
+        vectorConfig: VectorFieldConfig(dimensions: 128, precision: VectorPrecision.float32),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['embedding'],
+        type: IndexType.vector,
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,
+          distanceMetric: VectorDistanceMetric.cosine,
+        ),
+      ),
+    ],
+  ),
+]);
+
+final queryVector = VectorData.fromList(List.generate(128, (i) => i * 0.01));
+
+// Vektör arama
+final results = await db.vectorSearch(
+  'embeddings', 
+  fieldName: 'embedding', 
+  queryVector: queryVector, 
+  topK: 5,
+);
+```
+
+
+<a id="ttl-config"></a>
+### Tablo Düzeyinde TTL (Otomatik Zaman Aşımı)
+
+Günlükler veya olaylar için: süresi dolan veriler arka planda otomatik olarak temizlenir.
+
+```dart
+const TableSchema(
+  name: 'event_logs',
+  fields: [/* ... */],
+  ttlConfig: TableTtlConfig(ttlMs: 7 * 24 * 60 * 60 * 1000), // 7 gün sakla
+);
+```
+
+
+### Akıllı Yazma (Upsert)
+PK veya benzersiz anahtar varsa günceller, yoksa ekler.
+
+```dart
+await db.upsert('users', {
+  'id': 1,
+  'username': 'john',
+  'email': 'john@example.com',
+});
+```
+
+
+### JOIN ve Toplama (Aggregation)
 ```dart
 final orders = await db.query('orders')
     .select(['orders.id', 'users.name as user_name'])
     .join('users', 'orders.user_id', '=', 'users.id')
-    .where('orders.amount', '>', 1000);
-```
-
-### Akış (Streaming) ve İstatistikler
-```dart
-// Kayıtları say
-final count = await db.query('users').count();
-
-// Tablonun veritabanı schema'sında tanımlı olup olmadığını kontrol et (Space bağımsız)
-// Not: bu, tablonun veri içerdiği anlamına GELMEZ
-final usersTableDefined = await db.tableExists('users');
-
-// Koşullara göre yüksek verimli varlık kontrolü (tam kayıtları yüklemeden)
-final emailExists = await db.query('users')
-    .where('email', '=', 'test@example.com')
-    .exists();
+    .limit(20);
 
 // Toplama fonksiyonları
-final totalAge = await db.query('users').where('age', '>', 18).sum('age');
-final avgAge = await db.query('users').avg('age');
-final maxAge = await db.query('users').max('age');
-final minAge = await db.query('users').min('age');
-
-// Gruplama ve filtreleme
-final result = await db.query('orders')
-    .select(['status', Agg.sum('amount', alias: 'total')])
-    .groupBy(['status'])
-    .having(Agg.sum('amount'), '>', 1000)
-    .limit(20);
-
-// Benzersiz değer sorgusu
-final uniqueCities = await db.query('users').distinct(['city']);
-
-// Akış sorgusu (büyük veriler için uygun)
-db.streamQuery('users').listen((data) => print(data));
+final count = await db.query('users').count();
+final sum = await db.query('orders').sum('total');
 ```
 
 
+<a id="query-pagination"></a>
+### Sorgu ve Etkili Sayfalama
 
-### Sorgular ve Verimli Sayfalandırma
-
-ToStore, farklı veri ölçeklerine uygun çift modlu sayfalandırma desteği sunar:
-
-#### 1. Ofset Modu
-Küçük veri kümeleri için veya belirli bir sayfaya atlamak gerektiğinde uygundur.
+- **Offset Modu**: Küçük veri kümeleri veya sayfa atlamaları için.
+- **İmleç (Cursor) Modu**: Dev Veriler ve sonsuz kaydırma için önerilir (O(1)).
 
 ```dart
-final result = await db.query('users')
-    .orderByDesc('created_at')
-    .offset(40) // İlk 40 hesabı atla
-    .limit(20); // 20 tane al
-```
-> [!TIP]
-> `offset` çok büyük olduğunda, veritabanının birçok kaydı taraması ve atması gerekir, bu da performans kaybına yol açar. Derin sayfalandırma için **İmleç (Cursor) Modu**'nu kullanın.
+final page1 = await db.query('users').orderByDesc('id').limit(20);
 
-#### 2. Yüksek Performanslı İmleç (Cursor) Modu
-**Büyük veriler ve sonsuz kaydırma senaryoları için önerilir**. O(1) performans için `nextCursor` kullanır ve sayfa derinliğinden bağımsız olarak sabit sorgu hızı sağlar.
-
-> [!IMPORTANT]
-> Dizinlenmemiş bir alan üzerinden sıralama yapıldığında veya bazı karmaşık sorgularda, motor tam tablo taramasına dönebilir ve `null` bir imleç döndürebilir (bu, söz konusu sorgu için sayfalama desteğinin henüz mevcut olmadığı anlamına gelir).
-
-```dart
-// Sayfa 1
-final page1 = await db.query('users')
-    .orderByDesc('id')
-    .limit(20);
-
-// İmleci kullanarak bir sonraki sayfayı getirin
 if (page1.nextCursor != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Doğrudan konuma gidin
-}
-
-// prevCursor ile verimli bir şekilde geri gidin
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
-```
-
-| Özellik | Ofset Modu | İmleç Modu |
-| :--- | :--- | :--- |
-| **Performans** | Sayfa arttıkça düşer | **Sabit (O(1))** |
-| **Karmaşıklık** | Küçük veri, sayfa atlama | **Büyük veri, sonsuz kaydırma** |
-| **Tutarlılık** | Değişiklikler atlamalara neden olabilir | **Değişiklikler karşısında mükemmel bütünlük** |
-
-
-
-### Sorgu operatörleri
-
-`where(field, operator, value)` için tüm operatörler (büyük/küçük harf duyarsız):
-
-| Operator | Description | Example / Value type |
-| :--- | :--- | :--- |
-| `=` | Equal | `where('status', '=', 'active')` |
-| `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
-| `>` | Greater than | `where('age', '>', 18)` |
-| `>=` | Greater than or equal | `where('score', '>=', 60)` |
-| `<` | Less than | `where('price', '<', 100)` |
-| `<=` | Less than or equal | `where('quantity', '<=', 10)` |
-| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
-| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
-| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
-| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
-| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
-| `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
-| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
-
-### Anlamsal sorgu yöntemleri (önerilen)
-
-Operatörleri elle yazmak yerine anlamsal yöntemleri tercih edin.
-
-```dart
-// Comparison
-db.query('users').whereEqual('username', 'John');
-db.query('users').whereNotEqual('role', 'guest');
-db.query('users').whereGreaterThan('age', 18);
-db.query('users').whereGreaterThanOrEqualTo('score', 60);
-db.query('users').whereLessThan('price', 100);
-db.query('users').whereLessThanOrEqualTo('quantity', 10);
-
-// Membership & range
-db.query('users').whereIn('id', ['id1', 'id2']);
-db.query('users').whereNotIn('status', ['banned', 'pending']);
-db.query('users').whereBetween('age', 18, 65);
-
-// Null checks
-db.query('users').whereNull('deleted_at');
-db.query('users').whereNotNull('email');
-
-// Pattern match
-db.query('users').whereLike('name', '%John%');
-db.query('users').whereNotLike('email', '%@temp.');
-db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
-db.query('users').whereNotContains('title', 'draft');
-
-// Equivalent to: .where('age', '>', 18).where('name', 'like', '%John%')
-final users = await db.query('users')
-    .whereGreaterThan('age', 18)
-    .whereLike('username', '%John%')
-    .orderByDesc('age')
-    .limit(20);
-```
-
-## Dağıtık Mimari
-
-```dart
-// Dağıtık Düğümleri Yapılandırın
-final db = await ToStore.open(
-  config: DataStoreConfig(
-    distributedNodeConfig: const DistributedNodeConfig(
-      enableDistributed: true,
-      clusterId: 1,
-      centralServerUrl: 'http://127.0.0.1:8080',
-      accessToken: 'b7628a4f9b4d269b98649129'
-    )
-  )
-);
-
-// Yüksek Performanslı Toplu Ekleme (Batch Insert)
-await db.batchInsert('vector_data', [
-  {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
-  {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
-  // ... Kayıtlar verimli bir şekilde toplu olarak eklenir
-]);
-
-// Büyük veri kümelerini akışla işleyin - Sabit bellek
-await for (final record in db.streamQuery('vector_data')
-  .where('vector_name', '=', 'face_2366')
-  .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
-  .stream) {
-  // Yüksek bellek kullanımı olmadan TB ölçeğindeki verileri bile verimli bir şekilde işler
-  print(record);
+      .cursor(page1.nextCursor);
 }
 ```
 
-## Birincil Anahtar Örnekleri
 
-ToStore çeşitli dağıtık birincil anahtar algoritmaları sağlar:
-
-- **Sıralı** (PrimaryKeyType.sequential): 238978991
-- **Zaman Damgası Tabanlı** (PrimaryKeyType.timestampBased): 1306866018836946
-- **Tarih Öneki** (PrimaryKeyType.datePrefixed): 20250530182215887631
-- **Kısa Kod** (PrimaryKeyType.shortCode): 9eXrF0qeXZ
+<a id="foreign-keys"></a>
+### Yabancı Anahtarlar ve Kademeli İşlemler
 
 ```dart
-// Sıralı birincil anahtar yapılandırma örneği
-await db.createTables([
-  const TableSchema(
-    name: 'users',
-    primaryKeyConfig: PrimaryKeyConfig(
-      type: PrimaryKeyType.sequential,
-      sequentialConfig: SequentialIdConfig(
-        initialValue: 10000,
-        increment: 50,
-        useRandomIncrement: true, // İş hacmini gizle
-      ),
+foreignKeys: [
+    ForeignKeySchema(
+      name: 'fk_posts_user',
+      fields: ['user_id'],
+      referencedTable: 'users',
+      referencedFields: ['id'],
+      onDelete: ForeignKeyCascadeAction.cascade, // Kullanıcı silinirse gönderileri siler
     ),
-    fields: [/* Alan tanımları */]
-  ),
-]);
+],
 ```
 
 
-## İfadelerle Atomik İşlemler
+<a id="query-operators"></a>
+### Sorgu İşleçleri
 
-İfade sistemi, güvenli atomik alan güncellemeleri sağlar. Tüm hesaplamalar, eşzamanlılık çatışmalarını önlemek için veritabanı düzeyinde atomik olarak yürütülür:
+Desteklenenler: `=`, `!=`, `>`, `>=`, `<`, `<=`, `IN`, `NOT IN`, `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`.
 
 ```dart
-// Basit Artış: balance = balance + 100
+db.query('users').whereEqual('name', 'John').whereGreaterThan('age', 18).limit(20);
+```
+
+
+<a id="atomic-expressions"></a>
+## Atomik İfadeler
+
+Eşzamanlılık çakışmalarını önlemek için veritabanı düzeyinde hesaplamalar:
+
+```dart
+// balance = balance + 100
 await db.update('accounts', {
   'balance': Expr.field('balance') + Expr.value(100),
-}).where('id', '=', accountId);
+}).where('id', '=', id);
 
-// Karmaşık Hesaplama: total = price * quantity + tax
-await db.update('orders', {
-  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
-}).where('id', '=', orderId);
-
-// İçe içe parantezler: finalPrice = ((price * quantity) + tax) * (1 - discount)
-await db.update('orders', {
-  'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
-                 (Expr.value(1) - Expr.field('discount')),
-}).where('id', '=', orderId);
-
-// Fonksiyon kullanımı: price = min(price, maxPrice)
-await db.update('products', {
-  'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
-}).where('id', '=', productId);
-
-// Zaman Damgası: updatedAt = now()
-await db.update('users', {
-  'updatedAt': Expr.now(),
-}).where('id', '=', userId);
+// Bir Upsert içerisinde: güncellemeyse artır, değilse 1 yap
+await db.upsert('counters', {
+  'key': 'visits',
+  'count': Expr.ifElse(Expr.isUpdate(), Expr.field('count') + 1, 1),
+});
 ```
 
+
+<a id="transactions"></a>
 ## İşlemler (Transactions)
 
-İşlemler, birden fazla işlemin atomikliğini sağlar: Ya tümü başarılı olur ya da tümü geri alınır (rollback), veri tutarlılığı garanti edilir.
-
-**İşlem Özellikleri**:
-- Birden fazla işlemin atomik yürütülmesi.
-- Çökme sonrası tamamlanmamış işlemlerin otomatik kurtarılması.
-- Başarılı teslimde (commit) veriler güvenli bir şekilde kaydedilir.
+Atomikliği garanti eder: ya tüm işlemler başarılı olur ya da hepsi geri alınır.
 
 ```dart
-// Temel İşlem
 final txResult = await db.transaction(() async {
-  // Kullanıcı Ekle
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-    'fans': 100,
-  });
-  
-  // İfadeleri kullanarak atomik güncelleme
-  await db.update('users', {
-    'fans': Expr.field('fans') + Expr.value(50),
-  }).where('username', '=', 'john');
-  
-  // Herhangi bir işlem başarısız olursa, tüm değişiklikler otomatik olarak geri alınır.
+  await db.insert('users', {...});
+  await db.update('users', {...});
 });
-
-if (txResult.isSuccess) {
-  print('İşlem başarıyla tamamlandı');
-} else {
-  print('İşlem geri alındı: ${txResult.error?.message}');
-}
-
-// Hata durumunda otomatik geri alma
-final txResult2 = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'jane',
-    'email': 'jane@example.com',
-  });
-  throw Exception('İş mantığı hatası'); // Geri almayı tetikler
-}, rollbackOnError: true);
-```
-
-### Saf Bellek Modu (Memory Mode)
-
-Veri önbelleğe alma, geçici hesaplamalar veya diske kalıcılık gerektirmeyen disksiz ortamlar gibi senaryolar için `ToStore.memory()` kullanarak tamamen bellek içi bir veritabanı başlatabilirsiniz. Bu modda, tüm veriler (şemalar, dizinler ve anahtar-değer çiftleri dahil) kesinlikle bellekte tutulur.
-
-**Not**: Bellek modunda oluşturulan veriler, uygulama kapatıldığında veya yeniden başlatıldığında tamamen kaybolur.
-
-```dart
-// Veritabanını saf bellek modunda başlat
-final db = await ToStore.memory(
-  schemas: [],
-);
-
-// Tüm işlemler (CRUD ve arama) anında bellekte yürütülür
-await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
-
 ```
 
 
-## Güvenlik Yapılandırması
-
-**Veri Güvenliği Mekanizmaları**:
-- Çift koruma mekanizmaları verilerin asla kaybolmamasını sağlar.
-- Tamamlanmamış işlemler için otomatik çökme kurtarma.
-- İşlem başarısında anında güvenli kalıcılık.
-- Yüksek dirençli şifreleme hassas verileri korur.
+<a id="security-config"></a>
+## Güvenlik
 
 > [!WARNING]
-> **Anahtar Yönetimi**: **`encodingKey`** serbestçe değiştirilebilir; değiştiğinde motor verileri otomatik olarak taşır, veri kaybı endişesi yoktur. **`encryptionKey`** keyfi değiştirilmemelidir—değiştirmek eski verileri okunamaz yapar (migrasyon yapılmadıkça). Hassas anahtarları koda gömmeyin; güvenli bir sunucudan alın.
+> **Anahtar Yönetimi**: `encodingKey` değiştirilebilir (otomatik geçiş). `encryptionKey` kritiktir; geçiş olmadan değiştirilmesi eski verilerin okunamaz hale gelmesine neden olur.
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
-      // Desteklenen algoritmalar: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
-      
-      // Kodlama anahtarı (serbestçe değiştirilebilir; veriler otomatik taşınır)
-      encodingKey: '32-Byte-Uzunluğunda-Kodlama-Anahtarınız...', 
-      
-      // Kritik veriler için şifreleme anahtarı (keyfi değiştirmeyin; migrasyon olmadan eski veriler okunamaz)
-      encryptionKey: 'Güvenli-Şifreleme-Anahtarınız...',
-      
-      // Cihaz Bağlama (Yol tabanlı)
-      // Etkinleştirildiğinde, anahtarlar yola ve cihaz özelliklerine bağlanır.
-      // Veritabanı dosyalarının kopyalanmasına karşı güvenliği artırır.
-      deviceBinding: false, 
+      encodingKey: '...', 
+      encryptionKey: '...',
     ),
-    // Yazma Öncesi Günlük Kaydı (WAL) varsayılan olarak etkindir
-    enableJournal: true, 
-    // Commit sırasında diske yazmayı zorla (performans için false yapın)
-    persistRecoveryOnCommit: true,
   ),
 );
 ```
 
-### Değer düzeyinde şifreleme (ToCrypto)
+### Alan Düzeyinde Şifreleme (ToCrypto)
+Genel veritabanı performansını etkilemeden hassas alanları seçici olarak şifrelemek için.
 
-Yukarıdaki veritabanı genelinde şifreleme tüm tablo ve indeks verilerini şifreler ve genel performansı etkileyebilir. Yalnızca hassas alanları şifrelemek için **ToCrypto** kullanın: veritabanından bağımsızdır (db örneği gerekmez). Yazmadan önce veya okuduktan sonra değerleri kendiniz kodlar/dekodlarsınız; anahtar tamamen uygulamanız tarafından yönetilir. Çıktı Base64’tür, JSON veya TEXT sütunları için uygundur.
 
-- **key** (zorunlu): `String` veya `Uint8List`. 32 bayt değilse SHA-256 ile 32 bayt anahtar türetilir.
-- **type** (isteğe bağlı): Şifreleme türü [ToCryptoType]: [ToCryptoType.chacha20Poly1305] veya [ToCryptoType.aes256Gcm]. Varsayılan [ToCryptoType.chacha20Poly1305]. Varsayılan için atlayın.
-- **aad** (isteğe bağlı): Ek kimlik doğrulama verisi — `Uint8List`. Kodlama sırasında verilmişse, çözümleme sırasında aynı baytları vermeniz gerekir (örn. bağlam bağlamak için tablo adı + alan adı). Basit kullanımda atlayabilirsiniz.
+<a id="performance"></a>
+## Performans
 
-```dart
-const key = 'my-secret-key';
-// Kodlama: düz metin → Base64 şifre (DB veya JSON’a kaydet)
-final cipher = ToCrypto.encode('sensitive data', key: key);
-// Okurken çöz
-final plain = ToCrypto.decode(cipher, key: key);
-
-// İsteğe bağlı: aad ile bağlam bağlama (kodlama ve çözümlemede aynı aad)
-final aad = Uint8List.fromList(utf8.encode('users:id_number'));
-final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
-final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
-```
-
-## Performans ve Deneyim
-
-### Performans Spesifikasyonları
-
-- **Başlatma Hızı**: Tipik akıllı telefonlarda 100M+ kayıtla bile anında başlatma ve veri gösterimi.
-- **Sorgu Performansı**: Ölçekten bağımsız, her veri hacminde sürekli yıldırım hızında geri çağırma.
-- **Veri Güvenliği**: Sıfır veri kaybı için ACID işlem garantileri + çökme kurtarma.
-
-### Öneriler
-
-- 📱 **Örnek Proje**: `example` dizininde tam bir Flutter uygulaması örneği sunulmuştur.
-- 🚀 **Üretim**: Debug modundan çok daha yüksek performans için Release modunu kullanın.
-- ✅ **Standart Testler**: Tüm temel işlevler standart entegrasyon testlerini geçmiştir.
-
-### Demo videoları
+- 📱 **Örnek**: Tam bir Flutter projesi için `example` klasörüne bakın.
+- 🚀 **Release Modu**: Performans, Debug modundan çok daha yüksektir.
+- ✅ **Test Edildi**: Çekirdek işlevler kapsamlı test paketleri ile kapsanmıştır.
 
 <p align="center">
-  <img src="../media/basic-demo.gif" alt="ToStore temel performans demosu" width="320" />
-  </p>
-- **Temel performans demosu** (<a href="../media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF önizlemesi kırpılmış olabilir; tam demoyu görmek için videoya tıklayın. Sıradan bir akıllı telefonda, veri sayısı 100 M+ seviyesine çıktığında bile uygulamanın başlatma süresinin, sayfalama ve arama performansının her zaman kararlı ve akıcı kaldığını gösterir. Depolama alanı yeterli olduğu sürece, edge cihazlar TB/PB ölçeğindeki veri kümelerini işlerken dahi etkileşim gecikmesini sürekli düşük seviyede tutabilir.
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore Performans Demosu" width="320" />
+</p>
+
+- **Performans Tanıtımı**: 100M+ kayıtta bile pürüzsüz çalışma. ([Video](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4))
 
 <p align="center">
-  <img src="../media/disaster-recovery.gif" alt="ToStore felaket kurtarma stres testi" width="320" />
-  </p>
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.gif" alt="ToStore Kurtarma" width="320" />
+</p>
 
-- **Felaket kurtarma stres testi** (<a href="../media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Yoğun yazma yükü altında işlemi kasıtlı olarak defalarca yarıda keserek çökme ve elektrik kesintisi senaryolarını simüle eder. On binlerce yazma işlemi ani şekilde yarıda kalsa bile, ToStore tipik bir telefonda verileri çok hızlı biçimde geri yükler ve bir sonraki başlatmayı veya veri erişilebilirliğini olumsuz etkilemez.
-
-
+- **Kurtarma**: Ani güç kesintilerinde otomatik kurtarma. ([Video](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4))
 
 
-ToStore size yardımcı oluyorsa lütfen bize bir ⭐️ verin
+ToStore size yardımcı olduysa, lütfen bir ⭐️ verin! Bu, açık kaynağa verilen en büyük destektir.
 
+---
 
-
-
-## Yol Haritası (Roadmap)
-
-ToStore, yapay zeka çağında veri altyapısını güçlendirmek için aktif olarak özellikler geliştirmektedir:
-
-- **Yüksek Boyutlu Vektörler**: Vektör geri çağırma ve semantik arama algoritmaları ekleniyor.
-- **Çok Modlu Veriler**: Ham verilerden özellik vektörlerine kadar uçtan uca işleme sağlanıyor.
-- **Graf Veri Yapıları**: Bilgi graflarının ve karmaşık ilişkisel ağların verimli depolanması ve sorgulanması için destek.
-
-
-
-
-
-> **Öneri**: Mobil geliştiriciler, veri isteklerini, yüklemeyi, depolamayı, önbelleğe almayı ve görüntülemeyi otomatiklecek bir full-stack çözüm olan [Toway Framework](https://github.com/tocreator/toway)'ü de değerlendirebilirler.
-
-
-
-
-## Ek Kaynaklar
-
-- 📖 **Dokümantasyon**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **Geri Bildirim**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
-- 💬 **Tartışma**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
+> **Öneri**: Ön uç geliştirme için [ToApp Framework](https://github.com/tocreator/toapp) kullanmayı değerlendirin. İstek, önbellek ve durum yönetimi için tam yığın çözüm sunar.

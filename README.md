@@ -30,82 +30,64 @@
 </p>
 
 
+## Quick Navigation
+
+- [Why ToStore?](#why-tostore) | [Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start)
+- [Schema Definition](#schema-definition) | [Mobile/Desktop Integration](#mobile-integration) | [Server-side Integration](#server-integration)
+- [Vectors & ANN Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Query & Pagination](#query-pagination) | [Foreign Keys](#foreign-keys) | [Query Operators](#query-operators)
+- [Distributed Architecture](#distributed-architecture) | [Primary Keys](#primary-key-examples) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions) | [Error Handling](#error-handling)
+- [Security Config](#security-config) | [Performance](#performance) | [More Resources](#more-resources)
 
 
+<a id="why-tostore"></a>
 ## Why Choose ToStore?
 
-ToStore is the only high-performance storage engine for distributed vector databases in the Dart/Flutter ecosystem. Utilizing a neural-network-like architecture, it features intelligent interconnectivity and collaboration between nodes, supporting infinite horizontal scaling. It builds a flexible data topology network and provides precise schema change identification, encryption protection, and multi-space data isolation. ToStore fully leverages multi-core CPUs for extreme parallel processing and naturally supports cross-platform collaboration from mobile edge devices to the cloud. With various distributed primary key algorithms, it provides a powerful data foundation for scenarios such as immersive AR/VR fusion, multi-modal interaction, spatial computing, generative AI, and semantic vector space modeling.
+ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. It natively supports distributed systems, multi-modal fusion, relational structured data, high-dimensional vectors, and unstructured data storage. Based on a neural-network-like underlying architecture, nodes possess high autonomy and elastic horizontal scalability, building a flexible data topology network for seamless edge-cloud cross-platform collaboration. It features ACID transactions, complex relational queries (JOIN, cascading foreign keys), table-level TTL, and aggregate computations. It includes multiple distributed primary key algorithms, atomic expressions, schema change identification, encryption protection, multi-space data isolation, resource-aware intelligent load scheduling, and disaster/crash self-healing recovery.
 
-As generative AI and spatial computing shift the center of gravity toward the edge, terminal devices are evolving from mere content displays into cores for local generation, environmental perception, and real-time decision-making. Traditional single-file embedded databases are limited by their architectural design, often struggling to support the immediate response requirements of intelligent applications when facing high-concurrency writes, massive vector retrieval, and cloud-edge collaborative generation. ToStore is born for edge devices, empowering them with distributed storage capabilities sufficient to support complex local AI generation and large-scale data flow, truly achieving deep collaboration between the cloud and the edge.
+As computing continues to shift toward edge intelligence, various terminals such as agents and sensors are no longer mere "content displays" but intelligent nodes responsible for local generation, environmental perception, real-time decision-making, and data collaboration. Traditional database solutions, limited by their underlying architecture and "plug-in" extensions, struggle to meet the low-latency and stability requirements of edge-cloud intelligent applications when facing high-concurrency writes, massive data, vector retrieval, and collaborative generation.
 
-**Power failure and crash resistant**: Even in the event of an unexpected power outage or application crash, data can be automatically recovered, achieving true zero loss. When a data operation responds, the data has already been safely saved, eliminating the risk of data loss.
-
-**Breaking performance limits**: Performance tests show that even with 100 million+ records, a typical smartphone can maintain constant retrieval performance regardless of data scale, delivering an experience far exceeding that of traditional databases.
+ToStore empowers the edge with distributed capabilities sufficient to support massive data, complex local AI generation, and large-scale data flow. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for scenarios such as immersive AR/VR fusion, multi-modal interaction, semantic vectors, and spatial modeling.
 
 
-
-
-...... From fingertips to cloud applications, ToStore helps you release data computing power and empower the future ......
-
-
-
-
+<a id="key-features"></a>
 ## Key Features
 
-- 🌐 **Seamless All-Platform Support**
-  - Run the same code across all platforms, from mobile apps to cloud servers.
-  - Intelligently adapt to different platform storage backends (IndexedDB, File System, etc.).
-  - Unified API interface for worry-free cross-platform data synchronization.
-  - Seamless data flow from edge devices to cloud servers.
-  - Local vector computation on edge devices, reducing network latency and cloud dependency.
+- 🌐 **Unified Cross-Platform Data Engine**
+  - Unified API for Mobile, Desktop, Web, and Server.
+  - Supports relational structured data, high-dimensional vectors, and unstructured data storage.
+  - Ideal for data lifecycles from local storage to edge-cloud collaboration.
 
 - 🧠 **Neural-Network-Like Distributed Architecture**
-  - Neural-network-like interconnected node topology for efficient data flow organization.
-  - High-performance data partitioning mechanism for true distributed processing.
-  - Intelligent dynamic workload balancing to maximize resource utilization.
-  - Infinite horizontal scaling of nodes to easily build complex data networks.
+  - High node autonomy; interconnected collaboration builds flexible data topologies.
+  - Supports node collaboration and elastic horizontal scalability.
+  - Deep interconnection between edge intelligent nodes and the cloud.
 
-- ⚡ **Ultimate Parallel Processing**
-  - True parallel read/write using Isolates, running at full speed on multi-core CPUs.
-  - Intelligent resource scheduling automatically balances load to maximize multi-core performance.
-  - Collaborative multi-node computing network doubles task processing efficiency.
-  - Resource-aware scheduling framework automatically optimizes execution plans to avoid resource contention.
-  - Streaming query interface handles massive datasets with ease.
+- ⚡ **Parallel Execution & Resource Scheduling**
+  - Resource-aware intelligent load scheduling with high availability.
+  - Multi-node parallel collaborative computing and task decomposition.
 
-- 🔑 **Diverse Distributed Primary Key Algorithms**
-  - Sequential Increment Algorithm - Freely adjust random step sizes to hide business scale.
-  - Timestamp-Based Algorithm - The best choice for high-concurrency scenarios.
-  - Date-Prefix Algorithm - Perfect support for time-range data display.
-  - Short Code Algorithm - Generates short, human-readable unique identifiers.
+- 🔍 **Structured Query & Vector Retrieval**
+  - Supports complex condition queries, JOINs, aggregate computations, and table-level TTL.
+  - Supports vector fields, vector indexes, and Approximate Nearest Neighbor (ANN) search.
+  - Structured and vector data can be used collaboratively within the same engine.
 
-- 🔄 **Intelligent Schema Migration & Data Integrity**
-  - Precisely identifies renamed table fields with zero data loss.
-  - Millisecond-level automatic detection of schema changes and data migration.
-  - Zero-downtime upgrades, seamless to the business.
-  - Safe migration strategies for complex structure changes.
-  - Automatic foreign key constraint validation with cascading support ensures referential integrity.
+- 🔑 **Primary Keys, Indexing & Schema Evolution**
+  - Built-in Sequential Increment, Timestamp, Date-Prefix, and Short Code PK algorithms.
+  - Supports unique indexes, composite indexes, vector indexes, and foreign key constraints.
+  - Intelligently identifies schema changes and automates data migration.
 
-- 🛡️ **Enterprise-Grade Security & Durability**
-  - Dual Protection Mechanism: Real-time logging of data changes ensures nothing is ever lost.
-  - Automatic Crash Recovery: Automatically resumes unfinished operations after power failure or crash.
-  - Data Consistency Guarantee: Operations either succeed entirely or roll back completely.
-  - Atomic Computational Updates: Expression system supports complex calculations, executed atomically to avoid concurrency conflicts.
-  - Instant Safe Flushing: Data is safely saved when the operation succeeds, no waiting required.
-  - High-strength ChaCha20Poly1305 encryption protects sensitive data.
-  - End-to-end encryption for security throughout storage and transmission.
+- 🛡️ **Transactions, Security & Recovery**
+  - Provides ACID transactions, atomic expression updates, and cascading foreign keys.
+  - Supports crash recovery, persistent flush, and data consistency guarantees.
+  - Supports ChaCha20-Poly1305 and AES-256-GCM encryption.
 
-- 🚀 **Intelligent Caching & Retrieval Performance**
-  - Multi-level intelligent caching mechanism for blazing-fast data retrieval.
-  - Caching strategies deeply integrated with the storage engine.
-  - Adaptive scaling maintains stable performance as data scale grows.
-  - Real-time data change notifications with automatic query result updates.
-
-- 🔄 **Intelligent Data Workflow**
-  - Multi-space architecture provides data isolation along with global sharing.
-  - Intelligent workload distribution across computing nodes.
-  - Provides a solid foundation for large-scale data training and analysis.
+- 🔄 **Multi-Space & Data Workflow**
+  - Supports data isolation via Spaces with configurable global sharing.
+  - Real-time query listeners, multi-level intelligent caching, and cursor pagination.
+  - Perfect for multi-user, local-first, and offline-collaborative applications.
 
 
+<a id="installation"></a>
 ## Installation
 
 > [!IMPORTANT]
@@ -118,12 +100,14 @@ dependencies:
   tostore: any # Please use the latest version
 ```
 
+<a id="quick-start"></a>
 ## Quick Start
 
 > [!IMPORTANT]
-> **Defining table schema is the first step**: Before performing CRUD operations, you must define the table schema. The specific definition method depends on your scenario:
-> - **Mobile/Desktop**: Recommended [Static Definition](#integration-for-frequent-startup-scenarios).
-> - **Server-side**: Recommended [Dynamic Creation](#server-side-integration).
+> **Defining table schema is the first step**: You must define the table schema before performing CRUD operations (unless using only KV storage). The specific definition method depends on your scenario:
+> - See [Schema Definition](#schema-definition) for details on definitions and constraints.
+> - **Mobile/Desktop**: Pass `schemas` when initializing the instance; see [Frequent Startup Integration](#mobile-integration).
+> - **Server-side**: Use `createTables` at runtime; see [Server-side Integration](#server-integration).
 
 ```dart
 // 1. Initialize the database
@@ -136,7 +120,7 @@ await db.insert('users', {
   'age': 25,
 });
 
-// 3. Chained queries ([query operators](#query-operators) support =, !=, >, <, LIKE, IN, etc.)
+// 3. Chained queries (see [Query Operators](#query-operators); supports =, !=, >, <, LIKE, IN, etc.)
 final users = await db.query('users')
     .where('age', '>', 20)
     .where('username', 'like', '%John%')
@@ -154,173 +138,168 @@ db.query('users').where('age', '>', 18).watch().listen((users) {
 ```
 
 ### Key-Value Storage (KV)
-Suitable for scenarios that do not require defining structured tables. It's simple, practical, and includes a built-in high-performance KV store for configuration, status, and other scattered data. Data in different Spaces is naturally isolated but can be set for global sharing.
+Suitable for scenarios that do not require structured tables. Simple and practical, featuring a built-in high-performance KV store for configuration, status, and other scattered data. Data in different Spaces is isolated by default but can be set for global sharing.
 
 ```dart
-// 1. Set key-value pairs (Supports String, int, bool, double, Map, List, etc.)
+// Initialize the database
+final db = await ToStore.open();
+
+// Set key-value pairs (supports String, int, bool, double, Map, List, etc.)
 await db.setValue('theme', 'dark');
 await db.setValue('login_attempts', 3);
 
-// 2. Get data
+// Get data
 final theme = await db.getValue('theme'); // 'dark'
 
-// 3. Remove data
+// Remove data
 await db.removeValue('theme');
 
-// 4. Global key-value (Shared across Spaces)
-// Default KV data is space-specific. Use isGlobal: true for global sharing.
+// Global key-value (shared across Spaces)
+// Default KV data becomes inactive after switching spaces. Use isGlobal: true for global sharing.
 await db.setValue('app_version', '1.0.0', isGlobal: true);
 final version = await db.getValue('app_version', isGlobal: true);
 ```
 
 
+<a id="schema-definition"></a>
+## Schema Definition
+The following mobile and server-side examples reuse `appSchemas` defined here.
 
-## Integration for Frequent Startup Scenarios
+### TableSchema Overview
+
+```dart
+const userSchema = TableSchema(
+  name: 'users', // Table name, required
+  tableId: 'users', // Unique identifier, optional; used for 100% accurate rename detection
+  primaryKeyConfig: PrimaryKeyConfig(
+    name: 'id', // PK field name, defaults to 'id'
+    type: PrimaryKeyType.sequential, // Auto-generation type
+    sequentialConfig: SequentialIdConfig(
+      initialValue: 1000, // Starting value
+      increment: 1, // Step size
+      useRandomIncrement: false, // Whether to use random increments
+    ),
+  ),
+  fields: [
+    FieldSchema(
+      name: 'username', // Field name, required
+      type: DataType.text, // Data type, required
+      nullable: false, // Whether null is allowed
+      minLength: 3, // Min length
+      maxLength: 32, // Max length
+      unique: true, // Unique constraint
+      fieldId: 'username', // Field unique identifier, optional; for identify renames
+      comment: 'Login name', // Optional comment
+    ),
+    FieldSchema(
+      name: 'status',
+      type: DataType.integer,
+      minValue: 0, // Lower bound
+      maxValue: 150, // Upper bound
+      defaultValue: 0, // Static default value
+      createIndex: true,  // Shortcut for creating an index to boost performance
+    ),
+    FieldSchema(
+      name: 'created_at',
+      type: DataType.datetime,
+      nullable: false,
+      defaultValueType: DefaultValueType.currentTimestamp, // Auto-fill with current time
+      createIndex: true,
+    ),
+  ],
+  indexes: const [
+    IndexSchema(
+      indexName: 'idx_users_status_created_at', // Optional index name
+      fields: ['status', 'created_at'], // Composite index fields
+      unique: false, // Whether it's a unique index
+      type: IndexType.btree, // Index type: btree/hash/bitmap/vector
+    ),
+  ],
+  foreignKeys: const [], // Optional foreign key constraints; see "Foreign Keys" for example
+  isGlobal: false, // Whether it's a global table; accessible across all Spaces
+  ttlConfig: null, // Table-level TTL; see "Table-level TTL" for example
+);
+
+const appSchemas = [userSchema];
+```
+
+`DataType` supports `integer`, `bigInt`, `double`, `text`, `blob`, `boolean`, `datetime`, `array`, `json`, `vector`. `PrimaryKeyType` supports `none`, `sequential`, `timestampBased`, `datePrefixed`, `shortCode`.
+
+### Constraints & Auto-Validation
+
+You can write common validation rules directly into the schema using `FieldSchema`, avoiding duplicate logic in UI or service layers:
+
+- `nullable: false`: Non-null constraint.
+- `minLength` / `maxLength`: Text length constraints.
+- `minValue` / `maxValue`: Numeric range constraints.
+- `defaultValue` / `defaultValueType`: Static and dynamic default values.
+- `unique`: Unique constraint.
+- `createIndex`: Creates an index for high-frequency filtering, sorting, or joining.
+- `fieldId` / `tableId`: Assists in identifying renamed fields or tables during migration.
+
+These constraints are validated along the data write path, reducing the need for manual checks. `unique: true` automatically generates a unique index. `createIndex: true` and foreign keys automatically generate standard indexes. Use `indexes` for composite or vector indexes.
+
+
+### Choosing an Integration Method
+
+- **Mobile/Desktop**: Best for passing `appSchemas` directly to `ToStore.open(...)`.
+- **Server-side**: Best for dynamically creating schemas at runtime via `createTables(appSchemas)`.
+
+
+<a id="mobile-integration"></a>
+## Mobile/Desktop Integration
 
 📱 **Example**: [mobile_quickstart.dart](example/lib/mobile_quickstart.dart)
 
 ```dart
-// Schema definition suitable for frequent startup scenarios like mobile and desktop apps.
-// Precisely identifies schema changes and auto-migrates data with zero code maintenance.
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+// Android/iOS: Resolve the writable directory first, then pass dbPath
+final docDir = await getApplicationDocumentsDirectory();
+final dbRoot = p.join(docDir.path, 'common');
+
+// Reuse appSchemas defined above
 final db = await ToStore.open(
-  schemas: [
-    const TableSchema(
-            name: 'global_settings',
-            isGlobal: true,  // Global table accessible to all spaces
-            fields: [],
-    ),
-    const TableSchema(
-      name: 'users', // Table name
-      tableId: "users",  // Unique identifier for 100% rename detection
-      primaryKeyConfig: PrimaryKeyConfig(
-        name: 'id',       // Primary key name
-      ),
-      fields: [        // Field definitions (excluding primary key)
-        FieldSchema(
-          name: 'username', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true, // Automatically creates a unique index
-          fieldId: 'username',
-        ),
-        FieldSchema(
-          name: 'email', 
-          type: DataType.text, 
-          nullable: false, 
-          unique: true // Automatically creates a unique index
-        ),
-        FieldSchema(
-          name: 'last_login', 
-          type: DataType.datetime,
-          createIndex: true // Automatically creates an index
-        ),
-      ],
-      // Composite index example
-      indexes: [
-        IndexSchema(fields: ['username', 'last_login']),
-      ],
-    ),
-    // Foreign key constraint example
-    TableSchema(
-      name: 'posts',
-      primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
-      fields: [
-        const FieldSchema(name: 'title', type: DataType.text, nullable: false),
-        const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
-        const FieldSchema(name: 'content', type: DataType.text),
-      ],
-      foreignKeys: [
-        ForeignKeySchema(
-          name: 'fk_posts_user',
-          fields: ['user_id'],              // Current table fields
-          referencedTable: 'users',         // Referenced table
-          referencedFields: ['id'],         // Referenced fields
-          onDelete: ForeignKeyCascadeAction.cascade,  // Cascade delete
-          onUpdate: ForeignKeyCascadeAction.cascade,  // Cascade update
-        ),
-      ],
-    ),
-  ],
+  dbPath: dbRoot,
+  schemas: appSchemas,
 );
 
-// Multi-space architecture - perfect isolation of different users' data
+// Multi-space architecture - Isolating data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
 
-### Keeping login state and logout (active space)
+### Keeping Login State & Logout (Active Space)
 
-Multi-space works well for **per-user data**: use one space per user and switch when the user logs in. To keep the current user across app restarts and to support logout, use **active space** and **close** options.
+Multi-space is ideal for **isolating user data**: one space per user, switched upon login. Using **Active Space** and **Close options**, you can persist the current user across app restarts and support clean logouts.
 
-- **Keeping login state**: When the user switches to their space, save it as the active space so the next launch opens in that space by default (no need to "open default then switch").
-- **Logout**: When the user logs out, close the database with `keepActiveSpace: false` so the next launch does not auto-open in the previous user's space.
+- **Persist Login State**: When a user switches to their space, mark it as active. The next launch will directly enter that space via default opening, avoiding a "default then switch" sequence.
+- **Logout**: When a user logs out, close the database with `keepActiveSpace: false`. The next launch will not auto-enter the previous user's space.
 
 ```dart
+// After Login: Switch to the user space and mark as active (persist login)
+await db.switchSpace(spaceName: 'user_$userId', keepActive: true);
 
-// After login: switch to this user's space and remember it for next launch (keep login state)
-await db.switchSpace(spaceName: 'user_${userId}', keepActive: true);
-
-// Optional: open strictly in default (e.g. login screen only) — do not use stored active space
+// Optional: Strictly use the default space (e.g., login screen only)
 // final db = await ToStore.open(..., applyActiveSpaceOnDefault: false);
 
-// On logout: close and clear active space so next launch uses default space (logout)
+// On Logout: Close and clear the active space to use the default space next launch
 await db.close(keepActiveSpace: false);
 ```
 
 
-## Server-Side Integration
+<a id="server-integration"></a>
+## Server-side Integration
 
 🖥️ **Example**: [server_quickstart.dart](example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
 
-// Bulk schema creation at runtime - suitable for continuous running scenarios
-await db.createTables([
-  // 3D Spatial Feature Vector storage
-  const TableSchema(
-    name: 'spatial_embeddings',
-    primaryKeyConfig: PrimaryKeyConfig(
-      name: 'id',
-      type: PrimaryKeyType.timestampBased,   // Timestamp PK for high-concurrency writes
-    ),
-    fields: [
-      FieldSchema(
-        name: 'video_name',
-        type: DataType.text,
-        nullable: false,
-      ),
-      FieldSchema(
-        name: 'spatial_features',
-        type: DataType.vector,                // Vector storage type
-        vectorConfig: VectorFieldConfig(
-          dimensions: 1024,                   // High-dimensional vector
-          precision: VectorPrecision.float32, 
-        ),
-      ),
-    ],
-    indexes: [
-      IndexSchema(
-        fields: ['video_name'],
-        unique: true,
-      ),
-      IndexSchema(
-        type: IndexType.vector,              // Vector index
-        fields: ['spatial_features'],
-        vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,    // NGH algorithm for efficient ANN
-          distanceMetric: VectorDistanceMetric.cosine,
-          parameters: {
-            'M': 16,
-            'efConstruction': 200,
-          },
-        ),
-      ),
-    ],
-  ),
-  // Other tables...
-]);
+// Create or validate table structure on service startup
+await db.createTables(appSchemas);
 
-// Online Schema Updates - Seamless to the business
+// Online Schema Updates
 final taskId = await db.updateSchema('users')
   .renameTable('users_new')                // Rename table
   .modifyField(
@@ -330,10 +309,10 @@ final taskId = await db.updateSchema('users')
     unique: true
   )                                        // Modify field attributes
   .renameField('old_name', 'new_name')     // Rename field
-  .removeField('deprecated_field')         // Remove field
+  .removeField('deprecated_field')         // Delete field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK config
+  .setPrimaryKeyConfig(                    // Change PK type; data must be empty or will warn
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
     
@@ -343,10 +322,9 @@ print('Migration Progress: ${status?.progressPercentage}%');
 
 
 // Manual Query Cache Management (Server-side)
-// For queries on primary keys or indexed fields (Equality, IN queries), 
-// performance is already extreme and manual cache management is usually unnecessary.
+// Equality or IN queries on PKs or indexed fields are extremely fast; manual cache management is rarely needed.
 
-// Manually cache a query result for 5 minutes.
+// Manually cache a query result for 5 minutes. No expiration if duration is not provided.
 final activeUsers = await db.query('users')
     .where('is_active', '=', true)
     .useQueryCache(const Duration(minutes: 5));
@@ -363,14 +341,89 @@ final freshUserData = await db.query('users')
 ```
 
 
-
+<a id="advanced-usage"></a>
 ## Advanced Usage
 
 ToStore provides a rich set of advanced features for complex business requirements:
 
-### Table-level TTL (automatic time-based expiration)
 
-For logs, events, and other time-series style data that should expire automatically, you can define table-level TTL via `ttlConfig`. Expired data is cleaned up in the background in small batches, without requiring manual iteration in your business code:
+<a id="vector-advanced"></a>
+### Vectors & ANN Search
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'embeddings',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.timestampBased,
+    ),
+    fields: [
+      FieldSchema(
+        name: 'document_title',
+        type: DataType.text,
+        nullable: false,
+      ),
+      FieldSchema(
+        name: 'embedding',
+        type: DataType.vector,  // Declare vector type
+        nullable: false,
+        vectorConfig: VectorFieldConfig(
+          dimensions: 128, // Vector dimensions; must match during write and query
+          precision: VectorPrecision.float32, // Precision; float32 balances accuracy and space
+        ),
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['embedding'], // Field to index
+        type: IndexType.vector,  // Build vector index
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,  // Index algorithm; built-in NGH
+          distanceMetric: VectorDistanceMetric.cosine, // Metric; ideal for normalized embeddings
+          maxDegree: 32, // Max neighbors per node; larger increases recall but uses more memory
+          efSearch: 64, // Search expansion factor; larger is more accurate but slower
+          constructionEf: 128, // Index quality factor; larger is better but slower to build
+        ),
+      ),
+    ],
+  ),
+]);
+
+final queryVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
+
+// Vector Search
+final results = await db.vectorSearch(
+  'embeddings', 
+  fieldName: 'embedding', 
+  queryVector: queryVector, 
+  topK: 5, // Return top 5 matches
+  efSearch: 64, // Override default search expansion factor
+);
+
+for (final r in results) {
+  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+}
+```
+
+**Parameter Descriptions**:
+- `dimensions`: Must match the width of input embeddings.
+- `precision`: Optional `float64`, `float32`, `int8`; higher precision increases storage cost.
+- `distanceMetric`: `cosine` for semantic similarity, `l2` for Euclidean distance, `innerProduct` for dot product.
+- `maxDegree`: Max neighbors in the NGH graph; higher values improve recall.
+- `efSearch`: Expansion factor during search; higher values improve recall but add latency.
+- `topK`: Number of results to return.
+
+**Result Descriptions**:
+- `score`: Normalized similarity score (0 to 1); larger means more similar.
+- `distance`: Larger distance means less similarity for `l2` and `cosine`.
+
+
+<a id="ttl-config"></a>
+### Table-level TTL (Automatic Expiration)
+
+For time-series data like logs or events, define `ttlConfig` in the schema. Expired data is cleaned up automatically in the background:
 
 ```dart
 const TableSchema(
@@ -385,20 +438,20 @@ const TableSchema(
     ),
   ],
   ttlConfig: TableTtlConfig(
-    ttlMs: 7 * 24 * 60 * 60 * 1000, // keep 7 days
-    // When sourceField is omitted, the engine uses the write time
-    // and manages the required index automatically.
-    // Optional: when you provide a custom sourceField, it must:
-    // 1) have type DataType.datetime
-    // 2) be non-nullable (nullable: false)
-    // 3) use DefaultValueType.currentTimestamp as defaultValueType
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // Keep for 7 days
+    // sourceField: defaults to an auto-created index if omitted.
+    // Custom sourceField must be:
+    // 1) DataType.datetime
+    // 2) non-nullable (nullable: false)
+    // 3) DefaultValueType.currentTimestamp
     // sourceField: 'created_at',
   ),
 );
 ```
 
+
 ### Nested Queries & Custom Filtering
-Supports infinite nesting of conditions and flexible custom functions.
+Supports infinite nesting and flexible custom functions.
 
 ```dart
 // Condition nesting: (type = 'app' OR (id >= 123 OR fans >= 200))
@@ -412,12 +465,11 @@ final result = await db.query('users')
 
 // Custom condition function
 final customResult = await db.query('users')
-    .whereCustom((record) => record['tags']?.contains('recommend') ?? false)
-    .limit(20);
+    .whereCustom((record) => record['tags']?.contains('recommend') ?? false);
 ```
 
-### Intelligent Upsert
-Update if a row exists (by primary key or unique key in data), otherwise insert. No where clause; conflict target is derived from data.
+### Intelligent Storage (Upsert)
+Update if the PK or unique key exists, otherwise insert. Does not support `where`; conflict target is determined by data.
 
 ```dart
 // By primary key
@@ -427,7 +479,7 @@ final result = await db.upsert('users', {
   'email': 'john@example.com',
 });
 
-// By unique key (record must contain all fields of one unique index + required fields)
+// By unique key (record must contain all fields of a unique index plus required fields)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',
@@ -442,7 +494,7 @@ final batchResult = await db.batchUpsert('users', [
 ```
 
 
-### Joins & Field Selection
+### JOINs & Field Selection
 ```dart
 final orders = await db.query('orders')
     .select(['orders.id', 'users.name as user_name'])
@@ -456,11 +508,10 @@ final orders = await db.query('orders')
 // Count records
 final count = await db.query('users').count();
 
-// Check if a table has been defined in the current database (space-agnostic).
-// Note: this does NOT indicate whether the table has data.
+// Check if a table exists (space-agnostic)
 final usersTableDefined = await db.tableExists('users');
 
-// Efficient existence check based on conditions (no full record loading).
+// Efficient non-loading existence check
 final emailExists = await db.query('users')
     .where('email', '=', 'test@example.com')
     .exists();
@@ -471,7 +522,7 @@ final avgAge = await db.query('users').avg('age');
 final maxAge = await db.query('users').max('age');
 final minAge = await db.query('users').min('age');
 
-// Group and filter
+// Grouping & Filtering
 final result = await db.query('orders')
     .select(['status', Agg.sum('amount', alias: 'total')])
     .groupBy(['status'])
@@ -481,21 +532,21 @@ final result = await db.query('orders')
 // Distinct query
 final uniqueCities = await db.query('users').distinct(['city']);
 
-// Streaming query (suitable for massive data)
+// Streaming (ideal for massive data)
 db.streamQuery('users').listen((data) => print(data));
 ```
 
 
-
-### Querying & Efficient Pagination
+<a id="query-pagination"></a>
+### Query & Efficient Pagination
 
 > [!TIP]
-> **Use `limit` for better performance**: It is highly recommended to always specify a `limit`. If omitted, the engine defaults to a limit of 1000 records. While the core engine is fast, fetching and serializing 1000 records can cause unnecessary latency in UI-sensitive applications.
+> **Explicitly specify `limit` for best performance**: Always specifying a `limit` is highly recommended. If omitted, the engine defaults to 1000 records. While the core is fast, serializing large batches in the app layer can cause unnecessary latency.
 
-ToStore offers dual-mode pagination support to fit different data scales and performance needs:
+ToStore provides dual-mode pagination to suit your data scale:
 
 #### 1. Offset Mode
-Suitable for small datasets (e.g., under 10k records) or when specific page jumping is required.
+Ideal for small datasets (<10k records) or when specific page jumping is required.
 
 ```dart
 final result = await db.query('users')
@@ -504,13 +555,13 @@ final result = await db.query('users')
     .limit(20); // Take 20
 ```
 > [!TIP]
-> When `offset` is very large, the database must scan and discard many records, leading to linear performance degradation. Use **Cursor Mode** for deep paging.
+> Performance drops linearly as `offset` grows because the DB must scan and discard records. Use **Cursor Mode** for deep paging.
 
-#### 2. High-Performance Cursor Mode
-**Recommended for massive data and infinite scroll scenarios**. Utilizes `nextCursor` for O(1) performance, ensuring constant query speed regardless of page depth.
+#### 2. Cursor Mode
+**Recommended for massive data and infinite scroll**. Uses `nextCursor` to resume reading from the current position, avoiding the overhead of large offsets.
 
 > [!IMPORTANT]
-> If sorting by an unindexed field or for certain complex queries, the engine may fall back to a full table scan and return a `null` cursor (meaning pagination for that specific query is not yet supported).
+> For complex queries or sorting on unindexed fields, the engine may fallback to full table scans and return a `null` cursor (indicating pagination is not supported for that specific query).
 
 ```dart
 // Page 1
@@ -518,7 +569,7 @@ final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Fetch next page using the cursor
+// Fetch next page via cursor
 if (page1.nextCursor != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
@@ -526,7 +577,7 @@ if (page1.nextCursor != null) {
       .cursor(page1.nextCursor); // Seek directly to the position
 }
 
-// Efficiently move backwards with prevCursor
+// Rewind efficiently with prevCursor
 final prevPage = await db.query('users')
     .limit(20)
     .cursor(page2.prevCursor);
@@ -534,17 +585,54 @@ final prevPage = await db.query('users')
 
 | Feature | Offset Mode | Cursor Mode |
 | :--- | :--- | :--- |
-| **Query Performance** | Decreases as page increases | **Constant (O(1))** |
-| **Complexity** | Small data, page jumping | **Massive data, infinite scroll** |
-| **Consistency** | Data changes can cause skips | **Avoids duplicates/omissions from data changes** |
+| **Performance** | Drops as page increases | **Always Constant (O(1))** |
+| **Use Case** | Small data, page jumping | **Massive data, infinite scroll** |
+| **Consistency** | Changes may cause skips | **Avoids duplicates/omissions** |
 
 
+<a id="foreign-keys"></a>
+### Foreign Keys & Cascading
 
+Enforce referential integrity and configure cascading updates or deletions. Constraints are checked upon writing; cascading policies handle related data automatically, reducing consistent logic in your app.
+
+```dart
+await db.createTables([
+  const TableSchema(
+    name: 'users',
+    primaryKeyConfig: PrimaryKeyConfig(name: 'id'),
+    fields: [
+      FieldSchema(name: 'username', type: DataType.text, nullable: false),
+    ],
+  ),
+  TableSchema(
+    name: 'posts',
+    primaryKeyConfig: const PrimaryKeyConfig(name: 'id'),
+    fields: [
+      const FieldSchema(name: 'title', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'user_id', type: DataType.integer, nullable: false),
+      const FieldSchema(name: 'content', type: DataType.text),
+    ],
+    foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_posts_user',
+          fields: ['user_id'],              // Current table field
+          referencedTable: 'users',         // Referenced table
+          referencedFields: ['id'],         // Referenced field
+          onDelete: ForeignKeyCascadeAction.cascade,  // Cascade delete
+          onUpdate: ForeignKeyCascadeAction.cascade,  // Cascade update
+        ),
+    ],
+  ),
+]);
+```
+
+
+<a id="query-operators"></a>
 ### Query Operators
 
-All `where(field, operator, value)` conditions use the following operators (case-insensitive):
+All `where(field, operator, value)` conditions support these operators (case-insensitive):
 
-| Operator | Description | Example / Value type |
+| Operator | Description | Example / Value Type |
 | :--- | :--- | :--- |
 | `=` | Equal | `where('status', '=', 'active')` |
 | `!=`, `<>` | Not equal | `where('role', '!=', 'guest')` |
@@ -552,17 +640,17 @@ All `where(field, operator, value)` conditions use the following operators (case
 | `>=` | Greater than or equal | `where('score', '>=', 60)` |
 | `<` | Less than | `where('price', '<', 100)` |
 | `<=` | Less than or equal | `where('quantity', '<=', 10)` |
-| `IN` | Value in list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
-| `NOT IN` | Value not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
-| `BETWEEN` | Between start and end (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
-| `LIKE` | Pattern match (`%` any, `_` single char) | `where('name', 'LIKE', '%John%')` — value: `String` |
-| `NOT LIKE` | Pattern not match | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
+| `IN` | In list | `where('id', 'IN', ['a','b','c'])` — value: `List` |
+| `NOT IN` | Not in list | `where('status', 'NOT IN', ['banned'])` — value: `List` |
+| `BETWEEN` | Between range (inclusive) | `where('age', 'BETWEEN', [18, 65])` — value: `[start, end]` |
+| `LIKE` | Pattern match (`%` any, `_` single) | `where('name', 'LIKE', '%John%')` — value: `String` |
+| `NOT LIKE` | Pattern mismatch | `where('email', 'NOT LIKE', '%@test.com')` — value: `String` |
 | `IS` | Is null | `where('deleted_at', 'IS', null)` — value: `null` |
 | `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — value: `null` |
 
-### Semantic query methods (recommended)
+### Semantic Query Methods (Recommended)
 
-Prefer semantic methods to avoid typing operator strings and get better IDE support:
+Semantic methods avoid manual operator strings and provide better IDE support:
 
 ```dart
 // Comparison
@@ -573,7 +661,7 @@ db.query('users').whereGreaterThanOrEqualTo('score', 60);
 db.query('users').whereLessThan('price', 100);
 db.query('users').whereLessThanOrEqualTo('quantity', 10);
 
-// Membership & range
+// Sets & Ranges
 db.query('users').whereIn('id', ['id1', 'id2']);
 db.query('users').whereNotIn('status', ['banned', 'pending']);
 db.query('users').whereBetween('age', 18, 65);
@@ -582,7 +670,7 @@ db.query('users').whereBetween('age', 18, 65);
 db.query('users').whereNull('deleted_at');
 db.query('users').whereNotNull('email');
 
-// Pattern match
+// Pattern matching
 db.query('users').whereLike('name', '%John%');
 db.query('users').whereNotLike('email', '%@temp.');
 db.query('users').whereContains('bio', 'flutter');   // LIKE '%flutter%'
@@ -596,6 +684,8 @@ final users = await db.query('users')
     .limit(20);
 ```
 
+
+<a id="distributed-architecture"></a>
 ## Distributed Architecture
 
 ```dart
@@ -603,9 +693,9 @@ final users = await db.query('users')
 final db = await ToStore.open(
   config: DataStoreConfig(
     distributedNodeConfig: const DistributedNodeConfig(
-      enableDistributed: true,
-      clusterId: 1,
-      centralServerUrl: 'http://127.0.0.1:8080',
+      enableDistributed: true,            // Enable distributed mode
+      clusterId: 1,                       // Cluster ID
+      centralServerUrl: 'https://127.0.0.1:8080',
       accessToken: 'b7628a4f9b4d269b98649129'
     )
   )
@@ -615,22 +705,24 @@ final db = await ToStore.open(
 await db.batchInsert('vector_data', [
   {'vector_name': 'face_2365', 'timestamp': DateTime.now()},
   {'vector_name': 'face_2366', 'timestamp': DateTime.now()},
-  // ... Records inserted efficiently in bulk
+  // ... efficient bulk insertion
 ]);
 
-// Stream large datasets - Constant memory usage
+// Stream Large Datasets
 await for (final record in db.streamQuery('vector_data')
   .where('vector_name', '=', 'face_2366')
   .where('timestamp', '>=', DateTime.now().subtract(Duration(days: 30)))
   .stream) {
-  // Efficiently process even TB-scale data without high memory usage
+  // Process records sequentially to avoid memory spikes
   print(record);
 }
 ```
 
-## Primary Key Examples
 
-ToStore provides various distributed primary key algorithms for different scenarios:
+<a id="primary-key-examples"></a>
+## Primary Keys
+
+ToStore offers various distributed PK algorithms for diverse scenarios:
 
 - **Sequential** (PrimaryKeyType.sequential): 238978991
 - **Timestamp-Based** (PrimaryKeyType.timestampBased): 1306866018836946
@@ -638,7 +730,7 @@ ToStore provides various distributed primary key algorithms for different scenar
 - **Short Code** (PrimaryKeyType.shortCode): 9eXrF0qeXZ
 
 ```dart
-// Sequential Primary Key configuration example
+// Sequential PK Configuration Example
 await db.createTables([
   const TableSchema(
     name: 'users',
@@ -650,15 +742,16 @@ await db.createTables([
         useRandomIncrement: true, // Hide business volume
       ),
     ),
-    fields: [/* Field definitions */]
+    fields: [/* field definitions */]
   ),
 ]);
 ```
 
 
-## Expression Atomic Operations
+<a id="atomic-expressions"></a>
+## Atomic Expressions
 
-The expression system provides type-safe atomic field updates. All calculations are executed atomically at the database level to avoid concurrency conflicts:
+The expression system provides type-safe atomic field updates. All calculations are executed at the database level to prevent concurrency conflicts:
 
 ```dart
 // Simple Increment: balance = balance + 100
@@ -668,222 +761,234 @@ await db.update('accounts', {
 
 // Complex Calculation: total = price * quantity + tax
 await db.update('orders', {
-  'total': Expr.field('price') * Expr.field('quantity') + Expr.field('tax'),
+  'total': (Expr.field('price') * Expr.field('quantity')) + Expr.field('tax'),
 }).where('id', '=', orderId);
 
-// Nested Parentheses: finalPrice = ((price * quantity) + tax) * (1 - discount)
+// Nested Parentheses
 await db.update('orders', {
   'finalPrice': ((Expr.field('price') * Expr.field('quantity')) + Expr.field('tax')) * 
                  (Expr.value(1) - Expr.field('discount')),
 }).where('id', '=', orderId);
 
-// Using Functions: price = min(price, maxPrice)
+// Functions: price = min(price, maxPrice)
 await db.update('products', {
   'price': Expr.min(Expr.field('price'), Expr.field('maxPrice')),
 }).where('id', '=', productId);
 
-// Timestamp: updatedAt = now()
+// Timestamp
 await db.update('users', {
   'updatedAt': Expr.now(),
 }).where('id', '=', userId);
 ```
 
-**Conditional expressions (e.g. for upsert)**: Use `Expr.isUpdate()` / `Expr.isInsert()` with `Expr.ifElse` or `Expr.when` so that expressions run only on update or only on insert:
+**Conditional Expressions (e.g., for Upserts)**: Use `Expr.isUpdate()` / `Expr.isInsert()` with `Expr.ifElse` or `Expr.when` to execution logic only during update or insert:
 
 ```dart
-// Upsert: increment on update, set to 1 on insert (insert branch uses plain value; only update evaluates expression)
+// Upsert: Increment on update, set to 1 on insert
 await db.upsert('counters', {
   'key': 'visits',
   'count': Expr.ifElse(
     Expr.isUpdate(),
     Expr.field('count') + Expr.value(1),
-    1,  // insert branch: plain value, not evaluated by insert
+    1, // insert branch: literal value, ignored by evaluation
   ),
 });
 
-// Same with Expr.when (single-branch, otherwise defaults to null)
+// Using Expr.when
 await db.upsert('orders', {
   'id': orderId,
   'updatedAt': Expr.when(Expr.isUpdate(), Expr.now(), otherwise: Expr.now()),
 });
 ```
 
+
+<a id="transactions"></a>
 ## Transactions
 
-Transactions ensure the atomicity of multiple operations—either all succeed or all roll back, guaranteeing data consistency.
+Transactions ensure atomicity—either all operations succeed or all roll back, maintaining absolute consistency.
 
 **Transaction Features**:
-- Atomic execution of multiple operations.
-- Automatic recovery of unfinished operations after a crash.
-- Data is safely saved upon successful commit.
+- Atomic commit of multi-step operations.
+- Automatic recovery of unfinished tasks after a crash.
+- Data is safely persisted upon successful commit.
 
 ```dart
-// Basic Transaction - Atomic commit of multiple operations
+// Basic Transaction
 final txResult = await db.transaction(() async {
-  // Insert User
+  // Insert user
   await db.insert('users', {
     'username': 'john',
     'email': 'john@example.com',
     'fans': 100,
   });
   
-  // Atomic update using expressions
+  // Atomic update via expression
   await db.update('users', {
     'fans': Expr.field('fans') + Expr.value(50),
   }).where('username', '=', 'john');
   
-  // If any operation fails, all changes roll back automatically.
+  // Any failure here triggers an automatic rollback of all changes.
 });
 
 if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+  print('Transaction committed');
 } else {
   print('Transaction rolled back: ${txResult.error?.message}');
 }
 
-// Automatic rollback on error
+// Auto-rollback on exception
 final txResult2 = await db.transaction(() async {
   await db.insert('users', {
     'username': 'jane',
     'email': 'jane@example.com',
   });
-  throw Exception('Business logic error'); // Triggers rollback
+  throw Exception('Business Failure'); 
 }, rollbackOnError: true);
 ```
 
-### Pure Memory Mode
 
-For scenarios like data caching, temporary computation, or diskless environments without persisting to disk, you can initialize a pure in-memory database using ToStore.memory(). In this mode, all data (including schemas, indexes, and key-value pairs) is kept strictly in memory.
+<a id="error-handling"></a>
+### Error Handling
+
+ToStore uses a unified response model for data operations:
+- `ResultType`: A stable status enum for branch logic.
+- `result.code`: Numeric code corresponding to the `ResultType`.
+- `result.message`: Readable description of the error.
+- `successKeys` / `failedKeys`: Lists of primary keys for bulk operations.
 
 ```dart
-// Initialize database in pure memory mode
-final db = await ToStore.memory(
-  schemas: [],
-);
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
 
-// All operations (CRUD and search) are instantly executed in memory
-await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
-
-// Note: Data created in memory mode is completely lost upon application closure or restart.
+if (!result.isSuccess) {
+  switch (result.type) {
+    case ResultType.notFound:
+      print('Resource not found: ${result.message}');
+      break;
+    case ResultType.notNullViolation:
+    case ResultType.validationFailed:
+      print('Validation failed: ${result.message}');
+      break;
+    case ResultType.uniqueViolation:
+      print('Conflict: ${result.message}');
+      break;
+    default:
+      print('Code: ${result.code}, Message: ${result.message}');
+  }
+}
 ```
 
-## Security Configuration
+**Common Status Codes**:
+Success is 0; negative values represent errors.
+- `ResultType.success` (0)
+- `ResultType.partialSuccess` (1)
+- `ResultType.uniqueViolation` (-2)
+- `ResultType.primaryKeyViolation` (-3)
+- `ResultType.foreignKeyViolation` (-4)
+- `ResultType.notNullViolation` (-5)
+- `ResultType.validationFailed` (-6)
+- `ResultType.notFound` (-11)
+- `ResultType.resourceExhausted` (-15)
 
-**Data Security Mechanisms**:
-- Dual protection mechanisms ensure data is never lost.
-- Automatic crash recovery of unfinished operations.
-- Instant safe persistence upon operation success.
-- High-strength encryption protects sensitive data.
+
+### Pure Memory Mode
+
+For data caching or diskless environments, use `ToStore.memory()`. All data (schemas, indexes, KV) is kept strictly in RAM.
+
+**Note**: Data is lost upon application closure or restart.
+
+```dart
+// Initialize in-memory database
+final db = await ToStore.memory(schemas: []);
+
+// All operations are near-instant
+await db.insert('temp_cache', {'key': 'session_1', 'value': 'admin'});
+```
+
+
+<a id="security-config"></a>
+## Security Config
 
 > [!WARNING]
-> **Key Management**: **`encodingKey`** can be changed freely; the engine will automatically migrate data when it changes, so you need not worry about data loss. **`encryptionKey`** must not be changed arbitrarily—changing it will make old data unreadable unless a migration is performed. Do not hardcode sensitive keys; fetch them from a secure server.
+> **Key Management**: **`encodingKey`** can be changed; the engine will auto-migrate data. **`encryptionKey`** is critical; changing it makes old data unreadable without migration. Never hardcode sensitive keys.
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
-      // Algorithms supported: none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      // Supported: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305, 
       
-      // Encoding Key (can be changed freely; data will be auto-migrated)
+      // Encoding Key (flexible; auto-migrates data)
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
       
-      // Encryption Key for critical data (do not change arbitrarily; old data becomes unreadable unless migrated)
+      // Encryption Key (Critical; do not change without migration)
       encryptionKey: 'Your-Secure-Encryption-Key...',
       
       // Device Binding (Path-based)
-      // When enabled, keys are bound to path and device characteristics.
-      // Boosts security against database file copying but data retrieval 
-      // depends on app installation path and device persistence.
+      // Binds keys to the DB path and device characteristics. 
+      // Prevents decryption if the DB file is moved.
       deviceBinding: false, 
     ),
-    // Write-Ahead Logging (WAL) enabled by default
-    enableJournal: true, 
-    // Force disk flush on commit for maximum durability (set to false for performance)
-    persistRecoveryOnCommit: true,
+    enableJournal: true, // Write-Ahead Logging (WAL)
+    persistRecoveryOnCommit: true, // Force flush on commit
   ),
 );
 ```
 
-### Value-level encryption (ToCrypto)
+### Field-level Encryption (ToCrypto)
 
-Full-database encryption above encrypts all table and index data and can affect overall performance. To encrypt only sensitive fields, use **ToCrypto**: it is independent of the database (no db instance required). You encode or decode values yourself before writing or after reading; the key is managed entirely by your app. Output is Base64, suitable for JSON or TEXT columns.
-
-- **key** (required): `String` or `Uint8List`. If not 32 bytes, a 32-byte key is derived via SHA-256.
-- **type** (optional): Encryption type, [ToCryptoType]: [ToCryptoType.chacha20Poly1305] or [ToCryptoType.aes256Gcm]. Default [ToCryptoType.chacha20Poly1305]. Omit for default.
-- **aad** (optional): Additional Authenticated Data — `Uint8List`. If you pass it at encode, you must pass the same bytes at decode (e.g. table name + field name for context binding). Omit for simple use.
+Full database encryption can impact performance. For specific sensitive fields, use **ToCrypto**: a standalone utility (no DB instance required) to encode/decode values with Base64 output, ideal for JSON or TEXT columns.
 
 ```dart
-
 const key = 'my-secret-key';
-// Encode: plain → Base64 cipher (store in DB or JSON)
+// Encode: Plain text -> Base64 ciphertext
 final cipher = ToCrypto.encode('sensitive data', key: key);
-// Decode when reading
+// Decode
 final plain = ToCrypto.decode(cipher, key: key);
 
-// Optional: bind cipher to context with aad (same aad at encode and decode)
+// Optional: Bind context with AAD (must match during decode)
 final aad = Uint8List.fromList(utf8.encode('users:id_number'));
 final cipher2 = ToCrypto.encode('secret', key: key, aad: aad);
 final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
-## Performance & Experience
 
-### Performance Specs
+<a id="performance"></a>
+## Performance
 
-- **Startup Speed**: Instant startup and data display even with 100M+ records on average smartphones.
-- **Query Performance**: Scale-independent, consistently blazing-fast retrieval at any data volume.
-- **Data Safety**: ACID transaction guarantees + crash recovery for zero data loss.
+### Best Practices
+- 📱 **Example Project**: See the `example` directory for a full Flutter app.
+- 🚀 **Production**: Performance in Release mode significantly outperforms Debug mode.
+- ✅ **Standardized**: All core features are covered by comprehensive testing suites.
 
-### Recommendations
-
-- 📱 **Example Project**: A complete Flutter app example is provided in the `example` directory.
-- 🚀 **Production**: Use Release mode for performance far exceeding Debug mode.
-- ✅ **Standard Tests**: All core functionalities have passed standard integration tests.
-
-### Demo Videos
+### Benchmarks
 
 <p align="center">
-  <img src="doc/media/basic-demo.gif" alt="ToStore basic performance demo" width="320" />
-  </p>
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore Performance Demo" width="320" />
+</p>
 
-- **Basic performance demo** (<a href="doc/media/basic-demo.mp4?raw=1" target="_blank" rel="noopener">basic-demo.mp4</a>): GIF preview may be cropped; click the video to view the full demo. Shows that even on an ordinary mobile device with 100M+ records, startup, paging, and search performance remain stable and smooth. As long as storage is sufficient, edge devices can sustain TB/PB-scale datasets while keeping interactive latency consistently low.
+- **Performance Showcase**: Even with 100M+ records, startup, scrolling, and retrieval remain smooth on standard mobile devices. (See [Video](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4))
 
 <p align="center">
-  <img src="doc/media/disaster-recovery.gif" alt="ToStore disaster recovery stress test" width="320" />
-  </p>
+  <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.gif" alt="ToStore Disaster Recovery" width="320" />
+</p>
 
-- **Disaster recovery stress test** (<a href="doc/media/disaster-recovery.mp4?raw=1" target="_blank" rel="noopener">disaster-recovery.mp4</a>): Intentionally kills the process during intensive write workloads to simulate crashes and power failures. Even when tens of thousands of operations are interrupted, ToStore recovers extremely fast on a typical phone and does not impact startup or data availability.
-
-
+- **Disaster Recovery**: ToStore quickly self-recovers even if power is cut or the process is killed during high-frequency writes. (See [Video](https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4))
 
 
-If ToStore helps you, please give us a ⭐️
+If ToStore helps you, please give us a ⭐️! It is the greatest support for open source.
+
+---
+
+> **Recommendation**: Consider using the [ToApp Framework](https://github.com/tocreator/toapp) for frontend development. It provides a full-stack solution that automates data requests, loading, storage, caching, and state management.
 
 
-
-
-## Roadmap
-
-ToStore is actively developing features to further enhance AI-era data infrastructure:
-
-- **High-Dimensional Vectors**: Adding vector retrieval and semantic search algorithms.
-- **Multi-modal Data**: Providing end-to-end processing from raw data to feature vectors.
-- **Graph Data Structures**: Supporting efficient storage and querying of knowledge graphs and complex relational networks.
-
-
-
-
-
-> **Recommendation**: Mobile developers might also consider the [Toway Framework](https://github.com/tocreator/toway), a full-stack solution that automates data requests, loading, storage, caching, and display.
-
-
-
-
+<a id="more-resources"></a>
 ## More Resources
 
 - 📖 **Documentation**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Feedback**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Discussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
-
-
