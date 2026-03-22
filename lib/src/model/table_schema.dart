@@ -894,7 +894,14 @@ class TableSchema {
   ) {
     if (fields.isEmpty) return null;
     if (fields.length == 1) return record[fields[0]];
-    return fields.map((f) => record[f]).toList();
+    final values = <dynamic>[];
+    for (final field in fields) {
+      if (!record.containsKey(field)) return null;
+      final value = record[field];
+      if (value == null) return null;
+      values.add(value);
+    }
+    return values;
   }
 
   /// Check if primary key is ordered type

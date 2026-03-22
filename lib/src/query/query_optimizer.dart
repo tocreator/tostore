@@ -289,6 +289,53 @@ class QueryOptimizer {
       return false;
     }
 
+    ({int matchedFields, int equalityPrefix, bool hasRange, bool fullEquality})
+        analyzeIndexMatch(IndexSchema idx) {
+      int matchedFields = 0;
+      int equalityPrefix = 0;
+      bool hasRange = false;
+      bool fullEquality = true;
+
+      for (final field in idx.fields) {
+        if (!tableWhere.containsKey(field)) {
+          fullEquality = false;
+          break;
+        }
+
+        final cond = tableWhere[field];
+        if (isEqualityOrIn(cond)) {
+          matchedFields++;
+          if (isEqualityOnly(cond)) {
+            equalityPrefix++;
+            continue;
+          }
+          fullEquality = false;
+          break;
+        }
+
+        if (isRangeOrPrefixLike(cond)) {
+          matchedFields++;
+          hasRange = true;
+          fullEquality = false;
+          break;
+        }
+
+        fullEquality = false;
+        break;
+      }
+
+      if (matchedFields != idx.fields.length) {
+        fullEquality = false;
+      }
+
+      return (
+        matchedFields: matchedFields,
+        equalityPrefix: equalityPrefix,
+        hasRange: hasRange,
+        fullEquality: fullEquality,
+      );
+    }
+
     // Priority 1: Primary key '=' / IN (fastest and most selective).
     if (tableWhere.containsKey(schema.primaryKey) &&
         isEqualityOrIn(tableWhere[schema.primaryKey])) {
@@ -309,19 +356,14 @@ class QueryOptimizer {
         _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
     for (final idx in allIndexes) {
       if (!idx.unique) continue;
-      bool ok = true;
-      if (idx.fields.length == 1) {
-        final f = idx.fields.first;
-        ok = tableWhere.containsKey(f) && isEqualityOrIn(tableWhere[f]);
-      } else {
-        for (final f in idx.fields) {
-          if (!tableWhere.containsKey(f) || !isEqualityOnly(tableWhere[f])) {
-            ok = false;
-            break;
-          }
-        }
+      final match = analyzeIndexMatch(idx);
+      final bool ok = idx.fields.length == 1
+          ? (match.matchedFields == 1 &&
+              isEqualityOrIn(tableWhere[idx.fields.first]))
+          : match.fullEquality;
+      if (!ok) {
+        continue;
       }
-      if (!ok) continue;
       bestUniqueEq = idx;
       break;
     }
@@ -340,19 +382,14 @@ class QueryOptimizer {
     IndexSchema? bestIndex;
     int bestScore = 0;
     for (final idx in allIndexes) {
-      int matched = 0;
-      for (final f in idx.fields) {
-        if (!tableWhere.containsKey(f)) break;
-        final v = tableWhere[f];
-        if (!isEqualityOrIn(v) && !isRangeOrPrefixLike(v)) break;
-        matched++;
-      }
-      if (matched <= 0) continue;
-      // Composite indexes must be fully matched until tuple-prefix encoding exists.
-      if (idx.fields.length > 1 && matched != idx.fields.length) {
+      final match = analyzeIndexMatch(idx);
+      if (match.matchedFields <= 0) {
         continue;
       }
-      final score = matched * 10 + (idx.unique ? 3 : 0);
+      final score = match.equalityPrefix * 12 +
+          (match.hasRange ? 3 : 0) +
+          ((match.matchedFields - match.equalityPrefix) * 2) +
+          (idx.unique ? 3 : 0);
       if (score > bestScore) {
         bestScore = score;
         bestIndex = idx;

@@ -35,7 +35,7 @@
 - [Why ToStore?](#why-tostore) | [Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start)
 - [Schema Definition](#schema-definition) | [Mobile/Desktop Integration](#mobile-integration) | [Server-side Integration](#server-integration)
 - [Vectors & ANN Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Query & Pagination](#query-pagination) | [Foreign Keys](#foreign-keys) | [Query Operators](#query-operators)
-- [Distributed Architecture](#distributed-architecture) | [Primary Keys](#primary-key-examples) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions) | [Error Handling](#error-handling)
+- [Distributed Architecture](#distributed-architecture) | [Primary Keys](#primary-key-examples) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions) | [Error Handling](#error-handling) | [Log Callback and Database Diagnostics](#logging-diagnostics)
 - [Security Config](#security-config) | [Performance](#performance) | [More Resources](#more-resources)
 
 
@@ -891,6 +891,32 @@ Success is 0; negative values represent errors.
 - `ResultType.validationFailed` (-6)
 - `ResultType.notFound` (-11)
 - `ResultType.resourceExhausted` (-15)
+
+
+<a id="logging-diagnostics"></a>
+### Log Callback and Database Diagnostics
+
+ToStore can use `LogConfig.setConfig(...)` to route startup, recovery, automatic migration, and runtime constraint-conflict logs back to the application layer.
+
+- `onLogHandler` receives all logs filtered by the current `enableLog` and `logLevel`.
+- Call `LogConfig.setConfig(...)` before initialization so logs from initialization and automatic migration can also be captured.
+
+```dart
+  // Configure log parameters or callback
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // In production, warn/error can be reported to your backend or logging platform
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
+```
 
 
 ### Pure Memory Mode

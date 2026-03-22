@@ -1153,7 +1153,8 @@ class MigrationManager {
         if (_isIndexModified(matchedOldIndex, newIndex)) {
           operations.add(MigrationOperation(
             type: MigrationType.modifyIndex,
-            indexName: newIndex.indexName,
+            indexName: matchedOldIndex.actualIndexName,
+            index: newIndex,
             fields: newIndex.fields,
             unique: newIndex.unique,
           ));
@@ -1185,27 +1186,31 @@ class MigrationManager {
     if (a.indexName != null && b.indexName != null) {
       return a.indexName == b.indexName;
     }
-    // if no indexName, compare field list
-    return _areFieldListsEqual(a.fields, b.fields);
+    return _areIndexFieldsEqual(a.fields, b.fields);
   }
 
-  /// Compare two field lists ignoring order
-  bool _areFieldListsEqual(List<String> a, List<String> b) {
+  /// Compare two index field lists with order preserved.
+  bool _areIndexFieldsEqual(List<String> a, List<String> b) {
     if (a.length != b.length) return false;
-    final setA = Set<String>.from(a);
-    final setB = Set<String>.from(b);
-    return setA.difference(setB).isEmpty;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  bool _areFieldListsEqual(List<String> a, List<String> b) {
+    return _areIndexFieldsEqual(a, b);
   }
 
   /// Check if index is modified
   bool _isIndexModified(IndexSchema oldIndex, IndexSchema newIndex) {
-    if (oldIndex.indexName != null && newIndex.indexName != null) {
-      if (oldIndex.indexName != newIndex.indexName) {
-        return true;
-      }
+    if ((oldIndex.indexName ?? '') != (newIndex.indexName ?? '')) {
+      return true;
     }
     return oldIndex.unique != newIndex.unique ||
-        !_areFieldListsEqual(oldIndex.fields, newIndex.fields);
+        oldIndex.type != newIndex.type ||
+        oldIndex.vectorConfig != newIndex.vectorConfig ||
+        !_areIndexFieldsEqual(oldIndex.fields, newIndex.fields);
   }
 
   /// Compare foreign keys and generate operations
@@ -1960,12 +1965,12 @@ class MigrationManager {
           } else if (operation.type == MigrationType.modifyIndex) {
             await migrationInstance.indexManager?.modifyIndex(
               currentTableName,
-              operation.indexName ?? operation.fields!.join('_'),
-              IndexSchema(
-                indexName: operation.indexName,
-                fields: operation.fields!,
-                unique: operation.unique ?? false,
-              ),
+              operation.indexName ?? operation.index?.actualIndexName ?? '',
+              operation.index ??
+                  IndexSchema(
+                    fields: operation.fields!,
+                    unique: operation.unique ?? false,
+                  ),
             );
           } else if (operation.type == MigrationType.setTableTtlConfig) {
             await migrationInstance.setTableTtlConfig(

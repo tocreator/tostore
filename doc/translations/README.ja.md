@@ -35,7 +35,7 @@
 - [なぜToStoreなのか？](#why-tostore) | [主な機能](#key-features) | [インストール](#installation) | [クイックスタート](#quick-start)
 - [スキーマ定義](#schema-definition) | [モバイル/デスクトップ統合](#mobile-integration) | [サーバー側統合](#server-integration)
 - [ベクトルとANN検索](#vector-advanced) | [テーブルレベルTTL](#ttl-config) | [クエリとページネーション](#query-pagination) | [外部キー](#foreign-keys) | [クエリ演算子](#query-operators)
-- [分散アーキテクチャ](#distributed-architecture) | [主キーの例](#primary-key-examples) | [アトミックな式操作](#atomic-expressions) | [トランザクション](#transactions) | [エラー処理](#error-handling)
+- [分散アーキテクチャ](#distributed-architecture) | [主キーの例](#primary-key-examples) | [アトミックな式操作](#atomic-expressions) | [トランザクション](#transactions) | [エラー処理](#error-handling) | [ログコールバックとデータベース診断](#logging-diagnostics)
 - [セキュリティ構成](#security-config) | [パフォーマンス](#performance) | [リソース](#more-resources)
 
 
@@ -891,6 +891,32 @@ if (!result.isSuccess) {
 - `ResultType.validationFailed` (-6)
 - `ResultType.notFound` (-11)
 - `ResultType.resourceExhausted` (-15)
+
+
+<a id="logging-diagnostics"></a>
+### ログコールバックとデータベース診断
+
+ToStore は `LogConfig.setConfig(...)` を通じて、起動、復旧、自動移行、実行時の制約競合ログをアプリケーション層へまとめて返せます。
+
+- `onLogHandler` は、現在の `enableLog` と `logLevel` でフィルタされたすべてのログを受け取ります。
+- 初期化前に `LogConfig.setConfig(...)` を呼び出すことで、初期化および自動移行時のログも取得できます。
+
+```dart
+  // ログパラメータまたはコールバックを設定
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // 本番環境では warn/error をバックエンドやログ基盤へ報告できます
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
+```
 
 
 ### 純メモリモード

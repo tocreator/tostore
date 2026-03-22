@@ -35,7 +35,7 @@
 - [Neden ToStore?](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum](#installation) | [Hızlı Başlangıç](#quick-start)
 - [Şema Tanımlama](#schema-definition) | [Mobil/Masaüstü Entegrasyonu](#mobile-integration) | [Sunucu Tarafı Entegrasyonu](#server-integration)
 - [Vektör ve ANN Arama](#vector-advanced) | [Tablo Düzeyinde TTL](#ttl-config) | [Sorgu ve Sayfalama](#query-pagination) | [Yabancı Anahtarlar](#foreign-keys) | [Sorgu İşleçleri](#query-operators)
-- [Dağıtık Mimari](#distributed-architecture) | [Birincil Anahtar Örnekleri](#primary-key-examples) | [Atomik İfade İşlemleri](#atomic-expressions) | [İşlemler (Transactions)](#transactions) | [Hata Yönetimi](#error-handling)
+- [Dağıtık Mimari](#distributed-architecture) | [Birincil Anahtar Örnekleri](#primary-key-examples) | [Atomik İfade İşlemleri](#atomic-expressions) | [İşlemler (Transactions)](#transactions) | [Hata Yönetimi](#error-handling) | [Log geri çağrısı ve veritabanı tanısı](#logging-diagnostics)
 - [Güvenlik Yapılandırması](#security-config) | [Performans](#performance) | [Kaynaklar](#more-resources)
 
 
@@ -456,6 +456,32 @@ final txResult = await db.transaction(() async {
   await db.insert('users', {...});
   await db.update('users', {...});
 });
+```
+
+
+<a id="logging-diagnostics"></a>
+### Log geri çağrısı ve veritabanı tanısı
+
+ToStore, `LogConfig.setConfig(...)` aracılığıyla başlangıç, kurtarma, otomatik geçiş ve çalışma zamanındaki kısıt çakışması loglarını uygulama katmanına topluca geri iletebilir.
+
+- `onLogHandler`, geçerli `enableLog` ve `logLevel` ile filtrelenen tüm logları alır.
+- Başlatma ve otomatik geçiş aşamasındaki logların da yakalanabilmesi için `LogConfig.setConfig(...)` çağrısını ilklendirmeden önce yapın.
+
+```dart
+  // Log parametrelerini veya callback'i yapılandır
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // Üretim ortamında warn/error backend'e veya log platformuna bildirilebilir
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
 ```
 
 

@@ -54,13 +54,19 @@ class VectorIndexManager {
     List<Map<String, dynamic>> deletes = const [],
     BatchContext? batchContext,
     int? concurrency,
+    TableSchema? schemaOverride,
+    List<IndexSchema>? targetIndexesOverride,
   }) async {
-    final vectorIndexes =
-        await _dataStore.schemaManager?.getVectorIndexesForTable(tableName);
-    if (vectorIndexes == null || vectorIndexes.isEmpty) return;
-
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = schemaOverride ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
+
+    final vectorIndexes = List<IndexSchema>.from(
+      targetIndexesOverride?.where((index) => index.type == IndexType.vector) ??
+          (_dataStore.schemaManager?.getVectorIndexesFor(schema) ??
+              const <IndexSchema>[]),
+    );
+    if (vectorIndexes.isEmpty) return;
     final pkName = schema.primaryKey;
 
     final yc = YieldController(

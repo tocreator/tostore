@@ -38,7 +38,7 @@
 - [为什么选择 ToStore？](#why-tostore) | [ToStore特性](#key-features) | [安装](#installation) | [快速开始](#quick-start)
 - [表结构定义](#schema-definition) | [移动、桌面等频繁启动场景集成](#mobile-integration) | [服务端集成](#server-integration)
 - [向量字段、向量索引与向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [查询与高效分页](#query-pagination) | [外键与级联约束](#foreign-keys) | [查询操作符](#query-operators)
-- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [错误码与错误处理](#error-handling)
+- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [错误码与错误处理](#error-handling) | [日志回调与数据库诊断](#logging-diagnostics) 
 - [安全配置](#security-config) | [性能与体验](#performance) | [更多资源](#more-resources)
 
 
@@ -958,6 +958,31 @@ if (txResult.isFailed) {
 - `TransactionErrorType.unknown`：其他异常
 
 
+<a id="logging-diagnostics"></a>
+### 日志回调与数据库诊断
+
+ToStore 可以通过 `LogConfig.setConfig(...)` 把启动、恢复、自动迁移、运行时约束冲突等日志统一回调给业务层。
+
+- `onLogHandler` 会收到所有通过当前 `enableLog` 与 `logLevel` 过滤后的日志。
+- 请在初始化之前调用 `LogConfig.setConfig(...)`，这样初始化和自动迁移阶段的日志也能被捕获。
+
+```dart
+  // 配置日志参数或回调
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // 生产环境可以将 warn/error上报后端或日志平台
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
+```
+
 
 
 ### 纯内存模式 (Memory Mode)
@@ -976,6 +1001,7 @@ final db = await ToStore.memory(
 await db.insert('temp_cache', {'key': 'session_1', 'value': {'user': 'admin'}});
 
 ```
+
 
 
 <a id="security-config"></a>

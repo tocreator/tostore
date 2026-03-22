@@ -35,7 +35,7 @@
 - [왜 ToStore인가?](#why-tostore) | [주요 기능](#key-features) | [설치](#installation) | [빠른 시작](#quick-start)
 - [스키마 정의](#schema-definition) | [모바일/데스크톱 통합](#mobile-integration) | [서버 사이드 통합](#server-integration)
 - [벡터 및 ANN 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [쿼리 및 페이지네이션](#query-pagination) | [외래 키](#foreign-keys) | [쿼리 연산자](#query-operators)
-- [분산 아키텍처](#distributed-architecture) | [기본 키 예시](#primary-key-examples) | [원자적 표현식 작업](#atomic-expressions) | [트랜잭션](#transactions) | [오류 처리](#error-handling)
+- [분산 아키텍처](#distributed-architecture) | [기본 키 예시](#primary-key-examples) | [원자적 표현식 작업](#atomic-expressions) | [트랜잭션](#transactions) | [오류 처리](#error-handling) | [로그 콜백과 데이터베이스 진단](#logging-diagnostics)
 - [보안 구성](#security-config) | [성능](#performance) | [추가 리소스](#more-resources)
 
 
@@ -891,6 +891,32 @@ if (!result.isSuccess) {
 - `ResultType.validationFailed` (-6)
 - `ResultType.notFound` (-11)
 - `ResultType.resourceExhausted` (-15)
+
+
+<a id="logging-diagnostics"></a>
+### 로그 콜백과 데이터베이스 진단
+
+ToStore 는 `LogConfig.setConfig(...)` 를 통해 시작, 복구, 자동 마이그레이션, 런타임 제약 충돌 로그를 애플리케이션 계층으로 일괄 전달할 수 있습니다.
+
+- `onLogHandler` 는 현재 `enableLog`, `logLevel` 로 필터링된 모든 로그를 받습니다.
+- 초기화 전에 `LogConfig.setConfig(...)` 를 호출하면 초기화 및 자동 마이그레이션 단계의 로그도 함께 수집할 수 있습니다.
+
+```dart
+  // 로그 파라미터 또는 콜백 설정
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // 운영 환경에서는 warn/error 를 백엔드 또는 로그 플랫폼으로 보고할 수 있습니다
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
+```
 
 
 ### 순수 메모리 모드

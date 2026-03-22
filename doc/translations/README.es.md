@@ -35,7 +35,7 @@
 - [¿Por qué ToStore?](#why-tostore) | [Características](#key-features) | [Instalación](#installation) | [Inicio Rápido](#quick-start)
 - [Definición de Esquema](#schema-definition) | [Integración Móvil/Escritorio](#mobile-integration) | [Integración Servidor](#server-integration)
 - [Vectores y Búsqueda ANN](#vector-advanced) | [TTL a Nivel de Tabla](#ttl-config) | [Consulta y Paginación](#query-pagination) | [Claves Foráneas](#foreign-keys) | [Operadores de Consulta](#query-operators)
-- [Arquitectura Distribuida](#distributed-architecture) | [Ejemplos de Claves Primarias](#primary-key-examples) | [Operaciones Atómicas](#atomic-expressions) | [Transacciones](#transactions) | [Manejo de Errores](#error-handling)
+- [Arquitectura Distribuida](#distributed-architecture) | [Ejemplos de Claves Primarias](#primary-key-examples) | [Operaciones Atómicas](#atomic-expressions) | [Transacciones](#transactions) | [Manejo de Errores](#error-handling) | [Callback de Logs y Diagnóstico de Base de Datos](#logging-diagnostics)
 - [Configuración de Seguridad](#security-config) | [Rendimiento](#performance) | [Más Recursos](#more-resources)
 
 
@@ -891,6 +891,32 @@ if (!result.isSuccess) {
 - `ResultType.validationFailed` (-6)
 - `ResultType.notFound` (-11)
 - `ResultType.resourceExhausted` (-15)
+
+
+<a id="logging-diagnostics"></a>
+### Callback de Logs y Diagnóstico de Base de Datos
+
+ToStore puede usar `LogConfig.setConfig(...)` para devolver a la capa de aplicación los logs de inicio, recuperación, migración automática y conflictos de restricciones en tiempo de ejecución.
+
+- `onLogHandler` recibe todos los logs filtrados por el `enableLog` y `logLevel` actuales.
+- Llame a `LogConfig.setConfig(...)` antes de la inicialización para que también se capturen los logs de inicialización y migración automática.
+
+```dart
+  // Configurar parámetros o callback de logs
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // En producción, warn/error pueden reportarse al backend o a la plataforma de logs
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
+```
 
 
 ### Modo Memoria Pura

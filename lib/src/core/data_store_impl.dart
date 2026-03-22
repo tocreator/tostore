@@ -6026,12 +6026,21 @@ class DataStoreImpl {
       return;
     }
 
-    // Delete all indexes that include this field
-    await indexManager?.removeIndex(tableName, fields: [fieldName]);
+    final indexesToRemove = schema
+        .getAllIndexes()
+        .where((index) => index.fields.contains(fieldName))
+        .toList(growable: false);
+    for (final index in indexesToRemove) {
+      await indexManager?.removeIndex(tableName,
+          indexName: index.actualIndexName);
+    }
 
     // Remove field from schema
     final newFields = schema.fields.where((f) => f.name != fieldName).toList();
-    final newSchema = schema.copyWith(fields: newFields);
+    final newIndexes = schema.indexes
+        .where((index) => !index.fields.contains(fieldName))
+        .toList(growable: false);
+    final newSchema = schema.copyWith(fields: newFields, indexes: newIndexes);
 
     // Update schema file
     await schemaManager?.saveTableSchema(tableName, newSchema);
@@ -6060,7 +6069,15 @@ class DataStoreImpl {
       }
       fields[oldFieldIndex] = fields[oldFieldIndex].copyWith(name: newName);
 
-      final newSchema = schema.copyWith(fields: fields);
+      final indexes = schema.indexes
+          .map((index) => index.copyWith(
+                fields: index.fields
+                    .map((field) => field == oldName ? newName : field)
+                    .toList(growable: false),
+              ))
+          .toList(growable: false);
+
+      final newSchema = schema.copyWith(fields: fields, indexes: indexes);
       await schemaManager?.saveTableSchema(tableName, newSchema);
     } catch (e) {
       Logger.error(

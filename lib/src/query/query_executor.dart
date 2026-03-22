@@ -1663,6 +1663,143 @@ class QueryExecutor {
     }
   }
 
+  bool _isPrefixLikePattern(String pattern) {
+    if (pattern.isEmpty || !pattern.endsWith('%')) {
+      return false;
+    }
+    if (pattern.startsWith('%') || pattern.startsWith('_')) {
+      return false;
+    }
+    final wildcardIndex = pattern.indexOf('%');
+    return wildcardIndex == pattern.length - 1 && !pattern.contains('_');
+  }
+
+  IndexFieldCondition? _parseIndexFieldCondition(String field, dynamic raw) {
+    if (raw == null) return null;
+
+    if (raw is! Map<String, dynamic>) {
+      return IndexFieldCondition(field: field, operator: '=', value: raw);
+    }
+
+    if (raw.containsKey('=')) {
+      return IndexFieldCondition(field: field, operator: '=', value: raw['=']);
+    }
+
+    if (raw.containsKey('IN')) {
+      final value = raw['IN'];
+      if (value is List && value.isNotEmpty) {
+        return IndexFieldCondition(field: field, operator: 'IN', value: value);
+      }
+      return null;
+    }
+
+    if (raw.containsKey('BETWEEN')) {
+      final value = raw['BETWEEN'];
+      if (value is List && value.length == 2) {
+        return IndexFieldCondition(
+          field: field,
+          operator: 'BETWEEN',
+          value: value[0],
+          endValue: value[1],
+        );
+      }
+      if (value is Map<String, dynamic>) {
+        return IndexFieldCondition(
+          field: field,
+          operator: 'BETWEEN',
+          value: value['start'],
+          endValue: value['end'],
+        );
+      }
+      return null;
+    }
+
+    for (final op in const ['>', '>=', '<', '<=']) {
+      if (raw.containsKey(op)) {
+        return IndexFieldCondition(field: field, operator: op, value: raw[op]);
+      }
+    }
+
+    final likePattern = raw['LIKE'] ?? raw['like'];
+    if (likePattern is String && _isPrefixLikePattern(likePattern)) {
+      return IndexFieldCondition(
+        field: field,
+        operator: 'LIKE',
+        value: likePattern,
+      );
+    }
+
+    return null;
+  }
+
+  IndexCondition? _buildIndexConditionForSchema(
+    IndexSchema? indexSchema,
+    String actualIndexName,
+    Map<String, dynamic> conditions,
+  ) {
+    if (indexSchema == null || indexSchema.fields.isEmpty) {
+      if (actualIndexName.startsWith('uniq_') && actualIndexName.length > 5) {
+        final fieldName = actualIndexName.substring(5);
+        if (!conditions.containsKey(fieldName)) return null;
+        final raw = conditions[fieldName];
+        if (raw is Map<String, dynamic>) {
+          final likePattern = raw['LIKE'] ?? raw['like'];
+          if (likePattern is String) {
+            return IndexCondition.like(likePattern);
+          }
+          return IndexCondition.fromMap(raw);
+        }
+        return IndexCondition.equals(raw);
+      }
+      return null;
+    }
+
+    if (indexSchema.fields.length == 1) {
+      final fieldName = indexSchema.fields.first;
+      if (!conditions.containsKey(fieldName)) return null;
+      final raw = conditions[fieldName];
+      if (raw is Map<String, dynamic>) {
+        final likePattern = raw['LIKE'] ?? raw['like'];
+        if (likePattern is String) {
+          return IndexCondition.like(likePattern);
+        }
+        return IndexCondition.fromMap(raw);
+      }
+      return IndexCondition.equals(raw);
+    }
+
+    final components = <IndexFieldCondition>[];
+    for (final field in indexSchema.fields) {
+      if (!conditions.containsKey(field)) {
+        break;
+      }
+      final parsed = _parseIndexFieldCondition(field, conditions[field]);
+      if (parsed == null) {
+        break;
+      }
+      components.add(parsed);
+
+      final op = parsed.operator.toUpperCase();
+      if (op != '=') {
+        break;
+      }
+    }
+
+    if (components.isEmpty) {
+      return null;
+    }
+
+    final allEquality = components.length == indexSchema.fields.length &&
+        components.every((c) => c.operator.toUpperCase() == '=');
+    if (allEquality) {
+      return IndexCondition.equals(
+        components.map((c) => c.value).toList(growable: false),
+      );
+    }
+
+    return IndexCondition.composite(components);
+  }
+
   /// perform index scan
   Future<TableScanResult> _performIndexScan(
     String tableName,
@@ -1688,9 +1825,6 @@ class QueryExecutor {
       // Index name used by storage is already the actual index name.
       final String actualIndexName = indexName;
 
-      // get search value
-      dynamic searchValue;
-      String? fieldName;
       IndexSchema? indexSchema;
       try {
         final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
@@ -1701,48 +1835,23 @@ class QueryExecutor {
       } catch (_) {
         indexSchema = null;
       }
-      if (indexSchema != null && indexSchema.fields.isNotEmpty) {
-        fieldName = indexSchema.fields.first;
-      } else if (actualIndexName.startsWith('uniq_')) {
-        fieldName = actualIndexName.substring(5);
-      } else if (conditions.isNotEmpty) {
-        fieldName = conditions.keys.first;
-      }
-      if (fieldName != null) {
-        searchValue = conditions[fieldName];
-      }
-      IndexCondition indexCondition;
-      if (searchValue == null) {
-        if (indexSchema != null) {
-          // Full index scan required (e.g. for orderBy optimization)
-          indexCondition = IndexCondition.fromMap({'SCAN': true});
-        } else {
-          // Fallback to table scan if the condition value for the index is not provided.
-          return await _performTableScan(tableName, matcher,
-              limit: limit,
-              offset: offset,
-              orderBy: orderBy,
-              filter: filter,
-              onlyCount: onlyCount,
-              aggregations: aggregations,
-              groupBy: groupBy);
-        }
-      } else {
-        final indexConditionValue =
-            fieldName != null ? conditions[fieldName] : searchValue;
-        if (indexConditionValue is Map<String, dynamic>) {
-          // Prefer explicit LIKE so prefix pattern uses index range scan (not full scan).
-          final likePattern =
-              indexConditionValue['LIKE'] ?? indexConditionValue['like'];
-          if (likePattern is String) {
-            indexCondition = IndexCondition.like(likePattern);
-          } else {
-            indexCondition = IndexCondition.fromMap(indexConditionValue);
-          }
-        } else {
-          indexCondition = IndexCondition.fromMap({'=': indexConditionValue});
-        }
-      }
+      final IndexCondition? builtCondition = _buildIndexConditionForSchema(
+        indexSchema,
+        actualIndexName,
+        conditions,
+      );
+      final IndexCondition indexCondition = builtCondition ??
+          (indexSchema != null
+              ? IndexCondition.fromMap({'SCAN': true})
+              : (throw BusinessError(
+                  'Index condition is not available for index scan.',
+                  type: BusinessErrorType.dbError,
+                  data: {
+                    'table': tableName,
+                    'index': actualIndexName,
+                    'conditions': conditions,
+                  },
+                )));
 
       // use searchIndex to get pointers
       // IMPORTANT: offset is applied by the final pagination step in QueryExecutor.

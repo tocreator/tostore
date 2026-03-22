@@ -8,7 +8,10 @@ All notable changes to this project will be documented in this file.
 - Optimized `upsert` handling for concurrently executed records when the primary key and unique key contain the same value
 - Optimized WebAssembly build support on the Web platform
 - Improved table structure migration and integrity check error reporting, providing detailed failure reasons
-- Optimized documentation and multi-language (Japanese, Korean, Spanish, Portuguese, Russian, German, French, Italian, Turkish)
+- Optimized documentation and multi-language
+
+### Fixed
+- Fixed an issue where composite index queries could fall back to table scans
 
 ## 3.0.8
 

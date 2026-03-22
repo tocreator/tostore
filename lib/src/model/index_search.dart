@@ -86,6 +86,28 @@ class IndexSearchResult {
   bool get isEmpty => primaryKeys.isEmpty;
 }
 
+/// Represents a single field predicate used to search a composite index.
+class IndexFieldCondition {
+  /// Indexed field name.
+  final String field;
+
+  /// Comparison operator (for example `=`, `IN`, `>`, `BETWEEN`).
+  final String operator;
+
+  /// Primary value for the comparison.
+  final dynamic value;
+
+  /// Secondary value for range comparisons such as `BETWEEN`.
+  final dynamic endValue;
+
+  const IndexFieldCondition({
+    required this.field,
+    required this.operator,
+    required this.value,
+    this.endValue,
+  });
+}
+
 /// Represents a condition for a single index search.
 /// This provides a type-safe way to define index queries instead of using raw maps.
 class IndexCondition {
@@ -98,8 +120,16 @@ class IndexCondition {
   /// The end value for range queries (e.g., 'between'). Null for other queries.
   final dynamic endValue;
 
+  /// Ordered predicates for composite index searches.
+  final List<IndexFieldCondition>? components;
+
   /// Private constructor. Use the factory methods to create instances.
-  IndexCondition._(this.operator, this.value, {this.endValue});
+  IndexCondition._(
+    this.operator,
+    this.value, {
+    this.endValue,
+    this.components,
+  });
 
   /// Creates an equality condition ('=').
   factory IndexCondition.equals(dynamic value) {
@@ -134,6 +164,18 @@ class IndexCondition {
   /// Creates a 'like' condition.
   factory IndexCondition.like(String pattern) {
     return IndexCondition._('like', pattern);
+  }
+
+  /// Creates a composite-index condition using the leading indexed fields.
+  factory IndexCondition.composite(List<IndexFieldCondition> components) {
+    if (components.isEmpty) {
+      throw ArgumentError('Composite index components cannot be empty.');
+    }
+    return IndexCondition._(
+      'COMPOSITE',
+      null,
+      components: List<IndexFieldCondition>.unmodifiable(components),
+    );
   }
 
   /// Creates a condition from a map, for backward compatibility or flexibility.

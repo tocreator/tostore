@@ -35,7 +35,7 @@
 - [Почему ToStore?](#why-tostore) | [Ключевые особенности](#key-features) | [Установка](#installation) | [Быстрый старт](#quick-start)
 - [Определение схемы](#schema-definition) | [Мобильная/Десктопная интеграция](#mobile-integration) | [Серверная интеграция](#server-integration)
 - [Векторы и поиск ANN](#vector-advanced) | [TTL на уровне таблицы](#ttl-config) | [Запросы и пагинация](#query-pagination) | [Внешние ключи](#foreign-keys) | [Операторы запросов](#query-operators)
-- [Распределенная архитектура](#distributed-architecture) | [Примеры первичных ключей](#primary-key-examples) | [Атомарные операции](#atomic-expressions) | [Транзакции](#transactions) | [Обработка ошибок](#error-handling)
+- [Распределенная архитектура](#distributed-architecture) | [Примеры первичных ключей](#primary-key-examples) | [Атомарные операции](#atomic-expressions) | [Транзакции](#transactions) | [Обработка ошибок](#error-handling) | [Колбэк логов и диагностика базы данных](#logging-diagnostics)
 - [Конфигурация безопасности](#security-config) | [Производительность](#performance) | [Ресурсы](#more-resources)
 
 
@@ -474,6 +474,32 @@ final txResult = await db.transaction(() async {
   await db.insert('users', {...});
   await db.update('users', {...});
 });
+```
+
+
+<a id="logging-diagnostics"></a>
+### Колбэк логов и диагностика базы данных
+
+ToStore может через `LogConfig.setConfig(...)` единообразно передавать в прикладной слой логи запуска, восстановления, автоматической миграции и конфликтов ограничений во время выполнения.
+
+- `onLogHandler` получает все логи, отфильтрованные текущими `enableLog` и `logLevel`.
+- Вызывайте `LogConfig.setConfig(...)` до инициализации, чтобы также получать логи инициализации и автоматической миграции.
+
+```dart
+  // Настройка параметров логов или колбэка
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // В production warn/error можно отправлять на backend или в лог-платформу
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
 ```
 
 

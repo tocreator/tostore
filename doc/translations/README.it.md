@@ -35,7 +35,7 @@
 - [Perché ToStore?](#why-tostore) | [Caratteristiche Principali](#key-features) | [Installazione](#installation) | [Inizio Rapido](#quick-start)
 - [Definizione dello Schema](#schema-definition) | [Integrazione Mobile/Desktop](#mobile-integration) | [Integrazione Server](#server-integration)
 - [Vettori e Ricerca ANN](#vector-advanced) | [TTL a Livello di Tabella](#ttl-config) | [Query e Paginazione](#query-pagination) | [Chiavi Esterne](#foreign-keys) | [Operatori di Query](#query-operators)
-- [Architettura Distribuita](#distributed-architecture) | [Esempi di Chiavi Primarie](#primary-key-examples) | [Operazioni Atomiche](#atomic-expressions) | [Transazioni](#transactions) | [Gestione degli Errori](#error-handling)
+- [Architettura Distribuita](#distributed-architecture) | [Esempi di Chiavi Primarie](#primary-key-examples) | [Operazioni Atomiche](#atomic-expressions) | [Transazioni](#transactions) | [Gestione degli Errori](#error-handling) | [Callback dei log e diagnostica del database](#logging-diagnostics)
 - [Configurazione di Sicurezza](#security-config) | [Prestazioni](#performance) | [Altre Risorse](#more-resources)
 
 
@@ -456,6 +456,32 @@ final txResult = await db.transaction(() async {
   await db.insert('users', {...});
   await db.update('users', {...});
 });
+```
+
+
+<a id="logging-diagnostics"></a>
+### Callback dei log e diagnostica del database
+
+ToStore può usare `LogConfig.setConfig(...)` per riportare al livello applicativo i log di avvio, recupero, migrazione automatica e conflitti di vincoli a runtime.
+
+- `onLogHandler` riceve tutti i log filtrati dagli attuali `enableLog` e `logLevel`.
+- Chiama `LogConfig.setConfig(...)` prima dell'inizializzazione, così verranno catturati anche i log di inizializzazione e migrazione automatica.
+
+```dart
+  // Configura i parametri di log o il callback
+  LogConfig.setConfig(
+    enableLog: true,
+    logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
+    publicLabel: 'my_app_db',
+    onLogHandler: (message, type, label) {
+      // In produzione, warn/error possono essere inviati al backend o alla piattaforma di log
+      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
+        developer.log(message, name: label);
+      }
+    },
+  );
+
+  final db = await ToStore.open();
 ```
 
 

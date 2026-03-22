@@ -2,31 +2,31 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
-import '../handler/value_matcher.dart';
-import '../handler/topk_heap.dart';
-import '../query/query_executor.dart';
-import 'workload_scheduler.dart';
-import '../model/buffer_entry.dart';
-
-import '../model/data_store_config.dart';
-import '../model/table_schema.dart';
-import '../query/query_condition.dart';
-import '../model/query_aggregation.dart';
-import 'data_store_impl.dart';
-import '../model/meta_info.dart';
-import 'crontab_manager.dart';
-import '../model/id_generator.dart';
-import '../model/system_table.dart';
-import 'tree_cache.dart';
 import '../handler/parallel_processor.dart';
-import 'transaction_context.dart';
-import '../model/transaction_models.dart';
-import 'write_buffer_manager.dart';
+import '../handler/topk_heap.dart';
+import '../handler/value_matcher.dart';
+import '../model/buffer_entry.dart';
+import '../model/data_store_config.dart';
+import '../model/id_generator.dart';
+import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
-import 'yield_controller.dart';
+import '../model/query_aggregation.dart';
+import '../model/system_table.dart';
+import '../model/table_schema.dart';
+import '../model/transaction_models.dart';
+import '../query/query_condition.dart';
+import '../query/query_executor.dart';
+import 'crontab_manager.dart';
+import 'data_store_impl.dart';
+import 'transaction_context.dart';
+import 'tree_cache.dart';
 import 'weight_manager.dart';
+import 'workload_scheduler.dart';
+import 'write_buffer_manager.dart';
+import 'yield_controller.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -240,6 +240,7 @@ class TableDataManager {
     }
 
     // [Optimization] We only update if it's already there or forced
+
     final doNotCache = !_dataStore.isGlobalPrewarming && !force;
     if (isInsertOperation && doNotCache) {
       return;
@@ -266,7 +267,49 @@ class TableDataManager {
     }
   }
 
+  /// Asynchronously cache results fetched from disk after validating against write buffer.
+  /// This prevents Read-Through Cache Pollution without blocking the main query flow.
+  void _asyncCacheDiskResults({
+    required String tableName,
+    required List<Map<String, dynamic>> diskResults,
+    required TableSchema schema,
+  }) {
+    if (diskResults.isEmpty || _tableRecordCache.maxByteThreshold <= 0) return;
+
+    // Execute in microtask to avoid blocking the current execution flow
+    scheduleMicrotask(() async {
+      final validatedForCache = <Map<String, dynamic>>[];
+      final primaryKey = schema.primaryKey;
+
+      for (final r in diskResults) {
+        final pk = r[primaryKey]?.toString();
+        if (pk == null) continue;
+
+        // Only cache if the record is NOT marked as deleted in the global write buffer.
+        final bufferEntry =
+            _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+        if (bufferEntry != null &&
+            bufferEntry.operation == BufferOperationType.delete) {
+          continue;
+        }
+
+        validatedForCache.add(r);
+      }
+
+      if (validatedForCache.isNotEmpty) {
+        cacheTableRecordsBatch(
+          tableName,
+          validatedForCache,
+          primaryKey: primaryKey,
+          schema: schema,
+          force: true,
+        );
+      }
+    });
+  }
+
   /// Remove a cached table record (if present).
+
   void removeTableRecord(String tableName, String pk) {
     _tableRecordCache.remove([tableName, pk]);
   }
@@ -3333,14 +3376,12 @@ class TableDataManager {
         encryptionKeyId: encryptionKeyId,
       );
 
-      // Read-Through: Cache the results fetched from disk
+      // Read-Through: Cache the results fetched from disk (Asynchronously)
       if (diskResults.isNotEmpty) {
-        cacheTableRecordsBatch(
-          tableName,
-          diskResults,
-          primaryKey: schema.primaryKey,
+        _asyncCacheDiskResults(
+          tableName: tableName,
+          diskResults: diskResults,
           schema: schema,
-          force: true,
         );
       }
       results.addAll(diskResults);
@@ -3430,7 +3471,7 @@ class TableDataManager {
         endKeyPath = null;
       }
     } else {
-      // DESC: start from rangeMin (if any, otherwise tableName prefix)，
+      // DESC: start from rangeMin (if any, otherwise tableName prefix)
       // end at highBoundPk (the smaller value of rangeMax/cursor)
       if (lowBoundPk != null) {
         startKeyPath = [tableName, lowBoundPk];

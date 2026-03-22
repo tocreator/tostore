@@ -1,34 +1,33 @@
 import 'dart:async';
-
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import '../handler/parallel_processor.dart';
-import '../handler/memcomparable.dart';
-import '../handler/value_matcher.dart';
-import '../model/data_block_entry.dart';
-import '../model/index_search.dart';
-import 'package:tostore/src/core/yield_controller.dart';
-
-import '../handler/logger.dart';
 import '../handler/common.dart';
-import '../model/meta_info.dart';
-
-import '../model/unique_violation.dart';
-import '../model/parallel_journal_entry.dart';
-import '../model/table_schema.dart';
-import 'data_store_impl.dart';
-
-import '../model/system_table.dart';
-import 'table_data_manager.dart';
-import '../model/id_generator.dart';
-import 'tree_cache.dart';
-import '../model/index_entry.dart';
+import '../handler/logger.dart';
+import '../handler/memcomparable.dart';
+import '../handler/parallel_processor.dart';
+import '../handler/value_matcher.dart';
+import '../model/buffer_entry.dart';
+import '../model/business_error.dart';
+import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
+import '../model/id_generator.dart';
+import '../model/index_entry.dart';
+import '../model/index_search.dart';
+import '../model/meta_info.dart';
+import '../model/parallel_journal_entry.dart';
+import '../model/system_table.dart';
+import '../model/table_schema.dart';
+import '../model/unique_violation.dart';
+import '../query/query_condition.dart';
+import 'data_store_impl.dart';
 import 'io_concurrency_planner.dart';
+import 'table_data_manager.dart';
 import 'transaction_context.dart';
+import 'tree_cache.dart';
 import 'weight_manager.dart';
+import 'yield_controller.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -267,9 +266,12 @@ class IndexManager {
     final key = '$tableName:$indexName';
     if (_indexFieldMatchers.containsKey(key)) return;
 
-    final indexSchema = schema.indexes.firstWhere(
-        (i) => i.actualIndexName == indexName,
-        orElse: () => IndexSchema(indexName: '', fields: []));
+    final allIndexes =
+        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    final indexSchema = allIndexes.firstWhere(
+      (i) => i.actualIndexName == indexName,
+      orElse: () => IndexSchema(indexName: '', fields: []),
+    );
 
     if (indexSchema.fields.isEmpty) return;
 
@@ -343,7 +345,9 @@ class IndexManager {
     }
 
     // Resolve index schema for encoding key components (truncateText for non-unique).
-    final indexSchema = schema.indexes.firstWhere(
+    final allIndexes =
+        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    final indexSchema = allIndexes.firstWhere(
       (i) => i.actualIndexName == indexName,
       orElse: () => IndexSchema(indexName: '', fields: const []),
     );
@@ -634,9 +638,8 @@ class IndexManager {
 
   /// create index
   Future<void> createIndex(String tableName, IndexSchema schema) async {
+    final indexName = schema.actualIndexName;
     try {
-      final indexName = schema.actualIndexName;
-
       // Check if the index exists
       final meta = await getIndexMeta(tableName, indexName);
       if (meta != null) {
@@ -690,6 +693,7 @@ class IndexManager {
             label: 'IndexManager.createIndex');
       }
     } catch (e, stack) {
+      await _deletePhysicalIndexArtifacts(tableName, indexName);
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
       rethrow;
@@ -1028,7 +1032,23 @@ class IndexManager {
           // Get index metadata
           final meta = await getIndexMeta(tableName, indexName);
           if (meta == null || meta.totalEntries <= 0) {
-            // Fallback: index not available, skip (conservative: no violation)
+            for (final constraint in indexConstraints) {
+              final existingPk = await _findExistingPrimaryKeyByConstraint(
+                tableName: tableName,
+                schema: schema,
+                fields: constraint.fields,
+                value: constraint.value,
+                excludePrimaryKey: selfStoreIndexStr,
+              );
+              if (existingPk != null) {
+                return UniqueViolation(
+                  tableName: tableName,
+                  fields: constraint.fields,
+                  value: constraint.value,
+                  indexName: constraint.indexName,
+                );
+              }
+            }
             continue;
           }
 
@@ -1335,9 +1355,41 @@ class IndexManager {
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
       final meta = await getIndexMeta(tableName, indexName);
       if (meta == null || meta.totalEntries <= 0) {
-        // Fallback: without meta we cannot safely batch-check this unique constraint.
-        // Keep null -> caller may choose other strategies. For safety we conservatively
-        // do nothing here (performance-first path).
+        for (int i = 0; i < records.length; i++) {
+          await yieldController.maybeYield();
+          if (violations[i] != null) continue;
+          final r = records[i];
+          final recordId = r[primaryKey]?.toString();
+          if (recordId == null || recordId.isEmpty) continue;
+
+          final vals = <dynamic>[];
+          bool ok = true;
+          for (final f in idx.fields) {
+            final v = r[f];
+            if (v == null) {
+              ok = false;
+              break;
+            }
+            vals.add(v);
+          }
+          if (!ok) continue;
+
+          final existingPk = await _findExistingPrimaryKeyByConstraint(
+            tableName: tableName,
+            schema: schema,
+            fields: idx.fields,
+            value: idx.fields.length == 1 ? vals.first : vals,
+            excludePrimaryKey: recordId,
+          );
+          if (existingPk != null) {
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: idx.fields.length == 1 ? vals.first : vals,
+              indexName: indexName,
+            );
+          }
+        }
         continue;
       }
 
@@ -1421,8 +1473,21 @@ class IndexManager {
       final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return;
 
-      // check if index already exists
-      if (allIndexes.any((i) => i.actualIndexName == index.actualIndexName)) {
+      final bool existsInSchema =
+          allIndexes.any((i) => i.actualIndexName == index.actualIndexName);
+      final existingMeta = await getIndexMeta(tableName, index.actualIndexName);
+
+      if (!existsInSchema && existingMeta != null) {
+        Logger.warn(
+          'Detected orphaned index metadata for ${index.actualIndexName} in table $tableName, cleaning it up before rebuild',
+          label: 'IndexManager.addIndex',
+        );
+        await _deletePhysicalIndexArtifacts(tableName, index.actualIndexName);
+      }
+
+      // If the schema already contains the index and the physical index metadata
+      // also exists, there is nothing left to do.
+      if (existsInSchema && existingMeta != null) {
         Logger.warn(
           'Index ${index.actualIndexName} already exists in table $tableName',
           label: 'IndexManager.addIndex',
@@ -1439,13 +1504,51 @@ class IndexManager {
       await createIndex(tableName, index);
 
       // update table schema
-      final newIndexes = [...schema.indexes, index];
-      final newSchema = schema.copyWith(indexes: newIndexes);
-      await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
+      if (!existsInSchema) {
+        final newIndexes = [...schema.indexes, index];
+        final newSchema = schema.copyWith(indexes: newIndexes);
+        await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
+      }
     } catch (e) {
       Logger.error('Failed to add index: $e', label: 'IndexManager.addIndex');
       rethrow;
     }
+  }
+
+  Future<String?> _findExistingPrimaryKeyByConstraint({
+    required String tableName,
+    required TableSchema schema,
+    required List<String> fields,
+    required dynamic value,
+    String? excludePrimaryKey,
+  }) async {
+    final condition = QueryCondition();
+    if (fields.length == 1) {
+      condition.where(fields.first, '=', value);
+    } else if (value is List && value.length == fields.length) {
+      for (int i = 0; i < fields.length; i++) {
+        condition.where(fields[i], '=', value[i]);
+      }
+    } else {
+      return null;
+    }
+
+    final records = await _dataStore.executeQuery(
+      tableName,
+      condition,
+      limit: 2,
+    );
+    for (final record in records) {
+      final pk = record[schema.primaryKey]?.toString();
+      if (pk == null || pk.isEmpty) {
+        continue;
+      }
+      if (excludePrimaryKey != null && pk == excludePrimaryKey) {
+        continue;
+      }
+      return pk;
+    }
+    return null;
   }
 
   /// modify index
@@ -1522,15 +1625,8 @@ class IndexManager {
 
       // 2. if fields list is provided, try to match by fields list
       if (targetIndex == null && fields != null && fields.isNotEmpty) {
-        // sort fields list to ensure consistency
-        final sortedFields = List<String>.from(fields)..sort();
-
         for (var index in allIndexes) {
-          // sort index fields
-          final indexFields = List<String>.from(index.fields)..sort();
-
-          // check if fields list matches
-          if (_areFieldListsEqual(indexFields, sortedFields)) {
+          if (_areFieldListsEqual(index.fields, fields)) {
             targetIndex = index;
             break;
           }
@@ -1625,12 +1721,13 @@ class IndexManager {
     }
   }
 
-  /// compare two field lists (ignore order)
+  /// Compare two field lists with order preserved.
   bool _areFieldListsEqual(List<String> a, List<String> b) {
     if (a.length != b.length) return false;
-    final setA = Set<String>.from(a);
-    final setB = Set<String>.from(b);
-    return setA.difference(setB).isEmpty;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   /// Rebuild table indexes efficiently
@@ -1642,8 +1739,12 @@ class IndexManager {
       List<IndexSchema> indexesToBuild) async {
     try {
       final primaryKey = tableSchema.primaryKey;
+      final uniqueIndexes = indexesToBuild
+          .where((index) => index.type != IndexType.vector && index.unique)
+          .toList(growable: false);
 
       for (final indexSchema in indexesToBuild) {
+        if (indexSchema.type == IndexType.vector) continue;
         final indexName = indexSchema.actualIndexName;
         final indexMeta = IndexMeta.createEmpty(
           name: indexName,
@@ -1676,9 +1777,17 @@ class IndexManager {
           }
 
           if (newByPk.isNotEmpty) {
+            await _validateUniqueRebuildBatch(
+              tableName: tableName,
+              schema: tableSchema,
+              uniqueIndexes: uniqueIndexes,
+              records: newByPk.values,
+            );
             await _dataStore.indexManager?.writeChanges(
               tableName: tableName,
               inserts: newByPk.values.toList(growable: false),
+              schemaOverride: tableSchema,
+              targetIndexesOverride: indexesToBuild,
               concurrency: maxConcurrency > 0 ? maxConcurrency : null,
             );
             await Future.delayed(Duration.zero);
@@ -1690,6 +1799,99 @@ class IndexManager {
       Logger.error('Failed to rebuild table indexes: $e\n$stack',
           label: 'IndexManager._rebuildTableIndexes');
       rethrow;
+    }
+  }
+
+  Future<void> _validateUniqueRebuildBatch({
+    required String tableName,
+    required TableSchema schema,
+    required List<IndexSchema> uniqueIndexes,
+    required Iterable<Map<String, dynamic>> records,
+  }) async {
+    if (uniqueIndexes.isEmpty) return;
+
+    final pkName = schema.primaryKey;
+    for (final index in uniqueIndexes) {
+      final meta = await getIndexMeta(tableName, index.actualIndexName);
+      if (meta == null) continue;
+
+      final keys = <Uint8List>[];
+      final owners = <String>[];
+      final seenInBatch = <String, String>{};
+
+      for (final record in records) {
+        final pk = record[pkName]?.toString();
+        if (pk == null || pk.isEmpty) continue;
+
+        final key = encodeIndexKeyFromRecord(
+          schema: schema,
+          meta: meta,
+          record: record,
+          pkValue: pk,
+        );
+        if (key == null || key.isEmpty) continue;
+
+        final encodedKey = base64Encode(key);
+        final existingOwner = seenInBatch[encodedKey];
+        if (existingOwner != null && existingOwner != pk) {
+          throw BusinessError(
+            'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=$pk',
+            type: BusinessErrorType.uniqueError,
+          );
+        }
+
+        if (existingOwner == null) {
+          seenInBatch[encodedKey] = pk;
+          keys.add(key);
+          owners.add(pk);
+        }
+      }
+
+      if (keys.isEmpty) continue;
+
+      final existingOwners = await _dataStore.indexTreePartitionManager
+          .lookupUniquePrimaryKeysBatch(
+        tableName: tableName,
+        indexName: index.actualIndexName,
+        meta: meta,
+        uniqueKeys: keys,
+      );
+
+      for (int i = 0; i < existingOwners.length; i++) {
+        final existingOwner = existingOwners[i];
+        if (existingOwner == null || existingOwner == owners[i]) {
+          continue;
+        }
+        throw BusinessError(
+          'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=${owners[i]}',
+          type: BusinessErrorType.uniqueError,
+        );
+      }
+    }
+  }
+
+  Future<void> _deletePhysicalIndexArtifacts(
+    String tableName,
+    String indexName,
+  ) async {
+    _indexMetaCache.remove([tableName, indexName]);
+    _indexDataCache.remove([tableName, indexName]);
+    _indexFieldMatchers.remove('$tableName:$indexName');
+    _metaLoadingFutures.remove(_getMetaLoadingKey(tableName, indexName));
+
+    try {
+      final indexPath = await _dataStore.pathManager.getIndexPath(
+        tableName,
+        indexName,
+      );
+      if (await _dataStore.storage.existsDirectory(indexPath)) {
+        await _dataStore.storage.deleteDirectory(indexPath);
+      }
+    } catch (e) {
+      Logger.warn(
+        'Failed to clean index artifacts for $tableName.$indexName: $e',
+        label: 'IndexManager._deletePhysicalIndexArtifacts',
+      );
     }
   }
 
@@ -1734,19 +1936,24 @@ class IndexManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Set<String>? skipIndexes,
+    TableSchema? schemaOverride,
+    List<IndexSchema>? targetIndexesOverride,
   }) async {
     // Snapshot inputs to allow yielding and avoid concurrent modification
     final insertsCopy = List<Map<String, dynamic>>.from(inserts);
     final updatesCopy = List<IndexRecordUpdate>.from(updates);
     final deletesCopy = List<Map<String, dynamic>>.from(deletes);
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = schemaOverride ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
     final pkName = schema.primaryKey;
 
     // Build index targets: explicit indexes + auto-unique single-field + foreign keys (excluding PK).
-    final targets = (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
-            const <IndexSchema>[])
-        .toList();
+    final targets = List<IndexSchema>.from(
+      targetIndexesOverride ??
+          (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
+              const <IndexSchema>[]),
+    );
 
     // Skip redundant PK-only indexes (table data is already range-partitioned by PK).
     targets
@@ -1754,24 +1961,28 @@ class IndexManager {
     if (targets.isEmpty) return;
 
     // Single pass: split vector vs B+Tree indexes, count B+Tree for budget.
-    Future<void>? vectorFuture;
+    final vectorTargets = <IndexSchema>[];
     final btreeTargets = <IndexSchema>[];
     for (final idx in targets) {
       if (idx.type == IndexType.vector) {
-        // Dispatch once to VectorIndexManager (runs in parallel with B+Tree).
-        if (vectorFuture == null && _dataStore.vectorIndexManager != null) {
-          vectorFuture = _dataStore.vectorIndexManager!.writeChanges(
-            tableName: tableName,
-            inserts: insertsCopy,
-            deletes: deletesCopy,
-            batchContext: batchContext,
-            concurrency: concurrency,
-          );
-        }
+        vectorTargets.add(idx);
       } else {
         btreeTargets.add(idx);
       }
     }
+
+    final Future<void>? vectorFuture =
+        vectorTargets.isNotEmpty && _dataStore.vectorIndexManager != null
+            ? _dataStore.vectorIndexManager!.writeChanges(
+                tableName: tableName,
+                inserts: insertsCopy,
+                deletes: deletesCopy,
+                batchContext: batchContext,
+                concurrency: concurrency,
+                schemaOverride: schema,
+                targetIndexesOverride: vectorTargets,
+              )
+            : null;
 
     if (btreeTargets.isEmpty) {
       if (vectorFuture != null) await vectorFuture;
@@ -2063,11 +2274,9 @@ class IndexManager {
         return null;
       }
 
-      Uint8List? encodePrefix(dynamic raw) {
-        final vals = normalizeValues(raw, fields.length);
-        if (vals == null) return null;
+      Uint8List? encodeLeadingValues(List<dynamic> vals) {
         final comps = <Uint8List>[];
-        for (int i = 0; i < fields.length; i++) {
+        for (int i = 0; i < vals.length; i++) {
           final c = schema.encodeFieldComponentToMemComparable(
             fields[i],
             vals[i],
@@ -2077,6 +2286,12 @@ class IndexManager {
           comps.add(c);
         }
         return MemComparableKey.encodeTuple(comps);
+      }
+
+      Uint8List? encodePrefix(dynamic raw) {
+        final vals = normalizeValues(raw, fields.length);
+        if (vals == null) return null;
+        return encodeLeadingValues(vals);
       }
 
       // Cursor Logic
@@ -2125,6 +2340,276 @@ class IndexManager {
       }
 
       final opUpper = condition.operator.toUpperCase();
+
+      if (opUpper == 'COMPOSITE') {
+        final components = condition.components;
+        if (components == null || components.isEmpty) {
+          return IndexSearchResult.tableScan();
+        }
+        if (components.length > fields.length) {
+          return IndexSearchResult.tableScan();
+        }
+
+        for (int i = 0; i < components.length; i++) {
+          if (components[i].field != fields[i]) {
+            return IndexSearchResult.tableScan();
+          }
+        }
+
+        final prefixValues = <dynamic>[];
+        for (int i = 0; i < components.length - 1; i++) {
+          final componentOp = components[i].operator.toUpperCase();
+          if (componentOp != '=') {
+            return IndexSearchResult.tableScan();
+          }
+          prefixValues.add(components[i].value);
+        }
+
+        Uint8List? encodePrefixValues(List<dynamic> values) {
+          if (values.isEmpty) return Uint8List(0);
+          return encodeLeadingValues(values);
+        }
+
+        Uint8List? encodeCompositeValues(dynamic tailValue) {
+          final values = <dynamic>[...prefixValues, tailValue];
+          return encodeLeadingValues(values);
+        }
+
+        Uint8List? encodePrefixUpperBound() {
+          if (prefixValues.isEmpty) return Uint8List(0);
+          final prefixBytes = encodePrefixValues(prefixValues);
+          if (prefixBytes == null) return null;
+          return upperBoundExclusiveForPrefix(prefixBytes);
+        }
+
+        final last = components.last;
+        final lastOp = last.operator.toUpperCase();
+
+        if (lastOp == '=') {
+          final prefix = encodeCompositeValues(last.value);
+          if (prefix == null) return IndexSearchResult.empty();
+          final start = applyCursorStart(prefix);
+          final end = applyCursorEnd(upperBoundExclusiveForPrefix(prefix));
+
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            return IndexSearchResult.empty();
+          }
+
+          return await _searchIndexByKeyRangeLogical(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: start,
+            endKeyExclusive: end,
+            reverse: reverse,
+            limit: limit,
+            offset: effectiveOffset,
+          );
+        }
+
+        if (lastOp == 'IN' && last.value is List) {
+          final items = <(dynamic, Uint8List)>[];
+          for (final value in (last.value as List)) {
+            final prefix = encodeCompositeValues(value);
+            if (prefix != null) {
+              items.add((value, prefix));
+            }
+          }
+          items.sort((a, b) {
+            final cmp = MemComparableKey.compare(a.$2, b.$2);
+            return reverse ? -cmp : cmp;
+          });
+          if (items.isNotEmpty) {
+            final deduped = <(dynamic, Uint8List)>[];
+            for (int i = 0; i < items.length; i++) {
+              if (i == 0 ||
+                  MemComparableKey.compare(items[i].$2, items[i - 1].$2) != 0) {
+                deduped.add(items[i]);
+              }
+            }
+            items
+              ..clear()
+              ..addAll(deduped);
+          }
+
+          final out = <String>[];
+          final int need = (limit == null) ? -1 : max(0, limit);
+          int remaining = need;
+          final yieldController = YieldController('index_search_composite_in');
+
+          for (final item in items) {
+            await yieldController.maybeYield();
+            if (remaining == 0) break;
+
+            final start = applyCursorStart(item.$2);
+            final end = applyCursorEnd(upperBoundExclusiveForPrefix(item.$2));
+            if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+              continue;
+            }
+
+            final res = await _searchIndexByKeyRangeLogical(
+              tableName: tableName,
+              indexName: indexName,
+              meta: meta,
+              startKeyInclusive: start,
+              endKeyExclusive: end,
+              reverse: reverse,
+              limit: remaining > 0 ? remaining : null,
+              offset: null,
+            );
+            out.addAll(res.primaryKeys);
+
+            if (remaining > 0) {
+              remaining -= res.primaryKeys.length;
+              if (remaining <= 0) break;
+            }
+          }
+
+          List<String> finalPks = out;
+          if (effectiveOffset != null && effectiveOffset > 0) {
+            if (effectiveOffset >= finalPks.length) {
+              return IndexSearchResult.empty();
+            }
+            finalPks = finalPks.sublist(effectiveOffset);
+          }
+          if (limit != null && finalPks.length > limit) {
+            finalPks = finalPks.sublist(0, limit);
+          }
+
+          return finalPks.isEmpty
+              ? IndexSearchResult.empty()
+              : IndexSearchResult(primaryKeys: finalPks);
+        }
+
+        if (lastOp == 'BETWEEN') {
+          final startPrefix = encodeCompositeValues(last.value);
+          final endPrefix = encodeCompositeValues(last.endValue);
+          if (startPrefix == null || endPrefix == null) {
+            return IndexSearchResult.empty();
+          }
+          final start = applyCursorStart(startPrefix);
+          final end = applyCursorEnd(upperBoundExclusiveForPrefix(endPrefix));
+
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            return IndexSearchResult.empty();
+          }
+
+          return await _searchIndexByKeyRangeLogical(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: start,
+            endKeyExclusive: end,
+            reverse: reverse,
+            limit: limit,
+            offset: effectiveOffset,
+          );
+        }
+
+        if (lastOp == '>' ||
+            lastOp == '>=' ||
+            lastOp == '<' ||
+            lastOp == '<=') {
+          final pivot = encodeCompositeValues(last.value);
+          if (pivot == null) return IndexSearchResult.empty();
+
+          final prefixStart = encodePrefixValues(prefixValues);
+          final prefixEnd = encodePrefixUpperBound();
+          if (prefixValues.isNotEmpty &&
+              (prefixStart == null || prefixEnd == null)) {
+            return IndexSearchResult.empty();
+          }
+
+          Uint8List startBound;
+          Uint8List endBound;
+          final isLower = lastOp == '>' || lastOp == '>=';
+          if (isLower) {
+            startBound =
+                lastOp == '>' ? upperBoundExclusiveForPrefix(pivot) : pivot;
+            endBound = prefixEnd ?? Uint8List(0);
+          } else {
+            startBound = prefixStart ?? Uint8List(0);
+            endBound =
+                lastOp == '<=' ? upperBoundExclusiveForPrefix(pivot) : pivot;
+          }
+
+          final start = applyCursorStart(startBound);
+          final end = applyCursorEnd(endBound);
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            return IndexSearchResult.empty();
+          }
+
+          return await _searchIndexByKeyRangeLogical(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: start,
+            endKeyExclusive: end,
+            reverse: reverse,
+            limit: limit,
+            offset: effectiveOffset,
+          );
+        }
+
+        if (lastOp == 'LIKE' && last.value is String) {
+          final pattern = last.value as String;
+          final firstPercent = pattern.indexOf('%');
+          final prefixEnd = (firstPercent > 0)
+              ? firstPercent
+              : (firstPercent == -1 && pattern.isNotEmpty ? pattern.length : 0);
+          if (prefixEnd <= 0) {
+            return IndexSearchResult.tableScan();
+          }
+          final fieldPrefix = pattern.substring(0, prefixEnd);
+
+          String? incrementString(String s) {
+            if (s.isEmpty) return null;
+            final codeUnits = List<int>.from(s.codeUnits);
+            for (int i = codeUnits.length - 1; i >= 0; i--) {
+              if (codeUnits[i] < 0xFFFF) {
+                codeUnits[i]++;
+                return String.fromCharCodes(codeUnits);
+              }
+              codeUnits.removeLast();
+            }
+            return null;
+          }
+
+          final startPrefix = encodeCompositeValues(fieldPrefix);
+          if (startPrefix == null) return IndexSearchResult.empty();
+
+          final nextPrefix = incrementString(fieldPrefix);
+          Uint8List endBound;
+          if (nextPrefix != null) {
+            final endPrefix = encodeCompositeValues(nextPrefix);
+            if (endPrefix == null) return IndexSearchResult.empty();
+            endBound = endPrefix;
+          } else {
+            final prefixUpper = encodePrefixUpperBound();
+            if (prefixUpper == null) return IndexSearchResult.empty();
+            endBound = prefixUpper;
+          }
+
+          final start = applyCursorStart(startPrefix);
+          final end = applyCursorEnd(endBound);
+          if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+            return IndexSearchResult.empty();
+          }
+
+          return await _searchIndexByKeyRangeLogical(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: start,
+            endKeyExclusive: end,
+            reverse: reverse,
+            limit: limit,
+            offset: effectiveOffset,
+          );
+        }
+
+        return IndexSearchResult.tableScan();
+      }
 
       // Cache Check Helper
       // Returns null if cache not available or not applicable
@@ -2541,10 +3026,18 @@ class IndexManager {
                   uniqueKey: prefix,
                 );
                 if (pk != null) {
-                  out.add(pk);
-                  if (nativeVal != null) {
-                    final compositeKey = [tableName, indexName, ...nativeVal];
-                    _indexDataCache.put(compositeKey, pk);
+                  // Buffer Consistency check: only skip caching if record is deleted in buffer.
+                  final bufEntry = _dataStore.writeBufferManager
+                      .getBufferedRecord(tableName, pk);
+                  if (bufEntry == null ||
+                      bufEntry.operation != BufferOperationType.delete) {
+                    out.add(pk);
+                    if (nativeVal != null &&
+                        !(_dataStore.resourceManager?.isLowMemoryMode ??
+                            false)) {
+                      final compositeKey = [tableName, indexName, ...nativeVal];
+                      _indexDataCache.put(compositeKey, pk);
+                    }
                   }
                 }
               }
@@ -2566,31 +3059,51 @@ class IndexManager {
                   nativeVal != null &&
                   !hasCursorKey &&
                   !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
-                if (isUnique) {
-                  if (res.primaryKeys.isNotEmpty) {
-                    _indexDataCache.put([tableName, indexName, ...nativeVal],
-                        res.primaryKeys.first);
+                final validatedPks = <String>[];
+                for (final pk in res.primaryKeys) {
+                  final bufEntry = _dataStore.writeBufferManager
+                      .getBufferedRecord(tableName, pk);
+                  if (bufEntry == null ||
+                      bufEntry.operation != BufferOperationType.delete) {
+                    validatedPks.add(pk);
                   }
-                } else {
-                  final prefixKey = <dynamic>[
-                    tableName,
-                    indexName,
-                    ...nativeVal
-                  ];
-                  final yc = YieldController(
-                      'IndexManager.hotspotPopulateNonUniqueIn');
-                  for (final pk in res.primaryKeys) {
-                    await yc.maybeYield();
-                    _indexDataCache.put(
-                      <dynamic>[...prefixKey, pk],
-                      true,
-                      size: pk.length + 1,
-                    );
+                }
+
+                if (validatedPks.isNotEmpty) {
+                  if (isUnique) {
+                    _indexDataCache.put([tableName, indexName, ...nativeVal],
+                        validatedPks.first);
+                  } else {
+                    final prefixKey = <dynamic>[
+                      tableName,
+                      indexName,
+                      ...nativeVal
+                    ];
+                    final yc = YieldController(
+                        'IndexManager.hotspotPopulateNonUniqueIn');
+                    for (final pk in validatedPks) {
+                      await yc.maybeYield();
+                      _indexDataCache.put(
+                        <dynamic>[...prefixKey, pk],
+                        true,
+                        size: pk.length + 1,
+                      );
+                    }
+                  }
+                }
+                out.addAll(validatedPks);
+              } else {
+                // Filter logically deleted records for results consistency
+                for (final pk in res.primaryKeys) {
+                  final bufEntry = _dataStore.writeBufferManager
+                      .getBufferedRecord(tableName, pk);
+                  if (bufEntry == null ||
+                      bufEntry.operation != BufferOperationType.delete) {
+                    out.add(pk);
                   }
                 }
               }
 
-              out.addAll(res.primaryKeys);
               if (remaining > 0) {
                 remaining -= res.primaryKeys.length;
                 if (remaining <= 0) break;

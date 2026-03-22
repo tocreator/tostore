@@ -1663,6 +1663,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               }
             }
             break;
+          case 'restore_initialization':
+            _confirmRestoreInitialization();
+            break;
         }
       },
       itemBuilder: (BuildContext context) {
@@ -1717,6 +1720,20 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                 ),
                 SizedBox(width: 12),
                 Text('Clear All Tables'),
+              ],
+            ),
+          ),
+          const PopupMenuDivider(),
+          const PopupMenuItem<String>(
+            value: 'restore_initialization',
+            child: Row(
+              children: [
+                Icon(
+                  Icons.refresh_rounded,
+                  size: 20,
+                ),
+                SizedBox(width: 12),
+                Text('Restore Initialization'),
               ],
             ),
           ),
@@ -2150,6 +2167,51 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
 
         await _fetchTableData(resetPage: true);
+      }
+    }
+  }
+
+  Future<void> _confirmRestoreInitialization() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirm Restore Initialization'),
+        content: const Text(
+          'This will delete the entire database and all test data, then re-initialize it. This action cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Restore'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed ?? false) {
+      if (!mounted) return;
+      setState(() {
+        _isInitializing = true;
+        _lastOperationInfo = 'Restoring Initialization...';
+      });
+
+      try {
+        await widget.example.db.deleteDatabase();
+        logService.add('Database deleted for restoration.', LogType.info);
+        await _initializeDatabase();
+      } catch (e, s) {
+        logService.add('Failed to restore initialization: $e', LogType.error);
+        logService.add('Stacktrace: $s', LogType.error);
+        if (mounted) {
+          setState(() {
+            _isInitializing = false;
+          });
+        }
       }
     }
   }
