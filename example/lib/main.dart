@@ -1589,11 +1589,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                             return Padding(
                               padding:
                                   const EdgeInsets.symmetric(vertical: 4.0),
-                              child: Text(
-                                logEntry.message,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: _getLogColor(logEntry.type),
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onLongPress: () => _copySingleLog(logEntry),
+                                child: Text(
+                                  logEntry.message,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: _getLogColor(logEntry.type),
+                                  ),
                                 ),
                               ),
                             );
@@ -2339,6 +2343,18 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         ),
       );
     }
+  }
+
+  Future<void> _copySingleLog(LogEntry logEntry) async {
+    await Clipboard.setData(ClipboardData(text: logEntry.message));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied selected log to clipboard.'),
+        duration: Duration(seconds: 2),
+      ),
+    );
   }
 
   void _checkAndExpandLogPanel() {

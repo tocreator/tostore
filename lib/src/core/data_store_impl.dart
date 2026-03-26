@@ -3,78 +3,79 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+
 import 'package:path/path.dart' as path;
 
 import '../Interface/noop_storage_impl.dart';
 import '../Interface/status_provider.dart';
-import '../model/buffer_entry.dart';
-import '../model/query_result.dart';
-import 'lock_manager.dart';
-import 'backup_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
+import '../handler/parallel_processor.dart';
+import '../handler/platform_handler.dart';
+import '../handler/value_matcher.dart';
+import '../model/backup_scope.dart';
+import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
+import '../model/change_event.dart';
+import '../model/config_info.dart';
+import '../model/data_store_config.dart';
 import '../model/db_result.dart';
+import '../model/expr.dart';
+import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
+import '../model/id_generator.dart';
+import '../model/index_entry.dart';
+import '../model/log_config.dart';
+import '../model/memory_info.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
+import '../model/query_result.dart';
 import '../model/result_type.dart';
-import '../model/unique_violation.dart';
-import '../model/index_entry.dart';
+import '../model/space_config.dart';
+import '../model/space_info.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
-import 'cache_manager.dart';
-import '../model/data_store_config.dart';
-import 'resource_manager.dart';
-import 'table_data_manager.dart';
-import 'index_manager.dart';
-import 'vector_index_manager.dart';
-import 'foreign_key_manager.dart';
-import '../model/foreign_key_operation.dart';
 import '../model/table_info.dart';
+import '../model/table_op_meta.dart';
+import '../model/table_schema.dart';
+import '../model/transaction_models.dart';
+import '../model/transaction_result.dart';
+import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
-import 'migration_manager.dart';
-import 'integrity_checker.dart';
-import 'storage_adapter.dart';
-import 'key_manager.dart';
-import '../model/space_config.dart';
-import 'schema_manager.dart';
-import 'path_manager.dart';
-import 'crontab_manager.dart';
-import '../model/log_config.dart';
 import '../upgrades/old_structure_migration_handler.dart';
+import '../upgrades/version_upgrade_manager.dart';
+import 'backup_manager.dart';
+import 'cache_manager.dart';
+import 'compaction_manager.dart';
+import 'crontab_manager.dart';
 import 'directory_manager.dart';
-import '../model/table_op_meta.dart';
-import '../model/id_generator.dart';
-import '../model/space_info.dart';
-import '../handler/parallel_processor.dart';
-import '../handler/value_matcher.dart';
+import 'foreign_key_manager.dart';
+import 'index_manager.dart';
+import 'index_tree_partition_manager.dart';
+import 'integrity_checker.dart';
+import 'key_manager.dart';
+import 'lock_manager.dart';
+import 'migration_manager.dart';
+import 'notification_manager.dart';
+import 'overflow_manager.dart';
+import 'parallel_journal_manager.dart';
+import 'path_manager.dart';
+import 'read_view_manager.dart';
+import 'resource_manager.dart';
+import 'schema_manager.dart';
+import 'storage_adapter.dart';
+import 'table_data_manager.dart';
+import 'table_tree_partition_manager.dart';
+import 'transaction_context.dart';
+import 'transaction_manager.dart';
+import 'ttl_cleanup_manager.dart';
+import 'vector_index_manager.dart';
 import 'wal_manager.dart';
-import 'yield_controller.dart';
+import 'weight_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
-import 'parallel_journal_manager.dart';
-import '../model/transaction_result.dart';
-import 'transaction_manager.dart';
-import '../model/transaction_models.dart';
-import '../model/backup_scope.dart';
-import 'transaction_context.dart';
-import '../model/expr.dart';
-import '../handler/platform_handler.dart';
-import '../model/change_event.dart';
-import 'notification_manager.dart';
-import '../upgrades/version_upgrade_manager.dart';
-import '../model/memory_info.dart';
-import '../model/config_info.dart';
-import 'weight_manager.dart';
-import 'read_view_manager.dart';
-import 'table_tree_partition_manager.dart';
-import 'index_tree_partition_manager.dart';
-import 'compaction_manager.dart';
-import 'overflow_manager.dart';
-import 'ttl_cleanup_manager.dart';
+import 'yield_controller.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -90,7 +91,6 @@ class DataStoreImpl {
 
   // Internal reserved field for TTL ingest-time source (ISO8601 datetime string).
   static const String _systemIngestTsMsField = '_system_ingest_ts_ms';
-
   Completer<void> _initCompleter = Completer<void>();
   bool _isInitialized = false;
   bool _initializing = false;
@@ -815,7 +815,7 @@ class DataStoreImpl {
         }
 
         if (!isMigrationInstance) {
-          // await loadDataToCache();
+          await loadDataToCache();
           CrontabManager.start();
           _ttlCleanupManager.registerCleanupTask();
 
@@ -5345,6 +5345,13 @@ class DataStoreImpl {
 
   /// load data from specified path
   Future<void> loadDataToCache() async {
+    if (_isGlobalPrewarming) {
+      return;
+    }
+    if (config.persistenceMode == PersistenceMode.memory) {
+      return;
+    }
+
     // Priority 1: Preload foreign key system table cache first
     // This ensures the cache is loaded before user table caches consume memory,
     // preventing it from being evicted due to memory pressure
@@ -5365,56 +5372,72 @@ class DataStoreImpl {
 
   Future<void> _executePrewarm() async {
     try {
+      final schemaMgr = schemaManager;
+      if (schemaMgr == null) return;
+
       // From schemaManager get all tables
       final allTables = await getTableNames();
-      if (allTables.isEmpty) {
-        return;
-      }
+      if (allTables.isEmpty) return;
 
       // Sort tables by weight
       final prioritizedTables = await _prioritizeTablesByWeight(allTables);
-
       final yieldController =
           YieldController('DataStoreImpl._executePrewarm', checkInterval: 1);
+      const maxPrewarmTables = 50;
+      final selectedTables = prioritizedTables.length <= maxPrewarmTables
+          ? prioritizedTables
+          : prioritizedTables.take(maxPrewarmTables).toList(growable: false);
 
-      // Prewarm threshold (MB to bytes)
-      final thresholdBytes = (config.prewarmThresholdMB * 1024 * 1024).toInt();
-      final threshold95Percent = ((thresholdBytes * 0.95).round()).toInt();
-      int loadedSizeBytes = 0;
-
-      // Load tables by weight order
-      for (int i = 0; i < prioritizedTables.length; i++) {
-        final tableName = prioritizedTables[i];
+      // Load tables by weight order.
+      // If total table count is small, prewarm all tables to avoid missing hot
+      // tables when weight data is incomplete.
+      for (final tableName in selectedTables) {
         try {
-          // Check if 95% threshold is reached
-          if (loadedSizeBytes >= threshold95Percent) {
-            Logger.info(
-              'Prewarm stopped at 95% threshold: ${loadedSizeBytes ~/ (1024 * 1024)}MB / ${config.prewarmThresholdMB}MB',
-              label: 'DataStore._executePrewarm',
-            );
-            break;
-          }
-
           // Check if table exists in current space
           final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
           if (!tableExistsInSpace) {
             continue;
           }
 
+          final tableMeta = await tableDataManager.getTableMeta(tableName);
+          if (tableMeta != null && !tableMeta.btreeFirstLeaf.isNull) {
+            await tableTreePartitionManager.prewarmBoundaryPages(
+              tableName,
+              meta: tableMeta,
+            );
+          }
+
+          final schema = await schemaMgr.getTableSchema(tableName);
+          if (schema != null) {
+            final indexes = schemaMgr
+                .getBtreeIndexesFor(schema)
+                .where((index) => index.type == IndexType.btree);
+            for (final index in indexes) {
+              final indexName = index.actualIndexName;
+              final indexMeta =
+                  await _indexManager?.getIndexMeta(tableName, indexName);
+              if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
+                continue;
+              }
+              await indexTreePartitionManager.prewarmBoundaryPages(
+                tableName,
+                indexName,
+                meta: indexMeta,
+              );
+              await yieldController.maybeYield();
+            }
+          }
+
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
           await yieldController.maybeYield();
-        } catch (e, stackTrace) {
+        } catch (e) {
           Logger.error('Load table data failed: $tableName, error: $e',
-              label: 'DataStore._executePrewarm');
-          Logger.error('Stack trace: $stackTrace',
               label: 'DataStore._executePrewarm');
           continue; // Continue load other tables
         }
       }
-    } catch (e, stackTrace) {
+    } catch (e) {
       Logger.error('Error in _executePrewarm: $e',
-          label: 'DataStore._executePrewarm');
-      Logger.error('Stack trace: $stackTrace',
           label: 'DataStore._executePrewarm');
     } finally {
       _isGlobalPrewarming = false;

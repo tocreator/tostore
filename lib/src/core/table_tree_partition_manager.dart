@@ -162,6 +162,50 @@ final class TableTreePartitionManager {
     }
   }
 
+  /// Prewarm boundary leaf pages (first/last) for a table B+Tree.
+  ///
+  /// Returns an approximate number of bytes loaded into the page cache.
+  Future<int> prewarmBoundaryPages(
+    String tableName, {
+    TableMeta? meta,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final resolvedMeta =
+        meta ?? await _dataStore.tableDataManager.getTableMeta(tableName);
+    if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
+      return 0;
+    }
+
+    int loadedBytes = 0;
+    final pageSize = resolvedMeta.btreePageSize;
+    final firstLeaf = resolvedMeta.btreeFirstLeaf;
+    final lastLeaf = resolvedMeta.btreeLastLeaf;
+
+    Future<void> prewarmLeaf(TreePagePtr ptr) async {
+      if (ptr.isNull) return;
+      final cacheKey = [tableName, ptr.partitionNo, ptr.pageNo];
+      final alreadyCached = _leafPageCache.containsKey(cacheKey);
+      await _readLeafPage(
+        tableName,
+        resolvedMeta,
+        ptr,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      if (!alreadyCached) {
+        loadedBytes += pageSize;
+      }
+    }
+
+    await prewarmLeaf(firstLeaf);
+    if (lastLeaf != firstLeaf) {
+      await prewarmLeaf(lastLeaf);
+    }
+
+    return loadedBytes;
+  }
+
   /// Create an initial TableMeta with first partition and B+Tree fields.
   Future<TableMeta> _createInitialTableMeta(String tableName) async {
     return TableMeta.createEmpty(name: tableName);
@@ -368,6 +412,48 @@ final class TableTreePartitionManager {
     }
 
     return cur;
+  }
+
+  Future<TreePagePtr> _locateRightmostLeafFast(
+    String tableName,
+    TableMeta meta, {
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final root = meta.btreeRoot;
+    final lastLeaf = meta.btreeLastLeaf;
+    if (root.isNull) return lastLeaf;
+    if (meta.btreeHeight <= 0) return root;
+    if (lastLeaf.isNull) {
+      return _locateRightmostLeaf(
+        tableName,
+        meta,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+    }
+
+    try {
+      final leaf = await _readLeafPage(
+        tableName,
+        meta,
+        lastLeaf,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      final looksValid = leaf.next.isNull &&
+          (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalRecords <= 0);
+      if (looksValid) {
+        return lastLeaf;
+      }
+    } catch (_) {}
+
+    return _locateRightmostLeaf(
+      tableName,
+      meta,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+    );
   }
 
   /// Batch write changes for a table.
@@ -2047,9 +2133,9 @@ final class TableTreePartitionManager {
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         if (ptr.isNull) ptr = meta.btreeLastLeaf;
       } else {
-        // Robustness: descend tree to find true last leaf,
-        // rather than trusting meta.btreeLastLeaf which might be stale after crash.
-        ptr = await _locateRightmostLeaf(tableName, meta,
+        // Fast path: trust meta.btreeLastLeaf when it still points to the
+        // boundary leaf, and fall back to a full right-edge descent otherwise.
+        ptr = await _locateRightmostLeafFast(tableName, meta,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       }
     }
@@ -2250,8 +2336,7 @@ final class TableTreePartitionManager {
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         if (ptr.isNull) ptr = (meta.btreeLastLeaf);
       } else {
-        // Robustness: descend tree to find true last leaf
-        ptr = await _locateRightmostLeaf(tableName, meta,
+        ptr = await _locateRightmostLeafFast(tableName, meta,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       }
     }

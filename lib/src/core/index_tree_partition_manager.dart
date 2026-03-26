@@ -148,6 +148,52 @@ final class IndexTreePartitionManager {
     }
   }
 
+  /// Prewarm boundary leaf pages (first/last) for a B+Tree index.
+  ///
+  /// Returns an approximate number of bytes loaded into the page cache.
+  Future<int> prewarmBoundaryPages(
+    String tableName,
+    String indexName, {
+    IndexMeta? meta,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final resolvedMeta = meta ??
+        await _dataStore.indexManager?.getIndexMeta(tableName, indexName);
+    if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
+      return 0;
+    }
+
+    int loadedBytes = 0;
+    final pageSize = resolvedMeta.btreePageSize;
+    final firstLeaf = resolvedMeta.btreeFirstLeaf;
+    final lastLeaf = resolvedMeta.btreeLastLeaf;
+
+    Future<void> prewarmLeaf(TreePagePtr ptr) async {
+      if (ptr.isNull) return;
+      final cacheKey = [tableName, indexName, ptr.partitionNo, ptr.pageNo];
+      final alreadyCached = _leafPageCache.containsKey(cacheKey);
+      await _readLeaf(
+        tableName,
+        indexName,
+        resolvedMeta,
+        ptr,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      if (!alreadyCached) {
+        loadedBytes += pageSize;
+      }
+    }
+
+    await prewarmLeaf(firstLeaf);
+    if (lastLeaf != firstLeaf) {
+      await prewarmLeaf(lastLeaf);
+    }
+
+    return loadedBytes;
+  }
+
   /// Get partition file path using the dirIndex from partition meta.
   Future<String> _partitionFilePath(String tableName, String indexName,
       IndexMeta meta, int partitionNo) async {
@@ -359,6 +405,52 @@ final class IndexTreePartitionManager {
     }
 
     return cur;
+  }
+
+  Future<TreePagePtr> _locateRightmostLeafFast(
+    String tableName,
+    String indexName,
+    IndexMeta meta, {
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final root = meta.btreeRoot;
+    final lastLeaf = meta.btreeLastLeaf;
+    if (root.isNull) return lastLeaf;
+    if (meta.btreeHeight <= 0) return root;
+    if (lastLeaf.isNull) {
+      return _locateRightmostLeaf(
+        tableName,
+        indexName,
+        meta,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+    }
+
+    try {
+      final leaf = await _readLeaf(
+        tableName,
+        indexName,
+        meta,
+        lastLeaf,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      final looksValid = leaf.next.isNull &&
+          (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalEntries <= 0);
+      if (looksValid) {
+        return lastLeaf;
+      }
+    } catch (_) {}
+
+    return _locateRightmostLeaf(
+      tableName,
+      indexName,
+      meta,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+    );
   }
 
   /// Apply index deltas (put/delete) to paged tree.
@@ -1828,8 +1920,9 @@ final class IndexTreePartitionManager {
         );
       } else {
         // Reverse scan from end (Infinity).
-        // Robustness: descend tree to find true last leaf
-        leafPtr = await _locateRightmostLeaf(
+        // Fast path: trust meta.btreeLastLeaf when it still points to the
+        // boundary leaf, and fall back to a full right-edge descent otherwise.
+        leafPtr = await _locateRightmostLeafFast(
           tableName,
           indexName,
           meta,
