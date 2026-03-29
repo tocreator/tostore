@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
 
 import 'log_service.dart';
@@ -9,8 +12,13 @@ import 'log_service.dart';
 /// It covers basic CRUD, upsert, joins, multi-space, and various edge cases.
 class DatabaseTester {
   static const bool _isWasmBuild =
-      bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
+      kIsWasm || bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
   // These tests currently pull in code paths that break dart2wasm/wasm-opt.
+  static const String _schemaUpgradeLegacyUsersTable =
+      'mobile_upgrade_users_legacy';
+  static const String _schemaUpgradeUsersTable = 'mobile_upgrade_users';
+  static const String _schemaUpgradePostsTable = 'mobile_upgrade_posts';
+  static const String _schemaUpgradeAuditTable = 'mobile_upgrade_audit_logs';
 
   final ToStore db;
   final LogService log;
@@ -86,6 +94,10 @@ class DatabaseTester {
         {'name': 'Transaction Operations', 'test': _testTransactionOperations},
         {'name': 'Backup & Restore', 'test': _testBackupAndRestore},
         if (!_isWasmBuild) ...[
+          {
+            'name': 'Instance Schema Auto Upgrade',
+            'test': _testInstanceSchemaAutoUpgrade
+          },
           {
             'name': 'Advanced Queries & Edge Cases',
             'test': _testAdvancedQueriesAndEdgeCases
@@ -212,6 +224,592 @@ class DatabaseTester {
       isTestPassed = false;
       _failTest('Exception in _testClearAndDeleteAll: $e\n$s');
     }
+    return isTestPassed;
+  }
+
+  Future<String> _resolveSchemaAutoUpgradeTestDbPath() async {
+    final configuredDbPath = db.config.dbPath;
+    if (configuredDbPath != null && configuredDbPath.isNotEmpty) {
+      return configuredDbPath;
+    }
+
+    final currentInstancePath = db.instancePath;
+    if (currentInstancePath != null &&
+        currentInstancePath.isNotEmpty &&
+        !currentInstancePath.startsWith('memory://')) {
+      return p.dirname(currentInstancePath);
+    }
+
+    if (kIsWeb) {
+      return 'common';
+    }
+
+    final docDir = await getApplicationDocumentsDirectory();
+    return p.join(docDir.path, 'common');
+  }
+
+  Future<DataStoreConfig> _buildSchemaAutoUpgradeTestConfig() async {
+    final resolvedDbPath = await _resolveSchemaAutoUpgradeTestDbPath();
+    final uniqueSuffix =
+        '${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(1 << 20)}';
+
+    return db.config.copyWith(
+      dbPath: resolvedDbPath,
+      dbName: '${db.config.dbName}_schema_upgrade_validation_$uniqueSuffix',
+      spaceName: 'default',
+      enableLog: true,
+      logLevel: LogLevel.warn,
+    );
+  }
+
+  List<TableSchema> _buildSchemaAutoUpgradeOldSchemas() {
+    return [
+      const TableSchema(
+        name: _schemaUpgradeLegacyUsersTable,
+        tableId: 'mobile_upgrade_users_table',
+        primaryKeyConfig: PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          FieldSchema(
+            name: 'username',
+            type: DataType.text,
+            nullable: false,
+            unique: true,
+            maxLength: 24,
+            fieldId: 'username',
+          ),
+          FieldSchema(
+            name: 'nickname',
+            type: DataType.text,
+            maxLength: 20,
+            fieldId: 'display_name',
+          ),
+          FieldSchema(
+            name: 'status',
+            type: DataType.text,
+            nullable: false,
+            defaultValue: 'active',
+            maxLength: 12,
+            fieldId: 'status',
+          ),
+          FieldSchema(
+            name: 'points',
+            type: DataType.integer,
+            nullable: false,
+            defaultValue: 0,
+            fieldId: 'points',
+          ),
+          FieldSchema(
+            name: 'legacy_note',
+            type: DataType.text,
+            fieldId: 'legacy_note',
+          ),
+        ],
+        indexes: [
+          IndexSchema(fields: ['status']),
+        ],
+      ),
+      TableSchema(
+        name: _schemaUpgradePostsTable,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          const FieldSchema(
+            name: 'title',
+            type: DataType.text,
+            nullable: false,
+            maxLength: 60,
+            fieldId: 'title',
+          ),
+          const FieldSchema(
+            name: 'body',
+            type: DataType.text,
+            fieldId: 'content',
+          ),
+          const FieldSchema(
+            name: 'user_id',
+            type: DataType.integer,
+            nullable: false,
+            fieldId: 'user_id',
+          ),
+        ],
+        foreignKeys: [
+          ForeignKeySchema(
+            name: 'fk_mobile_upgrade_posts_user',
+            fields: ['user_id'],
+            referencedTable: _schemaUpgradeLegacyUsersTable,
+            referencedFields: ['id'],
+            onDelete: ForeignKeyCascadeAction.cascade,
+            onUpdate: ForeignKeyCascadeAction.cascade,
+          ),
+        ],
+        indexes: [
+          const IndexSchema(fields: ['user_id']),
+        ],
+      ),
+    ];
+  }
+
+  List<TableSchema> _buildSchemaAutoUpgradeNewSchemas() {
+    return [
+      const TableSchema(
+        name: _schemaUpgradeUsersTable,
+        tableId: 'mobile_upgrade_users_table',
+        primaryKeyConfig: PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          FieldSchema(
+            name: 'username',
+            type: DataType.text,
+            nullable: false,
+            unique: true,
+            maxLength: 32,
+            comment: 'login name',
+            fieldId: 'username',
+          ),
+          FieldSchema(
+            name: 'display_name',
+            type: DataType.text,
+            maxLength: 40,
+            comment: 'renamed from nickname',
+            fieldId: 'display_name',
+          ),
+          FieldSchema(
+            name: 'status',
+            type: DataType.text,
+            nullable: false,
+            defaultValue: 'active',
+            maxLength: 16,
+            comment: 'account status',
+            fieldId: 'status',
+          ),
+          FieldSchema(
+            name: 'points',
+            type: DataType.integer,
+            nullable: false,
+            defaultValue: 0,
+            minValue: 0,
+            maxValue: 100000,
+            comment: 'loyalty points',
+            fieldId: 'points',
+          ),
+          FieldSchema(
+            name: 'tier',
+            type: DataType.text,
+            nullable: false,
+            defaultValue: 'standard',
+            maxLength: 16,
+            fieldId: 'tier',
+          ),
+        ],
+        indexes: [
+          IndexSchema(fields: ['status']),
+        ],
+      ),
+      TableSchema(
+        name: _schemaUpgradePostsTable,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          const FieldSchema(
+            name: 'title',
+            type: DataType.text,
+            nullable: false,
+            maxLength: 120,
+            fieldId: 'title',
+          ),
+          const FieldSchema(
+            name: 'content',
+            type: DataType.text,
+            fieldId: 'content',
+          ),
+          const FieldSchema(
+            name: 'user_id',
+            type: DataType.integer,
+            nullable: false,
+            fieldId: 'user_id',
+          ),
+          const FieldSchema(
+            name: 'is_published',
+            type: DataType.boolean,
+            nullable: false,
+            defaultValue: true,
+            fieldId: 'is_published',
+          ),
+        ],
+        foreignKeys: [
+          ForeignKeySchema(
+            name: 'fk_mobile_upgrade_posts_user',
+            fields: ['user_id'],
+            referencedTable: _schemaUpgradeUsersTable,
+            referencedFields: ['id'],
+            onDelete: ForeignKeyCascadeAction.cascade,
+            onUpdate: ForeignKeyCascadeAction.cascade,
+          ),
+        ],
+        indexes: [
+          const IndexSchema(fields: ['user_id']),
+        ],
+      ),
+      const TableSchema(
+        name: _schemaUpgradeAuditTable,
+        primaryKeyConfig: PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          FieldSchema(
+            name: 'entity_type',
+            type: DataType.text,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: 'entity_id',
+            type: DataType.integer,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: 'action',
+            type: DataType.text,
+            nullable: false,
+          ),
+        ],
+      ),
+    ];
+  }
+
+  Future<void> _deleteSchemaAutoUpgradeTestDatabase(
+      DataStoreConfig config) async {
+    ToStore? cleanupDb;
+    try {
+      cleanupDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: const [],
+        applyActiveSpaceOnDefault: false,
+      );
+      await cleanupDb.deleteDatabase(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+      );
+      cleanupDb = null;
+    } catch (e) {
+      log.add(
+        'Schema auto-upgrade test database cleanup skipped: $e',
+        LogType.warn,
+      );
+    } finally {
+      if (cleanupDb != null) {
+        try {
+          await cleanupDb.close();
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _closeQuietly(ToStore? database) async {
+    if (database == null) {
+      return;
+    }
+    try {
+      await database.close();
+    } catch (_) {}
+  }
+
+  /// Validates schema-based auto migration on reopen using an isolated database.
+  Future<bool> _testInstanceSchemaAutoUpgrade() async {
+    if (db.config.persistenceMode == PersistenceMode.memory) {
+      _passTest(
+        'Schema auto upgrade reopen test skipped because the current instance uses memory persistence.',
+      );
+      return true;
+    }
+
+    bool isTestPassed = true;
+    final config = await _buildSchemaAutoUpgradeTestConfig();
+    final oldSchemas = _buildSchemaAutoUpgradeOldSchemas();
+    final newSchemas = _buildSchemaAutoUpgradeNewSchemas();
+    ToStore? oldDb;
+    ToStore? migratedDb;
+    ToStore? reopenedDb;
+
+    try {
+      oldDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: oldSchemas,
+        applyActiveSpaceOnDefault: false,
+      );
+
+      final insertUser = await oldDb.insert(_schemaUpgradeLegacyUsersTable, {
+        'username': 'legacy_user',
+        'nickname': 'Legacy Nick',
+        'status': 'active',
+        'points': 88,
+        'legacy_note': 'to be removed',
+      });
+      isTestPassed &= _expect(
+        'Old schema insert into renamed table should succeed',
+        insertUser.isSuccess,
+        true,
+      );
+      if (!isTestPassed || insertUser.successKeys.isEmpty) {
+        return false;
+      }
+      final userId = insertUser.successKeys.first;
+
+      final insertPost = await oldDb.insert(_schemaUpgradePostsTable, {
+        'title': 'Legacy post title',
+        'body': 'legacy body content',
+        'user_id': userId,
+      });
+      isTestPassed &= _expect(
+        'Old schema insert into child table should succeed',
+        insertPost.isSuccess,
+        true,
+      );
+      if (!isTestPassed) {
+        return false;
+      }
+
+      await oldDb.close();
+      oldDb = null;
+
+      migratedDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: newSchemas,
+        applyActiveSpaceOnDefault: false,
+      );
+
+      isTestPassed &= _expect(
+        'Legacy renamed table should not exist after reopen migration',
+        await migratedDb.tableExists(_schemaUpgradeLegacyUsersTable),
+        false,
+      );
+      isTestPassed &= _expect(
+        'Renamed users table should exist after reopen migration',
+        await migratedDb.tableExists(_schemaUpgradeUsersTable),
+        true,
+      );
+      isTestPassed &= _expect(
+        'New audit table should be created during reopen migration',
+        await migratedDb.tableExists(_schemaUpgradeAuditTable),
+        true,
+      );
+
+      final migratedUserSchema =
+          await migratedDb.getTableSchema(_schemaUpgradeUsersTable);
+      if (migratedUserSchema == null) {
+        return _failTest(
+          'Migrated users schema not found after reopen migration.',
+        );
+      }
+
+      final usernameField = migratedUserSchema.fields.firstWhere(
+        (field) => field.name == 'username',
+      );
+      final displayNameField = migratedUserSchema.fields.firstWhere(
+        (field) => field.name == 'display_name',
+      );
+      final statusField = migratedUserSchema.fields.firstWhere(
+        (field) => field.name == 'status',
+      );
+      final pointsField = migratedUserSchema.fields.firstWhere(
+        (field) => field.name == 'points',
+      );
+      final tierField = migratedUserSchema.fields.firstWhere(
+        (field) => field.name == 'tier',
+      );
+
+      isTestPassed &= _expect(
+          'Migrated username field maxLength', usernameField.maxLength, 32);
+      isTestPassed &= _expect(
+        'Migrated display_name field should keep renamed fieldId',
+        displayNameField.fieldId,
+        'display_name',
+      );
+      isTestPassed &= _expect(
+        'Migrated display_name field maxLength',
+        displayNameField.maxLength,
+        40,
+      );
+      isTestPassed &= _expect('Migrated status field comment',
+          statusField.comment, 'account status');
+      isTestPassed &= _expect(
+        'Migrated points field minValue',
+        pointsField.minValue,
+        0,
+      );
+      isTestPassed &= _expect(
+        'Migrated points field maxValue',
+        pointsField.maxValue,
+        100000,
+      );
+      isTestPassed &= _expect(
+        'Migrated tier field default value',
+        tierField.defaultValue,
+        'standard',
+      );
+
+      final migratedPostsSchema =
+          await migratedDb.getTableSchema(_schemaUpgradePostsTable);
+      if (migratedPostsSchema == null) {
+        return _failTest(
+          'Migrated posts schema not found after reopen migration.',
+        );
+      }
+      isTestPassed &= _expect(
+        'Child table foreign key should point to renamed users table',
+        migratedPostsSchema.foreignKeys.first.referencedTable,
+        _schemaUpgradeUsersTable,
+      );
+
+      final migratedUsers = await migratedDb
+          .query(_schemaUpgradeUsersTable)
+          .orderByAsc('id')
+          .limit(10);
+      isTestPassed &= _expect(
+        'Migrated renamed users table row count',
+        migratedUsers.length,
+        1,
+      );
+      if (!isTestPassed || migratedUsers.data.isEmpty) {
+        return false;
+      }
+
+      final migratedUser = migratedUsers.data.first;
+      isTestPassed &= _expect(
+          'Migrated username value', migratedUser['username'], 'legacy_user');
+      isTestPassed &= _expect(
+        'Migrated renamed field value',
+        migratedUser['display_name'],
+        'Legacy Nick',
+      );
+      isTestPassed &=
+          _expect('Migrated points value', migratedUser['points'], 88);
+      isTestPassed &= _expect(
+        'Migrated added field default value',
+        migratedUser['tier'],
+        'standard',
+      );
+      isTestPassed &= _expect(
+        'Removed field should not appear in migrated user row',
+        migratedUser.containsKey('legacy_note'),
+        false,
+      );
+
+      final migratedPosts = await migratedDb
+          .query(_schemaUpgradePostsTable)
+          .orderByAsc('id')
+          .limit(10);
+      isTestPassed &=
+          _expect('Migrated child table row count', migratedPosts.length, 1);
+      if (!isTestPassed || migratedPosts.data.isEmpty) {
+        return false;
+      }
+
+      final migratedPost = migratedPosts.data.first;
+      isTestPassed &= _expect(
+        'Migrated child field rename should preserve data',
+        migratedPost['content'],
+        'legacy body content',
+      );
+      isTestPassed &= _expect(
+        'Migrated child added field default should be applied',
+        migratedPost['is_published'],
+        true,
+      );
+
+      final insertAudit = await migratedDb.insert(_schemaUpgradeAuditTable, {
+        'entity_type': 'user',
+        'entity_id': userId,
+        'action': 'schema_upgrade_verified',
+      });
+      isTestPassed &= _expect(
+        'Insert into newly created table after migration should succeed',
+        insertAudit.isSuccess,
+        true,
+      );
+      if (!isTestPassed) {
+        return false;
+      }
+
+      await migratedDb.close();
+      migratedDb = null;
+
+      reopenedDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: newSchemas,
+        applyActiveSpaceOnDefault: false,
+      );
+
+      final reopenedUsers = await reopenedDb
+          .query(_schemaUpgradeUsersTable)
+          .orderByAsc('id')
+          .limit(10);
+      isTestPassed &= _expect(
+          'Reopened renamed users table row count', reopenedUsers.length, 1);
+      if (!isTestPassed || reopenedUsers.data.isEmpty) {
+        return false;
+      }
+      final reopenedUser = reopenedUsers.data.first;
+      isTestPassed &= _expect(
+        'Reopened renamed field value remains correct',
+        reopenedUser['display_name'],
+        'Legacy Nick',
+      );
+      isTestPassed &= _expect(
+        'Reopened added field value remains correct',
+        reopenedUser['tier'],
+        'standard',
+      );
+
+      final reopenedPosts = await reopenedDb
+          .query(_schemaUpgradePostsTable)
+          .orderByAsc('id')
+          .limit(10);
+      isTestPassed &=
+          _expect('Reopened child table row count', reopenedPosts.length, 1);
+      if (!isTestPassed || reopenedPosts.data.isEmpty) {
+        return false;
+      }
+      isTestPassed &= _expect(
+        'Reopened child renamed field remains correct',
+        reopenedPosts.data.first['content'],
+        'legacy body content',
+      );
+
+      final auditCount =
+          await reopenedDb.query(_schemaUpgradeAuditTable).count();
+      isTestPassed &= _expect(
+        'Newly created table data should persist after second reopen',
+        auditCount,
+        1,
+      );
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testInstanceSchemaAutoUpgrade: $e\n$s');
+    } finally {
+      await _closeQuietly(oldDb);
+      await _closeQuietly(migratedDb);
+      await _closeQuietly(reopenedDb);
+      await _deleteSchemaAutoUpgradeTestDatabase(config);
+    }
+
     return isTestPassed;
   }
 

@@ -1,8 +1,8 @@
-import '../model/space_config.dart';
-import '../model/global_config.dart';
-import '../model/meta_info.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
+import '../model/global_config.dart';
+import '../model/meta_info.dart';
+import '../model/space_config.dart';
 import 'data_store_impl.dart';
 
 /// Directory manager, responsible for table directory allocation and mapping logic
@@ -67,6 +67,57 @@ class DirectoryManager {
       Logger.error(
         'Failed to get table directory path: $e',
         label: 'DirectoryManager.getTableDirectoryPath',
+      );
+      return null;
+    }
+  }
+
+  /// Get table directory path using an already known scope.
+  ///
+  /// This avoids depending on schema lookup during rename flows where the
+  /// schema name may already have been updated but the physical directory
+  /// mapping has not yet been rewritten for every space.
+  Future<String?> getTableDirectoryPathByScope(
+    String tableName, {
+    required bool isGlobal,
+    String? spaceName,
+  }) async {
+    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
+    final tableKey = _getTableKey(spacePrefix, tableName);
+
+    try {
+      if (isGlobal) {
+        final globalConfig = await _dataStore.getGlobalConfig();
+        if (globalConfig == null) return null;
+
+        final dirInfo = globalConfig.tableDirectoryMap[tableKey];
+        if (dirInfo == null) return null;
+
+        return buildTableDirectoryPath(
+          tableName,
+          isGlobal: true,
+          dirIndex: dirInfo.dirIndex,
+          spaceName: currentSpaceName,
+        );
+      }
+
+      final spaceConfig = await _dataStore.getSpaceConfig();
+      if (spaceConfig == null) return null;
+
+      final dirInfo = spaceConfig.tableDirectoryMap[tableKey];
+      if (dirInfo == null) return null;
+
+      return buildTableDirectoryPath(
+        tableName,
+        isGlobal: false,
+        dirIndex: dirInfo.dirIndex,
+        spaceName: currentSpaceName,
+      );
+    } catch (e) {
+      Logger.error(
+        'Failed to get scoped table directory path: $e',
+        label: 'DirectoryManager.getTableDirectoryPathByScope',
       );
       return null;
     }
@@ -283,8 +334,10 @@ class DirectoryManager {
 
   /// Get table directory information
   Future<TableDirectoryInfo?> getTableDirectoryInfo(
-      String tableName, bool isGlobal) async {
-    final spacePrefix = isGlobal ? 'global' : _dataStore.config.spaceName;
+      String tableName, bool isGlobal,
+      {String? spaceName}) async {
+    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final tableKey = _getTableKey(spacePrefix, tableName);
 
     if (isGlobal) {
@@ -357,7 +410,10 @@ class DirectoryManager {
 
   /// Get table actual path
   /// If table does not exist, return null
-  Future<String?> getTablePathIfExists(String tableName) async {
+  Future<String?> getTablePathIfExists(
+    String tableName, {
+    bool createIfMappingMissing = true,
+  }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return null;
@@ -365,6 +421,13 @@ class DirectoryManager {
     final isGlobal = schema.isGlobal;
     final dirInfo = await getTableDirectoryInfo(tableName, isGlobal);
     if (dirInfo == null) {
+      if (!createIfMappingMissing) {
+        Logger.warn(
+          'Table directory mapping missing for existing schema: $tableName',
+          label: 'DirectoryManager.getTablePathIfExists',
+        );
+        return null;
+      }
       return await createTablePathIfNotExists(tableName, isGlobal);
     }
 
@@ -378,6 +441,24 @@ class DirectoryManager {
   /// Get table path (internal method)
   String _getTablePath(String tableName, bool isGlobal, int dirIndex) {
     final subDir = _getTableSubDirectoryPath(isGlobal, dirIndex);
+    return pathJoin(subDir, tableName);
+  }
+
+  /// Build a table directory path from a resolved directory shard.
+  String buildTableDirectoryPath(
+    String tableName, {
+    required bool isGlobal,
+    required int dirIndex,
+    String? spaceName,
+  }) {
+    final subDir = isGlobal
+        ? pathJoin(_dataStore.pathManager.getGlobalPath(), 'tables_$dirIndex')
+        : pathJoin(
+            _dataStore.pathManager.getSpacePath(
+              spaceName: spaceName ?? _dataStore.currentSpaceName,
+            ),
+            'tables_$dirIndex',
+          );
     return pathJoin(subDir, tableName);
   }
 
@@ -462,6 +543,83 @@ class DirectoryManager {
       Logger.error(
         'Failed to remove table directory mapping: $e',
         label: 'DirectoryManager.removeTableDirectoryMapping',
+      );
+      return false;
+    }
+  }
+
+  /// Rename a table directory mapping while preserving the existing dirIndex.
+  Future<bool> renameTableDirectoryMapping(
+    String oldTableName,
+    String newTableName, {
+    required bool isGlobal,
+    String? spaceName,
+  }) async {
+    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
+    final oldTableKey = _getTableKey(spacePrefix, oldTableName);
+    final newTableKey = _getTableKey(spacePrefix, newTableName);
+
+    try {
+      if (isGlobal) {
+        final globalConfig = await _dataStore.getGlobalConfig();
+        if (globalConfig == null) return false;
+
+        final existingNew = globalConfig.tableDirectoryMap[newTableKey];
+        final existingOld = globalConfig.tableDirectoryMap[oldTableKey];
+        if (existingOld == null) {
+          return existingNew != null;
+        }
+
+        if (existingNew != null &&
+            (existingNew.dirIndex != existingOld.dirIndex ||
+                existingNew.isGlobal != existingOld.isGlobal)) {
+          throw StateError(
+            'Conflicting directory mapping already exists for table $newTableName',
+          );
+        }
+
+        final updatedTableDirMap =
+            Map<String, TableDirectoryInfo>.from(globalConfig.tableDirectoryMap)
+              ..remove(oldTableKey)
+              ..[newTableKey] = existingOld;
+
+        await _dataStore.saveGlobalConfig(
+          globalConfig.copyWith(tableDirectoryMap: updatedTableDirMap),
+        );
+        return true;
+      }
+
+      final spaceConfig = await _dataStore.getSpaceConfig();
+      if (spaceConfig == null) return false;
+
+      final existingNew = spaceConfig.tableDirectoryMap[newTableKey];
+      final existingOld = spaceConfig.tableDirectoryMap[oldTableKey];
+      if (existingOld == null) {
+        return existingNew != null;
+      }
+
+      if (existingNew != null &&
+          (existingNew.dirIndex != existingOld.dirIndex ||
+              existingNew.isGlobal != existingOld.isGlobal)) {
+        throw StateError(
+          'Conflicting directory mapping already exists for table $newTableName',
+        );
+      }
+
+      final updatedTableDirMap =
+          Map<String, TableDirectoryInfo>.from(spaceConfig.tableDirectoryMap)
+            ..remove(oldTableKey)
+            ..[newTableKey] = existingOld;
+
+      await _dataStore.saveSpaceConfigToFile(
+        spaceConfig.copyWith(tableDirectoryMap: updatedTableDirMap),
+      );
+      return true;
+    } catch (e) {
+      Logger.error(
+        'Failed to rename table directory mapping: $e',
+        label: 'DirectoryManager.renameTableDirectoryMapping',
       );
       return false;
     }

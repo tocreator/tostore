@@ -101,6 +101,11 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<void> moveDirectory(String sourcePath, String destinationPath) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }

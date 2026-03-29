@@ -634,6 +634,29 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
+  @override
+  Future<void> moveDirectory(String sourcePath, String targetPath) async {
+    await _initCompleter.future;
+    final normalizedSourcePath = _normalizePath(sourcePath);
+    final normalizedTargetPath = _normalizePath(targetPath);
+    if (normalizedSourcePath == normalizedTargetPath) {
+      return;
+    }
+
+    final sourceExists = await existsDirectory(normalizedSourcePath);
+    if (!sourceExists) {
+      return;
+    }
+
+    final targetExists = await existsDirectory(normalizedTargetPath);
+    if (targetExists) {
+      throw StateError('Destination directory already exists: $targetPath');
+    }
+
+    await copyDirectory(normalizedSourcePath, normalizedTargetPath);
+    await deleteDirectory(normalizedSourcePath);
+  }
+
   /// Update getFileMeta to use FileInfo structure
   Future<FileMeta?> _getFileMeta(String path) async {
     try {

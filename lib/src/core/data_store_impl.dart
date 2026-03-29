@@ -29,6 +29,7 @@ import '../model/log_config.dart';
 import '../model/memory_info.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
+import '../model/ngh_index_meta.dart';
 import '../model/query_result.dart';
 import '../model/result_type.dart';
 import '../model/space_config.dart';
@@ -1131,6 +1132,7 @@ class DataStoreImpl {
       bool closeStorage = true,
       bool keepActiveSpace = true}) async {
     if (!_isInitialized) return;
+    _isInitialized = false;
 
     try {
       // Run save/close sequence as system operation so storage locks can be acquired
@@ -1239,7 +1241,6 @@ class DataStoreImpl {
       _globalConfigCache = null;
       _spaceConfigCache = null;
 
-      _isInitialized = false;
       _initializing = false;
       _initCompleter = Completer<void>();
 
@@ -2800,7 +2801,6 @@ class DataStoreImpl {
             processFunction: processFunction,
             startPartitionNo: startPartitionNo,
             skipMaintenanceGlobalLock: true,
-            largeUpdateOpId: largeUpdateOpId,
             onPartitionFlushed: (int partitionNo) async {
               try {
                 await walManager.updateLargeUpdateCheckpoint(
@@ -3838,7 +3838,6 @@ class DataStoreImpl {
             processFunction: processFunction,
             startPartitionNo: startPartitionNo,
             skipMaintenanceGlobalLock: true,
-            largeDeleteOpId: largeDeleteOpId,
             onPartitionFlushed: (int partitionNo) async {
               try {
                 await walManager.updateLargeDeleteCheckpoint(
@@ -5377,10 +5376,12 @@ class DataStoreImpl {
 
       // From schemaManager get all tables
       final allTables = await getTableNames();
-      if (allTables.isEmpty) return;
+      if (allTables.isEmpty || !_isInitialized) return;
 
       // Sort tables by weight
       final prioritizedTables = await _prioritizeTablesByWeight(allTables);
+      if (!_isInitialized) return;
+
       final yieldController =
           YieldController('DataStoreImpl._executePrewarm', checkInterval: 1);
       const maxPrewarmTables = 50;
@@ -5392,10 +5393,11 @@ class DataStoreImpl {
       // If total table count is small, prewarm all tables to avoid missing hot
       // tables when weight data is incomplete.
       for (final tableName in selectedTables) {
+        if (!_isInitialized) break;
         try {
           // Check if table exists in current space
           final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
-          if (!tableExistsInSpace) {
+          if (!tableExistsInSpace || !_isInitialized) {
             continue;
           }
 
@@ -5413,6 +5415,7 @@ class DataStoreImpl {
                 .getBtreeIndexesFor(schema)
                 .where((index) => index.type == IndexType.btree);
             for (final index in indexes) {
+              if (!_isInitialized) break;
               final indexName = index.actualIndexName;
               final indexMeta =
                   await _indexManager?.getIndexMeta(tableName, indexName);
@@ -5431,14 +5434,19 @@ class DataStoreImpl {
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
           await yieldController.maybeYield();
         } catch (e) {
+          // If already closing/closed, suppress errors from missing managers
+          if (!_isInitialized) break;
+
           Logger.error('Load table data failed: $tableName, error: $e',
               label: 'DataStore._executePrewarm');
           continue; // Continue load other tables
         }
       }
     } catch (e) {
-      Logger.error('Error in _executePrewarm: $e',
-          label: 'DataStore._executePrewarm');
+      if (_isInitialized) {
+        Logger.error('Error in _executePrewarm: $e',
+            label: 'DataStore._executePrewarm');
+      }
     } finally {
       _isGlobalPrewarming = false;
     }
@@ -6204,6 +6212,420 @@ class DataStoreImpl {
     }
   }
 
+  /// Rename table storage and metadata as part of a migration task.
+  ///
+  /// This is intentionally more conservative than normal write paths:
+  /// it flushes pending writes first, then moves the physical table directory,
+  /// rewrites directory/schema metadata, and finally refreshes dependent caches.
+  Future<void> renameTableForMigration(
+    String oldTableName,
+    String newTableName, {
+    TableSchema? oldSchemaSnapshot,
+    bool updateSchema = true,
+    bool refreshForeignKeySystemTables = true,
+  }) async {
+    if (oldTableName == newTableName) {
+      return;
+    }
+
+    final schemaMgr = schemaManager;
+    final dirMgr = directoryManager;
+    if (schemaMgr == null || dirMgr == null) {
+      throw StateError('Database managers are not initialized');
+    }
+
+    final existingOldSchema =
+        oldSchemaSnapshot ?? await schemaMgr.getTableSchema(oldTableName);
+    final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
+    if (updateSchema &&
+        existingOldSchema != null &&
+        existingNewSchema != null &&
+        oldTableName != newTableName) {
+      throw StateError(
+        'Cannot rename table $oldTableName -> $newTableName: target table already exists',
+      );
+    }
+    final schemaForLayout = existingOldSchema ?? existingNewSchema;
+    if (schemaForLayout == null) {
+      throw StateError(
+        'Cannot rename table $oldTableName -> $newTableName: schema not found',
+      );
+    }
+
+    final isGlobal = schemaForLayout.isGlobal;
+    final renamedSchema = _schemaWithRenamedReferencedTable(
+      schemaForLayout.copyWith(name: newTableName),
+      oldTableName,
+      newTableName,
+    );
+
+    await flush();
+
+    await cacheManager.invalidateCache(oldTableName, invalidateSchema: false);
+    await cacheManager.invalidateCache(newTableName, invalidateSchema: false);
+
+    final oldDirInfo =
+        await dirMgr.getTableDirectoryInfo(oldTableName, isGlobal);
+    final newDirInfo =
+        await dirMgr.getTableDirectoryInfo(newTableName, isGlobal);
+    final oldPath = await dirMgr.getTableDirectoryPathByScope(
+      oldTableName,
+      isGlobal: isGlobal,
+    );
+    String? newPath = await dirMgr.getTableDirectoryPathByScope(
+      newTableName,
+      isGlobal: isGlobal,
+    );
+    final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
+    if (newPath == null && resolvedDirIndex != null) {
+      newPath = dirMgr.buildTableDirectoryPath(
+        newTableName,
+        isGlobal: isGlobal,
+        dirIndex: resolvedDirIndex,
+      );
+    }
+
+    final sourceExists =
+        oldPath != null && await storage.existsDirectory(oldPath);
+    final targetExists =
+        newPath != null && await storage.existsDirectory(newPath);
+    final updatedReferencingTables = <String>{};
+
+    try {
+      if (sourceExists && newPath != null && oldPath != newPath) {
+        if (targetExists) {
+          throw StateError(
+            'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
+          );
+        }
+        await storage.moveDirectory(oldPath, newPath);
+      }
+
+      final mappingRenamed = await dirMgr.renameTableDirectoryMapping(
+        oldTableName,
+        newTableName,
+        isGlobal: isGlobal,
+      );
+      if (!mappingRenamed) {
+        throw StateError(
+          'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
+        );
+      }
+
+      if (updateSchema && existingOldSchema != null) {
+        await schemaMgr.renameTableSchema(oldTableName, renamedSchema);
+        await _updateSchemasReferencingRenamedTable(
+          oldTableName,
+          newTableName,
+          updatedTables: updatedReferencingTables,
+        );
+      }
+
+      await _rewriteMovedTableMetadataAfterRename(
+        newTableName,
+        schemaForLayout,
+      );
+
+      if (refreshForeignKeySystemTables) {
+        await _refreshForeignKeyMetadataAfterRename(
+          oldTableName,
+          newTableName,
+          referencingTables: updatedReferencingTables,
+          throwOnError: true,
+        );
+      }
+    } catch (error, stackTrace) {
+      try {
+        await _rollbackRenameTableForMigration(
+          oldTableName,
+          newTableName,
+          isGlobal: isGlobal,
+          schemaForLayout: schemaForLayout,
+          existingOldSchema: existingOldSchema,
+          updateSchema: updateSchema,
+          refreshForeignKeySystemTables: refreshForeignKeySystemTables,
+          updatedReferencingTables: updatedReferencingTables,
+          oldPath: oldPath,
+          newPath: newPath,
+        );
+      } catch (rollbackError, rollbackStackTrace) {
+        Logger.error(
+          'Failed to rollback table rename $oldTableName -> $newTableName after error: $rollbackError\n$rollbackStackTrace',
+          label: 'DataStoreImpl.renameTableForMigration',
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+
+    _pathManager?.clearTableCache(oldTableName);
+    _pathManager?.clearTableCache(newTableName);
+    await cacheManager.invalidateCache(oldTableName);
+    await cacheManager.invalidateCache(newTableName);
+  }
+
+  Future<void> _rollbackRenameTableForMigration(
+    String oldTableName,
+    String newTableName, {
+    required bool isGlobal,
+    required TableSchema schemaForLayout,
+    required TableSchema? existingOldSchema,
+    required bool updateSchema,
+    required bool refreshForeignKeySystemTables,
+    required Set<String> updatedReferencingTables,
+    String? oldPath,
+    String? newPath,
+  }) async {
+    final schemaMgr = schemaManager;
+    final dirMgr = directoryManager;
+    if (schemaMgr == null || dirMgr == null) {
+      throw StateError('Database managers are not initialized');
+    }
+
+    final rollbackSchema = existingOldSchema ??
+        _schemaWithRenamedReferencedTable(
+          schemaForLayout.copyWith(name: oldTableName),
+          newTableName,
+          oldTableName,
+        );
+
+    if (updateSchema && updatedReferencingTables.isNotEmpty) {
+      await _updateSchemasReferencingRenamedTable(
+        newTableName,
+        oldTableName,
+        candidateTables: updatedReferencingTables,
+      );
+    }
+
+    if (updateSchema) {
+      final currentOldSchema = await schemaMgr.getTableSchema(oldTableName);
+      final currentNewSchema = await schemaMgr.getTableSchema(newTableName);
+      if (currentOldSchema == null && currentNewSchema != null) {
+        await schemaMgr.renameTableSchema(newTableName, rollbackSchema);
+      }
+    }
+
+    final currentOldDirInfo =
+        await dirMgr.getTableDirectoryInfo(oldTableName, isGlobal);
+    final currentNewDirInfo =
+        await dirMgr.getTableDirectoryInfo(newTableName, isGlobal);
+    if (currentOldDirInfo == null && currentNewDirInfo != null) {
+      final restored = await dirMgr.renameTableDirectoryMapping(
+        newTableName,
+        oldTableName,
+        isGlobal: isGlobal,
+      );
+      if (!restored) {
+        throw StateError(
+          'Failed to restore directory mapping for table $oldTableName during rollback',
+        );
+      }
+    }
+
+    if (oldPath != null && newPath != null && oldPath != newPath) {
+      final oldExists = await storage.existsDirectory(oldPath);
+      final newExists = await storage.existsDirectory(newPath);
+      if (!oldExists && newExists) {
+        await storage.moveDirectory(newPath, oldPath);
+      }
+    }
+
+    _pathManager?.clearTableCache(oldTableName);
+    _pathManager?.clearTableCache(newTableName);
+    await cacheManager.invalidateCache(oldTableName, invalidateSchema: false);
+    await cacheManager.invalidateCache(newTableName, invalidateSchema: false);
+
+    final restoredSchema = await schemaMgr.getTableSchema(oldTableName);
+    if (restoredSchema != null) {
+      await _rewriteMovedTableMetadataAfterRename(
+        oldTableName,
+        rollbackSchema,
+      );
+    }
+
+    if (refreshForeignKeySystemTables && updateSchema) {
+      await _refreshForeignKeyMetadataAfterRename(
+        newTableName,
+        oldTableName,
+        referencingTables: updatedReferencingTables,
+        throwOnError: true,
+      );
+    }
+  }
+
+  TableSchema _schemaWithRenamedReferencedTable(
+    TableSchema schema,
+    String oldTableName,
+    String newTableName,
+  ) {
+    var changed = false;
+    final updatedForeignKeys = schema.foreignKeys.map((fk) {
+      if (fk.referencedTable != oldTableName) {
+        return fk;
+      }
+      changed = true;
+      return fk.copyWith(referencedTable: newTableName);
+    }).toList(growable: false);
+
+    if (!changed) {
+      return schema;
+    }
+    return schema.copyWith(foreignKeys: updatedForeignKeys);
+  }
+
+  Future<void> _updateSchemasReferencingRenamedTable(
+      String oldTableName, String newTableName,
+      {Iterable<String>? candidateTables, Set<String>? updatedTables}) async {
+    final schemaMgr = schemaManager;
+    if (schemaMgr == null) {
+      return;
+    }
+
+    final tablesToScan = candidateTables ?? await schemaMgr.listAllTables();
+
+    for (final tableName in tablesToScan) {
+      if (tableName == newTableName) continue;
+
+      final schema = await schemaMgr.getTableSchema(tableName);
+      if (schema == null) {
+        continue;
+      }
+
+      final updatedSchema = _schemaWithRenamedReferencedTable(
+        schema,
+        oldTableName,
+        newTableName,
+      );
+      if (identical(updatedSchema, schema)) {
+        continue;
+      }
+      await schemaMgr.saveTableSchema(tableName, updatedSchema);
+      updatedTables?.add(tableName);
+    }
+  }
+
+  Future<void> _rewriteMovedTableMetadataAfterRename(
+    String tableName,
+    TableSchema schemaForLayout,
+  ) async {
+    final currentTableMeta = await tableDataManager.getTableMeta(tableName);
+    if (currentTableMeta != null && currentTableMeta.name != tableName) {
+      await tableDataManager.updateTableMeta(
+        tableName,
+        currentTableMeta.copyWith(name: tableName),
+      );
+    }
+
+    final btreeIndexes =
+        schemaManager?.getBtreeIndexesFor(schemaForLayout) ?? <IndexSchema>[];
+    for (final index in btreeIndexes) {
+      final indexMeta =
+          await indexManager?.getIndexMeta(tableName, index.actualIndexName);
+      if (indexMeta == null || indexMeta.tableName == tableName) {
+        continue;
+      }
+      await indexManager?.updateIndexMeta(
+        tableName: tableName,
+        indexName: index.actualIndexName,
+        updatedMeta: indexMeta.copyWith(tableName: tableName),
+      );
+    }
+
+    final vectorIndexes =
+        schemaManager?.getVectorIndexesFor(schemaForLayout) ?? <IndexSchema>[];
+    for (final index in vectorIndexes) {
+      final metaPath =
+          await pathManager.getNghMetaPath(tableName, index.actualIndexName);
+      if (!await storage.existsFile(metaPath)) {
+        continue;
+      }
+
+      final content = await storage.readAsString(metaPath);
+      if (content == null || content.isEmpty) {
+        continue;
+      }
+
+      final json = jsonDecode(content);
+      if (json is! Map) {
+        continue;
+      }
+
+      final meta = NghIndexMeta.fromJson(Map<String, dynamic>.from(json));
+      final updatedMeta = meta.copyWith(
+        tableName: tableName,
+        nodeIdToPkMeta: meta.nodeIdToPkMeta?.copyWith(tableName: tableName),
+        pkToNodeIdMeta: meta.pkToNodeIdMeta?.copyWith(tableName: tableName),
+      );
+
+      if (updatedMeta.tableName == meta.tableName &&
+          updatedMeta.nodeIdToPkMeta?.tableName ==
+              meta.nodeIdToPkMeta?.tableName &&
+          updatedMeta.pkToNodeIdMeta?.tableName ==
+              meta.pkToNodeIdMeta?.tableName) {
+        continue;
+      }
+
+      await storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+
+      if (updatedMeta.nodeIdToPkMeta != null) {
+        await indexManager?.updateIndexMeta(
+          tableName: tableName,
+          indexName: updatedMeta.nid2pkIndexName,
+          updatedMeta: updatedMeta.nodeIdToPkMeta,
+        );
+      }
+      if (updatedMeta.pkToNodeIdMeta != null) {
+        await indexManager?.updateIndexMeta(
+          tableName: tableName,
+          indexName: updatedMeta.pk2nidIndexName,
+          updatedMeta: updatedMeta.pkToNodeIdMeta,
+        );
+      }
+    }
+  }
+
+  Future<void> _refreshForeignKeyMetadataAfterRename(
+    String oldTableName,
+    String newTableName, {
+    Iterable<String> referencingTables = const <String>[],
+    bool throwOnError = false,
+  }) async {
+    final fkManager = foreignKeyManager;
+    final schemaMgr = schemaManager;
+    if (fkManager == null || schemaMgr == null) {
+      return;
+    }
+
+    final tablesToRefresh = <String>{newTableName};
+    tablesToRefresh.addAll(referencingTables);
+
+    final schemasToRefresh = <String, TableSchema>{};
+    for (final tableName in tablesToRefresh) {
+      final schema = await schemaMgr.getTableSchema(tableName);
+      if (schema != null) {
+        schemasToRefresh[tableName] = schema;
+      }
+    }
+
+    final requiresRefresh = referencingTables.isNotEmpty ||
+        schemasToRefresh.values.any((schema) => schema.foreignKeys.isNotEmpty);
+    await fkManager.cleanupSystemTableForDroppedTable(
+      oldTableName,
+      throwOnError: throwOnError,
+    );
+
+    if (!requiresRefresh) {
+      return;
+    }
+
+    for (final entry in schemasToRefresh.entries) {
+      await fkManager.updateSystemTableForTable(
+        entry.key,
+        entry.value,
+        throwOnError: throwOnError,
+      );
+    }
+  }
+
   /// Invalidate all caches for table
   Future<void> _invalidateTableCaches(String tableName) async {
     await cacheManager.invalidateCache(tableName);
@@ -6492,9 +6914,6 @@ class DataStoreImpl {
     try {
       // Get space configuration
       var config = await getSpaceConfig();
-      // Get only user-created tables by using onlyUserTables=true
-      final allTables =
-          await schemaManager?.listAllTables(onlyUserTables: true) ?? [];
 
       // Check if statistics are stale (older than 1 hour) or if cache is disabled
       final currentTime = DateTime.now();
@@ -6508,14 +6927,12 @@ class DataStoreImpl {
         config = await getSpaceConfig();
       }
 
-      // Get only tables that exist in the current space
-      final userTables = <String>[];
-      for (final tableName in allTables) {
-        // Check if the table is used in the current space
-        if (await tableExistsInCurrentSpace(tableName)) {
-          userTables.add(tableName);
-        }
-      }
+      final spacePrefix = '$_currentSpaceName:';
+      final userTables = (config?.tableDirectoryMap.keys ?? const <String>[])
+          .where((tableKey) => tableKey.startsWith(spacePrefix))
+          .map((tableKey) => tableKey.substring(spacePrefix.length))
+          .where((tableName) => !SystemTable.isSystemTable(tableName))
+          .toList(growable: false);
 
       // Create the SpaceInfo object with user-table information
       return SpaceInfo(

@@ -21,7 +21,7 @@ class LogService {
   void add(String message,
       [LogType type = LogType.info, bool fromCallback = false]) {
     // To avoid UI freezing with a large number of logs, we keep a reasonable limit.
-    const maxLogs = 200;
+    const maxLogs = 300;
     final now = DateTime.now();
     final timestampString =
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';

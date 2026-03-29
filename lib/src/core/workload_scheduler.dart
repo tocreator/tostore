@@ -4,18 +4,23 @@ import 'dart:math';
 /// Centralized concurrency scheduler implementing global token budgeting.
 ///
 /// - Global capacity = [globalMax] tokens
-/// - Per type capacity = floor(globalMax * share[type])
+/// - Per type baseline = floor(globalMax * share[type])
 /// - Call [acquire] to reserve tokens for a workload; call [release] when done.
 ///
-/// Notes:
-/// - A "token" equals the energy cost of 1 flush/write unit.
-/// - Convert tokens to task concurrency via: floor(tokens / costPerTask).
-/// - For critical types (flush/query/maintenance), [acquire] guarantees at least 1 token
-///   once capacity becomes available (no preemption).
+/// Long-running callers should split work into smaller chunks and keep reporting
+/// their remaining total demand through [totalPlannedTokens]. That allows the
+/// scheduler to rebalance capacity across rounds instead of letting the first
+/// requester monopolize the entire budget for too long.
 class WorkloadScheduler {
   final int globalMax;
   final Map<WorkloadType, double> _share;
   final Map<WorkloadType, int> _usedTokens = {
+    WorkloadType.flush: 0,
+    WorkloadType.query: 0,
+    WorkloadType.maintenance: 0,
+    WorkloadType.aux: 0,
+  };
+  final Map<WorkloadType, int> _activeDemandTokens = {
     WorkloadType.flush: 0,
     WorkloadType.query: 0,
     WorkloadType.maintenance: 0,
@@ -39,197 +44,471 @@ class WorkloadScheduler {
               WorkloadType.aux: 0.05,
             };
 
-  /// Capacity in tokens for a given type.
+  /// Capacity in tokens for a given type under the current declared demand.
   ///
-  /// This supports **Elastic Capacity**:
-  /// - If system is under contention (other queues have waiters), returns [share] based limit.
-  /// - If system is idle (other queues empty), returns [globalMax] to allow bursting.
-  int capacityTokens(WorkloadType type) {
-    if (globalMax <= 0) return 0;
-
-    // Check if other types have pending requests (contention)
-    bool hasContention = false;
-    for (final t in WorkloadType.values) {
-      if (t != type && _queues[t]!.isNotEmpty) {
-        hasContention = true;
-        break;
-      }
-    }
-
-    if (!hasContention) {
-      // Elastic mode: allowed to use up to globalMax
-      return globalMax;
-    }
-
-    // Strict mode: share-based limit
-    int cap = (globalMax * (_share[type] ?? 0.0)).floor();
-    // Ensure critical types always have at least 1 token when globalMax > 0
-    if (type != WorkloadType.aux && cap < 1) cap = 1;
-    if (cap > globalMax) cap = globalMax;
-    return cap;
+  /// [extraDemandTokens] lets callers preview how much capacity a new/next round
+  /// of work would get before they actually enqueue it.
+  int capacityTokens(
+    WorkloadType type, {
+    int extraDemandTokens = 0,
+  }) {
+    return _capacityTokensFor(type, extraDemandTokens: extraDemandTokens);
   }
 
   /// Total tokens currently in use across all types.
   int get totalUsedTokens {
-    int sum = 0;
-    for (final v in _usedTokens.values) {
-      sum += v;
+    var sum = 0;
+    for (final value in _usedTokens.values) {
+      sum += value;
     }
     return sum;
   }
 
   /// Reserve tokens for a workload type.
   ///
-  /// - requestedTokens: desired tokens (defaults to type capacity)
-  /// - minTokens: minimum tokens to grant when available (defaults to 1 for critical, 0 for aux)
-  /// - label: optional tag for diagnostics
+  /// - [requestedTokens]: desired tokens (defaults to the current fair capacity)
+  /// - [minTokens]: minimum tokens to grant when available (defaults to 1)
+  /// - [totalPlannedTokens]: total remaining demand represented by this request
+  ///   across future rounds/chunks; defaults to [requestedTokens]
+  /// - [label]: optional tag for diagnostics
   Future<WorkloadLease> acquire(
     WorkloadType type, {
     int? requestedTokens,
     int? minTokens,
+    int? totalPlannedTokens,
     String? label,
   }) async {
-    final int cap = capacityTokens(type);
-    final int req = (requestedTokens == null || requestedTokens <= 0)
-        ? cap
-        : requestedTokens;
-    final int minTok = minTokens ?? (type == WorkloadType.aux ? 0 : 1);
+    final normalizedMin = _normalizeMinTokens(minTokens);
+    final declaredDemand = _normalizeDeclaredDemand(
+      requestedTokens,
+      totalPlannedTokens,
+      type,
+    );
+    final requested = _normalizeRequestedTokens(
+      type,
+      requestedTokens,
+      extraDemandTokens: declaredDemand,
+    );
 
-    // Fast path: try to allocate immediately.
-    // In elastic mode, we check against global available too.
-    final int typeCap = capacityTokens(type);
-
-    // We are limited by whichever is smaller: type capacity (elastic) or physical global tokens left
-    // Actually, capacityTokens(type) returning globalMax means logic is:
-    // available = capacityTokens(type) - _usedTokens[type] -> This is standard logic
-    // But we must ALSO respect the hard globalMax ceiling.
-
-    // Simplification: logic is always globalMax - totalUsedTokens?
-    // No, because we want to reserve shares for others if they are waiting.
-
-    // Correct logic with elastic capacityTokens():
-    // 1. Calculate how many tokens this type is *allowed* to have (elastic limit).
-    // 2. Calculate how many it *can* take physically (globalMax - totalUsed).
-    // 3. Take min.
-
-    // Wait, capacityTokens() already checks queues.
-    // If queues are empty, it returns globalMax.
-    // So currentUsed + grant <= globalMax.
-    // grant <= globalMax - currentUsed.
-    // BUT, we also have to respect the physical global limit:
-    // grant <= globalMax - totalUsedTokens.
-
-    final int typeAllowed = typeCap - _usedTokens[type]!;
-    final int physicalAvailable = globalMax - totalUsedTokens;
-    final int available = min(typeAllowed, physicalAvailable);
-
-    if (available >= (minTok <= 0 ? 1 : minTok)) {
-      final grant = _clampGrant(available, req, minTok);
-      _usedTokens[type] = _usedTokens[type]! + grant;
-      return WorkloadLease(this, type, grant, label: label);
+    final immediate = _tryGrantImmediate(
+      type,
+      requestedTokens: requested,
+      minTokens: normalizedMin,
+      declaredDemandTokens: declaredDemand,
+      label: label,
+    );
+    if (immediate != null) {
+      return immediate;
     }
 
-    // Otherwise, enqueue and wait.
     final completer = Completer<WorkloadLease>();
     _queues[type]!.add(
-        _PendingRequest(completer, req, (minTok <= 0 ? 1 : minTok), label));
+      _PendingRequest(
+        completer,
+        requested,
+        normalizedMin,
+        declaredDemand,
+        label,
+      ),
+    );
+    _drainQueues();
     return completer.future;
   }
 
   /// Try to reserve tokens without waiting.
   ///
   /// Returns a [WorkloadLease] if enough tokens are immediately available,
-  /// otherwise returns `null`. This is a non-blocking alternative to [acquire].
+  /// otherwise returns `null`.
   Future<WorkloadLease?> tryAcquire(
     WorkloadType type, {
     int? requestedTokens,
     int? minTokens,
+    int? totalPlannedTokens,
     String? label,
   }) async {
-    final int cap = capacityTokens(type);
-    final int req = (requestedTokens == null || requestedTokens <= 0)
-        ? cap
-        : requestedTokens;
-    final int minTok = minTokens ?? (type == WorkloadType.aux ? 0 : 1);
+    final normalizedMin = _normalizeMinTokens(minTokens);
+    final declaredDemand = _normalizeDeclaredDemand(
+      requestedTokens,
+      totalPlannedTokens,
+      type,
+    );
+    final requested = _normalizeRequestedTokens(
+      type,
+      requestedTokens,
+      extraDemandTokens: declaredDemand,
+    );
 
-    final int typeCap = capacityTokens(type);
-    final int typeAllowed = typeCap - _usedTokens[type]!;
-    final int physicalAvailable = globalMax - totalUsedTokens;
-    final int available = min(typeAllowed, physicalAvailable);
+    return _tryGrantImmediate(
+      type,
+      requestedTokens: requested,
+      minTokens: normalizedMin,
+      declaredDemandTokens: declaredDemand,
+      label: label,
+    );
+  }
 
-    if (available >= (minTok <= 0 ? 1 : minTok)) {
-      final grant = _clampGrant(available, req, (minTok <= 0 ? 1 : minTok));
-      _usedTokens[type] = _usedTokens[type]! + grant;
-      return WorkloadLease(this, type, grant, label: label);
+  void _release(
+    WorkloadType type,
+    int tokens,
+    int declaredDemandTokens,
+  ) {
+    if (tokens <= 0 && declaredDemandTokens <= 0) {
+      return;
     }
-    return null;
+
+    _usedTokens[type] = max(0, _usedTokens[type]! - tokens);
+    _activeDemandTokens[type] =
+        max(0, _activeDemandTokens[type]! - declaredDemandTokens);
+    _drainQueues();
   }
 
-  void _release(WorkloadType type, int tokens) {
-    if (tokens <= 0) return;
-    _usedTokens[type] = (_usedTokens[type]! - tokens);
-    if (_usedTokens[type]! < 0) _usedTokens[type] = 0;
-    _drainQueue(type);
+  void _drainQueues() {
+    var madeProgress = false;
+    do {
+      madeProgress = false;
+      for (final type in WorkloadType.values) {
+        if (_grantQueuedRequest(type)) {
+          madeProgress = true;
+        }
+      }
+    } while (madeProgress);
   }
 
-  void _drainQueue(WorkloadType type) {
-    if (_queues[type]!.isEmpty) return;
-    final int typeCap = capacityTokens(type); // Re-evaluate elastic capacity
-    final int typeAllowed = typeCap - _usedTokens[type]!;
-    final int physicalAvailable = globalMax - totalUsedTokens;
-    int available = min(typeAllowed, physicalAvailable);
-
-    if (available <= 0) return;
-
-    // FIFO fairness within type.
+  bool _grantQueuedRequest(WorkloadType type) {
     final queue = _queues[type]!;
-    int i = 0;
-    while (i < queue.length && available > 0) {
-      final p = queue[i];
-      if (available >= p.minTokens) {
-        final grant = _clampGrant(available, p.requested, p.minTokens);
-        _usedTokens[type] = _usedTokens[type]! + grant;
-        available -= grant;
-        queue.removeAt(i);
-        p.completer.complete(WorkloadLease(this, type, grant, label: p.label));
-      } else {
-        i++;
+    if (queue.isEmpty) {
+      return false;
+    }
+
+    final request = queue.first;
+    final available = _availableTokensFor(
+      type,
+      extraDemandTokens: 0,
+    );
+    if (available < request.minTokens) {
+      return false;
+    }
+
+    final grant = _clampGrant(available, request.requested, request.minTokens);
+    _usedTokens[type] = _usedTokens[type]! + grant;
+    _activeDemandTokens[type] =
+        _activeDemandTokens[type]! + request.declaredDemandTokens;
+    queue.removeAt(0);
+    request.completer.complete(
+      WorkloadLease(
+        this,
+        type,
+        grant,
+        label: request.label,
+        declaredDemandTokens: request.declaredDemandTokens,
+      ),
+    );
+    return true;
+  }
+
+  WorkloadLease? _tryGrantImmediate(
+    WorkloadType type, {
+    required int requestedTokens,
+    required int minTokens,
+    required int declaredDemandTokens,
+    String? label,
+  }) {
+    final available = _availableTokensFor(
+      type,
+      extraDemandTokens: declaredDemandTokens,
+    );
+    if (available < minTokens) {
+      return null;
+    }
+
+    final grant = _clampGrant(available, requestedTokens, minTokens);
+    _usedTokens[type] = _usedTokens[type]! + grant;
+    _activeDemandTokens[type] =
+        _activeDemandTokens[type]! + declaredDemandTokens;
+    return WorkloadLease(
+      this,
+      type,
+      grant,
+      label: label,
+      declaredDemandTokens: declaredDemandTokens,
+    );
+  }
+
+  int _availableTokensFor(
+    WorkloadType type, {
+    required int extraDemandTokens,
+    WorkloadLease? replacingLease,
+    bool includeReplacingLeaseTokens = false,
+  }) {
+    final replacingTokens = includeReplacingLeaseTokens &&
+            replacingLease != null &&
+            !replacingLease._released &&
+            replacingLease.type == type
+        ? replacingLease.tokens
+        : 0;
+
+    final usedByType = max(0, _usedTokens[type]! - replacingTokens);
+    final physicalAvailable =
+        max(0, globalMax - totalUsedTokens + replacingTokens);
+    final fairCapacity = _capacityTokensFor(
+      type,
+      extraDemandTokens: extraDemandTokens,
+      replacingLease: replacingLease,
+    );
+    final typeAvailable = max(0, fairCapacity - usedByType);
+    return min(typeAvailable, physicalAvailable);
+  }
+
+  int _capacityTokensFor(
+    WorkloadType type, {
+    int extraDemandTokens = 0,
+    WorkloadLease? replacingLease,
+  }) {
+    if (globalMax <= 0) {
+      return 0;
+    }
+
+    final demandByType = <WorkloadType, int>{};
+    for (final workloadType in WorkloadType.values) {
+      demandByType[workloadType] =
+          _declaredDemandFor(workloadType, replacingLease: replacingLease);
+    }
+    demandByType[type] = demandByType[type]! + max(0, extraDemandTokens);
+
+    final activeTypes = WorkloadType.values
+        .where((workloadType) => demandByType[workloadType]! > 0)
+        .toList(growable: false);
+    if (activeTypes.isEmpty) {
+      return globalMax;
+    }
+
+    final allocations = {
+      for (final workloadType in WorkloadType.values) workloadType: 0,
+    };
+    final baseTargets = <WorkloadType, int>{};
+    var allocated = 0;
+
+    for (final workloadType in activeTypes) {
+      final base = min(
+        demandByType[workloadType]!,
+        _baselineCapacityTokens(workloadType),
+      );
+      baseTargets[workloadType] = base;
+      allocated += base;
+    }
+
+    if (allocated > globalMax) {
+      final scaled = _allocateProportionally(baseTargets, globalMax);
+      for (final workloadType in activeTypes) {
+        allocations[workloadType] = scaled[workloadType] ?? 0;
+      }
+      allocated = globalMax;
+    } else {
+      for (final workloadType in activeTypes) {
+        allocations[workloadType] = baseTargets[workloadType] ?? 0;
       }
     }
+
+    final remainingBudget = globalMax - allocated;
+    if (remainingBudget > 0) {
+      final remainingDemand = <WorkloadType, int>{};
+      for (final workloadType in activeTypes) {
+        final stillNeeded =
+            demandByType[workloadType]! - allocations[workloadType]!;
+        if (stillNeeded > 0) {
+          remainingDemand[workloadType] = stillNeeded;
+        }
+      }
+
+      final burstAllocations =
+          _allocateProportionally(remainingDemand, remainingBudget);
+      for (final workloadType in activeTypes) {
+        allocations[workloadType] =
+            allocations[workloadType]! + (burstAllocations[workloadType] ?? 0);
+      }
+    }
+
+    return allocations[type] ?? 0;
+  }
+
+  int _declaredDemandFor(
+    WorkloadType type, {
+    WorkloadLease? replacingLease,
+  }) {
+    var activeDemand = _activeDemandTokens[type]!;
+    if (replacingLease != null &&
+        !replacingLease._released &&
+        replacingLease.type == type) {
+      activeDemand = max(0, activeDemand - replacingLease.declaredDemandTokens);
+    }
+
+    var queuedDemand = 0;
+    for (final request in _queues[type]!) {
+      queuedDemand += request.declaredDemandTokens;
+    }
+    return activeDemand + queuedDemand;
+  }
+
+  int _baselineCapacityTokens(WorkloadType type) {
+    if (globalMax <= 0) {
+      return 0;
+    }
+
+    var cap = (globalMax * (_share[type] ?? 0.0)).floor();
+    if (type != WorkloadType.aux && cap < 1) {
+      cap = 1;
+    }
+    return min(cap, globalMax);
+  }
+
+  Map<WorkloadType, int> _allocateProportionally(
+    Map<WorkloadType, int> weights,
+    int tokens,
+  ) {
+    final allocations = {
+      for (final workloadType in WorkloadType.values) workloadType: 0,
+    };
+    if (tokens <= 0) {
+      return allocations;
+    }
+
+    final activeTypes = weights.entries
+        .where((entry) => entry.value > 0)
+        .map((entry) => entry.key)
+        .toList(growable: false);
+    if (activeTypes.isEmpty) {
+      return allocations;
+    }
+
+    final totalWeight = activeTypes.fold<int>(
+      0,
+      (sum, workloadType) => sum + (weights[workloadType] ?? 0),
+    );
+    if (totalWeight <= 0) {
+      return allocations;
+    }
+
+    final remainders = <WorkloadType, double>{};
+    var used = 0;
+    for (final workloadType in activeTypes) {
+      final weight = weights[workloadType]!;
+      final exact = tokens * weight / totalWeight;
+      final whole = min(weight, exact.floor());
+      allocations[workloadType] = whole;
+      used += whole;
+      remainders[workloadType] = exact - whole;
+    }
+
+    var leftover = tokens - used;
+    while (leftover > 0) {
+      WorkloadType? bestType;
+      var bestScore = double.negativeInfinity;
+
+      for (final workloadType in activeTypes) {
+        final remainingWeight =
+            weights[workloadType]! - allocations[workloadType]!;
+        if (remainingWeight <= 0) {
+          continue;
+        }
+
+        final score = remainders[workloadType]! +
+            remainingWeight / weights[workloadType]!;
+        if (bestType == null || score > bestScore) {
+          bestType = workloadType;
+          bestScore = score;
+        }
+      }
+
+      if (bestType == null) {
+        break;
+      }
+
+      allocations[bestType] = allocations[bestType]! + 1;
+      remainders[bestType] = 0;
+      leftover--;
+    }
+
+    return allocations;
+  }
+
+  int _normalizeMinTokens(int? minTokens) {
+    if (minTokens == null || minTokens <= 0) {
+      return 1;
+    }
+    return minTokens;
+  }
+
+  int _normalizeRequestedTokens(
+    WorkloadType type,
+    int? requestedTokens, {
+    required int extraDemandTokens,
+  }) {
+    if (requestedTokens != null && requestedTokens > 0) {
+      return requestedTokens;
+    }
+
+    final capacity = capacityTokens(
+      type,
+      extraDemandTokens: extraDemandTokens,
+    );
+    return max(1, capacity);
+  }
+
+  int _normalizeDeclaredDemand(
+    int? requestedTokens,
+    int? totalPlannedTokens,
+    WorkloadType type,
+  ) {
+    final requested = _normalizeRequestedTokens(
+      type,
+      requestedTokens,
+      extraDemandTokens: max(0, totalPlannedTokens ?? 0),
+    );
+    final planned = totalPlannedTokens ?? requested;
+    return max(requested, planned);
   }
 
   int _clampGrant(int available, int requested, int minTokens) {
-    int grant = requested;
-    if (grant > available) grant = available;
-    if (grant < minTokens) grant = minTokens;
-    if (grant < 1) grant = 1;
+    var grant = requested;
+    if (grant > available) {
+      grant = available;
+    }
+    if (grant < minTokens) {
+      grant = minTokens;
+    }
+    if (grant < 1) {
+      grant = 1;
+    }
     return grant;
   }
 
   /// Reacquire a lease with updated token allocation.
   ///
-  /// Releases the old lease and acquires a new one with the latest available capacity.
-  /// This is useful for long-running tasks that want to dynamically adjust their
-  /// concurrency based on system load changes.
-  ///
-  /// - [oldLease]: The lease to replace
-  /// - [requestedTokens]: Desired tokens (defaults to type capacity)
-  /// - [minTokens]: Minimum tokens to grant (defaults to 1 for critical types)
-  /// - [label]: Optional label for the new lease
-  ///
-  /// Note: This method will wait until at least minTokens are available.
-  /// The old lease is released only after the new lease is acquired to ensure
-  /// continuous token occupation.
+  /// The caller should pass the remaining work through [totalPlannedTokens] so
+  /// the next round can be rebalanced against other active queues.
   Future<WorkloadLease> reacquire(
     WorkloadLease oldLease, {
     int? requestedTokens,
     int? minTokens,
+    int? totalPlannedTokens,
     String? label,
   }) async {
+    final swapped = tryReacquire(
+      oldLease,
+      requestedTokens: requestedTokens,
+      minTokens: minTokens,
+      totalPlannedTokens: totalPlannedTokens,
+      label: label,
+    );
+    if (swapped != null) {
+      return swapped;
+    }
+
     final newLease = await acquire(
       oldLease.type,
       requestedTokens: requestedTokens,
       minTokens: minTokens,
+      totalPlannedTokens: totalPlannedTokens,
       label: label ?? oldLease.label,
     );
     oldLease.release();
@@ -237,51 +516,54 @@ class WorkloadScheduler {
   }
 
   /// Try to reacquire a lease without blocking.
-  ///
-  /// Attempts to replace the old lease with a new one with updated capacity.
-  /// If insufficient tokens are available, returns null and keeps the old lease intact.
-  ///
-  /// - [oldLease]: The lease to replace
-  /// - [requestedTokens]: Desired tokens (defaults to type capacity)
-  /// - [minTokens]: Minimum tokens to grant (defaults to 1 for critical types)
-  /// - [label]: Optional label for the new lease
-  ///
-  /// Returns the new lease if successful, null otherwise.
-  /// The old lease remains valid if reacquisition fails.
   WorkloadLease? tryReacquire(
     WorkloadLease oldLease, {
     int? requestedTokens,
     int? minTokens,
+    int? totalPlannedTokens,
     String? label,
   }) {
-    if (oldLease._released) return null;
-
-    final int req = (requestedTokens == null || requestedTokens <= 0)
-        ? capacityTokens(oldLease.type)
-        : requestedTokens;
-    final int minTok = minTokens ?? (oldLease.type == WorkloadType.aux ? 0 : 1);
-
-    // Elastic check
-    final int typeCap = capacityTokens(oldLease.type);
-    final int typeAllowed =
-        typeCap - _usedTokens[oldLease.type]! + oldLease.tokens;
-    final int physicalAvailable = globalMax - totalUsedTokens + oldLease.tokens;
-    final int available = min(typeAllowed, physicalAvailable);
-
-    if (available >= (minTok <= 0 ? 1 : minTok)) {
-      final grant = _clampGrant(available, req, minTok);
-
-      // Atomically swap: add new tokens, remove old tokens
-      _usedTokens[oldLease.type] =
-          _usedTokens[oldLease.type]! + grant - oldLease.tokens;
-      if (_usedTokens[oldLease.type]! < 0) _usedTokens[oldLease.type] = 0;
-
-      // Mark old lease as released and create new lease
-      oldLease._released = true;
-      return WorkloadLease(this, oldLease.type, grant,
-          label: label ?? oldLease.label);
+    if (oldLease._released) {
+      return null;
     }
-    return null;
+
+    final normalizedMin = _normalizeMinTokens(minTokens);
+    final declaredDemand = _normalizeDeclaredDemand(
+      requestedTokens,
+      totalPlannedTokens,
+      oldLease.type,
+    );
+    final requested = _normalizeRequestedTokens(
+      oldLease.type,
+      requestedTokens,
+      extraDemandTokens: declaredDemand,
+    );
+
+    final available = _availableTokensFor(
+      oldLease.type,
+      extraDemandTokens: declaredDemand,
+      replacingLease: oldLease,
+      includeReplacingLeaseTokens: true,
+    );
+    if (available < normalizedMin) {
+      return null;
+    }
+
+    final grant = _clampGrant(available, requested, normalizedMin);
+    _usedTokens[oldLease.type] =
+        _usedTokens[oldLease.type]! + grant - oldLease.tokens;
+    _activeDemandTokens[oldLease.type] = _activeDemandTokens[oldLease.type]! +
+        declaredDemand -
+        oldLease.declaredDemandTokens;
+    oldLease._released = true;
+
+    return WorkloadLease(
+      this,
+      oldLease.type,
+      grant,
+      label: label ?? oldLease.label,
+      declaredDemandTokens: declaredDemand,
+    );
   }
 }
 
@@ -293,31 +575,49 @@ enum WorkloadType { flush, query, maintenance, aux }
 class WorkloadLease {
   final WorkloadScheduler _scheduler;
   final WorkloadType type;
-  final int tokens; // reserved energy tokens
+  final int tokens;
+  final int declaredDemandTokens;
   final String? label;
   bool _released = false;
 
-  WorkloadLease(this._scheduler, this.type, this.tokens, {this.label});
+  WorkloadLease(
+    this._scheduler,
+    this.type,
+    this.tokens, {
+    this.label,
+    required this.declaredDemandTokens,
+  });
 
   /// Convert reserved tokens to an integer concurrency based on energy cost.
-  /// Example: cost=1 for flush/write, 0.3 for read/query.
   int asConcurrency(double cost) {
-    if (tokens <= 0) return 1;
-    final c = (tokens / cost).floor();
-    return c < 1 ? 1 : c;
+    if (tokens <= 0) {
+      return 1;
+    }
+    final concurrency = (tokens / cost).floor();
+    return concurrency < 1 ? 1 : concurrency;
   }
 
   void release() {
-    if (_released) return;
+    if (_released) {
+      return;
+    }
     _released = true;
-    _scheduler._release(type, tokens);
+    _scheduler._release(type, tokens, declaredDemandTokens);
   }
 }
 
 class _PendingRequest {
   final Completer<WorkloadLease> completer;
-  final int requested; // requested tokens
+  final int requested;
   final int minTokens;
+  final int declaredDemandTokens;
   final String? label;
-  _PendingRequest(this.completer, this.requested, this.minTokens, this.label);
+
+  _PendingRequest(
+    this.completer,
+    this.requested,
+    this.minTokens,
+    this.declaredDemandTokens,
+    this.label,
+  );
 }

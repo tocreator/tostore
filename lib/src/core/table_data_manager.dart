@@ -2391,58 +2391,99 @@ class TableDataManager {
         targetPartitionNos, // Optional: specific partition numbers to process
     ParallelController? controller,
     bool skipMaintenanceGlobalLock = false,
-    String? largeDeleteOpId,
-    String? largeUpdateOpId,
     Future<void> Function(int partitionNo)? onPartitionFlushed,
   }) async {
     // Serialize writes with table-level exclusive lock to avoid concurrent flush/writeRecords.
     // Read-only tasks are allowed to run concurrently (no exclusive locks).
     final lockKey = 'table_$tableName';
-    final operationId = GlobalIdGenerator.generate('process_partitions_');
+    String? operationId;
     bool lockAcquired = false;
 
     // Acquire global maintenance lock ONLY for write operations to keep journal batches consistent,
     // unless explicitly skipped (for large delete parallelization).
     final maintenanceLockKey = 'maintenance_process_partitions';
-    final maintenanceOpId = GlobalIdGenerator.generate('maint_lock_');
+    String? maintenanceOpId;
     bool maintenanceLockAcquired = false;
-    if (!onlyRead &&
-        !skipMaintenanceGlobalLock &&
-        _dataStore.lockManager != null) {
-      maintenanceLockAcquired = await _dataStore.lockManager!
-          .acquireExclusiveLock(maintenanceLockKey, maintenanceOpId);
-      if (!maintenanceLockAcquired) {
-        Logger.warn(
-            'Another maintenance task is running, skipping processTablePartitions for $tableName',
-            label: 'TableDataManager.processTablePartitions');
-        return;
-      }
-    }
 
-    try {
-      // Acquire per-table exclusive lock ONLY for write operations.
-      if (!onlyRead) {
-        if (_dataStore.lockManager != null) {
-          lockAcquired = await _dataStore.lockManager!
-              .acquireExclusiveLock(lockKey, operationId);
-          if (!lockAcquired) {
-            Logger.warn(
-                'Failed to acquire exclusive lock for processTablePartitions: $tableName',
-                label: 'TableDataManager.processTablePartitions');
-            return;
-          }
-          _processingTables.add(tableName);
-        } else {
-          if (_processingTables.contains(tableName)) {
-            Logger.debug(
-                'Table $tableName is being processed by another operation, skipping processTablePartitions',
-                label: 'TableDataManager.processTablePartitions');
-            return;
-          }
-          _processingTables.add(tableName);
+    Future<bool> acquireWriteLocks() async {
+      if (onlyRead) {
+        return true;
+      }
+
+      if (!skipMaintenanceGlobalLock && _dataStore.lockManager != null) {
+        maintenanceOpId = GlobalIdGenerator.generate('maint_lock_');
+        maintenanceLockAcquired = await _dataStore.lockManager!
+            .acquireExclusiveLock(maintenanceLockKey, maintenanceOpId!);
+        if (!maintenanceLockAcquired) {
+          Logger.warn(
+              'Another maintenance task is running, skipping processTablePartitions for $tableName',
+              label: 'TableDataManager.processTablePartitions');
+          maintenanceOpId = null;
+          return false;
         }
       }
 
+      if (_dataStore.lockManager != null) {
+        operationId = GlobalIdGenerator.generate('process_partitions_');
+        lockAcquired = await _dataStore.lockManager!
+            .acquireExclusiveLock(lockKey, operationId!);
+        if (!lockAcquired) {
+          Logger.warn(
+              'Failed to acquire exclusive lock for processTablePartitions: $tableName',
+              label: 'TableDataManager.processTablePartitions');
+          if (maintenanceLockAcquired && maintenanceOpId != null) {
+            _dataStore.lockManager!
+                .releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
+            maintenanceLockAcquired = false;
+            maintenanceOpId = null;
+          }
+          operationId = null;
+          return false;
+        }
+        _processingTables.add(tableName);
+      } else {
+        if (_processingTables.contains(tableName)) {
+          Logger.debug(
+              'Table $tableName is being processed by another operation, skipping processTablePartitions',
+              label: 'TableDataManager.processTablePartitions');
+          if (maintenanceLockAcquired && maintenanceOpId != null) {
+            _dataStore.lockManager
+                ?.releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
+            maintenanceLockAcquired = false;
+            maintenanceOpId = null;
+          }
+          return false;
+        }
+        _processingTables.add(tableName);
+      }
+      return true;
+    }
+
+    void releaseWriteLocks() {
+      if (onlyRead) {
+        return;
+      }
+
+      _processingTables.remove(tableName);
+      if (lockAcquired &&
+          _dataStore.lockManager != null &&
+          operationId != null) {
+        _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId!);
+      }
+      if (maintenanceLockAcquired &&
+          _dataStore.lockManager != null &&
+          maintenanceOpId != null) {
+        _dataStore.lockManager!
+            .releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
+      }
+
+      lockAcquired = false;
+      maintenanceLockAcquired = false;
+      operationId = null;
+      maintenanceOpId = null;
+    }
+
+    try {
       final meta = await getTableMeta(tableName);
       if (meta == null) return;
 
@@ -2508,7 +2549,11 @@ class TableDataManager {
 
       if (onlyRead) {
         // Read-only: parallel load + process, no writeChanges, no journal batch.
-        final capacity = scheduler.capacityTokens(WorkloadType.maintenance);
+        final remainingPartitions = partitionNosToProcess.length;
+        final capacity = scheduler.capacityTokens(
+          WorkloadType.maintenance,
+          extraDemandTokens: remainingPartitions,
+        );
         var concurrency = max(1, min(capacity, partitionNosToProcess.length));
         if (maxConcurrent != null && maxConcurrent > 0) {
           concurrency = min(concurrency, maxConcurrent);
@@ -2533,6 +2578,7 @@ class TableDataManager {
             WorkloadType.maintenance,
             requestedTokens: concurrency,
             minTokens: 1,
+            totalPlannedTokens: remainingPartitions,
             label: 'processTablePartitions.$tableName.readOnly',
           );
           await ParallelProcessor.execute<void>(
@@ -2560,117 +2606,120 @@ class TableDataManager {
         final chunkEnd = min(chunkStart + 3, partitionNosToProcess.length);
         final chunkPartitions =
             partitionNosToProcess.sublist(chunkStart, chunkEnd);
+        final remainingPartitions = partitionNosToProcess.length - chunkStart;
 
-        BatchContext? batchContext;
-        if (journaling) {
-          batchContext = await _dataStore.parallelJournalManager
-              .beginMaintenanceBatch(table: tableName);
+        if (!await acquireWriteLocks()) {
+          return;
         }
 
-        final capacity = scheduler.capacityTokens(WorkloadType.maintenance);
-        var concurrency = max(1, min(capacity, chunkPartitions.length));
-        if (maxConcurrent != null && maxConcurrent > 0) {
-          concurrency = min(concurrency, maxConcurrent);
-        }
-        final tasks = <Future<
-                (
-                  int,
-                  List<Map<String, dynamic>>,
-                  List<Map<String, dynamic>>,
-                  List<Map<String, dynamic>>
-                )?>
-            Function()>[];
-        for (final pNo in chunkPartitions) {
-          tasks.add(() async {
-            if (effectiveController.isStopped) return null;
-            final records = await rangeManager.loadPartitionDataByNo(
-              tableName: tableName,
-              partitionNo: pNo,
-              encryptionKey: customKey,
-              encryptionKeyId: customKeyId,
-              decodeSchema: decodeSchema,
-            );
-            final processed =
-                await processFunction(records, pNo, effectiveController);
-            if (effectiveController.isStopped) return null;
-            final inserts = <Map<String, dynamic>>[];
-            final updates = <Map<String, dynamic>>[];
-            final deletes = <Map<String, dynamic>>[];
-            computeDelta(records, processed, inserts, updates, deletes);
-            if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
-              return null;
-            }
-            return (pNo, inserts, updates, deletes);
-          });
-        }
-
-        List<
-            (
-              int,
-              List<Map<String, dynamic>>,
-              List<Map<String, dynamic>>,
-              List<Map<String, dynamic>>
-            )?> results;
-        WorkloadLease? lease;
         try {
-          lease = await scheduler.acquire(
+          BatchContext? batchContext;
+          if (journaling) {
+            batchContext = await _dataStore.parallelJournalManager
+                .beginMaintenanceBatch(table: tableName);
+          }
+
+          final capacity = scheduler.capacityTokens(
             WorkloadType.maintenance,
-            requestedTokens: concurrency,
-            minTokens: 1,
-            label: 'processTablePartitions.$tableName',
+            extraDemandTokens: remainingPartitions,
           );
-          results = await ParallelProcessor.execute<
+          var concurrency = max(1, min(capacity, chunkPartitions.length));
+          if (maxConcurrent != null && maxConcurrent > 0) {
+            concurrency = min(concurrency, maxConcurrent);
+          }
+          final tasks = <Future<
+                  (
+                    int,
+                    List<Map<String, dynamic>>,
+                    List<Map<String, dynamic>>,
+                    List<Map<String, dynamic>>
+                  )?>
+              Function()>[];
+          for (final pNo in chunkPartitions) {
+            tasks.add(() async {
+              if (effectiveController.isStopped) return null;
+              final records = await rangeManager.loadPartitionDataByNo(
+                tableName: tableName,
+                partitionNo: pNo,
+                encryptionKey: customKey,
+                encryptionKeyId: customKeyId,
+                decodeSchema: decodeSchema,
+              );
+              final processed =
+                  await processFunction(records, pNo, effectiveController);
+              if (effectiveController.isStopped) return null;
+              final inserts = <Map<String, dynamic>>[];
+              final updates = <Map<String, dynamic>>[];
+              final deletes = <Map<String, dynamic>>[];
+              computeDelta(records, processed, inserts, updates, deletes);
+              if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
+                return null;
+              }
+              return (pNo, inserts, updates, deletes);
+            });
+          }
+
+          List<
               (
                 int,
                 List<Map<String, dynamic>>,
                 List<Map<String, dynamic>>,
                 List<Map<String, dynamic>>
-              )?>(
-            tasks,
-            concurrency: lease.asConcurrency(1),
-            controller: effectiveController,
-            label: 'processTablePartitions.$tableName',
-            continueOnError: false,
-          );
+              )?> results;
+          WorkloadLease? lease;
+          try {
+            lease = await scheduler.acquire(
+              WorkloadType.maintenance,
+              requestedTokens: concurrency,
+              minTokens: 1,
+              totalPlannedTokens: remainingPartitions,
+              label: 'processTablePartitions.$tableName',
+            );
+            results = await ParallelProcessor.execute<
+                (
+                  int,
+                  List<Map<String, dynamic>>,
+                  List<Map<String, dynamic>>,
+                  List<Map<String, dynamic>>
+                )?>(
+              tasks,
+              concurrency: lease.asConcurrency(1),
+              controller: effectiveController,
+              label: 'processTablePartitions.$tableName',
+              continueOnError: false,
+            );
+          } finally {
+            lease?.release();
+          }
+
+          for (var i = 0; i < chunkPartitions.length; i++) {
+            final r = results[i];
+            if (r == null) continue;
+            final (pNo, inserts, updates, deletes) = r;
+            await rangeManager.writeChanges(
+              tableName: tableName,
+              inserts: inserts,
+              updates: updates,
+              deletes: deletes,
+              batchContext: batchContext,
+              encryptionKey: customKey,
+              encryptionKeyId: customKeyId,
+            );
+            await onPartitionFlushed?.call(pNo);
+          }
+
+          if (journaling && batchContext != null) {
+            // Complete this chunk only: delete this chunk's page redo log now (not whole table).
+            await _dataStore.parallelJournalManager
+                .completeMaintenanceBatch(batchContext: batchContext);
+            await persistRuntimeMetaIfNeeded();
+          }
         } finally {
-          lease?.release();
-        }
-
-        for (var i = 0; i < chunkPartitions.length; i++) {
-          final r = results[i];
-          if (r == null) continue;
-          final (pNo, inserts, updates, deletes) = r;
-          await rangeManager.writeChanges(
-            tableName: tableName,
-            inserts: inserts,
-            updates: updates,
-            deletes: deletes,
-            batchContext: batchContext,
-            encryptionKey: customKey,
-            encryptionKeyId: customKeyId,
-          );
-          await onPartitionFlushed?.call(pNo);
-        }
-
-        if (journaling && batchContext != null) {
-          // Complete this chunk only: delete this chunk's page redo log now (not whole table).
-          await _dataStore.parallelJournalManager
-              .completeMaintenanceBatch(batchContext: batchContext);
-          await persistRuntimeMetaIfNeeded();
+          releaseWriteLocks();
         }
       }
     } finally {
-      // Only clean up locks/flags if we actually acquired them (write operations).
-      if (!onlyRead) {
-        _processingTables.remove(tableName);
-        if (lockAcquired && _dataStore.lockManager != null) {
-          _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId);
-        }
-        if (maintenanceLockAcquired && _dataStore.lockManager != null) {
-          _dataStore.lockManager!
-              .releaseExclusiveLock(maintenanceLockKey, maintenanceOpId);
-        }
-      }
+      releaseWriteLocks();
     }
   }
 

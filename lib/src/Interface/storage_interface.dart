@@ -104,6 +104,12 @@ abstract class StorageInterface {
   /// Copy a directory
   Future<void> copyDirectory(String sourcePath, String destinationPath);
 
+  /// Move or rename a directory.
+  ///
+  /// Implementations may fall back to copy + delete when the platform does not
+  /// support an efficient native rename.
+  Future<void> moveDirectory(String sourcePath, String destinationPath);
+
   /// Copy a file
   Future<void> copyFile(String sourcePath, String destinationPath);
 

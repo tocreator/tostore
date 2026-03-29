@@ -215,28 +215,52 @@ final class CacheManager {
   Future<void> invalidateCache(
     String tableName, {
     bool invalidateSchema = true,
+    bool invalidateQuery = true,
+    bool invalidateRecords = true,
+    bool invalidateRecordCount = true,
+    bool invalidateTableMeta = true,
+    bool invalidateTablePages = true,
+    bool invalidateIndexData = true,
+    bool invalidateIndexMeta = true,
+    bool invalidateIndexPages = true,
+    bool invalidateVectorCache = true,
   }) async {
     try {
       _statsCache.remove(tableName);
 
-      await _dataStore.tableDataManager.clearTableRecordsForTable(tableName);
-      // Manually remove record count cache to force reload next time
-      _dataStore.tableDataManager.removeRecordCountCache(tableName);
-      _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
-      _dataStore.tableTreePartitionManager.clearPageCacheForTable(tableName);
+      if (invalidateRecords) {
+        await _dataStore.tableDataManager.clearTableRecordsForTable(tableName);
+      } else if (invalidateRecordCount) {
+        // Record count cache may need refresh even when hot records are kept.
+        _dataStore.tableDataManager.removeRecordCountCache(tableName);
+      }
+      if (invalidateTableMeta) {
+        _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
+      }
+      if (invalidateTablePages) {
+        _dataStore.tableTreePartitionManager.clearPageCacheForTable(tableName);
+      }
       if (invalidateSchema) {
         _dataStore.schemaManager?.removeCachedTableSchema(tableName);
       }
 
-      // Conservative: invalidate all queries on this table.
-      _markQueryCacheDirty(tableName);
+      if (invalidateQuery) {
+        _markQueryCacheDirty(tableName);
+      }
 
-      // Best-effort: remove index meta cache (coarse-grained).
-      await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
-      _dataStore.indexTreePartitionManager.clearPageCacheForTable(tableName);
+      if (invalidateIndexData) {
+        await _dataStore.indexManager?.removeFullIndexCacheForTable(tableName);
+      }
+      if (invalidateIndexMeta) {
+        await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
+      }
+      if (invalidateIndexPages) {
+        _dataStore.indexTreePartitionManager.clearPageCacheForTable(tableName);
+      }
 
-      // Clear vector index caches for this table.
-      _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+      if (invalidateVectorCache) {
+        _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+      }
     } catch (e) {
       Logger.error(
         'Invalidate table cache failed: $e\n'

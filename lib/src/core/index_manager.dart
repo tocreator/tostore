@@ -1639,11 +1639,6 @@ class IndexManager {
       if (targetIndex != null) {
         actualName = targetIndex.actualIndexName;
       } else if (indexName != null) {
-        // if index name is provided but no matching index is found, try to delete index file
-        Logger.warn(
-          'index $indexName not found, try to delete index file',
-          label: 'IndexManager.removeIndex',
-        );
         actualName = indexName;
       } else {
         return;

@@ -729,6 +729,46 @@ class StorageAdapter implements StorageInterface {
   }
 
   @override
+  Future<void> moveDirectory(String sourcePath, String destinationPath) async {
+    final sourceResource = _getLockResource(sourcePath);
+    final destResource = _getLockResource(destinationPath);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    final firstResource = sourceResource.compareTo(destResource) <= 0
+        ? sourceResource
+        : destResource;
+    final secondResource =
+        firstResource == sourceResource ? destResource : sourceResource;
+
+    bool firstAcquired = false;
+    bool secondAcquired = false;
+    try {
+      firstAcquired =
+          await _lockManager.acquireExclusiveLock(firstResource, '$opId-first');
+      if (!firstAcquired) {
+        throw Exception(
+            'Failed to acquire lock for moveDirectory first: $firstResource');
+      }
+
+      secondAcquired = await _lockManager.acquireExclusiveLock(
+          secondResource, '$opId-second');
+      if (!secondAcquired) {
+        throw Exception(
+            'Failed to acquire lock for moveDirectory second: $secondResource');
+      }
+
+      await _storage.moveDirectory(sourcePath, destinationPath);
+    } finally {
+      if (secondAcquired) {
+        _lockManager.releaseExclusiveLock(secondResource, '$opId-second');
+      }
+      if (firstAcquired) {
+        _lockManager.releaseExclusiveLock(firstResource, '$opId-first');
+      }
+    }
+  }
+
+  @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);

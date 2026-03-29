@@ -613,6 +613,140 @@ class SchemaManager {
     }
   }
 
+  /// Rename an existing table schema in place while preserving the partition.
+  Future<void> renameTableSchema(
+    String oldTableName,
+    TableSchema newSchema,
+  ) async {
+    final newTableName = newSchema.name;
+    if (oldTableName == newTableName) {
+      await saveTableSchema(newTableName, newSchema);
+      return;
+    }
+
+    try {
+      final meta = await getSchemaMeta();
+      final oldPartitionIndex = meta.tablePartitionMap[oldTableName];
+      final existingNewPartitionIndex = meta.tablePartitionMap[newTableName];
+
+      if (oldPartitionIndex == null) {
+        if (existingNewPartitionIndex != null) {
+          cacheTableSchema(newTableName, newSchema);
+          removeCachedTableSchema(oldTableName);
+          _dataStore.removeTtlPlanForTable(oldTableName);
+          _dataStore.upsertTtlPlanForSchema(newSchema);
+          return;
+        }
+        throw StateError('Schema for table $oldTableName does not exist');
+      }
+
+      if (existingNewPartitionIndex != null &&
+          existingNewPartitionIndex != oldPartitionIndex) {
+        throw StateError(
+          'Schema for table $newTableName already exists in another partition',
+        );
+      }
+
+      final dirIndex =
+          await _getPartitionDirIndexForExistingPartition(oldPartitionIndex);
+      if (dirIndex == null) {
+        throw StateError(
+          'Schema partition directory not found for table $oldTableName',
+        );
+      }
+
+      final partitionPath = _dataStore.pathManager
+          .getSchemaPartitionFilePath(oldPartitionIndex, dirIndex);
+      if (!await _dataStore.storage.existsFile(partitionPath)) {
+        throw StateError(
+          'Schema partition file not found for table $oldTableName',
+        );
+      }
+
+      final content = await _dataStore.storage.readAsString(partitionPath);
+      if (content == null || content.isEmpty) {
+        throw StateError(
+          'Schema partition file is empty for table $oldTableName',
+        );
+      }
+
+      final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
+      if (!partitionMeta.tableSchemas.containsKey(oldTableName)) {
+        if (partitionMeta.tableSchemas.containsKey(newTableName)) {
+          meta.tablePartitionMap.remove(oldTableName);
+          meta.tablePartitionMap[newTableName] = oldPartitionIndex;
+          await saveSchemaStructure();
+          removeCachedTableSchema(oldTableName);
+          cacheTableSchema(newTableName, newSchema);
+          _dataStore.removeTtlPlanForTable(oldTableName);
+          _dataStore.upsertTtlPlanForSchema(newSchema);
+          return;
+        }
+        throw StateError(
+          'Schema payload not found for table $oldTableName in partition $oldPartitionIndex',
+        );
+      }
+
+      final newSize = _estimateTableSchemaSize(newSchema);
+      final oldSize = partitionMeta.tableSizes[oldTableName] ?? 0;
+      final tableNames = <String>[];
+      var inserted = false;
+      for (final tableName in partitionMeta.tableNames) {
+        if (tableName == oldTableName) {
+          if (!inserted) {
+            tableNames.add(newTableName);
+            inserted = true;
+          }
+          continue;
+        }
+        if (tableName == newTableName) {
+          inserted = true;
+        }
+        tableNames.add(tableName);
+      }
+      if (!inserted) {
+        tableNames.add(newTableName);
+      }
+
+      final updatedTableSizes = Map<String, int>.from(partitionMeta.tableSizes)
+        ..remove(oldTableName)
+        ..[newTableName] = newSize;
+      final updatedTableSchemas =
+          Map<String, dynamic>.from(partitionMeta.tableSchemas)
+            ..remove(oldTableName)
+            ..[newTableName] = newSchema.toJson();
+
+      final updatedPartitionMeta = partitionMeta.copyWith(
+        fileSizeInBytes: partitionMeta.fileSizeInBytes + newSize - oldSize,
+        tableNames: tableNames,
+        tableSizes: updatedTableSizes,
+        tableSchemas: updatedTableSchemas,
+        timestamps: Timestamps(
+          created: partitionMeta.timestamps.created,
+          modified: DateTime.now(),
+        ),
+      );
+
+      await _dataStore.storage.writeAsString(
+          partitionPath, jsonEncode(updatedPartitionMeta.toJson()));
+
+      meta.tablePartitionMap.remove(oldTableName);
+      meta.tablePartitionMap[newTableName] = oldPartitionIndex;
+      await saveSchemaStructure();
+
+      removeCachedTableSchema(oldTableName);
+      cacheTableSchema(newTableName, newSchema);
+      _dataStore.removeTtlPlanForTable(oldTableName);
+      _dataStore.upsertTtlPlanForSchema(newSchema);
+    } catch (e) {
+      Logger.error(
+        'Failed to rename table schema: $oldTableName -> $newTableName, $e',
+        label: 'SchemaManager.renameTableSchema',
+      );
+      rethrow;
+    }
+  }
+
   /// remove table from partition
   Future<bool> _removeTableFromPartition(
       String tableName, int partitionIndex) async {

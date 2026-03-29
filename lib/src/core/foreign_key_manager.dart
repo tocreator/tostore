@@ -1593,7 +1593,10 @@ class ForeignKeyManager {
   ///
   /// Note: This is a public method (not private) because it's called from DataStoreImpl
   Future<void> updateSystemTableForTable(
-      String tableName, TableSchema schema) async {
+    String tableName,
+    TableSchema schema, {
+    bool throwOnError = false,
+  }) async {
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
@@ -1605,9 +1608,14 @@ class ForeignKeyManager {
         // The system table should be created before user tables (ensured by getInitialSchema)
         // If we reach here, it means the system table creation was skipped or failed
         // Log a warning but don't throw - the system table will be created eventually
+        final message =
+            'System table $fkTableName does not exist yet. Foreign key relationships for table $tableName will not be stored in system table. '
+            'This may happen during upgrade. The system table should be created before user tables.';
+        if (throwOnError) {
+          throw StateError(message);
+        }
         Logger.warn(
-          'System table $fkTableName does not exist yet. Foreign key relationships for table $tableName will not be stored in system table. '
-          'This may happen during upgrade. The system table should be created before user tables.',
+          message,
           label: 'ForeignKeyManager.updateSystemTableForTable',
         );
         return;
@@ -1714,6 +1722,9 @@ class ForeignKeyManager {
         'Failed to update system table for table $tableName: $e',
         label: 'ForeignKeyManager.updateSystemTableForTable',
       );
+      if (throwOnError) {
+        rethrow;
+      }
       // Don't throw - cache invalidation will handle it
     }
   }
@@ -1734,7 +1745,10 @@ class ForeignKeyManager {
   /// 2. Records where the table is the referenced table (other tables reference it)
   ///
   /// [tableName] The table being dropped
-  Future<void> cleanupSystemTableForDroppedTable(String tableName) async {
+  Future<void> cleanupSystemTableForDroppedTable(
+    String tableName, {
+    bool throwOnError = false,
+  }) async {
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
@@ -1766,6 +1780,9 @@ class ForeignKeyManager {
         'Failed to cleanup system table for dropped table $tableName: $e',
         label: 'ForeignKeyManager.cleanupSystemTableForDroppedTable',
       );
+      if (throwOnError) {
+        rethrow;
+      }
       // Don't throw - cache invalidation will handle it
     }
   }

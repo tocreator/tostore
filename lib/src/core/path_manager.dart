@@ -121,7 +121,10 @@ class PathManager {
   //==================================
 
   /// get table path
-  Future<String> getTablePath(String tableName) async {
+  Future<String> getTablePath(
+    String tableName, {
+    bool createIfMissing = true,
+  }) async {
     // check cache
     if (_tablePathCache.containsKey(tableName)) {
       return _tablePathCache[tableName]!;
@@ -136,8 +139,10 @@ class PathManager {
     }
 
     // get table directory info using DirectoryManager
-    final tablePath =
-        await dataStore.directoryManager?.getTablePathIfExists(tableName);
+    final tablePath = await dataStore.directoryManager?.getTablePathIfExists(
+      tableName,
+      createIfMappingMissing: createIfMissing,
+    );
     if (tablePath == null) {
       throw StateError(
           'Table $tableName does not exist or path cannot be determined');

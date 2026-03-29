@@ -592,6 +592,44 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<void> moveDirectory(String sourcePath, String destinationPath) async {
+    try {
+      final normalizedSource = p.normalize(sourcePath);
+      final normalizedDestination = p.normalize(destinationPath);
+      if (normalizedSource == normalizedDestination) {
+        return;
+      }
+
+      final sourceDir = Directory(sourcePath);
+      if (!await sourceDir.exists()) {
+        return;
+      }
+
+      final destDir = Directory(destinationPath);
+      if (await destDir.exists()) {
+        throw StateError(
+            'Destination directory already exists: $destinationPath');
+      }
+
+      await _flushAndCloseHandlesUnderDirectory(sourcePath);
+      await _flushAndCloseHandlesUnderDirectory(destinationPath);
+      await destDir.parent.create(recursive: true);
+
+      try {
+        await sourceDir.rename(destinationPath);
+        return;
+      } on FileSystemException {
+        await copyDirectory(sourcePath, destinationPath);
+        await deleteDirectory(sourcePath);
+      }
+    } catch (e) {
+      Logger.error('Move directory failed: $e',
+          label: 'FileStorageImpl.moveDirectory');
+      rethrow;
+    }
+  }
+
+  @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {
     try {
       final srcFile = File(sourcePath);

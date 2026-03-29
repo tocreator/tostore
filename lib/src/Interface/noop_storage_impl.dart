@@ -96,6 +96,9 @@ final class NoopStorageImpl implements StorageInterface {
   Future<void> copyDirectory(String sourcePath, String destinationPath) async {}
 
   @override
+  Future<void> moveDirectory(String sourcePath, String destinationPath) async {}
+
+  @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {}
 
   @override

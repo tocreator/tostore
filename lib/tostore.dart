@@ -41,6 +41,7 @@ export 'src/model/db_result.dart';
 export 'src/model/expr.dart';
 export 'src/model/log_config.dart';
 export 'src/model/memory_info.dart';
+export 'src/model/migration_config.dart';
 export 'src/model/migration_task.dart';
 export 'src/model/query_aggregation.dart';
 export 'src/model/query_result.dart';

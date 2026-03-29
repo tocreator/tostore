@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Optimized `upsert` handling for concurrently executed records when the primary key and unique key contain the same value
 - Optimized WebAssembly build support on the Web platform
+- Optimized table structure migration validation
 - Improved table structure migration and integrity check error reporting, providing detailed failure reasons
 - Optimized documentation and multi-language
 
