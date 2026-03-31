@@ -35,7 +35,7 @@
 - [Почему ToStore?](#why-tostore) | [Ключевые особенности](#key-features) | [Установка](#installation) | [Быстрый старт](#quick-start)
 - [Определение схемы](#schema-definition) | [Мобильная/Десктопная интеграция](#mobile-integration) | [Серверная интеграция](#server-integration)
 - [Векторы и поиск ANN](#vector-advanced) | [TTL на уровне таблицы](#ttl-config) | [Запросы и пагинация](#query-pagination) | [Внешние ключи](#foreign-keys) | [Операторы запросов](#query-operators)
-- [Распределенная архитектура](#distributed-architecture) | [Примеры первичных ключей](#primary-key-examples) | [Атомарные операции](#atomic-expressions) | [Транзакции](#transactions) | [Обработка ошибок](#error-handling) | [Колбэк логов и диагностика базы данных](#logging-diagnostics)
+- [Распределенная архитектура](#distributed-architecture) | [Примеры первичных ключей](#primary-key-examples) | [Атомарные операции](#atomic-expressions) | [Транзакции](#transactions) | [Управление и обслуживание базы данных](#database-maintenance) | [Резервное копирование и восстановление](#backup-restore) | [Обработка ошибок](#error-handling) | [Колбэк логов и диагностика базы данных](#logging-diagnostics)
 - [Конфигурация безопасности](#security-config) | [Производительность](#performance) | [Ресурсы](#more-resources)
 
 
@@ -103,11 +103,16 @@ dependencies:
 <a id="quick-start"></a>
 ## Быстрый старт
 
-> [!IMPORTANT]
-> **Определение схемы таблицы — первый шаг**: Схему необходимо определить перед операциями CRUD (если не используется только KV-хранилище).
-> - Подробности в разделе [Определение схемы](#schema-definition).
-> - **Мобильные/Десктоп**: Передайте `schemas` при инициализации; см. [Мобильная интеграция](#mobile-integration).
-> - **Сервер**: Используйте `createTables` во время выполнения; см. [Серверная интеграция](#server-integration).
+> [!TIP]
+> **Поддерживает смешанное хранение структурированных и неструктурированных данных**
+> Как выбрать способ хранения?
+> 1. **Ключевые бизнес-данные**: рекомендуется [Определение схемы](#schema-definition). Подходит для сложных запросов, проверки ограничений, связей и повышенных требований к безопасности. Перенос логики целостности в движок заметно снижает затраты на разработку и сопровождение приложения.
+> 2. **Динамические/разрозненные данные**: можно сразу использовать [хранилище ключ-значение (KV)](#quick-start) или определить в таблице поля `DataType.json`. Подходит для хранения конфигурации или разрозненных состояний, когда важны быстрый старт и максимальная гибкость.
+
+### Структурированный табличный режим (Table)
+Для CRUD-операций нужно заранее создать схему таблицы (см. [Определение схемы](#schema-definition)). Рекомендации по интеграции для разных сценариев:
+- **Мобильные/Десктоп**: в [сценариях с частым запуском](#mobile-integration) рекомендуется передавать `schemas` при инициализации экземпляра.
+- **Сервер/Агент**: в [сценариях непрерывной работы](#server-integration) рекомендуется динамически создавать таблицы через `createTables`.
 
 ```dart
 // 1. Инициализация БД
@@ -161,6 +166,9 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 <a id="schema-definition"></a>
 ## Определение схемы
+**Одно определение позволяет движку взять на себя сквозное автоматизированное управление и надолго снимает с приложения бремя сложной валидации.**
+
+Примеры ниже для мобильных, серверных и агентных сценариев повторно используют `appSchemas`, определённый здесь.
 
 ### Обзор TableSchema
 
@@ -475,6 +483,159 @@ final txResult = await db.transaction(() async {
   await db.update('users', {...});
 });
 ```
+
+
+<a id="database-maintenance"></a>
+### Управление и обслуживание базы данных
+
+Следующие API подходят для администрирования, диагностики и служебного обслуживания:
+
+- **Обслуживание таблиц**
+  `createTable(schema)`: Создает одну таблицу во время выполнения.
+  `getTableSchema(tableName)`: Читает текущую активную схему таблицы.
+  `getTableInfo(tableName)`: Возвращает статистику таблицы, включая число записей, индексов, размер файла, время создания и признак глобальности.
+  `clear(tableName)`: Удаляет все данные, сохраняя схему, индексы и ограничения.
+  `dropTable(tableName)`: Полностью удаляет таблицу вместе со схемой и данными.
+- **Управление пространствами**
+  `currentSpaceName`: Возвращает имя текущего активного пространства.
+  `listSpaces()`: Перечисляет все пространства текущего экземпляра.
+  `getSpaceInfo(useCache: true)`: Возвращает статистику текущего пространства; используйте `useCache: false`, чтобы принудительно получить самые свежие данные.
+  `deleteSpace(spaceName)`: Удаляет пространство. Нельзя удалить пространство `default` и текущее активное пространство.
+- **Метаданные экземпляра**
+  `config`: Читает фактически примененный `DataStoreConfig`.
+  `instancePath`: Возвращает итоговый каталог хранения экземпляра.
+  `getVersion()` / `setVersion(version)`: Читает и записывает вашу бизнес-версию. Это значение не участвует во внутренней логике движка.
+- **Служебные операции**
+  `flush(flushStorage: true)`: Принудительно сбрасывает ожидающие записи на диск. При `true` дополнительно сбрасывает буферы нижележащего хранилища.
+  `deleteDatabase()`: Удаляет текущий экземпляр базы данных и связанные файлы. Разрушающая операция.
+- **Единая точка диагностики**
+  `db.status.memory()`: Проверяет использование кэша и памяти.
+  `db.status.space()`: Проверяет общее состояние текущего пространства.
+  `db.status.table(tableName)`: Проверяет диагностическую информацию по конкретной таблице.
+  `db.status.config()`: Проверяет снимок действующей конфигурации.
+  `db.status.migration(taskId)`: Проверяет состояние задачи миграции схемы.
+
+```dart
+final spaces = await db.listSpaces();
+final spaceInfo = await db.getSpaceInfo(useCache: false);
+final tableInfo = await db.getTableInfo('users');
+await db.flush();
+
+print(spaces);
+print(spaceInfo.toJson());
+print(tableInfo?.toJson());
+```
+
+
+<a id="backup-restore"></a>
+### Резервное копирование и восстановление
+
+Подходит для локального импорта/экспорта, миграции пользовательских данных, отката и операционных снимков:
+
+- `backup(compress: true, scope: ...)`: Создает резервную копию и возвращает путь к файлу. `compress: true` создает сжатый пакет, а `scope` определяет охват резервного копирования.
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: Восстанавливает данные из резервной копии. `cleanupBeforeRestore: true` предварительно очищает связанные данные, а `deleteAfterRestore: true` удаляет файл после успешного восстановления.
+- `BackupScope.database`: Резервирует весь экземпляр базы данных, включая все пространства, глобальные таблицы и связанные метаданные.
+- `BackupScope.currentSpace`: Резервирует только текущее пространство без глобальных таблиц.
+- `BackupScope.currentSpaceWithGlobal`: Резервирует текущее пространство вместе с глобальными таблицами.
+
+```dart
+final backupPath = await db.backup(
+  compress: true,
+  scope: BackupScope.currentSpaceWithGlobal,
+);
+
+final restored = await db.restore(backupPath);
+print(backupPath);
+print(restored);
+```
+
+
+<a id="error-handling"></a>
+### Обработка ошибок
+
+ToStore использует единую модель ответа для операций с данными:
+
+- `ResultType`: Стабильное перечисление статусов для ветвления логики.
+- `result.code`: Числовой код, соответствующий `ResultType`.
+- `result.message`: Понятное описание ошибки.
+- `successKeys` / `failedKeys`: Списки первичных ключей для пакетных операций.
+
+```dart
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
+
+if (!result.isSuccess) {
+  switch (result.type) {
+    case ResultType.notFound:
+      print('Ресурс не найден: ${result.message}');
+      break;
+    case ResultType.notNullViolation:
+    case ResultType.validationFailed:
+      print('Ошибка валидации: ${result.message}');
+      break;
+    case ResultType.primaryKeyViolation:
+    case ResultType.uniqueViolation:
+      print('Конфликт ограничения: ${result.message}');
+      break;
+    case ResultType.foreignKeyViolation:
+      print('Нарушение внешнего ключа: ${result.message}');
+      break;
+    case ResultType.resourceExhausted:
+    case ResultType.timeout:
+      print('Система занята, попробуйте позже: ${result.message}');
+      break;
+    case ResultType.ioError:
+    case ResultType.dbError:
+      print('Ошибка хранилища, добавьте запись в лог: ${result.message}');
+      break;
+    default:
+      print('Тип: ${result.type}, Код: ${result.code}, Сообщение: ${result.message}');
+  }
+}
+```
+
+**Часто встречающиеся коды статуса**:
+Успех имеет значение `0`; отрицательные значения означают ошибки.
+- `ResultType.success` (`0`): Операция успешно выполнена.
+- `ResultType.partialSuccess` (`1`): Пакетная операция выполнена частично.
+- `ResultType.unknown` (`-1`): Неизвестная ошибка.
+- `ResultType.uniqueViolation` (`-2`): Конфликт уникального индекса.
+- `ResultType.primaryKeyViolation` (`-3`): Конфликт первичного ключа.
+- `ResultType.foreignKeyViolation` (`-4`): Нарушение ограничения внешнего ключа.
+- `ResultType.notNullViolation` (`-5`): Отсутствует обязательное поле или `null` недопустим.
+- `ResultType.validationFailed` (`-6`): Не пройдена проверка длины, диапазона, формата или ограничения.
+- `ResultType.notFound` (`-11`): Не найдена целевая таблица, пространство или ресурс.
+- `ResultType.resourceExhausted` (`-15`): Недостаточно системных ресурсов; снизьте нагрузку или повторите позже.
+- `ResultType.ioError` (`-90`): Ошибка ввода-вывода файловой системы или хранилища.
+- `ResultType.dbError` (`-91`): Внутренняя ошибка базы данных.
+- `ResultType.timeout` (`-92`): Превышено время ожидания.
+
+### Обработка результата транзакции
+
+```dart
+final txResult = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+  });
+});
+
+if (txResult.isFailed) {
+  print('Тип ошибки транзакции: ${txResult.error?.type}');
+  print('Сообщение ошибки транзакции: ${txResult.error?.message}');
+}
+```
+
+Типы ошибок транзакции:
+- `TransactionErrorType.operationError`: Ошибка обычной операции внутри транзакции, например сбой валидации поля, некорректное состояние ресурса или другое бизнес-исключение.
+- `TransactionErrorType.integrityViolation`: Конфликт целостности или ограничений, например первичный ключ, уникальный ключ, внешний ключ или not-null.
+- `TransactionErrorType.timeout`: Транзакция превысила лимит времени.
+- `TransactionErrorType.io`: Ошибка ввода-вывода в нижележащем хранилище или файловой системе.
+- `TransactionErrorType.conflict`: Транзакция завершилась неудачно из-за конфликта.
+- `TransactionErrorType.userAbort`: Прерывание по инициативе пользователя. Ручной abort через выброс исключения пока не поддерживается.
+- `TransactionErrorType.unknown`: Любая другая неожиданная ошибка.
 
 
 <a id="logging-diagnostics"></a>

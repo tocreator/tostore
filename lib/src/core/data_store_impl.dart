@@ -6937,7 +6937,6 @@ class DataStoreImpl {
       // Create the SpaceInfo object with user-table information
       return SpaceInfo(
         spaceName: _currentSpaceName,
-        version: await getVersion(),
         tableCount: userTables.length, // Use actual count of user tables
         recordCount: config?.totalRecordCount ?? 0,
         dataSizeBytes: config?.totalDataSizeBytes ?? 0,

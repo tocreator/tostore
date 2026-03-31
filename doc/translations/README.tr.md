@@ -15,6 +15,8 @@
   <img src="https://img.shields.io/badge/Architecture-Neural--Distributed-orange" alt="Architecture">
 </p>
 
+
+
 <p align="center">
   <a href="../../README.md">English</a> | 
   <a href="README.zh-CN.md">简体中文</a> | 
@@ -35,7 +37,7 @@
 - [Neden ToStore?](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum](#installation) | [Hızlı Başlangıç](#quick-start)
 - [Şema Tanımlama](#schema-definition) | [Mobil/Masaüstü Entegrasyonu](#mobile-integration) | [Sunucu Tarafı Entegrasyonu](#server-integration)
 - [Vektör ve ANN Arama](#vector-advanced) | [Tablo Düzeyinde TTL](#ttl-config) | [Sorgu ve Sayfalama](#query-pagination) | [Yabancı Anahtarlar](#foreign-keys) | [Sorgu İşleçleri](#query-operators)
-- [Dağıtık Mimari](#distributed-architecture) | [Birincil Anahtar Örnekleri](#primary-key-examples) | [Atomik İfade İşlemleri](#atomic-expressions) | [İşlemler (Transactions)](#transactions) | [Hata Yönetimi](#error-handling) | [Log geri çağrısı ve veritabanı tanısı](#logging-diagnostics)
+- [Dağıtık Mimari](#distributed-architecture) | [Birincil Anahtar Örnekleri](#primary-key-examples) | [Atomik İfade İşlemleri](#atomic-expressions) | [İşlemler (Transactions)](#transactions) | [Veritabanı Yönetimi ve Bakım](#database-maintenance) | [Yedekleme ve Geri Yükleme](#backup-restore) | [Hata Yönetimi](#error-handling) | [Log geri çağrısı ve veritabanı tanısı](#logging-diagnostics)
 - [Güvenlik Yapılandırması](#security-config) | [Performans](#performance) | [Kaynaklar](#more-resources)
 
 
@@ -103,11 +105,16 @@ dependencies:
 <a id="quick-start"></a>
 ## Hızlı Başlangıç
 
-> [!IMPORTANT]
-> **Tablo şemasını tanımlamak ilk adımdır**: CRUD işlemlerini gerçekleştirmeden önce tablo şemasını tanımlamanız gerekir (yalnızca KV depolama kullanmıyorsanız).
-> - Tanımlar ve kısıtlamalar hakkında ayrıntılar için [Şema Tanımlama](#schema-definition) bölümüne bakın.
-> - **Mobil/Masaüstü**: Örneği başlatırken `schemas` parametresini geçirin; bkz. [Mobil Entegrasyon](#mobile-integration).
-> - **Sunucu**: Çalışma zamanında `createTables` kullanın; bkz. [Sunucu Entegrasyonu](#server-integration).
+> [!TIP]
+> **Yapılandırılmış ve yapılandırılmamış verilerin birlikte depolanmasını destekler**
+> Depolama yöntemi nasıl seçilmeli?
+> 1. **Temel iş verileri**: [Şema Tanımlama](#schema-definition) önerilir. Karmaşık sorgular, kısıt doğrulamaları, ilişkiler ve yüksek güvenlik gereksinimleri için uygundur. Bütünlük mantığını motora indirmek, uygulama katmanındaki geliştirme ve bakım maliyetini belirgin şekilde azaltır.
+> 2. **Dinamik/dağınık veriler**: Doğrudan [Anahtar-Değer Depolama (KV)](#quick-start) kullanabilir veya tabloda `DataType.json` alanları tanımlayabilirsiniz. Yapılandırma erişimi ve dağınık durum yönetimi için uygundur; hızlı başlangıç ve yüksek esneklik sağlar.
+
+### Yapılandırılmış tablo modu (Table)
+CRUD işlemleri için tablo şemasının önceden oluşturulması gerekir (bkz. [Şema Tanımlama](#schema-definition)). Senaryoya göre önerilen entegrasyon yaklaşımı:
+- **Mobil/Masaüstü**: [Sık başlatılan senaryolar](#mobile-integration) için, örnek başlatılırken `schemas` geçirilmesi önerilir.
+- **Sunucu/Ajan**: [Sürekli çalışan senaryolar](#server-integration) için, tabloların `createTables` ile dinamik olarak oluşturulması önerilir.
 
 ```dart
 // 1. Veritabanını başlatın
@@ -161,6 +168,9 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 <a id="schema-definition"></a>
 ## Şema Tanımlama
+**Tek seferlik tanım, motorun uçtan uca otomatik yönetimi üstlenmesini sağlar ve uygulamayı ağır doğrulama bakım yükünden uzun vadede kurtarır.**
+
+Aşağıdaki mobil, sunucu ve ajan örnekleri burada tanımlanan `appSchemas` yapısını yeniden kullanır.
 
 ### TableSchema Genel Bakış
 
@@ -457,6 +467,159 @@ final txResult = await db.transaction(() async {
   await db.update('users', {...});
 });
 ```
+
+
+<a id="database-maintenance"></a>
+### Veritabanı Yönetimi ve Bakım
+
+Aşağıdaki API'ler veritabanı yönetimi, tanılama ve bakım işleri için uygundur:
+
+- **Tablo bakımı**
+  `createTable(schema)`: Çalışma zamanında tek bir tablo oluşturur.
+  `getTableSchema(tableName)`: Şu anda etkin olan şema tanımını okur.
+  `getTableInfo(tableName)`: Kayıt sayısı, indeks sayısı, dosya boyutu, oluşturulma zamanı ve global tablo durumu gibi istatistikleri döndürür.
+  `clear(tableName)`: Şema, indeksler ve kısıtlamalar korunurken tüm verileri temizler.
+  `dropTable(tableName)`: Şema ve veriler dahil tüm tabloyu kaldırır.
+- **Alan (Space) yönetimi**
+  `currentSpaceName`: Geçerli aktif alan adını döndürür.
+  `listSpaces()`: Mevcut örnekteki tüm alanları listeler.
+  `getSpaceInfo(useCache: true)`: Geçerli alanın istatistiklerini getirir; en güncel veriler için `useCache: false` kullanın.
+  `deleteSpace(spaceName)`: Bir alanı siler. `default` alanı ve şu anda aktif olan alan silinemez.
+- **Örnek meta verileri**
+  `config`: Etkin `DataStoreConfig` değerini okur.
+  `instancePath`: Örneğin son depolama dizinini döndürür.
+  `getVersion()` / `setVersion(version)`: İş mantığınız için tanımladığınız sürüm numarasını okur ve yazar. Bu değer motorun dahili mantığında kullanılmaz.
+- **Bakım işlemleri**
+  `flush(flushStorage: true)`: Bekleyen yazmaları diske yazar. `true` olduğunda alttaki depolama tamponlarını da temizler.
+  `deleteDatabase()`: Geçerli veritabanı örneğini ve dosyalarını siler. Yıkıcı bir işlemdir.
+- **Birleşik tanı girişi**
+  `db.status.memory()`: Önbellek ve bellek kullanımını inceler.
+  `db.status.space()`: Geçerli alanın genel durumunu inceler.
+  `db.status.table(tableName)`: Belirli bir tablonun tanı bilgilerini inceler.
+  `db.status.config()`: Etkin yapılandırma anlık görüntüsünü inceler.
+  `db.status.migration(taskId)`: Şema göçü görevinin durumunu inceler.
+
+```dart
+final spaces = await db.listSpaces();
+final spaceInfo = await db.getSpaceInfo(useCache: false);
+final tableInfo = await db.getTableInfo('users');
+await db.flush();
+
+print(spaces);
+print(spaceInfo.toJson());
+print(tableInfo?.toJson());
+```
+
+
+<a id="backup-restore"></a>
+### Yedekleme ve Geri Yükleme
+
+Yerel içe/dışa aktarma, kullanıcı verisi taşıma, geri alma ve operasyonel anlık görüntüler için uygundur:
+
+- `backup(compress: true, scope: ...)`: Bir yedek oluşturur ve dosya yolunu döndürür. `compress: true` sıkıştırılmış bir paket üretir ve `scope` yedekleme kapsamını belirler.
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: Yedekten geri yükler. `cleanupBeforeRestore: true` ilgili eski verileri önce temizler, `deleteAfterRestore: true` ise başarılı geri yüklemeden sonra dosyayı siler.
+- `BackupScope.database`: Tüm alanlar, global tablolar ve ilgili meta veriler dahil tüm örneği yedekler.
+- `BackupScope.currentSpace`: Global tablolar hariç yalnızca geçerli alanı yedekler.
+- `BackupScope.currentSpaceWithGlobal`: Geçerli alanı global tablolarla birlikte yedekler.
+
+```dart
+final backupPath = await db.backup(
+  compress: true,
+  scope: BackupScope.currentSpaceWithGlobal,
+);
+
+final restored = await db.restore(backupPath);
+print(backupPath);
+print(restored);
+```
+
+
+<a id="error-handling"></a>
+### Hata Yönetimi
+
+ToStore, veri işlemleri için birleşik bir yanıt modeli kullanır:
+
+- `ResultType`: Dallanma mantığı için kararlı durum enum'u.
+- `result.code`: `ResultType` ile ilişkili sayısal kod.
+- `result.message`: Okunabilir hata açıklaması.
+- `successKeys` / `failedKeys`: Toplu işlemlerde başarılı ve başarısız birincil anahtar listeleri.
+
+```dart
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
+
+if (!result.isSuccess) {
+  switch (result.type) {
+    case ResultType.notFound:
+      print('Kaynak bulunamadı: ${result.message}');
+      break;
+    case ResultType.notNullViolation:
+    case ResultType.validationFailed:
+      print('Doğrulama başarısız: ${result.message}');
+      break;
+    case ResultType.primaryKeyViolation:
+    case ResultType.uniqueViolation:
+      print('Kısıt çakışması: ${result.message}');
+      break;
+    case ResultType.foreignKeyViolation:
+      print('Yabancı anahtar kısıtı başarısız: ${result.message}');
+      break;
+    case ResultType.resourceExhausted:
+    case ResultType.timeout:
+      print('Sistem meşgul, lütfen daha sonra tekrar deneyin: ${result.message}');
+      break;
+    case ResultType.ioError:
+    case ResultType.dbError:
+      print('Depolama hatası, lütfen loglayın: ${result.message}');
+      break;
+    default:
+      print('Tür: ${result.type}, Kod: ${result.code}, Mesaj: ${result.message}');
+  }
+}
+```
+
+**Yaygın durum kodları**:
+Başarı `0` değeridir; negatif değerler hataları gösterir.
+- `ResultType.success` (`0`): İşlem başarılı.
+- `ResultType.partialSuccess` (`1`): Toplu işlem kısmen başarılı.
+- `ResultType.unknown` (`-1`): Bilinmeyen hata.
+- `ResultType.uniqueViolation` (`-2`): Benzersiz indeks çakışması.
+- `ResultType.primaryKeyViolation` (`-3`): Birincil anahtar çakışması.
+- `ResultType.foreignKeyViolation` (`-4`): Yabancı anahtar kısıtı ihlali.
+- `ResultType.notNullViolation` (`-5`): Zorunlu alan eksik veya `null` kabul edilmiyor.
+- `ResultType.validationFailed` (`-6`): Uzunluk, aralık, biçim veya kısıt doğrulaması başarısız.
+- `ResultType.notFound` (`-11`): Hedef tablo, alan veya kaynak bulunamadı.
+- `ResultType.resourceExhausted` (`-15`): Sistem kaynakları yetersiz; yükü azaltın veya tekrar deneyin.
+- `ResultType.ioError` (`-90`): Dosya sistemi veya depolama I/O hatası.
+- `ResultType.dbError` (`-91`): Dahili veritabanı hatası.
+- `ResultType.timeout` (`-92`): İşlem zaman aşımına uğradı.
+
+### İşlem Sonucu Yönetimi
+
+```dart
+final txResult = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+  });
+});
+
+if (txResult.isFailed) {
+  print('İşlem hata türü: ${txResult.error?.type}');
+  print('İşlem hata mesajı: ${txResult.error?.message}');
+}
+```
+
+İşlem hata türleri:
+- `TransactionErrorType.operationError`: Alan doğrulama hatası, geçersiz kaynak durumu veya diğer iş kuralı istisnaları gibi işlem içindeki normal operasyon hatası.
+- `TransactionErrorType.integrityViolation`: Birincil anahtar, benzersiz anahtar, yabancı anahtar veya not-null gibi bütünlük ya da kısıt çakışması.
+- `TransactionErrorType.timeout`: İşlem zaman aşımına uğradı.
+- `TransactionErrorType.io`: Alttaki depolama ya da dosya sisteminde I/O hatası.
+- `TransactionErrorType.conflict`: İşlem bir çakışma nedeniyle başarısız oldu.
+- `TransactionErrorType.userAbort`: Kullanıcı tarafından tetiklenen iptal. İstisna fırlatarak manuel iptal şu anda desteklenmiyor.
+- `TransactionErrorType.unknown`: Diğer tüm beklenmeyen hatalar.
 
 
 <a id="logging-diagnostics"></a>

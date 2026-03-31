@@ -1,9 +1,8 @@
 import 'dart:developer';
 
-import 'platform_handler.dart';
-
-import 'common.dart';
 import '../model/log_config.dart';
+import 'common.dart';
+import 'platform_handler.dart';
 
 // log type enum
 enum LogType { info, debug, warn, error }
@@ -110,12 +109,9 @@ class Logger {
   /// internal log handler
   static void _log(Object? message, {String label = "log-info"}) {
     if (PlatformHandler.isDebug && LogConfig.enableLog) {
-      String startDash = "${'-' * 20}    $label    ${'-' * 18}>>";
-      String endDash = "${'-' * (startDash.length - 2)}<<";
-      if (startDash.length > 130) {
-        startDash = "${'-' * 40}>>\n    $label\n";
-        endDash = "${'-' * 40}<<";
-      }
+      String startDash =
+          "--------------------    $label    --------------------";
+      String endDash = '-' * (startDash.length);
       if (message is DateTime) {
         message = message.toIso8601String();
       }

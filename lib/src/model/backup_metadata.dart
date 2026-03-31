@@ -1,29 +1,31 @@
+import '../handler/common.dart';
 import 'backup_scope.dart';
 
 /// Structured backup metadata stored as meta.json inside each backup entry
 class BackupMetadata {
   final String timestamp; // ISO8601 string
-  final int version; // database version at backup time
+  final int backupFormatVersion; // backup package format version
   final BackupScope scope; // backup scope
   final bool compressed; // whether the backup entry is a zip archive
 
   const BackupMetadata({
     required this.timestamp,
-    required this.version,
+    this.backupFormatVersion = InternalConfig.currentBackupFormatVersion,
     required this.scope,
     required this.compressed,
   });
 
   Map<String, dynamic> toJson() => {
         'timestamp': timestamp,
-        'version': version,
+        'backupFormatVersion': backupFormatVersion,
         'scope': scope.toString().split('.').last,
         'compressed': compressed,
       };
 
   static BackupMetadata fromJson(Map<String, dynamic> json) {
     final String ts = (json['timestamp'] as String?) ?? '';
-    final int ver = (json['version'] as num?)?.toInt() ?? 0;
+    final int backupFormatVersion = resolveVersionValue(
+        json['backupFormatVersion'], InternalConfig.legacyBackupFormatVersion);
     final bool comp = (json['compressed'] as bool?) ?? false;
 
     // Scope: prefer explicit scope; fall back to legacy 'type' (full/partial)
@@ -53,7 +55,7 @@ class BackupMetadata {
 
     return BackupMetadata(
       timestamp: ts,
-      version: ver,
+      backupFormatVersion: backupFormatVersion,
       scope: scope,
       compressed: comp,
     );

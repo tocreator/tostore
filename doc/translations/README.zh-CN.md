@@ -15,6 +15,9 @@
   <img src="https://img.shields.io/badge/Architecture-Neural--Distributed-orange" alt="Architecture">
 </p>
 
+
+
+
 <p align="center">
   <a href="../../README.md">English</a> | 
   简体中文 | 
@@ -36,9 +39,9 @@
 ## 快速导航
 
 - [为什么选择 ToStore？](#why-tostore) | [ToStore特性](#key-features) | [安装](#installation) | [快速开始](#quick-start)
-- [表结构定义](#schema-definition) | [移动、桌面等频繁启动场景集成](#mobile-integration) | [服务端集成](#server-integration)
+- [表结构定义](#schema-definition) | [移动、桌面等频繁启动场景集成](#mobile-integration) | [服务端/智能体（持续运行）](#server-integration)
 - [向量字段、向量索引与向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [查询与高效分页](#query-pagination) | [外键与级联约束](#foreign-keys) | [查询操作符](#query-operators)
-- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [错误码与错误处理](#error-handling) | [日志回调与数据库诊断](#logging-diagnostics) 
+- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [管理与维护](#database-maintenance) | [备份与恢复](#backup-restore) | [错误码与错误处理](#error-handling) | [日志回调与数据库诊断](#logging-diagnostics) 
 - [安全配置](#security-config) | [性能与体验](#performance) | [更多资源](#more-resources)
 
 
@@ -108,11 +111,17 @@ dependencies:
 <a id="quick-start"></a>
 ## 快速开始
 
-> [!IMPORTANT]
-> **定义表结构是首要步骤**：在进行增删改查之前，必须先定义表结构。当然仅使用键值对存储的忽略。具体的定义方式取决于您的场景：
-> - 表结构定义与约束说明见 [表结构定义](#schema-definition)。
-> - **移动端/桌面端**：[频繁启动场景集成](#mobile-integration) 在初始化实例时传入 `schemas`。
-> - **服务端**： [服务端集成](#server-integration) 推荐在运行时通过调用 `createTables`创建。
+> [!TIP]
+> **支持结构化与非结构化数据混合存储**
+> 如何选择存储方式？
+> 1. **核心业务数据**：推荐使用 [表结构定义](#schema-definition)。适用于需要复杂查询、约束校验或关联关系、安全性高要求等场景。通过将完整性逻辑下沉到引擎，可显著降低应用层的开发与维护成本。
+> 2. **动态/零散数据**：可直接使用 [键值对存储 (KV)](#quick-start) 或在表中定义 `DataType.json` 字段。适用于配置存取或零散状态管理，主打快速上手与极致灵活性。
+
+### 结构化表方式 (Table)
+需预先创建表结构（详见 [表结构定义](#schema-definition)）方可进行增删改查。针对不同场景的接入建议：
+- **移动端/桌面端**：[针对频繁启动场景](#mobile-integration)，推荐在初始化实例时传入 `schemas`。
+- **服务端/智能体**：[针对持续运行场景](#server-integration)，推荐通过调用 `createTables` 动态创建。
+
 
 ```dart
 // 1. 初始化数据库
@@ -169,14 +178,17 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 <a id="schema-definition"></a>
 ## 表结构定义
-下文移动端与服务端示例都会复用这里的 `appSchemas`。
+**一次定义，换来引擎全链路自动化治理，长久免除应用维护繁重校验。**
+
+下文移动端、服务端与智能体示例都会复用这里的 `appSchemas`。
+
 
 ### TableSchema 结构总览
 
 ```dart
 const userSchema = TableSchema(
   name: 'users', // 表名，必填
-  tableId: 'users', // 表的唯一标识，可选，用于100%识别表重命名，省略也有99.9%精准识别率
+  tableId: 'users', // 表的唯一标识，可选
   primaryKeyConfig: PrimaryKeyConfig(
     name: 'id', // 主键字段名，默认 id
     type: PrimaryKeyType.sequential, // 主键自动生成类型
@@ -233,7 +245,7 @@ const appSchemas = [userSchema];
 
 ### 约束与自动校验
 
-通过 `FieldSchema` 可以直接把常见校验规则写入 schema，而不是在 UI、接口或服务层重复维护同一套逻辑：
+通过 `FieldSchema` 将常见的校验规则直接下沉到引擎层，避免在应用层重复实现逻辑：
 
 - `nullable: false`：非空约束
 - `minLength` / `maxLength`：文本长度约束
@@ -243,7 +255,6 @@ const appSchemas = [userSchema];
 - `createIndex`：为高频查询过滤、排序或关联字段创建索引，提升检索性能
 - `fieldId` / `tableId`：辅助识别字段或表重命名，便于迁移
 
-这些约束会在数据写入路径中统一校验，减少业务层重复实现非空、长度、范围和默认值逻辑。
 
 其中，`unique: true` 及会自动生成单字段唯一索引，`createIndex: true` 、外键会自动生成单字段普通索引；`indexes` 更适合定义组合索引、命名索引或向量索引。
 
@@ -253,7 +264,7 @@ const appSchemas = [userSchema];
 ### 选择接入方式
 
 - **移动端/桌面端**：适合在初始化实例直接把 `appSchemas` 传入 `ToStore.open(...)`
-- **服务端**：适合在进程运行时动态创建 schema，调用 `createTables(appSchemas)`
+- **服务端/智能体**：适合在进程运行时动态创建 schema，调用 `createTables(appSchemas)`
 
 
 <a id="mobile-integration"></a>
@@ -301,14 +312,14 @@ await db.close(keepActiveSpace: false);
 
 
 <a id="server-integration"></a>
-## 服务端集成
+## 服务端/智能体（持续运行场景集成）
 
 🖥️ **示例**：[server_quickstart.dart](../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
 
-// 服务启动时创建或校验表结构
+// 进程运行时创建表结构
 await db.createTables(appSchemas);
 
 // 在线表结构更新
@@ -867,6 +878,92 @@ final txResult2 = await db.transaction(() async {
   throw Exception('业务逻辑错误'); // 触发回滚
 }, rollbackOnError: true);
 ```
+
+
+<a id="database-maintenance"></a>
+### 管理与维护
+
+接下来介绍数据库管理、诊断与维护，便于日常开发、运维进行管理：
+
+- **表维护**
+  `createTable(schema)`：创建单张表，适合插件化模块或运行时按需建表。
+  `getTableSchema(tableName)`：查询指定表结构定义，适合调试、校验或后台管理界面展示。
+  `getTableInfo(tableName)`：获取表的统计信息，例如记录总数、索引数、文件大小、建表时间、是否全局表等。
+  `clear(tableName)`：只清空表数据，保留表结构、索引和约束。
+  `dropTable(tableName)`：彻底删除整张表，包含结构与数据。
+- **空间管理**
+  `currentSpaceName`：获取当前活跃空间名称。
+  `listSpaces()`：列出当前实例中的所有空间名称。
+  `getSpaceInfo(useCache: true)`：获取当前空间的统计信息，如表数量、记录数、数据大小和表名列表；设置 `useCache: false` 可强制读取最新状态。
+  `deleteSpace(spaceName)`：删除指定空间，但不能删除 `default` 空间，也不能删除当前正在使用的空间。
+- **实例元信息**
+  `config`：读取当前实例实际生效的 `DataStoreConfig`。
+  `instancePath`：获取数据库实例最终落盘目录的完整路径，便于定位文件或导出数据。
+  `getVersion()`：读取业务自定义版本号，仅供业务维护，不参与引擎内部版本控制。
+  `setVersion(version)`：写入业务自定义版本号。
+- **维护操作**
+  `flush(flushStorage: true)`：主动将待落盘数据刷入磁盘；`flushStorage: true` 时还会继续刷新文件系统底层存储缓冲区。
+  `deleteDatabase()`：删除当前数据库实例及其数据文件。
+- **统一诊断入口**
+  `db.status.memory()`：查看缓存和内存占用情况。
+  `db.status.space()`：查看当前空间的整体统计状态。
+  `db.status.table(tableName)`：查看指定表的诊断信息。
+  `db.status.config()`：查看当前生效配置快照。
+  `db.status.migration(taskId)`：查看模式迁移任务的执行状态。
+
+```dart
+
+final spaces = await db.listSpaces();
+final spaceInfo = await db.getSpaceInfo(useCache: false);
+final tableSchema = await db.getTableSchema('users');
+final tableInfo = await db.getTableInfo('users');
+
+print('spaces: $spaces');
+print(spaceInfo.toJson());
+print(tableSchema?.toJson());
+print(tableInfo?.toJson());
+
+await db.flush();
+
+final memoryInfo = await db.status.memory();
+final configInfo = await db.status.config();
+print(memoryInfo.toJson());
+print(configInfo.toJson());
+```
+
+
+
+<a id="backup-restore"></a>
+### 备份与恢复
+
+适合本地导入导出、用户数据迁移、故障回滚和运维快照：
+
+- `backup(compress: true, scope: ...)`：创建备份并返回备份文件路径。
+  `compress: true` 时会生成压缩备份文件，便于传输和归档。
+  `scope` 用来控制备份范围。
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`：从备份恢复数据库。
+  `cleanupBeforeRestore: true` 表示恢复前先清理相关旧数据，避免新旧数据混杂。
+  `deleteAfterRestore: true` 表示恢复成功后自动删除备份文件。
+- `BackupScope.database`：备份整个数据库实例，包含所有 Space、全局表和相关元数据。
+- `BackupScope.currentSpace`：仅备份当前 Space，不包含全局表。
+- `BackupScope.currentSpaceWithGlobal`：备份当前 Space 以及全局表，适合单用户导入导出。
+
+```dart
+// 备份数据
+final backupPath = await db.backup(
+  compress: true,
+  scope: BackupScope.currentSpaceWithGlobal,
+);
+
+// 恢复备份数据
+final restored = await db.restore(
+  backupPath,
+  cleanupBeforeRestore: true,
+  deleteAfterRestore: false, 
+);
+
+```
+
 
 
 <a id="error-handling"></a>

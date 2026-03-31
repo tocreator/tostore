@@ -35,7 +35,7 @@
 - [왜 ToStore인가?](#why-tostore) | [주요 기능](#key-features) | [설치](#installation) | [빠른 시작](#quick-start)
 - [스키마 정의](#schema-definition) | [모바일/데스크톱 통합](#mobile-integration) | [서버 사이드 통합](#server-integration)
 - [벡터 및 ANN 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [쿼리 및 페이지네이션](#query-pagination) | [외래 키](#foreign-keys) | [쿼리 연산자](#query-operators)
-- [분산 아키텍처](#distributed-architecture) | [기본 키 예시](#primary-key-examples) | [원자적 표현식 작업](#atomic-expressions) | [트랜잭션](#transactions) | [오류 처리](#error-handling) | [로그 콜백과 데이터베이스 진단](#logging-diagnostics)
+- [분산 아키텍처](#distributed-architecture) | [기본 키 예시](#primary-key-examples) | [원자적 표현식 작업](#atomic-expressions) | [트랜잭션](#transactions) | [데이터베이스 관리 및 유지보수](#database-maintenance) | [백업 및 복원](#backup-restore) | [오류 처리](#error-handling) | [로그 콜백과 데이터베이스 진단](#logging-diagnostics)
 - [보안 구성](#security-config) | [성능](#performance) | [추가 리소스](#more-resources)
 
 
@@ -103,11 +103,16 @@ dependencies:
 <a id="quick-start"></a>
 ## 빠른 시작
 
-> [!IMPORTANT]
-> **테이블 스키마 정의가 첫 번째 단계입니다**: CRUD 작업을 수행하기 전에 테이블 스키마를 정의해야 합니다(KV 저장소만 사용하는 경우 제외). 구체적인 정의 방법은 시나리오에 따라 다릅니다:
-> - 정의 및 제약 조건에 대한 자세한 내용은 [스키마 정의](#schema-definition)를 참조하세요.
-> - **모바일/데스크톱**: 인스턴스 초기화 시 `schemas`를 전달합니다. 자세한 내용은 [모바일/데스크톱 통합](#mobile-integration)을 참조하세요.
-> - **서버 사이드**: 런타임에 `createTables`를 사용합니다. 자세한 내용은 [서버 사이드 통합](#server-integration)을 참조하세요.
+> [!TIP]
+> **구조화 데이터와 비구조화 데이터의 혼합 저장을 지원합니다**
+> 저장 방식을 어떻게 선택할까요?
+> 1. **핵심 비즈니스 데이터**: [스키마 정의](#schema-definition)를 권장합니다. 복잡한 쿼리, 제약 검증, 관계, 높은 보안 요구가 있는 시나리오에 적합합니다. 무결성 로직을 엔진으로 내려 애플리케이션 계층의 개발 및 유지보수 비용을 크게 낮출 수 있습니다.
+> 2. **동적/분산 데이터**: [키-값 저장소 (KV)](#quick-start)를 직접 사용하거나 테이블에 `DataType.json` 필드를 정의할 수 있습니다. 설정 접근이나 분산 상태 관리에 적합하며 빠른 도입과 높은 유연성을 중시합니다.
+
+### 구조화 테이블 방식 (Table)
+CRUD 작업을 수행하려면 먼저 테이블 스키마를 생성해야 합니다(자세한 내용은 [스키마 정의](#schema-definition) 참고). 시나리오별 권장 연동 방식:
+- **모바일/데스크톱**: [빈번한 시작 시나리오](#mobile-integration)에서는 인스턴스 초기화 시 `schemas`를 전달하는 것을 권장합니다.
+- **서버/에이전트**: [지속 실행 시나리오](#server-integration)에서는 `createTables`로 동적으로 생성하는 것을 권장합니다.
 
 ```dart
 // 1. 데이터베이스 초기화
@@ -163,7 +168,9 @@ final version = await db.getValue('app_version', isGlobal: true);
 
 <a id="schema-definition"></a>
 ## 스키마 정의
-다음 모바일 및 서버 사이드 예제는 여기서 정의된 `appSchemas`를 재사용합니다.
+**한 번 정의하면 엔진이 전 구간 자동 거버넌스를 맡아 애플리케이션이 무거운 검증 유지보수를 오래 떠안지 않아도 됩니다.**
+
+아래의 모바일, 서버, 에이전트 예제는 여기서 정의한 `appSchemas`를 재사용합니다.
 
 ### TableSchema 개요
 
@@ -847,6 +854,88 @@ final txResult2 = await db.transaction(() async {
 ```
 
 
+<a id="database-maintenance"></a>
+### 데이터베이스 관리 및 유지보수
+
+다음 API는 데이터베이스 관리, 진단, 정리 작업에 적합합니다.
+
+- **테이블 관리**
+  `createTable(schema)`: 런타임에 단일 테이블을 생성합니다.
+  `getTableSchema(tableName)`: 현재 적용 중인 스키마 정의를 읽습니다.
+  `getTableInfo(tableName)`: 레코드 수, 인덱스 수, 파일 크기, 생성 시각, 글로벌 테이블 여부 등의 통계를 확인합니다.
+  `clear(tableName)`: 스키마, 인덱스, 제약 조건은 유지한 채 모든 데이터를 비웁니다.
+  `dropTable(tableName)`: 스키마와 데이터를 포함해 테이블 전체를 삭제합니다.
+- **스페이스 관리**
+  `currentSpaceName`: 현재 활성 스페이스 이름을 가져옵니다.
+  `listSpaces()`: 현재 인스턴스의 모든 스페이스를 나열합니다.
+  `getSpaceInfo(useCache: true)`: 현재 스페이스의 통계를 가져옵니다. 최신 상태가 필요하면 `useCache: false`를 사용합니다.
+  `deleteSpace(spaceName)`: 스페이스를 삭제합니다. `default` 스페이스와 현재 활성 스페이스는 삭제할 수 없습니다.
+- **인스턴스 메타데이터**
+  `config`: 실제로 적용된 `DataStoreConfig`를 읽습니다.
+  `instancePath`: 인스턴스의 최종 저장 디렉터리를 가져옵니다.
+  `getVersion()` / `setVersion(version)`: 비즈니스에서 정의한 버전 번호를 읽고 씁니다. 이 값은 엔진 내부 로직에는 사용되지 않습니다.
+- **유지보수 작업**
+  `flush(flushStorage: true)`: 대기 중인 쓰기를 디스크에 반영합니다. `true`이면 하위 저장소 버퍼까지 함께 비웁니다.
+  `deleteDatabase()`: 현재 데이터베이스 인스턴스와 관련 파일을 삭제합니다. 파괴적인 작업입니다.
+- **통합 진단 진입점**
+  `db.status.memory()`: 캐시와 메모리 사용량을 확인합니다.
+  `db.status.space()`: 현재 스페이스의 전체 통계 상태를 확인합니다.
+  `db.status.table(tableName)`: 특정 테이블의 진단 정보를 확인합니다.
+  `db.status.config()`: 현재 적용된 설정 스냅샷을 확인합니다.
+  `db.status.migration(taskId)`: 스키마 마이그레이션 작업 상태를 확인합니다.
+
+```dart
+print('current space: ${db.currentSpaceName}');
+print('instance path: ${db.instancePath}');
+
+final spaces = await db.listSpaces();
+final spaceInfo = await db.getSpaceInfo(useCache: false);
+final tableInfo = await db.getTableInfo('users');
+
+final userVersion = await db.getVersion();
+await db.setVersion(userVersion + 1);
+await db.flush();
+
+final memoryInfo = await db.status.memory();
+print(spaces);
+print(spaceInfo.toJson());
+print(tableInfo?.toJson());
+print(memoryInfo.toJson());
+```
+
+데이터만 비우고 스키마와 인덱스를 유지하려면 `clear(...)`를 사용하고, 테이블 자체를 완전히 제거하려면 `dropTable(...)`를 사용하세요. `deleteSpace(...)`, `dropTable(...)`, `deleteDatabase(...)`는 모두 파괴적인 작업이므로 주의해서 사용해야 합니다.
+
+
+<a id="backup-restore"></a>
+### 백업 및 복원
+
+로컬 가져오기/내보내기, 사용자 데이터 마이그레이션, 롤백, 운영 스냅샷에 적합합니다.
+
+- `backup(compress: true, scope: ...)`: 백업을 생성하고 파일 경로를 반환합니다. `compress: true`이면 압축 백업 패키지가 생성되고, `scope`로 백업 범위를 제어합니다.
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: 백업에서 복원합니다. `cleanupBeforeRestore: true`는 기존 관련 데이터를 먼저 정리해 오래된 데이터와 섞이지 않도록 하고, `deleteAfterRestore: true`는 복원 성공 후 백업 파일을 삭제합니다.
+- `BackupScope.database`: 모든 스페이스, 글로벌 테이블, 관련 메타데이터를 포함한 전체 데이터베이스 인스턴스를 백업합니다.
+- `BackupScope.currentSpace`: 글로벌 테이블을 제외하고 현재 스페이스만 백업합니다.
+- `BackupScope.currentSpaceWithGlobal`: 현재 스페이스와 글로벌 테이블을 함께 백업합니다. 단일 사용자 데이터 내보내기/가져오기에 적합합니다.
+
+```dart
+final backupPath = await db.backup(
+  compress: true,
+  scope: BackupScope.currentSpaceWithGlobal,
+);
+
+final restored = await db.restore(
+  backupPath,
+  cleanupBeforeRestore: true,
+  deleteAfterRestore: false,
+);
+
+print(backupPath);
+print(restored);
+```
+
+가능하면 복원 전에 애플리케이션의 쓰기 작업을 잠시 멈추는 것이 좋습니다.
+
+
 <a id="error-handling"></a>
 ### 오류 처리
 
@@ -871,26 +960,67 @@ if (!result.isSuccess) {
     case ResultType.validationFailed:
       print('유효성 검사 실패: ${result.message}');
       break;
+    case ResultType.primaryKeyViolation:
     case ResultType.uniqueViolation:
       print('충돌 발생: ${result.message}');
       break;
+    case ResultType.foreignKeyViolation:
+      print('외래 키 제약 조건 실패: ${result.message}');
+      break;
+    case ResultType.resourceExhausted:
+    case ResultType.timeout:
+      print('시스템이 바쁩니다. 잠시 후 다시 시도하세요: ${result.message}');
+      break;
+    case ResultType.ioError:
+    case ResultType.dbError:
+      print('스토리지 오류입니다. 로그를 남겨주세요: ${result.message}');
+      break;
     default:
-      print('코드: ${result.code}, 메시지: ${result.message}');
+      print('타입: ${result.type}, 코드: ${result.code}, 메시지: ${result.message}');
   }
 }
 ```
 
 **일반 상태 코드**:
-성공은 0, 음수 값은 오류입니다.
-- `ResultType.success` (0)
-- `ResultType.partialSuccess` (1)
-- `ResultType.uniqueViolation` (-2)
-- `ResultType.primaryKeyViolation` (-3)
-- `ResultType.foreignKeyViolation` (-4)
-- `ResultType.notNullViolation` (-5)
-- `ResultType.validationFailed` (-6)
-- `ResultType.notFound` (-11)
-- `ResultType.resourceExhausted` (-15)
+성공은 `0`, 음수 값은 오류를 의미합니다.
+- `ResultType.success` (`0`): 작업 성공.
+- `ResultType.partialSuccess` (`1`): 배치 작업 일부 성공.
+- `ResultType.unknown` (`-1`): 알 수 없는 오류.
+- `ResultType.uniqueViolation` (`-2`): 유니크 인덱스 충돌.
+- `ResultType.primaryKeyViolation` (`-3`): 기본 키 충돌.
+- `ResultType.foreignKeyViolation` (`-4`): 외래 키 제약 조건 위반.
+- `ResultType.notNullViolation` (`-5`): 필수 필드 누락 또는 `null` 불가.
+- `ResultType.validationFailed` (`-6`): 길이, 범위, 형식 또는 제약 조건 검증 실패.
+- `ResultType.notFound` (`-11`): 대상 테이블, 스페이스 또는 리소스를 찾을 수 없음.
+- `ResultType.resourceExhausted` (`-15`): 시스템 리소스 부족. 부하를 줄이거나 다시 시도하세요.
+- `ResultType.ioError` (`-90`): 파일 시스템 또는 스토리지 I/O 오류.
+- `ResultType.dbError` (`-91`): 데이터베이스 내부 오류.
+- `ResultType.timeout` (`-92`): 시간 초과.
+
+### 트랜잭션 결과 처리
+
+```dart
+final txResult = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+  });
+});
+
+if (txResult.isFailed) {
+  print('트랜잭션 오류 타입: ${txResult.error?.type}');
+  print('트랜잭션 오류 메시지: ${txResult.error?.message}');
+}
+```
+
+트랜잭션 오류 타입:
+- `TransactionErrorType.operationError`: 필드 검증 실패, 잘못된 리소스 상태, 기타 비즈니스 예외 등 트랜잭션 내부의 일반 작업 실패.
+- `TransactionErrorType.integrityViolation`: 기본 키, 유니크 키, 외래 키, not-null 등 무결성 또는 제약 조건 충돌.
+- `TransactionErrorType.timeout`: 트랜잭션 시간 초과.
+- `TransactionErrorType.io`: 하위 스토리지 또는 파일 시스템의 I/O 오류.
+- `TransactionErrorType.conflict`: 충돌로 인해 트랜잭션 실패.
+- `TransactionErrorType.userAbort`: 사용자에 의한 중단. 예외를 던지는 방식의 수동 중단은 현재 지원되지 않습니다.
+- `TransactionErrorType.unknown`: 기타 예기치 못한 오류.
 
 
 <a id="logging-diagnostics"></a>
