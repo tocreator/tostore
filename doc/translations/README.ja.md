@@ -30,21 +30,11 @@
 </p>
 
 ## クイックナビゲーション
-<<<<<<< HEAD
 - **はじめに**: [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
 - **アーキテクチャとモデル**: [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - **高度なクエリ**: [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
 - **高度な機能とパフォーマンス**: [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
 - **運用とセキュリティ**: [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [その他のリソース](#more-resources)
-=======
-
-- [なぜToStoreなのか？](#why-tostore) | [主な機能](#key-features) | [インストール](#installation) | [クイックスタート](#quick-start)
-- [スキーマ定義](#schema-definition) | [モバイル/デスクトップ統合](#mobile-integration) | [サーバー側統合](#server-integration)
-- [ベクトルとANN検索](#vector-advanced) | [テーブルレベルTTL](#ttl-config) | [クエリとページネーション](#query-pagination) | [外部キー](#foreign-keys) | [クエリ演算子](#query-operators)
-- [分散アーキテクチャ](#distributed-architecture) | [主キーの例](#primary-key-examples) | [アトミックな式操作](#atomic-expressions) | [トランザクション](#transactions) | [データベース管理と保守](#database-maintenance) | [バックアップと復元](#backup-restore) | [エラー処理](#error-handling) | [ログコールバックとデータベース診断](#logging-diagnostics)
-- [セキュリティ構成](#security-config) | [パフォーマンス](#performance) | [リソース](#more-resources)
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="why-tostore"></a>
 ## ToStore を選ぶ理由
@@ -111,7 +101,6 @@ dependencies:
 ## クイックスタート
 
 > [!TIP]
-<<<<<<< HEAD
 > **ストレージ モードはどのように選択すればよいですか?**
 > 1. [**Key-Value モード (KV)**](#quick-start-kv): 構成アクセス、分散状態管理、または JSON データ ストレージに最適です。これが最も早く始める方法です。
 > 2. [**構造化テーブル モード**](#quick-start-table): 複雑なクエリ、制約の検証、または大規模なデータ ガバナンスを必要とするコア ビジネス データに最適です。整合性ロジックをエンジンにプッシュすることで、アプリケーション層の開発とメンテナンスのコストを大幅に削減できます。
@@ -120,17 +109,6 @@ dependencies:
 <a id="quick-start-kv"></a>
 ### キーバリューストレージ (KV)
 このモードは、事前定義された構造化テーブルが必要ない場合に適しています。シンプルで実用的で、高性能ストレージ エンジンを搭載しています。 **その効率的なインデックス作成アーキテクチャにより、非常に大規模なデータ規模の通常のモバイル デバイスでもクエリ パフォーマンスが非常に安定し、非常に応答性が高くなります。** 異なるスペース内のデータは自然に分離され、グローバル共有もサポートされます。
-=======
-> **構造化データと非構造化データの混合保存をサポート**
-> 保存方式はどう選ぶ？
-> 1. **中核業務データ**：[スキーマ定義](#schema-definition) を推奨します。複雑なクエリ、制約検証、関連関係、高いセキュリティ要件があるシナリオに適しています。整合性ロジックをエンジンに委ねることで、アプリ層の開発・保守コストを大幅に下げられます。
-> 2. **動的／散在データ**：直接 [キー値ストレージ (KV)](#quick-start) を使うか、テーブルで `DataType.json` フィールドを定義できます。設定の読み書きや散在した状態管理に向いており、素早い導入と高い柔軟性を重視します。
-
-### 構造化テーブル方式 (Table)
-CRUD を行うには、事前にテーブルスキーマを作成する必要があります（詳しくは [スキーマ定義](#schema-definition)）。シナリオ別の導入推奨:
-- **モバイル/デスクトップ**：[頻繁に起動するシナリオ](#mobile-integration) では、初期化時に `schemas` を渡すことを推奨します。
-- **サーバー/エージェント**：[継続実行シナリオ](#server-integration) では、`createTables` による動的作成を推奨します。
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ```dart
 // Initialize the database
@@ -269,16 +247,10 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 
 <a id="schema-definition"></a>
 ## スキーマ定義
-<<<<<<< HEAD
 **一度定義すれば、エンジンがエンドツーエンドの自動ガバナンスを処理できるため、アプリケーションは重度の検証メンテナンスを行う必要がなくなります。**
 
 次のモバイル、サーバー側、およびエージェントの例はすべて、ここで定義された `appSchemas` を再利用します。
 
-=======
-**一度定義すれば、エンジンがエンドツーエンドの自動ガバナンスを担い、アプリ側で重い検証ロジックを長期に保守する負担を減らせます。**
-
-以下のモバイル、サーバー、エージェントの例では、ここで定義した `appSchemas` を再利用します。
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ### TableSchema の概要
 
@@ -1147,7 +1119,6 @@ final txResult2 = await db.transaction(() async {
 
 
 <a id="database-maintenance"></a>
-<<<<<<< HEAD
 ### 管理とメンテナンス
 
 次の API は、プラグイン スタイルの開発、管理パネル、運用シナリオのデータベース管理、診断、メンテナンスをカバーします。
@@ -1196,63 +1167,10 @@ print(memoryInfo.toJson());
 print(configInfo.toJson());
 ```
 
-=======
-### データベース管理と保守
-
-以下の API は、データベース管理、診断、クリーンアップ用途向けです。
-
-- **テーブル管理**
-  `createTable(schema)`: 実行時に単一テーブルを作成します。
-  `getTableSchema(tableName)`: 現在有効なスキーマ定義を取得します。
-  `getTableInfo(tableName)`: レコード数、インデックス数、ファイルサイズ、作成時刻、グローバルテーブルかどうかなどの統計情報を取得します。
-  `clear(tableName)`: スキーマ、インデックス、制約を残したまま全データを削除します。
-  `dropTable(tableName)`: スキーマとデータを含めてテーブル全体を削除します。
-- **Space 管理**
-  `currentSpaceName`: 現在アクティブな Space 名を取得します。
-  `listSpaces()`: 現在のインスタンス内のすべての Space を一覧します。
-  `getSpaceInfo(useCache: true)`: 現在の Space の統計情報を取得します。最新状態を取得したい場合は `useCache: false` を指定します。
-  `deleteSpace(spaceName)`: Space を削除します。`default` Space と現在アクティブな Space は削除できません。
-- **インスタンス情報**
-  `config`: 実際に有効な `DataStoreConfig` を取得します。
-  `instancePath`: インスタンスの最終保存ディレクトリを取得します。
-  `getVersion()` / `setVersion(version)`: 業務側で定義するバージョン番号を読み書きします。この値はエンジン内部では使用されません。
-- **メンテナンス操作**
-  `flush(flushStorage: true)`: 保留中の書き込みをディスクへフラッシュします。`true` の場合は基盤ストレージのバッファもフラッシュします。
-  `deleteDatabase()`: 現在のデータベースインスタンスと関連ファイルを削除します。破壊的な操作です。
-- **統一診断エントリ**
-  `db.status.memory()`: キャッシュとメモリ使用量を確認します。
-  `db.status.space()`: 現在の Space 全体の統計状態を確認します。
-  `db.status.table(tableName)`: 特定テーブルの診断情報を確認します。
-  `db.status.config()`: 現在有効な設定スナップショットを確認します。
-  `db.status.migration(taskId)`: スキーマ移行タスクの状態を確認します。
-
-```dart
-print('current space: ${db.currentSpaceName}');
-print('instance path: ${db.instancePath}');
-
-final spaces = await db.listSpaces();
-final spaceInfo = await db.getSpaceInfo(useCache: false);
-final tableInfo = await db.getTableInfo('users');
-
-final userVersion = await db.getVersion();
-await db.setVersion(userVersion + 1);
-await db.flush();
-
-final memoryInfo = await db.status.memory();
-print(spaces);
-print(spaceInfo.toJson());
-print(tableInfo?.toJson());
-print(memoryInfo.toJson());
-```
-
-データだけを消してスキーマやインデックスを残したい場合は `clear(...)` を使用し、テーブル自体を完全に削除したい場合は `dropTable(...)` を使用します。`deleteSpace(...)`、`dropTable(...)`、`deleteDatabase(...)` は破壊的な操作のため、慎重に実行してください。
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="backup-restore"></a>
 ### バックアップと復元
 
-<<<<<<< HEAD
 シングルユーザーのローカルインポート/エクスポート、大規模なオフラインデータの移行、障害後のシステムのロールバックに特に役立ちます。
 
 - **バックアップ (`backup`)**
@@ -1268,23 +1186,11 @@ print(memoryInfo.toJson());
 
 ```dart
 // Example: export the full data package for the current user
-=======
-ローカルのインポート/エクスポート、ユーザーデータ移行、ロールバック、運用スナップショットに適しています。
-
-- `backup(compress: true, scope: ...)`: バックアップを作成し、そのファイルパスを返します。`compress: true` で圧縮バックアップを生成し、`scope` で対象範囲を制御します。
-- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: バックアップから復元します。`cleanupBeforeRestore: true` は関連データを先に消去して旧データとの混在を防ぎ、`deleteAfterRestore: true` は復元成功後にバックアップファイルを削除します。
-- `BackupScope.database`: すべての Space、グローバルテーブル、関連メタデータを含むデータベースインスタンス全体をバックアップします。
-- `BackupScope.currentSpace`: グローバルテーブルを除き、現在の Space のみをバックアップします。
-- `BackupScope.currentSpaceWithGlobal`: 現在の Space とグローバルテーブルをバックアップします。単一ユーザーのエクスポート/インポートに適しています。
-
-```dart
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 final backupPath = await db.backup(
   compress: true,
   scope: BackupScope.currentSpaceWithGlobal,
 );
 
-<<<<<<< HEAD
 // Example: restore from a backup package and clean up the source file automatically
 final restored = await db.restore(
   backupPath,
@@ -1303,23 +1209,6 @@ ToStore は、データ操作に統合応答モデルを使用します。
 - `result.code`: `ResultType` に対応する安定した数値コード
 - `result.message`: 現在のエラーを説明する読み取り可能なメッセージ
 - `successKeys` / `failedKeys`: 一括操作で成功した主キーと失敗した主キーのリスト
-=======
-final restored = await db.restore(
-  backupPath,
-  cleanupBeforeRestore: true,
-  deleteAfterRestore: false,
-);
-
-print(backupPath);
-print(restored);
-```
-
-可能であれば、復元前にアプリケーションからの書き込みを停止してください。
-
-
-<a id="error-handling"></a>
-### エラー処理
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 ```dart
@@ -1352,28 +1241,12 @@ if (!result.isSuccess) {
     case ResultType.dbError:
       print('Underlying storage error. Please record the logs: ${result.message}');
       break;
-    case ResultType.foreignKeyViolation:
-      print('外部キー制約に失敗しました: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('システムが混み合っています。しばらくしてから再試行してください: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('ストレージエラーです。ログに記録してください: ${result.message}');
-      break;
     default:
-<<<<<<< HEAD
       print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
-=======
-      print('タイプ: ${result.type}, コード: ${result.code}, メッセージ: ${result.message}');
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
   }
 }
 ```
 
-<<<<<<< HEAD
 一般的なステータス コードの例:
 成功すると `0` が返されます。負の数値はエラーを示します。
 - `ResultType.success` (`0`): 操作は成功しました
@@ -1391,26 +1264,6 @@ if (!result.isSuccess) {
 - `ResultType.timeout` (`-92`): タイムアウト
 
 ### トランザクション結果の処理
-=======
-**一般的なステータスコード**:
-成功は `0`、負の値はエラーを表します。
-- `ResultType.success` (`0`)：操作成功。
-- `ResultType.partialSuccess` (`1`)：一括操作が部分的に成功。
-- `ResultType.unknown` (`-1`)：不明なエラー。
-- `ResultType.uniqueViolation` (`-2`)：一意インデックスの競合。
-- `ResultType.primaryKeyViolation` (`-3`)：主キー競合。
-- `ResultType.foreignKeyViolation` (`-4`)：外部キー制約違反。
-- `ResultType.notNullViolation` (`-5`)：必須フィールドが欠落、または `null` が許可されていません。
-- `ResultType.validationFailed` (`-6`)：長さ、範囲、形式、制約の検証に失敗。
-- `ResultType.notFound` (`-11`)：対象のテーブル、Space、またはリソースが見つかりません。
-- `ResultType.resourceExhausted` (`-15`)：システムリソース不足。負荷を下げるか再試行してください。
-- `ResultType.ioError` (`-90`)：ファイルシステムまたはストレージの I/O エラー。
-- `ResultType.dbError` (`-91`)：データベース内部エラー。
-- `ResultType.timeout` (`-92`)：タイムアウト。
-
-### トランザクション結果の処理
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 ```dart
 final txResult = await db.transaction(() async {
   await db.insert('users', {
@@ -1419,7 +1272,6 @@ final txResult = await db.transaction(() async {
   });
 });
 
-<<<<<<< HEAD
 // txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
 if (txResult.isFailed) {
   print('Transaction error type: ${txResult.error?.type}');
@@ -1435,22 +1287,6 @@ if (txResult.isFailed) {
 - `TransactionErrorType.conflict`: 競合によりトランザクションが失敗しました
 - `TransactionErrorType.userAbort`: ユーザーが開始した中止 (スローベースの手動中止は現在サポートされていません)
 - `TransactionErrorType.unknown`: その他のエラー
-=======
-if (txResult.isFailed) {
-  print('トランザクションエラー種別: ${txResult.error?.type}');
-  print('トランザクションエラーメッセージ: ${txResult.error?.message}');
-}
-```
-
-トランザクションエラーの種類:
-- `TransactionErrorType.operationError`：フィールド検証失敗、リソース状態不正、その他の業務例外など、トランザクション内の通常操作の失敗。
-- `TransactionErrorType.integrityViolation`：主キー、一意キー、外部キー、非 null などの整合性・制約違反。
-- `TransactionErrorType.timeout`：トランザクションのタイムアウト。
-- `TransactionErrorType.io`：下位ストレージまたはファイルシステムの I/O エラー。
-- `TransactionErrorType.conflict`：競合によりトランザクションが失敗。
-- `TransactionErrorType.userAbort`：ユーザー起因の中断。例外送出による手動中断は現時点では未対応です。
-- `TransactionErrorType.unknown`：その他の予期しないエラー。
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 <a id="logging-diagnostics"></a>

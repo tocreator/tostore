@@ -30,21 +30,11 @@
 </p>
 
 ## 빠른 탐색
-<<<<<<< HEAD
 - **시작하기**: [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - **아키텍처 및 모델**: [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - **고급 쿼리**: [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
 - **고급 및 성능**: [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - **운영 및 보안**: [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
-=======
-
-- [왜 ToStore인가?](#why-tostore) | [주요 기능](#key-features) | [설치](#installation) | [빠른 시작](#quick-start)
-- [스키마 정의](#schema-definition) | [모바일/데스크톱 통합](#mobile-integration) | [서버 사이드 통합](#server-integration)
-- [벡터 및 ANN 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [쿼리 및 페이지네이션](#query-pagination) | [외래 키](#foreign-keys) | [쿼리 연산자](#query-operators)
-- [분산 아키텍처](#distributed-architecture) | [기본 키 예시](#primary-key-examples) | [원자적 표현식 작업](#atomic-expressions) | [트랜잭션](#transactions) | [데이터베이스 관리 및 유지보수](#database-maintenance) | [백업 및 복원](#backup-restore) | [오류 처리](#error-handling) | [로그 콜백과 데이터베이스 진단](#logging-diagnostics)
-- [보안 구성](#security-config) | [성능](#performance) | [추가 리소스](#more-resources)
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="why-tostore"></a>
 ## 왜 ToStore를 선택해야 할까요?
@@ -111,7 +101,6 @@ dependencies:
 ## 빠른 시작
 
 > [!TIP]
-<<<<<<< HEAD
 > **저장 모드를 어떻게 선택해야 합니까?**
 > 1. [**키-값 모드(KV)**](#quick-start-kv): 구성 액세스, 분산 상태 관리 또는 JSON 데이터 저장에 가장 적합합니다. 시작하는 가장 빠른 방법입니다.
 > 2. [**구조화된 테이블 모드**](#quick-start-table): 복잡한 쿼리, 제약 조건 확인 또는 대규모 데이터 거버넌스가 필요한 핵심 비즈니스 데이터에 가장 적합합니다. 무결성 로직을 엔진에 적용하면 애플리케이션 계층 개발 및 유지 관리 비용을 크게 줄일 수 있습니다.
@@ -120,17 +109,6 @@ dependencies:
 <a id="quick-start-kv"></a>
 ### 키-값 저장소(KV)
 이 모드는 사전 정의된 구조화된 테이블이 필요하지 않은 경우에 적합합니다. 간단하고 실용적이며 고성능 스토리지 엔진이 지원됩니다. **효율적인 인덱싱 아키텍처는 매우 큰 데이터 규모의 일반 모바일 장치에서도 쿼리 성능을 매우 안정적으로 유지하고 응답성이 뛰어납니다.** 서로 다른 공간의 데이터는 자연스럽게 격리되는 동시에 글로벌 공유도 지원됩니다.
-=======
-> **구조화 데이터와 비구조화 데이터의 혼합 저장을 지원합니다**
-> 저장 방식을 어떻게 선택할까요?
-> 1. **핵심 비즈니스 데이터**: [스키마 정의](#schema-definition)를 권장합니다. 복잡한 쿼리, 제약 검증, 관계, 높은 보안 요구가 있는 시나리오에 적합합니다. 무결성 로직을 엔진으로 내려 애플리케이션 계층의 개발 및 유지보수 비용을 크게 낮출 수 있습니다.
-> 2. **동적/분산 데이터**: [키-값 저장소 (KV)](#quick-start)를 직접 사용하거나 테이블에 `DataType.json` 필드를 정의할 수 있습니다. 설정 접근이나 분산 상태 관리에 적합하며 빠른 도입과 높은 유연성을 중시합니다.
-
-### 구조화 테이블 방식 (Table)
-CRUD 작업을 수행하려면 먼저 테이블 스키마를 생성해야 합니다(자세한 내용은 [스키마 정의](#schema-definition) 참고). 시나리오별 권장 연동 방식:
-- **모바일/데스크톱**: [빈번한 시작 시나리오](#mobile-integration)에서는 인스턴스 초기화 시 `schemas`를 전달하는 것을 권장합니다.
-- **서버/에이전트**: [지속 실행 시나리오](#server-integration)에서는 `createTables`로 동적으로 생성하는 것을 권장합니다.
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ```dart
 // Initialize the database
@@ -269,13 +247,7 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 
 <a id="schema-definition"></a>
 ## 스키마 정의
-<<<<<<< HEAD
 **한 번 정의하면 엔진이 엔드투엔드 자동화 거버넌스를 처리하게 되므로 애플리케이션이 더 이상 과도한 검증 유지 관리를 수행하지 않아도 됩니다.**
-=======
-**한 번 정의하면 엔진이 전 구간 자동 거버넌스를 맡아 애플리케이션이 무거운 검증 유지보수를 오래 떠안지 않아도 됩니다.**
-
-아래의 모바일, 서버, 에이전트 예제는 여기서 정의한 `appSchemas`를 재사용합니다.
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 다음 모바일, 서버 측 및 에이전트 예제는 모두 여기에 정의된 `appSchemas`을 재사용합니다.
 
@@ -1147,7 +1119,6 @@ final txResult2 = await db.transaction(() async {
 
 
 <a id="database-maintenance"></a>
-<<<<<<< HEAD
 ### 관리 및 유지 관리
 
 다음 API는 플러그인 스타일 개발, 관리 패널 및 운영 시나리오를 위한 데이터베이스 관리, 진단 및 유지 관리를 다룹니다.
@@ -1196,63 +1167,10 @@ print(memoryInfo.toJson());
 print(configInfo.toJson());
 ```
 
-=======
-### 데이터베이스 관리 및 유지보수
-
-다음 API는 데이터베이스 관리, 진단, 정리 작업에 적합합니다.
-
-- **테이블 관리**
-  `createTable(schema)`: 런타임에 단일 테이블을 생성합니다.
-  `getTableSchema(tableName)`: 현재 적용 중인 스키마 정의를 읽습니다.
-  `getTableInfo(tableName)`: 레코드 수, 인덱스 수, 파일 크기, 생성 시각, 글로벌 테이블 여부 등의 통계를 확인합니다.
-  `clear(tableName)`: 스키마, 인덱스, 제약 조건은 유지한 채 모든 데이터를 비웁니다.
-  `dropTable(tableName)`: 스키마와 데이터를 포함해 테이블 전체를 삭제합니다.
-- **스페이스 관리**
-  `currentSpaceName`: 현재 활성 스페이스 이름을 가져옵니다.
-  `listSpaces()`: 현재 인스턴스의 모든 스페이스를 나열합니다.
-  `getSpaceInfo(useCache: true)`: 현재 스페이스의 통계를 가져옵니다. 최신 상태가 필요하면 `useCache: false`를 사용합니다.
-  `deleteSpace(spaceName)`: 스페이스를 삭제합니다. `default` 스페이스와 현재 활성 스페이스는 삭제할 수 없습니다.
-- **인스턴스 메타데이터**
-  `config`: 실제로 적용된 `DataStoreConfig`를 읽습니다.
-  `instancePath`: 인스턴스의 최종 저장 디렉터리를 가져옵니다.
-  `getVersion()` / `setVersion(version)`: 비즈니스에서 정의한 버전 번호를 읽고 씁니다. 이 값은 엔진 내부 로직에는 사용되지 않습니다.
-- **유지보수 작업**
-  `flush(flushStorage: true)`: 대기 중인 쓰기를 디스크에 반영합니다. `true`이면 하위 저장소 버퍼까지 함께 비웁니다.
-  `deleteDatabase()`: 현재 데이터베이스 인스턴스와 관련 파일을 삭제합니다. 파괴적인 작업입니다.
-- **통합 진단 진입점**
-  `db.status.memory()`: 캐시와 메모리 사용량을 확인합니다.
-  `db.status.space()`: 현재 스페이스의 전체 통계 상태를 확인합니다.
-  `db.status.table(tableName)`: 특정 테이블의 진단 정보를 확인합니다.
-  `db.status.config()`: 현재 적용된 설정 스냅샷을 확인합니다.
-  `db.status.migration(taskId)`: 스키마 마이그레이션 작업 상태를 확인합니다.
-
-```dart
-print('current space: ${db.currentSpaceName}');
-print('instance path: ${db.instancePath}');
-
-final spaces = await db.listSpaces();
-final spaceInfo = await db.getSpaceInfo(useCache: false);
-final tableInfo = await db.getTableInfo('users');
-
-final userVersion = await db.getVersion();
-await db.setVersion(userVersion + 1);
-await db.flush();
-
-final memoryInfo = await db.status.memory();
-print(spaces);
-print(spaceInfo.toJson());
-print(tableInfo?.toJson());
-print(memoryInfo.toJson());
-```
-
-데이터만 비우고 스키마와 인덱스를 유지하려면 `clear(...)`를 사용하고, 테이블 자체를 완전히 제거하려면 `dropTable(...)`를 사용하세요. `deleteSpace(...)`, `dropTable(...)`, `deleteDatabase(...)`는 모두 파괴적인 작업이므로 주의해서 사용해야 합니다.
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="backup-restore"></a>
 ### 백업 및 복원
 
-<<<<<<< HEAD
 단일 사용자 로컬 가져오기/내보내기, 대규모 오프라인 데이터 마이그레이션 및 오류 후 시스템 롤백에 특히 유용합니다.
 
 - **백업(`backup`)**
@@ -1268,23 +1186,11 @@ print(memoryInfo.toJson());
 
 ```dart
 // Example: export the full data package for the current user
-=======
-로컬 가져오기/내보내기, 사용자 데이터 마이그레이션, 롤백, 운영 스냅샷에 적합합니다.
-
-- `backup(compress: true, scope: ...)`: 백업을 생성하고 파일 경로를 반환합니다. `compress: true`이면 압축 백업 패키지가 생성되고, `scope`로 백업 범위를 제어합니다.
-- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: 백업에서 복원합니다. `cleanupBeforeRestore: true`는 기존 관련 데이터를 먼저 정리해 오래된 데이터와 섞이지 않도록 하고, `deleteAfterRestore: true`는 복원 성공 후 백업 파일을 삭제합니다.
-- `BackupScope.database`: 모든 스페이스, 글로벌 테이블, 관련 메타데이터를 포함한 전체 데이터베이스 인스턴스를 백업합니다.
-- `BackupScope.currentSpace`: 글로벌 테이블을 제외하고 현재 스페이스만 백업합니다.
-- `BackupScope.currentSpaceWithGlobal`: 현재 스페이스와 글로벌 테이블을 함께 백업합니다. 단일 사용자 데이터 내보내기/가져오기에 적합합니다.
-
-```dart
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 final backupPath = await db.backup(
   compress: true,
   scope: BackupScope.currentSpaceWithGlobal,
 );
 
-<<<<<<< HEAD
 // Example: restore from a backup package and clean up the source file automatically
 final restored = await db.restore(
   backupPath,
@@ -1303,23 +1209,6 @@ ToStore는 데이터 작업에 통합 응답 모델을 사용합니다.
 - `result.code`: `ResultType`에 해당하는 안정적인 숫자 코드
 - `result.message`: 현재 오류를 설명하는 읽을 수 있는 메시지
 - `successKeys` / `failedKeys`: 대량 작업에서 성공 및 실패한 기본 키 목록
-=======
-final restored = await db.restore(
-  backupPath,
-  cleanupBeforeRestore: true,
-  deleteAfterRestore: false,
-);
-
-print(backupPath);
-print(restored);
-```
-
-가능하면 복원 전에 애플리케이션의 쓰기 작업을 잠시 멈추는 것이 좋습니다.
-
-
-<a id="error-handling"></a>
-### 오류 처리
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 ```dart
@@ -1352,28 +1241,12 @@ if (!result.isSuccess) {
     case ResultType.dbError:
       print('Underlying storage error. Please record the logs: ${result.message}');
       break;
-    case ResultType.foreignKeyViolation:
-      print('외래 키 제약 조건 실패: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('시스템이 바쁩니다. 잠시 후 다시 시도하세요: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('스토리지 오류입니다. 로그를 남겨주세요: ${result.message}');
-      break;
     default:
-<<<<<<< HEAD
       print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
-=======
-      print('타입: ${result.type}, 코드: ${result.code}, 메시지: ${result.message}');
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
   }
 }
 ```
 
-<<<<<<< HEAD
 일반적인 상태 코드 예:
 성공하면 `0`이 반환됩니다. 음수는 오류를 나타냅니다.
 - `ResultType.success` (`0`) : 작업 성공
@@ -1391,26 +1264,6 @@ if (!result.isSuccess) {
 - `ResultType.timeout`(`-92`): 시간 초과
 
 ### 거래결과 처리
-=======
-**일반 상태 코드**:
-성공은 `0`, 음수 값은 오류를 의미합니다.
-- `ResultType.success` (`0`): 작업 성공.
-- `ResultType.partialSuccess` (`1`): 배치 작업 일부 성공.
-- `ResultType.unknown` (`-1`): 알 수 없는 오류.
-- `ResultType.uniqueViolation` (`-2`): 유니크 인덱스 충돌.
-- `ResultType.primaryKeyViolation` (`-3`): 기본 키 충돌.
-- `ResultType.foreignKeyViolation` (`-4`): 외래 키 제약 조건 위반.
-- `ResultType.notNullViolation` (`-5`): 필수 필드 누락 또는 `null` 불가.
-- `ResultType.validationFailed` (`-6`): 길이, 범위, 형식 또는 제약 조건 검증 실패.
-- `ResultType.notFound` (`-11`): 대상 테이블, 스페이스 또는 리소스를 찾을 수 없음.
-- `ResultType.resourceExhausted` (`-15`): 시스템 리소스 부족. 부하를 줄이거나 다시 시도하세요.
-- `ResultType.ioError` (`-90`): 파일 시스템 또는 스토리지 I/O 오류.
-- `ResultType.dbError` (`-91`): 데이터베이스 내부 오류.
-- `ResultType.timeout` (`-92`): 시간 초과.
-
-### 트랜잭션 결과 처리
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 ```dart
 final txResult = await db.transaction(() async {
   await db.insert('users', {
@@ -1419,7 +1272,6 @@ final txResult = await db.transaction(() async {
   });
 });
 
-<<<<<<< HEAD
 // txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
 if (txResult.isFailed) {
   print('Transaction error type: ${txResult.error?.type}');
@@ -1435,22 +1287,6 @@ if (txResult.isFailed) {
 - `TransactionErrorType.conflict`: 충돌로 인해 거래가 실패했습니다.
 - `TransactionErrorType.userAbort`: 사용자가 시작한 중단(throw 기반 수동 중단은 현재 지원되지 않음)
 - `TransactionErrorType.unknown`: 기타 오류
-=======
-if (txResult.isFailed) {
-  print('트랜잭션 오류 타입: ${txResult.error?.type}');
-  print('트랜잭션 오류 메시지: ${txResult.error?.message}');
-}
-```
-
-트랜잭션 오류 타입:
-- `TransactionErrorType.operationError`: 필드 검증 실패, 잘못된 리소스 상태, 기타 비즈니스 예외 등 트랜잭션 내부의 일반 작업 실패.
-- `TransactionErrorType.integrityViolation`: 기본 키, 유니크 키, 외래 키, not-null 등 무결성 또는 제약 조건 충돌.
-- `TransactionErrorType.timeout`: 트랜잭션 시간 초과.
-- `TransactionErrorType.io`: 하위 스토리지 또는 파일 시스템의 I/O 오류.
-- `TransactionErrorType.conflict`: 충돌로 인해 트랜잭션 실패.
-- `TransactionErrorType.userAbort`: 사용자에 의한 중단. 예외를 던지는 방식의 수동 중단은 현재 지원되지 않습니다.
-- `TransactionErrorType.unknown`: 기타 예기치 못한 오류.
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 <a id="logging-diagnostics"></a>

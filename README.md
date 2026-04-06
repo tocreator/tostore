@@ -15,8 +15,6 @@
   <img src="https://img.shields.io/badge/Architecture-Neural--Distributed-orange" alt="Architecture">
 </p>
 
-
-
 <p align="center">
   English |
   <a href="doc/translations/README.zh-CN.md">简体中文</a> |
@@ -32,21 +30,11 @@
 </p>
 
 ## Quick Navigation
-<<<<<<< HEAD
 - **Getting Started**: [Why ToStore](#why-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#quick-start-kv) | [Table Mode](#quick-start-table) | [Memory Mode](#quick-start-memory)
 - **Architecture & Model**: [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys) | [Mobile/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primary Key Algorithms](#primary-key-examples)
 - **Advanced Queries**: [Advanced Queries (JOIN)](#query-advanced) | [Aggregation & Statistics](#aggregation-stats) | [Complex Logic (QueryCondition)](#query-condition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
 - **Advanced & Performance**: [Vector Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Efficient Pagination](#query-pagination) | [Query Cache](#query-cache) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - **Operations & Security**: [Administration](#database-maintenance) | [Security Configuration](#security-config) | [Error Handling](#error-handling) | [Performance & Diagnostics](#performance) | [More Resources](#more-resources)
-=======
-
-- [Why ToStore?](#why-tostore) | [Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start)
-- [Schema Definition](#schema-definition) | [Mobile/Desktop Integration](#mobile-integration) | [Server-side Integration](#server-integration)
-- [Vectors & ANN Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Query & Pagination](#query-pagination) | [Foreign Keys](#foreign-keys) | [Query Operators](#query-operators)
-- [Distributed Architecture](#distributed-architecture) | [Primary Keys](#primary-key-examples) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions) | [Database Administration & Maintenance](#database-maintenance) | [Backup & Restore](#backup-restore) | [Error Handling](#error-handling) | [Log Callback and Database Diagnostics](#logging-diagnostics)
-- [Security Config](#security-config) | [Performance](#performance) | [More Resources](#more-resources)
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="why-tostore"></a>
 ## Why Choose ToStore?
@@ -113,7 +101,6 @@ dependencies:
 ## Quick Start
 
 > [!TIP]
-<<<<<<< HEAD
 > **How should you choose a storage mode?**
 > 1. [**Key-Value Mode (KV)**](#quick-start-kv): Best for configuration access, scattered state management, or JSON data storage. It is the fastest way to get started.
 > 2. [**Structured Table Mode**](#quick-start-table): Best for core business data that needs complex queries, constraint validation, or large-scale data governance. By pushing integrity logic into the engine, you can significantly reduce application-layer development and maintenance costs.
@@ -181,17 +168,6 @@ StreamBuilder(
 CRUD on structured tables requires the schema to be created in advance (see [Schema Definition](#schema-definition)). Recommended integration approaches for different scenarios:
 - **Mobile/Desktop**: For [frequent startup scenarios](#mobile-integration), it is recommended to pass `schemas` during initialization.
 - **Server/Agent**: For [long-running scenarios](#server-integration), it is recommended to create tables dynamically through `createTables`.
-=======
-> **Supports mixed storage of structured and unstructured data**
-> How should you choose a storage approach?
-> 1. **Core business data**: [Schema Definition](#schema-definition) is recommended. Best for scenarios requiring complex queries, constraint validation, relationships, or higher security requirements. By moving integrity logic into the engine, you can significantly reduce application-layer development and maintenance costs.
-> 2. **Dynamic/scattered data**: You can directly use [Key-Value Storage (KV)](#quick-start) or define `DataType.json` fields in tables. Best for configuration access or scattered state management, prioritizing quick onboarding and maximum flexibility.
-
-### Table Mode (Structured)
-CRUD operations require creating the table schema in advance (see [Schema Definition](#schema-definition)). Recommended integration approaches for different scenarios:
-- **Mobile/Desktop**: For [frequent startup scenarios](#mobile-integration), it's recommended to pass `schemas` when initializing the instance.
-- **Server/Agent**: For [long-running scenarios](#server-integration), it's recommended to create tables dynamically via `createTables`.
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ```dart
 // 1. Initialize the database
@@ -274,10 +250,7 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 **Define once, and let the engine handle end-to-end automated governance so your application no longer carries heavy validation maintenance.**
 
 The following mobile, server-side, and agent examples all reuse `appSchemas` defined here.
-<<<<<<< HEAD
 
-=======
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ### TableSchema Overview
 
@@ -1146,7 +1119,6 @@ final txResult2 = await db.transaction(() async {
 
 
 <a id="database-maintenance"></a>
-<<<<<<< HEAD
 ### Administration & Maintenance
 
 The following APIs cover database administration, diagnostics, and maintenance for plugin-style development, admin panels, and operational scenarios:
@@ -1195,63 +1167,10 @@ print(memoryInfo.toJson());
 print(configInfo.toJson());
 ```
 
-=======
-### Database Administration & Maintenance
-
-The following APIs focus on database administration, diagnostics, and cleanup tasks:
-
-- **Table maintenance**
-  `createTable(schema)`: Create a single table at runtime.
-  `getTableSchema(tableName)`: Read the active schema definition.
-  `getTableInfo(tableName)`: Inspect table statistics such as record count, index count, file size, creation time, and whether the table is global.
-  `clear(tableName)`: Remove all rows while keeping the schema, indexes, and constraints.
-  `dropTable(tableName)`: Remove the entire table, including schema and data.
-- **Space management**
-  `currentSpaceName`: Get the current active space name.
-  `listSpaces()`: List all spaces in the current instance.
-  `getSpaceInfo(useCache: true)`: Get statistics for the current space; set `useCache: false` to force the latest data.
-  `deleteSpace(spaceName)`: Delete a space. The `default` space and the currently active space cannot be deleted.
-- **Instance metadata**
-  `config`: Read the effective `DataStoreConfig`.
-  `instancePath`: Get the final storage directory of the instance.
-  `getVersion()` / `setVersion(version)`: Read and write your business-defined version number. This value is not used by the engine internally.
-- **Maintenance operations**
-  `flush(flushStorage: true)`: Flush pending writes to disk. When `true`, it also flushes the underlying storage buffers.
-  `deleteDatabase()`: Delete the current database instance and its files. This is destructive.
-- **Unified diagnostics entry**
-  `db.status.memory()`: Inspect cache and memory usage.
-  `db.status.space()`: Inspect overall statistics for the current space.
-  `db.status.table(tableName)`: Inspect diagnostics for a specific table.
-  `db.status.config()`: Inspect the effective configuration snapshot.
-  `db.status.migration(taskId)`: Inspect the status of a schema migration task.
-
-```dart
-print('current space: ${db.currentSpaceName}');
-print('instance path: ${db.instancePath}');
-
-final spaces = await db.listSpaces();
-final spaceInfo = await db.getSpaceInfo(useCache: false);
-final tableInfo = await db.getTableInfo('users');
-
-final userVersion = await db.getVersion();
-await db.setVersion(userVersion + 1);
-await db.flush();
-
-final memoryInfo = await db.status.memory();
-print(spaces);
-print(spaceInfo.toJson());
-print(tableInfo?.toJson());
-print(memoryInfo.toJson());
-```
-
-If you only want to clear data but keep schema and indexes, use `clear(...)`; use `dropTable(...)` to remove the entire table. `deleteSpace(...)`, `dropTable(...)`, and `deleteDatabase(...)` are destructive and should be used with care.
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="backup-restore"></a>
 ### Backup & Restore
 
-<<<<<<< HEAD
 Especially useful for single-user local import/export, large offline data migration, and system rollback after failure:
 
 - **Backup (`backup`)**
@@ -1267,23 +1186,11 @@ Especially useful for single-user local import/export, large offline data migrat
 
 ```dart
 // Example: export the full data package for the current user
-=======
-Suitable for local import/export, user data migration, rollback, and ops snapshots:
-
-- `backup(compress: true, scope: ...)`: Create a backup and return its file path. `compress: true` produces a compressed backup package, and `scope` controls the backup range.
-- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: Restore from a backup. `cleanupBeforeRestore: true` clears related data first to avoid mixing old and new data, and `deleteAfterRestore: true` removes the backup file after a successful restore.
-- `BackupScope.database`: Backup the entire database instance, including all spaces, global tables, and related metadata.
-- `BackupScope.currentSpace`: Backup only the current space, excluding global tables.
-- `BackupScope.currentSpaceWithGlobal`: Backup the current space plus global tables. This is useful for single-user export/import.
-
-```dart
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 final backupPath = await db.backup(
   compress: true,
   scope: BackupScope.currentSpaceWithGlobal,
 );
 
-<<<<<<< HEAD
 // Example: restore from a backup package and clean up the source file automatically
 final restored = await db.restore(
   backupPath,
@@ -1292,21 +1199,6 @@ final restored = await db.restore(
 );
 ```
 
-=======
-final restored = await db.restore(
-  backupPath,
-  cleanupBeforeRestore: true,
-  deleteAfterRestore: false,
-);
-
-print(backupPath);
-print(restored);
-```
-
-Pause application writes before restore whenever possible.
-
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 <a id="error-handling"></a>
 ### Status Codes & Error Handling
 
@@ -1349,28 +1241,12 @@ if (!result.isSuccess) {
     case ResultType.dbError:
       print('Underlying storage error. Please record the logs: ${result.message}');
       break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy, retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Storage error, please log it: ${result.message}');
-      break;
     default:
-<<<<<<< HEAD
       print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
-=======
-      print('Type: ${result.type}, Code: ${result.code}, Message: ${result.message}');
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
   }
 }
 ```
 
-<<<<<<< HEAD
 Common status code examples:
 Success returns `0`; negative numbers indicate errors.
 - `ResultType.success` (`0`): operation succeeded
@@ -1388,26 +1264,6 @@ Success returns `0`; negative numbers indicate errors.
 - `ResultType.timeout` (`-92`): timeout
 
 ### Transaction Result Handling
-=======
-**Common Status Codes**:
-Success is `0`; negative values indicate errors.
-- `ResultType.success` (`0`): Operation succeeded.
-- `ResultType.partialSuccess` (`1`): Bulk operation partially succeeded.
-- `ResultType.unknown` (`-1`): Unknown error.
-- `ResultType.uniqueViolation` (`-2`): Unique index conflict.
-- `ResultType.primaryKeyViolation` (`-3`): Primary key conflict.
-- `ResultType.foreignKeyViolation` (`-4`): Foreign key constraint failed.
-- `ResultType.notNullViolation` (`-5`): Required field missing or `null` is not allowed.
-- `ResultType.validationFailed` (`-6`): Length, range, format, or constraint validation failed.
-- `ResultType.notFound` (`-11`): Target table, space, or resource was not found.
-- `ResultType.resourceExhausted` (`-15`): System resources are insufficient; reduce load or retry.
-- `ResultType.ioError` (`-90`): Filesystem or storage I/O error.
-- `ResultType.dbError` (`-91`): Database internal error.
-- `ResultType.timeout` (`-92`): Operation timed out.
-
-### Transaction Result Handling
-
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 ```dart
 final txResult = await db.transaction(() async {
   await db.insert('users', {
@@ -1416,10 +1272,7 @@ final txResult = await db.transaction(() async {
   });
 });
 
-<<<<<<< HEAD
 // txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-=======
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 if (txResult.isFailed) {
   print('Transaction error type: ${txResult.error?.type}');
   print('Transaction error message: ${txResult.error?.message}');
@@ -1427,7 +1280,6 @@ if (txResult.isFailed) {
 ```
 
 Transaction error types:
-<<<<<<< HEAD
 - `TransactionErrorType.operationError`: a regular operation failed inside the transaction, such as field validation failure, invalid resource state, or another business-level error
 - `TransactionErrorType.integrityViolation`: integrity or constraint conflict, such as primary key, unique key, foreign key, or non-null failure
 - `TransactionErrorType.timeout`: timeout
@@ -1435,15 +1287,6 @@ Transaction error types:
 - `TransactionErrorType.conflict`: a conflict caused the transaction to fail
 - `TransactionErrorType.userAbort`: user-initiated abort (throw-based manual abort is not currently supported)
 - `TransactionErrorType.unknown`: any other error
-=======
-- `TransactionErrorType.operationError`: Regular operation failure inside a transaction, such as field validation errors, invalid resource state, or other business-level exceptions.
-- `TransactionErrorType.integrityViolation`: Constraint conflict, such as primary key, unique key, foreign key, or non-null failure.
-- `TransactionErrorType.timeout`: Transaction timed out.
-- `TransactionErrorType.io`: Underlying storage or filesystem I/O error.
-- `TransactionErrorType.conflict`: Transaction failed due to a conflict.
-- `TransactionErrorType.userAbort`: User-initiated abort. Throw-based manual abort is not currently supported.
-- `TransactionErrorType.unknown`: Any other unexpected error.
->>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 <a id="logging-diagnostics"></a>
