@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.1.0
+
+### Added
+- Added support for key-value TTL expiration automatic cleanup via `setValue(..., {Duration? ttl, DateTime? expiresAt})`
+- Added support for key-value data state monitoring via `db.watchValue` and `db.watchValues` to facilitate UI refreshing
+- Added some semantic queries: support `whereTrue`、`whereFalse`、`whereEmpty`、`whereNotEmpty`、`whereStartsWith`、`whereEndsWith`
+
+### Changed
+- Optimized benchmark tests
+- Optimized documentation and multi-language
+
 ## 3.0.9
 
 ### Changed
@@ -9,7 +20,6 @@ All notable changes to this project will be documented in this file.
 - Optimized WebAssembly build support on the Web platform
 - Optimized table structure migration validation
 - Improved table structure migration and integrity check error reporting, providing detailed failure reasons
-- Optimized documentation and multi-language
 
 ### Fixed
 - Fixed an issue where composite index queries could fall back to table scans

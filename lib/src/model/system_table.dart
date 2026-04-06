@@ -10,9 +10,20 @@ class SystemTable {
   static const String _keyValueName = 'kv_store';
   static const String _globalKeyValueName = 'global_kv_store';
 
+  /// Key-value store field names
+  static const String keyValueKeyField = 'key';
+  static const String keyValueValueField = 'value';
+  static const String keyValueUpdatedAtField = 'updated_at';
+  static const String keyValueExpiresAtField = 'expires_at';
+  static const String keyValueExpiryIndexName = '_system_kv_expiry';
+
   /// get key-value store table name
   static String getKeyValueName(bool isGlobal) {
     return isGlobal ? _globalKeyValueName : _keyValueName;
+  }
+
+  static bool isKeyValueTable(String tableName) {
+    return tableName == _keyValueName || tableName == _globalKeyValueName;
   }
 
   /// get foreign key references system table name
@@ -149,22 +160,29 @@ class SystemTable {
         primaryKeyConfig: const PrimaryKeyConfig(),
         fields: [
           const FieldSchema(
-              name: 'key',
-              fieldId: 'key',
+              name: keyValueKeyField,
+              fieldId: keyValueKeyField,
               type: DataType.text,
               nullable: false,
               unique: true),
           const FieldSchema(
-              name: 'value', fieldId: 'value', type: DataType.text),
+              name: keyValueValueField,
+              fieldId: keyValueValueField,
+              type: DataType.text),
           const FieldSchema(
-              name: 'updated_at',
-              fieldId: 'updated_at',
+              name: keyValueUpdatedAtField,
+              fieldId: keyValueUpdatedAtField,
               type: DataType.datetime,
               defaultValueType: DefaultValueType.currentTimestamp),
+          const FieldSchema(
+            name: keyValueExpiresAtField,
+            fieldId: keyValueExpiresAtField,
+            type: DataType.datetime,
+          ),
         ],
         indexes: const [
-          IndexSchema(fields: ['key'], unique: true),
-          IndexSchema(fields: ['updated_at']),
+          IndexSchema(fields: [keyValueKeyField], unique: true),
+          IndexSchema(fields: [keyValueUpdatedAtField]),
         ],
       );
 }

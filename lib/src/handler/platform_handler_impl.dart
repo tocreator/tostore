@@ -1,7 +1,9 @@
-import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
 import 'dart:async';
-import 'package:path/path.dart' as path;
+import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
+
 import 'package:archive/archive_io.dart';
+import 'package:path/path.dart' as path;
+
 import '../Interface/platform_interface.dart';
 import '../handler/logger.dart';
 import 'system_ffi_helper.dart';
@@ -169,16 +171,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   bool get isServerEnvironment {
     if (_cachedIsServerEnvironment == null) {
       try {
-        // Server environment detection strategy:
-        // 1. Linux systems are almost always servers or high-performance environments in this context.
-        // 2. Windows/macOS with high core counts (>=12) often act as workstations or build servers.
-        if (isLinux) {
-          _cachedIsServerEnvironment = true;
-        } else if ((isWindows || isMacOS) && processorCores >= 12) {
-          _cachedIsServerEnvironment = true;
-        } else {
-          _cachedIsServerEnvironment = false;
-        }
+        _cachedIsServerEnvironment = isLinux;
       } catch (e) {
         _cachedIsServerEnvironment = false;
         Logger.warn('Error detecting server environment: $e',

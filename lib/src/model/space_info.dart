@@ -3,9 +3,6 @@ class SpaceInfo {
   /// Name of the space
   final String spaceName;
 
-  /// Database version
-  final int version;
-
   /// Number of user-created tables in this space
   final int tableCount;
 
@@ -24,7 +21,6 @@ class SpaceInfo {
   /// Create a new SpaceInfo instance
   const SpaceInfo({
     required this.spaceName,
-    required this.version,
     this.tableCount = 0,
     this.recordCount = 0,
     this.dataSizeBytes = 0,
@@ -36,7 +32,6 @@ class SpaceInfo {
   Map<String, dynamic> toJson() {
     return {
       'spaceName': spaceName,
-      'version': version,
       'tableCount': tableCount,
       'recordCount': recordCount,
       'dataSizeBytes': dataSizeBytes,

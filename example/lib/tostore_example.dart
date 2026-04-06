@@ -546,12 +546,7 @@ class ToStoreExample {
         .orCondition(// orCondition is equivalent to OR condition combination
             recentLoginCondition);
 
-    // custom condition function - flexible handling of any complex logic
-    final customCondition = QueryCondition().whereCustom((record) {
-      // for example: check if the tag contains 'recommend'
-      return record['tags'] != null &&
-          record['tags'].toString().contains('recommend');
-    });
+    final tagCondition = QueryCondition().whereContains('tags', 'recommend');
 
     // query condition nesting example - show infinite nesting ability
     final result = await db
@@ -561,7 +556,7 @@ class ToStoreExample {
                 .whereEqual('type', 'app')
                 .condition(idCondition) // nest again the defined conditions
             )
-        .orCondition(customCondition) // or satisfy custom complex conditions
+        .orCondition(tagCondition) // or satisfy tag conditions
         .limit(20);
 
     for (var user in result.data) {
@@ -573,7 +568,7 @@ class ToStoreExample {
     // SELECT * FROM users
     // WHERE is_active = true
     //   AND (type = 'app' OR id >= 1 OR fans >= 200)
-    //   OR ([custom condition: tag contains 'recommend'])
+    //   OR (tag contains 'recommend')
     // LIMIT 20
   }
 

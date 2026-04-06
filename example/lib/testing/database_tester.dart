@@ -19,6 +19,11 @@ class DatabaseTester {
   static const String _schemaUpgradeUsersTable = 'mobile_upgrade_users';
   static const String _schemaUpgradePostsTable = 'mobile_upgrade_posts';
   static const String _schemaUpgradeAuditTable = 'mobile_upgrade_audit_logs';
+  static const List<String> _crudUserReadFields = [
+    'username',
+    'email',
+    'age',
+  ];
 
   final ToStore db;
   final LogService log;
@@ -70,6 +75,32 @@ class DatabaseTester {
       _failTest('$description: Expected [$expected], but received [$actual].');
       return false;
     }
+  }
+
+  Future<Map<String, dynamic>?> _queryCachedFirstUserByField(
+      String field, dynamic value) async {
+    return await db
+        .query('users')
+        .select(_crudUserReadFields)
+        .where(field, '=', value)
+        .first();
+  }
+
+  Future<bool> _expectCachedUserQueryTwice({
+    required String description,
+    required String field,
+    required dynamic value,
+    Map<String, dynamic>? expected,
+  }) async {
+    bool isTestPassed = true;
+
+    final firstResult = await _queryCachedFirstUserByField(field, value);
+    isTestPassed &= _expect('$description (1st query)', firstResult, expected);
+
+    final secondResult = await _queryCachedFirstUserByField(field, value);
+    isTestPassed &= _expect('$description (2nd query)', secondResult, expected);
+
+    return isTestPassed;
   }
 
   /// Main test runner that executes all test suites.
@@ -819,34 +850,156 @@ class DatabaseTester {
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
+
+      if (_isWasmBuild) {
+        final insertResult = await db.insert('users',
+            {'username': 'crud_user', 'email': 'crud@test.com', 'age': 30});
+        isTestPassed &= _expect(
+            'Insert should be successful', insertResult.isSuccess, true);
+        isTestPassed &=
+            _expect('Insert should affect 1 row', insertResult.successCount, 1);
+
+        final user =
+            await db.query('users').where('username', '=', 'crud_user');
+        isTestPassed &= _expect('Read should find 1 user', user.length, 1);
+        isTestPassed &= _expect('Read should find correct user',
+            user.data.first['email'], 'crud@test.com');
+
+        await db
+            .update('users', {'age': 31}).where('username', '=', 'crud_user');
+        final updatedUser =
+            await db.query('users').where('username', '=', 'crud_user').first();
+        isTestPassed &=
+            _expect('Update should change age to 31', updatedUser?['age'], 31);
+
+        final deleteResult =
+            await db.delete('users').where('username', '=', 'crud_user');
+        isTestPassed &= _expect(
+            'Delete should be successful', deleteResult.isSuccess, true);
+        isTestPassed &=
+            _expect('Delete should affect 1 row', deleteResult.successCount, 1);
+        final dataAfterDeleteQuery = await db.query('users');
+        final countAfterDelete = dataAfterDeleteQuery.length;
+        isTestPassed &=
+            _expect('Count after delete should be 0', countAfterDelete, 0);
+        return isTestPassed;
+      }
+
+      const username = 'crud_user';
+      const email = 'crud@test.com';
+      const insertedAge = 30;
+      const updatedAge = 31;
+
+      final insertedExpected = <String, dynamic>{
+        'username': username,
+        'email': email,
+        'age': insertedAge,
+      };
+      final updatedExpected = <String, dynamic>{
+        'username': username,
+        'email': email,
+        'age': updatedAge,
+      };
+
+      // Prime cached miss queries so insert must invalidate and rebuild them.
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Pre-insert username index query should be empty',
+        field: 'username',
+        value: username,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Pre-insert age index query should be empty',
+        field: 'age',
+        value: insertedAge,
+      );
+
       // Create
-      final insertResult = await db.insert('users',
-          {'username': 'crud_user', 'email': 'crud@test.com', 'age': 30});
+      final insertResult = await db.insert('users', {
+        'username': username,
+        'email': email,
+        'age': insertedAge,
+      });
       isTestPassed &=
           _expect('Insert should be successful', insertResult.isSuccess, true);
       isTestPassed &=
           _expect('Insert should affect 1 row', insertResult.successCount, 1);
+      if (!isTestPassed || insertResult.successKeys.isEmpty) return false;
 
-      // Read
-      final user = await db.query('users').where('username', '=', 'crud_user');
-      isTestPassed &= _expect('Read should find 1 user', user.length, 1);
-      isTestPassed &= _expect('Read should find correct user',
-          user.data.first['email'], 'crud@test.com');
+      final userId = insertResult.successKeys.first;
 
-      // Update
-      await db.update('users', {'age': 31}).where('username', '=', 'crud_user');
-      final updatedUser =
-          await db.query('users').where('username', '=', 'crud_user').first();
+      // Read twice after insert to ensure repeated cached queries stay correct.
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Inserted user should be readable by primary key',
+        field: 'id',
+        value: userId,
+        expected: insertedExpected,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Inserted user should be readable by username index',
+        field: 'username',
+        value: username,
+        expected: insertedExpected,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Inserted user should be readable by age index',
+        field: 'age',
+        value: insertedAge,
+        expected: insertedExpected,
+      );
+
+      // Update: query twice after write to catch stale data being re-cached.
+      final updateResult = await db
+          .update('users', {'age': updatedAge}).where('id', '=', userId);
       isTestPassed &=
-          _expect('Update should change age to 31', updatedUser?['age'], 31);
+          _expect('Update should be successful', updateResult.isSuccess, true);
+      isTestPassed &=
+          _expect('Update should affect 1 row', updateResult.successCount, 1);
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Updated user should return latest data by primary key',
+        field: 'id',
+        value: userId,
+        expected: updatedExpected,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Updated user should return latest data by username index',
+        field: 'username',
+        value: username,
+        expected: updatedExpected,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Updated user should return latest data by new age index',
+        field: 'age',
+        value: updatedAge,
+        expected: updatedExpected,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Updated user old age index query should stay empty',
+        field: 'age',
+        value: insertedAge,
+      );
 
-      // Delete
-      final deleteResult =
-          await db.delete('users').where('username', '=', 'crud_user');
+      // Delete: verify repeated cached lookups do not resurrect stale data.
+      final deleteResult = await db.delete('users').where('id', '=', userId);
       isTestPassed &=
           _expect('Delete should be successful', deleteResult.isSuccess, true);
       isTestPassed &=
           _expect('Delete should affect 1 row', deleteResult.successCount, 1);
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Deleted user primary key query should stay empty',
+        field: 'id',
+        value: userId,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Deleted user username index query should stay empty',
+        field: 'username',
+        value: username,
+      );
+      isTestPassed &= await _expectCachedUserQueryTwice(
+        description: 'Deleted user age index query should stay empty',
+        field: 'age',
+        value: updatedAge,
+      );
+
       final dataAfterDeleteQuery = await db.query('users');
       final countAfterDelete = dataAfterDeleteQuery.length;
       isTestPassed &=

@@ -9,6 +9,7 @@ import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
 import '../model/buffer_entry.dart';
+import '../model/business_error.dart';
 import '../model/data_store_config.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
@@ -193,6 +194,31 @@ class TableDataManager {
   bool hasLiveTableRecord(String tableName, String pk) {
     final rec = _tableRecordCache.get([tableName, pk], updateStats: false);
     return rec != null && !isDeletedRecord(rec);
+  }
+
+  /// Returns true when the record is hidden by a delete overlay in the current
+  /// visibility context, even if the physical row still exists on disk.
+  bool isRecordHiddenByDeleteOverlay(String tableName, String pk,
+      {String? transactionId}) {
+    final currentTxId =
+        transactionId ?? TransactionContext.getCurrentTransactionId();
+
+    if (currentTxId != null) {
+      final txOp = _txnDeferredOps[currentTxId]?[tableName]?[pk];
+      if (txOp != null) {
+        return txOp.type == BufferOperationType.delete ||
+            isDeletedRecord(txOp.data);
+      }
+    }
+
+    final bufferEntry =
+        _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+    if (bufferEntry == null) {
+      return false;
+    }
+
+    return bufferEntry.operation == BufferOperationType.delete ||
+        isDeletedRecord(bufferEntry.data);
   }
 
   /// Cache a single table record
@@ -973,6 +999,13 @@ class TableDataManager {
       Map<String, dynamic> finalData = rec;
 
       if (existingOp != null) {
+        if (existingOp.type == BufferOperationType.delete &&
+            operationType == BufferOperationType.update) {
+          throw BusinessError(
+            'Cannot update record $recordId in table $tableName because it has already been deleted in the current transaction',
+            type: BusinessErrorType.notFound,
+          );
+        }
         if (existingOp.type == BufferOperationType.insert &&
             operationType == BufferOperationType.update) {
           // Insert then update: merge into a single insert with final data.
@@ -1019,6 +1052,18 @@ class TableDataManager {
         }
       }
       return;
+    }
+
+    if (operationType == BufferOperationType.update) {
+      final priorBuffered =
+          _dataStore.writeBufferManager.getBufferedRecord(tableName, recordId);
+      if (priorBuffered != null &&
+          priorBuffered.operation == BufferOperationType.delete) {
+        throw BusinessError(
+          'Cannot update record $recordId in table $tableName because it has already been deleted',
+          type: BusinessErrorType.notFound,
+        );
+      }
     }
 
     // -------------------- Memory mode: TreeCache-only (no WAL, no write queue, no IO) --------------------

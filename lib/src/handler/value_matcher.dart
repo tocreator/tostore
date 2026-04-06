@@ -314,8 +314,8 @@ class ValueMatcher {
     try {
       // Escape special regex characters, then convert SQL wildcards to regex.
       final regexPattern = pattern
-          .replaceAllMapped(
-              RegExp(r'([.$*+?()\[\]{}|^])'), (match) => '\\${match.group(1)}')
+          .replaceAllMapped(RegExp(r'([\\.$*+?()\[\]{}|^])'),
+              (match) => '\\${match.group(1)}')
           .replaceAll('%', '.*')
           .replaceAll('_', '.');
       return RegExp('^$regexPattern\$').hasMatch(value);
@@ -465,8 +465,6 @@ class ConditionRecordMatcher {
     switch (node.type) {
       case NodeType.leaf:
         return _matchAllConditions(record, node.condition);
-      case NodeType.custom:
-        return node.customMatcher?.call(record) ?? false;
       case NodeType.and:
         // For AND, all children must be true.
         for (final child in node.children) {
@@ -608,18 +606,7 @@ class ConditionRecordMatcher {
 
   /// Converts a SQL LIKE pattern to a RegExp and executes it.
   bool _matchesLike(String value, String pattern) {
-    try {
-      // Escape special regex characters, then convert SQL wildcards to regex.
-      final regexPattern = pattern
-          .replaceAllMapped(
-              RegExp(r'([.$*+?()\[\]{}|^])'), (match) => '\\${match.group(1)}')
-          .replaceAll('%', '.*')
-          .replaceAll('_', '.');
-      return RegExp('^$regexPattern\$').hasMatch(value);
-    } catch (e) {
-      Logger.warn('Invalid LIKE pattern: $pattern', label: '_matchesLike');
-      return false;
-    }
+    return ValueMatcher.matchesLike(value, pattern);
   }
 
   /// Extracts primary keys if the condition restricts the query to a specific set of IDs.
@@ -728,9 +715,6 @@ enum NodeType {
 
   /// OR operator node.
   or,
-
-  /// Custom function node.
-  custom
 }
 
 /// Condition node class, used by both QueryCondition and _ConditionEvaluator.
@@ -741,9 +725,6 @@ class ConditionNode {
   /// Condition content (only valid for leaf nodes).
   Map<String, dynamic> condition;
 
-  /// Custom matcher function (only valid for custom nodes).
-  bool Function(Map<String, dynamic>)? customMatcher;
-
   /// Child node list.
   List<ConditionNode> children;
 
@@ -751,7 +732,6 @@ class ConditionNode {
   ConditionNode({
     required this.type,
     this.condition = const {},
-    this.customMatcher,
   }) : children = [];
 
   /// Create a deep copy of the node.
@@ -759,7 +739,6 @@ class ConditionNode {
     final copy = ConditionNode(
       type: type,
       condition: Map.from(condition),
-      customMatcher: customMatcher,
     );
 
     for (final child in children) {

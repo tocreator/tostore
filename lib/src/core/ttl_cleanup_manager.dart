@@ -3,11 +3,13 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../handler/logger.dart';
+import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_block_entry.dart';
+import '../model/index_search.dart';
+import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
-import '../model/index_search.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'workload_scheduler.dart';
@@ -124,13 +126,20 @@ class TtlCleanupManager {
     });
   }
 
+  List<String> _systemKvTables() {
+    return <String>[
+      SystemTable.getKeyValueName(false),
+      SystemTable.getKeyValueName(true),
+    ];
+  }
+
   Future<Map<String, _TtlCleanupPlan>> _getCleanupPlans() async {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final refreshIntervalMs =
         max(_dataStore.config.ttlCleanupIntervalMs * 6, 1800000);
     if (_planCacheFullyLoaded &&
         nowMs - _planCacheRefreshedMs < refreshIntervalMs) {
-      return _planCache;
+      return Map<String, _TtlCleanupPlan>.from(_planCache);
     }
 
     final tables =
@@ -140,7 +149,7 @@ class TtlCleanupManager {
       _planCache.clear();
       _planCacheRefreshedMs = nowMs;
       _planCacheFullyLoaded = true;
-      return _planCache;
+      return Map<String, _TtlCleanupPlan>.from(_planCache);
     }
 
     WorkloadLease? lease;
@@ -196,11 +205,11 @@ class TtlCleanupManager {
         );
       _planCacheRefreshedMs = nowMs;
       _planCacheFullyLoaded = true;
-      return _planCache;
+      return Map<String, _TtlCleanupPlan>.from(_planCache);
     } catch (e) {
       Logger.warn('Refresh TTL plan cache failed: $e',
           label: 'TtlCleanupManager._getCleanupPlans');
-      return _planCache;
+      return Map<String, _TtlCleanupPlan>.from(_planCache);
     } finally {
       lease?.release();
     }
@@ -309,8 +318,12 @@ class TtlCleanupManager {
       // User-defined TTL source field: use regular predicate delete.
       final condition = QueryCondition()
         ..whereLessThanOrEqualTo(plan.sourceField, cutoffIso);
-      final r = await _dataStore.deleteInternal(plan.tableName, condition,
-          limit: batchSize);
+      final r = await _dataStore.deleteInternal(
+        plan.tableName,
+        condition,
+        orderBy: [plan.sourceField],
+        limit: batchSize,
+      );
       if (!r.isSuccess) {
         Logger.warn(
           'TTL cleanup delete failed on ${plan.tableName}: ${r.message}',
@@ -327,12 +340,161 @@ class TtlCleanupManager {
     }
   }
 
+  String? _normalizeDateTimeIso(dynamic rawValue) {
+    if (rawValue == null) return null;
+    if (rawValue is DateTime) {
+      return rawValue.toIso8601String();
+    }
+    if (rawValue is String) {
+      final value = rawValue.trim();
+      if (value.isEmpty) return null;
+      return DateTime.tryParse(value)?.toIso8601String();
+    }
+    if (rawValue is int) {
+      return DateTime.fromMillisecondsSinceEpoch(rawValue).toIso8601String();
+    }
+    if (rawValue is BigInt) {
+      return DateTime.fromMillisecondsSinceEpoch(rawValue.toInt())
+          .toIso8601String();
+    }
+    return null;
+  }
+
+  String? _decodeKvExpiryIso(Uint8List keyBytes) {
+    try {
+      final values = MemComparableKey.decodeTuple(keyBytes);
+      if (values.isEmpty) return null;
+      final raw = values.first;
+      if (raw == null) return null;
+      return raw.toString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _removeKvExpiryIndexEntry(
+    String tableName,
+    Uint8List keyBytes,
+  ) async {
+    if (keyBytes.isEmpty) return;
+    await _dataStore.indexManager
+        ?.removeInternalKvExpiryIndexEntryByRawKey(tableName, keyBytes);
+  }
+
+  Future<_TtlBatchResult> _runKvCleanupBatch(
+    String tableName,
+    DateTime cycleNow, {
+    required int batchSize,
+  }) async {
+    try {
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      if (schema == null) {
+        return const _TtlBatchResult(deleted: 0, ok: false);
+      }
+
+      final pkName = schema.primaryKey;
+      final res =
+          await _dataStore.indexManager?.searchInternalKvExpiryIndexUpTo(
+        tableName,
+        cycleNow,
+        limit: batchSize,
+      );
+      final entries = res?.entries ?? const <IndexSearchEntry>[];
+      if (entries.isEmpty) {
+        return const _TtlBatchResult(deleted: 0, ok: true);
+      }
+
+      int deletedCount = 0;
+      final yieldController =
+          YieldController('TtlCleanupManager._runKvCleanupBatch');
+      for (final entry in entries) {
+        await yieldController.maybeYield();
+
+        final rows = await _dataStore.executeQuery(
+          tableName,
+          QueryCondition()..where(pkName, '=', entry.primaryKey),
+          limit: 1,
+        );
+        if (rows.isEmpty) {
+          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          continue;
+        }
+
+        final row = rows.first;
+        final currentExpiresAtIso =
+            _normalizeDateTimeIso(row[SystemTable.keyValueExpiresAtField]);
+        if (currentExpiresAtIso == null) {
+          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          continue;
+        }
+
+        final currentExpiresAt = DateTime.tryParse(currentExpiresAtIso);
+        if (currentExpiresAt == null || currentExpiresAt.isAfter(cycleNow)) {
+          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          continue;
+        }
+
+        final deleteResult = await _dataStore.deleteInternal(
+          tableName,
+          QueryCondition()
+            ..where(pkName, '=', entry.primaryKey)
+            ..where(
+              SystemTable.keyValueExpiresAtField,
+              '=',
+              currentExpiresAtIso,
+            ),
+          limit: 1,
+        );
+        if (!deleteResult.isSuccess) {
+          Logger.warn(
+            'KV TTL cleanup delete failed on $tableName pk=${entry.primaryKey}: ${deleteResult.message}',
+            label: 'TtlCleanupManager._runKvCleanupBatch',
+          );
+          return const _TtlBatchResult(deleted: 0, ok: false);
+        }
+
+        if (deleteResult.successKeys.isNotEmpty) {
+          deletedCount += deleteResult.successKeys.length;
+        }
+
+        await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+
+        if (deleteResult.successKeys.isNotEmpty) {
+          final currentKeyBytes =
+              await _dataStore.indexManager?.encodeInternalKvExpiryIndexKey(
+            tableName,
+            expiresAt: currentExpiresAtIso,
+            primaryKey: entry.primaryKey,
+          );
+          if (currentKeyBytes != null &&
+              currentKeyBytes.isNotEmpty &&
+              MemComparableKey.compare(currentKeyBytes, entry.keyBytes) != 0) {
+            await _removeKvExpiryIndexEntry(tableName, currentKeyBytes);
+          }
+        } else {
+          final candidateExpiresAtIso = _decodeKvExpiryIso(entry.keyBytes);
+          if (candidateExpiresAtIso != null &&
+              candidateExpiresAtIso != currentExpiresAtIso) {
+            await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          }
+        }
+      }
+
+      return _TtlBatchResult(deleted: deletedCount, ok: true);
+    } catch (e) {
+      Logger.warn('KV TTL cleanup batch failed on $tableName: $e',
+          label: 'TtlCleanupManager._runKvCleanupBatch');
+      return const _TtlBatchResult(deleted: 0, ok: false);
+    }
+  }
+
   Future<void> _runCleanupCycle() async {
     bool cycleHasBacklog = false;
     CrontabManager.acquireBackgroundWorkLease(_backgroundLeaseId);
     try {
       final plans = await _getCleanupPlans();
-      if (plans.isEmpty) return;
+      final systemKvTables = _systemKvTables();
+      if (plans.isEmpty && systemKvTables.isEmpty) return;
 
       const int batchSize = 1000;
       final int cycleStartMs = DateTime.now().millisecondsSinceEpoch;
@@ -344,8 +506,9 @@ class TtlCleanupManager {
       int totalDeleted = 0;
       int round = 0;
       var activePlans = plans.values.toList(growable: false);
+      var activeKvTables = systemKvTables;
 
-      while (activePlans.isNotEmpty) {
+      while (activePlans.isNotEmpty || activeKvTables.isNotEmpty) {
         await yieldController.maybeYield();
 
         final lease = await _dataStore.workloadScheduler.tryAcquire(
@@ -363,46 +526,92 @@ class TtlCleanupManager {
         final int concurrency = lease.asConcurrency(2.0).clamp(1, maxParallel);
 
         try {
-          final tasks = activePlans
-              .map<Future<_TtlBatchResult> Function()>(
-                (plan) => () => _runCleanupBatch(
-                      plan,
-                      cycleNow,
-                      batchSize: batchSize,
-                    ),
-              )
-              .toList(growable: false);
-
-          final roundResults = await ParallelProcessor.execute<_TtlBatchResult>(
-            tasks,
-            label: 'ttl-cleanup-round-$round',
-            concurrency: concurrency,
-            continueOnError: true,
-          );
-
           int roundDeleted = 0;
           final nextPlans = <_TtlCleanupPlan>[];
+          final nextKvTables = <String>[];
 
-          for (int i = 0; i < roundResults.length; i++) {
-            final result = roundResults[i];
-            final plan = activePlans[i];
+          if (activePlans.isNotEmpty) {
+            final tasks = activePlans
+                .map<Future<_TtlBatchResult> Function()>(
+                  (plan) => () => _runCleanupBatch(
+                        plan,
+                        cycleNow,
+                        batchSize: batchSize,
+                      ),
+                )
+                .toList(growable: false);
 
-            if (result == null || !result.ok) {
-              continue;
+            final roundResults =
+                await ParallelProcessor.execute<_TtlBatchResult>(
+              tasks,
+              label: 'ttl-cleanup-user-round-$round',
+              concurrency: concurrency,
+              continueOnError: true,
+            );
+
+            for (int i = 0; i < roundResults.length; i++) {
+              final result = roundResults[i];
+              final plan = activePlans[i];
+
+              if (result == null || !result.ok) {
+                continue;
+              }
+
+              final deleted = result.deleted;
+              if (deleted > 0) {
+                roundDeleted += deleted;
+                totalDeleted += deleted;
+                Logger.info(
+                  'TTL cleanup deleted $deleted rows from table ${plan.tableName}',
+                  label: 'TtlCleanupManager._runCleanupCycle',
+                );
+              }
+
+              if (deleted >= batchSize) {
+                nextPlans.add(plan);
+              }
             }
+          }
 
-            final deleted = result.deleted;
-            if (deleted > 0) {
-              roundDeleted += deleted;
-              totalDeleted += deleted;
-              Logger.info(
-                'TTL cleanup deleted $deleted rows from table ${plan.tableName}',
-                label: 'TtlCleanupManager._runCleanupCycle',
-              );
-            }
+          if (activeKvTables.isNotEmpty) {
+            final tasks = activeKvTables
+                .map<Future<_TtlBatchResult> Function()>(
+                  (tableName) => () => _runKvCleanupBatch(
+                        tableName,
+                        cycleNow,
+                        batchSize: batchSize,
+                      ),
+                )
+                .toList(growable: false);
 
-            if (deleted >= batchSize) {
-              nextPlans.add(plan);
+            final kvResults = await ParallelProcessor.execute<_TtlBatchResult>(
+              tasks,
+              label: 'ttl-cleanup-kv-round-$round',
+              concurrency: concurrency,
+              continueOnError: true,
+            );
+
+            for (int i = 0; i < kvResults.length; i++) {
+              final result = kvResults[i];
+              final tableName = activeKvTables[i];
+
+              if (result == null || !result.ok) {
+                continue;
+              }
+
+              final deleted = result.deleted;
+              if (deleted > 0) {
+                roundDeleted += deleted;
+                totalDeleted += deleted;
+                Logger.info(
+                  'KV TTL cleanup deleted $deleted rows from table $tableName',
+                  label: 'TtlCleanupManager._runCleanupCycle',
+                );
+              }
+
+              if (deleted >= batchSize) {
+                nextKvTables.add(tableName);
+              }
             }
           }
 
@@ -411,27 +620,31 @@ class TtlCleanupManager {
           final int queueLen = _dataStore.writeBufferManager.queueLength;
           final int flushThreshold =
               writeBatchSize > 0 ? (writeBatchSize / 10).ceil() : 0;
-          final bool hasBacklog = nextPlans.isNotEmpty;
+          final bool hasBacklog =
+              nextPlans.isNotEmpty || nextKvTables.isNotEmpty;
           final bool ioBusy = flushThreshold > 0 && queueLen >= flushThreshold;
 
           if (roundDeleted <= 0) {
-            activePlans = const [];
+            activePlans = const <_TtlCleanupPlan>[];
+            activeKvTables = const <String>[];
           } else if (hasBacklog && !ioBusy) {
             // There is still TTL backlog and the write buffer is not busy:
             // continue another cleanup round and keep CrontabManager active.
             activePlans = nextPlans;
+            activeKvTables = nextKvTables;
             CrontabManager.notifyActivity();
           } else {
             // Write buffer is under pressure or there is no backlog: yield to
             // foreground writes and end this cleanup cycle.
-            activePlans = const [];
+            activePlans = const <_TtlCleanupPlan>[];
+            activeKvTables = const <String>[];
           }
 
           if (hasBacklog) {
             cycleHasBacklog = true;
           }
 
-          if (activePlans.isEmpty) break;
+          if (activePlans.isEmpty && activeKvTables.isEmpty) break;
         } finally {
           lease.release();
         }

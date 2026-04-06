@@ -1,13 +1,13 @@
-import 'dart:collection';
 import 'dart:async';
-import 'crontab_manager.dart';
+import 'dart:collection';
 
 import '../handler/logger.dart';
 import '../model/buffer_entry.dart';
-import '../model/wal_pointer.dart';
 import '../model/unique_violation.dart';
-import 'yield_controller.dart';
+import '../model/wal_pointer.dart';
+import 'crontab_manager.dart';
 import 'data_store_impl.dart';
+import 'yield_controller.dart';
 
 class WriteQueueEntry {
   final String tableName;
@@ -419,9 +419,11 @@ class WriteBufferManager {
     bool skipBufferStore = false;
     bool skipQueueEnqueue =
         false; // Flag to skip adding to queue when merging INSERT+UPDATE
+    bool restoreDeletedCount = false;
     BufferEntry effectiveEntry = entry;
-    if (prior != null && prior.operation == BufferOperationType.insert) {
-      if (entry.operation == BufferOperationType.update) {
+    if (prior != null) {
+      if (prior.operation == BufferOperationType.insert &&
+          entry.operation == BufferOperationType.update) {
         // Merge: keep as INSERT with latest data
         // The buffer data is updated, but we should NOT add this UPDATE to the queue
         // because the INSERT entry is already in the queue and will be flushed with the updated data.
@@ -435,7 +437,8 @@ class WriteBufferManager {
         );
         skipQueueEnqueue =
             true; // Skip queue enqueue - INSERT entry already exists
-      } else if (entry.operation == BufferOperationType.delete) {
+      } else if (prior.operation == BufferOperationType.insert &&
+          entry.operation == BufferOperationType.delete) {
         // Cancel: drop the pending INSERT from buffer (no buffered record kept)
         // Remove the existing buffered INSERT so subsequent reads won't see it.
         // Cancel: drop the pending INSERT from buffer (no buffered record kept)
@@ -443,6 +446,20 @@ class WriteBufferManager {
         buf.records.remove(recordId);
         buf.insertedKeys.remove(recordId);
         skipBufferStore = true;
+      } else if (prior.operation == BufferOperationType.delete &&
+          entry.operation == BufferOperationType.insert) {
+        // A committed record was deleted and then recreated with the same PK
+        // before the delete flushed. Persist this as an UPDATE so flush keeps
+        // the old indexed values available for diff/removal.
+        effectiveEntry = BufferEntry(
+          data: entry.data,
+          operation: BufferOperationType.update,
+          timestamp: entry.timestamp,
+          walPointer: entry.walPointer,
+          transactionId: prior.transactionId ?? entry.transactionId,
+          oldValues: prior.oldValues ?? prior.data,
+        );
+        restoreDeletedCount = true;
       }
     }
 
@@ -482,6 +499,8 @@ class WriteBufferManager {
       // Update Insert Index
       if (effectiveEntry.operation == BufferOperationType.insert) {
         buf.insertedKeys.add(recordId);
+      } else {
+        buf.insertedKeys.remove(recordId);
       }
 
       if (uniqueKeys.isNotEmpty &&
@@ -520,8 +539,13 @@ class WriteBufferManager {
       await _dataStore.parallelJournalManager.waitIfThrottled();
       // Update record count statistics (awaited to ensure consistency)
       if (updateStats) {
-        await _dataStore.tableDataManager
-            .updateTableRecordCount(tableName, effectiveEntry.operation);
+        if (restoreDeletedCount) {
+          await _dataStore.tableDataManager
+              .updateTableRecordCount(tableName, BufferOperationType.insert);
+        } else {
+          await _dataStore.tableDataManager
+              .updateTableRecordCount(tableName, effectiveEntry.operation);
+        }
       }
       _writeQueue.add(WriteQueueEntry(
         tableName: tableName,
@@ -581,6 +605,19 @@ class WriteBufferManager {
       final recordId = recordIds[i];
       final entry = entries[i];
       final uniqueKeys = uniqueKeysList[i];
+      final prior = buf.records[recordId];
+      BufferEntry effectiveEntry = entry;
+
+      if (prior != null && prior.operation == BufferOperationType.delete) {
+        effectiveEntry = BufferEntry(
+          data: entry.data,
+          operation: BufferOperationType.update,
+          timestamp: entry.timestamp,
+          walPointer: entry.walPointer,
+          transactionId: prior.transactionId ?? entry.transactionId,
+          oldValues: prior.oldValues ?? prior.data,
+        );
+      }
 
       // Store entry (INSERT). If a prior entry exists, remove its unique keys to prevent leaks.
       final existingKeys = buf.recordIdToUniqueKeys.remove(recordId);
@@ -604,8 +641,12 @@ class WriteBufferManager {
         }
       }
 
-      buf.records[recordId] = entry;
-      buf.insertedKeys.add(recordId);
+      buf.records[recordId] = effectiveEntry;
+      if (effectiveEntry.operation == BufferOperationType.insert) {
+        buf.insertedKeys.add(recordId);
+      } else {
+        buf.insertedKeys.remove(recordId);
+      }
 
       if (uniqueKeys.isNotEmpty) {
         buf.recordIdToUniqueKeys[recordId] = uniqueKeys;
@@ -633,7 +674,7 @@ class WriteBufferManager {
         }
       }
 
-      final wp = entry.walPointer;
+      final wp = effectiveEntry.walPointer;
       if (wp == null) {
         // Should never happen for modern batch paths; skip enqueue to preserve queue integrity.
         Logger.warn(
@@ -645,7 +686,7 @@ class WriteBufferManager {
       _writeQueue.add(WriteQueueEntry(
         tableName: tableName,
         recordId: recordId,
-        operationType: BufferOperationType.insert,
+        operationType: effectiveEntry.operation,
         walPointer: wp,
       ));
       if ((i + 1) % emitChunk == 0 || i == recordIds.length - 1) {

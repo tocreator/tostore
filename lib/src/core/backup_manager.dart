@@ -55,7 +55,7 @@ class BackupManager {
       // Create metadata file with backup information
       final meta = BackupMetadata(
         timestamp: timestamp,
-        version: await _dataStore.getVersion(),
+        backupFormatVersion: InternalConfig.currentBackupFormatVersion,
         scope: scope,
         compressed: compress,
       );

@@ -5,31 +5,29 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../handler/wal_encoder.dart';
+import '../Interface/storage_interface.dart';
+import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
-import '../handler/encoder.dart';
-import '../model/encoder_config.dart';
-import 'compute_manager.dart';
-import '../model/buffer_entry.dart';
-import '../model/wal_pointer.dart';
-import 'data_store_impl.dart';
-import 'page_redo_log_codec.dart';
-import 'wal_manager.dart';
-import '../model/parallel_journal_entry.dart';
-import '../model/meta_info.dart';
-
 import '../handler/value_matcher.dart';
-import 'write_buffer_manager.dart';
-import '../Interface/storage_interface.dart';
-import 'storage_adapter.dart';
-import 'btree_page.dart';
-
-import 'workload_scheduler.dart';
-import 'io_concurrency_planner.dart';
-import '../model/table_schema.dart';
+import '../handler/wal_encoder.dart';
+import '../model/buffer_entry.dart';
+import '../model/encoder_config.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
+import '../model/meta_info.dart';
+import '../model/parallel_journal_entry.dart';
+import '../model/table_schema.dart';
+import '../model/wal_pointer.dart';
+import 'btree_page.dart';
+import 'compute_manager.dart';
+import 'data_store_impl.dart';
+import 'io_concurrency_planner.dart';
+import 'page_redo_log_codec.dart';
+import 'storage_adapter.dart';
+import 'wal_manager.dart';
+import 'workload_scheduler.dart';
+import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 
 class ParallelJournalManager {
@@ -494,9 +492,11 @@ class ParallelJournalManager {
 
             if (schema != null) {
               // B+Tree indexes only (vector indexes have separate meta).
-              final allIndexes =
-                  _dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
-                      <IndexSchema>[];
+              final allIndexes = <IndexSchema>[
+                ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+                ...?_dataStore.indexManager
+                    ?.getEngineManagedBtreeIndexes(table, schema),
+              ];
               for (final idx in allIndexes) {
                 final idxName = idx.actualIndexName;
                 indexNames.add(idxName);
@@ -684,10 +684,11 @@ class ParallelJournalManager {
                 // btreeIndexes excludes vector indexes — used for B+Tree budget calculation.
                 // IndexManager.writeChanges internally intercepts vector-type and dispatches
                 // to VectorIndexManager, so a single entry point handles both.
-                final allIndexes =
-                    (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
-                            <IndexSchema>[])
-                        .toList();
+                final allIndexes = <IndexSchema>[
+                  ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+                  ...?_dataStore.indexManager
+                      ?.getEngineManagedBtreeIndexes(table, schema),
+                ];
                 final btreeIndexCount =
                     allIndexes.where((i) => i.type != IndexType.vector).length;
                 final split = IoConcurrencyPlanner.splitPerTableBudget(
@@ -1797,11 +1798,11 @@ class ParallelJournalManager {
         if (schema == null) continue;
 
         // B+Tree indexes only — vector indexes have separate meta and recovery.
-        final btreeIndexNames =
-            (_dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
-                    <IndexSchema>[])
-                .map((i) => i.actualIndexName)
-                .toList(growable: false);
+        final btreeIndexNames = <IndexSchema>[
+          ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+          ...?_dataStore.indexManager
+              ?.getEngineManagedBtreeIndexes(tableName, schema),
+        ].map((i) => i.actualIndexName).toList(growable: false);
         if (btreeIndexNames.isEmpty) continue;
 
         final flushedForTable = flushedIndexes[tableName] ?? const <String>{};
@@ -2051,9 +2052,11 @@ class ParallelJournalManager {
     try {
       if (schema != null) {
         // B+Tree indexes only — vector index meta is separate, no B+Tree IndexMeta to read.
-        final btreeIndexes =
-            _dataStore.schemaManager?.getBtreeIndexesFor(schema) ??
-                <IndexSchema>[];
+        final btreeIndexes = <IndexSchema>[
+          ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+          ...?_dataStore.indexManager
+              ?.getEngineManagedBtreeIndexes(table, schema),
+        ];
         for (final idx in btreeIndexes) {
           final idxName = idx.actualIndexName;
           indexNames.add(idxName);

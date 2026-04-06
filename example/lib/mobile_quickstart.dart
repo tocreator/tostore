@@ -1,6 +1,7 @@
+import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
-import 'package:tostore/tostore.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:tostore/tostore.dart';
 
 /// quick-start example for mobile apps.
 ///
@@ -128,7 +129,7 @@ class MobileQuickStart {
   }
 
   /// List generic records, optionally by type, ordered by newest update first.
-  static Future<QueryResult> listRecords({String? type, int limit = 100}) {
+  static Future<QueryResult> listRecords({String? type, int limit = 20}) {
     final builder = db.query('records');
     if (type != null) {
       builder.where('type', '=', type);
@@ -141,6 +142,19 @@ class MobileQuickStart {
     return db.delete('records').where('id', '=', id);
   }
 
+  /// Watch generic records (reactive).
+  ///
+  /// This returns a Stream that automatically emits a new list of records
+  /// whenever the 'records' table is modified.
+  static Stream<List<Map<String, dynamic>>> watchRecords(
+      {String? type, int limit = 20}) {
+    final builder = db.query('records');
+    if (type != null) {
+      builder.where('type', '=', type);
+    }
+    return builder.orderByDesc('updated_at').limit(limit).watch();
+  }
+
   /// Set a global setting value (shared across spaces).
   static Future<DbResult> setSetting(String key, String value) {
     return db.upsert('settings', {'key': key, 'value': value});
@@ -151,5 +165,84 @@ class MobileQuickStart {
     final result = await db.query('settings').where('key', '=', key).limit(1);
     if (result.data.isEmpty) return null;
     return result.data.first['value'] as String?;
+  }
+}
+
+/// A simple UI example demonstrating ToStore's reactive "Auto-Refresh" capability.
+///
+/// Use [StreamBuilder] combined with [watch] to keep your UI in sync with the DB
+/// without manual state management or polling.
+class RecordsRefreshExample extends StatelessWidget {
+  const RecordsRefreshExample({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ToStore Auto-Refresh'),
+        backgroundColor: Colors.blueGrey[900],
+        foregroundColor: Colors.white,
+      ),
+      body: StreamBuilder<List<Map<String, dynamic>>>(
+        // 1. Listen to the reactive stream from watchRecords()
+        stream: MobileQuickStart.watchRecords(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
+          }
+
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final records = snapshot.data!;
+          if (records.isEmpty) {
+            return const Center(
+              child: Text(
+                'No records found.\nTap the + button to add one!',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey, fontSize: 16),
+              ),
+            );
+          }
+
+          // 2. The ListView will automatically rebuild when the stream emits
+          return ListView.separated(
+            padding: const EdgeInsets.all(16),
+            itemCount: records.length,
+            separatorBuilder: (_, __) => const Divider(),
+            itemBuilder: (context, index) {
+              final record = records[index];
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(
+                  record['title'] ?? 'Untitled',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: Text(
+                  'ID: ${record['id']} • Updated: ${record['updated_at']}',
+                  style: TextStyle(color: Colors.blueGrey[600], fontSize: 12),
+                ),
+                trailing: IconButton(
+                  icon:
+                      const Icon(Icons.delete_outline, color: Colors.redAccent),
+                  onPressed: () =>
+                      MobileQuickStart.deleteRecord(record['id'].toString()),
+                ),
+              );
+            },
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => MobileQuickStart.addRecord(
+          'note',
+          title: 'Quick Note ${DateTime.now().second}',
+          content: 'Reactive UI update demo',
+        ),
+        label: const Text('Add Record'),
+        icon: const Icon(Icons.add),
+      ),
+    );
   }
 }

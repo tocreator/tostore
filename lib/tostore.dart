@@ -555,16 +555,31 @@ class ToStore implements DataStoreInterface {
   /// Set key-value pair
   /// [key] Key
   /// [value] Value
+  /// [ttl] Relative expiration duration. Mutually exclusive with [expiresAt].
+  /// [expiresAt] Absolute expiration time. Mutually exclusive with [ttl].
   /// [isGlobal] Whether it's global key-value pair, default false
   ///
   /// 设置键值对
   /// [key] 键
   /// [value] 值
+  /// [ttl] 相对过期时间。与 [expiresAt] 互斥。
+  /// [expiresAt] 绝对过期时间。与 [ttl] 互斥。
   /// [isGlobal] 是否为全局键值对，默认false
   @override
-  Future<DbResult> setValue(String key, dynamic value,
-      {bool isGlobal = false}) async {
-    return await _impl.setValue(key, value, isGlobal: isGlobal);
+  Future<DbResult> setValue(
+    String key,
+    dynamic value, {
+    Duration? ttl,
+    DateTime? expiresAt,
+    bool isGlobal = false,
+  }) async {
+    return await _impl.setValue(
+      key,
+      value,
+      ttl: ttl,
+      expiresAt: expiresAt,
+      isGlobal: isGlobal,
+    );
   }
 
   /// Get key-value pair
@@ -577,6 +592,49 @@ class ToStore implements DataStoreInterface {
   @override
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
     return await _impl.getValue(key, isGlobal: isGlobal);
+  }
+
+  /// Watch key-value pair changes and emit the latest value immediately
+  /// [key] Key
+  /// [isGlobal] Whether it's global key-value pair, default false
+  /// [defaultValue] Fallback value when the key does not exist
+  /// [distinct] Whether to suppress repeated emissions with the same stored value
+  ///
+  /// 监听键值对变化，并立即发出当前值
+  /// [key] 键
+  /// [isGlobal] 是否为全局键值对，默认false
+  /// [defaultValue] 当键不存在时使用的默认值
+  /// [distinct] 是否抑制相同存储值的重复发射
+  @override
+  Stream<T?> watchValue<T>(String key,
+      {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
+    return _impl.watchValue<T>(
+      key,
+      isGlobal: isGlobal,
+      defaultValue: defaultValue,
+      distinct: distinct,
+    );
+  }
+
+  /// Watch multiple key-value pairs and emit the latest snapshot immediately
+  /// Missing keys are included with `null` values in the emitted map.
+  /// [keys] Key list
+  /// [isGlobal] Whether it's global key-value pair, default false
+  /// [distinct] Whether to suppress repeated emissions with the same stored value
+  ///
+  /// 监听多个键值对，并立即发出最新快照
+  /// 对于不存在的键，会在返回的 Map 中以 `null` 填充
+  /// [keys] 键列表
+  /// [isGlobal] 是否为全局键值对，默认false
+  /// [distinct] 是否抑制相同存储值的重复发射
+  @override
+  Stream<Map<String, dynamic>> watchValues(Iterable<String> keys,
+      {bool isGlobal = false, bool distinct = true}) {
+    return _impl.watchValues(
+      keys,
+      isGlobal: isGlobal,
+      distinct: distinct,
+    );
   }
 
   /// Delete key-value pair

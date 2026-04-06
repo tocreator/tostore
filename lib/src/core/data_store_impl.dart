@@ -92,6 +92,10 @@ class DataStoreImpl {
 
   // Internal reserved field for TTL ingest-time source (ISO8601 datetime string).
   static const String _systemIngestTsMsField = '_system_ingest_ts_ms';
+  static const String _kvKeyField = SystemTable.keyValueKeyField;
+  static const String _kvValueField = SystemTable.keyValueValueField;
+  static const String _kvUpdatedAtField = SystemTable.keyValueUpdatedAtField;
+  static const String _kvExpiresAtField = SystemTable.keyValueExpiresAtField;
   Completer<void> _initCompleter = Completer<void>();
   bool _isInitialized = false;
   bool _initializing = false;
@@ -2507,8 +2511,14 @@ class DataStoreImpl {
 
           final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
           final Set<String> indexedFieldNames = <String>{primaryKey}..addAll(
-              (schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[])
-                  .expand((i) => i.fields));
+              <IndexSchema>[
+                ...?schemaManager?.getAllIndexesFor(schema),
+                ...?indexManager?.getEngineManagedBtreeIndexes(
+                  tableName,
+                  schema,
+                ),
+              ].expand((i) => i.fields),
+            );
 
           Future<void> flushIndexUpdateBatch() async {
             if (_indexManager == null || recordsInBatch.isEmpty) return;
@@ -3127,8 +3137,13 @@ class DataStoreImpl {
               record[primaryKey] != null &&
               updatedRecord[primaryKey] != null &&
               record[primaryKey] != updatedRecord[primaryKey];
-          final allIndexes =
-              schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+          final allIndexes = <IndexSchema>[
+            ...?schemaManager?.getAllIndexesFor(schema),
+            ...?indexManager?.getEngineManagedBtreeIndexes(
+              tableName,
+              schema,
+            ),
+          ];
           if (pkChanged) {
             // Primary key change affects all secondary indexes (non-unique: key suffix; unique: value).
             for (final idx in allIndexes) {
@@ -3198,6 +3213,20 @@ class DataStoreImpl {
       Logger.error('Update failed: $e', label: 'DataStore-update');
       if (isInTransactionWithRollback()) {
         rethrow;
+      }
+      if (e is BusinessError) {
+        if (e.type == BusinessErrorType.notFound) {
+          return finish(DbResult.error(
+            type: ResultType.notFound,
+            message: e.message,
+          ));
+        }
+        if (e.type == BusinessErrorType.invalidData) {
+          return finish(DbResult.error(
+            type: ResultType.validationFailed,
+            message: e.message,
+          ));
+        }
       }
       // Best-effort release locks
       try {
@@ -5815,29 +5844,54 @@ class DataStoreImpl {
   }
 
   /// Set key-value pair
-  Future<DbResult> setValue(String key, dynamic value,
-      {bool isGlobal = false}) async {
+  Future<DbResult> setValue(
+    String key,
+    dynamic value, {
+    Duration? ttl,
+    DateTime? expiresAt,
+    bool isGlobal = false,
+  }) async {
     await ensureInitialized();
 
+    if (ttl != null && expiresAt != null) {
+      return DbResult.error(
+        type: ResultType.validationFailed,
+        message: 'ttl and expiresAt are mutually exclusive',
+        failedKeys: [key],
+      );
+    }
+    if (ttl != null && ttl <= Duration.zero) {
+      return DbResult.error(
+        type: ResultType.validationFailed,
+        message: 'ttl must be greater than zero',
+        failedKeys: [key],
+      );
+    }
+
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final now = DateTime.now();
+    final nowIso = now.toIso8601String();
+    final expiresAtIso = expiresAt?.toIso8601String() ??
+        (ttl != null ? now.add(ttl).toIso8601String() : null);
 
     // Build data
     final data = {
-      'key': key,
-      'value': jsonEncode(value),
-      'updated_at': DateTime.now().toIso8601String(),
+      _kvKeyField: key,
+      _kvValueField: jsonEncode(value),
+      _kvUpdatedAtField: nowIso,
+      _kvExpiresAtField: expiresAtIso,
     };
 
     try {
       final existing = await executeQuery(
-          tableName, QueryCondition()..where('key', '=', key));
+          tableName, QueryCondition()..where(_kvKeyField, '=', key));
 
       if (existing.isEmpty) {
         final result = await insert(tableName, data);
         return result;
       } else {
         // Build update condition
-        final condition = QueryCondition()..where('key', '=', key);
+        final condition = QueryCondition()..where(_kvKeyField, '=', key);
         final result = await updateInternal(
           tableName,
           data,
@@ -5861,28 +5915,21 @@ class DataStoreImpl {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final result =
-        await executeQuery(tableName, QueryCondition()..where('key', '=', key));
+    final result = await executeQuery(
+      tableName,
+      QueryCondition()..where(_kvKeyField, '=', key),
+    );
     if (result.isEmpty) {
       return null;
     }
 
-    final rawValue = result.first['value'];
-    if (rawValue == null) {
+    final row = result.first;
+    if (_isKvRowExpired(row)) {
+      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
       return null;
     }
 
-    try {
-      // Try to parse as JSON first
-      return jsonDecode(rawValue);
-    } catch (e) {
-      // If it fails, it's likely a plain string that was stored directly, not as JSON.
-      // We return the raw string value for backward compatibility.
-      Logger.warn(
-          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`. Error: $e',
-          label: 'DataStore.getValue');
-      return rawValue;
-    }
+    return _decodeStoredKeyValue(row[_kvValueField], key: key);
   }
 
   /// Remove key-value pair
@@ -5891,8 +5938,345 @@ class DataStoreImpl {
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     // Build delete condition
-    final condition = QueryCondition()..where('key', '=', key);
+    final condition = QueryCondition()..where(_kvKeyField, '=', key);
     return await deleteInternal(tableName, condition);
+  }
+
+  /// Watch a single key-value pair and emit the latest value immediately.
+  Stream<T?> watchValue<T>(String key,
+      {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final condition = QueryCondition()..where(_kvKeyField, '=', key);
+
+    return _watchKvQuery<T?>(
+      tableName: tableName,
+      condition: condition,
+      distinct: distinct,
+      loadSnapshot: () async {
+        final rows = await executeQuery(tableName, condition);
+        if (rows.isEmpty) {
+          return (
+            value: defaultValue,
+            fingerprint: jsonEncode([
+              key,
+              false,
+              null,
+            ]),
+            nextRefreshAt: null,
+          );
+        }
+
+        final row = rows.first;
+        final rawExpiresAt = row[_kvExpiresAtField];
+        final expiresAt = _parseKvDateTime(rawExpiresAt);
+        if (expiresAt != null && !expiresAt.isAfter(DateTime.now())) {
+          _scheduleExactExpiredKvCleanup(tableName, key, rawExpiresAt);
+          return (
+            value: defaultValue,
+            fingerprint: jsonEncode([
+              key,
+              false,
+              null,
+            ]),
+            nextRefreshAt: null,
+          );
+        }
+
+        final rawValue = row[_kvValueField];
+        return (
+          value: _decodeStoredKeyValue(rawValue, key: key) as T?,
+          fingerprint: jsonEncode([
+            key,
+            true,
+            rawValue,
+          ]),
+          nextRefreshAt: expiresAt,
+        );
+      },
+    );
+  }
+
+  /// Watch multiple key-value pairs and emit the latest snapshot immediately.
+  /// Missing keys are included with `null` values.
+  Stream<Map<String, dynamic>> watchValues(Iterable<String> keys,
+      {bool isGlobal = false, bool distinct = true}) {
+    final requestedKeys =
+        LinkedHashSet<String>.from(keys).toList(growable: false);
+    if (requestedKeys.isEmpty) {
+      return Stream.value(const <String, dynamic>{});
+    }
+
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final condition = QueryCondition();
+    if (requestedKeys.length == 1) {
+      condition.where(_kvKeyField, '=', requestedKeys.first);
+    } else {
+      condition.where(_kvKeyField, 'IN', requestedKeys);
+    }
+
+    return _watchKvQuery<Map<String, dynamic>>(
+      tableName: tableName,
+      condition: condition,
+      distinct: distinct,
+      loadSnapshot: () async {
+        final rows = await executeQuery(tableName, condition);
+        final rowsByKey = <String, Map<String, dynamic>>{};
+        for (final row in rows) {
+          final rowKey = row[_kvKeyField];
+          if (rowKey != null) {
+            rowsByKey[rowKey.toString()] = row;
+          }
+        }
+
+        final values = <String, dynamic>{};
+        final fingerprintParts = <Object?>[];
+        DateTime? nextRefreshAt;
+        final now = DateTime.now();
+        for (final requestedKey in requestedKeys) {
+          final row = rowsByKey[requestedKey];
+          if (row == null) {
+            values[requestedKey] = null;
+            fingerprintParts.add([requestedKey, false, null]);
+            continue;
+          }
+
+          final rawExpiresAt = row[_kvExpiresAtField];
+          final expiresAt = _parseKvDateTime(rawExpiresAt);
+          if (expiresAt != null && !expiresAt.isAfter(now)) {
+            values[requestedKey] = null;
+            fingerprintParts.add([requestedKey, false, null]);
+            _scheduleExactExpiredKvCleanup(
+                tableName, requestedKey, rawExpiresAt);
+            continue;
+          }
+
+          if (expiresAt != null &&
+              (nextRefreshAt == null || expiresAt.isBefore(nextRefreshAt))) {
+            nextRefreshAt = expiresAt;
+          }
+
+          final rawValue = row[_kvValueField];
+          values[requestedKey] =
+              _decodeStoredKeyValue(rawValue, key: requestedKey);
+          fingerprintParts.add([requestedKey, true, rawValue]);
+        }
+
+        return (
+          value: Map<String, dynamic>.unmodifiable(values),
+          fingerprint: jsonEncode(fingerprintParts),
+          nextRefreshAt: nextRefreshAt,
+        );
+      },
+    );
+  }
+
+  Stream<T> _watchKvQuery<T>({
+    required String tableName,
+    required QueryCondition condition,
+    required Future<({T value, String fingerprint, DateTime? nextRefreshAt})>
+            Function()
+        loadSnapshot,
+    bool distinct = true,
+  }) {
+    late StreamController<T> controller;
+    StreamSubscription? subscription;
+    Timer? refreshTimer;
+    bool queryPending = false;
+    bool needsRefresh = false;
+    bool hasEmitted = false;
+    String? lastFingerprint;
+    late Future<void> Function() emitLatest;
+
+    void scheduleRefresh(DateTime? refreshAt) {
+      refreshTimer?.cancel();
+      if (refreshAt == null || controller.isClosed) {
+        return;
+      }
+
+      final delay = refreshAt.difference(DateTime.now());
+      refreshTimer = Timer(
+        delay <= Duration.zero ? Duration.zero : delay,
+        () async {
+          if (controller.isClosed) {
+            return;
+          }
+          if (queryPending) {
+            needsRefresh = true;
+            return;
+          }
+
+          queryPending = true;
+          try {
+            do {
+              needsRefresh = false;
+              await emitLatest();
+            } while (needsRefresh && !controller.isClosed);
+          } catch (e, st) {
+            if (!controller.isClosed) {
+              controller.addError(e, st);
+            }
+          } finally {
+            queryPending = false;
+          }
+        },
+      );
+    }
+
+    emitLatest = () async {
+      final snapshot = await loadSnapshot();
+      scheduleRefresh(snapshot.nextRefreshAt);
+      final shouldEmit =
+          !distinct || !hasEmitted || snapshot.fingerprint != lastFingerprint;
+
+      hasEmitted = true;
+      lastFingerprint = snapshot.fingerprint;
+
+      if (shouldEmit && !controller.isClosed) {
+        controller.add(snapshot.value);
+      }
+    };
+
+    controller = StreamController<T>(
+      onListen: () async {
+        try {
+          await ensureInitialized();
+          await emitLatest();
+        } catch (e, st) {
+          if (!controller.isClosed) {
+            controller.addError(e, st);
+          }
+        }
+
+        if (controller.isClosed) {
+          return;
+        }
+
+        subscription = notificationManager.register(
+          tableName,
+          condition,
+          (event) async {
+            if (queryPending) {
+              needsRefresh = true;
+              return;
+            }
+
+            queryPending = true;
+            try {
+              do {
+                needsRefresh = false;
+                await emitLatest();
+              } while (needsRefresh && !controller.isClosed);
+            } catch (e, st) {
+              if (!controller.isClosed) {
+                controller.addError(e, st);
+              }
+            } finally {
+              queryPending = false;
+            }
+          },
+        );
+      },
+      onCancel: () async {
+        refreshTimer?.cancel();
+        await subscription?.cancel();
+      },
+    );
+
+    return controller.stream;
+  }
+
+  DateTime? _parseKvDateTime(dynamic rawValue) {
+    if (rawValue == null) {
+      return null;
+    }
+    if (rawValue is DateTime) {
+      return rawValue;
+    }
+    if (rawValue is String) {
+      final value = rawValue.trim();
+      if (value.isEmpty) {
+        return null;
+      }
+      try {
+        return DateTime.parse(value);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (rawValue is int) {
+      try {
+        return DateTime.fromMillisecondsSinceEpoch(rawValue);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (rawValue is BigInt) {
+      try {
+        return DateTime.fromMillisecondsSinceEpoch(rawValue.toInt());
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  bool _isKvRowExpired(Map<String, dynamic> row, {DateTime? now}) {
+    final expiresAt = _parseKvDateTime(row[_kvExpiresAtField]);
+    if (expiresAt == null) {
+      return false;
+    }
+    final referenceTime = now ?? DateTime.now();
+    return !expiresAt.isAfter(referenceTime);
+  }
+
+  void _scheduleExactExpiredKvCleanup(
+    String tableName,
+    String key,
+    dynamic rawExpiresAt,
+  ) {
+    final expiresAtIso = _parseKvDateTime(rawExpiresAt)?.toIso8601String();
+    if (expiresAtIso == null) {
+      return;
+    }
+    unawaited(_deleteExpiredKvRecordExact(
+      tableName,
+      key: key,
+      expiresAtIso: expiresAtIso,
+    ));
+  }
+
+  Future<void> _deleteExpiredKvRecordExact(
+    String tableName, {
+    required String key,
+    required String expiresAtIso,
+  }) async {
+    try {
+      final condition = QueryCondition()
+        ..where(_kvKeyField, '=', key)
+        ..where(_kvExpiresAtField, '=', expiresAtIso);
+      await deleteInternal(tableName, condition, limit: 1);
+    } catch (e) {
+      Logger.warn(
+        'Failed to cleanup expired kv key "$key" in $tableName: $e',
+        label: 'DataStore._deleteExpiredKvRecordExact',
+      );
+    }
+  }
+
+  dynamic _decodeStoredKeyValue(dynamic rawValue, {required String key}) {
+    if (rawValue == null) {
+      return null;
+    }
+
+    try {
+      final encodedValue = rawValue is String ? rawValue : rawValue.toString();
+      return jsonDecode(encodedValue);
+    } catch (e) {
+      Logger.warn(
+          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`. Error: $e',
+          label: 'DataStore.getValue');
+      return rawValue;
+    }
   }
 
   /// Get table info
@@ -6937,7 +7321,6 @@ class DataStoreImpl {
       // Create the SpaceInfo object with user-table information
       return SpaceInfo(
         spaceName: _currentSpaceName,
-        version: await getVersion(),
         tableCount: userTables.length, // Use actual count of user tables
         recordCount: config?.totalRecordCount ?? 0,
         dataSizeBytes: config?.totalDataSizeBytes ?? 0,

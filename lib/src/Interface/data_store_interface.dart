@@ -57,10 +57,24 @@ abstract class DataStoreInterface {
   DeleteBuilder delete(String tableName);
 
   /// set key-value pair
-  Future<DbResult> setValue(String key, dynamic value, {bool isGlobal = false});
+  Future<DbResult> setValue(
+    String key,
+    dynamic value, {
+    Duration? ttl,
+    DateTime? expiresAt,
+    bool isGlobal = false,
+  });
 
   /// get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false});
+
+  /// watch a single key-value pair and emit the current value immediately
+  Stream<T?> watchValue<T>(String key,
+      {bool isGlobal = false, T? defaultValue, bool distinct = true});
+
+  /// watch multiple key-value pairs and emit the latest snapshot immediately
+  Stream<Map<String, dynamic>> watchValues(Iterable<String> keys,
+      {bool isGlobal = false, bool distinct = true});
 
   /// remove key-value pair
   Future<DbResult> removeValue(String key, {bool isGlobal = false});

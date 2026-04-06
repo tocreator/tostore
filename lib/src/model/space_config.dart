@@ -9,7 +9,7 @@ class SpaceConfig {
   /// previous encryption key info (if any)
   final EncryptionKeyInfo? previous;
 
-  /// database version
+  /// Internal engine/storage format version
   final int version;
 
   /// Table directory mapping - Records the directory index where each table is located

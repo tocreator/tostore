@@ -1,6 +1,6 @@
-import '../Interface/platform_interface.dart';
 import '../Interface/platform_handler_web.dart'
     if (dart.library.io) 'platform_handler_impl.dart';
+import '../Interface/platform_interface.dart';
 
 /// Platform capability detection entry point
 class PlatformHandler {
@@ -105,34 +105,25 @@ class PlatformHandler {
     final cores = processorCores;
 
     if (isServerEnvironment) {
-      // For servers, utilize all available cores.
+      // For servers, utilize available cores.
       // YieldController inside the engine will handle any necessary execution pauses.
-      return cores.clamp(10, 128);
+      return cores.clamp(8, 128);
     } else if (isDesktop) {
-      // For desktops, utilize all available cores.
-      // Modern OS schedulers and YieldController ensure UI responsiveness.
-      return cores.clamp(8, 64);
+      // For desktops, utilize cores but avoid aggressive over-provisioning.
+      // 4 is a safe minimum for modern desktops; 64 is a reasonable cap.
+      return cores.clamp(4, 64);
     } else if (isMobile) {
-      // For mobile, utilize all cores but cap at 8 to avoid excessive memory/thermal pressure.
-      return cores.clamp(6, 16);
+      // For mobile, be conservative to avoid excessive memory/thermal/battery pressure.
+      return cores.clamp(4, 16);
     } else {
-      // For web and unknown platforms, use cores but cap at 6.
-      return cores.clamp(3, 8);
+      // For web and unknown platforms, use cores but keep it very low.
+      return cores.clamp(2, 8);
     }
   }
 
   /// Detect if it's a server environment
   static bool get isServerEnvironment {
-    // Server environment detection strategy:
-    // 1. Linux systems are almost always servers or high-performance environments in this context.
-    // 2. Windows/macOS with high core counts (>=12) often act as workstations or build servers.
-    if (isLinux) {
-      return true;
-    } else if ((isWindows || isMacOS) && processorCores >= 12) {
-      return true;
-    }
-
-    return false;
+    return isLinux;
   }
 
   /// Get device hardware signature for enhanced security

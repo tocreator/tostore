@@ -232,6 +232,7 @@ class ServerSchemaManager {
             'type': 'text',
             'nullable': false,
             'maxLength': 200,
+            'createIndex': true,
           },
           {
             'name': 'description',
@@ -535,12 +536,9 @@ class ServerCRUDExamples {
     final totalProducts = await _db.query('products').count();
     log('📊 Total products: $totalProducts');
 
-    // Search with LIKE
-    final searchResults = await _db
-        .query('products')
-        .where('name', 'like', '%laptop%')
-        .or()
-        .where('description', 'like', '%laptop%');
+    // Search with LIKE (start with prefix search)
+    final searchResults =
+        await _db.query('products').whereStartsWith('name', 'laptop');
 
     log('🔍 Search results: ${searchResults.length}');
   }

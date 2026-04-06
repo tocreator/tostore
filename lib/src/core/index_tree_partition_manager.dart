@@ -479,7 +479,26 @@ final class IndexTreePartitionManager {
         checkInterval: 300);
     for (final d in deltas) {
       await yc.maybeYield();
-      ops[ByteKey(d.key)] = d.value;
+      final key = ByteKey(d.key);
+      final existing = ops[key];
+      if (existing == null) {
+        ops[key] = d.value;
+        continue;
+      }
+
+      if (meta.isUnique) {
+        final existingIsDelete = existing.isNotEmpty && existing[0] == 1;
+        final incomingIsDelete = d.value.isNotEmpty && d.value[0] == 1;
+
+        // Unique replacement in one flush batch is often encoded as:
+        // put(newOwner) -> delete(oldOwner) on the same logical key.
+        // The final state must keep the key present rather than deleted.
+        if (!existingIsDelete && incomingIsDelete) {
+          continue;
+        }
+      }
+
+      ops[key] = d.value;
     }
     if (ops.isEmpty) return;
 

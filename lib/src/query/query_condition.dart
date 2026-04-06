@@ -526,12 +526,8 @@ class QueryCondition {
   }
 
   /// Determine if the condition tree contains any effective predicate
-  /// (leaf node with non-empty condition, or a custom node).
+  /// (leaf node with non-empty condition).
   bool _hasMeaningfulPredicate(ConditionNode node) {
-    // A custom node is always meaningful
-    if (node.type == NodeType.custom) {
-      return true;
-    }
     // A leaf node is meaningful only when it carries a condition
     if (node.type == NodeType.leaf) {
       return node.condition.isNotEmpty;
@@ -631,58 +627,54 @@ class QueryCondition {
   }
 
   /// Contains condition
+  ///
+  /// **[PERFORMANCE WARNING]** Full substring matching ('%value%') will ALWAYS trigger a
+  /// full table scan even if an index is present. For large-scale data, consider using
   QueryCondition whereContains(String field, String value) {
     return where(field, 'LIKE', '%$value%');
   }
 
   /// Not contains condition
+  ///
+  /// **[PERFORMANCE WARNING]** Full substring matching ('%value%') will ALWAYS trigger a
+  /// full table scan.
   QueryCondition whereNotContains(String field, String value) {
     return where(field, 'NOT LIKE', '%$value%');
   }
 
-  /// Add a custom condition using a user-provided function
-  QueryCondition whereCustom(bool Function(Map<String, dynamic>) record) {
-    final customNode = ConditionNode(
-      type: NodeType.custom,
-      customMatcher: record,
-    );
-
-    // If the current node is an AND node, add the custom node as a child
-    if (_current.type == NodeType.and) {
-      _current.children.add(customNode);
-    }
-    // If the current node is an OR node
-    else if (_current.type == NodeType.or) {
-      _current.children.add(customNode);
-    }
-    // If the current node is a leaf or custom node, create a new AND node as a parent
-    else {
-      // Find the parent node of the current node
-      final parent = _findParent(_root, _current);
-
-      if (parent != null) {
-        // Create a new AND node
-        final andNode = ConditionNode(type: NodeType.and);
-
-        // Replace the current node with the AND node
-        final index = parent.children.indexOf(_current);
-        parent.children[index] = andNode;
-
-        // Add the current node and the custom node as children of the AND node
-        andNode.children.add(_current);
-        andNode.children.add(customNode);
-
-        // Update the current node to the AND node
-        _current = andNode;
-      }
-    }
-
-    return this;
+  /// Starts with condition
+  QueryCondition whereStartsWith(String field, String prefix) {
+    return where(field, 'LIKE', '$prefix%');
   }
 
-  /// Add a custom condition using a user-provided function with OR logic
-  QueryCondition orWhereCustom(bool Function(Map<String, dynamic>) record) {
-    return or().whereCustom(record);
+  /// Ends with condition
+  ///
+  /// **[PERFORMANCE WARNING]** Suffix matching ('%suffix') will ALWAYS trigger a
+  /// full table scan even if an index is present.
+  QueryCondition whereEndsWith(String field, String suffix) {
+    return where(field, 'LIKE', '%$suffix');
+  }
+
+  /// whereEmpty condition - matches null or empty string
+  QueryCondition whereEmpty(String field) {
+    final sub = QueryCondition();
+    sub.whereNull(field).or().where(field, '=', '');
+    return condition(sub);
+  }
+
+  /// whereNotEmpty condition - matches non-null and non-empty string
+  QueryCondition whereNotEmpty(String field) {
+    return whereNotNull(field).where(field, '!=', '');
+  }
+
+  /// whereTrue condition - matches true
+  QueryCondition whereTrue(String field) {
+    return where(field, '=', true);
+  }
+
+  /// whereFalse condition - matches false
+  QueryCondition whereFalse(String field) {
+    return where(field, '=', false);
   }
 
   /// set order by (asc)

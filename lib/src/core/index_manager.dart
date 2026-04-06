@@ -8,7 +8,6 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
-import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
@@ -50,8 +49,11 @@ class IndexManager {
 
   // Loading futures to prevent thundering herd on concurrent meta loads
   final Map<String, Future<IndexMeta?>> _metaLoadingFutures = {};
+  final Map<String, Future<void>> _emptyIndexRepairFutures = {};
 
   String _getMetaLoadingKey(String tableName, String indexName) =>
+      '$tableName#$indexName';
+  String _getEmptyIndexRepairKey(String tableName, String indexName) =>
       '$tableName#$indexName';
 
   IndexManager(this._dataStore) {
@@ -130,6 +132,204 @@ class IndexManager {
         meta.fields.length * 20;
   }
 
+  List<IndexSchema> getEngineManagedBtreeIndexes(
+    String tableName,
+    TableSchema schema,
+  ) {
+    if (!SystemTable.isKeyValueTable(tableName)) {
+      return const <IndexSchema>[];
+    }
+
+    return const <IndexSchema>[
+      IndexSchema(
+        indexName: SystemTable.keyValueExpiryIndexName,
+        fields: <String>[SystemTable.keyValueExpiresAtField],
+        unique: false,
+      ),
+    ];
+  }
+
+  String get _internalKvExpiryActualIndexName => const IndexSchema(
+        indexName: SystemTable.keyValueExpiryIndexName,
+        fields: <String>[SystemTable.keyValueExpiresAtField],
+        unique: false,
+      ).actualIndexName;
+
+  bool _isInternalKvExpiryIndex(String tableName, String indexName) {
+    return SystemTable.isKeyValueTable(tableName) &&
+        indexName == _internalKvExpiryActualIndexName;
+  }
+
+  Uint8List? _encodeInternalKvExpiryIndexKey(
+    TableSchema schema,
+    dynamic expiresAt,
+    String pkValue,
+  ) {
+    final expiresAtComp = schema.encodeFieldComponentToMemComparable(
+      SystemTable.keyValueExpiresAtField,
+      expiresAt,
+      truncateText: false,
+    );
+    if (expiresAtComp == null) return null;
+    return MemComparableKey.encodeTuple(<Uint8List>[
+      expiresAtComp,
+      schema.encodePrimaryKeyComponent(pkValue),
+    ]);
+  }
+
+  Future<Uint8List?> encodeInternalKvExpiryIndexKey(
+    String tableName, {
+    required dynamic expiresAt,
+    required String primaryKey,
+  }) async {
+    if (!_isInternalKvExpiryIndex(
+        tableName, _internalKvExpiryActualIndexName)) {
+      return null;
+    }
+    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) return null;
+    return _encodeInternalKvExpiryIndexKey(schema, expiresAt, primaryKey);
+  }
+
+  Future<IndexSearchResult> searchInternalKvExpiryIndexUpTo(
+    String tableName,
+    DateTime upTo, {
+    int? limit,
+  }) async {
+    if (!SystemTable.isKeyValueTable(tableName)) {
+      return IndexSearchResult.empty();
+    }
+
+    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return IndexSearchResult.empty();
+    }
+
+    final indexName = _internalKvExpiryActualIndexName;
+    _registerIndexComparator(tableName, indexName, schema);
+    final cutoffIso = upTo.toIso8601String();
+
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final primaryKeys = <String>[];
+      final entries = <IndexSearchEntry>[];
+
+      await _indexDataCache.scanRange(
+        <dynamic>[tableName, indexName],
+        null,
+        onEntry: (key, _) {
+          if (key.length < 4 || key[0] != tableName || key[1] != indexName) {
+            return false;
+          }
+
+          final expiresAt = key[2];
+          final pk = key.last?.toString();
+          if (expiresAt == null || pk == null || pk.isEmpty) {
+            return true;
+          }
+
+          final expiresAtText = expiresAt.toString();
+          if (expiresAtText.compareTo(cutoffIso) > 0) {
+            return false;
+          }
+
+          final keyBytes =
+              _encodeInternalKvExpiryIndexKey(schema, expiresAtText, pk);
+          if (keyBytes == null) {
+            return true;
+          }
+
+          primaryKeys.add(pk);
+          entries.add(IndexSearchEntry(primaryKey: pk, keyBytes: keyBytes));
+          return limit == null || primaryKeys.length < limit;
+        },
+      );
+
+      return IndexSearchResult(
+        primaryKeys: primaryKeys,
+        entries: entries.isEmpty ? null : entries,
+        lastKey: entries.isEmpty ? null : entries.last.keyBytes,
+      );
+    }
+
+    final meta = await getIndexMeta(tableName, indexName);
+    if (meta == null) {
+      return IndexSearchResult.empty();
+    }
+
+    final cutoffComp = schema.encodeFieldComponentToMemComparable(
+      SystemTable.keyValueExpiresAtField,
+      cutoffIso,
+      truncateText: false,
+    );
+    if (cutoffComp == null) {
+      return IndexSearchResult.empty();
+    }
+
+    final prefix = MemComparableKey.encodeTuple(<Uint8List>[cutoffComp]);
+    final endExclusive = Uint8List(prefix.length + 5);
+    endExclusive.setRange(0, prefix.length, prefix);
+    endExclusive[prefix.length] = 0xFF;
+
+    return _dataStore.indexTreePartitionManager.searchByKeyRange(
+      tableName: tableName,
+      indexName: indexName,
+      meta: meta,
+      startKeyInclusive: Uint8List(0),
+      endKeyExclusive: endExclusive,
+      limit: limit,
+    );
+  }
+
+  Future<void> removeInternalKvExpiryIndexEntryByRawKey(
+    String tableName,
+    Uint8List keyBytes,
+  ) async {
+    if (!_isInternalKvExpiryIndex(
+            tableName, _internalKvExpiryActualIndexName) ||
+        keyBytes.isEmpty) {
+      return;
+    }
+
+    try {
+      try {
+        final decoded = MemComparableKey.decodeTuple(keyBytes);
+        _indexDataCache.remove(
+          <dynamic>[
+            tableName,
+            _internalKvExpiryActualIndexName,
+            ...decoded,
+          ],
+        );
+      } catch (_) {}
+
+      if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+        return;
+      }
+
+      final meta = await getIndexMeta(
+        tableName,
+        _internalKvExpiryActualIndexName,
+      );
+      if (meta == null) {
+        return;
+      }
+
+      await _dataStore.indexTreePartitionManager.writeChanges(
+        tableName: tableName,
+        indexName: _internalKvExpiryActualIndexName,
+        indexMeta: meta,
+        deltas: <DataBlockEntry>[
+          DataBlockEntry(keyBytes, Uint8List.fromList(const <int>[1])),
+        ],
+      );
+    } catch (e) {
+      Logger.warn(
+        'Failed to remove internal KV expiry index entry for $tableName: $e',
+        label: 'IndexManager.removeInternalKvExpiryIndexEntryByRawKey',
+      );
+    }
+  }
+
   /// Evict index metadata cache
   Future<void> evictIndexMetaCache(double ratio) async {
     if (ratio <= 0 || ratio > 1) return;
@@ -152,8 +352,10 @@ class IndexManager {
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) return;
-      final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-          const <IndexSchema>[];
+      final indexes = <IndexSchema>[
+        ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+        ...getEngineManagedBtreeIndexes(tableName, schema),
+      ];
       if (indexes.isEmpty) return;
 
       final bool isMemoryMode =
@@ -268,10 +470,21 @@ class IndexManager {
 
     final allIndexes =
         _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
-    final indexSchema = allIndexes.firstWhere(
+    var indexSchema = allIndexes.firstWhere(
       (i) => i.actualIndexName == indexName,
       orElse: () => IndexSchema(indexName: '', fields: []),
     );
+
+    if (indexSchema.fields.isEmpty) {
+      final engineManaged =
+          getEngineManagedBtreeIndexes(tableName, schema).firstWhere(
+        (i) => i.actualIndexName == indexName,
+        orElse: () => IndexSchema(indexName: '', fields: []),
+      );
+      if (engineManaged.fields.isNotEmpty) {
+        indexSchema = engineManaged;
+      }
+    }
 
     if (indexSchema.fields.isEmpty) return;
 
@@ -487,6 +700,19 @@ class IndexManager {
     );
   }
 
+  bool _isPrimaryKeyHiddenByDeleteOverlay(
+    String tableName,
+    String? primaryKey, {
+    String? transactionId,
+  }) {
+    if (primaryKey == null || primaryKey.isEmpty) return false;
+    return _dataStore.tableDataManager.isRecordHiddenByDeleteOverlay(
+      tableName,
+      primaryKey,
+      transactionId: transactionId,
+    );
+  }
+
   /// Get index metadata
   /// First tries to get from cache, if not found, loads from file and caches it
   Future<IndexMeta?> getIndexMeta(String tableName, String indexName) async {
@@ -536,9 +762,10 @@ class IndexManager {
             final schema =
                 await _dataStore.schemaManager?.getTableSchema(tableName);
             if (schema != null) {
-              final allIndexes =
-                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-                      const <IndexSchema>[];
+              final allIndexes = <IndexSchema>[
+                ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+                ...getEngineManagedBtreeIndexes(tableName, schema),
+              ];
               final idx = allIndexes.firstWhere(
                 (i) => i.actualIndexName == indexName,
                 orElse: () => IndexSchema(indexName: '', fields: const []),
@@ -639,7 +866,23 @@ class IndexManager {
   /// create index
   Future<void> createIndex(String tableName, IndexSchema schema) async {
     final indexName = schema.actualIndexName;
+    final lockMgr = _dataStore.lockManager;
+    final indexLockKey = 'index:$tableName:$indexName';
+    final indexLockOpId = GlobalIdGenerator.generate('create_index_');
+    bool indexLocked = false;
+
     try {
+      if (lockMgr != null) {
+        indexLocked = await lockMgr.acquireExclusiveLock(
+          indexLockKey,
+          indexLockOpId,
+        );
+        if (!indexLocked) {
+          throw StateError(
+              'Failed to acquire lock for creating index $tableName.$indexName');
+        }
+      }
+
       // Check if the index exists
       final meta = await getIndexMeta(tableName, indexName);
       if (meta != null) {
@@ -697,6 +940,10 @@ class IndexManager {
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
       rethrow;
+    } finally {
+      if (indexLocked && lockMgr != null) {
+        lockMgr.releaseExclusiveLock(indexLockKey, indexLockOpId);
+      }
     }
   }
 
@@ -726,12 +973,17 @@ class IndexManager {
               .map((i) => i.actualIndexName)
               .toList() ??
           const <String>[];
+      final engineManagedIndexes = getEngineManagedBtreeIndexes(
+        tableName,
+        schema,
+      ).map((i) => i.actualIndexName);
 
       // Add internal mapping B+Tree indexes for vector indexes only.
       // These use virtual names (__nid2pk, __pk2nid) and are NOT in the schema index list.
       final allIndexesToReset = <String>[];
       // Add main indexes
       allIndexesToReset.addAll(indexesToReset);
+      allIndexesToReset.addAll(engineManagedIndexes);
       // Add mapping indexes only for vector indexes (using dedicated method for efficiency)
       final vectorIndexes =
           _dataStore.schemaManager?.getVectorIndexesFor(schema) ??
@@ -743,46 +995,150 @@ class IndexManager {
         }
       }
 
-      // Clear vector index caches (vector files are under the index directory tree
-      // which gets deleted below, so no separate file cleanup needed).
-      _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+      final dedupedSortedIndexes = allIndexesToReset.toSet().toList()..sort();
 
-      // Clear index data from memory and files
-      final yieldController = YieldController('IndexManager.resetIndexes');
-      for (final indexName in allIndexesToReset) {
-        // Remove from cache
-        _indexMetaCache.remove([tableName, indexName]);
-        _indexDataCache.remove([tableName, indexName]);
+      final lockMgr = _dataStore.lockManager;
+      final Map<String, String> acquiredLocks = <String, String>{};
 
-        // v2+ layout: delete entire index directory (fast & deterministic).
-        await yieldController.maybeYield();
-        try {
-          final indexPath =
-              await _dataStore.pathManager.getIndexPath(tableName, indexName);
-          if (await _dataStore.storage.existsDirectory(indexPath)) {
-            await _dataStore.storage.deleteDirectory(indexPath);
+      try {
+        if (lockMgr != null) {
+          for (final indexName in dedupedSortedIndexes) {
+            final lockKey = 'index:$tableName:$indexName';
+            final lockOpId = GlobalIdGenerator.generate('reset_index_');
+            final locked = await lockMgr.acquireExclusiveLock(
+              lockKey,
+              lockOpId,
+            );
+            if (!locked) {
+              throw StateError(
+                'Failed to acquire lock for resetting index $tableName.$indexName',
+              );
+            }
+            acquiredLocks[lockKey] = lockOpId;
           }
-        } catch (e) {
-          Logger.warn('Failed to delete index directory for $indexName: $e',
-              label: 'IndexManager.resetIndexes');
+        }
+
+        // Clear vector index caches (vector files are under the index directory tree
+        // which gets deleted below, so no separate file cleanup needed).
+        _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+
+        // Clear index data from memory and files
+        final yieldController = YieldController('IndexManager.resetIndexes');
+        for (final indexName in dedupedSortedIndexes) {
+          // Remove from cache
+          _indexMetaCache.remove([tableName, indexName]);
+          _indexDataCache.remove([tableName, indexName]);
+
+          // v2+ layout: delete entire index directory (fast & deterministic).
+          await yieldController.maybeYield();
+          try {
+            final indexPath =
+                await _dataStore.pathManager.getIndexPath(tableName, indexName);
+            if (await _dataStore.storage.existsDirectory(indexPath)) {
+              await _dataStore.storage.deleteDirectory(indexPath);
+            }
+          } catch (e) {
+            Logger.warn('Failed to delete index directory for $indexName: $e',
+                label: 'IndexManager.resetIndexes');
+          }
+        }
+
+        // Collect B+Tree indexes to rebuild (vector indexes are managed separately).
+        final indexesToBuild =
+            _dataStore.schemaManager?.getBtreeIndexesFor(schema);
+        if (indexesToBuild == null || indexesToBuild.isEmpty) return;
+
+        // Use optimized batch index building mechanism
+        await _rebuildTableIndexes(tableName, schema, indexesToBuild);
+
+        Logger.debug('Reset table indexes completed: $tableName',
+            label: 'IndexManager.resetIndexes');
+      } finally {
+        if (lockMgr != null) {
+          for (final entry in acquiredLocks.entries) {
+            lockMgr.releaseExclusiveLock(entry.key, entry.value);
+          }
         }
       }
-
-      // Collect B+Tree indexes to rebuild (vector indexes are managed separately).
-      final indexesToBuild =
-          _dataStore.schemaManager?.getBtreeIndexesFor(schema);
-      if (indexesToBuild == null || indexesToBuild.isEmpty) return;
-
-      // Use optimized batch index building mechanism
-      await _rebuildTableIndexes(tableName, schema, indexesToBuild);
-
-      Logger.debug('Reset table indexes completed: $tableName',
-          label: 'IndexManager.resetIndexes');
     } catch (e) {
       Logger.error('Failed to reset indexes: $e',
           label: 'IndexManager.resetIndexes');
       rethrow;
     }
+  }
+
+  IndexSchema _resolveIndexSchemaForRepair(
+    TableSchema schema,
+    String indexName,
+    IndexMeta meta,
+  ) {
+    final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
+        const <IndexSchema>[];
+    for (final index in allIndexes) {
+      if (index.actualIndexName == indexName) {
+        return index;
+      }
+    }
+    return IndexSchema(
+      indexName: indexName,
+      fields: meta.fields,
+      unique: meta.isUnique,
+    );
+  }
+
+  Future<void> _scheduleEmptyIndexRepair({
+    required String tableName,
+    required String indexName,
+    required TableSchema schema,
+    required IndexSchema index,
+    required int persistedTableRecords,
+  }) async {
+    final repairKey = _getEmptyIndexRepairKey(tableName, indexName);
+    if (_emptyIndexRepairFutures.containsKey(repairKey)) {
+      return;
+    }
+    final completer = Completer<void>();
+    _emptyIndexRepairFutures[repairKey] = completer.future;
+
+    unawaited(() async {
+      final lockMgr = _dataStore.lockManager;
+      final indexLockKey = 'index:$tableName:$indexName';
+      final indexLockOpId = GlobalIdGenerator.generate('empty_index_index_');
+      bool indexLocked = false;
+      try {
+        if (lockMgr != null) {
+          indexLocked =
+              lockMgr.tryAcquireExclusiveLock(indexLockKey, indexLockOpId);
+          if (!indexLocked) {
+            Logger.debug(
+              'Defer empty-index rebuild for $tableName.$indexName because index is busy',
+              label: 'IndexManager._scheduleEmptyIndexRepair',
+            );
+            return;
+          }
+        }
+
+        Logger.warn(
+          'Detected empty index $tableName.$indexName while table has $persistedTableRecords persisted records, rebuilding',
+          label: 'IndexManager._scheduleEmptyIndexRepair',
+        );
+        await _deletePhysicalIndexArtifacts(tableName, indexName);
+        await _rebuildTableIndexes(tableName, schema, [index]);
+      } catch (e, stack) {
+        Logger.error(
+          'Empty-index rebuild failed for $tableName.$indexName: $e\n$stack',
+          label: 'IndexManager._scheduleEmptyIndexRepair',
+        );
+      } finally {
+        if (indexLocked) {
+          lockMgr?.releaseExclusiveLock(indexLockKey, indexLockOpId);
+        }
+        _emptyIndexRepairFutures.remove(repairKey);
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      }
+    }());
   }
 
   /// Check unique constraints
@@ -868,7 +1224,12 @@ class IndexManager {
           try {
             final exists = await _dataStore.tableTreePartitionManager
                 .existsPrimaryKey(tableName, pkStr);
-            if (exists) {
+            if (exists &&
+                !_isPrimaryKeyHiddenByDeleteOverlay(
+                  tableName,
+                  pkStr,
+                  transactionId: currentTxId,
+                )) {
               Logger.warn(
                 "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
                 label: 'IndexManager.checkUniqueConstraints',
@@ -1098,36 +1459,61 @@ class IndexManager {
             uniqueKeys: keyBytes,
           );
 
-          // Check results
+          final positiveKeyBytes = <Uint8List>[];
+          final positiveConstraintIndices = <int>[];
           for (int j = 0; j < exists.length; j++) {
-            if (!exists[j]) continue;
+            if (!exists[j]) {
+              continue;
+            }
             final constraintIdx = constraintIndices[j];
             if (constraintIdx < 0 || constraintIdx >= indexConstraints.length) {
               continue;
             }
-            final constraint = indexConstraints[constraintIdx];
+            positiveKeyBytes.add(keyBytes[j]);
+            positiveConstraintIndices.add(constraintIdx);
+          }
 
-            // For updates, we need to verify it's not the same record
-            if (isUpdate && selfStoreIndexStr != null) {
-              // Use lookupUniquePrimaryKey to get the actual PK owning this unique key.
-              // If the PK matches the current record's PK, it's not a violation (self-update).
-              try {
-                final existingPk = await _lookupUniquePrimaryKeyLogical(
-                  tableName: tableName,
-                  indexName: indexName,
-                  meta: meta,
-                  uniqueKey: keyBytes[j],
-                );
-                if (existingPk != null && existingPk == selfStoreIndexStr) {
-                  // Same record, not a violation - skip this constraint
-                  continue;
-                }
-              } catch (e) {
-                Logger.warn(
-                  'Failed to lookup unique PK for update check: $e',
-                  label: 'IndexManager.checkUniqueConstraints',
-                );
-                // On error, conservatively treat as violation
+          if (positiveKeyBytes.isEmpty) {
+            continue;
+          }
+
+          final existingPks = await _dataStore.indexTreePartitionManager
+              .lookupUniquePrimaryKeysBatch(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            uniqueKeys: positiveKeyBytes,
+          );
+
+          // Check results
+          for (int j = 0; j < positiveConstraintIndices.length; j++) {
+            final constraintIdx = positiveConstraintIndices[j];
+            if (constraintIdx < 0 || constraintIdx >= indexConstraints.length) {
+              continue;
+            }
+            final constraint = indexConstraints[constraintIdx];
+            final existingPk = j < existingPks.length ? existingPks[j] : null;
+
+            // Keep the fast existence probe, but only treat it as a conflict when
+            // the resolved owner record is still logically visible.
+            if (existingPk == null || existingPk.isEmpty) {
+              Logger.warn(
+                'Unique key exists but owner lookup returned null: table=$tableName index=$indexName value=${constraint.value}',
+                label: 'IndexManager.checkUniqueConstraints',
+              );
+            } else {
+              if (_isPrimaryKeyHiddenByDeleteOverlay(
+                tableName,
+                existingPk,
+                transactionId: currentTxId,
+              )) {
+                continue;
+              }
+
+              if (isUpdate &&
+                  selfStoreIndexStr != null &&
+                  existingPk == selfStoreIndexStr) {
+                continue;
               }
             }
 
@@ -1245,7 +1631,12 @@ class IndexManager {
             if (violations[i] != null) continue;
             final pk = records[i][primaryKey]?.toString();
             if (pk == null || pk.isEmpty) continue;
-            if (existing.contains(pk)) {
+            if (existing.contains(pk) &&
+                !_isPrimaryKeyHiddenByDeleteOverlay(
+                  tableName,
+                  pk,
+                  transactionId: txId,
+                )) {
               violations[i] = UniqueViolation(
                 tableName: tableName,
                 fields: [primaryKey],
@@ -1436,11 +1827,46 @@ class IndexManager {
         uniqueKeys: keyBytes,
       );
 
+      final positiveRecordIdxs = <int>[];
+      final positiveKeyBytes = <Uint8List>[];
       for (int j = 0; j < exists.length; j++) {
-        if (!exists[j]) continue;
+        if (!exists[j]) {
+          continue;
+        }
         final i = recordIdxs[j];
         if (i < 0 || i >= violations.length) continue;
         if (violations[i] != null) continue;
+        positiveRecordIdxs.add(i);
+        positiveKeyBytes.add(keyBytes[j]);
+      }
+
+      if (positiveKeyBytes.isEmpty) {
+        continue;
+      }
+
+      final existingPks = await _dataStore.indexTreePartitionManager
+          .lookupUniquePrimaryKeysBatch(
+        tableName: tableName,
+        indexName: indexName,
+        meta: meta,
+        uniqueKeys: positiveKeyBytes,
+      );
+
+      for (int j = 0; j < positiveRecordIdxs.length; j++) {
+        final i = positiveRecordIdxs[j];
+        if (i < 0 || i >= violations.length) continue;
+        if (violations[i] != null) continue;
+
+        final existingPk = j < existingPks.length ? existingPks[j] : null;
+        if (existingPk != null &&
+            existingPk.isNotEmpty &&
+            _isPrimaryKeyHiddenByDeleteOverlay(
+              tableName,
+              existingPk,
+              transactionId: txId,
+            )) {
+          continue;
+        }
 
         final r = records[i];
         final vals = idx.fields.map((f) => r[f]).toList(growable: false);
@@ -1644,17 +2070,40 @@ class IndexManager {
         return;
       }
 
-      // delete index file
-      await _deleteIndexFiles(tableName, actualName);
+      final lockMgr = _dataStore.lockManager;
+      final indexLockKey = 'index:$tableName:$actualName';
+      final indexLockOpId = GlobalIdGenerator.generate('remove_index_');
+      bool indexLocked = false;
 
-      // if target index is found, remove it from table schema
-      if (targetIndex != null) {
-        final newIndexes =
-            schema.indexes.where((i) => i != targetIndex).toList();
-        final newSchema = schema.copyWith(indexes: newIndexes);
+      try {
+        if (lockMgr != null) {
+          indexLocked = await lockMgr.acquireExclusiveLock(
+            indexLockKey,
+            indexLockOpId,
+          );
+          if (!indexLocked) {
+            throw StateError(
+              'Failed to acquire lock for removing index $tableName.$actualName',
+            );
+          }
+        }
 
-        // update table schema
-        await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
+        // delete index file
+        await _deleteIndexFiles(tableName, actualName);
+
+        // if target index is found, remove it from table schema
+        if (targetIndex != null) {
+          final newIndexes =
+              schema.indexes.where((i) => i != targetIndex).toList();
+          final newSchema = schema.copyWith(indexes: newIndexes);
+
+          // update table schema
+          await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
+        }
+      } finally {
+        if (indexLocked && lockMgr != null) {
+          lockMgr.releaseExclusiveLock(indexLockKey, indexLockOpId);
+        }
       }
     } catch (e) {
       Logger.error('Failed to remove index: $e',
@@ -1670,20 +2119,7 @@ class IndexManager {
     String tableName,
     String indexName,
   ) async {
-    // create lock resource for index operation
-    final lockResource = 'index:$tableName:$indexName';
-    final operationId = GlobalIdGenerator.generate('delete_index_');
-
-    bool lockAcquired = false;
     try {
-      // get exclusive lock, ensure no other operation is accessing this index
-      lockAcquired = await (_dataStore.lockManager
-              ?.acquireExclusiveLock(lockResource, operationId) ??
-          false);
-      if (!lockAcquired) {
-        return;
-      }
-
       // get index directory path
       final indexDirPath =
           await _dataStore.pathManager.getIndexDirPath(tableName);
@@ -1708,11 +2144,6 @@ class IndexManager {
       Logger.error('Failed to delete index file: $e',
           label: 'IndexManager._deleteIndexFiles');
       rethrow;
-    } finally {
-      // release exclusive lock
-      if (lockAcquired) {
-        _dataStore.lockManager?.releaseExclusiveLock(lockResource, operationId);
-      }
     }
   }
 
@@ -1946,8 +2377,10 @@ class IndexManager {
     // Build index targets: explicit indexes + auto-unique single-field + foreign keys (excluding PK).
     final targets = List<IndexSchema>.from(
       targetIndexesOverride ??
-          (_dataStore.schemaManager?.getAllIndexesFor(schema) ??
-              const <IndexSchema>[]),
+          <IndexSchema>[
+            ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+            ...getEngineManagedBtreeIndexes(tableName, schema),
+          ],
     );
 
     // Skip redundant PK-only indexes (table data is already range-partitioned by PK).
@@ -2029,6 +2462,8 @@ class IndexManager {
         final bool isInternalTtlIndex = usesInternalTtlSource &&
             fields.length == 1 &&
             fields.first == TableSchema.internalTtlIngestTsMsField;
+        final bool isInternalKvExpiryIndex =
+            _isInternalKvExpiryIndex(tableName, indexName);
 
         // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
         final String? batchIngestIso =
@@ -2051,6 +2486,14 @@ class IndexManager {
           String pkValue, {
           required bool forInsert,
         }) {
+          if (isInternalKvExpiryIndex) {
+            return _encodeInternalKvExpiryIndexKey(
+              schema,
+              record[SystemTable.keyValueExpiresAtField],
+              pkValue,
+            );
+          }
+
           if (isInternalTtlIndex) {
             if (!forInsert || batchIngestIso == null) {
               // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
@@ -2248,6 +2691,22 @@ class IndexManager {
       // pointers/entry counts may be unset or stale. We still allow searching.
       if (!isMemoryMode &&
           (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull)) {
+        final tableMeta = await _dataStore.tableDataManager.getTableMeta(
+          tableName,
+        );
+        final persistedTableRecords = tableMeta?.totalRecords ?? 0;
+        if (persistedTableRecords > 0) {
+          final indexSchema =
+              _resolveIndexSchemaForRepair(schema, indexName, meta);
+          await _scheduleEmptyIndexRepair(
+            tableName: tableName,
+            indexName: indexName,
+            schema: schema,
+            index: indexSchema,
+            persistedTableRecords: persistedTableRecords,
+          );
+          return IndexSearchResult.tableScan();
+        }
         return IndexSearchResult.empty();
       }
 
@@ -2708,6 +3167,9 @@ class IndexManager {
             uniqueKey: prefix,
           );
           if (pk == null) return IndexSearchResult.empty();
+          if (_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
+            return IndexSearchResult.empty();
+          }
 
           // Hotspot populate: Use Native Key (if not disabled)
           if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
@@ -2736,12 +3198,19 @@ class IndexManager {
           offset: effectiveOffset,
         );
 
-        if (!isUnique && limit == null && offset == null && !hasCursorKey) {
-          // Hotspot populate (non-unique): cache one entry per PK.
+        final validatedPks = <String>[];
+        for (final pk in res.primaryKeys) {
+          if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
+            validatedPks.add(pk);
+          }
+        }
+
+        if (limit == null && offset == null && !hasCursorKey) {
+          // Hotspot populate (non-unique): cache one entry per visible PK.
           if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
             final prefixKey = <dynamic>[tableName, indexName, ...nativeVal];
             final yc = YieldController('IndexManager.hotspotPopulateNonUnique');
-            for (final pk in res.primaryKeys) {
+            for (final pk in validatedPks) {
               await yc.maybeYield();
               _indexDataCache.put(
                 <dynamic>[...prefixKey, pk],
@@ -2751,7 +3220,13 @@ class IndexManager {
             }
           }
         }
-        return res;
+
+        return IndexSearchResult(
+          primaryKeys: validatedPks,
+          lastKey: res.lastKey,
+          requiresTableScan: res.requiresTableScan,
+          indexWasUsed: res.indexWasUsed,
+        );
       }
 
       // BETWEEN (inclusive).
@@ -3009,8 +3484,12 @@ class IndexManager {
                     ...nativeVal
                   ];
                   final pk = _indexDataCache.get(compositeKey);
-                  if (pk is String && pk.isNotEmpty) {
+                  if (pk is String &&
+                      pk.isNotEmpty &&
+                      !_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     out.add(pk);
+                  } else if (pk is String && pk.isNotEmpty) {
+                    _indexDataCache.remove(compositeKey);
                   }
                 }
               } else {
@@ -3021,11 +3500,7 @@ class IndexManager {
                   uniqueKey: prefix,
                 );
                 if (pk != null) {
-                  // Buffer Consistency check: only skip caching if record is deleted in buffer.
-                  final bufEntry = _dataStore.writeBufferManager
-                      .getBufferedRecord(tableName, pk);
-                  if (bufEntry == null ||
-                      bufEntry.operation != BufferOperationType.delete) {
+                  if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     out.add(pk);
                     if (nativeVal != null &&
                         !(_dataStore.resourceManager?.isLowMemoryMode ??
@@ -3056,10 +3531,7 @@ class IndexManager {
                   !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
                 final validatedPks = <String>[];
                 for (final pk in res.primaryKeys) {
-                  final bufEntry = _dataStore.writeBufferManager
-                      .getBufferedRecord(tableName, pk);
-                  if (bufEntry == null ||
-                      bufEntry.operation != BufferOperationType.delete) {
+                  if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     validatedPks.add(pk);
                   }
                 }
@@ -3090,10 +3562,7 @@ class IndexManager {
               } else {
                 // Filter logically deleted records for results consistency
                 for (final pk in res.primaryKeys) {
-                  final bufEntry = _dataStore.writeBufferManager
-                      .getBufferedRecord(tableName, pk);
-                  if (bufEntry == null ||
-                      bufEntry.operation != BufferOperationType.delete) {
+                  if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     out.add(pk);
                   }
                 }

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+
 import 'package:path/path.dart' as p;
 
 import 'logger.dart';
@@ -28,6 +29,10 @@ class InternalConfig {
   /// index version (index files + partitions)
   static const int indexVersion = 1;
   static const int legacyIndexVersion = 0; // legacy file default value
+
+  /// backup package format version used by backup
+  static const int currentBackupFormatVersion = 1;
+  static const int legacyBackupFormatVersion = 1; // legacy file default value
 
   /// Max entries (files/subdirs) per directory.
   ///

@@ -235,16 +235,51 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     return _self;
   }
 
-  /// Add a custom condition using a user-provided function
-  SELF whereCustom(bool Function(Map<String, dynamic>) record) {
-    _condition.whereCustom(record);
+  /// whereStartsWith condition
+  SELF whereStartsWith(String field, String prefix) {
+    _condition.whereStartsWith(field, prefix);
     _onChanged();
     return _self;
   }
 
-  /// Add a custom condition using a user-provided function with OR logic
-  SELF orWhereCustom(bool Function(Map<String, dynamic>) record) {
-    _condition.orWhereCustom(record);
+  /// whereEndsWith condition
+  SELF whereEndsWith(String field, String suffix) {
+    _condition.whereEndsWith(field, suffix);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereContainsAny condition
+  SELF whereContainsAny(String field, List values) {
+    _condition.whereContainsAny(field, values);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereEmpty condition - matches null or empty string
+  SELF whereEmpty(String field) {
+    _condition.whereEmpty(field);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereNotEmpty condition - matches non-null and non-empty string
+  SELF whereNotEmpty(String field) {
+    _condition.whereNotEmpty(field);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereTrue condition - matches true
+  SELF whereTrue(String field) {
+    _condition.whereTrue(field);
+    _onChanged();
+    return _self;
+  }
+
+  /// whereFalse condition - matches false
+  SELF whereFalse(String field) {
+    _condition.whereFalse(field);
     _onChanged();
     return _self;
   }
