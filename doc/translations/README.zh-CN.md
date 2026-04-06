@@ -36,11 +36,20 @@
 
 
 ## 快速导航
+<<<<<<< HEAD
 - **快速上手**：[为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - **架构与模型**：[表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - **深度查询**：[高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
 - **进阶与性能**：[向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - **运维与安全**：[管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
+=======
+
+- [为什么选择 ToStore？](#why-tostore) | [ToStore特性](#key-features) | [安装](#installation) | [快速开始](#quick-start)
+- [表结构定义](#schema-definition) | [移动、桌面等频繁启动场景集成](#mobile-integration) | [服务端/智能体（持续运行）](#server-integration)
+- [向量字段、向量索引与向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [查询与高效分页](#query-pagination) | [外键与级联约束](#foreign-keys) | [查询操作符](#query-operators)
+- [分布式架构](#distributed-architecture) | [主键类型示例](#primary-key-examples) | [表达式原子操作](#atomic-expressions) | [事务操作](#transactions) | [管理与维护](#database-maintenance) | [备份与恢复](#backup-restore) | [错误码与错误处理](#error-handling) | [日志回调与数据库诊断](#logging-diagnostics) 
+- [安全配置](#security-config) | [性能与体验](#performance) | [更多资源](#more-resources)
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 
 <a id="why-tostore"></a>
@@ -112,6 +121,7 @@ dependencies:
 ## 快速开始
 
 > [!TIP]
+<<<<<<< HEAD
 > **如何选择存储方式？**
 > 1. [**键值对模式 (KV)**](#quick-start-kv)：适用于配置存取、零散状态管理或 JSON 数据存储，主打快速上手。
 > 2. [**结构化表 (Table)**](#quick-start-table)：适用于核心业务，需复杂查询、约束校验或海量数据治理。通过将完整性逻辑下沉到引擎，可显著降低应用层开发与维护成本。
@@ -178,6 +188,13 @@ StreamBuilder(
 ```
 
 <a id="quick-start-table"></a>
+=======
+> **支持结构化与非结构化数据混合存储**
+> 如何选择存储方式？
+> 1. **核心业务数据**：推荐使用 [表结构定义](#schema-definition)。适用于需要复杂查询、约束校验或关联关系、安全性高要求等场景。通过将完整性逻辑下沉到引擎，可显著降低应用层的开发与维护成本。
+> 2. **动态/零散数据**：可直接使用 [键值对存储 (KV)](#quick-start) 或在表中定义 `DataType.json` 字段。适用于配置存取或零散状态管理，主打快速上手与极致灵活性。
+
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 ### 结构化表方式 (Table)
 需预先创建表结构（详见 [表结构定义](#schema-definition)）方可进行增删改查。针对不同场景的接入建议：
 - **移动端/桌面端**：[针对频繁启动场景](#mobile-integration)，推荐在初始化实例时传入 `schemas`。
@@ -1151,6 +1168,7 @@ final txResult2 = await db.transaction(() async {
 <a id="database-maintenance"></a>
 ### 管理与维护
 
+<<<<<<< HEAD
 接下来介绍数据库管理、诊断与维护相关的 API，方便在插件化开发、后台管理或运维场景下使用：
 
 - **表维护 (Table Management)**
@@ -1176,6 +1194,35 @@ final txResult2 = await db.transaction(() async {
   - `db.status.space()` / `db.status.table(tableName)`：空间与表的实时统计及健康状态。
   - `db.status.config()`：运行参数快照。
   - `db.status.migration(taskId)`：异步迁移进度实时跟踪。
+=======
+接下来介绍数据库管理、诊断与维护，便于日常开发、运维进行管理：
+
+- **表维护**
+  `createTable(schema)`：创建单张表，适合插件化模块或运行时按需建表。
+  `getTableSchema(tableName)`：查询指定表结构定义，适合调试、校验或后台管理界面展示。
+  `getTableInfo(tableName)`：获取表的统计信息，例如记录总数、索引数、文件大小、建表时间、是否全局表等。
+  `clear(tableName)`：只清空表数据，保留表结构、索引和约束。
+  `dropTable(tableName)`：彻底删除整张表，包含结构与数据。
+- **空间管理**
+  `currentSpaceName`：获取当前活跃空间名称。
+  `listSpaces()`：列出当前实例中的所有空间名称。
+  `getSpaceInfo(useCache: true)`：获取当前空间的统计信息，如表数量、记录数、数据大小和表名列表；设置 `useCache: false` 可强制读取最新状态。
+  `deleteSpace(spaceName)`：删除指定空间，但不能删除 `default` 空间，也不能删除当前正在使用的空间。
+- **实例元信息**
+  `config`：读取当前实例实际生效的 `DataStoreConfig`。
+  `instancePath`：获取数据库实例最终落盘目录的完整路径，便于定位文件或导出数据。
+  `getVersion()`：读取业务自定义版本号，仅供业务维护，不参与引擎内部版本控制。
+  `setVersion(version)`：写入业务自定义版本号。
+- **维护操作**
+  `flush(flushStorage: true)`：主动将待落盘数据刷入磁盘；`flushStorage: true` 时还会继续刷新文件系统底层存储缓冲区。
+  `deleteDatabase()`：删除当前数据库实例及其数据文件。
+- **统一诊断入口**
+  `db.status.memory()`：查看缓存和内存占用情况。
+  `db.status.space()`：查看当前空间的整体统计状态。
+  `db.status.table(tableName)`：查看指定表的诊断信息。
+  `db.status.config()`：查看当前生效配置快照。
+  `db.status.migration(taskId)`：查看模式迁移任务的执行状态。
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ```dart
 
@@ -1202,6 +1249,7 @@ print(configInfo.toJson());
 <a id="backup-restore"></a>
 ### 备份与恢复
 
+<<<<<<< HEAD
 非常适用于单用户的本地导入导出、大规模数据离线迁移、系统故障回滚：
 
 - **数据备份 (`backup`)**
@@ -1217,11 +1265,28 @@ print(configInfo.toJson());
 
 ```dart
 // 示例：导出当前用户完整数据包
+=======
+适合本地导入导出、用户数据迁移、故障回滚和运维快照：
+
+- `backup(compress: true, scope: ...)`：创建备份并返回备份文件路径。
+  `compress: true` 时会生成压缩备份文件，便于传输和归档。
+  `scope` 用来控制备份范围。
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`：从备份恢复数据库。
+  `cleanupBeforeRestore: true` 表示恢复前先清理相关旧数据，避免新旧数据混杂。
+  `deleteAfterRestore: true` 表示恢复成功后自动删除备份文件。
+- `BackupScope.database`：备份整个数据库实例，包含所有 Space、全局表和相关元数据。
+- `BackupScope.currentSpace`：仅备份当前 Space，不包含全局表。
+- `BackupScope.currentSpaceWithGlobal`：备份当前 Space 以及全局表，适合单用户导入导出。
+
+```dart
+// 备份数据
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 final backupPath = await db.backup(
   compress: true,
   scope: BackupScope.currentSpaceWithGlobal,
 );
 
+<<<<<<< HEAD
 // 示例：从数据包还原（并自动清理源文件）
 final restored = await db.restore(
   backupPath,
@@ -1230,6 +1295,19 @@ final restored = await db.restore(
 );
 ```
 
+=======
+// 恢复备份数据
+final restored = await db.restore(
+  backupPath,
+  cleanupBeforeRestore: true,
+  deleteAfterRestore: false, 
+);
+
+```
+
+
+
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 <a id="error-handling"></a>
 ### 状态码与错误处理
 

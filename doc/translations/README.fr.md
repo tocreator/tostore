@@ -29,12 +29,24 @@
   <a href="README.tr.md">Türkçe</a>
 </p>
 
+<<<<<<< HEAD
 ## Navigation rapide
 - **Mise en route** : [Pourquoi ToStore](#why-tostore) | [Fonctionnalités clés](#key-features) | [Guide d'installation](#installation) | [Mode KV](#quick-start-kv) | [Mode Tableau](#quick-start-table) | [Mode mémoire](#quick-start-memory)
 - **Architecture et modèle** : [Définition du schéma](#schema-definition) | [Architecture distribuée](#distributed-architecture) | [Clés étrangères en cascade](#foreign-keys) | [Mobile/Ordinateur de bureau](#mobile-integration) | [Serveur/Agent](#server-integration) | [Algorithmes de clé primaire](#primary-key-examples)
 - **Requêtes avancées** : [Requêtes avancées (JOIN)](#query-advanced) | [Agrégation & Statistiques](#aggregation-stats) | [Logique complexe (QueryCondition)](#query-condition) | [Requête réactive (regarder)](#reactive-query) | [Requête en streaming](#streaming-query)
 - **Avancé et performances** : [Recherche de vecteurs](#vector-advanced) | [TTL au niveau de la table](#ttl-config) | [Pagination efficace](#query-pagination) | [Cache de requêtes](#query-cache) | [Expressions atomiques](#atomic-expressions) | [Transactions](#transactions)
 - **Opérations et sécurité** : [Administration](#database-maintenance) | [Configuration de sécurité](#security-config) | [Gestion des erreurs](#error-handling) | [Performances et diagnostics](#performance) | [Plus de ressources](#more-resources)
+=======
+
+## Navigation Rapide
+
+- [Pourquoi ToStore ?](#why-tostore) | [Points Clés](#key-features) | [Installation](#installation) | [Démarrage Rapide](#quick-start)
+- [Définition du Schéma](#schema-definition) | [Intégration Mobile/Bureau](#mobile-integration) | [Intégration Serveur](#server-integration)
+- [Vecteurs et Recherche ANN](#vector-advanced) | [TTL par Table](#ttl-config) | [Requête & Pagination](#query-pagination) | [Clés Étrangères](#foreign-keys) | [Opérateurs de Requête](#query-operators)
+- [Architecture Distribuée](#distributed-architecture) | [Exemples de Clés Primaires](#primary-key-examples) | [Opérations Atomiques](#atomic-expressions) | [Transactions](#transactions) | [Administration et maintenance de la base de données](#database-maintenance) | [Sauvegarde et restauration](#backup-restore) | [Gestion des Erreurs](#error-handling) | [Callback de logs et diagnostic de base de données](#logging-diagnostics)
+- [Configuration de Sécurité](#security-config) | [Performance](#performance) | [Plus de Ressources](#more-resources)
+
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 <a id="why-tostore"></a>
 ## Pourquoi choisir ToStore ?
@@ -101,6 +113,7 @@ dependencies:
 ## Démarrage rapide
 
 > [!TIP]
+<<<<<<< HEAD
 > **Comment choisir un mode de stockage ?**
 > 1. [**Key-Value Mode (KV)**](#quick-start-kv) : Idéal pour l'accès à la configuration, la gestion des états dispersés ou le stockage de données JSON. C'est le moyen le plus rapide de démarrer.
 > 2. [**Mode table structurée**](#quick-start-table) : Idéal pour les données métier de base qui nécessitent des requêtes complexes, une validation de contraintes ou une gouvernance des données à grande échelle. En intégrant la logique d’intégrité dans le moteur, vous pouvez réduire considérablement les coûts de développement et de maintenance de la couche applicative.
@@ -109,6 +122,17 @@ dependencies:
 <a id="quick-start-kv"></a>
 ### Stockage de valeurs-clés (KV)
 Ce mode convient lorsque vous n'avez pas besoin de tableaux structurés prédéfinis. C'est simple, pratique et soutenu par un moteur de stockage hautes performances. **Son architecture d'indexation efficace maintient les performances des requêtes très stables et extrêmement réactives, même sur les appareils mobiles ordinaires à très grande échelle de données.** Les données dans différents espaces sont naturellement isolées, tandis que le partage mondial est également pris en charge.
+=======
+> **Prend en charge le stockage mixte de données structurées et non structurées**
+> Comment choisir le mode de stockage ?
+> 1. **Données métier principales** : [Définition du Schéma](#schema-definition) est recommandée. Adaptée aux scénarios qui exigent des requêtes complexes, la validation des contraintes, des relations ou un niveau de sécurité élevé. En confiant la logique d'intégrité au moteur, on réduit nettement les coûts de développement et de maintenance côté application.
+> 2. **Données dynamiques/éparses** : vous pouvez utiliser directement le [Stockage Clé-Valeur (KV)](#quick-start) ou définir des champs `DataType.json` dans les tables. Adapté à l'accès à la configuration ou à la gestion d'états dispersés, avec un accent sur la mise en route rapide et une flexibilité maximale.
+
+### Mode table structurée (Table)
+Les opérations CRUD nécessitent de créer au préalable le schéma de table (voir [Définition du Schéma](#schema-definition)). Recommandations d'intégration selon le scénario :
+- **Mobile/Bureau** : pour les [scénarios de démarrage fréquent](#mobile-integration), il est recommandé de passer `schemas` à l'initialisation de l'instance.
+- **Serveur/Agent** : pour les [scénarios d'exécution continue](#server-integration), il est recommandé de créer dynamiquement via `createTables`.
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 ```dart
 // Initialize the database
@@ -246,8 +270,15 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 
 
 <a id="schema-definition"></a>
+<<<<<<< HEAD
 ## Définition du schéma
 **Définissez une seule fois et laissez le moteur gérer une gouvernance automatisée de bout en bout afin que votre application ne subisse plus de maintenance de validation lourde.**
+=======
+## Définition du Schéma
+**Une seule définition permet au moteur d'assurer une gouvernance automatisée de bout en bout et libère durablement l'application d'une validation lourde à maintenir.**
+
+Les exemples mobile, serveur et agent ci-dessous réutilisent `appSchemas` défini ici.
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 Les exemples suivants de mobile, côté serveur et agent réutilisent tous `appSchemas` défini ici.
 
@@ -1119,7 +1150,164 @@ final txResult2 = await db.transaction(() async {
 
 
 <a id="database-maintenance"></a>
+<<<<<<< HEAD
 ### Administration et maintenance
+=======
+### Administration et maintenance de la base de données
+
+Les API suivantes sont utiles pour l'administration, le diagnostic et les opérations de maintenance :
+
+- **Maintenance des tables**
+  `createTable(schema)`: Crée une table unique à l'exécution.
+  `getTableSchema(tableName)`: Lit la définition de schéma actuellement active.
+  `getTableInfo(tableName)`: Récupère des statistiques comme le nombre d'enregistrements, d'index, la taille du fichier, la date de création et le statut global.
+  `clear(tableName)`: Supprime toutes les données tout en conservant le schéma, les index et les contraintes.
+  `dropTable(tableName)`: Supprime entièrement la table, schéma et données compris.
+- **Gestion des espaces**
+  `currentSpaceName`: Récupère le nom de l'espace actif.
+  `listSpaces()`: Liste tous les espaces de l'instance courante.
+  `getSpaceInfo(useCache: true)`: Récupère les statistiques de l'espace courant ; utilisez `useCache: false` pour forcer les données les plus récentes.
+  `deleteSpace(spaceName)`: Supprime un espace. L'espace `default` et l'espace actuellement actif ne peuvent pas être supprimés.
+- **Métadonnées de l'instance**
+  `config`: Lit le `DataStoreConfig` effectif.
+  `instancePath`: Récupère le répertoire final de stockage de l'instance.
+  `getVersion()` / `setVersion(version)`: Lit et écrit une version métier. Cette valeur n'est pas utilisée par le moteur en interne.
+- **Opérations de maintenance**
+  `flush(flushStorage: true)`: Force l'écriture des données en attente sur disque. Quand `true`, vide aussi les buffers du stockage sous-jacent.
+  `deleteDatabase()`: Supprime l'instance courante et ses fichiers. C'est une opération destructive.
+- **Point d'entrée de diagnostic unifié**
+  `db.status.memory()`: Vérifie l'usage du cache et de la mémoire.
+  `db.status.space()`: Vérifie l'état global de l'espace courant.
+  `db.status.table(tableName)`: Vérifie le diagnostic d'une table donnée.
+  `db.status.config()`: Vérifie le snapshot de configuration effectif.
+  `db.status.migration(taskId)`: Vérifie l'état d'une migration de schéma.
+
+```dart
+final spaces = await db.listSpaces();
+final spaceInfo = await db.getSpaceInfo(useCache: false);
+final tableInfo = await db.getTableInfo('users');
+await db.flush();
+
+print(spaces);
+print(spaceInfo.toJson());
+print(tableInfo?.toJson());
+```
+
+
+<a id="backup-restore"></a>
+### Sauvegarde et restauration
+
+Adapté à l'import/export local, à la migration de données utilisateur, au rollback et aux snapshots d'exploitation :
+
+- `backup(compress: true, scope: ...)`: Crée une sauvegarde et retourne son chemin. `compress: true` produit une archive compressée et `scope` contrôle la portée.
+- `restore(backupPath, deleteAfterRestore: false, cleanupBeforeRestore: true)`: Restaure une sauvegarde. `cleanupBeforeRestore: true` nettoie d'abord les données concernées, et `deleteAfterRestore: true` supprime le fichier après une restauration réussie.
+- `BackupScope.database`: Sauvegarde toute l'instance, y compris tous les espaces, les tables globales et les métadonnées associées.
+- `BackupScope.currentSpace`: Sauvegarde uniquement l'espace courant, sans les tables globales.
+- `BackupScope.currentSpaceWithGlobal`: Sauvegarde l'espace courant avec les tables globales.
+
+```dart
+final backupPath = await db.backup(
+  compress: true,
+  scope: BackupScope.currentSpaceWithGlobal,
+);
+
+final restored = await db.restore(backupPath);
+print(backupPath);
+print(restored);
+```
+
+
+<a id="error-handling"></a>
+### Gestion des Erreurs
+
+ToStore utilise un modèle de réponse unifié pour les opérations de données :
+
+- `ResultType` : Enum stable pour la logique de branchement.
+- `result.code` : Code numérique correspondant au `ResultType`.
+- `result.message` : Description lisible de l'erreur.
+- `successKeys` / `failedKeys` : Listes des clés primaires réussies ou échouées dans les opérations par lot.
+
+```dart
+final result = await db.insert('users', {
+  'username': 'john',
+  'email': 'john@example.com',
+});
+
+if (!result.isSuccess) {
+  switch (result.type) {
+    case ResultType.notFound:
+      print('Ressource introuvable : ${result.message}');
+      break;
+    case ResultType.notNullViolation:
+    case ResultType.validationFailed:
+      print('Validation échouée : ${result.message}');
+      break;
+    case ResultType.primaryKeyViolation:
+    case ResultType.uniqueViolation:
+      print('Conflit de contrainte : ${result.message}');
+      break;
+    case ResultType.foreignKeyViolation:
+      print('Échec de la contrainte de clé étrangère : ${result.message}');
+      break;
+    case ResultType.resourceExhausted:
+    case ResultType.timeout:
+      print('Le système est occupé, réessayez plus tard : ${result.message}');
+      break;
+    case ResultType.ioError:
+    case ResultType.dbError:
+      print('Erreur de stockage, veuillez la journaliser : ${result.message}');
+      break;
+    default:
+      print('Type : ${result.type}, Code : ${result.code}, Message : ${result.message}');
+  }
+}
+```
+
+**Codes d’état courants** :
+Le succès vaut `0` ; les valeurs négatives indiquent des erreurs.
+- `ResultType.success` (`0`) : L’opération a réussi.
+- `ResultType.partialSuccess` (`1`) : Une opération par lot a partiellement réussi.
+- `ResultType.unknown` (`-1`) : Erreur inconnue.
+- `ResultType.uniqueViolation` (`-2`) : Conflit d’index unique.
+- `ResultType.primaryKeyViolation` (`-3`) : Conflit de clé primaire.
+- `ResultType.foreignKeyViolation` (`-4`) : Échec d’une contrainte de clé étrangère.
+- `ResultType.notNullViolation` (`-5`) : Champ obligatoire manquant ou `null` non autorisé.
+- `ResultType.validationFailed` (`-6`) : Échec d’une validation de longueur, plage, format ou contrainte.
+- `ResultType.notFound` (`-11`) : Table, espace ou ressource cible introuvable.
+- `ResultType.resourceExhausted` (`-15`) : Ressources système insuffisantes ; réduisez la charge ou réessayez.
+- `ResultType.ioError` (`-90`) : Erreur d’E/S du système de fichiers ou du stockage.
+- `ResultType.dbError` (`-91`) : Erreur interne de la base de données.
+- `ResultType.timeout` (`-92`) : Délai dépassé.
+
+### Gestion du résultat des transactions
+
+```dart
+final txResult = await db.transaction(() async {
+  await db.insert('users', {
+    'username': 'john',
+    'email': 'john@example.com',
+  });
+});
+
+if (txResult.isFailed) {
+  print('Type d’erreur de transaction : ${txResult.error?.type}');
+  print('Message d’erreur de transaction : ${txResult.error?.message}');
+}
+```
+
+Types d’erreur de transaction :
+- `TransactionErrorType.operationError` : Échec d’une opération normale dans la transaction, par exemple validation de champ, état de ressource invalide ou autre exception métier.
+- `TransactionErrorType.integrityViolation` : Conflit d’intégrité ou de contrainte, par exemple clé primaire, clé unique, clé étrangère ou non-nullité.
+- `TransactionErrorType.timeout` : La transaction a dépassé le temps limite.
+- `TransactionErrorType.io` : Erreur d’E/S du stockage sous-jacent ou du système de fichiers.
+- `TransactionErrorType.conflict` : La transaction a échoué à cause d’un conflit.
+- `TransactionErrorType.userAbort` : Annulation initiée par l’utilisateur. L’abandon manuel via exception n’est pas encore pris en charge.
+- `TransactionErrorType.unknown` : Toute autre erreur inattendue.
+
+
+<a id="logging-diagnostics"></a>
+### Callback de logs et diagnostic de base de données
+>>>>>>> 4f6c638c44ecdff1a3a62c3210da8f3c60d63f5c
 
 Les API suivantes couvrent l'administration, les diagnostics et la maintenance des bases de données pour le développement de type plugin, les panneaux d'administration et les scénarios opérationnels :
 
