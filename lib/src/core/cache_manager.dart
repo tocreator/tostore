@@ -142,73 +142,22 @@ final class CacheManager {
   // -------------------- Space / lifecycle --------------------
 
   /// Clear in-memory caches synchronously (used on close).
-  void clear({bool includeSchema = true}) {
+  Future<void> dispose({bool includeSchema = true}) async {
+    // Batch wait for multiple asynchronous tasks
+    await Future.wait([
+      _dataStore.schemaManager?.dispose() ?? Future.value(),
+      _dataStore.tableDataManager.dispose(),
+      _dataStore.indexManager?.dispose() ?? Future.value(),
+    ]);
+
+    _dataStore.queryExecutor.clearAllQueryCacheSync();
+    _dataStore.tableTreePartitionManager.clearPageCacheSync();
+    _dataStore.indexTreePartitionManager.clearPageCacheSync();
+    _dataStore.weightManager?.clearMemory();
+    _dataStore.clearAllTtlPlanCache();
     _statsCache.clear();
 
-    try {
-      _dataStore.queryExecutor.clearAllQueryCacheSync();
-    } catch (_) {}
-
-    try {
-      _dataStore.tableDataManager.clearAllTableRecordCacheSync();
-    } catch (_) {}
-
-    try {
-      _dataStore.tableDataManager.clearTableMetaCacheSync();
-    } catch (_) {}
-
-    try {
-      _dataStore.tableTreePartitionManager.clearPageCacheSync();
-    } catch (_) {}
-
-    try {
-      _dataStore.indexTreePartitionManager.clearPageCacheSync();
-    } catch (_) {}
-
-    try {
-      if (includeSchema) {
-        _dataStore.schemaManager?.clearSchemaCacheSync();
-      }
-    } catch (_) {}
-
-    try {
-      _dataStore.weightManager?.clearMemory();
-    } catch (_) {}
-
-    _dataStore.clearAllTtlPlanCache();
-
-    // Fire-and-forget async clears.
-    Future(() async {
-      try {
-        await _dataStore.indexManager?.clearIndexMetaCache();
-      } catch (_) {}
-    });
-
     Logger.debug('Clear all cache', label: 'CacheManager.clear');
-  }
-
-  /// Handle base path / space change.
-  Future<void> onBasePathChanged() async {
-    try {
-      _statsCache.clear();
-
-      await _dataStore.queryExecutor.clearAllQueryCache();
-      await _dataStore.tableDataManager.clearAllTableRecordCache();
-      await _dataStore.tableDataManager.clearTableMetaCache();
-      _dataStore.tableTreePartitionManager.clearPageCacheSync();
-      _dataStore.indexTreePartitionManager.clearPageCacheSync();
-      await _dataStore.schemaManager?.clearSchemaCache();
-      await _dataStore.indexManager?.clearIndexMetaCache();
-      _dataStore.weightManager?.clearMemory();
-      _dataStore.clearAllTtlPlanCache();
-
-      Logger.debug('Base path change completed, caches cleared',
-          label: 'CacheManager.onBasePathChanged');
-    } catch (e) {
-      Logger.error('Base path change handling failed: $e',
-          label: 'CacheManager.onBasePathChanged');
-      rethrow;
-    }
   }
 
   /// Invalidate all caches of a table

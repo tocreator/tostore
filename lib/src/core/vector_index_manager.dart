@@ -8,9 +8,9 @@ import '../handler/memcomparable.dart';
 import '../model/data_block_entry.dart';
 import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/table_schema.dart';
-import '../model/parallel_journal_entry.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
@@ -19,8 +19,8 @@ import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_cache.dart';
 import 'vector_quantizer.dart';
-import 'yield_controller.dart';
 import 'workload_scheduler.dart';
+import 'yield_controller.dart';
 
 /// Manages all NGH vector indexes for the data store.
 class VectorIndexManager {
@@ -957,7 +957,15 @@ class VectorIndexManager {
   }
 
   /// Clear all caches.
-  void clearAllCaches() {
+  Future<void> dispose() async {
+    // Wait for all ongoing metadata loading
+    if (_metaLoadingFutures.isNotEmpty) {
+      try {
+        await Future.wait(_metaLoadingFutures.values);
+      } catch (_) {}
+    }
+    await _partitionManager.dispose();
+    _metaLoadingFutures.clear();
     _vectorCache.clear();
     _partitionManager.clearPageCacheSync();
   }

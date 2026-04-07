@@ -2125,6 +2125,27 @@ class MigrationManager {
             await migrationInstance.initialize();
           }
 
+          // Check if table exists under either the old or new name in this space before migration.
+          // Note: meta-step (executeSchemaOperations) might have already renamed the mapping for the primary space.
+          final isGlobalTable = oldSchema?.isGlobal ?? false;
+          final dirInfo = await migrationInstance.directoryManager
+              ?.getTableDirectoryInfo(originalTableName, isGlobalTable);
+
+          bool exists = dirInfo != null;
+          if (!exists && originalTableName != currentTableName) {
+            final dirInfoNew = await migrationInstance.directoryManager
+                ?.getTableDirectoryInfo(currentTableName, isGlobalTable);
+            exists = dirInfoNew != null;
+          }
+
+          if (!exists && !SystemTable.isSystemTable(originalTableName)) {
+            Logger.info(
+              'Skip migration for table [$originalTableName] in space [$space]: table mapping not found (table never used in this space)',
+              label: 'MigrationManager._executeMigrationTask',
+            );
+            continue;
+          }
+
           if (renameOp != null && renameOp.newTableName != null) {
             await migrationInstance.renameTableForMigration(
               originalTableName,

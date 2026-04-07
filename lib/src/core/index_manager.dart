@@ -3638,9 +3638,39 @@ class IndexManager {
     _indexMetaCache.remove([tableName]);
   }
 
-  /// Clear all index metadata cache
-  Future<void> clearIndexMetaCache() async {
+  /// Clear all cache
+  Future<void> clearAllCache() async {
+    _indexDataCache.clear();
     _indexMetaCache.clear();
+    _indexFieldMatchers.clear();
+    _metaLoadingFutures.clear();
+    _emptyIndexRepairFutures.clear();
+  }
+
+  /// Dispose resources and wait for pending tasks to complete.
+  Future<void> dispose() async {
+    // 1. Wait for any in-flight metadata loading or repair futures.
+    final futures = <Future<dynamic>>[
+      ..._metaLoadingFutures.values,
+      ..._emptyIndexRepairFutures.values,
+    ];
+
+    if (futures.isNotEmpty) {
+      try {
+        await Future.wait(futures).timeout(const Duration(seconds: 5));
+      } catch (e) {
+        Logger.warn(
+            'IndexManager dispose: some futures failed or timed out: $e',
+            label: 'IndexManager');
+      }
+    }
+
+    // 2. Clear caches to release memory
+    _indexDataCache.clear();
+    _indexMetaCache.clear();
+    _indexFieldMatchers.clear();
+    _metaLoadingFutures.clear();
+    _emptyIndexRepairFutures.clear();
   }
 }
 

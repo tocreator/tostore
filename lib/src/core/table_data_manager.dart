@@ -374,16 +374,6 @@ class TableDataManager {
     await _tableRecordCache.cleanup(removeRatio: ratio);
   }
 
-  /// Clear all table record cache entries.
-  Future<void> clearAllTableRecordCache() async {
-    _tableRecordCache.clear();
-  }
-
-  /// Clear all table record cache entries synchronously (used on shutdown).
-  void clearAllTableRecordCacheSync() {
-    _tableRecordCache.clear();
-  }
-
   /// Current table record cache size in bytes.
   int getCurrentTableRecordCacheSize() {
     return _tableRecordCache.estimatedTotalSizeBytes;
@@ -550,16 +540,6 @@ class TableDataManager {
       Logger.warn('Evict table meta cache failed: $e',
           label: 'TableDataManager.evictTableMetaCache');
     }
-  }
-
-  /// Clear all table metadata cache entries (yielding).
-  Future<void> clearTableMetaCache() async {
-    _tableMetaCache.clear();
-  }
-
-  /// Clear all table metadata cache entries synchronously (used on shutdown).
-  void clearTableMetaCacheSync() {
-    _tableMetaCache.clear();
   }
 
   /// Invalidate cached table metadata for a single table (best-effort).
@@ -833,35 +813,38 @@ class TableDataManager {
       if (persistChanges) {
         // Persist runtime metadata (max IDs, statistics) one last time.
         await persistRuntimeMetaIfNeeded(force: true);
+
+        // Save ID range information for all tables
+        final idGenKeys = List<String>.from(_idGenerators.keys);
+        final yieldController = YieldController('TableDataManager.dispose');
+        for (final tableName in idGenKeys) {
+          await yieldController.maybeYield();
+          await _saveIdRange(tableName);
+        }
       }
 
-      // Clear table record cache.
-      clearAllTableRecordCacheSync();
-      // cleanup file size information
-      clearFileSizes();
-
-      // cleanup table meta cache
-      clearTableMetaCacheSync();
-
+      _tableRecordCache.clear();
+      _tableMetaCache.clear();
+      _tableRecordCounts.clear();
+      _recordCountLoadingFutures.clear();
+      _metaLoadingFutures.clear();
+      _txnDeferredOps.clear();
+      _maxIds.clear();
       _maxIdsDirty.clear();
-
-      // Save ID range information for all tables
-      final idGenKeys = List<String>.from(_idGenerators.keys);
-      final yieldController = YieldController('TableDataManager.dispose');
-      for (final tableName in idGenKeys) {
-        await yieldController.maybeYield();
-        await _saveIdRange(tableName);
-      }
-
-      // Cleanup ID generator resources
       _idGenerators.clear();
       _idGeneratorPending.clear();
       _idRanges.clear();
       _checkedOrderedRange.clear();
-      _maxIds.clear();
-
-      // Ensure processing flags are cleared
+      _fileSizes.clear();
+      _lastModifiedTimes.clear();
+      _tablePartitionSizes.clear();
       _processingTables.clear();
+      _tableFlushingFlags.clear();
+      _pkComparators.clear();
+      _totalTableCount = 0;
+      _totalRecordCount = 0;
+      _totalDataSizeBytes = 0;
+      _needSaveStats = false;
     } catch (e) {
       Logger.error('Failed to dispose TableDataManager: $e',
           label: 'TableDataManager.dispose');
@@ -878,6 +861,8 @@ class TableDataManager {
         if (!entry.value) continue; // Skip unchanged
 
         final tableName = entry.key;
+        if (isTableBeingCleared(tableName)) continue;
+
         final maxId = _maxIds[tableName];
         if (maxId == null) continue;
 
@@ -1694,12 +1679,6 @@ class TableDataManager {
   /// get file last modified time
   DateTime? getLastModifiedTime(String tableName) {
     return _lastModifiedTimes[tableName];
-  }
-
-  /// cleanup table size information
-  void clearFileSizes() {
-    _fileSizes.clear();
-    _lastModifiedTimes.clear();
   }
 
   /// Get table meta information
@@ -2794,6 +2773,7 @@ class TableDataManager {
   Future<void> clearTable(String tableName) async {
     // Mark that table is being flushed to prevent other operations from interfering
     _tableFlushingFlags[tableName] = true;
+    _maxIdsDirty[tableName] = false; // Proactively stop background flush
     // lock this table to ensure data consistency
     final lockKey = 'table_$tableName';
     final operationId = GlobalIdGenerator.generate('clear_table_');

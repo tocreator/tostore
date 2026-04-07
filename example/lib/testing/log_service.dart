@@ -20,18 +20,49 @@ class LogService {
 
   void add(String message,
       [LogType type = LogType.info, bool fromCallback = false]) {
-    // To avoid UI freezing with a large number of logs, we keep a reasonable limit.
-    const maxLogs = 300;
+    // Increased the limit to 500. ListView.builder in Flutter handles 500 entries efficiently.
+    const maxLogs = 500;
+    const pruneTo =
+        350; // Prune back to 70% when limit reached (removes 150 entries)
+
     final now = DateTime.now();
     final timestampString =
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
-    final newLogs = List<LogEntry>.from(_logs.value);
-    newLogs.add(LogEntry(
-        message: '[$timestampString] $message', type: type, timestamp: now));
-    if (newLogs.length > maxLogs) {
-      newLogs.removeRange(0, newLogs.length - maxLogs);
+
+    final entry = LogEntry(
+        message: '[$timestampString] $message', type: type, timestamp: now);
+
+    final currentLogs = _logs.value;
+
+    if (currentLogs.length >= maxLogs) {
+      // Smart Pruning: Prioritize removing older debug/info logs while keeping errors/warnings.
+      final logsToKeep = <LogEntry>[];
+      final toRemoveCount = (currentLogs.length + 1) - pruneTo;
+      int removed = 0;
+
+      for (int i = 0; i < currentLogs.length; i++) {
+        final e = currentLogs[i];
+        // In the older half of logs, skip debug/info entries until we reach prune target.
+        if (removed < toRemoveCount &&
+            (e.type == LogType.debug || e.type == LogType.info)) {
+          removed++;
+          continue;
+        }
+        logsToKeep.add(e);
+      }
+
+      // If we haven't removed enough (due to high volume of errors/warnings),
+      // forced removal from the oldest entries to stay within bounds.
+      while (logsToKeep.length >= pruneTo) {
+        logsToKeep.removeAt(0);
+      }
+
+      logsToKeep.add(entry);
+      _logs.value = logsToKeep;
+    } else {
+      // Standard addition
+      _logs.value = [...currentLogs, entry];
     }
-    _logs.value = newLogs;
 
     // Only print to the developer console if the log is NOT from the internal callback.
     if (!fromCallback) {

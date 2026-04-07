@@ -1089,6 +1089,9 @@ class WriteBufferManager {
     _txnBuffers.clear();
     _txnGlobalUniqueKeyOwners.clear();
 
+    _tableClearEpochs.clear();
+    _globalClearEpoch = 0;
+
     _emitSizeChanged();
   }
 

@@ -8,12 +8,12 @@ import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
-import 'data_store_impl.dart';
 import 'btree_page.dart';
+import 'data_store_impl.dart';
 import 'ngh_page.dart';
 import 'tree_cache.dart';
-import 'yield_controller.dart';
 import 'workload_scheduler.dart';
+import 'yield_controller.dart';
 
 // ============================================================================
 // NGH Partition Manager
@@ -175,6 +175,19 @@ final class NghPartitionManager {
     }
     _graphPageCache.put(instanceKey, page);
     return page;
+  }
+
+  /// Clear all in-memory caches and reset state.
+  Future<void> dispose() async {
+    if (_preloadFutures.isNotEmpty) {
+      try {
+        await Future.wait(_preloadFutures.values);
+      } catch (_) {}
+    }
+    _graphPageCache.clear();
+    _pqCodePageCache.clear();
+    _rawVectorPageCache.clear();
+    _preloadFutures.clear();
   }
 
   /// Read a PQ-code page from cache or disk.

@@ -126,7 +126,7 @@ class DataStoreImpl {
   bool get isGlobalPrewarming => _isGlobalPrewarming;
 
   // Global configuration cache
-  static GlobalConfig? _globalConfigCache;
+  GlobalConfig? _globalConfigCache;
 
   String _currentSpaceName = 'default';
   DataStoreConfig? _config;
@@ -1223,7 +1223,7 @@ class DataStoreImpl {
       // Release all managers
       readViewManager.dispose();
       compactionManager.dispose();
-      cacheManager.clear();
+      await cacheManager.dispose();
       _ttlCleanupManager.unregisterCleanupTask();
 
       // Clean up resource manager resources
@@ -1232,7 +1232,7 @@ class DataStoreImpl {
       // Clear instance variables
       _queryOptimizer = null;
       _indexManager = null;
-      _vectorIndexManager?.clearAllCaches();
+      await _vectorIndexManager?.dispose();
       _vectorIndexManager = null;
       _queryExecutor = null;
       _integrityChecker = null;
@@ -5721,7 +5721,7 @@ class DataStoreImpl {
       }
 
       // Clear caches
-      await cacheManager.onBasePathChanged();
+      await cacheManager.dispose();
       await storage.flushAll(closeHandles: true);
 
       // Reinitialize database; do not apply activeSpace-on-default so switching to default stays default

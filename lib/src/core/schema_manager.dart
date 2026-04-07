@@ -91,16 +91,20 @@ class SchemaManager {
     await cache.cleanup(removeRatio: ratio);
   }
 
-  /// Clear all schema cache entries.
-  Future<void> clearSchemaCache() async {
+  /// Clear all in-memory caches and reset state.
+  Future<void> dispose() async {
+    // Wait for all ongoing schema loading
+    if (_schemaLoadingFutures.isNotEmpty) {
+      try {
+        await Future.wait(_schemaLoadingFutures.values);
+      } catch (_) {}
+    }
     _tableSchemaCache?.clear();
     _indexListCache.clear();
-  }
-
-  /// Clear all schema cache entries synchronously (used on shutdown).
-  void clearSchemaCacheSync() {
-    _tableSchemaCache?.clear();
-    _indexListCache.clear();
+    _schemaMeta = null;
+    _directoryMapping = null;
+    _schemaLoadingFutures.clear();
+    _currentPartitionDirIndex = 0;
   }
 
   int _estimateTableSchemaSize(TableSchema schema) {

@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
 - Optimized benchmark tests
 - Optimized documentation and multi-language
 
+### Fixed
+- Fixed global config cache state leakage between different database instances in the same process.
+
 ## 3.0.9
 
 ### Changed

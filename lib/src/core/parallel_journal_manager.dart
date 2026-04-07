@@ -223,6 +223,10 @@ class ParallelJournalManager {
       _running = false;
       _loopFuture = null;
       _flushInProgress = false;
+      _perRecordFlushUs = 0;
+      _throttleDelayPerRecordUs = 0;
+      _activeBatchContext = null;
+      _isRecovering = false;
     }
   }
 

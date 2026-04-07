@@ -2,29 +2,26 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import '../core/tree_cache.dart';
-import '../handler/logger.dart';
-import '../handler/memcomparable.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
 import '../core/transaction_context.dart';
-
-import '../model/index_search.dart';
-import '../model/business_error.dart';
-
-import '../model/join_clause.dart';
+import '../core/tree_cache.dart';
+import '../core/workload_scheduler.dart';
+import '../core/yield_controller.dart';
+import '../handler/logger.dart';
+import '../handler/memcomparable.dart';
+import '../handler/parallel_processor.dart';
+import '../handler/topk_heap.dart';
+import '../handler/value_matcher.dart';
 import '../model/buffer_entry.dart';
+import '../model/business_error.dart';
+import '../model/index_search.dart';
+import '../model/join_clause.dart';
+import '../model/query_aggregation.dart';
 import '../model/table_schema.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
 import 'query_plan.dart';
-import '../handler/topk_heap.dart';
-import '../handler/value_matcher.dart';
-import '../handler/parallel_processor.dart';
-import '../core/yield_controller.dart';
-import '../core/workload_scheduler.dart';
-
-import '../model/query_aggregation.dart';
 
 /// query executor
 class QueryExecutor {
@@ -3062,12 +3059,6 @@ class QueryExecutor {
   bool clearQueryCacheForKey(QueryCacheKey key) {
     _queryCache.remove(_buildQueryCacheKey(key));
     return true;
-  }
-
-  /// Clear all cached query entries.
-  Future<void> clearAllQueryCache() async {
-    _queryCache.clear();
-    _tableQueryGenerations.clear();
   }
 
   /// Clear all cached query entries synchronously (used on shutdown).
