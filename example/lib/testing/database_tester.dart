@@ -1461,13 +1461,15 @@ class DatabaseTester {
       await db.clear('settings');
 
       final random = Random();
-      final operations = <Future>[];
+      // Store closures to DEFER execution until the concurrent phase.
+      // Previously, futures fired immediately when added, causing UI jank.
+      final operations = <Future Function()>[];
 
-      // Helper to prepare base data and generate operations
+      // Helper to prepare base data and generate operation closures
       Future<List<Map<String, dynamic>>> prepareAndGenerateOpsForTable({
         required String tableName,
         required Map<String, int> tableConfig,
-        required _GeneratedDbOperation Function(int i) insertGenerator,
+        required Map<String, dynamic> Function(int i) dataGenerator,
         required Map<String, dynamic> updateData,
         required List<Map<String, dynamic>> itemsToInsert,
         required List<Map<String, dynamic>> itemsToUpdate,
@@ -1484,50 +1486,40 @@ class DatabaseTester {
 
         final baseItems = <Map<String, dynamic>>[];
         if (baseCount > 0) {
-          // Store original data by index to ensure correct mapping
-          final originalDataList = <Map<String, dynamic>>[];
-
-          // Generate and execute base data creation in batches to avoid UI jank
-          const batchSize = 50;
+          // Use batchInsert instead of individual inserts to avoid N concurrent
+          // futures flooding the main isolate and blocking UI frames.
+          const batchSize = 200;
           for (int i = 0; i < baseCount; i += batchSize) {
             final end = (i + batchSize > baseCount) ? baseCount : i + batchSize;
 
-            _updateLastOperation(
-                'Preparing base for $tableName: ${i + 1}-$end of $baseCount');
-
-            final batchFutures = <Future<DbResult>>[];
-            for (int batchIndex = i; batchIndex < end; batchIndex++) {
-              final gen = insertGenerator(batchIndex);
-              originalDataList.add(gen.data);
-              batchFutures.add(gen.future);
-              // Yield frequently within the batch to prevent UI lag during generation
-              if (batchIndex > 0 && batchIndex % 10 == 0) {
-                await Future.delayed(Duration.zero);
-              }
+            // Throttle UI updates: only update at start and every 200 records
+            if (i == 0 || i % 200 == 0) {
+              _updateLastOperation(
+                  'Preparing base for $tableName: ${i + 1}-$end of $baseCount');
             }
 
-            final results = await Future.wait(batchFutures, eagerError: true);
+            final batchData = <Map<String, dynamic>>[];
+            for (int j = i; j < end; j++) {
+              batchData.add(dataGenerator(j));
+            }
 
-            for (int j = 0; j < results.length; j++) {
-              final r = results[j];
-              final globalIndex = i + j;
-              if (r.isSuccess &&
-                  r.successKeys.isNotEmpty &&
-                  globalIndex < originalDataList.length) {
-                final originalData = originalDataList[globalIndex];
+            final result = await db.batchInsert(tableName, batchData);
+
+            if (result.isSuccess) {
+              for (int j = 0; j < result.successKeys.length; j++) {
                 final Map<String, dynamic> newItem = {
-                  idField: r.successKeys.first
+                  idField: result.successKeys[j]
                 };
-                if (originalData.containsKey(nameField)) {
-                  newItem[nameField] = originalData[nameField];
+                if (j < batchData.length &&
+                    batchData[j].containsKey(nameField)) {
+                  newItem[nameField] = batchData[j][nameField];
                 }
                 baseItems.add(newItem);
               }
-              if (j % 50 == 0) {
-                await Future.delayed(Duration.zero);
-              }
             }
-            await Future.delayed(Duration.zero); // Yield to the event loop
+
+            // Yield with 1ms to guarantee UI frame can render
+            await Future.delayed(const Duration(milliseconds: 1));
           }
           log.add(
               'Created ${baseItems.length}/$baseCount base records for $tableName.',
@@ -1545,48 +1537,48 @@ class DatabaseTester {
               baseItems.skip(updateCount).take(deleteCount).toList();
           itemsToDelete.addAll(itemsToDeleteLocal);
 
-          // Add Updates
-          for (var i = 0; i < itemsToUpdateLocal.length; i++) {
+          // Add Update closures (deferred — no future fires until called)
+          for (int i = 0; i < itemsToUpdateLocal.length; i++) {
             final item = itemsToUpdateLocal[i];
-            operations.add(db
+            operations.add(() => db
                 .update(tableName, updateData)
                 .where(idField, '=', item[idField]));
-            if (i % 50 == 0) {
+            if (i > 0 && i % 200 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
 
-          // Add Deletes
+          // Add Delete closures (deferred)
           for (int i = 0; i < itemsToDeleteLocal.length; i++) {
             final item = itemsToDeleteLocal[i];
-            operations
-                .add(db.delete(tableName).where(idField, '=', item[idField]));
-            if (i % 50 == 0) {
+            operations.add(
+                () => db.delete(tableName).where(idField, '=', item[idField]));
+            if (i > 0 && i % 200 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
         }
 
-        // Add Reads
+        // Add Read closures (deferred)
         final readCount = tableConfig['read'] ?? 0;
         if (baseItems.isNotEmpty) {
           for (var i = 0; i < readCount; i++) {
             final item = baseItems[random.nextInt(baseItems.length)];
-            operations.add(
+            operations.add(() =>
                 db.query(tableName).where(idField, '=', item[idField]).first());
-            if (i % 50 == 0) {
+            if (i > 0 && i % 200 == 0) {
               await Future.delayed(Duration.zero);
             }
           }
         }
 
-        // Add new Inserts
+        // Add new Insert closures (deferred)
         final insertCount = tableConfig['insert'] ?? 0;
         for (var i = 0; i < insertCount; i++) {
-          final gen = insertGenerator(baseCount + i);
-          operations.add(gen.future);
-          itemsToInsert.add(gen.data);
-          if (i % 50 == 0) {
+          final data = dataGenerator(baseCount + i);
+          operations.add(() => db.insert(tableName, data));
+          itemsToInsert.add(data);
+          if (i > 0 && i % 200 == 0) {
             await Future.delayed(Duration.zero);
           }
         }
@@ -1601,16 +1593,10 @@ class DatabaseTester {
         itemsToInsert: insertedUsers,
         itemsToUpdate: updatedUsers,
         itemsToDelete: deletedUsers,
-        insertGenerator: (i) {
-          final data = {
-            'username': 'cc_user_$i',
-            'email': 'cc_user_$i@test.com',
-            'age': 20 + i,
-          };
-          return _GeneratedDbOperation(
-            future: db.insert('users', data),
-            data: data,
-          );
+        dataGenerator: (i) => {
+          'username': 'cc_user_$i',
+          'email': 'cc_user_$i@test.com',
+          'age': 20 + i,
         },
         updateData: {'age': 999},
         nameField: 'username',
@@ -1623,15 +1609,9 @@ class DatabaseTester {
         itemsToInsert: insertedSettings,
         itemsToUpdate: updatedSettings,
         itemsToDelete: deletedSettings,
-        insertGenerator: (i) {
-          final data = {
-            'key': 'cc_setting_$i',
-            'value': 'value_$i',
-          };
-          return _GeneratedDbOperation(
-            future: db.insert('settings', data),
-            data: data,
-          );
+        dataGenerator: (i) => {
+          'key': 'cc_setting_$i',
+          'value': 'value_$i',
         },
         updateData: {'value': 'updated_value'},
         idField: 'key',
@@ -1649,16 +1629,25 @@ class DatabaseTester {
       final actualDeletedUsers = <String>[];
       final actualDeletedSettings = <String>[];
 
-      const batchSize = 100;
+      const batchSize = 50;
+      final totalBatches = (operations.length / batchSize).ceil();
       for (int i = 0; i < operations.length; i += batchSize) {
         final end = (i + batchSize > operations.length)
             ? operations.length
             : i + batchSize;
-        final batch = operations.sublist(i, end);
-        _updateLastOperation(
-            'Running batch ${i ~/ batchSize + 1}/${(operations.length / batchSize).ceil()}...');
+        // Throttle UI updates to avoid excessive setState rebuilds
+        if (i == 0 || i % 200 == 0) {
+          _updateLastOperation(
+              'Running batch ${i ~/ batchSize + 1}/$totalBatches...');
+        }
+        // Launch this batch NOW — closures start futures only when called
+        final batch = <Future>[];
+        for (int j = i; j < end; j++) {
+          batch.add(operations[j]());
+        }
         await Future.wait(batch, eagerError: false);
-        await Future.delayed(Duration.zero); // Yield to the event loop
+        // 1ms delay guarantees the UI event loop gets a chance to render
+        await Future.delayed(const Duration(milliseconds: 1));
       }
 
       stopwatch.stop();
@@ -1666,32 +1655,32 @@ class DatabaseTester {
       // Stage 4: Verification
       _updateLastOperation('Verifying results...');
 
-      // Verify which deletions actually succeeded
+      // Verify which deletions actually succeeded — use batch whereIn
+      // instead of N individual queries to avoid O(N) round-trips.
       _updateLastOperation('Checking actual deletion results...');
-      for (int i = 0; i < deletedUsers.length; i++) {
-        final user = deletedUsers[i];
-        final exists =
-            await db.query('users').where('id', '=', user['id']).first();
-        if (exists == null) {
-          actualDeletedUsers.add(user['id'].toString());
-        }
-        // Yield to UI thread every 50 iterations to prevent UI jank
-        if (i % 50 == 0) {
-          await Future.delayed(Duration.zero);
+      if (deletedUsers.isNotEmpty) {
+        final allDeletedUserIds = deletedUsers.map((u) => u['id']).toList();
+        final stillExisting =
+            await db.query('users').whereIn('id', allDeletedUserIds);
+        final existingIdSet =
+            stillExisting.data.map((u) => u['id'].toString()).toSet();
+        for (final user in deletedUsers) {
+          if (!existingIdSet.contains(user['id'].toString())) {
+            actualDeletedUsers.add(user['id'].toString());
+          }
         }
       }
-      for (int i = 0; i < deletedSettings.length; i++) {
-        final setting = deletedSettings[i];
-        final exists = await db
-            .query('settings')
-            .where('key', '=', setting['key'])
-            .first();
-        if (exists == null) {
-          actualDeletedSettings.add(setting['key'].toString());
-        }
-        // Yield to UI thread every 50 iterations to prevent UI jank
-        if (i % 50 == 0) {
-          await Future.delayed(Duration.zero);
+      if (deletedSettings.isNotEmpty) {
+        final allDeletedSettingKeys =
+            deletedSettings.map((s) => s['key']).toList();
+        final stillExisting =
+            await db.query('settings').whereIn('key', allDeletedSettingKeys);
+        final existingKeySet =
+            stillExisting.data.map((s) => s['key'].toString()).toSet();
+        for (final setting in deletedSettings) {
+          if (!existingKeySet.contains(setting['key'].toString())) {
+            actualDeletedSettings.add(setting['key'].toString());
+          }
         }
       }
 
@@ -2591,14 +2580,4 @@ class DatabaseTester {
     }
     return isTestPassed;
   }
-}
-
-class _GeneratedDbOperation {
-  final Future<DbResult> future;
-  final Map<String, dynamic> data;
-
-  const _GeneratedDbOperation({
-    required this.future,
-    required this.data,
-  });
 }

@@ -1075,148 +1075,157 @@ final class IndexTreePartitionManager {
         pendingPtrs.clear();
       }
 
-      for (final entry in dirtyLeaves.entries) {
-        await stageYc.maybeYield();
-        final ptr = entry.key;
-        final leaf = entry.value;
-        final payload = leaf.encodePayload();
-        if (!payloadFitsInPage(payload.length)) {
-          final frames = <_IFrame>[];
-          await descendToLeaf(
-              leaf.keys.isEmpty ? leaf.highKey : leaf.keys.first, frames);
-          final splitResult = leaf.split();
-          final rightLeaf = splitResult.right;
-          final rightLeafPtr = await allocatePage();
-          rightLeaf.prev = ptr;
-          rightLeaf.next = leaf.next;
-          final oldNext = leaf.next;
-          leaf.next = rightLeafPtr;
-          if (!oldNext.isNull) {
-            final nextLeaf = await getLeaf(oldNext);
-            nextLeaf.prev = rightLeafPtr;
-            markLeafDirty(oldNext, nextLeaf);
-          } else {
-            meta = meta.copyWith(btreeLastLeaf: rightLeafPtr);
-          }
-          await insertSplitIntoParents(
-            frames,
-            leftHighKey: leaf.highKey,
-            leftPtr: ptr,
-            rightHighKey: rightLeaf.highKey,
-            rightPtr: rightLeafPtr,
-          );
-          leafCache[keyOfPtr(rightLeafPtr)] = rightLeaf;
-          final leftPayload = leaf.encodePayload();
-          final rightPayload = rightLeaf.encodePayload();
-          if (!payloadFitsInPage(leftPayload.length) ||
-              !payloadFitsInPage(rightPayload.length)) {
-            throw StateError(
-              'Index $tableName.$indexName: page overflow after split '
-              '(single entry may exceed page capacity). '
-              'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
-              'pageSize=${meta.btreePageSize}',
+      while (dirtyLeaves.isNotEmpty) {
+        final batch = Map<TreePagePtr, LeafPage>.from(dirtyLeaves);
+        dirtyLeaves.clear();
+        for (final entry in batch.entries) {
+          await stageYc.maybeYield();
+          final ptr = entry.key;
+          final leaf = entry.value;
+          final payload = leaf.encodePayload();
+          if (!payloadFitsInPage(payload.length)) {
+            final frames = <_IFrame>[];
+            await descendToLeaf(
+                leaf.keys.isEmpty ? leaf.highKey : leaf.keys.first, frames);
+            final splitResult = leaf.split();
+            final rightLeaf = splitResult.right;
+            final rightLeafPtr = await allocatePage();
+            rightLeaf.prev = ptr;
+            rightLeaf.next = leaf.next;
+            final oldNext = leaf.next;
+            leaf.next = rightLeafPtr;
+            if (!oldNext.isNull) {
+              final nextLeaf = await getLeaf(oldNext);
+              nextLeaf.prev = rightLeafPtr;
+              markLeafDirty(oldNext, nextLeaf);
+            } else {
+              meta = meta.copyWith(btreeLastLeaf: rightLeafPtr);
+            }
+            await insertSplitIntoParents(
+              frames,
+              leftHighKey: leaf.highKey,
+              leftPtr: ptr,
+              rightHighKey: rightLeaf.highKey,
+              rightPtr: rightLeafPtr,
             );
+            leafCache[keyOfPtr(rightLeafPtr)] = rightLeaf;
+            final leftPayload = leaf.encodePayload();
+            final rightPayload = rightLeaf.encodePayload();
+            if (!payloadFitsInPage(leftPayload.length) ||
+                !payloadFitsInPage(rightPayload.length)) {
+              throw StateError(
+                'Index $tableName.$indexName: page overflow after split '
+                '(single entry may exceed page capacity). '
+                'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
+                'pageSize=${meta.btreePageSize}',
+              );
+            }
+            pendingPtrs.add(ptr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.leaf.index,
+              partitionNo: ptr.partitionNo,
+              pageNo: ptr.pageNo,
+              payload: leftPayload,
+            ));
+            pendingPtrs.add(rightLeafPtr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.leaf.index,
+              partitionNo: rightLeafPtr.partitionNo,
+              pageNo: rightLeafPtr.pageNo,
+              payload: rightPayload,
+            ));
+          } else {
+            pendingPtrs.add(ptr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.leaf.index,
+              partitionNo: ptr.partitionNo,
+              pageNo: ptr.pageNo,
+              payload: payload,
+            ));
           }
-          pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
-            partitionNo: ptr.partitionNo,
-            pageNo: ptr.pageNo,
-            payload: leftPayload,
-          ));
-          pendingPtrs.add(rightLeafPtr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
-            partitionNo: rightLeafPtr.partitionNo,
-            pageNo: rightLeafPtr.pageNo,
-            payload: rightPayload,
-          ));
-        } else {
-          pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
-            partitionNo: ptr.partitionNo,
-            pageNo: ptr.pageNo,
-            payload: payload,
-          ));
-        }
-        if (pending.length >= chunkSize) {
-          await flushEncodeChunk();
+          if (pending.length >= chunkSize) {
+            await flushEncodeChunk();
+          }
         }
       }
 
-      for (final entry in dirtyInternals.entries) {
-        await stageYc.maybeYield();
-        final ptr = entry.key;
-        final node = entry.value;
-        final payload = node.encodePayload();
-        if (!payloadFitsInPage(payload.length)) {
-          final frames = <_IFrame>[];
-          await descendToLeaf(
-              node.maxKeys.isEmpty ? Uint8List(0) : node.maxKeys.first, frames);
-          int selfFrameIndex = -1;
-          for (int i = 0; i < frames.length; i++) {
-            if (frames[i].ptr.partitionNo == ptr.partitionNo &&
-                frames[i].ptr.pageNo == ptr.pageNo) {
-              selfFrameIndex = i;
-              break;
+      while (dirtyInternals.isNotEmpty) {
+        final batch = Map<TreePagePtr, InternalPage>.from(dirtyInternals);
+        dirtyInternals.clear();
+        for (final entry in batch.entries) {
+          await stageYc.maybeYield();
+          final ptr = entry.key;
+          final node = entry.value;
+          final payload = node.encodePayload();
+          if (!payloadFitsInPage(payload.length)) {
+            final frames = <_IFrame>[];
+            await descendToLeaf(
+                node.maxKeys.isEmpty ? Uint8List(0) : node.maxKeys.first,
+                frames);
+            int selfFrameIndex = -1;
+            for (int i = 0; i < frames.length; i++) {
+              if (frames[i].ptr.partitionNo == ptr.partitionNo &&
+                  frames[i].ptr.pageNo == ptr.pageNo) {
+                selfFrameIndex = i;
+                break;
+              }
             }
-          }
-          if (selfFrameIndex < 0) {
-            throw StateError(
-              'Index $tableName.$indexName: internal ptr not found in descent frames',
+            if (selfFrameIndex < 0) {
+              throw StateError(
+                'Index $tableName.$indexName: internal ptr not found in descent frames',
+              );
+            }
+            if (selfFrameIndex > 0) {
+              frames.removeRange(selfFrameIndex, frames.length);
+            } else {
+              frames.clear();
+            }
+            final splitResult = node.split();
+            final rightNode = splitResult.right;
+            final rightNodePtr = await allocatePage();
+            await insertSplitIntoParents(
+              frames,
+              leftHighKey: node.maxKey(),
+              leftPtr: ptr,
+              rightHighKey: rightNode.maxKey(),
+              rightPtr: rightNodePtr,
             );
-          }
-          if (selfFrameIndex > 0) {
-            frames.removeRange(selfFrameIndex, frames.length);
+            internalCache[keyOfPtr(rightNodePtr)] = rightNode;
+            final leftPayload = node.encodePayload();
+            final rightPayload = rightNode.encodePayload();
+            if (!payloadFitsInPage(leftPayload.length) ||
+                !payloadFitsInPage(rightPayload.length)) {
+              throw StateError(
+                'Index $tableName.$indexName: internal page overflow after split. '
+                'pageSize=${meta.btreePageSize}',
+              );
+            }
+            pendingPtrs.add(ptr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.internal.index,
+              partitionNo: ptr.partitionNo,
+              pageNo: ptr.pageNo,
+              payload: leftPayload,
+            ));
+            pendingPtrs.add(rightNodePtr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.internal.index,
+              partitionNo: rightNodePtr.partitionNo,
+              pageNo: rightNodePtr.pageNo,
+              payload: rightPayload,
+            ));
           } else {
-            frames.clear();
+            pendingPtrs.add(ptr);
+            pending.add(BTreePageEncodeItem(
+              typeIndex: BTreePageType.internal.index,
+              partitionNo: ptr.partitionNo,
+              pageNo: ptr.pageNo,
+              payload: payload,
+            ));
           }
-          final splitResult = node.split();
-          final rightNode = splitResult.right;
-          final rightNodePtr = await allocatePage();
-          await insertSplitIntoParents(
-            frames,
-            leftHighKey: node.maxKey(),
-            leftPtr: ptr,
-            rightHighKey: rightNode.maxKey(),
-            rightPtr: rightNodePtr,
-          );
-          internalCache[keyOfPtr(rightNodePtr)] = rightNode;
-          final leftPayload = node.encodePayload();
-          final rightPayload = rightNode.encodePayload();
-          if (!payloadFitsInPage(leftPayload.length) ||
-              !payloadFitsInPage(rightPayload.length)) {
-            throw StateError(
-              'Index $tableName.$indexName: internal page overflow after split. '
-              'pageSize=${meta.btreePageSize}',
-            );
+          if (pending.length >= chunkSize) {
+            await flushEncodeChunk();
           }
-          pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
-            partitionNo: ptr.partitionNo,
-            pageNo: ptr.pageNo,
-            payload: leftPayload,
-          ));
-          pendingPtrs.add(rightNodePtr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
-            partitionNo: rightNodePtr.partitionNo,
-            pageNo: rightNodePtr.pageNo,
-            payload: rightPayload,
-          ));
-        } else {
-          pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
-            partitionNo: ptr.partitionNo,
-            pageNo: ptr.pageNo,
-            payload: payload,
-          ));
-        }
-        if (pending.length >= chunkSize) {
-          await flushEncodeChunk();
         }
       }
 

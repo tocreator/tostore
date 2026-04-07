@@ -130,6 +130,9 @@ final class CompactionManager {
     while (_queue.isNotEmpty &&
         tasks < _maxTasksPerTick &&
         sw.elapsedMilliseconds < budgetMs) {
+      // Check if engine is being shut down
+      if (!_dataStore.isInitialized) return;
+
       // Acquire a small maintenance token per task. If contention appears, stop immediately.
       final lease = await _dataStore.workloadScheduler.tryAcquire(
         WorkloadType.maintenance,
