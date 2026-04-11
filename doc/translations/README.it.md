@@ -36,8 +36,7 @@
 - **Avanzate e prestazioni**: [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Impostazione efficiente](#query-pagination) | [Query Cache](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
 - **Operazioni e sicurezza**: [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Altre risorse](#more-resources)
 
-<a id="why-tostore"></a>
-## Perché scegliere ToStore?
+## <a id="why-tostore"></a>Perché scegliere ToStore?
 
 ToStore è un moderno motore di dati progettato per l'era AGI e gli scenari di edge intelligence. Supporta nativamente sistemi distribuiti, fusione multimodale, dati strutturati relazionali, vettori ad alta dimensione e archiviazione di dati non strutturati. Costruito su un'architettura di nodi Self-Routing e un motore ispirato alla rete neurale, offre ai nodi un'elevata autonomia e una scalabilità orizzontale elastica, disaccoppiando logicamente le prestazioni dalla scalabilità dei dati. Include transazioni ACID, query relazionali complesse (JOIN e chiavi esterne a cascata), TTL a livello di tabella e aggregazioni, insieme a più algoritmi di chiave primaria distribuiti, espressioni atomiche, riconoscimento delle modifiche dello schema, crittografia, isolamento dei dati multi-spazio, pianificazione del carico intelligente basata sulle risorse e ripristino con autoriparazione in caso di disastro/arresto anomalo.
 
@@ -45,8 +44,7 @@ Mentre l'informatica continua a spostarsi verso l'intelligenza periferica, agent
 
 ToStore offre funzionalità distribuite all'edge sufficientemente potenti per set di dati di grandi dimensioni, generazione di intelligenza artificiale locale complessa e spostamento di dati su larga scala. Una collaborazione profonda e intelligente tra nodi edge e cloud fornisce una base dati affidabile per realtà mista immersiva, interazione multimodale, vettori semantici, modellazione spaziale e scenari simili.
 
-<a id="key-features"></a>
-## Caratteristiche principali
+## <a id="key-features"></a>Caratteristiche principali
 
 - 🌐 **Motore dati multipiattaforma unificato**
   - API unificata in ambienti mobili, desktop, Web e server
@@ -84,8 +82,7 @@ ToStore offre funzionalità distribuite all'edge sufficientemente potenti per se
   - Supporta ascoltatori di query in tempo reale, memorizzazione nella cache intelligente multilivello e impaginazione del cursore
   - Adatto ad applicazioni multiutente, local-first e collaborative offline
 
-<a id="installation"></a>
-## Installazione
+## <a id="installation"></a>Installazione
 
 > [!IMPORTANT]
 > **Aggiornamento da v2.x?** Leggi la [Guida all'aggiornamento v3.x](../UPGRADE_GUIDE_v3.md) per i passaggi critici della migrazione e le modifiche importanti.
@@ -97,8 +94,7 @@ dependencies:
   tostore: any # Please use the latest version
 ```
 
-<a id="quick-start"></a>
-## Avvio rapido
+## <a id="quick-start"></a>Avvio rapido
 
 > [!TIP]
 > **Come dovresti scegliere una modalità di archiviazione?**
@@ -106,8 +102,7 @@ dependencies:
 > 2. [**Modalità tabella strutturata**](#quick-start-table): ideale per i dati aziendali principali che richiedono query complesse, convalida dei vincoli o governance dei dati su larga scala. Inserendo la logica dell'integrità nel motore, è possibile ridurre significativamente i costi di sviluppo e manutenzione a livello di applicazione.
 > 3. [**Modalità memoria**](#quick-start-memory): ideale per calcoli temporanei, test unitari o **gestione ultrarapida dello stato globale**. Con le query globali e i listener `watch`, puoi rimodellare l'interazione dell'applicazione senza mantenere una pila di variabili globali.
 
-<a id="quick-start-kv"></a>
-### Archiviazione valori-chiave (KV)
+### <a id="quick-start-kv"></a>Archiviazione valori-chiave (KV)
 Questa modalità è adatta quando non sono necessarie tabelle strutturate predefinite. È semplice, pratico e supportato da un motore di archiviazione ad alte prestazioni. **La sua efficiente architettura di indicizzazione mantiene le prestazioni delle query altamente stabili ed estremamente reattive anche sui normali dispositivi mobili su scale di dati molto grandi.** I dati in spazi diversi sono naturalmente isolati, mentre è supportata anche la condivisione globale.
 
 ```dart
@@ -163,8 +158,7 @@ StreamBuilder(
 )
 ```
 
-<a id="quick-start-table"></a>
-### Modalità tabella strutturata
+### <a id="quick-start-table"></a>Modalità tabella strutturata
 CRUD su tabelle strutturate richiede la creazione anticipata dello schema (vedere [Definizione dello schema](#schema-definition)). Approcci di integrazione consigliati per diversi scenari:
 - **Mobile/Desktop**: per [scenari di avvio frequenti](#mobile-integration), si consiglia di passare `schemas` durante l'inizializzazione.
 - **Server/Agente**: per [scenari di lunga esecuzione](#server-integration), si consiglia di creare tabelle dinamicamente tramite `createTables`.
@@ -217,8 +211,7 @@ StreamBuilder(
 );
 ```
 
-<a id="quick-start-memory"></a>
-### Modalità memoria
+### <a id="quick-start-memory"></a>Modalità memoria
 
 Per scenari quali memorizzazione nella cache, calcoli temporanei o carichi di lavoro che non richiedono la persistenza su disco, è possibile inizializzare un database in memoria puro tramite `ToStore.memory()`. In questa modalità, tutti i dati, inclusi schemi, indici e coppie chiave-valore, risiedono interamente in memoria per le massime prestazioni di lettura/scrittura.
 
@@ -245,8 +238,7 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 ```
 
 
-<a id="schema-definition"></a>
-## Definizione dello schema
+## <a id="schema-definition"></a>Definizione dello schema
 **Definisci una volta e lascia che sia il motore a gestire la governance automatizzata end-to-end in modo che la tua applicazione non debba più sostenere una pesante manutenzione di convalida.**
 
 I seguenti esempi di dispositivi mobili, lato server e agenti riutilizzano tutti `appSchemas` definito qui.
@@ -357,8 +349,7 @@ Inoltre, `unique: true` crea automaticamente un indice univoco a campo singolo. 
 - **Server/Agente**: migliore quando si creano dinamicamente schemi in fase di runtime tramite `createTables(appSchemas)`
 
 
-<a id="mobile-integration"></a>
-## Integrazione per dispositivi mobili, desktop e altri scenari di avvio frequenti
+## <a id="mobile-integration"></a>Integrazione per dispositivi mobili, desktop e altri scenari di avvio frequenti
 
 📱 **Esempio**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
 
@@ -404,8 +395,7 @@ await db.close(keepActiveSpace: false);
 ```
 
 
-<a id="server-integration"></a>
-## Integrazione lato server/agente (scenari di lunga esecuzione)
+## <a id="server-integration"></a>Integrazione lato server/agente (scenari di lunga esecuzione)
 
 🖥️ **Esempio**: [server_quickstart.dart](../../example/lib/server_quickstart.dart)
 
@@ -447,14 +437,12 @@ final dbServer = await ToStore.open(
 ```
 
 
-<a id="advanced-usage"></a>
-## Utilizzo avanzato
+## <a id="advanced-usage"></a>Utilizzo avanzato
 
 ToStore fornisce un ricco set di funzionalità avanzate per scenari aziendali complessi:
 
 
-<a id="vector-advanced"></a>
-### Campi vettoriali, indici vettoriali e ricerca vettoriale
+### <a id="vector-advanced"></a>Campi vettoriali, indici vettoriali e ricerca vettoriale
 
 ```dart
 await db.createTables([
@@ -528,8 +516,7 @@ Note sui risultati:
 - `score`: punteggio di somiglianza normalizzato, tipicamente nell'intervallo `0 ~ 1`; più grande significa più simile
 - `distance`: valore della distanza; per `l2` e `cosine`, più piccolo solitamente significa più simile
 
-<a id="ttl-config"></a>
-### TTL a livello di tabella (scadenza automatica basata sul tempo)
+### <a id="ttl-config"></a>TTL a livello di tabella (scadenza automatica basata sul tempo)
 
 Per log, telemetria, eventi e altri dati che dovrebbero scadere nel tempo, è possibile definire TTL a livello di tabella tramite `ttlConfig`. Il motore pulirà automaticamente i record scaduti in background:
 
@@ -585,8 +572,7 @@ final batchResult = await db.batchUpsert('users', [
 ```
 
 
-<a id="query-advanced"></a>
-### Query avanzate
+### <a id="query-advanced"></a>Query avanzate
 
 ToStore fornisce un'API di query dichiarativa concatenabile con gestione flessibile dei campi e complesse relazioni multitabella.
 
@@ -628,8 +614,7 @@ final posts = await db.query('posts')
 
 ---
 
-<a id="aggregation-stats"></a>
-### Aggregazione, raggruppamento e statistiche (Agg e GroupBy)
+### <a id="aggregation-stats"></a>Aggregazione, raggruppamento e statistiche (Agg e GroupBy)
 
 #### 1. Aggregazione (`Agg` fabbrica)
 Le funzioni aggregate calcolano le statistiche su un set di dati. Con il parametro `alias` è possibile personalizzare i nomi dei campi dei risultati.
@@ -681,8 +666,7 @@ if (await db.query('users').whereEqual('email', 'test@test.com').exists()) {
 final cities = await db.query('users').distinct(['city']);
 ```
 
-<a id="query-condition"></a>
-#### 4. Logica complessa con `QueryCondition`
+#### <a id="query-condition"></a>4. Logica complessa con `QueryCondition`
 `QueryCondition` è lo strumento principale di ToStore per la logica annidata e la costruzione di query tra parentesi. Quando le semplici chiamate `where` concatenate non sono sufficienti per espressioni come `(A AND B) OR (C AND D)`, questo è lo strumento da utilizzare.
 
 - **`condition(QueryCondition sub)`**: apre un gruppo nidificato `AND`
@@ -716,8 +700,7 @@ final targetUsers = await db.query('users')
 ```
 
 
-<a id="streaming-query"></a>
-#### 5. Richiesta di streaming
+#### <a id="streaming-query"></a>5. Richiesta di streaming
 Adatto per set di dati molto grandi quando non si desidera caricare tutto in memoria in una volta. I risultati possono essere elaborati man mano che vengono letti.
 
 ```dart
@@ -726,8 +709,7 @@ db.streamQuery('users').listen((data) {
 });
 ```
 
-<a id="reactive-query"></a>
-#### 6. Query reattiva
+#### <a id="reactive-query"></a>6. Query reattiva
 Il metodo `watch()` consente di monitorare i risultati delle query in tempo reale. Restituisce un `Stream` ed esegue automaticamente nuovamente la query ogni volta che i dati corrispondono alle modifiche nella tabella di destinazione.
 - **Debounce automatico**: il debounce intelligente integrato evita raffiche ridondanti di query
 - **Sincronizzazione dell'interfaccia utente**: funziona in modo naturale con Flutter `StreamBuilder` per gli elenchi aggiornati in tempo reale
@@ -756,8 +738,7 @@ StreamBuilder<List<Map<String, dynamic>>>(
 
 ---
 
-<a id="query-cache"></a>
-### Memorizzazione manuale nella cache dei risultati delle query (facoltativo)
+### <a id="query-cache"></a>Memorizzazione manuale nella cache dei risultati delle query (facoltativo)
 
 > [!IMPORTANT]
 > **ToStore include già internamente un'efficiente cache LRU intelligente multilivello.**
@@ -776,8 +757,7 @@ final results = await db.query('heavy_table')
 ```
 
 
-<a id="query-pagination"></a>
-### Query e impaginazione efficiente
+### <a id="query-pagination"></a>Query e impaginazione efficiente
 
 > [!TIP]
 > **Specificare sempre `limit` per ottenere prestazioni ottimali**: si consiglia vivamente di fornire esplicitamente `limit` in ogni query. Se omesso, il motore utilizza per impostazione predefinita 1000 righe. Il motore di query principale è veloce, ma la serializzazione di set di risultati molto grandi nel livello dell'applicazione può comunque aggiungere un sovraccarico non necessario.
@@ -829,8 +809,7 @@ final prevPage = await db.query('users')
 | **Coerenza sotto modifiche** | Le modifiche ai dati possono causare righe saltate | Evita duplicati e omissioni causate da modifiche ai dati |
 
 
-<a id="foreign-keys"></a>
-### Chiavi esterne e cascata
+### <a id="foreign-keys"></a>Chiavi esterne e cascata
 
 Le chiavi esterne garantiscono l'integrità referenziale e consentono di configurare aggiornamenti ed eliminazioni a cascata. Le relazioni vengono convalidate in fase di scrittura e aggiornamento. Se le policy a cascata sono abilitate, i dati correlati vengono aggiornati automaticamente, riducendo il lavoro di coerenza nel codice dell'applicazione.
 
@@ -866,8 +845,7 @@ await db.createTables([
 ```
 
 
-<a id="query-operators"></a>
-### Operatori di query
+### <a id="query-operators"></a>Operatori di query
 
 Tutte le condizioni `where(field, operator, value)` supportano i seguenti operatori (senza distinzione tra maiuscole e minuscole):
 
@@ -957,8 +935,7 @@ final users = await db.query('users')
 >    *   **Mancata corrispondenza del modello**: `NOT LIKE`.
 >    *   *Spiegazione: Le operazioni precedenti richiedono solitamente l'attraversamento dell'intera area di memorizzazione dei dati anche se è stato creato un indice. Sebbene l'impatto sia minimo su dispositivi mobili o piccoli set di dati, in scenari di analisi dati distribuiti o ultra-grandi, dovrebbero essere utilizzate con cautela, combinate con altre condizioni di indice (ad esempio, limitare i dati per ID o intervallo temporale) e la clausola `limit`.*
 
-<a id="distributed-architecture"></a>
-## Architettura distribuita
+## <a id="distributed-architecture"></a>Architettura distribuita
 
 ```dart
 // Configure distributed nodes
@@ -990,8 +967,7 @@ await for (final record in db.streamQuery('vector_data')
 }
 ```
 
-<a id="primary-key-examples"></a>
-## Esempi di chiavi primarie
+## <a id="primary-key-examples"></a>Esempi di chiavi primarie
 
 ToStore fornisce più algoritmi di chiave primaria distribuiti per diversi scenari aziendali:
 
@@ -1019,8 +995,7 @@ await db.createTables([
 ```
 
 
-<a id="atomic-expressions"></a>
-## Espressioni atomiche
+## <a id="atomic-expressions"></a>Espressioni atomiche
 
 Il sistema di espressione fornisce aggiornamenti del campo atomico indipendenti dal tipo. Tutti i calcoli vengono eseguiti atomicamente a livello di database, evitando conflitti simultanei:
 
@@ -1073,8 +1048,7 @@ await db.upsert('orders', {
 });
 ```
 
-<a id="transactions"></a>
-## Transazioni
+## <a id="transactions"></a>Transazioni
 
 Le transazioni garantiscono l'atomicità tra più operazioni: tutto ha successo o tutto viene ripristinato, preservando la coerenza dei dati.
 
@@ -1118,8 +1092,7 @@ final txResult2 = await db.transaction(() async {
 ```
 
 
-<a id="database-maintenance"></a>
-### Amministrazione e manutenzione
+### <a id="database-maintenance"></a>Amministrazione e manutenzione
 
 Le seguenti API coprono l'amministrazione del database, la diagnostica e la manutenzione per lo sviluppo in stile plug-in, i pannelli di amministrazione e gli scenari operativi:
 
@@ -1168,8 +1141,7 @@ print(configInfo.toJson());
 ```
 
 
-<a id="backup-restore"></a>
-### Backup e ripristino
+### <a id="backup-restore"></a>Backup e ripristino
 
 Particolarmente utile per l'importazione/esportazione locale di un singolo utente, la migrazione di dati offline di grandi dimensioni e il rollback del sistema dopo un errore:
 
@@ -1199,8 +1171,7 @@ final restored = await db.restore(
 );
 ```
 
-<a id="error-handling"></a>
-### Codici di stato e gestione degli errori
+### <a id="error-handling"></a>Codici di stato e gestione degli errori
 
 
 ToStore utilizza un modello di risposta unificato per le operazioni sui dati:
@@ -1289,8 +1260,7 @@ Tipi di errori di transazione:
 - `TransactionErrorType.unknown`: qualsiasi altro errore
 
 
-<a id="logging-diagnostics"></a>
-### Registra richiamate e diagnostica del database
+### <a id="logging-diagnostics"></a>Registra richiamate e diagnostica del database
 
 ToStore può instradare i registri di avvio, ripristino, migrazione automatica e conflitti tra vincoli di runtime al livello aziendale tramite `LogConfig.setConfig(...)`.
 
@@ -1315,8 +1285,7 @@ ToStore può instradare i registri di avvio, ripristino, migrazione automatica e
 ```
 
 
-<a id="security-config"></a>
-## Configurazione della sicurezza
+## <a id="security-config"></a>Configurazione della sicurezza
 
 > [!WARNING]
 > **Gestione delle chiavi**: **`encodingKey`** può essere modificato liberamente e il motore migrerà i dati automaticamente, in modo che i dati rimangano recuperabili. **`encryptionKey`** non deve essere modificato casualmente. Una volta modificati, i vecchi dati non possono essere decrittografati a meno che non ne venga eseguita esplicitamente la migrazione. Non codificare mai i tasti sensibili; si consiglia di recuperarli da un servizio sicuro.
@@ -1371,8 +1340,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
 
-<a id="advanced-config"></a>
-## Spiegazione della configurazione avanzata (DataStoreConfig)
+## <a id="advanced-config"></a>Spiegazione della configurazione avanzata (DataStoreConfig)
 
 > [!TIP]
 > **Intelligenza di configurazione zero**
@@ -1402,8 +1370,7 @@ final db = await ToStore.open(
 
 ---
 
-<a id="performance"></a>
-## Prestazioni ed esperienza
+## <a id="performance"></a>Prestazioni ed esperienza
 
 ### Benchmark
 
@@ -1434,8 +1401,7 @@ Se ToStore ti è d'aiuto, lasciaci un ⭐️
 > **Raccomandazione**: per lo sviluppo di app frontend, prendi in considerazione il [framework ToApp](https://github.com/tocreator/toapp), che fornisce una soluzione full-stack che automatizza e unifica richieste di dati, caricamento, archiviazione, memorizzazione nella cache e presentazione.
 
 
-<a id="more-resources"></a>
-## Più risorse
+## <a id="more-resources"></a>Più risorse
 
 - 📖 **Documentazione**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Segnalazione dei problemi**: [Problemi GitHub](https://github.com/tocreator/tostore/issues)

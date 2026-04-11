@@ -36,8 +36,7 @@
 - **고급 및 성능**: [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - **운영 및 보안**: [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
 
-<a id="why-tostore"></a>
-## 왜 ToStore를 선택해야 할까요?
+## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
 
 ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된 최신 데이터 엔진입니다. 기본적으로 분산 시스템, 다중 모드 융합, 관계형 구조 데이터, 고차원 벡터 및 구조화되지 않은 데이터 스토리지를 지원합니다. 자체 라우팅 노드 아키텍처와 신경망에서 영감을 받은 엔진을 기반으로 구축된 이 솔루션은 노드에 높은 자율성과 탄력적인 수평 확장성을 제공하는 동시에 데이터 규모에서 성능을 논리적으로 분리합니다. 여기에는 ACID 트랜잭션, 복잡한 관계형 쿼리(JOIN 및 계단식 외래 키), 테이블 수준 TTL 및 집계가 포함되며, 다중 분산 기본 키 알고리즘, 원자 표현식, 스키마 변경 인식, 암호화, 다중 공간 데이터 격리, 리소스 인식 지능형 로드 스케줄링, 재해/충돌 자가 치유 복구도 포함됩니다.
 
@@ -45,8 +44,7 @@ ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된
 
 ToStore는 대규모 데이터 세트, 복잡한 로컬 AI 생성 및 대규모 데이터 이동에 충분히 강력한 엣지 분산 기능을 제공합니다. 엣지 노드와 클라우드 노드 간의 심층적인 지능형 협업은 몰입형 혼합 현실, 다중 모드 상호 작용, 의미 체계 벡터, 공간 모델링 및 유사한 시나리오를 위한 안정적인 데이터 기반을 제공합니다.
 
-<a id="key-features"></a>
-## 주요 기능
+## <a id="key-features"></a>주요 기능
 
 - 🌐 **통합 크로스 플랫폼 데이터 엔진**
   - 모바일, 데스크톱, 웹, 서버 환경 전반에 걸친 통합 API
@@ -84,8 +82,7 @@ ToStore는 대규모 데이터 세트, 복잡한 로컬 AI 생성 및 대규모 
   - 실시간 쿼리 리스너, 다단계 지능형 캐싱 및 커서 페이지 매김 지원
   - 다중 사용자, 로컬 우선, 오프라인 협업 애플리케이션에 적합
 
-<a id="installation"></a>
-## 설치
+## <a id="installation"></a>설치
 
 > [!IMPORTANT]
 > **v2.x에서 업그레이드하시겠습니까?** 중요한 마이그레이션 단계 및 주요 변경 사항에 대해서는 [v3.x 업그레이드 가이드](../UPGRADE_GUIDE_v3.md)를 읽어보세요.
@@ -97,8 +94,7 @@ dependencies:
   tostore: any # Please use the latest version
 ```
 
-<a id="quick-start"></a>
-## 빠른 시작
+## <a id="quick-start"></a>빠른 시작
 
 > [!TIP]
 > **저장 모드를 어떻게 선택해야 합니까?**
@@ -106,8 +102,7 @@ dependencies:
 > 2. [**구조화된 테이블 모드**](#quick-start-table): 복잡한 쿼리, 제약 조건 확인 또는 대규모 데이터 거버넌스가 필요한 핵심 비즈니스 데이터에 가장 적합합니다. 무결성 로직을 엔진에 적용하면 애플리케이션 계층 개발 및 유지 관리 비용을 크게 줄일 수 있습니다.
 > 3. [**메모리 모드**](#quick-start-memory): 임시 계산, 단위 테스트 또는 **초고속 전역 상태 관리**에 가장 적합합니다. 글로벌 쿼리와 `watch` 리스너를 사용하면 수많은 글로벌 변수를 유지하지 않고도 애플리케이션 상호 작용을 재구성할 수 있습니다.
 
-<a id="quick-start-kv"></a>
-### 키-값 저장소(KV)
+### <a id="quick-start-kv"></a>키-값 저장소(KV)
 이 모드는 사전 정의된 구조화된 테이블이 필요하지 않은 경우에 적합합니다. 간단하고 실용적이며 고성능 스토리지 엔진이 지원됩니다. **효율적인 인덱싱 아키텍처는 매우 큰 데이터 규모의 일반 모바일 장치에서도 쿼리 성능을 매우 안정적으로 유지하고 응답성이 뛰어납니다.** 서로 다른 공간의 데이터는 자연스럽게 격리되는 동시에 글로벌 공유도 지원됩니다.
 
 ```dart
@@ -163,8 +158,7 @@ StreamBuilder(
 )
 ```
 
-<a id="quick-start-table"></a>
-### 구조화된 테이블 모드
+### <a id="quick-start-table"></a>구조화된 테이블 모드
 구조화된 테이블의 CRUD를 사용하려면 스키마를 미리 생성해야 합니다([스키마 정의](#schema-definition) 참조). 다양한 시나리오에 권장되는 통합 접근 방식:
 - **모바일/데스크톱**: [자주 시작하는 시나리오](#mobile-integration)의 경우 초기화 시 `schemas`을 전달하는 것이 좋습니다.
 - **서버/에이전트**: [장기 실행 시나리오](#server-integration)의 경우 `createTables`을 통해 동적으로 테이블을 생성하는 것이 좋습니다.
@@ -217,8 +211,7 @@ StreamBuilder(
 );
 ```
 
-<a id="quick-start-memory"></a>
-### 메모리 모드
+### <a id="quick-start-memory"></a>메모리 모드
 
 캐싱, 임시 계산 또는 디스크에 대한 지속성이 필요하지 않은 작업 부하와 같은 시나리오의 경우 `ToStore.memory()`을 통해 순수 메모리 내 데이터베이스를 초기화할 수 있습니다. 이 모드에서는 스키마, 인덱스, 키-값 쌍을 포함한 모든 데이터가 최대 읽기/쓰기 성능을 위해 메모리에 완전히 저장됩니다.
 
@@ -245,8 +238,7 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 ```
 
 
-<a id="schema-definition"></a>
-## 스키마 정의
+## <a id="schema-definition"></a>스키마 정의
 **한 번 정의하면 엔진이 엔드투엔드 자동화 거버넌스를 처리하게 되므로 애플리케이션이 더 이상 과도한 검증 유지 관리를 수행하지 않아도 됩니다.**
 
 다음 모바일, 서버 측 및 에이전트 예제는 모두 여기에 정의된 `appSchemas`을 재사용합니다.
@@ -357,8 +349,7 @@ const appSchemas = [userSchema];
 - **서버/에이전트**: `createTables(appSchemas)`을 통해 런타임에 스키마를 동적으로 생성할 때 가장 적합합니다.
 
 
-<a id="mobile-integration"></a>
-## 모바일, 데스크탑 및 기타 빈번한 시작 시나리오를 위한 통합
+## <a id="mobile-integration"></a>모바일, 데스크탑 및 기타 빈번한 시작 시나리오를 위한 통합
 
 📱 **예**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
 
@@ -404,8 +395,7 @@ await db.close(keepActiveSpace: false);
 ```
 
 
-<a id="server-integration"></a>
-## 서버측/에이전트 통합(장기 실행 시나리오)
+## <a id="server-integration"></a>서버측/에이전트 통합(장기 실행 시나리오)
 
 🖥️ **예**: [server_quickstart.dart](../../example/lib/server_quickstart.dart)
 
@@ -447,14 +437,12 @@ final dbServer = await ToStore.open(
 ```
 
 
-<a id="advanced-usage"></a>
-## 고급 사용법
+## <a id="advanced-usage"></a>고급 사용법
 
 ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능 세트를 제공합니다.
 
 
-<a id="vector-advanced"></a>
-### 벡터 필드, 벡터 인덱스 및 벡터 검색
+### <a id="vector-advanced"></a>벡터 필드, 벡터 인덱스 및 벡터 검색
 
 ```dart
 await db.createTables([
@@ -528,8 +516,7 @@ for (final r in results) {
 - `score`: 정규화된 유사성 점수(일반적으로 `0 ~ 1` 범위) 클수록 더 비슷하다는 뜻
 - `distance`: 거리 값; `l2` 및 `cosine`의 경우 일반적으로 작을수록 더 유사함을 의미합니다.
 
-<a id="ttl-config"></a>
-### 테이블 수준 TTL(자동 시간 기반 만료)
+### <a id="ttl-config"></a>테이블 수준 TTL(자동 시간 기반 만료)
 
 시간이 지남에 따라 만료되어야 하는 로그, 원격 분석, 이벤트 및 기타 데이터의 경우 `ttlConfig`을 통해 테이블 ​​수준 TTL을 정의할 수 있습니다. 엔진은 백그라운드에서 만료된 레코드를 자동으로 정리합니다.
 
@@ -585,8 +572,7 @@ final batchResult = await db.batchUpsert('users', [
 ```
 
 
-<a id="query-advanced"></a>
-### 고급 쿼리
+### <a id="query-advanced"></a>고급 쿼리
 
 ToStore는 유연한 필드 처리 및 복잡한 다중 테이블 관계를 갖춘 선언적 연결 가능 쿼리 API를 제공합니다.
 
@@ -628,8 +614,7 @@ final posts = await db.query('posts')
 
 ---
 
-<a id="aggregation-stats"></a>
-### 집계, 그룹화 및 통계(Agg 및 GroupBy)
+### <a id="aggregation-stats"></a>집계, 그룹화 및 통계(Agg 및 GroupBy)
 
 #### 1. 집계(`Agg` 공장)
 집계 함수는 데이터 세트에 대한 통계를 계산합니다. `alias` 매개변수를 사용하면 결과 필드 이름을 사용자 정의할 수 있습니다.
@@ -681,8 +666,7 @@ if (await db.query('users').whereEqual('email', 'test@test.com').exists()) {
 final cities = await db.query('users').distinct(['city']);
 ```
 
-<a id="query-condition"></a>
-#### 4. `QueryCondition`을 사용한 복잡한 논리
+#### <a id="query-condition"></a>4. `QueryCondition`을 사용한 복잡한 논리
 `QueryCondition`은 중첩 논리 및 괄호로 묶인 쿼리 구성을 위한 ToStore의 핵심 도구입니다. 단순한 연결 `where` 호출로는 `(A AND B) OR (C AND D)`과 같은 표현이 충분하지 않을 때 사용할 수 있는 도구입니다.
 
 - **`condition(QueryCondition sub)`**: `AND` 중첩된 그룹을 엽니다.
@@ -716,8 +700,7 @@ final targetUsers = await db.query('users')
 ```
 
 
-<a id="streaming-query"></a>
-#### 5. 스트리밍 쿼리
+#### <a id="streaming-query"></a>5. 스트리밍 쿼리
 모든 것을 한 번에 메모리에 로드하고 싶지 않은 매우 큰 데이터 세트에 적합합니다. 결과를 읽으면서 처리할 수 있습니다.
 
 ```dart
@@ -726,8 +709,7 @@ db.streamQuery('users').listen((data) {
 });
 ```
 
-<a id="reactive-query"></a>
-#### 6. 반응형 쿼리
+#### <a id="reactive-query"></a>6. 반응형 쿼리
 `watch()` 메서드를 사용하면 쿼리 결과를 실시간으로 모니터링할 수 있습니다. `Stream`을 반환하고 대상 테이블에서 일치하는 데이터가 변경될 때마다 자동으로 쿼리를 다시 실행합니다.
 - **자동 디바운스**: 내장된 지능형 디바운싱으로 중복된 쿼리 급증을 방지합니다.
 - **UI 동기화**: 실시간 업데이트 목록을 위해 Flutter `StreamBuilder`와 자연스럽게 작동합니다.
@@ -756,8 +738,7 @@ StreamBuilder<List<Map<String, dynamic>>>(
 
 ---
 
-<a id="query-cache"></a>
-### 수동 쿼리 결과 캐싱(선택 사항)
+### <a id="query-cache"></a>수동 쿼리 결과 캐싱(선택 사항)
 
 > [!IMPORTANT]
 > **ToStore에는 이미 내부적으로 효율적인 다단계 지능형 LRU 캐시가 포함되어 있습니다.**
@@ -776,8 +757,7 @@ final results = await db.query('heavy_table')
 ```
 
 
-<a id="query-pagination"></a>
-### 쿼리 및 효율적인 페이지 매김
+### <a id="query-pagination"></a>쿼리 및 효율적인 페이지 매김
 
 > [!TIP]
 > **최고의 성능을 위해 항상 `limit`을 지정하세요**: 모든 쿼리에 `limit`을 명시적으로 제공하는 것이 좋습니다. 생략하면 엔진의 기본값은 1000행입니다. 핵심 쿼리 엔진은 빠르지만 애플리케이션 계층에서 매우 큰 결과 집합을 직렬화하면 여전히 불필요한 오버헤드가 추가될 수 있습니다.
@@ -829,8 +809,7 @@ final prevPage = await db.query('users')
 | **변경 시 일관성** | 데이터 변경으로 인해 행 건너뛰기가 발생할 수 있음 | 데이터 변경으로 인한 중복 및 누락 방지 |
 
 
-<a id="foreign-keys"></a>
-### 외래 키 및 계단식 배열
+### <a id="foreign-keys"></a>외래 키 및 계단식 배열
 
 외래 키는 참조 무결성을 보장하고 계단식 업데이트 및 삭제를 구성할 수 있도록 해줍니다. 쓰기 및 업데이트 시 관계의 유효성이 검사됩니다. 캐스케이드 정책이 활성화되면 관련 데이터가 자동으로 업데이트되어 애플리케이션 코드의 일관성 작업이 줄어듭니다.
 
@@ -866,8 +845,7 @@ await db.createTables([
 ```
 
 
-<a id="query-operators"></a>
-### 쿼리 연산자
+### <a id="query-operators"></a>쿼리 연산자
 
 모든 `where(field, operator, value)` 조건은 다음 연산자를 지원합니다(대소문자 구분 안 함).
 
@@ -957,8 +935,7 @@ final users = await db.query('users')
 >    *   **패턴 불일치**: `NOT LIKE`.
 >    *   *설명: 위 작업은 인덱스가 구성되어 있더라도 일반적으로 전체 데이터 저장 영역을 탐색해야 합니다. 모바일이나 작은 데이터 세트에서는 영향이 미미하지만, 분산형 또는 초대형 데이터 분석 시나리오에서는 다른 인덱스 조건(예: ID 또는 시간 범위별 데이터 필터링) 및 `limit` 절과 결합하여 신중하게 사용해야 합니다.*
 
-<a id="distributed-architecture"></a>
-## 분산 아키텍처
+## <a id="distributed-architecture"></a>분산 아키텍처
 
 ```dart
 // Configure distributed nodes
@@ -990,8 +967,7 @@ await for (final record in db.streamQuery('vector_data')
 }
 ```
 
-<a id="primary-key-examples"></a>
-## 기본 키 예
+## <a id="primary-key-examples"></a>기본 키 예
 
 ToStore는 다양한 비즈니스 시나리오에 대해 여러 분산 기본 키 알고리즘을 제공합니다.
 
@@ -1019,8 +995,7 @@ await db.createTables([
 ```
 
 
-<a id="atomic-expressions"></a>
-## 원자 표현
+## <a id="atomic-expressions"></a>원자 표현
 
 표현식 시스템은 유형이 안전한 원자 필드 업데이트를 제공합니다. 모든 계산은 데이터베이스 계층에서 원자적으로 실행되어 동시 충돌을 방지합니다.
 
@@ -1073,8 +1048,7 @@ await db.upsert('orders', {
 });
 ```
 
-<a id="transactions"></a>
-## 거래
+## <a id="transactions"></a>거래
 
 트랜잭션은 여러 작업에서 원자성을 보장합니다. 즉, 모든 것이 성공하거나 모든 것이 롤백되어 데이터 일관성이 유지됩니다.
 
@@ -1118,8 +1092,7 @@ final txResult2 = await db.transaction(() async {
 ```
 
 
-<a id="database-maintenance"></a>
-### 관리 및 유지 관리
+### <a id="database-maintenance"></a>관리 및 유지 관리
 
 다음 API는 플러그인 스타일 개발, 관리 패널 및 운영 시나리오를 위한 데이터베이스 관리, 진단 및 유지 관리를 다룹니다.
 
@@ -1168,8 +1141,7 @@ print(configInfo.toJson());
 ```
 
 
-<a id="backup-restore"></a>
-### 백업 및 복원
+### <a id="backup-restore"></a>백업 및 복원
 
 단일 사용자 로컬 가져오기/내보내기, 대규모 오프라인 데이터 마이그레이션 및 오류 후 시스템 롤백에 특히 유용합니다.
 
@@ -1199,8 +1171,7 @@ final restored = await db.restore(
 );
 ```
 
-<a id="error-handling"></a>
-### 상태 코드 및 오류 처리
+### <a id="error-handling"></a>상태 코드 및 오류 처리
 
 
 ToStore는 데이터 작업에 통합 응답 모델을 사용합니다.
@@ -1289,8 +1260,7 @@ if (txResult.isFailed) {
 - `TransactionErrorType.unknown`: 기타 오류
 
 
-<a id="logging-diagnostics"></a>
-### 로그 콜백 및 데이터베이스 진단
+### <a id="logging-diagnostics"></a>로그 콜백 및 데이터베이스 진단
 
 ToStore는 시작, 복구, 자동 마이그레이션 및 런타임 제약 조건 충돌 로그를 `LogConfig.setConfig(...)`을 통해 비즈니스 계층으로 다시 라우팅할 수 있습니다.
 
@@ -1315,8 +1285,7 @@ ToStore는 시작, 복구, 자동 마이그레이션 및 런타임 제약 조건
 ```
 
 
-<a id="security-config"></a>
-## 보안 구성
+## <a id="security-config"></a>보안 구성
 
 > [!WARNING]
 > **키 관리**: **`encodingKey`** 자유롭게 변경할 수 있으며 엔진이 자동으로 데이터를 마이그레이션하므로 데이터를 복구 가능한 상태로 유지합니다. **`encryptionKey`** 임의로 변경하면 안 됩니다. 변경된 후에는 명시적으로 마이그레이션하지 않는 한 오래된 데이터를 해독할 수 없습니다. 민감한 키를 하드코딩하지 마세요. 보안 서비스에서 가져오는 것이 좋습니다.
@@ -1371,8 +1340,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
 
-<a id="advanced-config"></a>
-## 고급 구성 설명(DataStoreConfig)
+## <a id="advanced-config"></a>고급 구성 설명(DataStoreConfig)
 
 > [!TIP]
 > **제로 구성 인텔리전스**
@@ -1402,8 +1370,7 @@ final db = await ToStore.open(
 
 ---
 
-<a id="performance"></a>
-## 성능 및 경험
+## <a id="performance"></a>성능 및 경험
 
 ### 벤치마크
 
@@ -1434,8 +1401,7 @@ ToStore가 도움이 되셨다면 ⭐️댓글 부탁드려요
 > **권장사항**: 프런트엔드 앱 개발의 경우 데이터 요청, 로드, 저장, 캐싱 및 프레젠테이션을 자동화하고 통합하는 풀 스택 솔루션을 제공하는 [ToApp 프레임워크](https://github.com/tocreator/toapp)을 고려하세요.
 
 
-<a id="more-resources"></a>
-## 추가 리소스
+## <a id="more-resources"></a>추가 리소스
 
 - 📖 **문서**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **문제 보고**: [GitHub 문제](https://github.com/tocreator/tostore/issues)

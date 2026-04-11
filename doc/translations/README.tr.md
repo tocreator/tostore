@@ -36,8 +36,7 @@
 - **Gelişmiş ve Performans**: [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - **Operasyonlar ve Güvenlik**: [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
 
-<a id="why-tostore"></a>
-## Neden ToStore'u Seçmelisiniz?
+## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
 ToStore, AGI dönemi ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Yerel olarak dağıtılmış sistemleri, çok modlu füzyonu, ilişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı destekler. Kendi Kendini Yönlendiren düğüm mimarisi ve sinir ağından ilham alan bir motor üzerine inşa edilmiş olup, performansı veri ölçeğinden mantıksal olarak ayırırken düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlar. ACID işlemlerini, karmaşık ilişkisel sorguları (JOIN'ler ve basamaklı yabancı anahtarlar), tablo düzeyinde TTL ve toplamaların yanı sıra birden fazla dağıtılmış birincil anahtar algoritması, atomik ifadeler, şema değişikliği tanıma, şifreleme, çok alanlı veri izolasyonu, kaynağa duyarlı akıllı yük planlaması ve felaket/çökme kendi kendini onaran kurtarmayı içerir.
 
@@ -45,8 +44,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe aracılar, sensörler ve d
 
 ToStore, büyük veri kümeleri, karmaşık yerel yapay zeka üretimi ve büyük ölçekli veri hareketi için yeterince güçlü uç dağıtılmış yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, sürükleyici karma gerçeklik, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme ve benzer senaryolar için güvenilir bir veri temeli sağlar.
 
-<a id="key-features"></a>
-## Temel Özellikler
+## <a id="key-features"></a>Temel Özellikler
 
 - 🌐 **Birleşik Platformlar Arası Veri Motoru**
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
@@ -84,8 +82,7 @@ ToStore, büyük veri kümeleri, karmaşık yerel yapay zeka üretimi ve büyük
   - Gerçek zamanlı sorgu dinleyicilerini, çok düzeyli akıllı önbelleğe almayı ve imleç sayfalandırmayı destekler
   - Çok kullanıcılı, öncelikli yerel ve çevrimdışı işbirliğine dayalı uygulamalara uygundur
 
-<a id="installation"></a>
-## Kurulum
+## <a id="installation"></a>Kurulum
 
 > [!IMPORTANT]
 > **V2.x'ten yükseltme mi yapıyorsunuz?** Kritik geçiş adımları ve önemli değişiklikler için lütfen [v3.x Yükseltme Kılavuzu](../UPGRADE_GUIDE_v3.md)'nu okuyun.
@@ -97,8 +94,7 @@ dependencies:
   tostore: any # Please use the latest version
 ```
 
-<a id="quick-start"></a>
-## Hızlı Başlangıç
+## <a id="quick-start"></a>Hızlı Başlangıç
 
 > [!TIP]
 > **Depolama modunu nasıl seçmelisiniz?**
@@ -106,8 +102,7 @@ dependencies:
 > 2. [**Yapılandırılmış Tablo Modu**](#quick-start-table): Karmaşık sorgular, kısıtlama doğrulama veya büyük ölçekli veri yönetimi gerektiren temel iş verileri için en iyisi. Bütünlük mantığını motora aktararak uygulama katmanı geliştirme ve bakım maliyetlerini önemli ölçüde azaltabilirsiniz.
 > 3. [**Bellek Modu**](#quick-start-memory): Geçici hesaplama, birim testleri veya **ultra hızlı küresel durum yönetimi** için en iyisi. Global sorgular ve `watch` dinleyicilerle, bir yığın global değişkeni muhafaza etmeden uygulama etkileşimini yeniden şekillendirebilirsiniz.
 
-<a id="quick-start-kv"></a>
-### Anahtar-Değer Depolama (KV)
+### <a id="quick-start-kv"></a>Anahtar-Değer Depolama (KV)
 Bu mod, önceden tanımlanmış yapılandırılmış tablolara ihtiyacınız olmadığında uygundur. Basittir, pratiktir ve yüksek performanslı bir depolama motoruyla desteklenir. **Etkili indeksleme mimarisi, çok büyük veri ölçeklerindeki sıradan mobil cihazlarda bile sorgu performansını son derece istikrarlı ve son derece duyarlı tutar.** Farklı Alanlardaki veriler doğal olarak izole edilirken küresel paylaşım da desteklenir.
 
 ```dart
@@ -163,8 +158,7 @@ StreamBuilder(
 )
 ```
 
-<a id="quick-start-table"></a>
-### Yapılandırılmış Tablo Modu
+### <a id="quick-start-table"></a>Yapılandırılmış Tablo Modu
 Yapılandırılmış tablolardaki CRUD, şemanın önceden oluşturulmasını gerektirir (bkz. [Şema Tanımı](#schema-definition)). Farklı senaryolar için önerilen entegrasyon yaklaşımları:
 - **Mobil/Masaüstü**: [Sık başlatma senaryoları](#mobile-integration) için, başlatma sırasında `schemas` iletilmesi önerilir.
 - **Sunucu/Aracı**: [Uzun süren senaryolar](#server-integration) için, tabloların `createTables` aracılığıyla dinamik olarak oluşturulması önerilir.
@@ -217,8 +211,7 @@ StreamBuilder(
 );
 ```
 
-<a id="quick-start-memory"></a>
-### Hafıza Modu
+### <a id="quick-start-memory"></a>Hafıza Modu
 
 Önbelleğe alma, geçici hesaplama veya diskte kalıcılık gerektirmeyen iş yükleri gibi senaryolar için, `ToStore.memory()` aracılığıyla saf bir bellek içi veritabanını başlatabilirsiniz. Bu modda, şemalar, dizinler ve anahtar/değer çiftleri de dahil olmak üzere tüm veriler, maksimum okuma/yazma performansı için tamamen bellekte saklanır.
 
@@ -245,8 +238,7 @@ await memDb.insert('active_users', {'name': 'Marley', 'status': 'online'});
 ```
 
 
-<a id="schema-definition"></a>
-## Şema Tanımı
+## <a id="schema-definition"></a>Şema Tanımı
 **Bir kez tanımlayın ve uygulamanızın artık ağır doğrulama bakımı gerektirmemesi için motorun uçtan uca otomatik yönetimi yönetmesine izin verin.**
 
 Aşağıdaki mobil, sunucu tarafı ve aracı örneklerinin tümü, burada tanımlanan `appSchemas`'yi yeniden kullanır.
@@ -357,8 +349,7 @@ Ayrıca `unique: true` otomatik olarak tek alanlı benzersiz bir dizin oluşturu
 - **Sunucu/Aracı**: Çalışma zamanında `createTables(appSchemas)` aracılığıyla dinamik olarak şemalar oluştururken en iyisidir
 
 
-<a id="mobile-integration"></a>
-## Mobil, Masaüstü ve Diğer Sık Başlatma Senaryoları için Entegrasyon
+## <a id="mobile-integration"></a>Mobil, Masaüstü ve Diğer Sık Başlatma Senaryoları için Entegrasyon
 
 📱 **Örnek**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
 
@@ -404,8 +395,7 @@ await db.close(keepActiveSpace: false);
 ```
 
 
-<a id="server-integration"></a>
-## Sunucu Tarafı / Aracı Entegrasyonu (Uzun Süreli Senaryolar)
+## <a id="server-integration"></a>Sunucu Tarafı / Aracı Entegrasyonu (Uzun Süreli Senaryolar)
 
 🖥️ **Örnek**: [sunucu_hızlıbaşlangıç.dart](../../example/lib/server_quickstart.dart)
 
@@ -447,14 +437,12 @@ final dbServer = await ToStore.open(
 ```
 
 
-<a id="advanced-usage"></a>
-## Gelişmiş Kullanım
+## <a id="advanced-usage"></a>Gelişmiş Kullanım
 
 ToStore, karmaşık iş senaryoları için zengin bir dizi gelişmiş yetenek sağlar:
 
 
-<a id="vector-advanced"></a>
-### Vektör Alanları, Vektör İndeksleri ve Vektör Arama
+### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Vektör Arama
 
 ```dart
 await db.createTables([
@@ -528,8 +516,7 @@ Sonuç notları:
 - `score`: normalleştirilmiş benzerlik puanı, genellikle `0 ~ 1` aralığında; daha büyük, daha benzer anlamına gelir
 - `distance`: mesafe değeri; `l2` ve `cosine` için daha küçük, genellikle daha benzer anlamına gelir
 
-<a id="ttl-config"></a>
-### Tablo düzeyinde TTL (Otomatik Zamana Dayalı Sona Erme)
+### <a id="ttl-config"></a>Tablo düzeyinde TTL (Otomatik Zamana Dayalı Sona Erme)
 
 Günlükler, telemetri, olaylar ve zamanla sona ermesi gereken diğer veriler için tablo düzeyinde TTL'yi `ttlConfig` aracılığıyla tanımlayabilirsiniz. Motor, süresi dolmuş kayıtları arka planda otomatik olarak temizleyecektir:
 
@@ -585,8 +572,7 @@ final batchResult = await db.batchUpsert('users', [
 ```
 
 
-<a id="query-advanced"></a>
-### Gelişmiş Sorgular
+### <a id="query-advanced"></a>Gelişmiş Sorgular
 
 ToStore, esnek alan işleme ve karmaşık çoklu tablo ilişkileriyle bildirim temelli zincirlenebilir bir sorgu API'si sağlar.
 
@@ -628,8 +614,7 @@ final posts = await db.query('posts')
 
 ---
 
-<a id="aggregation-stats"></a>
-### Toplama, Gruplandırma ve İstatistik (Toplama ve Gruplandırma)
+### <a id="aggregation-stats"></a>Toplama, Gruplandırma ve İstatistik (Toplama ve Gruplandırma)
 
 #### 1. Toplama (`Agg` fabrika)
 Toplama işlevleri, bir veri kümesi üzerinden istatistikleri hesaplar. `alias` parametresiyle sonuç alanı adlarını özelleştirebilirsiniz.
@@ -681,8 +666,7 @@ if (await db.query('users').whereEqual('email', 'test@test.com').exists()) {
 final cities = await db.query('users').distinct(['city']);
 ```
 
-<a id="query-condition"></a>
-#### 4. `QueryCondition` ile Karmaşık Mantık
+#### <a id="query-condition"></a>4. `QueryCondition` ile Karmaşık Mantık
 `QueryCondition`, ToStore'un iç içe mantık ve parantezli sorgu oluşturmaya yönelik temel aracıdır. Basit zincirleme `where` çağrıları `(A AND B) OR (C AND D)` gibi ifadeler için yeterli olmadığında kullanılacak araç budur.
 
 - **`condition(QueryCondition sub)`**: `AND` iç içe geçmiş bir grubu açar
@@ -716,8 +700,7 @@ final targetUsers = await db.query('users')
 ```
 
 
-<a id="streaming-query"></a>
-#### 5. Akış Sorgusu
+#### <a id="streaming-query"></a>5. Akış Sorgusu
 Her şeyi aynı anda belleğe yüklemek istemediğinizde çok büyük veri kümeleri için uygundur. Sonuçlar okundukça işlenebilir.
 
 ```dart
@@ -726,8 +709,7 @@ db.streamQuery('users').listen((data) {
 });
 ```
 
-<a id="reactive-query"></a>
-#### 6. Reaktif Sorgu
+#### <a id="reactive-query"></a>6. Reaktif Sorgu
 `watch()` yöntemi, sorgu sonuçlarını gerçek zamanlı olarak izlemenizi sağlar. Bir `Stream` döndürür ve hedef tabloda eşleşen veriler değiştiğinde sorguyu otomatik olarak yeniden çalıştırır.
 - **Otomatik geri dönme**: yerleşik akıllı geri dönme, gereksiz sorgu patlamalarını önler
 - **UI senkronizasyonu**: canlı güncelleme listeleri için Flutter `StreamBuilder` ile doğal olarak çalışır
@@ -756,8 +738,7 @@ StreamBuilder<List<Map<String, dynamic>>>(
 
 ---
 
-<a id="query-cache"></a>
-### Manuel Sorgu Sonucunu Önbelleğe Alma (İsteğe bağlı)
+### <a id="query-cache"></a>Manuel Sorgu Sonucunu Önbelleğe Alma (İsteğe bağlı)
 
 > [!IMPORTANT]
 > **ToStore zaten dahili olarak verimli, çok seviyeli bir akıllı LRU önbelleği içerir.**
@@ -776,8 +757,7 @@ final results = await db.query('heavy_table')
 ```
 
 
-<a id="query-pagination"></a>
-### Sorgu ve Verimli Sayfalandırma
+### <a id="query-pagination"></a>Sorgu ve Verimli Sayfalandırma
 
 > [!TIP]
 > **En iyi performans için her zaman `limit`'yi belirtin**: Her sorguda açıkça `limit` sağlanması kesinlikle önerilir. Atlanırsa motor varsayılan olarak 1000 satıra ayarlanır. Çekirdek sorgu motoru hızlıdır ancak uygulama katmanında çok büyük sonuç kümelerinin serileştirilmesi yine de gereksiz ek yük getirebilir.
@@ -829,8 +809,7 @@ final prevPage = await db.query('users')
 | **Değişiklikler altında tutarlılık** | Veri değişiklikleri satırların atlanmasına neden olabilir | Veri değişikliklerinden kaynaklanan kopyaları ve atlamaları önler |
 
 
-<a id="foreign-keys"></a>
-### Yabancı Anahtarlar ve Basamaklı
+### <a id="foreign-keys"></a>Yabancı Anahtarlar ve Basamaklı
 
 Yabancı anahtarlar bilgi bütünlüğünü garanti eder ve basamaklı güncellemeleri ve silmeleri yapılandırmanıza olanak tanır. İlişkiler yazma ve güncelleme sırasında doğrulanır. Basamaklı ilkeler etkinleştirilirse ilgili veriler otomatik olarak güncellenir ve uygulama kodundaki tutarlılık çalışması azalır.
 
@@ -866,8 +845,7 @@ await db.createTables([
 ```
 
 
-<a id="query-operators"></a>
-### Sorgu Operatörleri
+### <a id="query-operators"></a>Sorgu Operatörleri
 
 Tüm `where(field, operator, value)` koşulları aşağıdaki operatörleri destekler (büyük/küçük harfe duyarlı değildir):
 
@@ -957,8 +935,7 @@ final users = await db.query('users')
 >    *   **Desen uyuşmazlığı**: `NOT LIKE`.
 >    *   *Açıklama: Yukarıdaki işlemler genellikle bir indeks oluşturulmuş olsa bile tüm veri depolama alanının taranmasını gerektirir. Mobil cihazlarda veya küçük veri kümelerinde etkisi minimum olsa da, dağıtılmış analiz veya ultra büyük veri senaryolarında bunlar dikkatli kullanılmalı, diğer indeks koşullarıyla (örneğin, ID veya zaman aralığına göre verileri daraltma) ve `limit` ifadesiyle birleştirilmelidir.*
 
-<a id="distributed-architecture"></a>
-## Dağıtık Mimari
+## <a id="distributed-architecture"></a>Dağıtık Mimari
 
 ```dart
 // Configure distributed nodes
@@ -990,8 +967,7 @@ await for (final record in db.streamQuery('vector_data')
 }
 ```
 
-<a id="primary-key-examples"></a>
-## Birincil Anahtar Örnekleri
+## <a id="primary-key-examples"></a>Birincil Anahtar Örnekleri
 
 ToStore, farklı iş senaryoları için birden fazla dağıtılmış birincil anahtar algoritması sağlar:
 
@@ -1019,8 +995,7 @@ await db.createTables([
 ```
 
 
-<a id="atomic-expressions"></a>
-## Atomik İfadeler
+## <a id="atomic-expressions"></a>Atomik İfadeler
 
 İfade sistemi, tür açısından güvenli atom alanı güncellemeleri sağlar. Tüm hesaplamalar veritabanı katmanında atomik olarak yürütülür ve eşzamanlı çakışmalar önlenir:
 
@@ -1073,8 +1048,7 @@ await db.upsert('orders', {
 });
 ```
 
-<a id="transactions"></a>
-## İşlemler
+## <a id="transactions"></a>İşlemler
 
 İşlemler birden fazla işlem arasında atomiklik sağlar: ya her şey başarılı olur ya da her şey geri alınarak veri tutarlılığı korunur.
 
@@ -1118,8 +1092,7 @@ final txResult2 = await db.transaction(() async {
 ```
 
 
-<a id="database-maintenance"></a>
-### Yönetim ve Bakım
+### <a id="database-maintenance"></a>Yönetim ve Bakım
 
 Aşağıdaki API'ler, eklenti tarzı geliştirme, yönetici panelleri ve operasyonel senaryolar için veritabanı yönetimini, tanılamayı ve bakımı kapsar:
 
@@ -1168,8 +1141,7 @@ print(configInfo.toJson());
 ```
 
 
-<a id="backup-restore"></a>
-### Yedekleme ve Geri Yükleme
+### <a id="backup-restore"></a>Yedekleme ve Geri Yükleme
 
 Özellikle tek kullanıcılı yerel içe/dışa aktarım, büyük çevrimdışı veri geçişi ve arıza sonrasında sistemin geri alınması için kullanışlıdır:
 
@@ -1199,8 +1171,7 @@ final restored = await db.restore(
 );
 ```
 
-<a id="error-handling"></a>
-### Durum Kodları ve Hata İşleme
+### <a id="error-handling"></a>Durum Kodları ve Hata İşleme
 
 
 ToStore, veri işlemleri için birleşik bir yanıt modeli kullanır:
@@ -1289,8 +1260,7 @@ if (txResult.isFailed) {
 - `TransactionErrorType.unknown`: başka herhangi bir hata
 
 
-<a id="logging-diagnostics"></a>
-### Günlük Geri Arama ve Veritabanı Tanılama
+### <a id="logging-diagnostics"></a>Günlük Geri Arama ve Veritabanı Tanılama
 
 ToStore, başlatma, kurtarma, otomatik geçiş ve çalışma zamanı kısıtlama çakışması günlüklerini `LogConfig.setConfig(...)` aracılığıyla iş katmanına geri yönlendirebilir.
 
@@ -1315,8 +1285,7 @@ ToStore, başlatma, kurtarma, otomatik geçiş ve çalışma zamanı kısıtlama
 ```
 
 
-<a id="security-config"></a>
-## Güvenlik Yapılandırması
+## <a id="security-config"></a>Güvenlik Yapılandırması
 
 > [!WARNING]
 > **Anahtar yönetimi**: **`encodingKey`** serbestçe değiştirilebilir ve motor, verileri otomatik olarak taşıyarak verilerin kurtarılabilir kalmasını sağlar. **`encryptionKey`** rastgele değiştirilmemelidir. Bir kez değiştirildikten sonra, siz açıkça taşımadığınız sürece eski verilerin şifresi çözülemez. Hassas anahtarları hiçbir zaman sabit kodlamayın; bunları güvenli bir servisten almanız önerilir.
@@ -1371,8 +1340,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 ```
 
 
-<a id="advanced-config"></a>
-## Gelişmiş Yapılandırma Açıklaması (DataStoreConfig)
+## <a id="advanced-config"></a>Gelişmiş Yapılandırma Açıklaması (DataStoreConfig)
 
 > [!TIP]
 > **Sıfır Yapılandırma zekası**
@@ -1402,8 +1370,7 @@ final db = await ToStore.open(
 
 ---
 
-<a id="performance"></a>
-## Performans ve Deneyim
+## <a id="performance"></a>Performans ve Deneyim
 
 ### Karşılaştırmalar
 
@@ -1434,8 +1401,7 @@ Projeyi desteklemenin en iyi yollarından biridir. Çok teşekkür ederim.
 > **Öneri**: Ön uç uygulama geliştirme için, veri isteklerini, yüklemeyi, depolamayı, önbelleğe almayı ve sunumu otomatikleştiren ve birleştiren tam kapsamlı bir çözüm sağlayan [ToApp çerçevesi](https://github.com/tocreator/toapp)'yi göz önünde bulundurun.
 
 
-<a id="more-resources"></a>
-## Daha Fazla Kaynak
+## <a id="more-resources"></a>Daha Fazla Kaynak
 
 - 📖 **Belgeler**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Sorun Bildirme**: [GitHub Sorunları](https://github.com/tocreator/tostore/issues)
