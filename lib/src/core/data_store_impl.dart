@@ -1960,10 +1960,15 @@ class DataStoreImpl {
       return QueryCondition()..where(pk, '=', pkVal);
     }
     for (final idx in uniqueIndexes) {
-      if (idx.fields.every((f) => data.containsKey(f) && data[f] != null)) {
+      final canKey = schema.createCanonicalIndexKey(idx.fields, data);
+      if (canKey != null) {
         final cond = QueryCondition();
-        for (final f in idx.fields) {
-          cond.where(f, '=', data[f]);
+        if (canKey is List) {
+          for (int i = 0; i < idx.fields.length; i++) {
+            cond.where(idx.fields[i], '=', canKey[i]);
+          }
+        } else {
+          cond.where(idx.fields.first, '=', canKey);
         }
         return cond;
       }
@@ -1983,11 +1988,9 @@ class DataStoreImpl {
       return 'upsert:$tableName:pk:${pkVal.toString()}';
     }
     for (final idx in uniqueIndexes) {
-      if (idx.fields.every((f) => data.containsKey(f) && data[f] != null)) {
-        final canKey = schema.createCanonicalIndexKey(idx.fields, data);
-        if (canKey != null && canKey.isNotEmpty) {
-          return 'upsert:$tableName:uniq:${idx.actualIndexName}:$canKey';
-        }
+      final canKey = schema.createCanonicalIndexKey(idx.fields, data);
+      if (canKey != null && (canKey is! String || canKey.isNotEmpty)) {
+        return 'upsert:$tableName:uniq:${idx.actualIndexName}:$canKey';
       }
     }
     return null;

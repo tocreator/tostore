@@ -108,23 +108,22 @@ class MigrationManager {
             continue;
           }
 
-          // Generate rename table operation
-          final operations = <MigrationOperation>[
-            MigrationOperation(
-              type: MigrationType.renameTable,
-              newTableName: newSchema.name,
-            ),
-          ];
-
-          // Compare possible structure changes after renaming
+          // Compare possible structure changes
           final schemaOperations = await _compareSchemasAndGenerateOperations(
             oldSchema,
             newSchema,
             renamedTableTargets: renamedTableTargets,
           );
 
-          // Merge operations
+          // Generate final operations list
+          final operations = <MigrationOperation>[];
+          // 1. First add structural changes (performed on the old table name)
           operations.addAll(schemaOperations);
+          // 2. Finally add the table rename operation
+          operations.add(MigrationOperation(
+            type: MigrationType.renameTable,
+            newTableName: newSchema.name,
+          ));
 
           if (!SystemTable.isSystemTable(oldTableName)) {
             Logger.info(
@@ -1078,7 +1077,7 @@ class MigrationManager {
     final operations = <MigrationOperation>[];
 
     // Check field changes
-    _compareFields(normalizedOldSchema, normalizedNewSchema, operations);
+    await _compareFields(normalizedOldSchema, normalizedNewSchema, operations);
 
     // check primary key config change
     if (_isPrimaryKeyConfigChanged(normalizedOldSchema, normalizedNewSchema)) {
@@ -1233,11 +1232,11 @@ class MigrationManager {
   }
 
   /// Compare fields and generate operations
-  void _compareFields(
+  Future<void> _compareFields(
     TableSchema oldSchema,
     TableSchema newSchema,
     List<MigrationOperation> operations,
-  ) {
+  ) async {
     // check added fields
     for (var newField in newSchema.fields) {
       if (!oldSchema.fields.any((f) => f.name == newField.name)) {
@@ -1294,7 +1293,7 @@ class MigrationManager {
     }
 
     // Check for renamed fields
-    _detectRenamedFields(oldSchema, newSchema, operations);
+    await _detectRenamedFields(oldSchema, newSchema, operations);
   }
 
   /// Compare indexes and generate operations
@@ -1489,11 +1488,11 @@ class MigrationManager {
   }
 
   /// Detect renamed fields using strict matching
-  void _detectRenamedFields(
+  Future<void> _detectRenamedFields(
     TableSchema oldSchema,
     TableSchema newSchema,
     List<MigrationOperation> operations,
-  ) {
+  ) async {
     // Get removed and added fields
     final removedFields = operations
         .where((op) => op.type == MigrationType.removeField)
@@ -1513,7 +1512,7 @@ class MigrationManager {
 
     // if there are still fields to match, match by similarity
     if (removedFields.isNotEmpty && addedFields.isNotEmpty) {
-      _detectRenamedFieldsBySimilarityParallel(
+      await _detectRenamedFieldsBySimilarityParallel(
           oldSchema, newSchema, operations, removedFields, addedFields);
     }
   }
@@ -2267,14 +2266,14 @@ class MigrationManager {
     final typePriority = {
       MigrationType.setPrimaryKeyConfig: 1,
       MigrationType.setTableTtlConfig: 2,
-      MigrationType.renameTable: 3,
-      MigrationType.addField: 4,
-      MigrationType.modifyField: 5,
-      MigrationType.renameField: 6,
-      MigrationType.removeField: 7,
-      MigrationType.addIndex: 8,
-      MigrationType.modifyIndex: 9,
-      MigrationType.removeIndex: 10,
+      MigrationType.addIndex: 3,
+      MigrationType.modifyIndex: 4,
+      MigrationType.removeIndex: 5,
+      MigrationType.addField: 6,
+      MigrationType.modifyField: 7,
+      MigrationType.renameField: 8,
+      MigrationType.removeField: 9,
+      MigrationType.renameTable: 10,
       MigrationType.dropTable: 11,
     };
 
