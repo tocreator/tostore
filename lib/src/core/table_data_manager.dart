@@ -3481,6 +3481,7 @@ class TableDataManager {
     bool includeMin = true,
     bool includeMax = true,
     String? cursorPk,
+    bool decodeRecord = true,
     required bool Function(Map<String, dynamic>) onRecord,
   }) async {
     final isMemoryMode =
@@ -3495,6 +3496,7 @@ class TableDataManager {
         limit: limit,
         recordPredicate: recordPredicate,
         onRecord: (r) => onRecord(r),
+        decodeRecord: decodeRecord,
       );
       return;
     }
@@ -3625,6 +3627,7 @@ class TableDataManager {
     bool includeMin = true,
     bool includeMax = true,
     String? cursorPk,
+    bool decodeRecord = true,
   }) async {
     final rangeMgr = _dataStore.tableTreePartitionManager;
     final isMemoryMode =
@@ -3659,6 +3662,7 @@ class TableDataManager {
       includeMin: includeMin,
       includeMax: includeMax,
       cursorPk: cursorPk,
+      decodeRecord: decodeRecord,
       onRecord: (r) {
         out.add(r);
         return true;
@@ -3707,9 +3711,16 @@ class TableDataManager {
       // but later removed during mergeConsistency.
       final pk = r[primaryKey]?.toString();
       if (pk != null) {
-        final be = bufferMgr.getBufferedRecord(tableName, pk);
-        if (be != null && be.operation == BufferOperationType.delete) {
-          return false;
+        if (onlyCount) {
+          // Skip if in buffer for onlyCount fast path to avoid double counting
+          if (bufferMgr.getBufferedRecord(tableName, pk) != null) {
+            return false;
+          }
+        } else {
+          final be = bufferMgr.getBufferedRecord(tableName, pk);
+          if (be != null && be.operation == BufferOperationType.delete) {
+            return false;
+          }
         }
       }
 
@@ -3790,6 +3801,26 @@ class TableDataManager {
       final batchRes = await queryRecordsBatch(tableName, keys);
       final recs = batchRes.records;
 
+      if (onlyCount) {
+        int filteredCount = 0;
+        for (final r in recs) {
+          if (recordMatches(r)) {
+            filteredCount++;
+          }
+        }
+        int finalCount = filteredCount;
+        if (offset != null && offset > 0) {
+          finalCount = max(0, finalCount - offset);
+        }
+        if (limit != null && finalCount > limit) {
+          finalCount = limit;
+        }
+        return TableScanResult(
+          records: const [],
+          count: finalCount,
+        );
+      }
+
       final filtered = <Map<String, dynamic>>[];
       for (final r in recs) {
         if (recordMatches(r)) {
@@ -3810,8 +3841,7 @@ class TableDataManager {
       // Apply Offset/Limit in memory
       if (offset != null && offset > 0) {
         if (offset >= filtered.length) {
-          return TableScanResult(
-              records: const [], count: onlyCount ? 0 : null);
+          return TableScanResult(records: const []);
         }
         filtered.removeRange(0, offset);
       }
@@ -3831,8 +3861,7 @@ class TableDataManager {
       }
 
       return TableScanResult(
-        records: onlyCount ? const [] : filtered,
-        count: onlyCount ? filtered.length : null,
+        records: filtered,
       );
     }
 
@@ -4030,6 +4059,7 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+          decodeRecord: (filter != null || (matcher != null && matcher.fields.any((f) => f != primaryKey))),
           onRecord: (r) {
             totalCount++;
             return true;
@@ -4080,7 +4110,9 @@ class TableDataManager {
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
         );
-        return TableScanResult(records: out);
+        return TableScanResult(
+          records: out,
+        );
       }
     }
 
@@ -4141,7 +4173,10 @@ class TableDataManager {
         if (offset != null && offset > 0) {
           finalCount = max(0, finalCount - offset);
         }
-        return TableScanResult(records: const [], count: finalCount);
+        return TableScanResult(
+          records: const [],
+          count: finalCount,
+        );
       }
       if (aggregations != null && aggregations.isNotEmpty) {
         return TableScanResult(
@@ -4150,7 +4185,9 @@ class TableDataManager {
               calculateAggregateResult(out, aggregations, groupBy: groupBy),
         );
       }
-      return TableScanResult(records: out);
+      return TableScanResult(
+        records: out,
+      );
     }
 
     // Maintain a bounded global topK heap of size <= needCount.
@@ -4238,7 +4275,10 @@ class TableDataManager {
       if (offset != null && offset > 0) {
         finalCount = max(0, finalCount - offset);
       }
-      return TableScanResult(records: const [], count: finalCount);
+      return TableScanResult(
+        records: const [],
+        count: finalCount,
+      );
     }
     if (aggregations != null && aggregations.isNotEmpty) {
       return TableScanResult(
@@ -4247,7 +4287,9 @@ class TableDataManager {
             groupBy: groupBy),
       );
     }
-    return TableScanResult(records: sortedList);
+    return TableScanResult(
+      records: sortedList,
+    );
   }
 
   dynamic calculateAggregateResult(

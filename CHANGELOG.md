@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.1.1
+
+### Fixed
+- Fixed `upsert` validation for numeric unique keys
+
+### Changed
+- Improved documentation navigation compatibility
+- Optimized memory cleanup
+- Optimized `count()` performance
+
+
 ## 3.1.0
 
 ### Added

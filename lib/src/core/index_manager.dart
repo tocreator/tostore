@@ -541,6 +541,7 @@ class IndexManager {
 
     final prefixKey = <dynamic>[tableName, indexName];
     final results = <String>[];
+    final entries = <IndexSearchEntry>[];
     Uint8List? lastKey;
 
     // Safety check on bounds validity vs prefix.
@@ -630,6 +631,7 @@ class IndexManager {
 
         if (pk != null && pk.isNotEmpty) {
           results.add(pk);
+          entries.add(IndexSearchEntry(primaryKey: pk, keyBytes: encodedKey));
           addedCount++;
         }
 
@@ -638,7 +640,11 @@ class IndexManager {
       },
     );
 
-    return IndexSearchResult(primaryKeys: results, lastKey: lastKey);
+    return IndexSearchResult(
+      primaryKeys: results,
+      entries: entries.isEmpty ? null : entries,
+      lastKey: lastKey,
+    );
   }
 
   Future<IndexSearchResult> _searchIndexByKeyRangeLogical({
@@ -2887,6 +2893,7 @@ class IndexManager {
           }
 
           final out = <String>[];
+          final entriesOut = <IndexSearchEntry>[];
           final int need = (limit == null) ? -1 : max(0, limit);
           int remaining = need;
           final yieldController = YieldController('index_search_composite_in');
@@ -2912,6 +2919,9 @@ class IndexManager {
               offset: null,
             );
             out.addAll(res.primaryKeys);
+            if (res.entries != null) {
+              entriesOut.addAll(res.entries!);
+            }
 
             if (remaining > 0) {
               remaining -= res.primaryKeys.length;
@@ -2920,19 +2930,31 @@ class IndexManager {
           }
 
           List<String> finalPks = out;
+          List<IndexSearchEntry>? finalEntries =
+              entriesOut.isEmpty ? null : entriesOut;
+
           if (effectiveOffset != null && effectiveOffset > 0) {
             if (effectiveOffset >= finalPks.length) {
               return IndexSearchResult.empty();
             }
             finalPks = finalPks.sublist(effectiveOffset);
+            if (finalEntries != null) {
+              finalEntries = finalEntries.sublist(effectiveOffset);
+            }
           }
           if (limit != null && finalPks.length > limit) {
             finalPks = finalPks.sublist(0, limit);
+            if (finalEntries != null) {
+              finalEntries = finalEntries.sublist(0, limit);
+            }
           }
 
           return finalPks.isEmpty
               ? IndexSearchResult.empty()
-              : IndexSearchResult(primaryKeys: finalPks);
+              : IndexSearchResult(
+                  primaryKeys: finalPks,
+                  entries: finalEntries,
+                );
         }
 
         if (lastOp == 'BETWEEN') {
@@ -3199,9 +3221,15 @@ class IndexManager {
         );
 
         final validatedPks = <String>[];
-        for (final pk in res.primaryKeys) {
+        final validatedEntries =
+            res.entries != null ? <IndexSearchEntry>[] : null;
+        for (int i = 0; i < res.primaryKeys.length; i++) {
+          final pk = res.primaryKeys[i];
           if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
             validatedPks.add(pk);
+            if (validatedEntries != null) {
+              validatedEntries.add(res.entries![i]);
+            }
           }
         }
 
@@ -3223,6 +3251,7 @@ class IndexManager {
 
         return IndexSearchResult(
           primaryKeys: validatedPks,
+          entries: validatedEntries,
           lastKey: res.lastKey,
           requiresTableScan: res.requiresTableScan,
           indexWasUsed: res.indexWasUsed,
@@ -3435,6 +3464,7 @@ class IndexManager {
         }
 
         final out = <String>[];
+        final entriesOut = <IndexSearchEntry>[];
         final int need = (limit == null) ? -1 : max(0, limit);
         int remaining = need;
         final yieldController = YieldController('index_search_in');
@@ -3477,20 +3507,16 @@ class IndexManager {
 
               // Memory mode: serve unique lookup from _indexDataCache only (no disk fallback).
               if (isMemoryMode) {
-                if (nativeVal != null) {
-                  final compositeKey = <dynamic>[
-                    tableName,
-                    indexName,
-                    ...nativeVal
-                  ];
-                  final pk = _indexDataCache.get(compositeKey);
-                  if (pk is String &&
-                      pk.isNotEmpty &&
-                      !_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
-                    out.add(pk);
-                  } else if (pk is String && pk.isNotEmpty) {
-                    _indexDataCache.remove(compositeKey);
-                  }
+                final compositeKey = <dynamic>[tableName, indexName, ...v];
+                final pkValue = _indexDataCache.get(compositeKey);
+                if (pkValue is String &&
+                    pkValue.isNotEmpty &&
+                    !_isPrimaryKeyHiddenByDeleteOverlay(tableName, pkValue)) {
+                  out.add(pkValue);
+                  entriesOut.add(
+                      IndexSearchEntry(primaryKey: pkValue, keyBytes: prefix));
+                } else if (pkValue is String && pkValue.isNotEmpty) {
+                  _indexDataCache.remove(compositeKey);
                 }
               } else {
                 final pk = await _lookupUniquePrimaryKeyLogical(
@@ -3502,10 +3528,11 @@ class IndexManager {
                 if (pk != null) {
                   if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     out.add(pk);
-                    if (nativeVal != null &&
-                        !(_dataStore.resourceManager?.isLowMemoryMode ??
-                            false)) {
-                      final compositeKey = [tableName, indexName, ...nativeVal];
+                    entriesOut.add(
+                        IndexSearchEntry(primaryKey: pk, keyBytes: prefix));
+                    if (!(_dataStore.resourceManager?.isLowMemoryMode ??
+                        false)) {
+                      final compositeKey = [tableName, indexName, ...v];
                       _indexDataCache.put(compositeKey, pk);
                     }
                   }
@@ -3526,26 +3553,27 @@ class IndexManager {
 
               // Hotspot populate: Populate cache if we did a full bucket scan (no cursor)
               if (!usedCache &&
-                  nativeVal != null &&
                   !hasCursorKey &&
                   !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
                 final validatedPks = <String>[];
-                for (final pk in res.primaryKeys) {
+                final validatedEntries =
+                    res.entries != null ? <IndexSearchEntry>[] : null;
+                for (int i = 0; i < res.primaryKeys.length; i++) {
+                  final pk = res.primaryKeys[i];
                   if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     validatedPks.add(pk);
+                    if (validatedEntries != null) {
+                      validatedEntries.add(res.entries![i]);
+                    }
                   }
                 }
 
                 if (validatedPks.isNotEmpty) {
                   if (isUnique) {
-                    _indexDataCache.put([tableName, indexName, ...nativeVal],
-                        validatedPks.first);
+                    _indexDataCache
+                        .put([tableName, indexName, ...v], validatedPks.first);
                   } else {
-                    final prefixKey = <dynamic>[
-                      tableName,
-                      indexName,
-                      ...nativeVal
-                    ];
+                    final prefixKey = <dynamic>[tableName, indexName, ...v];
                     final yc = YieldController(
                         'IndexManager.hotspotPopulateNonUniqueIn');
                     for (final pk in validatedPks) {
@@ -3559,11 +3587,18 @@ class IndexManager {
                   }
                 }
                 out.addAll(validatedPks);
+                if (validatedEntries != null) {
+                  entriesOut.addAll(validatedEntries);
+                }
               } else {
                 // Filter logically deleted records for results consistency
-                for (final pk in res.primaryKeys) {
+                for (int i = 0; i < res.primaryKeys.length; i++) {
+                  final pk = res.primaryKeys[i];
                   if (!_isPrimaryKeyHiddenByDeleteOverlay(tableName, pk)) {
                     out.add(pk);
+                    if (res.entries != null) {
+                      entriesOut.add(res.entries![i]);
+                    }
                   }
                 }
               }
@@ -3582,18 +3617,30 @@ class IndexManager {
 
         // Final Filter
         List<String> finalPks = out;
+        List<IndexSearchEntry>? finalEntries =
+            entriesOut.isEmpty ? null : entriesOut;
+
         if (effectiveOffset != null && effectiveOffset > 0) {
           if (effectiveOffset >= finalPks.length) {
             return IndexSearchResult.empty();
           }
           finalPks = finalPks.sublist(effectiveOffset);
+          if (finalEntries != null) {
+            finalEntries = finalEntries.sublist(effectiveOffset);
+          }
         }
         if (limit != null && finalPks.length > limit) {
           finalPks = finalPks.sublist(0, limit);
+          if (finalEntries != null) {
+            finalEntries = finalEntries.sublist(0, limit);
+          }
         }
 
         if (finalPks.isEmpty) return IndexSearchResult.empty();
-        return IndexSearchResult(primaryKeys: finalPks);
+        return IndexSearchResult(
+          primaryKeys: finalPks,
+          entries: finalEntries,
+        );
       }
 
       // LIKE / != / others: fallback to table scan for correctness.

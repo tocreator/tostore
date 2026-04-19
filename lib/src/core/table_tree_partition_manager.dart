@@ -2310,6 +2310,7 @@ final class TableTreePartitionManager {
     required int? limit,
     bool Function(Map<String, dynamic>)? recordPredicate,
     required bool Function(Map<String, dynamic> record) onRecord,
+    bool decodeRecord = true,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
@@ -2406,20 +2407,26 @@ final class TableTreePartitionManager {
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
             return;
           }
-          final decoded = await _decodeStoredRecord(
-            tableName: tableName,
-            meta: meta,
-            storedValue: leaf.values[i],
-            fieldStruct: fieldStruct,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-          );
-          if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          final row = pk != null
-              ? TableSchema.rowWithPrimaryKeyFirst(
-                  schema.primaryKey, pk, decoded)
-              : decoded;
+          Map<String, dynamic> row;
+          if (decodeRecord) {
+            final decoded = await _decodeStoredRecord(
+              tableName: tableName,
+              meta: meta,
+              storedValue: leaf.values[i],
+              fieldStruct: fieldStruct,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            );
+            if (decoded == null) continue;
+            row = pk != null
+                ? TableSchema.rowWithPrimaryKeyFirst(
+                    schema.primaryKey, pk, decoded)
+                : decoded;
+          } else {
+            if (pk == null) continue;
+            row = {schema.primaryKey: pk};
+          }
           if (recordPredicate != null && !recordPredicate(row)) continue;
           if (!onRecord(row)) return;
           remaining--;
@@ -2448,20 +2455,26 @@ final class TableTreePartitionManager {
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
             continue;
           }
-          final decoded = await _decodeStoredRecord(
-            tableName: tableName,
-            meta: meta,
-            storedValue: leaf.values[i],
-            fieldStruct: fieldStruct,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-          );
-          if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
-          final row = pk != null
-              ? TableSchema.rowWithPrimaryKeyFirst(
-                  schema.primaryKey, pk, decoded)
-              : decoded;
+          Map<String, dynamic> row;
+          if (decodeRecord) {
+            final decoded = await _decodeStoredRecord(
+              tableName: tableName,
+              meta: meta,
+              storedValue: leaf.values[i],
+              fieldStruct: fieldStruct,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            );
+            if (decoded == null) continue;
+            row = pk != null
+                ? TableSchema.rowWithPrimaryKeyFirst(
+                    schema.primaryKey, pk, decoded)
+                : decoded;
+          } else {
+            if (pk == null) continue;
+            row = {schema.primaryKey: pk};
+          }
           if (recordPredicate != null && !recordPredicate(row)) continue;
           if (!onRecord(row)) return;
           remaining--;

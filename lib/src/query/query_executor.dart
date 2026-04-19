@@ -487,6 +487,17 @@ class QueryExecutor {
       );
 
       if (onlyCount) {
+        // For count queries, we must merge the WriteBuffer content to account for
+        // uncommitted inserts/updates that were NOT in the persistent index/table scan.
+        final bufferResults =
+            await _dataStore.tableDataManager.mergeConsistency(
+          tableName,
+          const [], // base results empty for count
+          matcher: matcher,
+          limit: effectiveLimit,
+        );
+        int finalCount = (planResult.count ?? 0) + bufferResults.length;
+
         stopwatch.stop();
         int? tableTotalCount;
         try {
@@ -495,7 +506,7 @@ class QueryExecutor {
         } catch (_) {}
         return ExecuteResult(
           records: const [],
-          count: planResult.count,
+          count: finalCount,
           executionTimeMs: stopwatch.elapsedMilliseconds,
           tableTotalCount: tableTotalCount,
         );
@@ -1057,7 +1068,7 @@ class QueryExecutor {
         }
       }
 
-      return PlanExecutionResult(results, totalCount);
+      return PlanExecutionResult(results, totalCount, null);
     } finally {
       _dataStore.readViewManager.releaseReadView(localViewId);
     }
@@ -1244,7 +1255,10 @@ class QueryExecutor {
       if (offset != null && offset > 0) {
         finalCount = max(0, finalCount - offset);
       }
-      return TableScanResult(records: const [], count: finalCount);
+      return TableScanResult(
+        records: const [],
+        count: finalCount,
+      );
     }
 
     if (aggregations != null && aggregations.isNotEmpty) {
@@ -1265,7 +1279,9 @@ class QueryExecutor {
       out = out.sublist(0, limit);
     }
 
-    return TableScanResult(records: out);
+    return TableScanResult(
+      records: out,
+    );
   }
 
   /// Execute table join operation
@@ -1999,50 +2015,109 @@ class QueryExecutor {
           // End reached: no more index entries to scan.
           if ((pks.isEmpty) && (lastKey == null)) break;
 
-          // Fetch records for this index page (order is restored using pk list).
-          final records = pks.isEmpty
-              ? const <Map<String, dynamic>>[]
-              : (await _dataStore.tableDataManager.queryRecordsBatch(
-                  tableName,
-                  pks,
-                ))
-                  .records;
+          // Index-Only Scan Optimization:
+          // If all fields required by the matcher are present in the index,
+          // we can bypass the full record fetch (table storage query) and
+          // match directly against the index key's decoded tuple.
+          final bool isIndexOnlyCoverage = onlyCount &&
+              indexResults.entries != null &&
+              indexSchema != null &&
+              (matcher == null ||
+                  (matcher.fields.isNotEmpty &&
+                      matcher.fields.every((f) =>
+                          indexSchema!.fields.contains(f) ||
+                          f == tblSchema.primaryKey)));
 
           final recordByPk = <String, Map<String, dynamic>>{};
-          for (final r in records) {
-            final pk = r[tblSchema.primaryKey]?.toString();
-            if (pk != null && pk.isNotEmpty) {
-              recordByPk[pk] = r;
-            }
-          }
+          if (isIndexOnlyCoverage) {
+            final entries = indexResults.entries!;
+            for (int i = 0; i < entries.length; i++) {
+              final entry = entries[i];
+              final pk = entry.primaryKey;
 
-          if (pks.isNotEmpty) {
-            for (final pk in pks) {
               // Early break when target count reached
-              if (onlyCount && targetNeed > 0 && outCount >= targetNeed) break;
-              if (!(onlyCount ||
-                      (aggregations != null && aggregations.isNotEmpty)) &&
-                  out.length >= targetNeed) {
-                break;
-              }
-              final rec = recordByPk[pk];
-              if (rec == null) {
+              if (targetNeed > 0 && outCount >= targetNeed) break;
+
+              // Skip if in buffer for onlyCount fast path to avoid double counting
+              if (onlyCount &&
+                  _dataStore.writeBufferManager
+                          .getBufferedRecord(tableName, pk) !=
+                      null) {
                 continue;
               }
 
-              final be = _dataStore.writeBufferManager
-                  .getBufferedRecord(tableName, pk);
-              if (be != null && be.operation == BufferOperationType.delete) {
-                continue;
+              // Decode index key to get field values for matching
+              final decoded = MemComparableKey.decodeTuple(entry.keyBytes);
+              final virtualRec = <String, dynamic>{};
+              for (int j = 0; j < indexSchema.fields.length; j++) {
+                virtualRec[indexSchema.fields[j]] = decoded[j];
               }
-              if ((matcher == null || matcher.matches(rec)) &&
-                  (filter == null || filter(rec))) {
+              virtualRec[tblSchema.primaryKey] = pk;
+
+              if ((matcher == null || matcher.matches(virtualRec)) &&
+                  (filter == null || filter(virtualRec))) {
+                outCount++;
+              }
+              // Always capture the last virtual record for potential resume logic
+              recordByPk[pk] = virtualRec;
+            }
+          } else {
+            final records = pks.isEmpty
+                ? const <Map<String, dynamic>>[]
+                : (await _dataStore.tableDataManager.queryRecordsBatch(
+                    tableName,
+                    pks,
+                  ))
+                    .records;
+
+            for (final r in records) {
+              final pk = r[tblSchema.primaryKey]?.toString();
+              if (pk != null && pk.isNotEmpty) {
+                recordByPk[pk] = r;
+              }
+            }
+
+            if (pks.isNotEmpty) {
+              for (final pk in pks) {
+                // Early break when target count reached
+                if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
+                  break;
+                }
+                if (!(onlyCount ||
+                        (aggregations != null && aggregations.isNotEmpty)) &&
+                    out.length >= targetNeed) {
+                  break;
+                }
+                final rec = recordByPk[pk];
+                if (rec == null) {
+                  continue;
+                }
+
+                // Skip if in buffer for onlyCount
                 if (onlyCount) {
-                  outCount++;
-                } else if (aggregator != null) {
-                  aggregator.accumulate(rec);
+                  if (_dataStore.writeBufferManager
+                          .getBufferedRecord(tableName, pk) !=
+                      null) {
+                    continue;
+                  }
                 } else {
-                  out.add(rec);
+                  final be = _dataStore.writeBufferManager
+                      .getBufferedRecord(tableName, pk);
+                  if (be != null &&
+                      be.operation == BufferOperationType.delete) {
+                    continue;
+                  }
+                }
+
+                if ((matcher == null || matcher.matches(rec)) &&
+                    (filter == null || filter(rec))) {
+                  if (onlyCount) {
+                    outCount++;
+                  } else if (aggregator != null) {
+                    aggregator.accumulate(rec);
+                  } else {
+                    out.add(rec);
+                  }
                 }
               }
             }
@@ -2095,7 +2170,10 @@ class QueryExecutor {
           if (offset != null && offset > 0) {
             finalCount = max(0, finalCount - offset);
           }
-          return TableScanResult(records: const [], count: finalCount);
+          return TableScanResult(
+            records: const [],
+            count: finalCount,
+          );
         }
         if (aggregations != null && aggregations.isNotEmpty) {
           return TableScanResult(
@@ -2213,11 +2291,21 @@ class QueryExecutor {
             final rec = recordByPk[pk];
             if (rec == null) continue;
 
-            final be =
-                _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
-            if (be != null && be.operation == BufferOperationType.delete) {
-              continue;
+            // Skip if in buffer for onlyCount
+            if (onlyCount) {
+              if (_dataStore.writeBufferManager
+                      .getBufferedRecord(tableName, pk) !=
+                  null) {
+                continue;
+              }
+            } else {
+              final be = _dataStore.writeBufferManager
+                  .getBufferedRecord(tableName, pk);
+              if (be != null && be.operation == BufferOperationType.delete) {
+                continue;
+              }
             }
+
             if ((matcher == null || matcher.matches(rec)) &&
                 (filter == null || filter(rec))) {
               if (onlyCount) {
@@ -2248,9 +2336,14 @@ class QueryExecutor {
         if (offset != null && offset > 0) {
           finalCount = max(0, finalCount - offset);
         }
-        return TableScanResult(records: const [], count: finalCount);
+        return TableScanResult(
+          records: const [],
+          count: finalCount,
+        );
       }
-      return TableScanResult(records: selector.toSortedList());
+      return TableScanResult(
+        records: selector.toSortedList(),
+      );
     } catch (e) {
       Logger.error('Index scan failed: $e',
           label: 'QueryExecutor._performIndexScan');

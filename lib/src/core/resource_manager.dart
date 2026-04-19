@@ -247,6 +247,18 @@ class ResourceManager {
     // Run the entire eviction process asynchronously.
     Future(() async {
       try {
+        // Efficiently check total cache usage first
+        final info = await getMemoryInfo();
+        final totalUsage = info.tableDataCacheUsage +
+            info.indexCacheUsage +
+            info.queryCacheUsage +
+            info.schemaCacheUsage +
+            info.metaCacheUsage;
+
+        if (totalUsage < _getMinTotalCacheToEvict()) {
+          return;
+        }
+
         // Clean up cache in order of priority, from low priority to high priority
         await _evictCacheAndCheck(MemoryQuotaType.tableData);
         if (_status == ResourceStatus.normal) return;
@@ -280,6 +292,12 @@ class ResourceManager {
     try {
       // Measure cache size before eviction for relevant cache types
       int beforeSize = await _getCurrentCacheSizeByType(cacheType);
+
+      // Guard check: skip if cache size is below minimum threshold
+      final minThreshold = _getMinEvictThreshold(cacheType);
+      if (beforeSize < minThreshold) {
+        return;
+      }
 
       // Execute eviction callback, which might be async
       final result = callback();
@@ -410,6 +428,36 @@ class ResourceManager {
       metaCacheLimit: _metaCacheSize,
       isLowMemoryMode: _status != ResourceStatus.normal,
     );
+  }
+
+  /// Get baseline protection threshold for specific cache type
+  int _getMinEvictThreshold(MemoryQuotaType type) {
+    final total = _getMinTotalCacheToEvict();
+    switch (type) {
+      case MemoryQuotaType.tableData:
+        return (total * 0.5).toInt(); // 50% of protection budget
+      case MemoryQuotaType.indexData:
+        return (total * 0.25).toInt(); // 25%
+      case MemoryQuotaType.queryResult:
+        return (total * 0.125).toInt(); // 12.5%
+      case MemoryQuotaType.schema:
+        return (total * 0.0625).toInt(); // 6.25%
+      case MemoryQuotaType.meta:
+        return (total * 0.0625).toInt(); // 6.25%
+    }
+  }
+
+  /// Get global minimum total cache size to trigger any eviction based on platform
+  int _getMinTotalCacheToEvict() {
+    if (PlatformHandler.isServerEnvironment) {
+      return 512 * 1024 * 1024; // 512MB for high-throughput servers
+    } else if (PlatformHandler.isDesktop) {
+      return 256 * 1024 * 1024; // 256MB for desktops
+    } else if (PlatformHandler.isWeb) {
+      return 64 * 1024 * 1024; // 64MB (more restricted environments)
+    } else {
+      return 128 * 1024 * 1024; // 128MB for modern mobile devices
+    }
   }
 
   /// Clean up all resources

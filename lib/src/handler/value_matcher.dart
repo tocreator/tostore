@@ -339,6 +339,9 @@ class ConditionRecordMatcher {
   /// The original condition, can be used for query planning.
   QueryCondition get condition => _condition;
 
+  /// Returns the set of fields involved in this condition tree.
+  Set<String> get fields => _matchers.keys.toSet();
+
   /// Prepares an evaluator by creating optimized matcher functions for all
   /// fields involved in the query condition.
   factory ConditionRecordMatcher.prepare(QueryCondition condition,
