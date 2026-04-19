@@ -148,6 +148,7 @@ final class CacheManager {
       _dataStore.schemaManager?.dispose() ?? Future.value(),
       _dataStore.tableDataManager.dispose(),
       _dataStore.indexManager?.dispose() ?? Future.value(),
+      _dataStore.vectorIndexManager?.dispose() ?? Future.value(),
     ]);
 
     _dataStore.queryExecutor.clearAllQueryCacheSync();

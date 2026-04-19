@@ -14,6 +14,8 @@ import 'yield_controller.dart';
 class FileStorageImpl implements StorageInterface {
   FileStorageImpl();
 
+  bool _closed = false;
+
   // File handle pool with simple LRU eviction to reduce open/close overhead
   final Map<String, RandomAccessFile> _handlePool = {};
   final LinkedHashMap<String, DateTime> _lru =
@@ -110,6 +112,7 @@ class FileStorageImpl implements StorageInterface {
   }
 
   Future<RandomAccessFile> _getHandle(String path, FileMode mode) async {
+    if (_closed) throw StateError('Storage is closed');
     final key = _poolKey(path, mode);
     final file = File(path);
     await file.parent.create(recursive: true);
@@ -266,6 +269,7 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   Future<void> close() async {
+    _closed = true;
     try {
       // Snapshot handles (key, raf) to avoid concurrent modification if pool changes during close
       final entries = _handlePool.entries.toList();

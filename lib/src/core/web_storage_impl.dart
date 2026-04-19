@@ -14,6 +14,7 @@ import '../model/meta_info.dart';
 class WebStorageImpl implements StorageInterface {
   static final Map<String, WebStorageImpl> _instances = {};
   IDBDatabase? _db;
+  bool _closed = false;
   final Completer<void> _initCompleter = Completer<void>();
 
   // In-memory write buffer to simulate OS page cache on web.
@@ -329,6 +330,7 @@ class WebStorageImpl implements StorageInterface {
   /// close database connection
   @override
   Future<void> close() async {
+    _closed = true;
     await _initCompleter.future; // ensure database is initialized
 
     try {
@@ -381,6 +383,7 @@ class WebStorageImpl implements StorageInterface {
 
   /// Replace _writeSingleFileGeneric with _storeFileInfo
   Future<void> _storeFileInfo(FileInfo fileInfo) async {
+    if (_closed) return;
     final transaction =
         _db!.transaction([_fileStore].jsify() as JSArray, 'readwrite');
     final store = transaction.objectStore(_fileStore);

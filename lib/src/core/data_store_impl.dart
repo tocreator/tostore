@@ -1131,108 +1131,38 @@ class DataStoreImpl {
   /// Set [closeStorage] to false when performing operations like Restore that need
   /// to re-initialize the DataStore but keep the connection logic alive.
   /// [keepActiveSpace]: when false, clears [GlobalConfig.activeSpace] so next launch uses default (e.g. logout). Default true.
-  Future<void> close(
-      {bool persistChanges = true,
-      bool closeStorage = true,
-      bool keepActiveSpace = true}) async {
+  Future<void> close({
+    bool persistChanges = true,
+    bool closeStorage = true,
+    bool keepActiveSpace = true,
+  }) async {
     if (!_isInitialized) return;
     _isInitialized = false;
 
     try {
-      // Run save/close sequence as system operation so storage locks can be acquired
-      await TransactionContext.runAsSystemOperation(() async {
-        if (persistChanges) {
-          // Enter maintenance before saving: block new external locks and wait for quiescent
-          try {
-            await lockManager?.enterMaintenance(
-                timeout: config.transactionTimeout);
-          } catch (_) {}
+      // 1. Unified shutdown logic
+      await _flushAndShutdown(
+        persistChanges: persistChanges,
+        closeStorage: closeStorage,
+        isCloseInstance: true,
+      );
 
-          // Force flush and stop the write queue and index update pipeline.
-          try {
-            await parallelJournalManager.drainAndStop();
-          } catch (e) {
-            Logger.error('Failed to save cache when closing: $e',
-                label: 'DataStoreImpl.close');
-          }
-          // Ensure runtime metadata is also persisted once all data is durable.
-          try {
-            await tableDataManager.persistRuntimeMetaIfNeeded(force: true);
-          } catch (e) {
-            Logger.error('Persist runtime metadata on close failed: $e',
-                label: 'DataStoreImpl.close');
-          }
-        } else {
-          // For close without persistChanges (e.g. restore), do not enter maintenance to avoid
-          // blocking internal flush tasks; just stop pipeline and flush handles best-effort.
-          try {
-            await parallelJournalManager.stopWithoutFlush();
-          } catch (e) {
-            Logger.error('Stop journal manager without flush failed: $e',
-                label: 'DataStoreImpl.close');
-          }
-        }
-
-        // Regardless of persistChanges, ensure WAL append queue is quiescent before closing storage,
-        // to avoid WAL flush task writing to storage after close causing File closed exception.
+      // 2. Clear active space so next launch uses default (e.g. logout).
+      if (!keepActiveSpace) {
         try {
-          await walManager.flushQueueCompletely();
+          final globalConfig = await getGlobalConfig();
+          if (globalConfig != null && globalConfig.activeSpace != null) {
+            await saveGlobalConfig(globalConfig.clearActiveSpace());
+          }
         } catch (e) {
-          Logger.error('Flush WAL queue on close failed: $e',
+          Logger.error('Clear activeSpace on close failed: $e',
               label: 'DataStoreImpl.close');
         }
+      }
 
-        // Flush weight data
-        if (_weightManager != null) {
-          await _weightManager!.saveWeights(force: true);
-          _weightManager!.dispose();
-        }
-
-        await _tableDataManager?.dispose(persistChanges: persistChanges);
-
-        // Clear active space so next launch uses default (e.g. logout).
-        if (!keepActiveSpace) {
-          try {
-            final globalConfig = await getGlobalConfig();
-            if (globalConfig != null && globalConfig.activeSpace != null) {
-              await saveGlobalConfig(globalConfig.clearActiveSpace());
-            }
-          } catch (e) {
-            Logger.error('Clear activeSpace on close failed: $e',
-                label: 'DataStoreImpl.close');
-          }
-        }
-
-        CrontabManager.dispose();
-
-        // Ensure all handles are deeply flushed and closed to release file locks on Windows
-        // This MUST be the absolute last storage instruction before `storage.close()`
-        // so that late background savers (like walManager.flushQueueCompletely) do not reopen handles.
-        try {
-          await storage.flushAll(closeHandles: true);
-        } catch (_) {}
-
-        if (closeStorage) {
-          await storage.close(isMigrationInstance: isMigrationInstance);
-        }
-      });
-
-      // After storage closed, old lockManager no longer used; new instance will create a fresh lock manager
-      lockManager = null;
-
-      // Release all managers
-      readViewManager.dispose();
-      compactionManager.dispose();
-      await cacheManager.dispose();
-      _ttlCleanupManager.unregisterCleanupTask();
-
-      // Clean up resource manager resources
-      _resourceManager?.dispose();
-
-      // Clear instance variables
+      // 3. Clear instance references and state
       _queryOptimizer = null;
       _indexManager = null;
-      await _vectorIndexManager?.dispose();
       _vectorIndexManager = null;
       _queryExecutor = null;
       _integrityChecker = null;
@@ -5707,25 +5637,14 @@ class DataStoreImpl {
 
     final oldSpaceName = _currentSpaceName;
     try {
-      // Before switching space, first flush and stop the write queue and index update pipeline,
-      // to avoid "old space data" being incorrectly flushed to new space path.
-      await parallelJournalManager.drainAndStop();
+      // 1. Unified shutdown logic for the current space
+      await _flushAndShutdown(persistChanges: true, closeStorage: false);
 
-      // Before switching space, first save weights for the current space
-      if (_weightManager != null) {
-        await _weightManager!.saveWeights(force: true);
-      }
-      // Now it is safe to switch the current space name
+      // 2. Update current space name and config
       _currentSpaceName = spaceName;
-
-      // Update configuration
       if (_config != null) {
         _config = _config!.copyWith(spaceName: _currentSpaceName);
       }
-
-      // Clear caches
-      await cacheManager.dispose();
-      await storage.flushAll(closeHandles: true);
 
       // Reinitialize database; do not apply activeSpace-on-default so switching to default stays default
       _isInitialized = false;
@@ -5779,51 +5698,25 @@ class DataStoreImpl {
       if (!_isInitialized) return;
 
       // 1) Flush WAL queue and persist metadata to ensure durability.
-      try {
-        await walManager.flushQueueCompletely();
-        if (config.enableJournal) {
-          await walManager.persistMeta(flush: true);
-        }
-      } catch (e) {
-        Logger.error('Flush WAL queue failed: $e',
-            label: 'DataStoreImpl.saveAllCacheBeforeExit');
+      await walManager.flushQueueCompletely();
+      if (config.enableJournal) {
+        await walManager.persistMeta(flush: true);
       }
 
       // 2) Flush all pending writes and index updates from the write queue.
-      try {
-        await parallelJournalManager.flushCompletely();
-      } catch (e) {
-        Logger.error('flushCompletely failed: $e',
-            label: 'DataStoreImpl.saveAllCacheBeforeExit');
-      }
+      await parallelJournalManager.flushCompletely();
 
       // 3) Persist runtime metadata (max IDs, table statistics) eagerly.
-      try {
-        await tableDataManager.persistRuntimeMetaIfNeeded(force: true);
-      } catch (e) {
-        Logger.error('Persist runtime metadata failed: $e',
-            label: 'DataStoreImpl.saveAllCacheBeforeExit');
-      }
-
-      // Ensure buffered IO is flushed to disk
-      try {
-        await storage.flushAll(closeHandles: true);
-      } catch (e) {
-        Logger.warn('Flush buffered IO failed: $e',
-            label: 'DataStoreImpl.saveAllCacheBeforeExit');
-      }
+      await tableDataManager.persistRuntimeMetaIfNeeded(force: true);
 
       // 4) Save weights
-      try {
-        await weightManager?.saveWeights(force: true);
-      } catch (e) {
-        Logger.error('Save weights failed: $e',
-            label: 'DataStoreImpl.saveAllCacheBeforeExit');
-      }
+      await weightManager?.saveWeights(force: true);
+
+      // 5) Ensure buffered IO is flushed to disk (releases handles on Windows)
+      await storage.flushAll(closeHandles: true);
     } catch (e) {
       Logger.error('Failed to save cache before exit: $e',
           label: 'DataStoreImpl.saveAllCacheBeforeExit');
-      return;
     }
   }
 
@@ -5843,6 +5736,80 @@ class DataStoreImpl {
       Logger.error('Delete database failed: $e',
           label: 'DataStore.deleteDatabase');
       rethrow;
+    }
+  }
+
+  /// Unified internal shutdown logic for space switching or full instance closure.
+  Future<void> _flushAndShutdown({
+    bool persistChanges = true,
+    bool closeStorage = false,
+    bool isCloseInstance = false,
+  }) async {
+    // 1. Stop background triggers first to prevent new work from entering pipelines
+    _ttlCleanupManager.unregisterCleanupTask();
+    compactionManager.dispose();
+
+    // 2. Perform all flushing and shutdown as system operation to bypass transaction locks
+    await TransactionContext.runAsSystemOperation(() async {
+      if (persistChanges) {
+        // Enter maintenance mode to wait for active transactions to finish
+        try {
+          await lockManager?.enterMaintenance(
+              timeout: config.transactionTimeout);
+        } catch (_) {}
+      }
+
+      // 3. Flush and stop write pipelines
+      try {
+        if (persistChanges) {
+          await parallelJournalManager.flushCompletely();
+        }
+        await parallelJournalManager.drainAndStop();
+      } catch (e) {
+        Logger.warn('Stop journal manager failed: $e', label: 'DataStoreImpl');
+      }
+
+      try {
+        await walManager.flushQueueCompletely();
+        if (persistChanges && config.enableJournal) {
+          await walManager.persistMeta(flush: true);
+        }
+      } catch (e) {
+        Logger.warn('Flush WAL failed: $e', label: 'DataStoreImpl');
+      }
+
+      // 4. Flush weight data
+      if (_weightManager != null) {
+        if (persistChanges) {
+          await _weightManager!.saveWeights(force: true);
+        }
+        if (isCloseInstance) {
+          _weightManager!.dispose();
+        }
+      }
+
+      // 5. Persist and dispose data managers via CacheManager
+      // This handles TableDataManager, IndexManager, VectorIndexManager, SchemaManager
+      await cacheManager.dispose();
+
+      // 6. Final storage flush and close
+      // This must be the absolute last storage instruction to release handles on Windows
+      try {
+        await storage.flushAll(closeHandles: true);
+        if (closeStorage) {
+          await storage.close(isMigrationInstance: isMigrationInstance);
+        }
+      } catch (e) {
+        Logger.warn('Storage flush/close failed: $e', label: 'DataStoreImpl');
+      }
+    });
+
+    // 7. Cleanup remaining non-storage managers
+    if (isCloseInstance) {
+      readViewManager.dispose();
+      _resourceManager?.dispose();
+      CrontabManager.dispose();
+      lockManager = null;
     }
   }
 

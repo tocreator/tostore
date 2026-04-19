@@ -4059,7 +4059,8 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
-          decodeRecord: (filter != null || (matcher != null && matcher.fields.any((f) => f != primaryKey))),
+          decodeRecord: (filter != null ||
+              (matcher != null && matcher.fields.any((f) => f != primaryKey))),
           onRecord: (r) {
             totalCount++;
             return true;

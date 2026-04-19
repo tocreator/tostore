@@ -6,8 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Fixed `upsert` validation for numeric unique keys
+- Optimized database lifecycle resilience during space switching and closure.
 
 ### Changed
+- Standardized the database shutdown and cleanup pipeline for improved stability.
 - Improved documentation navigation compatibility
 - Optimized memory cleanup
 - Optimized `count()` performance
