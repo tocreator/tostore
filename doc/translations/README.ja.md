@@ -33,7 +33,7 @@
 - **はじめに**: [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
 - **アーキテクチャとモデル**: [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - **高度なクエリ**: [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
-- **高度な機能とパフォーマンス**: [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
+- **高度な機能とパフォーマンス**: [KV高度な操作](#kv-advanced) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
 - **運用とセキュリティ**: [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [その他のリソース](#more-resources)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
@@ -142,6 +142,10 @@ db.watchValues(['current_user', 'login_status']).listen((map) {
 // Remove data
 await db.removeValue('current_user');
 ```
+
+> [!TIP]
+> **より多くの鍵値ペア機能が必要ですか？**
+> 型安全な読み取り（`getInt`、`getBool`）、アトミックインクリメント、プレフィックス検索、キー空間探索などの高度な操作については、[**鍵値ペアの高度な操作 (db.kv)**](#kv-advanced) を参照してください。
 
 #### Flutter UI 自動更新の例
 Flutter では、`StreamBuilder` と `watchValue` により、非常に簡潔なリアクティブな更新フローが得られます。
@@ -440,6 +444,60 @@ final dbServer = await ToStore.open(
 ## <a id="advanced-usage"></a>高度な使用法
 
 ToStore は、複雑なビジネス シナリオに対応する高度な機能の豊富なセットを提供します。
+
+
+### <a id="kv-advanced"></a>鍵値ペアの高度な操作 (db.kv)
+
+より複雑な Key-Value シナリオでは、`db.kv` 名前空間の使用をお勧めします。より豊富なメソッドセットを提供します。
+以下のメソッドはすべて、オプションの引数 `isGlobal` をサポートしています：`true` はグローバル空間での共有データを表し、`false`（デフォルト）は現在の空間を表します。
+
+- **型安全な取得 (Type-Safe Getters)**
+  型を手動で変換することなく、ターゲット形式のデータを直接取得します：
+  ```dart
+  String? name = await db.kv.getString('user_name');
+  int? age = await db.kv.getInt('user_age');
+  bool? isVip = await db.kv.getBool('is_vip');
+  Map<String, dynamic>? profile = await db.kv.getMap('profile');
+  List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **アトミックカウンタ (Atomic Increment)**
+  高並列シナリオで数値の増減を安全に行います：
+  ```dart
+  // 1増やす (デフォルト値)
+  await db.kv.setIncrement('view_count');
+  // 5減らす (负数を渡してデクリメント)
+  await db.kv.setIncrement('stock_count', amount: -5);
+  ```
+
+- **キー空間の探索と管理 (Discovery & Management)**
+  プレフィックスによるキー検索、合計数の統計、一括削除をサポートします：
+  ```dart
+  // 'setting_' で始まるすべてのキーを取得
+  final keys = await db.kv.getKeys(prefix: 'setting_');
+
+  // 現在の空間内のキー値ペアの总数を取得
+  final count = await db.kv.count();
+
+  // キーが存在し、期限切れでないか確認
+  final exists = await db.kv.exists('config_cache');
+
+  // 複数のキーを一括削除
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+
+  // 現在の空間のすべての KV データをクリア
+  await db.kv.clear();
+  ```
+
+- **ライフサイクル管理 (TTL)**
+  既存のキーの有効期限を取得または更新します：
+  ```dart
+  // 残りの有効期限を取得
+  Duration? ttl = await db.kv.getTtl('token');
+
+  // 既存のキーの有効期限を更新（7日後に期限切れ）
+  await db.kv.setTtl('token', Duration(days: 7));
+  ```
 
 
 ### <a id="vector-advanced"></a>ベクトル フィールド、ベクトル インデックス、ベクトル検索

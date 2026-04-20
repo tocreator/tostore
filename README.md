@@ -33,7 +33,7 @@
 - **Getting Started**: [Why ToStore](#why-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#quick-start-kv) | [Table Mode](#quick-start-table) | [Memory Mode](#quick-start-memory)
 - **Architecture & Model**: [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys) | [Mobile/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primary Key Algorithms](#primary-key-examples)
 - **Advanced Queries**: [Advanced Queries (JOIN)](#query-advanced) | [Aggregation & Statistics](#aggregation-stats) | [Complex Logic (QueryCondition)](#query-condition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- **Advanced & Performance**: [Vector Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Efficient Pagination](#query-pagination) | [Query Cache](#query-cache) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- **Advanced & Performance**: [Advanced KV](#kv-advanced) | [Vector Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Efficient Pagination](#query-pagination) | [Query Cache](#query-cache) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - **Operations & Security**: [Administration](#database-maintenance) | [Security Configuration](#security-config) | [Error Handling](#error-handling) | [Performance & Diagnostics](#performance) | [More Resources](#more-resources)
 
 ## <a id="why-tostore"></a>Why Choose ToStore?
@@ -142,6 +142,10 @@ db.watchValues(['current_user', 'login_status']).listen((map) {
 // Remove data
 await db.removeValue('current_user');
 ```
+
+> [!TIP]
+> **Need more Key-Value features?**
+> For advanced operations like type-safe getters (`getInt`, `getBool`), atomic increments, prefix-based discovery, and key counting, see [**Advanced Key-Value Operations (db.kv)**](#kv-advanced).
 
 #### Flutter UI Auto-Refresh Example
 In Flutter, `StreamBuilder` plus `watchValue` gives you a very concise reactive refresh flow:
@@ -440,6 +444,60 @@ final dbServer = await ToStore.open(
 ## <a id="advanced-usage"></a>Advanced Usage
 
 ToStore provides a rich set of advanced capabilities for complex business scenarios:
+
+
+### <a id="kv-advanced"></a>Advanced Key-Value Operations (db.kv)
+
+For more complex Key-Value scenarios, it is recommended to use the `db.kv` namespace. It provides a richer set of methods:
+All methods support the optional `isGlobal` parameter: `true` for globally shared data, `false` (default) for current space.
+
+- **Type-Safe Getters**
+  Retrieve data directly in the desired format without manual casting:
+  ```dart
+  String? name = await db.kv.getString('user_name');
+  int? age = await db.kv.getInt('user_age');
+  bool? isVip = await db.kv.getBool('is_vip');
+  Map<String, dynamic>? profile = await db.kv.getMap('profile');
+  List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **Atomic Counters (setIncrement)**
+  Safely increment or decrement numeric values in high-concurrency scenarios:
+  ```dart
+  // Increment by 1 (default)
+  await db.kv.setIncrement('view_count');
+  // Decrement by 5 (pass a negative amount)
+  await db.kv.setIncrement('stock_count', amount: -5);
+  ```
+
+- **Discovery & Management**
+  Scan for keys by prefix, count total keys, and perform bulk removals:
+  ```dart
+  // Get all keys starting with 'setting_'
+  final keys = await db.kv.getKeys(prefix: 'setting_');
+
+  // Count total keys in the current space
+  final count = await db.kv.count();
+
+  // Check if a key exists and is not expired
+  final exists = await db.kv.exists('config_cache');
+
+  // Remove multiple keys at once
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+
+  // Clear all KV data in the current space
+  await db.kv.clear();
+  ```
+
+- **Lifecycle Management (TTL)**
+  Inspect or update expiration settings for existing keys:
+  ```dart
+  // Get remaining duration
+  Duration? ttl = await db.kv.getTtl('token');
+
+  // Update TTL for an existing key
+  await db.kv.setTtl('token', Duration(days: 7));
+  ```
 
 
 ### <a id="vector-advanced"></a>Vector Fields, Vector Indexes & Vector Search

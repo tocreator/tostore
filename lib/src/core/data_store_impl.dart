@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
+import '../Interface/kv_store.dart';
 import '../Interface/noop_storage_impl.dart';
 import '../Interface/status_provider.dart';
 import '../handler/common.dart';
@@ -59,6 +60,7 @@ import 'key_manager.dart';
 import 'lock_manager.dart';
 import 'migration_manager.dart';
 import 'notification_manager.dart';
+
 import 'overflow_manager.dart';
 import 'parallel_journal_manager.dart';
 import 'path_manager.dart';
@@ -150,6 +152,9 @@ class DataStoreImpl {
   LockManager? lockManager;
   TransactionManager? transactionManager;
   ResourceManager? _resourceManager;
+
+  /// Key-value storage namespace
+  late final KvStore kv = KvStore(this);
 
   // Transaction zone key
   static const Symbol _txnZoneKey = #to_txn_zone;
@@ -3185,7 +3190,9 @@ class DataStoreImpl {
     if (registerWalOp) {
       await ensureInitialized();
     }
+
     final schema = await schemaManager?.getTableSchema(tableName);
+
     if (schema == null) {
       Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
       return finish(DbResult.error(
@@ -5888,6 +5895,7 @@ class DataStoreImpl {
     final result = await executeQuery(
       tableName,
       QueryCondition()..where(_kvKeyField, '=', key),
+      limit: 1,
     );
     if (result.isEmpty) {
       return null;
@@ -5902,6 +5910,49 @@ class DataStoreImpl {
     return _decodeStoredKeyValue(row[_kvValueField], key: key);
   }
 
+  /// Get all keys in the specified space, optionally filtered by prefix.
+  Future<List<String>> getKeys({String? prefix, bool isGlobal = false}) async {
+    await ensureInitialized();
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final condition = QueryCondition();
+    if (prefix != null && prefix.isNotEmpty) {
+      condition.whereStartsWith(_kvKeyField, prefix);
+    }
+
+    final rows = await executeQuery(tableName, condition);
+    final now = DateTime.now();
+    final keys = <String>[];
+
+    for (final row in rows) {
+      if (!_isKvRowExpired(row, now: now)) {
+        keys.add(row[_kvKeyField].toString());
+      } else {
+        _scheduleExactExpiredKvCleanup(
+            tableName, row[_kvKeyField].toString(), row[_kvExpiresAtField]);
+      }
+    }
+    return keys;
+  }
+
+  /// Check if a key exists and is not expired.
+  Future<bool> exists(String key, {bool isGlobal = false}) async {
+    await ensureInitialized();
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final result = await executeQuery(
+      tableName,
+      QueryCondition()..where(_kvKeyField, '=', key),
+      limit: 1,
+    );
+    if (result.isEmpty) return false;
+
+    final row = result.first;
+    if (_isKvRowExpired(row)) {
+      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
+      return false;
+    }
+    return true;
+  }
+
   /// Remove key-value pair
   Future<DbResult> removeValue(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
@@ -5910,6 +5961,85 @@ class DataStoreImpl {
     // Build delete condition
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
     return await deleteInternal(tableName, condition);
+  }
+
+  /// Remove multiple key-value pairs.
+  Future<DbResult> removeValues(Iterable<String> keys,
+      {bool isGlobal = false}) async {
+    await ensureInitialized();
+    final keyList = keys.toList();
+    if (keyList.isEmpty) return DbResult.success();
+
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final condition = QueryCondition()..whereIn(_kvKeyField, keyList);
+    return await deleteInternal(tableName, condition);
+  }
+
+  /// Get remaining TTL for a key.
+  Future<Duration?> getTtl(String key, {bool isGlobal = false}) async {
+    await ensureInitialized();
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final result = await executeQuery(
+      tableName,
+      QueryCondition()..where(_kvKeyField, '=', key),
+      limit: 1,
+    );
+    if (result.isEmpty) return null;
+
+    final row = result.first;
+    final expiresAt = _parseKvDateTime(row[_kvExpiresAtField]);
+    if (expiresAt == null) return null;
+
+    final now = DateTime.now();
+    if (expiresAt.isBefore(now)) {
+      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
+      return null;
+    }
+    return expiresAt.difference(now);
+  }
+
+  /// Set TTL for an existing key.
+  Future<DbResult> setTtl(String key, Duration? ttl,
+      {DateTime? expiresAt, bool isGlobal = false}) async {
+    await ensureInitialized();
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+
+    final now = DateTime.now();
+    final expiresAtIso = expiresAt?.toIso8601String() ??
+        (ttl != null ? now.add(ttl).toIso8601String() : null);
+
+    final data = {
+      _kvExpiresAtField: expiresAtIso,
+      _kvUpdatedAtField: now.toIso8601String(),
+    };
+
+    final condition = QueryCondition()..where(_kvKeyField, '=', key);
+    return await updateInternal(tableName, data, condition);
+  }
+
+  /// Atomic increment for a numeric value.
+  Future<DbResult> setIncrement(String key,
+      {int amount = 1, bool isGlobal = false}) async {
+    await ensureInitialized();
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+
+    // Efficiently check if key exists and is not expired.
+    // If not exists, we use setValue to handle insert and default values (TTL etc.)
+    if (!(await exists(key, isGlobal: isGlobal))) {
+      return await setValue(key, amount, isGlobal: isGlobal);
+    }
+
+    // Atomic update using expression system.
+    // The expression evaluator in TableDataManager automatically handles
+    // numeric strings (from jsonEncode) by parsing them.
+    final nowIso = DateTime.now().toIso8601String();
+    final data = {
+      _kvValueField: Expr.field(_kvValueField) + Expr.value(amount),
+      _kvUpdatedAtField: nowIso,
+    };
+
+    final condition = QueryCondition()..where(_kvKeyField, '=', key);
+    return await updateInternal(tableName, data, condition);
   }
 
   /// Watch a single key-value pair and emit the latest value immediately.

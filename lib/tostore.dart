@@ -17,15 +17,20 @@ import 'dart:async';
 import 'src/Interface/chain_builder.dart';
 import 'src/Interface/data_store_interface.dart';
 import 'src/Interface/status_provider.dart';
+
 import 'src/chain/schema_builder.dart';
 import 'src/chain/stream_query_builder.dart';
 import 'src/core/data_store_impl.dart';
+import 'src/Interface/kv_store.dart';
+import 'src/handler/logger.dart';
 import 'src/model/backup_scope.dart';
+
 import 'src/model/data_store_config.dart';
 import 'src/model/db_result.dart';
 import 'src/model/migration_task.dart';
 import 'src/model/query_result.dart';
 import 'src/model/space_info.dart';
+import 'src/model/system_table.dart';
 import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
@@ -344,6 +349,9 @@ class ToStore implements DataStoreInterface {
   /// 返回操作结果，包含主键信息
   @override
   Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be accessed manually', 'ToStore.insert');
+
     return await _impl.insert(tableName, data);
   }
 
@@ -359,6 +367,9 @@ class ToStore implements DataStoreInterface {
   /// 查询构建器，支持链式操作
   @override
   QueryBuilder query(String tableName) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be queried manually', 'ToStore.query');
+
     return QueryBuilder(_impl, tableName);
   }
 
@@ -382,6 +393,9 @@ class ToStore implements DataStoreInterface {
   /// 流式查询，支持链式操作条件过滤
   @override
   StreamQueryBuilder streamQuery(String tableName) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be watched manually', 'ToStore.streamQuery');
+
     return StreamQueryBuilder(_impl, tableName);
   }
 
@@ -400,6 +414,9 @@ class ToStore implements DataStoreInterface {
   /// [data] 要插入或更新的数据
   @override
   Future<DbResult> upsert(String tableName, Map<String, dynamic> data) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be modified manually', 'ToStore.upsert');
+
     return _impl.upsert(tableName, data);
   }
 
@@ -438,6 +455,8 @@ class ToStore implements DataStoreInterface {
     int? efSearch,
     double? distanceThreshold,
   }) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be searched manually', 'ToStore.vectorSearch');
     return _impl.vectorSearch(
       tableName,
       fieldName: fieldName,
@@ -488,6 +507,9 @@ class ToStore implements DataStoreInterface {
   @override
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be updated manually', 'ToStore.update');
+
     return UpdateBuilder(_impl, tableName, data);
   }
 
@@ -522,6 +544,9 @@ class ToStore implements DataStoreInterface {
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList,
       {bool allowPartialErrors = true}) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be batchInserted manually', 'ToStore.batchInsert');
+
     return await _impl.batchInsert(
       tableName,
       dataList,
@@ -545,6 +570,9 @@ class ToStore implements DataStoreInterface {
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> dataList,
       {bool allowPartialErrors = true}) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be batchUpserted manually', 'ToStore.batchUpsert');
+
     return await _impl.batchUpsert(
       tableName,
       dataList,
@@ -729,6 +757,9 @@ class ToStore implements DataStoreInterface {
   /// 链式操作，支持带条件删除
   @override
   DeleteBuilder delete(String tableName) {
+    _checkSystemTableAccess(
+        tableName, 'cannot be deleted from manually', 'ToStore.delete');
+
     return DeleteBuilder(_impl, tableName);
   }
 
@@ -741,6 +772,9 @@ class ToStore implements DataStoreInterface {
   /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
   Future<DbResult> dropTable(String tableName) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be dropped manually', 'ToStore.dropTable');
+
     return await _impl.dropTable(tableName);
   }
 
@@ -753,6 +787,9 @@ class ToStore implements DataStoreInterface {
   /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
   Future<DbResult> clear(String tableName) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be cleared manually', 'ToStore.clear');
+
     return await _impl.clear(tableName);
   }
 
@@ -910,6 +947,8 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名
   @override
   SchemaBuilder updateSchema(String tableName) {
+    _checkSystemTableAccess(tableName, 'its schema cannot be modified manually',
+        'ToStore.updateSchema');
     return SchemaBuilder(_impl, tableName);
   }
 
@@ -979,6 +1018,10 @@ class ToStore implements DataStoreInterface {
   @override
   DbStatus get status => _impl.status;
 
+  /// Key-value storage namespace
+  @override
+  KvStore get kv => _impl.kv;
+
   /// @nodoc
   static final Map<String, ToStore> _instances = {};
 
@@ -991,5 +1034,14 @@ class ToStore implements DataStoreInterface {
   /// @nodoc
   static ToStore _fromImpl(DataStoreImpl impl) {
     return ToStore._internal(impl);
+  }
+
+  /// Check system table access and throw exception if denied
+  void _checkSystemTableAccess(String tableName, String action, String label) {
+    if (SystemTable.isKnownSystemTable(tableName)) {
+      final msg = 'Table $tableName is a system table and $action.';
+      Logger.error(msg, label: label);
+      throw ArgumentError(msg);
+    }
   }
 }

@@ -10,6 +10,7 @@ import '../model/space_info.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
 import '../model/backup_scope.dart';
+import '../Interface/kv_store.dart';
 import 'status_provider.dart';
 
 /// Data store engine interface
@@ -163,4 +164,7 @@ abstract class DataStoreInterface {
 
   /// Get unified status and diagnostics
   DbStatus get status;
+
+  /// Key-value storage namespace
+  KvStore get kv;
 }

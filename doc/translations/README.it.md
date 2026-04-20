@@ -33,7 +33,7 @@
 - **Per iniziare**: [Perché ToStore](#why-tostore) | [Caratteristiche principali](#key-features) | [Guida all'installazione](#installation) | [Modalità KV](#quick-start-kv) | [Modalità tabella](#quick-start-table) | [Modalità memoria](#quick-start-memory)
 - **Architettura e modello**: [Definizione dello schema](#schema-definition) | [Architettura distribuita](#distributed-architecture) | [Chiavi esterne a cascata](#foreign-keys) | [Cellulare/Desktop](#mobile-integration) | [Server/Agente](#server-integration) | [Algoritmi a chiave primaria](#primary-key-examples)
 - **Query avanzate**: [Query avanzate (JOIN)](#query-advanced) | [Aggregazione e statistiche](#aggregation-stats) | [Logica complessa (Condizione query)](#query-condition) | [Query reattiva (guarda)](#reactive-query) | [Query sullo streaming](#streaming-query)
-- **Avanzate e prestazioni**: [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Impostazione efficiente](#query-pagination) | [Query Cache](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
+- **Avanzate e prestazioni**: [Operazioni avanzate KV](#kv-advanced) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Impostazione efficiente](#query-pagination) | [Query Cache](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
 - **Operazioni e sicurezza**: [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Altre risorse](#more-resources)
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
@@ -142,6 +142,10 @@ db.watchValues(['current_user', 'login_status']).listen((map) {
 // Remove data
 await db.removeValue('current_user');
 ```
+
+> [!TIP]
+> **Hai bisogno di più funzioni chiave-valore?**
+> Per operazioni avanzate come la lettura sicura dei tipi (`getInt`, `getBool`), l'incremento atomico, la ricerca per prefisso e l'esplorazione dello spazio delle chiavi, consulta [**Operazioni avanzate chiave-valore (db.kv)**](#kv-advanced).
 
 #### Esempio di aggiornamento automatico dell'interfaccia utente Flutter
 In Flutter, `StreamBuilder` plus `watchValue` offre un flusso di aggiornamento reattivo molto conciso:
@@ -440,6 +444,60 @@ final dbServer = await ToStore.open(
 ## <a id="advanced-usage"></a>Utilizzo avanzato
 
 ToStore fornisce un ricco set di funzionalità avanzate per scenari aziendali complessi:
+
+
+### <a id="kv-advanced"></a>Operazioni avanzate chiave-valore (db.kv)
+
+Per scenari chiave-valore più complessi, si consiglia di utilizzare lo spazio dei nomi `db.kv`. Fornisce un set più completo di metodi.
+Tutti i metodi seguenti supportano il parametro opzionale `isGlobal`: `true` indica dati condivisi a livello globale, `false` (predefinito) per lo spazio corrente.
+
+- **Lettura sicura dei tipi (Type-Safe Getters)**
+  Ottieni i dati direttamente nel formato di destinazione senza conversione manuale dei tipi:
+  ```dart
+  String? name = await db.kv.getString('user_name');
+  int? age = await db.kv.getInt('user_age');
+  bool? isVip = await db.kv.getBool('is_vip');
+  Map<String, dynamic>? profile = await db.kv.getMap('profile');
+  List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **Contatore atomico (Atomic Increment)**
+  Aumenta o diminuisci i valori numerici in modo sicuro in scenari ad alta concorrenza:
+  ```dart
+  // Incrementa di 1 (predefinito)
+  await db.kv.setIncrement('view_count');
+  // Decrementa di 5 (passando un valore negativo)
+  await db.kv.setIncrement('stock_count', amount: -5);
+  ```
+
+- **Esplorazione e gestione dello spazio delle chiavi**
+  Supporta il recupero delle chiavi basato su prefisso, statistiche totali e cancellazione di massa:
+  ```dart
+  // Ottieni tutte le chiavi che iniziano con 'setting_'
+  final keys = await db.kv.getKeys(prefix: 'setting_');
+
+  // Ottieni il numero totale di coppie chiave-valore nello spazio corrente
+  final count = await db.kv.count();
+
+  // Verifica se una chiave esiste e non è scaduta
+  final exists = await db.kv.exists('config_cache');
+
+  // Rimuovi più chiavi contemporaneamente
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+
+  // Cancella tutti i dati KV dello spazio corrente
+  await db.kv.clear();
+  ```
+
+- **Gestione del ciclo di vita (TTL)**
+  Ottieni o aggiorna il tempo di scadenza delle chiavi esistenti:
+  ```dart
+  // Ottieni il tempo di scadenza rimanente
+  Duration? ttl = await db.kv.getTtl('token');
+
+  // Aggiorna il tempo di scadenza di una chiave esistente (scade tra 7 giorni)
+  await db.kv.setTtl('token', Duration(days: 7));
+  ```
 
 
 ### <a id="vector-advanced"></a>Campi vettoriali, indici vettoriali e ricerca vettoriale

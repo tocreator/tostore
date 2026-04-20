@@ -33,7 +33,7 @@
 - **Başlarken**: [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - **Mimari ve Model**: [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - **Gelişmiş Sorgular**: [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- **Gelişmiş ve Performans**: [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- **Gelişmiş ve Performans**: [Gelişmiş KV İşlemleri](#kv-advanced) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - **Operasyonlar ve Güvenlik**: [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
@@ -142,6 +142,10 @@ db.watchValues(['current_user', 'login_status']).listen((map) {
 // Remove data
 await db.removeValue('current_user');
 ```
+
+> [!TIP]
+> **Daha fazla anahtar-değer özelliğine mi ihtiyacınız var?**
+> Tür açısından güvenli okuma (`getInt`, `getBool`), atomik artırma, önek arama ve anahtar alanı keşfi gibi gelişmiş işlemler için lütfen [**Gelişmiş Anahtar-Değer İşlemleri (db.kv)**](#kv-advanced) bölümüne bakın.
 
 #### Flutter Kullanıcı Arayüzü Otomatik Yenileme Örneği
 Flutter'da, `StreamBuilder` plus `watchValue` size çok kısa bir reaktif yenileme akışı sağlar:
@@ -440,6 +444,60 @@ final dbServer = await ToStore.open(
 ## <a id="advanced-usage"></a>Gelişmiş Kullanım
 
 ToStore, karmaşık iş senaryoları için zengin bir dizi gelişmiş yetenek sağlar:
+
+
+### <a id="kv-advanced"></a>Gelişmiş Anahtar-Değer İşlemleri (db.kv)
+
+Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanılması önerilir. Daha kapsamlı bir yöntem seti sunar.
+Aşağıdaki tüm yöntemler isteğe bağlı `isGlobal` parametresini destekler: `true` küresel olarak paylaşılan verileri, `false` (varsayılan) ise mevcut alanı temsil eder.
+
+- **Tür Güvenli Okuma (Type-Safe Getters)**
+  Verileri manuel tür dönüştürme olmadan doğrudan hedef formatta alın:
+  ```dart
+  String? name = await db.kv.getString('user_name');
+  int? age = await db.kv.getInt('user_age');
+  bool? isVip = await db.kv.getBool('is_vip');
+  Map<String, dynamic>? profile = await db.kv.getMap('profile');
+  List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **Atomik Sayaç (Atomic Increment)**
+  Yüksek eşzamanlı senaryolarda sayısal değerleri güvenli bir şekilde artırın veya azaltın:
+  ```dart
+  // 1 artır (varsayılan)
+  await db.kv.setIncrement('view_count');
+  // 5 azalt (negatif miktar geçerek)
+  await db.kv.setIncrement('stock_count', amount: -5);
+  ```
+
+- **Anahtar Alanı Keşfi ve Yönetimi**
+  Önek tabanlı anahtar alma, toplam istatistikler ve toplu silme işlemlerini destekler:
+  ```dart
+  // 'setting_' ile başlayan tüm anahtarları al
+  final keys = await db.kv.getKeys(prefix: 'setting_');
+
+  // Mevcut alandaki toplam anahtar-değer çifti sayısını al
+  final count = await db.kv.count();
+
+  // Bir anahtarın mevcut olup olmadığını ve süresinin dolup dolmadığını kontrol et
+  final exists = await db.kv.exists('config_cache');
+
+  // Birden fazla anahtarı aynı anda sil
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+
+  // Mevcut alanın tüm KV verilerini temizle
+  await db.kv.clear();
+  ```
+
+- **Yaşam Döngüsü Yönetimi (TTL)**
+  Mevcut anahtarların sona erme süresini al veya güncelle:
+  ```dart
+  // Kalan sona erme süresini al
+  Duration? ttl = await db.kv.getTtl('token');
+
+  // Mevcut bir anahtarın sona erme süresini güncelle (7 gün içinde sona erer)
+  await db.kv.setTtl('token', Duration(days: 7));
+  ```
 
 
 ### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Vektör Arama

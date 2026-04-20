@@ -115,6 +115,7 @@ class DatabaseTester {
     try {
       final tests = <Map<String, Object>>[
         {'name': 'Clear & Delete All', 'test': _testClearAndDeleteAll},
+        {'name': 'KV Store Operations', 'test': _testKvStoreOperations},
         {'name': 'Basic CRUD', 'test': _testBasicCrud},
         {'name': 'Non-Nullable Constraint', 'test': _testNonNullConstraint},
         {'name': 'Upsert Logic', 'test': _testUpsert},
@@ -2577,6 +2578,165 @@ class DatabaseTester {
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testTransactionOperations: $e\n$s');
+    }
+    return isTestPassed;
+  }
+
+  /// Validates all Key-Value Store (db.kv) operations.
+  Future<bool> _testKvStoreOperations() async {
+    log.add('--- Testing: KV Store Operations ---', LogType.debug);
+    bool isTestPassed = true;
+    final kv = db.kv;
+
+    try {
+      // 1. Basic Set/Get
+      await kv.clear();
+      await kv.set('test_string', 'hello');
+      await kv.set('test_int', 123);
+      await kv.set('test_bool', true);
+      await kv.set('test_map', {'a': 1, 'b': '2'});
+      await kv.set('test_list', [1, 2, 3]);
+
+      final stringVal = await kv.getString('test_string');
+      isTestPassed = isTestPassed &&
+          _expect('getString("test_string")', stringVal, 'hello');
+
+      final intVal = await kv.getInt('test_int');
+      isTestPassed = isTestPassed && _expect('getInt("test_int")', intVal, 123);
+
+      final boolVal = await kv.getBool('test_bool');
+      isTestPassed =
+          isTestPassed && _expect('getBool("test_bool")', boolVal, true);
+
+      final mapVal = await kv.getMap('test_map');
+      isTestPassed = isTestPassed &&
+          _expect('getMap("test_map") contains a', mapVal?['a'], 1);
+      isTestPassed = isTestPassed &&
+          _expect('getMap("test_map") contains b', mapVal?['b'], '2');
+
+      final listVal = await kv.getList<int>('test_list');
+      isTestPassed = isTestPassed &&
+          _expect('getList<int>("test_list") length', listVal?.length, 3);
+      isTestPassed = isTestPassed &&
+          _expect('getList<int>("test_list")[1]', listVal?[1], 2);
+
+      // 2. Exists and Count
+      final existsStr = await kv.exists('test_string');
+      isTestPassed = isTestPassed &&
+          _expect('exists("test_string") should be true', existsStr, true);
+
+      final existsNon = await kv.exists('non_existent');
+      isTestPassed = isTestPassed &&
+          _expect('exists("non_existent") should be false', existsNon, false);
+
+      final countVal = await kv.count();
+      isTestPassed =
+          isTestPassed && _expect('count() should be 5', countVal, 5);
+
+      // 3. Prefix GetKeys
+      await kv.set('pref_1', 1);
+      await kv.set('pref_2', 2);
+      await kv.set('other', 3);
+      final keysResult = await kv.getKeys(prefix: 'pref_');
+      isTestPassed = isTestPassed &&
+          _expect('getKeys(prefix: "pref_") length', keysResult.length, 2);
+      isTestPassed = isTestPassed &&
+          _expect(
+              'getKeys contains pref_1', keysResult.contains('pref_1'), true);
+      isTestPassed = isTestPassed &&
+          _expect(
+              'getKeys contains pref_2', keysResult.contains('pref_2'), true);
+
+      // 4. Atomic Increment
+      await kv.set('counter', 10);
+      await kv.setIncrement('counter', amount: 5);
+      final counterVal = await kv.getInt('counter');
+      isTestPassed = isTestPassed &&
+          _expect('setIncrement("counter", 5) result', counterVal, 15);
+
+      await kv.setIncrement('new_counter', amount: 1);
+      final newCounterVal = await kv.getInt('new_counter');
+      isTestPassed =
+          isTestPassed && _expect('setIncrement on new key', newCounterVal, 1);
+
+      // 5. TTL Operations
+      await kv.set('temp_key', 'temp', ttl: const Duration(seconds: 10));
+      final ttlVal = await kv.getTtl('temp_key');
+      isTestPassed = isTestPassed &&
+          _expect(
+              'getTtl should be positive', (ttlVal?.inSeconds ?? 0) > 0, true);
+
+      await kv.setTtl('temp_key', const Duration(seconds: 3600));
+      final newTtlVal = await kv.getTtl('temp_key');
+      isTestPassed = isTestPassed &&
+          _expect('newTtl should be around 3600',
+              (newTtlVal?.inSeconds ?? 0) > 3500, true);
+
+      // 6. Global Space Test
+      await kv.set('global_key', 'global_val', isGlobal: true);
+      final gVal = await kv.getString('global_key', isGlobal: true);
+      isTestPassed = isTestPassed &&
+          _expect('get(global_key, isGlobal: true)', gVal, 'global_val');
+
+      final lVal = await kv.getString('global_key');
+      isTestPassed = isTestPassed &&
+          _expect('get(global_key) from local should be null', lVal, null);
+
+      // 7. Watch (Single and Many) - Skipped on Wasm due to Record/Stream compatibility issues
+      if (!_isWasmBuild) {
+        final watchStream = kv.watch<String>('test_string');
+        final watchFirst =
+            await watchStream.first.timeout(const Duration(seconds: 1));
+        isTestPassed = isTestPassed &&
+            _expect('watch("test_string") first emission', watchFirst, 'hello');
+
+        final watchManyStream = kv.watchValues(['test_string', 'test_int']);
+        final watchManyFirst =
+            await watchManyStream.first.timeout(const Duration(seconds: 1));
+        isTestPassed = isTestPassed &&
+            _expect('watchValues first emission test_string',
+                watchManyFirst['test_string'], 'hello');
+        isTestPassed = isTestPassed &&
+            _expect('watchValues first emission test_int',
+                watchManyFirst['test_int'], 123);
+      }
+
+      // 8. Removal
+      await kv.remove('test_string');
+      final existsAfterRemove = await kv.exists('test_string');
+      isTestPassed = isTestPassed &&
+          _expect('exists after remove', existsAfterRemove, false);
+
+      await kv.removeKeys(['test_int', 'test_bool']);
+      final existsInt = await kv.exists('test_int');
+      isTestPassed = isTestPassed &&
+          _expect('exists after removeKeys(int)', existsInt, false);
+
+      final existsBool = await kv.exists('test_bool');
+      isTestPassed = isTestPassed &&
+          _expect('exists after removeKeys(bool)', existsBool, false);
+
+      await kv.clear();
+      final countFinal = await kv.count();
+      isTestPassed =
+          isTestPassed && _expect('count after clear', countFinal, 0);
+
+      // 9. Edge case: Expired key
+      await kv.set('expired_key', 'gone',
+          ttl: const Duration(milliseconds: 10));
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      final existsExpired = await kv.exists('expired_key');
+      isTestPassed = isTestPassed &&
+          _expect(
+              'exists for expired key should be false', existsExpired, false);
+
+      final valExpired = await kv.get('expired_key');
+      isTestPassed = isTestPassed &&
+          _expect('get for expired key should be null', valExpired, null);
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testKvStoreOperations: $e\n$s');
     }
     return isTestPassed;
   }

@@ -39,7 +39,7 @@
 - **快速上手**：[为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - **架构与模型**：[表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - **深度查询**：[高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- **进阶与性能**：[向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- **进阶与性能**：[KV进阶](#kv-advanced) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - **运维与安全**：[管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
 
 
@@ -156,6 +156,10 @@ db.watchValues(['current_user', 'login_status']).listen((map) {
 // 删除数据
 await db.removeValue('current_user');
 ```
+
+> [!TIP]
+> **需要更多键值对功能？**
+> 诸如强类型读取（`getInt`、`getBool`）、原子自增、前缀检索、键空间探索等进阶操作，请参阅 [**键值对进阶操作 (db.kv)**](#kv-advanced)。
 
 #### Flutter UI 自动监听刷新示例
 在 Flutter 中，利用 `StreamBuilder` 配合 `watchValue` 可以实现极其简洁的响应式刷新：
@@ -465,6 +469,60 @@ final dbServer = await ToStore.open(
 ## <a id="advanced-usage"></a>进阶用法
 
 ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
+
+
+### <a id="kv-advanced"></a>键值对进阶操作 (db.kv)
+
+对于更复杂的 Key-Value 场景，建议使用 `db.kv` 命名空间。它提供了更丰富的方法集：
+以下方法均支持可选参数 `isGlobal`：`true` 表示全局空间共享数据，`false`（默认）表示当前空间。
+
+- **强类型获取 (Type-Safe Getters)**
+  无需手动转换类型，直接获取目标格式数据：
+  ```dart
+  String? name = await db.kv.getString('user_name');
+  int? age = await db.kv.getInt('user_age');
+  bool? isVip = await db.kv.getBool('is_vip');
+  Map<String, dynamic>? profile = await db.kv.getMap('profile');
+  List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **原子计数器 (Atomic Increment)**
+  在高并发场景下安全地递增或递减数值：
+  ```dart
+  // 自增 1 (默认值)
+  await db.kv.setIncrement('view_count');
+  // 自减 5 (传入负数实现递减)
+  await db.kv.setIncrement('stock_count', amount: -5);
+  ```
+
+- **键空间探索与管理 (Discovery & Management)**
+  支持按前缀检索键名、统计数量及批量删除：
+  ```dart
+  // 获取所有前缀以 'setting_' 开头的键名
+  final keys = await db.kv.getKeys(prefix: 'setting_');
+
+  // 统计当前空间内的键值对总数
+  final count = await db.kv.count();
+
+  // 检查某个键是否存在且未过期
+  final exists = await db.kv.exists('config_cache');
+
+  // 批量删除多个键
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+
+  // 清空当前空间的所有 KV 数据
+  await db.kv.clear();
+  ```
+
+- **生命周期管理 (TTL)**
+  获取或动态更新现有键的过期时间：
+  ```dart
+  // 获取剩余过期时长
+  Duration? ttl = await db.kv.getTtl('token');
+
+  // 为现有键更新过期时间（7天后过期）
+  await db.kv.setTtl('token', Duration(days: 7));
+  ```
 
 
 ### <a id="vector-advanced"></a>向量字段、向量索引与向量检索
