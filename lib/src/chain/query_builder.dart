@@ -37,6 +37,56 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     _invalidateFuture();
   }
 
+  void _prewarm({String? nextCursor, int? nextOffset}) {
+    if (!_db.isLowPressure()) return;
+
+    // Safety Threshold: Avoid pre-warming excessively large result sets.
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit > 1000) return;
+
+    // Use Future.delayed to ensure the pre-warm task starts after the current event tick,
+    // allowing the user's primary query result to be processed first.
+    Future.delayed(Duration.zero, () async {
+      try {
+        // Final pressure check before starting background IO
+        if (!_db.isLowPressure()) return;
+
+        // Try to acquire an auxiliary (low priority) token.
+        // If the system is busy (e.g. heavy writes or many active queries),
+        // tryAcquire will return null and we skip pre-warming to protect foreground tasks.
+        final lease = await _db.workloadScheduler.tryAcquire(
+          WorkloadType.aux,
+          label: 'Prewarm:$_tableName',
+        );
+        if (lease == null) return;
+
+        try {
+          // Directly call the executor to bypass builder overhead and avoid cloning.
+          // This warms up the B-Tree Page Cache and Record Cache in ResourceManager.
+          await _db.queryExecutor.execute(
+            _tableName,
+            condition: _condition,
+            orderBy: _orderBy,
+            limit: _limit,
+            offset: nextOffset ?? _offset,
+            cursor: nextCursor,
+            joins: _joins,
+            enableQueryCache: false, // Don't interfere with manual result cache
+            onlyCount: false,
+            aggregations: _aggregations,
+            groupBy: _groupByFields,
+          );
+        } finally {
+          lease.release();
+        }
+      } catch (e) {
+        // Silently ignore pre-warm errors
+        Logger.debug('Pre-warm next page failed (ignoring): $e',
+            label: 'QueryBuilder.prewarm');
+      }
+    });
+  }
+
   /// Specified query returns specific fields. Can also accept `QueryAggregation` via `Agg` factory.
   /// Note: The original generic [fields] was `List<String>`. To support `Agg` blending,
   /// this is changed to `List<dynamic>`.
@@ -325,7 +375,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<QueryResult<Map<String, dynamic>>> get future async {
     if (_future == null) {
       final result = await _executeQuery();
-      return QueryResult.success(
+      final queryResult = QueryResult.success(
         data: result.records,
         prevCursor: result.prevCursor,
         nextCursor: result.nextCursor,
@@ -334,6 +384,23 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         tableTotalCount: result.tableTotalCount,
         executionTimeMs: result.executionTimeMs,
       );
+
+      // Trigger background pre-warm for next page if conditions are met
+      if (queryResult.hasMore) {
+        if (queryResult.nextCursor != null) {
+          _prewarm(nextCursor: queryResult.nextCursor);
+        } else {
+          // Offset-based pagination pre-warm: calculate and warm up next page
+          // Use default limit if not specified to ensure correct page boundary
+          final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+          if (effectiveLimit > 0) {
+            final currentOffset = _offset ?? 0;
+            _prewarm(nextOffset: currentOffset + effectiveLimit);
+          }
+        }
+      }
+
+      return queryResult;
     }
     final result = await _future!;
     return QueryResult.success(

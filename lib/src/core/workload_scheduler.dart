@@ -14,6 +14,14 @@ import 'dart:math';
 class WorkloadScheduler {
   final int globalMax;
   final Map<WorkloadType, double> _share;
+
+  /// Callback triggered whenever the system pressure state potentially changes.
+  void Function()? onPressureChanged;
+
+  /// Cached high-pressure flag to avoid repeated calculation in hot paths.
+  bool _isHighPressure = false;
+  bool get isHighPressure => _isHighPressure;
+
   final Map<WorkloadType, int> _usedTokens = {
     WorkloadType.flush: 0,
     WorkloadType.query: 0,
@@ -147,6 +155,48 @@ class WorkloadScheduler {
     );
   }
 
+  /// Check if the system is under high workload pressure.
+  ///
+  /// This method updates the cached [_isHighPressure] flag.
+  bool isSystemUnderPressure() {
+    if (globalMax <= 0) return true;
+
+    bool high = false;
+
+    // 1. Check global saturation (70% threshold)
+    if (totalUsedTokens > globalMax * 0.7) {
+      high = true;
+    } else {
+      // 2. Check specific type pressure (Flush and Query are most critical)
+      for (final type in [WorkloadType.flush, WorkloadType.query]) {
+        if (_usedTokens[type]! >= _capacityTokensFor(type) * 0.8) {
+          high = true;
+          break;
+        }
+      }
+    }
+
+    if (!high) {
+      // 3. Check for queued demand
+      for (final queue in _queues.values) {
+        if (queue.isNotEmpty) {
+          high = true;
+          break;
+        }
+      }
+    }
+
+    _setHighPressure(high);
+    return high;
+  }
+
+  void _setHighPressure(bool high) {
+    if (_isHighPressure != high) {
+      _isHighPressure = high;
+      onPressureChanged?.call();
+    }
+  }
+
   void _release(
     WorkloadType type,
     int tokens,
@@ -160,6 +210,7 @@ class WorkloadScheduler {
     _activeDemandTokens[type] =
         max(0, _activeDemandTokens[type]! - declaredDemandTokens);
     _drainQueues();
+    isSystemUnderPressure(); // Update pressure status after release
   }
 
   void _drainQueues() {
@@ -225,13 +276,18 @@ class WorkloadScheduler {
     _usedTokens[type] = _usedTokens[type]! + grant;
     _activeDemandTokens[type] =
         _activeDemandTokens[type]! + declaredDemandTokens;
-    return WorkloadLease(
+
+    final lease = WorkloadLease(
       this,
       type,
       grant,
       label: label,
       declaredDemandTokens: declaredDemandTokens,
     );
+
+    isSystemUnderPressure(); // Update pressure status after acquisition
+
+    return lease;
   }
 
   int _availableTokensFor(

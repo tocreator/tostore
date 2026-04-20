@@ -141,6 +141,10 @@ class DataStoreImpl {
   late CacheManager cacheManager;
   MigrationManager? migrationManager;
   VersionUpgradeManager? versionUpgradeManager;
+
+  // Cached high pressure status to avoid redundant calculations in query paths.
+  bool _isHighPressure = false;
+  bool get isHighPressure => _isHighPressure;
   IntegrityChecker? _integrityChecker;
   KeyManager? _keyManager;
   WeightManager? _weightManager;
@@ -355,6 +359,39 @@ class DataStoreImpl {
 
   /// Get resource manager
   ResourceManager? get resourceManager => _resourceManager;
+
+  /// Check if the system is currently under low pressure, suitable for non-critical pre-warming tasks.
+  bool isLowPressure() {
+    if (!_isInitialized) return false;
+    // Use cached pressure status (updated via WorkloadScheduler and ResourceManager callbacks)
+    return !_isHighPressure;
+  }
+
+  void updatePressureStatus() {
+    bool high = workloadScheduler.isHighPressure;
+
+    // Check memory pressure (Cache Usage vs Threshold)
+    if (!high && _resourceManager != null) {
+      if (_resourceManager!.isLowMemoryMode) {
+        high = true;
+      } else {
+        // Check prewarmThresholdMB from config
+        final usageMB = _resourceManager!.lastMeasuredTotalUsageMB;
+        if (usageMB >= config.prewarmThresholdMB) {
+          high = true;
+        }
+      }
+    }
+
+    final bool oldHigh = _isHighPressure;
+    _isHighPressure = high;
+
+    // Reactive: If transitioning to high pressure, trigger an immediate resource check
+    // to see if memory eviction is needed to relieve system stress.
+    if (_isHighPressure && !oldHigh) {
+      _resourceManager?.triggerImmediateCheck();
+    }
+  }
 
   /// TTL cache hooks for schema/cache managers.
   void upsertTtlPlanForSchema(TableSchema schema) {
@@ -664,9 +701,9 @@ class DataStoreImpl {
       }
 
       // Initialize global workload scheduler using maxIoConcurrency as total token capacity.
-      // This allows higher I/O parallelism while CPU tasks are naturally limited by isolate count.
       workloadScheduler =
           WorkloadScheduler(globalMax: _config!.maxIoConcurrency);
+      workloadScheduler.onPressureChanged = updatePressureStatus;
 
       // Configure the global parallel processor with sensible defaults
       ParallelProcessor.setConfig(
@@ -7900,6 +7937,7 @@ class _DbStatusImpl implements DbStatus {
         schemaCacheLimit: 0,
         metaCacheUsage: 0,
         metaCacheLimit: 0,
+        totalUsageBytes: 0,
         isLowMemoryMode: false,
       );
     }

@@ -54,6 +54,9 @@ class ResourceManager {
   /// Initialization flag
   bool _initialized = false;
 
+  /// Last measured total cache usage across all types (bytes)
+  int _lastMeasuredTotalUsageBytes = 0;
+
   /// Data store reference
   DataStoreImpl? _dataStore;
 
@@ -149,9 +152,25 @@ class ResourceManager {
   /// Register resource monitoring periodic task
   void _registerResourceMonitor() {
     // Use CrontabManager to register resource monitoring task
-    CrontabManager.addCallback(
-        ExecuteInterval.seconds10, // 10 seconds interval
-        _checkResourceUsage);
+    // Default to 30 seconds to reduce overhead; during high pressure,
+    // the system can trigger immediate checks reactively.
+    CrontabManager.addCallback(ExecuteInterval.seconds30, _checkResourceUsage);
+  }
+
+  // Throttle immediate checks to avoid storming the resource manager
+  DateTime _lastImmediateCheckTime = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Trigger an immediate resource check (bypassing the timer).
+  ///
+  /// Useful when large operations finish and system pressure might have changed.
+  /// This call is throttled to at most once per 2 seconds.
+  Future<void> triggerImmediateCheck() async {
+    final now = DateTime.now();
+    if (now.difference(_lastImmediateCheckTime).inMilliseconds < 2000) {
+      return;
+    }
+    _lastImmediateCheckTime = now;
+    await _checkResourceUsage();
   }
 
   /// Check resource usage (Memory and Disk) and trigger cleanup if needed
@@ -159,10 +178,14 @@ class ResourceManager {
     try {
       await _updateResourceStatus();
 
-      // Trigger cleanup if warning or higher
+      // Update last measured total usage and trigger cleanup if warning or higher
+      final info = await getMemoryInfo();
       if (_status != ResourceStatus.normal) {
-        _triggerCacheEviction();
+        _triggerCacheEviction(info: info);
       }
+
+      // Notify data store to update cached pressure status
+      _dataStore?.updatePressureStatus();
     } catch (e) {
       Logger.error('Failed to check resource usage: $e',
           label: 'ResourceManager._checkResourceUsage');
@@ -229,7 +252,7 @@ class ResourceManager {
   }
 
   /// Trigger cache cleanup
-  void _triggerCacheEviction() {
+  void _triggerCacheEviction({MemoryInfo? info}) {
     if (_isCleaning) {
       return;
     }
@@ -248,12 +271,8 @@ class ResourceManager {
     Future(() async {
       try {
         // Efficiently check total cache usage first
-        final info = await getMemoryInfo();
-        final totalUsage = info.tableDataCacheUsage +
-            info.indexCacheUsage +
-            info.queryCacheUsage +
-            info.schemaCacheUsage +
-            info.metaCacheUsage;
+        final currentInfo = info ?? await getMemoryInfo();
+        final totalUsage = currentInfo.totalUsageBytes;
 
         if (totalUsage < _getMinTotalCacheToEvict()) {
           return;
@@ -408,26 +427,45 @@ class ResourceManager {
   /// Whether resources are low (warning or critical), triggers cache cleanup
   bool get isLowMemoryMode => _status != ResourceStatus.normal;
 
+  /// Get last measured total cache usage in MB
+  int get lastMeasuredTotalUsageMB =>
+      _lastMeasuredTotalUsageBytes ~/ (1024 * 1024);
+
   /// Get current memory and cache usage information
   Future<MemoryInfo> getMemoryInfo() async {
-    return MemoryInfo(
+    final tableDataUsage =
+        await _getCurrentCacheSizeByType(MemoryQuotaType.tableData);
+    final indexUsage =
+        await _getCurrentCacheSizeByType(MemoryQuotaType.indexData);
+    final queryUsage =
+        await _getCurrentCacheSizeByType(MemoryQuotaType.queryResult);
+    final schemaUsage =
+        await _getCurrentCacheSizeByType(MemoryQuotaType.schema);
+    final metaUsage = await _getCurrentCacheSizeByType(MemoryQuotaType.meta);
+
+    final totalUsage =
+        tableDataUsage + indexUsage + queryUsage + schemaUsage + metaUsage;
+
+    final info = MemoryInfo(
       totalThresholdMB: _memoryThresholdInMB,
-      tableDataCacheUsage:
-          await _getCurrentCacheSizeByType(MemoryQuotaType.tableData),
+      tableDataCacheUsage: tableDataUsage,
       tableDataCacheLimit: _tableDataCacheSize,
-      indexCacheUsage:
-          await _getCurrentCacheSizeByType(MemoryQuotaType.indexData),
+      indexCacheUsage: indexUsage,
       indexCacheLimit: _indexCacheSize,
-      queryCacheUsage:
-          await _getCurrentCacheSizeByType(MemoryQuotaType.queryResult),
+      queryCacheUsage: queryUsage,
       queryCacheLimit: _queryCacheSize,
-      schemaCacheUsage:
-          await _getCurrentCacheSizeByType(MemoryQuotaType.schema),
+      schemaCacheUsage: schemaUsage,
       schemaCacheLimit: _schemaCacheSize,
-      metaCacheUsage: await _getCurrentCacheSizeByType(MemoryQuotaType.meta),
+      metaCacheUsage: metaUsage,
       metaCacheLimit: _metaCacheSize,
       isLowMemoryMode: _status != ResourceStatus.normal,
+      totalUsageBytes: totalUsage,
     );
+
+    // Sync last measured total usage whenever info is gathered
+    _lastMeasuredTotalUsageBytes = totalUsage;
+
+    return info;
   }
 
   /// Get baseline protection threshold for specific cache type

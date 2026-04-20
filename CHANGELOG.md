@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
 - Refactored Key-Value storage API to group methods under `db.kv.*` (e.g., `db.kv.clear()`, `db.kv.count()`).
 - Enhanced system table protection to prevent accidental manual deletion/clearing of critical internal tables.
 - Optimized Key-Value query performance.
+- Optimized resource-aware scheduling for improved resource management.
+- Optimized query channel performance.
+
 
 
 

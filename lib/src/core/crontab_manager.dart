@@ -284,6 +284,8 @@ class CrontabManager {
         return '3 seconds';
       case ExecuteInterval.seconds10:
         return '10 seconds';
+      case ExecuteInterval.seconds30:
+        return '30 seconds';
       case ExecuteInterval.minutes1:
         return '1 minute';
       case ExecuteInterval.minutes5:
@@ -303,6 +305,9 @@ enum ExecuteInterval {
 
   /// 10-second interval
   seconds10(Duration(seconds: 10)),
+
+  /// 30-second interval
+  seconds30(Duration(seconds: 30)),
 
   /// 1-minute interval
   minutes1(Duration(minutes: 1)),

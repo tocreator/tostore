@@ -820,6 +820,11 @@ class ParallelJournalManager {
           Logger.debug(
               'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at',
               label: 'ParallelJournalManager');
+
+          // Trigger resource check after significant data writes
+          if (batch.length >= (_dataStore.config.writeBatchSize * 0.8)) {
+            _dataStore.resourceManager?.triggerImmediateCheck();
+          }
         }
 
         // Mark completed and advance checkpoint

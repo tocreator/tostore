@@ -36,6 +36,9 @@ class MemoryInfo {
   /// Whether current system is in low memory mode
   final bool isLowMemoryMode;
 
+  /// Total cache usage across all types (Bytes)
+  final int totalUsageBytes;
+
   const MemoryInfo({
     required this.totalThresholdMB,
     required this.tableDataCacheUsage,
@@ -49,6 +52,7 @@ class MemoryInfo {
     required this.metaCacheUsage,
     required this.metaCacheLimit,
     required this.isLowMemoryMode,
+    required this.totalUsageBytes,
   });
 
   /// Create a map representation of this object
@@ -66,6 +70,7 @@ class MemoryInfo {
       'metaCacheUsage': metaCacheUsage,
       'metaCacheLimit': metaCacheLimit,
       'isLowMemoryMode': isLowMemoryMode,
+      'totalUsageBytes': totalUsageBytes,
     };
   }
 }
