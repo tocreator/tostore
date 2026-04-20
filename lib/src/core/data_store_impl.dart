@@ -5411,6 +5411,10 @@ class DataStoreImpl {
           continue; // Continue load other tables
         }
       }
+
+      // [Optimization] Prewarm KV store at the end to avoid delaying
+      // boundary page prewarming for other prioritized tables.
+      await _prewarmKvStore();
     } catch (e) {
       if (_isInitialized) {
         Logger.error('Error in _executePrewarm: $e',
@@ -5418,6 +5422,46 @@ class DataStoreImpl {
       }
     } finally {
       _isGlobalPrewarming = false;
+    }
+  }
+
+  /// Prewarm KV store tables into TreeCache
+  Future<void> _prewarmKvStore() async {
+    // Use the threshold from config as the total budget for KV prewarming
+    final maxPrewarmBytes = config.prewarmThresholdMB * 1024 * 1024;
+    // Safety cap for record count to avoid excessive object overhead from millions of tiny keys
+    const maxRecordsSafetyCap = 200000;
+
+    final kvTables = [
+      SystemTable.getKeyValueName(true), // Global KV
+      SystemTable.getKeyValueName(false), // Local KV
+    ];
+
+    int currentPrewarmedBytes = 0;
+
+    for (final tableName in kvTables) {
+      if (!_isInitialized) break;
+      try {
+        final tableMeta = await tableDataManager.getTableMeta(tableName);
+        if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
+
+        // Threshold check: avoids OOM by staying within the configured prewarm budget.
+        // We accumulate usage to ensure the sum of all KV tables respects the threshold.
+        if (currentPrewarmedBytes + tableMeta.totalSizeInBytes <=
+                maxPrewarmBytes &&
+            tableMeta.totalRecords <= maxRecordsSafetyCap) {
+          // [Optimization] Use a range query on the 'key' field to force an Index Scan.
+          // This preloads both index pages and data records into the cache.
+          await executeQuery(tableName,
+              QueryCondition()..where(SystemTable.keyValueKeyField, '>=', ''),
+              limit: maxRecordsSafetyCap);
+
+          currentPrewarmedBytes += tableMeta.totalSizeInBytes;
+        }
+      } catch (e) {
+        Logger.warn('Prewarm KV store failed for $tableName: $e',
+            label: 'DataStore.prewarm');
+      }
     }
   }
 
