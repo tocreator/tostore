@@ -1059,10 +1059,13 @@ class WalManager {
           final useIsolate = rawEntries.length > 100;
 
           final result = await ComputeManager.run(
-            batchEncodeWal,
-            BatchWalEncodeRequest(
+            ComputeTask(
+              function: batchEncodeWal,
+              message: BatchWalEncodeRequest(
                 entries: rawEntries,
-                encoderConfig: EncoderHandler.getCurrentEncodingState()),
+                encoderConfig: EncoderHandler.getCurrentEncodingState(),
+              ),
+            ),
             useIsolate: useIsolate,
           );
 

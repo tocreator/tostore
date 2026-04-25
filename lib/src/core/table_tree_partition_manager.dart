@@ -1173,8 +1173,10 @@ final class TableTreePartitionManager {
         );
 
         final res = await ComputeManager.run(
-          batchEncodeBTreePages,
-          req,
+          ComputeTask(
+            function: batchEncodeBTreePages,
+            message: req,
+          ),
           useIsolate: useIsolateForPageEncode,
         );
 

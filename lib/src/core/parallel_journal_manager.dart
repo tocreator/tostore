@@ -1038,8 +1038,10 @@ class ParallelJournalManager {
           );
 
           final entries = await ComputeManager.run(
-            _walDecodeTask,
-            request,
+            ComputeTask(
+              function: _walDecodeTask,
+              message: request,
+            ),
             useIsolate: fileBytes.length > 4096,
           );
 

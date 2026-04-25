@@ -716,8 +716,10 @@ class TimeBasedIdGenerator implements IdGenerator {
 
         // Add task, record task index for order preservation
         final task = await ComputeManager.run(
-          generateTimeBasedIds,
-          request,
+          ComputeTask(
+            function: generateTimeBasedIds,
+            message: request,
+          ),
           useIsolate: true,
         );
 

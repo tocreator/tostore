@@ -469,10 +469,14 @@ class MigrationManager {
       }
 
       // parallel processing all batches
-      final batchResults = await Future.wait(batches.map((batch) =>
-          ComputeManager.run(calculateBatchTableSimilarity,
-              BatchTableSimilarityRequest(requests: batch),
-              useIsolate: similarityRequests.length > 20)));
+      final batchResults =
+          await Future.wait(batches.map((batch) => ComputeManager.run(
+                ComputeTask(
+                  function: calculateBatchTableSimilarity,
+                  message: BatchTableSimilarityRequest(requests: batch),
+                ),
+                useIsolate: similarityRequests.length > 20,
+              )));
 
       // merge all results
       final allResults = <TableSimilarityResult>[];
@@ -1633,10 +1637,14 @@ class MigrationManager {
     }
 
     // parallel processing all batches
-    final batchResults = await Future.wait(batches.map((batch) =>
-        ComputeManager.run(calculateBatchFieldSimilarity,
-            BatchFieldSimilarityRequest(requests: batch),
-            useIsolate: similarityRequests.length > 100)));
+    final batchResults =
+        await Future.wait(batches.map((batch) => ComputeManager.run(
+              ComputeTask(
+                function: calculateBatchFieldSimilarity,
+                message: BatchFieldSimilarityRequest(requests: batch),
+              ),
+              useIsolate: similarityRequests.length > 100,
+            )));
 
     // merge all results
     final allResults = <FieldSimilarityResult>[];
@@ -2307,14 +2315,17 @@ class MigrationManager {
     // Parallel processing all batches
     final batchResults =
         await Future.wait(batches.map((batch) => ComputeManager.run(
-            processMigrationRecords,
-            MigrationRecordProcessRequest(
-              records: batch,
-              operations: operations,
-              oldSchema: oldSchema,
-              yieldDurationMs: _dataStore.config.yieldDurationMs,
-            ),
-            useIsolate: records.length > 500)));
+              ComputeTask(
+                function: processMigrationRecords,
+                message: MigrationRecordProcessRequest(
+                  records: batch,
+                  operations: operations,
+                  oldSchema: oldSchema,
+                  yieldDurationMs: _dataStore.config.yieldDurationMs,
+                ),
+              ),
+              useIsolate: records.length > 500,
+            )));
 
     // Merge results
     final allProcessedRecords = <Map<String, dynamic>>[];

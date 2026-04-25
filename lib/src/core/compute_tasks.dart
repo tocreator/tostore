@@ -1,21 +1,21 @@
 import 'dart:async';
 import 'dart:math';
 
-import '../model/table_schema.dart';
-import '../model/data_store_config.dart';
-import '../model/migration_task.dart';
-import '../handler/value_matcher.dart';
+import 'dart:typed_data';
+
+import '../handler/encoder.dart';
 import '../handler/logger.dart';
+import '../handler/value_matcher.dart';
+import '../model/data_store_config.dart';
+import '../model/encoder_config.dart';
+import '../model/migration_task.dart';
+import '../model/table_schema.dart';
+import '../core/vector_quantizer.dart';
+import '../handler/wal_encoder.dart';
 import 'btree_page.dart';
 import 'page_redo_log_codec.dart';
 import 'table_data_manager.dart';
 import 'yield_controller.dart';
-import '../handler/wal_encoder.dart';
-import '../handler/encoder.dart';
-import '../model/encoder_config.dart';
-import 'dart:typed_data';
-
-import '../core/vector_quantizer.dart';
 
 /// Table similarity calculation request
 class TableSimilarityRequest {

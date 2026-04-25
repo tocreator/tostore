@@ -120,15 +120,17 @@ class VectorIndexManager {
 
           // Isolate: PQ encode only (no file I/O). Graph insert + flush on main.
           final quantizeResult = await ComputeManager.run(
-            quantizeVectorsForNghTask,
-            QuantizeVectorsForNghArgs(
-              pqSubspaces: quantizer.codebook.subspaces,
-              pqCentroids: quantizer.codebook.centroids,
-              pqSubDimensions: quantizer.codebook.subDimensions,
-              pqData: quantizer.codebook.data,
-              vectors: vectors,
+            ComputeTask(
+              function: quantizeVectorsForNghTask,
+              message: QuantizeVectorsForNghArgs(
+                pqSubspaces: quantizer.codebook.subspaces,
+                pqCentroids: quantizer.codebook.centroids,
+                pqSubDimensions: quantizer.codebook.subDimensions,
+                pqData: quantizer.codebook.data,
+                vectors: vectors,
+              ),
             ),
-            useIsolate: true,
+            useIsolate: vectors.length > 256,
           );
           final pqCodes = quantizeResult.pqCodes;
 
@@ -566,16 +568,17 @@ class VectorIndexManager {
             }
           }
 
-          futures
-              .add(ComputeManager.run<PqTrainSubspaceRequest, PqSubspaceResult>(
-            trainPqSubspace,
-            PqTrainSubspaceRequest(
-              subSamples: subSamples,
-              n: n,
-              subDim: subDim,
-              k: k,
-              iterations: 10,
-              subspaceIndex: m,
+          futures.add(ComputeManager.run(
+            ComputeTask<PqTrainSubspaceRequest, PqSubspaceResult>(
+              function: trainPqSubspace,
+              message: PqTrainSubspaceRequest(
+                subSamples: subSamples,
+                n: n,
+                subDim: subDim,
+                k: k,
+                iterations: 10,
+                subspaceIndex: m,
+              ),
             ),
           ));
         }

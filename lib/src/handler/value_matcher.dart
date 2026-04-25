@@ -49,8 +49,11 @@ class ValueMatcher {
   ) async {
     if (list.isEmpty) return list;
     return await ComputeManager.run(
-      executeSort,
-      SortMessage(list, sortFields, sortDirections, schemas, mainTableName),
+      ComputeTask(
+        function: executeSort,
+        message: SortMessage(
+            list, sortFields, sortDirections, schemas, mainTableName),
+      ),
       useIsolate: list.length >= 500,
     );
   }
