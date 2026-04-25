@@ -39,7 +39,7 @@
 - **快速上手**：[为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - **架构与模型**：[表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - **深度查询**：[高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- **进阶与性能**：[KV进阶](#kv-advanced) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- **进阶与性能**：[KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - **运维与安全**：[管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
 
 
@@ -473,8 +473,19 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
 
 ### <a id="kv-advanced"></a>键值对进阶操作 (db.kv)
 
-对于更复杂的 Key-Value 场景，建议使用 `db.kv` 命名空间。它提供了更丰富的方法集：
-以下方法均支持可选参数 `isGlobal`：`true` 表示全局空间共享数据，`false`（默认）表示当前空间。
+对于更复杂的 Key-Value 场景，建议使用 `db.kv` 命名空间。它提供了完整的 API 集，支持空间隔离、全局共享及多种数据类型。
+
+- **基础存取 (Basic Access)**
+  ```dart
+  // 设置值 (支持 String, int, bool, double, Map, List 等)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // 获取原始动态类型
+  dynamic val = await db.kv.get('key');
+
+  // 删除单个键
+  await db.kv.remove('key');
+  ```
 
 - **强类型获取 (Type-Safe Getters)**
   无需手动转换类型，直接获取目标格式数据：
@@ -486,6 +497,19 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
+- **批量操作 (Bulk Operations)**
+  在单个操作中高效地处理多个键值对：
+  ```dart
+  // 批量设置
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'zh_CN',
+  });
+
+  // 批量删除
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
 - **原子计数器 (Atomic Increment)**
   在高并发场景下安全地递增或递减数值：
   ```dart
@@ -495,8 +519,7 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **键空间探索与管理 (Discovery & Management)**
-  支持按前缀检索键名、统计数量及批量删除：
+- **键空间管理与探索 (Discovery & Management)**
   ```dart
   // 获取所有前缀以 'setting_' 开头的键名
   final keys = await db.kv.getKeys(prefix: 'setting_');
@@ -506,9 +529,6 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
 
   // 检查某个键是否存在且未过期
   final exists = await db.kv.exists('config_cache');
-
-  // 批量删除多个键
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
 
   // 清空当前空间的所有 KV 数据
   await db.kv.clear();
@@ -523,6 +543,56 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
   // 为现有键更新过期时间（7天后过期）
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **响应式监听 (Reactive Watch)**
+  ```dart
+  // 监听单个键
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // 监听多个键的变化快照
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **全局共享参数 (isGlobal)**
+  以上所有方法均支持可选参数 `isGlobal`：`true` 表示在全局空间操作（跨 Space 共享），`false`（默认）表示在当前隔离空间操作。
+
+
+### <a id="bulk-operations"></a>批量操作 (Bulk Operations)
+
+ToStore 针对大规模数据吞吐提供了专门的批量处理接口。这些接口内置了并行任务分发与时间切片调度机制，在执行高吞吐写入时能有效降低对 UI 主线程的影响。
+
+| 接口 | 核心用途 | 数据要求 | 特点 |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | 批量插入新记录 | 必须包含所有非空字段 | 纯插入，效率最高 |
+| `batchUpsert` | 批量同步（插入或更新） | **必须包含所有非空字段** | 全量同步，基于主键或唯一字段自动判断 |
+| `batchUpdate` | 批量局部更新 | **主键或唯一字段** + 待更新字段 | 增量更新，专门用于修改已有记录 |
+
+- **批量插入 (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **智能批量同步 (batchUpsert)**
+  基于主键或唯一字段自动识别“插入”或“更新”。常用于数据全量同步场景。
+  > [!IMPORTANT]
+  > **数据要求**：由于可能触发插入操作，`batchUpsert` 要求每条记录必须包含所有非空（nullable: false）字段。
+
+- **高效批量更新 (batchUpdate)**
+  专门用于更新已有记录。每条记录需包含主键或唯一字段作为标识，以及需要修改的字段。
+  > [!TIP]
+  > **局部更新**：`batchUpdate` 仅更新提供的字段，不需要包含所有非空字段，适合增量修改场景。
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // 通过唯一字段 username 定位并更新 age
+    {'id': '1002', 'status': 'active'}, // 也支持直接指定主键
+  ]);
+  ```
+
+> [!TIP]
+> 可以设置 `allowPartialErrors: true` 来确保个别数据错误不会拒绝本次批量操作。
 
 
 ### <a id="vector-advanced"></a>向量字段、向量索引与向量检索
@@ -629,7 +699,7 @@ const TableSchema(
 
 
 ### 智能存储 (Upsert)
-根据 data 中的主键或唯一键判断：存在则更新，不存在则插入。不支持 where，冲突目标由 data 决定。
+根据 data 中的主键或唯一字段判断：存在则更新，不存在则插入。不支持 where，冲突目标由 data 决定。
 
 ```dart
 // 按主键
@@ -639,7 +709,7 @@ final result = await db.upsert('users', {
   'email': 'john@example.com',
 });
 
-// 按唯一键（记录须包含某一唯一索引的全部字段及必填字段）
+// 按唯一键（记录须包含参与唯一约束的所有字段及必填字段）
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',

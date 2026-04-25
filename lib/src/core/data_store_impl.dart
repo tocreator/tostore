@@ -191,7 +191,9 @@ class DataStoreImpl {
   TableDataManager? _tableDataManager;
   TableDataManager get tableDataManager {
     if (_tableDataManager == null) {
-      throw StateError('TableDataManager not initialized');
+      if (_isInitialized) {
+        throw StateError('TableDataManager not initialized');
+      }
     }
     return _tableDataManager!;
   }
@@ -204,8 +206,8 @@ class DataStoreImpl {
   late WalManager walManager;
   late WriteBufferManager writeBufferManager;
   late ParallelJournalManager parallelJournalManager;
-  late TableTreePartitionManager tableTreePartitionManager;
-  late IndexTreePartitionManager indexTreePartitionManager;
+  TableTreePartitionManager? tableTreePartitionManager;
+  IndexTreePartitionManager? indexTreePartitionManager;
 
   /// Global workload scheduler for centralized concurrency budgeting.
   late WorkloadScheduler workloadScheduler;
@@ -375,9 +377,10 @@ class DataStoreImpl {
       if (_resourceManager!.isLowMemoryMode) {
         high = true;
       } else {
-        // Check prewarmThresholdMB from config
+        // Compare against the cached effective prewarm threshold.
         final usageMB = _resourceManager!.lastMeasuredTotalUsageMB;
-        if (usageMB >= config.prewarmThresholdMB) {
+        final thresholdMB = _resourceManager!.getEffectivePrewarmThresholdMB();
+        if (usageMB >= thresholdMB) {
           high = true;
         }
       }
@@ -639,7 +642,10 @@ class DataStoreImpl {
     _initializing = true;
     try {
       if (_config != null && (reinitialize || _isInitialized)) {
-        await close(persistChanges: !noPersistOnClose);
+        await close(
+            persistChanges: !noPersistOnClose,
+            closeStorage: false,
+            removeRegistry: false);
       }
       // Ensure this instance is re-registered after successful initialization
       // especially when initialize(reinitialize: true) called after close() removed it.
@@ -1177,19 +1183,74 @@ class DataStoreImpl {
     bool persistChanges = true,
     bool closeStorage = true,
     bool keepActiveSpace = true,
+    bool removeRegistry = true,
   }) async {
-    if (!_isInitialized) return;
+    if (!_isInitialized && !_baseInitialized) return;
+
+    // Immediately mark as uninitialized to block new operations
     _isInitialized = false;
+    _baseInitialized = false;
+    await Future.delayed(Duration.zero);
 
     try {
-      // 1. Unified shutdown logic
-      await _flushAndShutdown(
-        persistChanges: persistChanges,
-        closeStorage: closeStorage,
-        isCloseInstance: true,
-      );
+      // Stop background triggers first to prevent new work from entering pipelines
+      _ttlCleanupManager.unregisterCleanupTask();
+      compactionManager.dispose();
 
-      // 2. Clear active space so next launch uses default (e.g. logout).
+      // Perform all flushing and shutdown as system operation to bypass transaction locks
+      await TransactionContext.runAsSystemOperation(() async {
+        CrontabManager.dispose();
+        if (persistChanges) {
+          // Enter maintenance mode to wait for active transactions to finish
+          try {
+            await lockManager?.enterMaintenance(
+                timeout: config.transactionTimeout);
+          } catch (_) {}
+        }
+
+        // Flush and stop write pipelines
+        try {
+          if (persistChanges) {
+            await parallelJournalManager.flushCompletely();
+          }
+          await parallelJournalManager.drainAndStop();
+        } catch (e) {
+          Logger.warn('Stop journal manager failed: $e',
+              label: 'DataStoreImpl');
+        }
+
+        try {
+          await walManager.flushQueueCompletely();
+          if (persistChanges && config.enableJournal) {
+            await walManager.persistMeta(flush: true);
+          }
+        } catch (e) {
+          Logger.warn('Flush WAL failed: $e', label: 'DataStoreImpl');
+        }
+
+        // Flush weight data
+        if (_weightManager != null) {
+          if (persistChanges) {
+            await _weightManager!.saveWeights(force: true);
+          }
+          _weightManager!.dispose();
+        }
+
+        // Persist and dispose data managers via CacheManager
+        await cacheManager.dispose();
+
+        // Final storage flush and close
+        try {
+          await storage.flushAll(closeHandles: true);
+          if (closeStorage) {
+            await storage.close(isMigrationInstance: isMigrationInstance);
+          }
+        } catch (e) {
+          Logger.warn('Storage flush/close failed: $e', label: 'DataStoreImpl');
+        }
+      });
+
+      // Clear active space if requested
       if (!keepActiveSpace) {
         try {
           final globalConfig = await getGlobalConfig();
@@ -1202,34 +1263,59 @@ class DataStoreImpl {
         }
       }
 
-      // 3. Clear instance references and state
-      _queryOptimizer = null;
-      _indexManager = null;
-      _vectorIndexManager = null;
-      _queryExecutor = null;
-      _integrityChecker = null;
-      _keyManager = null;
-      migrationManager = null;
-      schemaManager = null;
-      _tableDataManager = null;
-      _resourceManager = null;
+      // Cleanup remaining non-storage managers and stop background tasks
+      readViewManager.dispose();
+      transactionManager?.dispose();
+      notificationManager.dispose();
+      _resourceManager?.dispose();
 
       _globalConfigCache = null;
       _spaceConfigCache = null;
 
+      // Now that we have yielded and called dispose, it is safe to
+      // nullify manager references for GC. This satisfies the requirement
+      // for "Immediate destruction" on true close() while preventing crashes.
+      if (closeStorage) {
+        _indexManager = null;
+        tableTreePartitionManager = null;
+        indexTreePartitionManager = null;
+        _vectorIndexManager = null;
+        _tableDataManager = null;
+        _queryOptimizer = null;
+        _queryExecutor = null;
+        _integrityChecker = null;
+        _keyManager = null;
+        _weightManager = null;
+        directoryManager = null;
+        schemaManager = null;
+        transactionManager = null;
+        _resourceManager = null;
+        migrationManager = null;
+        versionUpgradeManager = null;
+        _foreignKeyManager = null;
+      }
+
+      if (removeRegistry) {
+        lockManager = null;
+      }
+    } catch (e) {
+      Logger.error('Database shutdown error: $e', label: 'DataStoreImpl.close');
+      rethrow;
+    } finally {
       _initializing = false;
+      _baseInitialized = false;
+      _isInitialized = false;
       _initCompleter = Completer<void>();
 
-      // Only remove if the registry still points to this instance
-      if (_instances[_instanceKey] == this) {
+      // Only remove from factory cache if requested
+      if (removeRegistry && _instances[_instanceKey] == this) {
         _instances.remove(_instanceKey);
       }
 
-      Logger.info('The database instance has been closed: $_instanceKey',
-          label: 'DataStoreImpl.close');
-    } catch (e) {
-      Logger.error('Database shutdown failed: $e', label: 'DataStore.close');
-      rethrow;
+      if (removeRegistry || closeStorage) {
+        Logger.info('Database instance has been closed: $_instanceKey',
+            label: 'DataStoreImpl.close');
+      }
     }
   }
 
@@ -1553,29 +1639,12 @@ class DataStoreImpl {
         ));
       }
 
-      // 2. Validate foreign key constraints
-      if (_foreignKeyManager != null) {
-        try {
-          await _foreignKeyManager!.validateForeignKeyConstraints(
-            tableName: tableName,
-            data: validData,
-            operation: ForeignKeyOperation.insert,
-          );
-        } catch (e) {
-          Logger.error('Foreign key constraint validation failed: $e',
-              label: 'DataStore.insert');
-          return finish(DbResult.error(
-            type: ResultType.foreignKeyViolation,
-            message: e.toString(),
-          ));
-        }
-      }
-
-      // 3. Plan unique locks + refs once; acquire locks then reuse refs for buffer
+      // 2. Plan unique locks + refs once; acquire locks then reuse refs for buffer
       final planIns = planUniqueForInsert(tableName, schema, validData);
 
-      // Reservation based: try reserve unique keys first
       final recordId = validData[schema.primaryKey].toString();
+
+      // 3. Reservation based: try reserve unique keys first to lock the buffer
       try {
         writeBufferManager.tryReserveUniqueKeys(
           tableName: tableName,
@@ -1585,59 +1654,114 @@ class DataStoreImpl {
         );
       } catch (e) {
         if (e is UniqueViolation) {
+          final bool isPkConflict = e.indexName == 'pk';
+          final bool isSequentialPk =
+              schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
+
+          // Handle PK conflict: only auto-correct if the ID was generated by the system.
+          // If the user provided a manual ID, we must respect it and return a violation.
+          final bool userProvidedPk = data.containsKey(schema.primaryKey) &&
+              data[schema.primaryKey] != null;
+
+          if (isPkConflict && isSequentialPk && !userProvidedPk) {
+            final providedId = validData[schema.primaryKey];
+            if (providedId != null) {
+              await tableDataManager.handlePrimaryKeyConflict(
+                  tableName, providedId);
+            }
+            if (!retryOnPkConflict) {
+              return await insert(tableName, data, retryOnPkConflict: true);
+            }
+          }
+
           return finish(DbResult.error(
             type: ResultType.uniqueViolation,
             message: e.message,
-            failedKeys: [e.value?.toString() ?? ''],
+            failedKeys: [recordId],
           ));
         }
         rethrow;
       }
 
-      // 3. Unique check (disk/cache only)
+      // 4. Validate foreign key constraints after reservation
+      final bool hasForeignKeys = _foreignKeyManager != null;
+      if (hasForeignKeys) {
+        try {
+          await _foreignKeyManager!.validateForeignKeyConstraints(
+            tableName: tableName,
+            data: validData,
+            operation: ForeignKeyOperation.insert,
+          );
+        } catch (e) {
+          // Rollback reservation on FK failure
+          try {
+            writeBufferManager.releaseReservedUniqueKeys(
+              tableName: tableName,
+              recordId: recordId,
+              transactionId: txId,
+            );
+          } catch (_) {}
+
+          Logger.error('Foreign key constraint validation failed: $e',
+              label: 'DataStore.insert');
+          return finish(DbResult.error(
+            type: ResultType.foreignKeyViolation,
+            message: e.toString(),
+          ));
+        }
+      }
+
+      // 5. Unique check (disk only) - skip buffer check as we already reserved the keys
       final uniqueViolation = await _indexManager?.checkUniqueConstraints(
           tableName, validData,
-          txId: txId, schemaOverride: schema);
+          txId: txId, schemaOverride: schema, skipBufferCheck: true);
 
       if (uniqueViolation != null) {
-        // Release reservation
-        writeBufferManager.releaseReservedUniqueKeys(
-            tableName: tableName, recordId: recordId, transactionId: txId);
-
-        final primaryKey = schema.primaryKey;
-        final providedId = validData[primaryKey];
         final bool isPkConflict = uniqueViolation.indexName == 'pk';
-
         final bool isSequentialPk =
             schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
 
-        // Only adjust maxId and retry when the conflict is on the primary key.
-        // Non-PK unique violations (e.g. duplicate email) must not trigger handlePrimaryKeyConflict
-        // or retry, to avoid wasting auto-increment IDs and wrong "primary key conflict" logs.
-        if (isPkConflict && isSequentialPk && providedId != null) {
-          await tableDataManager.handlePrimaryKeyConflict(
-              tableName, providedId);
+        // Handle PK conflict found on disk: only auto-correct if ID was NOT user-provided
+        final bool userProvidedPk = data.containsKey(schema.primaryKey) &&
+            data[schema.primaryKey] != null;
+
+        if (isPkConflict && isSequentialPk && !userProvidedPk) {
+          final providedId = validData[schema.primaryKey];
+          if (providedId != null) {
+            await tableDataManager.handlePrimaryKeyConflict(
+                tableName, providedId);
+          }
+          if (!retryOnPkConflict) {
+            // Rollback reservation before retrying
+            try {
+              writeBufferManager.releaseReservedUniqueKeys(
+                tableName: tableName,
+                recordId: recordId,
+                transactionId: txId,
+              );
+            } catch (_) {}
+
+            return await insert(tableName, data, retryOnPkConflict: true);
+          }
         }
 
-        final bool userProvidedPk =
-            data.containsKey(primaryKey) && data[primaryKey] != null;
-        if (isPkConflict &&
-            isSequentialPk &&
-            providedId != null &&
-            !retryOnPkConflict) {
-          final Map<String, dynamic> retryData =
-              userProvidedPk ? (Map.from(data)..remove(primaryKey)) : data;
-          return await insert(tableName, retryData, retryOnPkConflict: true);
-        }
+        // Rollback reservation on disk conflict
+        try {
+          writeBufferManager.releaseReservedUniqueKeys(
+            tableName: tableName,
+            recordId: recordId,
+            transactionId: txId,
+          );
+        } catch (_) {}
 
         return finish(DbResult.error(
           type: ResultType.uniqueViolation,
           message: uniqueViolation.message,
-          failedKeys: providedId != null ? [providedId.toString()] : [],
+          failedKeys: [recordId],
         ));
       }
 
-      // 4. Rebuild record strictly following schema order (primary key first)
+      // 6. Rebuild record strictly following schema order (primary key first)
       final orderedValidData = <String, dynamic>{
         schema.primaryKey: validData[schema.primaryKey],
       };
@@ -1648,7 +1772,7 @@ class DataStoreImpl {
         orderedValidData[field.name] = validData[field.name];
       }
 
-      // 5. Add to write queue (insert operation) using planned refs (no extra parsing)
+      // 7. Add to write queue (insert operation) using planned refs (no extra parsing)
       final uniqueRefs = planIns.refs;
       await tableDataManager.addToBuffer(
         tableName,
@@ -1729,7 +1853,6 @@ class DataStoreImpl {
     TableSchema schema,
     Map<String, dynamic> data,
     String tableName, {
-    bool skipPrimaryKeyOrderCheck = false,
     bool skipPrimaryKeyFormatCheck = false,
     List<String>? validationErrors,
     Map<String, FieldSchema>? fieldMap,
@@ -1765,16 +1888,6 @@ class DataStoreImpl {
               !schema.validatePrimaryKeyFormat(providedId)) {
             throw BusinessError(
               'The provided primary key value $providedId does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
-              type: BusinessErrorType.invalidData,
-            );
-          }
-
-          // Ordering validation
-          if (!skipPrimaryKeyOrderCheck &&
-              !await _validatePrimaryKeyOrder(
-                  tableName, providedId, schema.primaryKeyConfig.type)) {
-            throw BusinessError(
-              'The provided primary key value $providedId violates the key ordering of table $tableName, data insertion rejected',
               type: BusinessErrorType.invalidData,
             );
           }
@@ -1919,75 +2032,34 @@ class DataStoreImpl {
     return UniquePlan(refs);
   }
 
-  /// Build QueryCondition for upsert conflict target (pk or unique index).
-  /// Returns null if no valid conflict target.
-  QueryCondition? _buildUpsertCondition(
-    TableSchema schema,
-    Map<String, dynamic> data,
-    List<IndexSchema> uniqueIndexes,
-  ) {
-    final pk = schema.primaryKey;
-    final pkVal = data[pk];
-    if (pkVal != null && pkVal.toString().trim().isNotEmpty) {
-      return QueryCondition()..where(pk, '=', pkVal);
-    }
-    for (final idx in uniqueIndexes) {
-      final canKey = schema.createCanonicalIndexKey(idx.fields, data);
-      if (canKey != null) {
-        final cond = QueryCondition();
-        if (canKey is List) {
-          for (int i = 0; i < idx.fields.length; i++) {
-            cond.where(idx.fields[i], '=', canKey[i]);
-          }
-        } else {
-          cond.where(idx.fields.first, '=', canKey);
-        }
-        return cond;
-      }
-    }
-    return null;
-  }
-
-  String? _buildUpsertLockResource(
-    String tableName,
-    TableSchema schema,
-    Map<String, dynamic> data,
-    List<IndexSchema> uniqueIndexes,
-  ) {
-    final pk = schema.primaryKey;
-    final pkVal = data[pk];
-    if (pkVal != null && pkVal.toString().trim().isNotEmpty) {
-      return 'upsert:$tableName:pk:${pkVal.toString()}';
-    }
-    for (final idx in uniqueIndexes) {
-      final canKey = schema.createCanonicalIndexKey(idx.fields, data);
-      if (canKey != null && (canKey is! String || canKey.isNotEmpty)) {
-        return 'upsert:$tableName:uniq:${idx.actualIndexName}:$canKey';
-      }
-    }
-    return null;
-  }
-
-  /// Validate upsert record: must contain all non-nullable fields + pk or a complete unique index.
+  /// Validate if a record contains enough information to identify it (pk or a complete unique index).
+  /// If [checkRequiredFields] is true, also validates that all non-nullable fields are present.
   /// Returns null on valid, or error message.
-  String? _validateUpsertRecord(
+  String? _validateRecordIdentifier(
     TableSchema schema,
     Map<String, dynamic> data,
-    List<IndexSchema> uniqueIndexes,
-  ) {
+    List<IndexSchema> uniqueIndexes, {
+    bool checkRequiredFields = false,
+  }) {
     final pk = schema.primaryKey;
-    for (final f in schema.fields) {
-      if (f.name == pk) continue;
-      if (!f.nullable && (!data.containsKey(f.name) || data[f.name] == null)) {
-        return 'Field ${f.name} is required (nullable=false) for upsert';
+    if (checkRequiredFields) {
+      for (final f in schema.fields) {
+        if (f.name == pk) continue;
+        if (!f.nullable &&
+            (!data.containsKey(f.name) || data[f.name] == null)) {
+          return 'Field ${f.name} is required (nullable=false) for this operation';
+        }
       }
     }
+
     final hasPk = data.containsKey(pk) && data[pk] != null;
     if (hasPk) return null;
+
     if (uniqueIndexes.isEmpty) {
       return 'Record has no primary key and table has no unique constraints; '
-          'upsert would risk massive duplicates';
+          'a unique identifier is required.';
     }
+
     bool hasValidUnique = false;
     for (final idx in uniqueIndexes) {
       if (idx.fields.every((f) =>
@@ -1998,6 +2070,7 @@ class DataStoreImpl {
         break;
       }
     }
+
     if (!hasValidUnique) {
       return 'Record has no primary key; provide all fields of at least one '
           'unique index: ${uniqueIndexes.map((i) => i.fields.join(",")).join(" or ")}';
@@ -2027,97 +2100,7 @@ class DataStoreImpl {
         message: 'Table $tableName does not exist',
       ));
     }
-    final uniqueIndexes =
-        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-    return upsertOne(
-      tableName,
-      data,
-      schema,
-      uniqueIndexes,
-    );
-  }
-
-  /// Single-record upsert implementation. Used by [upsert] and [batchUpsert].
-  Future<DbResult> upsertOne(
-    String tableName,
-    Map<String, dynamic> data,
-    TableSchema schema,
-    List<IndexSchema> uniqueIndexes, {
-    bool continueOnPartialErrors = false,
-  }) async {
-    DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
-    final validationErr = _validateUpsertRecord(schema, data, uniqueIndexes);
-    if (validationErr != null) {
-      return finish(DbResult.error(
-        type: ResultType.validationFailed,
-        message: validationErr,
-        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
-      ));
-    }
-    final cond = _buildUpsertCondition(schema, data, uniqueIndexes);
-    if (cond == null) {
-      return finish(DbResult.error(
-        type: ResultType.validationFailed,
-        message: 'No valid conflict target for upsert',
-        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
-      ));
-    }
-    final String? txId = Zone.current[_txnZoneKey] as String?;
-    final String? upsertLockResource =
-        _buildUpsertLockResource(tableName, schema, data, uniqueIndexes);
-    String? upsertLockOpId;
-    final existingTxnUpsertLock = txId != null && upsertLockResource != null
-        ? TransactionContext.getExclusiveLocks()[upsertLockResource]
-        : null;
-    try {
-      if (lockManager != null &&
-          upsertLockResource != null &&
-          existingTxnUpsertLock == null) {
-        upsertLockOpId = GlobalIdGenerator.generate('upsert_target_');
-        final acquired = await lockManager!
-            .acquireExclusiveLock(upsertLockResource, upsertLockOpId);
-        if (!acquired) {
-          return finish(DbResult.error(
-            type: ResultType.dbError,
-            message: 'Lock conflict on upsert target',
-            failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
-          ));
-        }
-        if (txId != null) {
-          TransactionContext.registerExclusiveLock(
-              upsertLockResource, upsertLockOpId);
-        }
-      }
-
-      // Pass data directly: updateInternal handles ExprNode; insert() will validate/process.
-      final updateResult = await updateInternal(
-        tableName,
-        Map<String, dynamic>.from(data),
-        cond,
-        limit: 1,
-        continueOnPartialErrors: continueOnPartialErrors,
-      );
-      if (updateResult.isSuccess && updateResult.successKeys.isNotEmpty) {
-        return finish(updateResult);
-      }
-      return finish(await insert(tableName, data));
-    } catch (e) {
-      Logger.error('Upsert failed: $e', label: 'DataStore.upsertOne');
-      return finish(DbResult.error(
-        type: ResultType.dbError,
-        message: 'Upsert failed: $e',
-        failedKeys: [data[schema.primaryKey]?.toString() ?? ''],
-      ));
-    } finally {
-      try {
-        if (lockManager != null &&
-            txId == null &&
-            upsertLockResource != null &&
-            upsertLockOpId != null) {
-          lockManager!.releaseExclusiveLock(upsertLockResource, upsertLockOpId);
-        }
-      } catch (_) {}
-    }
+    return await batchUpsert(tableName, [data]);
   }
 
   /// backup data and return backup path
@@ -2856,28 +2839,14 @@ class DataStoreImpl {
         final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
 
         // Validate foreign key constraints for each record to be updated
-        if (_foreignKeyManager != null) {
+        final bool hasForeignKeys = _foreignKeyManager != null;
+        if (hasForeignKeys) {
           final yieldController = YieldController('db_update_fk');
           for (final record in records) {
             await yieldController.maybeYield();
             // Merge existing record with update data
             final mergedData = Map<String, dynamic>.from(record);
             mergedData.addAll(validData);
-
-            try {
-              await _foreignKeyManager!.validateForeignKeyConstraints(
-                tableName: tableName,
-                data: mergedData,
-                operation: ForeignKeyOperation.update,
-              );
-            } catch (e) {
-              Logger.error('Foreign key constraint validation failed: $e',
-                  label: 'DataStore.updateInternal');
-              return finish(DbResult.error(
-                type: ResultType.foreignKeyViolation,
-                message: e.toString(),
-              ));
-            }
 
             // Handle foreign key constraints for primary key update: RESTRICT must be checked immediately, CASCADE can be deferred
             // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately when update is attempted,
@@ -3007,13 +2976,14 @@ class DataStoreImpl {
             planUpd = planUniqueForUpdate(
                 tableName, schema, updatedRecord, changedFields);
 
-            // Try reserve unique keys (replaces manual locking)
+            // 1. Try reserve unique keys first to lock the buffer
             try {
               oldUniqueKeys = writeBufferManager.tryReserveUniqueKeys(
                 tableName: tableName,
                 recordId: recordKey,
                 uniqueKeys: planUpd.refs,
                 transactionId: txId,
+                isUpdate: true,
               );
             } catch (e) {
               if (e is UniqueViolation) {
@@ -3030,7 +3000,40 @@ class DataStoreImpl {
               rethrow;
             }
 
-            // Perform unique check under reservation (disk/cache only)
+            // 2. Validate foreign key constraints after reservation
+            if (hasForeignKeys && changedFields.isNotEmpty) {
+              try {
+                await _foreignKeyManager!.validateForeignKeyConstraints(
+                  tableName: tableName,
+                  data: updatedRecord,
+                  operation: ForeignKeyOperation.update,
+                );
+              } catch (e) {
+                // Rollback reservation on FK failure
+                try {
+                  writeBufferManager.releaseReservedUniqueKeys(
+                    tableName: tableName,
+                    recordId: recordKey,
+                    transactionId: txId,
+                    restoreKeys: oldUniqueKeys,
+                  );
+                } catch (_) {}
+
+                Logger.error('Foreign key constraint validation failed: $e',
+                    label: 'DataStore.updateInternal');
+                if (continueOnPartialErrors) {
+                  failedKeys.add(recordKey);
+                  continue;
+                }
+                return finish(DbResult.error(
+                  type: ResultType.foreignKeyViolation,
+                  message: e.toString(),
+                  failedKeys: [recordKey],
+                ));
+              }
+            }
+
+            // 3. Perform unique check (disk only) - skip buffer check as we already reserved the keys
             final Map<String, dynamic> uniqueCheckData = <String, dynamic>{};
             // Include primary key for self-identification during update
             uniqueCheckData[primaryKey] = record[primaryKey];
@@ -3043,16 +3046,20 @@ class DataStoreImpl {
               isUpdate: true,
               txId: txId,
               schemaOverride: schema,
+              skipBufferCheck: true,
             );
             ok = uniqueViolation == null;
+
             if (!ok) {
-              // Release reservation and restore old keys if check failed
-              writeBufferManager.releaseReservedUniqueKeys(
-                tableName: tableName,
-                recordId: recordKey,
-                transactionId: txId,
-                restoreKeys: oldUniqueKeys,
-              );
+              // Rollback reservation on disk conflict
+              try {
+                writeBufferManager.releaseReservedUniqueKeys(
+                  tableName: tableName,
+                  recordId: recordKey,
+                  transactionId: txId,
+                  restoreKeys: oldUniqueKeys,
+                );
+              } catch (_) {}
             }
           }
 
@@ -4508,15 +4515,6 @@ class DataStoreImpl {
       final bool hasCommittedData =
           tableMeta != null && tableMeta.totalRecords > 0;
       final bool skipDiskUniqueChecks = !hasCommittedData;
-      // Disk unique checks are only needed when:
-      // - the table uses custom primary keys (type == none), which rely on index-based
-      //   uniqueness enforcement, or
-      // - the table defines secondary unique indexes.
-      final bool needDiskUniqueCheck = !skipDiskUniqueChecks &&
-          _indexManager != null &&
-          (tableSchema.primaryKeyConfig.type == PrimaryKeyType.none ||
-              hasSecondaryUniqueIndexes);
-
       // PK order validation optimization: compare against the last partition maxKey once.
       dynamic lastMaxKey = tableMeta?.maxAutoIncrementId;
       final pkMatcher =
@@ -4533,14 +4531,16 @@ class DataStoreImpl {
       if (lastMaxKey == null && requireStrictPkOrder && hasCommittedData) {
         try {
           final last =
-              await tableTreePartitionManager.scanRecordsByPrimaryKeyRange(
+              await tableTreePartitionManager?.scanRecordsByPrimaryKeyRange(
             tableName: tableName,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
             reverse: true,
             limit: 1,
           );
-          if (last.isNotEmpty) lastMaxKey = last.first[primaryKey];
+          if (last != null && last.isNotEmpty) {
+            lastMaxKey = last.first[primaryKey];
+          }
         } catch (_) {}
       }
 
@@ -4548,7 +4548,7 @@ class DataStoreImpl {
       final bool hasForeignKeys = _foreignKeyManager != null &&
           tableSchema.foreignKeys.any((fk) => fk.enabled);
 
-      final recordsToProcess = List<Map<String, dynamic>>.from(records);
+      var recordsToProcess = List<Map<String, dynamic>>.from(records);
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
@@ -4610,18 +4610,16 @@ class DataStoreImpl {
         }
       }
 
-      // For purely auto-generated sequential primary keys, we can safely skip the
-      // expensive PK order check against lastMaxKey: the ID generator already
-      // guarantees monotonic increasing values that are greater than existing
-      // committed data. We only need strict order enforcement when the user
-      // supplies their own PK values for sequential PK tables, or for other
-      // non-sequential ordered PK types.
-      bool needPkOrderCheck = requireStrictPkOrder && lastMaxKey != null;
-      if (needPkOrderCheck &&
-          tableSchema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
-          !hasUserProvidedPrimaryKey) {
-        needPkOrderCheck = false;
-      }
+      // Disk unique checks are only needed when:
+      // - the table has committed data to check against (skipDiskUniqueChecks is false),
+      // - the table uses custom primary keys (type == none),
+      // - the table defines secondary unique indexes, OR
+      // - the user manually provided a primary key in this batch.
+      final bool needDiskUniqueCheck = !skipDiskUniqueChecks &&
+          _indexManager != null &&
+          (tableSchema.primaryKeyConfig.type == PrimaryKeyType.none ||
+              hasSecondaryUniqueIndexes ||
+              hasUserProvidedPrimaryKey);
 
       // If all records were filtered out due to PK generation failure and partial errors are allowed,
       // we can end early without starting a transaction.
@@ -4672,11 +4670,11 @@ class DataStoreImpl {
                 Future<List<UniqueViolation?>> checkWithFallback(
                     List<Map<String, dynamic>> recs) async {
                   try {
-                    return await _indexManager!
-                        .checkUniqueConstraintsBatchForInsert(
+                    return await _indexManager!.checkUniqueConstraintsBatch(
                       tableName,
                       recs,
                       schemaOverride: tableSchema,
+                      skipBufferCheck: true,
                     );
                   } catch (e) {
                     // Fallback: chunked validation to reduce peak memory/IO pressure.
@@ -4695,8 +4693,8 @@ class DataStoreImpl {
                           ? off + chunkSize
                           : recs.length;
                       final sub = recs.sublist(off, to);
-                      final subVios = await _indexManager!
-                          .checkUniqueConstraintsBatchForInsert(
+                      final subVios =
+                          await _indexManager!.checkUniqueConstraintsBatch(
                         tableName,
                         sub,
                         schemaOverride: tableSchema,
@@ -4745,7 +4743,14 @@ class DataStoreImpl {
                       } catch (_) {}
 
                       final orig = batchOriginalById[rid];
-                      if (orig != null) invalidRecords.add(orig);
+                      if (orig != null) {
+                        invalidRecords.add(orig);
+                        // Efficient error capture for reporting
+                        if (validationErrorsForResult.length < 20) {
+                          validationErrorsForResult
+                              .add('pk=$rid: [Disk Conflict] ${vio.message}');
+                        }
+                      }
                       failedKeys.add(rid);
                     }
                   }
@@ -4794,11 +4799,13 @@ class DataStoreImpl {
               return false;
             }
 
-            final bufferResult = await tableDataManager.addInsertBatchToBuffer(
-              tableName,
-              batchRecordsForBuffer,
+            final bufferResult = await tableDataManager.addBatchToBuffer(
+              tableName: tableName,
+              records: batchRecordsForBuffer,
+              operation: BufferOperationType.insert,
               schema: tableSchema,
               uniqueKeyRefsList: batchUniqueRefsForBuffer,
+              transactionId: txId,
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
@@ -4829,9 +4836,6 @@ class DataStoreImpl {
             return hadFailures;
           }
 
-          // Reuse a single validation error buffer across records to reduce
-          // per-record allocation overhead. This buffer is only used within
-          // this batch and does not escape.
           final recordErrors = <String>[];
 
           for (int j = start; j < end; j++) {
@@ -4851,7 +4855,6 @@ class DataStoreImpl {
                   tableSchema,
                   record,
                   tableName,
-                  skipPrimaryKeyOrderCheck: true,
                   skipPrimaryKeyFormatCheck: isAutoPk,
                   validationErrors: recordErrors,
                   fieldMap: fieldMapForValidation,
@@ -4872,93 +4875,6 @@ class DataStoreImpl {
                   }
                   finishedRecord = true;
                   break;
-                }
-
-                // PK order check (batch-optimized): compare against last committed maxKey.
-                if (needPkOrderCheck) {
-                  final dynamic pkVal = validData[primaryKey];
-                  if (pkVal == null || pkMatcher(pkVal, lastMaxKey) <= 0) {
-                    final bool isSequentialPk =
-                        tableSchema.primaryKeyConfig.type ==
-                            PrimaryKeyType.sequential;
-                    if (isSequentialPk &&
-                        isAutoPk &&
-                        pkVal != null &&
-                        !triedPkConflictRetry) {
-                      try {
-                        // Handle primary key conflict: recalculate from disk/buffer
-                        await tableDataManager.handlePrimaryKeyConflict(
-                            tableName, pkVal);
-
-                        // CRITICAL: Also consider records already processed in the current flush batch
-                        // to ensure the new ID stays ahead of everything currently in-flight.
-                        dynamic maxInCurrentBatch;
-                        for (final r in batchRecordsForBuffer) {
-                          final val = r[primaryKey];
-                          if (val != null) {
-                            if (maxInCurrentBatch == null ||
-                                pkMatcher(val, maxInCurrentBatch) > 0) {
-                              maxInCurrentBatch = val;
-                            }
-                          }
-                        }
-                        if (maxInCurrentBatch != null) {
-                          await tableDataManager.updateMaxIdInMemory(
-                              tableName, maxInCurrentBatch);
-                        }
-
-                        // Update local lastMaxKey
-                        final newMaxId =
-                            tableDataManager.getMaxIdInMemory(tableName);
-                        if (newMaxId != null) {
-                          lastMaxKey = newMaxId;
-                        }
-
-                        // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
-                        if (isAutoPk) {
-                          final List<Map<String, dynamic>>
-                              subsequentToReassign = [];
-                          for (int k = j + 1;
-                              k < recordsToProcess.length;
-                              k++) {
-                            if (autoPkRecords.contains(recordsToProcess[k])) {
-                              subsequentToReassign.add(recordsToProcess[k]);
-                            }
-                          }
-
-                          if (subsequentToReassign.isNotEmpty) {
-                            final newIds = await tableDataManager.getBatchIds(
-                                tableName, subsequentToReassign.length);
-                            for (int k = 0;
-                                k < subsequentToReassign.length;
-                                k++) {
-                              if (k < newIds.length) {
-                                subsequentToReassign[k][primaryKey] = newIds[k];
-                              }
-                            }
-                          }
-                        } else {
-                          // For user-provided PK, remove it so retry uses next auto ID
-                          record.remove(primaryKey);
-                        }
-                      } catch (err) {
-                        Logger.warn(
-                            'Failed to auto-correct PK order violation in batch: $err',
-                            label: 'DataStore.batchInsert');
-                      }
-                      record[primaryKey] = null;
-                      triedPkConflictRetry = true;
-                      continue;
-                    }
-
-                    invalidRecords.add(record);
-                    final failedKey = pkVal?.toString() ?? '';
-                    if (failedKey.isNotEmpty) {
-                      failedKeys.add(failedKey);
-                    }
-                    finishedRecord = true;
-                    break;
-                  }
                 }
 
                 // Validate foreign key constraints (skip when table has no enabled FKs)
@@ -5002,10 +4918,12 @@ class DataStoreImpl {
                     final bool isSequentialPk =
                         tableSchema.primaryKeyConfig.type ==
                             PrimaryKeyType.sequential;
-                    // Only adjust maxId and retry when the conflict is on the primary key.
-                    // Non-PK unique violations must not trigger handlePrimaryKeyConflict or retry.
+                    // Only adjust maxId and retry when the conflict is on the primary key
+                    // and the ID was originally generated by the system (Auto-ID).
+                    // Manual IDs must result in a violation if they conflict.
                     if (isPkConflict &&
                         isSequentialPk &&
+                        isAutoPk &&
                         !triedPkConflictRetry) {
                       try {
                         final dynamic pkVal = validData[primaryKey];
@@ -5242,16 +5160,15 @@ class DataStoreImpl {
   }
 
   /// Batch upsert: each record must contain all non-nullable fields + pk or all fields
-  /// of at least one unique index. No where support. Uses update-first: try update by
-  /// conflict target, then insert if not found. Rejects when record has no pk and
-  /// table has no unique constraints.
+  /// of at least one unique index. No where support.
+  /// Optimized to use batch index probing for high throughput.
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
       {bool allowPartialErrors = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
     await ensureInitialized();
-    // Emergency Resource Check
+
     if (_resourceManager?.isWriteBlocked ?? false) {
       return DbResult.error(
         type: ResultType.resourceExhausted,
@@ -5267,29 +5184,43 @@ class DataStoreImpl {
       );
     }
 
-    TableSchema? schema;
+    final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null || schema.name.isEmpty) {
+      return finish(DbResult.error(
+        type: ResultType.notFound,
+        message: 'Table $tableName does not exist',
+      ));
+    }
+
+    final uniqueIndexes =
+        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    final pk = schema.primaryKey;
+    final successKeys = <String>[];
+    final failedKeys = <String>[];
+    final validationYield = YieldController(
+        'DataStoreImpl.batchUpsert.validate',
+        checkInterval: 200);
+
+    final validationErrorsForResult = <String>[];
+
     try {
-      schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null || schema.name.isEmpty) {
-        return finish(DbResult.error(
-          type: ResultType.notFound,
-          message: 'Table $tableName does not exist',
-        ));
-      }
-      final uniqueIndexes =
-          schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-      final pk = schema.primaryKey;
-
-      final successKeys = <String>[];
-      final failedKeys = <String>[];
-      final yieldController =
-          YieldController('DataStoreImpl.batchUpsert', checkInterval: 64);
-
-      for (final record in records) {
-        await yieldController.maybeYield();
-        final err = _validateUpsertRecord(schema, record, uniqueIndexes);
+      // 1. Bulk validation (O(N) CPU)
+      final validatedRecords = <Map<String, dynamic>>[];
+      for (int i = 0; i < records.length; i++) {
+        final record = records[i];
+        await validationYield.maybeYield();
+        final err = _validateRecordIdentifier(schema, record, uniqueIndexes,
+            checkRequiredFields: true);
         if (err != null) {
+          final failedKey = record[pk]?.toString() ?? 'index=$i';
           failedKeys.add(record[pk]?.toString() ?? '');
+
+          if (validationErrorsForResult.length < 10) {
+            validationErrorsForResult.add('pk=$failedKey: $err');
+          }
+          Logger.warn('Upsert validation failed for $failedKey: $err',
+              label: 'DataStore.batchUpsert');
+
           if (!allowPartialErrors) {
             return finish(DbResult.error(
               type: ResultType.validationFailed,
@@ -5297,53 +5228,625 @@ class DataStoreImpl {
               failedKeys: failedKeys,
             ));
           }
-          continue;
+        } else {
+          validatedRecords.add(record);
         }
-        final result = await upsertOne(
+      }
+
+      if (validatedRecords.isEmpty) {
+        String message = 'All operations failed during validation';
+        if (validationErrorsForResult.isNotEmpty) {
+          message += '. Examples: ${validationErrorsForResult.join(" | ")}';
+        }
+        return finish(DbResult.batch(
+          successKeys: successKeys,
+          failedKeys: failedKeys,
+          message: message,
+        ));
+      }
+
+      // 2. Full-set probing existence via unique indexes
+      // Processing the full set here is more efficient as it maximizes
+      // IndexManager's internal optimization and Page Cache reuse.
+      final violations = await indexManager!.checkUniqueConstraintsBatch(
+        tableName,
+        validatedRecords,
+        schemaOverride: schema,
+        resolveInPlace: true,
+      );
+
+      final toInsert = <Map<String, dynamic>>[];
+      final toUpdate = <Map<String, dynamic>>[];
+      for (int j = 0; j < validatedRecords.length; j++) {
+        final record = validatedRecords[j];
+
+        if (violations[j] == null) {
+          toInsert.add(record);
+        } else {
+          toUpdate.add(record);
+        }
+      }
+
+      // 3. Batch Update for existing records
+      if (toUpdate.isNotEmpty) {
+        final upResult = await batchUpdate(
           tableName,
-          record,
-          schema,
-          uniqueIndexes,
-          continueOnPartialErrors: allowPartialErrors,
+          toUpdate,
+          allowPartialErrors: allowPartialErrors,
         );
-        if (result.isSuccess && result.successKeys.isNotEmpty) {
-          successKeys.addAll(result.successKeys);
-        } else if (result.failedKeys.isNotEmpty) {
-          failedKeys.addAll(result.failedKeys);
+        if (upResult.isSuccess || allowPartialErrors) {
+          successKeys.addAll(upResult.successKeys);
+          failedKeys.addAll(upResult.failedKeys);
+        } else {
+          return finish(upResult);
+        }
+      }
+
+      // 4. Final Batch Insert for new records
+      if (toInsert.isNotEmpty) {
+        final insResult = await batchInsert(
+          tableName,
+          toInsert,
+          allowPartialErrors: allowPartialErrors,
+        );
+        successKeys.addAll(insResult.successKeys);
+        failedKeys.addAll(insResult.failedKeys);
+        if (!allowPartialErrors && !insResult.isSuccess) {
+          return finish(insResult);
+        }
+      }
+
+      String message = 'Batch upsert completed';
+      if (failedKeys.isNotEmpty) {
+        message =
+            'Batch upsert partially successful: ${successKeys.length} success, ${failedKeys.length} failed';
+        if (validationErrorsForResult.isNotEmpty) {
+          message +=
+              '. Validation errors: ${validationErrorsForResult.join(" | ")}';
+        }
+      }
+
+      return finish(DbResult.batch(
+        successKeys: successKeys,
+        failedKeys: failedKeys,
+        message: message,
+      ));
+    } catch (e) {
+      Logger.error('Batch upsert failed: $e', label: 'DataStore.batchUpsert');
+      return finish(DbResult.error(
+        type: ResultType.dbError,
+        message: 'Batch upsert failed: $e',
+      ));
+    }
+  }
+
+  /// batch update data based on primary keys or unique identifiers.
+  Future<DbResult> batchUpdate(
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true}) async {
+    DbResult finish(DbResult r) =>
+        _returnOrThrowIfTxn(r, 'batchUpdate', tableName);
+    await ensureInitialized();
+
+    // Emergency Resource Check
+    if (_resourceManager?.isWriteBlocked ?? false) {
+      return DbResult.error(
+        type: ResultType.resourceExhausted,
+        message:
+            'batch update operation blocked: System resources are critically low.',
+      );
+    }
+
+    if (records.isEmpty) {
+      return DbResult.success(
+        message: 'No records to update',
+        successKeys: [],
+      );
+    }
+
+    final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null || schema.name.isEmpty) {
+      return finish(DbResult.error(
+        type: ResultType.notFound,
+        message: 'Table $tableName does not exist',
+      ));
+    }
+
+    final String? txId = Zone.current[_txnZoneKey] as String?;
+    final primaryKey = schema.primaryKey;
+    final allUniqueIndexes =
+        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+
+    final successKeys = <String>[];
+    final failedKeys = <String>[];
+
+    final validationYield = YieldController(
+        'DataStoreImpl.batchUpdate.validate',
+        checkInterval: 200);
+
+    // 1. Identification & Resolution Phase
+    // Pre-process records to ensure every record has a primary key.
+    // If a record only has a unique identifier, resolve its PK via IndexManager.
+    final List<Map<String, dynamic>> withPk = [];
+    final List<Map<String, dynamic>> needsResolution = [];
+
+    for (int i = 0; i < records.length; i++) {
+      await validationYield.maybeYield();
+      final record = records[i];
+      final pkVal = record[primaryKey]?.toString();
+
+      if (pkVal != null && pkVal.isNotEmpty) {
+        withPk.add(record);
+      } else {
+        // Missing PK, validate if it has enough info to resolve (at least one complete Unique Index)
+        final err = _validateRecordIdentifier(schema, record, allUniqueIndexes);
+        if (err != null) {
+          failedKeys.add(pkVal ?? 'missing_identifier');
           if (!allowPartialErrors) {
             return finish(DbResult.error(
-              type: result.type,
-              message: result.message,
+              type: ResultType.validationFailed,
+              message: 'Validation failed for record $i: $err',
+              failedKeys: failedKeys,
+            ));
+          }
+          continue; // Skip this record
+        }
+        needsResolution.add(record);
+      }
+    }
+
+    // Perform batched PK resolution via IndexManager
+    if (needsResolution.isNotEmpty) {
+      // PERFORMANCE: IndexManager.checkUniqueConstraintsBatch now sorts probe keys internally.
+      // resolveInPlace: true ensures records are updated with their existingPrimaryKey directly.
+      await indexManager!.checkUniqueConstraintsBatch(
+        tableName,
+        needsResolution,
+        schemaOverride: schema,
+        isUpdate: false,
+        resolveInPlace: true,
+        transactionId: txId,
+      );
+
+      // Handle records that failed resolution (not found in DB/Buffer)
+      for (final r in needsResolution) {
+        if (r[primaryKey] == null) {
+          failedKeys.add('not_found');
+          if (!allowPartialErrors) {
+            final idInfo = r.keys.take(3).map((k) => '$k=${r[k]}').join(', ');
+            return finish(DbResult.error(
+              type: ResultType.notFound,
+              message: 'Record not found for unique identifier: {$idInfo}',
               failedKeys: failedKeys,
             ));
           }
         }
       }
+    }
 
-      if (successKeys.isEmpty && failedKeys.isEmpty) {
-        return finish(DbResult.success(
-          message: 'No records to upsert',
-          successKeys: [],
-        ));
-      }
+    // Combine all records that now have a valid PK
+    final List<Map<String, dynamic>> finalRecords = [
+      ...withPk,
+      ...needsResolution.where((r) => r[primaryKey] != null)
+    ];
+
+    if (finalRecords.isEmpty) {
       return finish(DbResult.batch(
         successKeys: successKeys,
         failedKeys: failedKeys,
+        message: 'No valid records found to update',
       ));
-    } catch (e) {
-      Logger.error('Batch upsert failed: $e', label: 'DataStore.batchUpsert');
-      final failedKeys = <String>[];
-      if (schema != null) {
-        final pk = schema.primaryKey;
-        for (final r in records) {
-          final k = r[pk]?.toString();
-          if (k != null && k.isNotEmpty) failedKeys.add(k);
+    }
+
+    final batchYield =
+        YieldController('DataStoreImpl.batchUpdate.batch', checkInterval: 1);
+    final executionYield =
+        YieldController('DataStoreImpl.batchUpdate.execute', checkInterval: 50);
+
+    try {
+      // Process in batches to maintain UI responsiveness and manage memory
+      const int batchSize = 1000;
+
+      for (int i = 0; i < finalRecords.length; i += batchSize) {
+        await batchYield.maybeYield();
+        final int end = (i + batchSize < finalRecords.length)
+            ? i + batchSize
+            : finalRecords.length;
+        final subBatch = finalRecords.sublist(i, end);
+
+        // 3. Prepare primary key list
+        final List<String> pkList = [];
+        for (final record in subBatch) {
+          final pkVal = record[primaryKey]?.toString();
+          if (pkVal != null) pkList.add(pkVal);
+        }
+
+        if (pkList.isEmpty) continue;
+
+        // 4. Bulk Fetch Existing Records
+        final results = await executeQuery(
+          tableName,
+          QueryCondition()..whereIn(primaryKey, pkList),
+          limit: pkList.length,
+        );
+
+        // Convert results to a map for O(1) lookup
+        final Map<String, Map<String, dynamic>> resultsMap = {
+          for (var r in results) r[primaryKey].toString(): r
+        };
+
+        // 5. Fast-path check for strict error mode (if results missing items)
+        if (!allowPartialErrors && resultsMap.length < pkList.length) {
+          for (final pkVal in pkList) {
+            if (!resultsMap.containsKey(pkVal)) {
+              failedKeys.add(pkVal);
+            }
+          }
+          return finish(DbResult.error(
+            type: ResultType.notFound,
+            message: 'Some records not found during batchUpdate',
+            failedKeys: failedKeys,
+          ));
+        }
+
+        // 6. Optimization: Create batch context to hoist table/buffer lookups
+        final batchContext =
+            writeBufferManager.createBatchCheckContext(tableName, txId);
+
+        // 7. Pipeline Stage 1: Batch Merge and Validate
+        final List<Map<String, dynamic>> candidateMergedRecords = [];
+        final List<String> candidatePkVals = [];
+        final List<Map<String, dynamic>> candidateOldRecords = [];
+        final Map<String, Set<String>> candidateChangedFieldsMap = {};
+
+        for (final record in subBatch) {
+          final pkVal = record[primaryKey]?.toString();
+          if (pkVal == null) continue;
+
+          final existingRecord = resultsMap[pkVal];
+
+          if (existingRecord == null) {
+            if (allowPartialErrors) {
+              failedKeys.add(pkVal);
+            }
+            continue;
+          }
+
+          await executionYield.maybeYield();
+
+          // Validate update data
+          final validData =
+              await _validateAndProcessUpdateData(schema, record, tableName);
+          if (validData == null || validData.isEmpty) {
+            failedKeys.add(pkVal);
+            if (!allowPartialErrors) {
+              return finish(DbResult.error(
+                type: ResultType.validationFailed,
+                message: 'Data validation failed for record $pkVal',
+                failedKeys: failedKeys,
+              ));
+            }
+            continue;
+          }
+
+          // Merge fields and detect changes
+          final updatedRecord = <String, dynamic>{...existingRecord};
+          final Set<String> changedFields = {};
+
+          for (final entry in validData.entries) {
+            final fname = entry.key;
+            final dynamic proposed = entry.value;
+
+            if (proposed is ExprNode) {
+              try {
+                final result = _evaluateExpression(
+                  proposed,
+                  existingRecord,
+                  schema,
+                  isUpdate: true,
+                );
+                final field = schema.fields.firstWhere((f) => f.name == fname);
+                final converted = field.convertValue(result);
+
+                // Re-validate after expression evaluation
+                if (!field.validateUpdateValue(converted)) {
+                  failedKeys.add(pkVal);
+                  if (!allowPartialErrors) {
+                    return finish(DbResult.error(
+                      type: ResultType.validationFailed,
+                      message:
+                          'Result of expression for $fname exceeds constraints: $converted',
+                      failedKeys: failedKeys,
+                    ));
+                  }
+                  continue;
+                }
+
+                var finalValue = converted;
+                if (finalValue is String && field.maxLength != null) {
+                  if (finalValue.length > field.maxLength!) {
+                    finalValue = finalValue.substring(0, field.maxLength!);
+                  }
+                }
+
+                if (updatedRecord[fname] != finalValue) {
+                  updatedRecord[fname] = finalValue;
+                  changedFields.add(fname);
+                }
+              } catch (e) {
+                Logger.error('Expression evaluation failed for $fname: $e');
+              }
+            } else {
+              if (updatedRecord[fname] != proposed) {
+                updatedRecord[fname] = proposed;
+                changedFields.add(fname);
+              }
+            }
+          }
+
+          if (changedFields.isEmpty) {
+            successKeys.add(pkVal);
+            continue;
+          }
+
+          candidateMergedRecords.add(updatedRecord);
+          candidatePkVals.add(pkVal);
+          candidateOldRecords.add(existingRecord);
+          candidateChangedFieldsMap[pkVal] = changedFields;
+        }
+
+        if (candidateMergedRecords.isEmpty) continue;
+
+        // 8. Pipeline Stage 2: Batch Reserve (Buffer Lock)
+        // We lock the buffer FIRST to ensure atomic isolation during the subsequent slow disk check.
+        final List<Map<String, dynamic>> readyForDiskCheck = [];
+        final List<String> readyPkVals = [];
+        final List<Map<String, dynamic>> readyOldRecords = [];
+        final Map<String, Set<String>> readyChangedFieldsMap = {};
+        final Map<String, List<UniqueKeyRef>> reservedRefsMap = {};
+
+        for (int j = 0; j < candidateMergedRecords.length; j++) {
+          final pkVal = candidatePkVals[j];
+          final updatedRecord = candidateMergedRecords[j];
+          final changedFields = candidateChangedFieldsMap[pkVal]!;
+
+          // Collect unique keys that need reservation
+          final List<UniqueKeyRef> refsToReserve = [];
+          for (final idx in allUniqueIndexes) {
+            if (idx.fields.any((f) => changedFields.contains(f))) {
+              final canKey =
+                  schema.createCanonicalIndexKey(idx.fields, updatedRecord);
+              if (canKey != null) {
+                refsToReserve.add(UniqueKeyRef(idx.actualIndexName, canKey));
+              }
+            }
+          }
+
+          if (refsToReserve.isNotEmpty) {
+            try {
+              batchContext.tryReserve(pkVal, refsToReserve);
+              reservedRefsMap[pkVal] = refsToReserve;
+            } catch (e) {
+              failedKeys.add(pkVal);
+              if (!allowPartialErrors) {
+                // Rollback all reservations in this sub-batch before returning
+                for (final rPk in reservedRefsMap.keys) {
+                  try {
+                    writeBufferManager.releaseReservedUniqueKeys(
+                      tableName: tableName,
+                      recordId: rPk,
+                      transactionId: txId,
+                    );
+                  } catch (_) {}
+                }
+                return finish(DbResult.error(
+                  type: ResultType.uniqueViolation,
+                  message: 'Unique reservation failed for $pkVal: $e',
+                  failedKeys: failedKeys,
+                ));
+              }
+              continue;
+            }
+          }
+
+          readyForDiskCheck.add(updatedRecord);
+          readyPkVals.add(pkVal);
+          readyOldRecords.add(candidateOldRecords[j]);
+          readyChangedFieldsMap[pkVal] = changedFields;
+        }
+
+        if (readyForDiskCheck.isEmpty) continue;
+
+        // 9. Pipeline Stage 3: Batch Unique Constraint Check (Disk Only)
+        // Since we already hold the buffer locks, we only need to verify against committed disk state.
+        final violations = await indexManager!.checkUniqueConstraintsBatch(
+          tableName,
+          readyForDiskCheck,
+          schemaOverride: schema,
+          transactionId: txId,
+          isUpdate: true,
+          skipBufferCheck: true,
+          changedFieldsMap: readyChangedFieldsMap,
+        );
+
+        // 10. Pipeline Stage 4: Validation and Commit
+        final List<Map<String, dynamic>> recordsToCommit = [];
+        final List<Map<String, dynamic>> oldRecordsToCommit = [];
+        final List<List<UniqueKeyRef>> batchUniqueKeyRefs = [];
+        final List<String> commitPkVals = [];
+
+        for (int j = 0; j < readyForDiskCheck.length; j++) {
+          final pkVal = readyPkVals[j];
+          final violation = violations[j];
+
+          if (violation != null) {
+            failedKeys.add(pkVal);
+            // Rollback reservation for this specific record on disk conflict
+            if (reservedRefsMap.containsKey(pkVal)) {
+              try {
+                writeBufferManager.releaseReservedUniqueKeys(
+                  tableName: tableName,
+                  recordId: pkVal,
+                  transactionId: txId,
+                );
+              } catch (_) {}
+            }
+
+            if (!allowPartialErrors) {
+              // Rollback all other reservations in this sub-batch
+              for (final rPk in reservedRefsMap.keys) {
+                try {
+                  writeBufferManager.releaseReservedUniqueKeys(
+                    tableName: tableName,
+                    recordId: rPk,
+                    transactionId: txId,
+                  );
+                } catch (_) {}
+              }
+              return finish(DbResult.error(
+                type: ResultType.uniqueViolation,
+                message:
+                    'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
+                failedKeys: failedKeys,
+              ));
+            }
+            continue;
+          }
+
+          final updatedRecord = readyForDiskCheck[j];
+          final existingRecord = readyOldRecords[j];
+
+          // Prepare full unique key refs for buffer consistency
+          final currentUniqueRefs = <UniqueKeyRef>[UniqueKeyRef('pk', pkVal)];
+          for (final idx in allUniqueIndexes) {
+            final canKey =
+                schema.createCanonicalIndexKey(idx.fields, updatedRecord);
+            if (canKey != null) {
+              currentUniqueRefs.add(UniqueKeyRef(idx.actualIndexName, canKey));
+            }
+          }
+
+          // 10.1: Foreign Key Checks
+          if (_foreignKeyManager != null) {
+            try {
+              await _foreignKeyManager!.validateForeignKeyConstraints(
+                tableName: tableName,
+                data: updatedRecord,
+                operation: ForeignKeyOperation.update,
+              );
+            } catch (e) {
+              failedKeys.add(pkVal);
+              if (reservedRefsMap.containsKey(pkVal)) {
+                try {
+                  writeBufferManager.releaseReservedUniqueKeys(
+                    tableName: tableName,
+                    recordId: pkVal,
+                    transactionId: txId,
+                  );
+                } catch (_) {}
+              }
+              if (!allowPartialErrors) {
+                // Rollback all reservations
+                for (final rPk in reservedRefsMap.keys) {
+                  try {
+                    writeBufferManager.releaseReservedUniqueKeys(
+                      tableName: tableName,
+                      recordId: rPk,
+                      transactionId: txId,
+                    );
+                  } catch (_) {}
+                }
+                return finish(DbResult.error(
+                  type: ResultType.foreignKeyViolation,
+                  message: e.toString(),
+                  failedKeys: [pkVal],
+                ));
+              }
+              continue;
+            }
+          }
+
+          recordsToCommit.add(updatedRecord);
+          oldRecordsToCommit.add(existingRecord);
+          batchUniqueKeyRefs.add(currentUniqueRefs);
+          commitPkVals.add(pkVal);
+        }
+
+        // 10.2: Single atomic batch commit to TableDataManager
+        if (recordsToCommit.isNotEmpty) {
+          final Map<String, Map<String, dynamic>> oldRecordsMap = {};
+          for (int k = 0; k < recordsToCommit.length; k++) {
+            final rec = recordsToCommit[k];
+            final pk = rec[primaryKey]?.toString();
+            if (pk != null) {
+              oldRecordsMap[pk] = oldRecordsToCommit[k];
+            }
+          }
+
+          final commitResult = await tableDataManager.addBatchToBuffer(
+            tableName: tableName,
+            records: recordsToCommit,
+            operation: BufferOperationType.update,
+            schema: schema,
+            uniqueKeyRefsList: batchUniqueKeyRefs,
+            oldRecordsMap: oldRecordsMap,
+            transactionId: txId,
+          );
+
+          successKeys.addAll(commitResult.successRecordIds);
+
+          if (commitResult.failedRecordIds.isNotEmpty) {
+            for (final fId in commitResult.failedRecordIds) {
+              failedKeys.add(fId);
+              if (reservedRefsMap.containsKey(fId)) {
+                try {
+                  writeBufferManager.releaseReservedUniqueKeys(
+                    tableName: tableName,
+                    recordId: fId,
+                    transactionId: txId,
+                  );
+                } catch (_) {}
+              }
+            }
+          }
+
+          for (int k = 0; k < recordsToCommit.length; k++) {
+            if (commitResult.successRecordIds.contains(commitPkVals[k])) {
+              notificationManager.notify(ChangeEvent(
+                type: ChangeType.update,
+                tableName: tableName,
+                record: recordsToCommit[k],
+                oldRecord: oldRecordsToCommit[k],
+              ));
+            }
+          }
         }
       }
+
+      if (successKeys.isNotEmpty && failedKeys.isNotEmpty) {
+        return finish(DbResult.batch(
+          successKeys: successKeys,
+          failedKeys: failedKeys,
+          message:
+              'Batch update partially successful: ${successKeys.length} updated, ${failedKeys.length} failed',
+        ));
+      } else if (successKeys.isNotEmpty) {
+        return finish(DbResult.success(
+          successKeys: successKeys,
+          message: 'Batch update successful: ${successKeys.length} updated',
+        ));
+      } else {
+        return finish(DbResult.error(
+          type: ResultType.notFound,
+          message: 'No records were updated',
+          failedKeys: failedKeys,
+        ));
+      }
+    } catch (e) {
+      Logger.error('Batch update failed: $e', label: 'DataStore.batchUpdate');
       return finish(DbResult.error(
         type: ResultType.dbError,
-        message: 'Batch upsert failed: $e',
-        failedKeys: failedKeys,
+        message: 'Batch update failed: $e',
       ));
     }
   }
@@ -5409,7 +5912,7 @@ class DataStoreImpl {
 
           final tableMeta = await tableDataManager.getTableMeta(tableName);
           if (tableMeta != null && !tableMeta.btreeFirstLeaf.isNull) {
-            await tableTreePartitionManager.prewarmBoundaryPages(
+            await tableTreePartitionManager?.prewarmBoundaryPages(
               tableName,
               meta: tableMeta,
             );
@@ -5428,7 +5931,7 @@ class DataStoreImpl {
               if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
                 continue;
               }
-              await indexTreePartitionManager.prewarmBoundaryPages(
+              await indexTreePartitionManager?.prewarmBoundaryPages(
                 tableName,
                 indexName,
                 meta: indexMeta,
@@ -5449,9 +5952,20 @@ class DataStoreImpl {
         }
       }
 
-      // [Optimization] Prewarm KV store at the end to avoid delaying
-      // boundary page prewarming for other prioritized tables.
-      await _prewarmKvStore();
+      final effectivePrewarmThresholdMB =
+          await _resourceManager!.initializeEffectivePrewarmThresholdMB(config);
+      final effectivePrewarmBudgetBytes =
+          effectivePrewarmThresholdMB * 1024 * 1024;
+
+      var remainingPrewarmBytes = effectivePrewarmBudgetBytes;
+      remainingPrewarmBytes = await _prewarmKvStore(
+        maxPrewarmBytes: remainingPrewarmBytes,
+      );
+
+      await _prewarmUserTables(
+        prioritizedTables: prioritizedTables,
+        prewarmBudgetBytes: remainingPrewarmBytes,
+      );
     } catch (e) {
       if (_isInitialized) {
         Logger.error('Error in _executePrewarm: $e',
@@ -5462,44 +5976,161 @@ class DataStoreImpl {
     }
   }
 
-  /// Prewarm KV store tables into TreeCache
-  Future<void> _prewarmKvStore() async {
-    // Use the threshold from config as the total budget for KV prewarming
-    final maxPrewarmBytes = config.prewarmThresholdMB * 1024 * 1024;
-    // Safety cap for record count to avoid excessive object overhead from millions of tiny keys
+  /// Prewarm KV store tables into TreeCache.
+  /// Returns the remaining budget after KV warmup.
+  Future<int> _prewarmKvStore({required int maxPrewarmBytes}) async {
     const maxRecordsSafetyCap = 200000;
 
     final kvTables = [
-      SystemTable.getKeyValueName(true), // Global KV
-      SystemTable.getKeyValueName(false), // Local KV
+      SystemTable.getKeyValueName(true),
+      SystemTable.getKeyValueName(false),
     ];
 
-    int currentPrewarmedBytes = 0;
+    var currentPrewarmedBytes = 0;
+    final yieldController =
+        YieldController('DataStoreImpl._prewarmKvStore', checkInterval: 1);
 
     for (final tableName in kvTables) {
-      if (!_isInitialized) break;
+      if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
       try {
         final tableMeta = await tableDataManager.getTableMeta(tableName);
+        if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
         if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
 
-        // Threshold check: avoids OOM by staying within the configured prewarm budget.
-        // We accumulate usage to ensure the sum of all KV tables respects the threshold.
-        if (currentPrewarmedBytes + tableMeta.totalSizeInBytes <=
-                maxPrewarmBytes &&
-            tableMeta.totalRecords <= maxRecordsSafetyCap) {
-          // [Optimization] Use a range query on the 'key' field to force an Index Scan.
-          // This preloads both index pages and data records into the cache.
-          await executeQuery(tableName,
-              QueryCondition()..where(SystemTable.keyValueKeyField, '>=', ''),
-              limit: maxRecordsSafetyCap);
-
-          currentPrewarmedBytes += tableMeta.totalSizeInBytes;
+        final indexBytes = await _estimateTableIndexBytes(tableName);
+        final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
+        if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
+          continue;
         }
+
+        await executeQuery(
+          tableName,
+          QueryCondition()..where(SystemTable.keyValueKeyField, '>=', ''),
+          limit: maxRecordsSafetyCap,
+        );
+        currentPrewarmedBytes += estimatedBytes;
+        await yieldController.maybeYield();
       } catch (e) {
+        if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
         Logger.warn('Prewarm KV store failed for $tableName: $e',
             label: 'DataStore.prewarm');
       }
     }
+
+    return maxPrewarmBytes - currentPrewarmedBytes;
+  }
+
+  /// Prewarm user tables when the current space remains small enough.
+  Future<void> _prewarmUserTables({
+    List<String>? prioritizedTables,
+    required int prewarmBudgetBytes,
+  }) async {
+    final schemaMgr = schemaManager;
+    if (schemaMgr == null || !_isInitialized) return;
+
+    final spaceConfig = await getSpaceConfig();
+    final spaceUsageBytes = spaceConfig?.totalDataSizeBytes ?? 0;
+    const maxRecordsSafetyCap = 200000;
+
+    if (spaceUsageBytes >= prewarmBudgetBytes) {
+      return;
+    }
+
+    final tables = prioritizedTables ??
+        _getUserDefinedSchemas()
+            .map((schema) => schema.name)
+            .toList(growable: false);
+    if (tables.isEmpty) return;
+
+    final userTables = tables
+        .where((t) => !SystemTable.isSystemTable(t))
+        .toList(growable: false);
+    if (userTables.isEmpty) return;
+
+    final yieldController =
+        YieldController('DataStoreImpl._prewarmUserTables', checkInterval: 1);
+
+    var currentPrewarmedBytes = 0;
+
+    for (final tableName in userTables) {
+      if (!_isInitialized) break;
+      try {
+        final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
+        if (!tableExistsInSpace || !_isInitialized) continue;
+
+        final tableMeta = await tableDataManager.getTableMeta(tableName);
+        if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
+
+        final schema = await schemaMgr.getTableSchema(tableName);
+        if (schema == null) continue;
+
+        final indexBytes = await _estimateTableIndexBytes(tableName);
+        final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
+
+        if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
+            tableMeta.totalRecords > maxRecordsSafetyCap) {
+          break;
+        }
+
+        await executeQuery(
+          tableName,
+          QueryCondition()..where(schema.primaryKey, '>=', ''),
+          limit: maxRecordsSafetyCap,
+        );
+        await yieldController.maybeYield();
+
+        final indexes = schemaMgr.getBtreeIndexesFor(schema);
+        for (final index in indexes) {
+          if (!_isInitialized) break;
+          final indexName = index.actualIndexName;
+          final indexMeta =
+              await _indexManager?.getIndexMeta(tableName, indexName);
+          if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
+
+          // Warm the full index by traversing its leaf chain directly.
+          await indexTreePartitionManager?.searchByKeyRange(
+            tableName: tableName,
+            indexName: indexName,
+            meta: indexMeta,
+            startKeyInclusive: Uint8List(0),
+            endKeyExclusive: Uint8List(0),
+            limit: maxRecordsSafetyCap,
+          );
+          await yieldController.maybeYield();
+        }
+
+        currentPrewarmedBytes += estimatedBytes;
+        await yieldController.maybeYield();
+      } catch (e) {
+        if (!_isInitialized) break;
+        Logger.warn('Prewarm user table failed for $tableName: $e',
+            label: 'DataStore.prewarm');
+      }
+    }
+  }
+
+  Future<int> _estimateTableIndexBytes(String tableName) async {
+    final schemaMgr = schemaManager;
+    if (schemaMgr == null) return 0;
+    final schema = await schemaMgr.getTableSchema(tableName);
+    if (schema == null) return 0;
+
+    var total = 0;
+    final yieldController = YieldController(
+        'DataStoreImpl._estimateTableIndexBytes',
+        checkInterval: 2);
+    final indexes = schemaMgr
+        .getBtreeIndexesFor(schema)
+        .where((index) => index.type == IndexType.btree);
+    for (final index in indexes) {
+      final indexMeta =
+          await _indexManager?.getIndexMeta(tableName, index.actualIndexName);
+      if (indexMeta != null) {
+        total += indexMeta.totalSizeInBytes;
+      }
+      await yieldController.maybeYield();
+    }
+    return total;
   }
 
   /// Sort tables by weight (descending)
@@ -5725,8 +6356,10 @@ class DataStoreImpl {
 
     final oldSpaceName = _currentSpaceName;
     try {
-      // 1. Unified shutdown logic for the current space
-      await _flushAndShutdown(persistChanges: true, closeStorage: false);
+      // 1. Unified shutdown logic for the current space via close()
+      // closeStorage: false keeps the driver connection alive during space switch.
+      // removeRegistry: false ensures this DataStoreImpl instance stays in the factory cache.
+      await close(closeStorage: false, removeRegistry: false);
 
       // 2. Update current space name and config
       _currentSpaceName = spaceName;
@@ -5734,9 +6367,7 @@ class DataStoreImpl {
         _config = _config!.copyWith(spaceName: _currentSpaceName);
       }
 
-      // Reinitialize database; do not apply activeSpace-on-default so switching to default stays default
-      _isInitialized = false;
-      _baseInitialized = false;
+      // Reinitialize database with the new space configuration
       await initialize(applyActiveSpaceOnDefault: false);
 
       // Update GlobalConfig only if there are actual changes to avoid unnecessary IO
@@ -5827,80 +6458,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Unified internal shutdown logic for space switching or full instance closure.
-  Future<void> _flushAndShutdown({
-    bool persistChanges = true,
-    bool closeStorage = false,
-    bool isCloseInstance = false,
-  }) async {
-    // 1. Stop background triggers first to prevent new work from entering pipelines
-    _ttlCleanupManager.unregisterCleanupTask();
-    compactionManager.dispose();
-
-    // 2. Perform all flushing and shutdown as system operation to bypass transaction locks
-    await TransactionContext.runAsSystemOperation(() async {
-      if (persistChanges) {
-        // Enter maintenance mode to wait for active transactions to finish
-        try {
-          await lockManager?.enterMaintenance(
-              timeout: config.transactionTimeout);
-        } catch (_) {}
-      }
-
-      // 3. Flush and stop write pipelines
-      try {
-        if (persistChanges) {
-          await parallelJournalManager.flushCompletely();
-        }
-        await parallelJournalManager.drainAndStop();
-      } catch (e) {
-        Logger.warn('Stop journal manager failed: $e', label: 'DataStoreImpl');
-      }
-
-      try {
-        await walManager.flushQueueCompletely();
-        if (persistChanges && config.enableJournal) {
-          await walManager.persistMeta(flush: true);
-        }
-      } catch (e) {
-        Logger.warn('Flush WAL failed: $e', label: 'DataStoreImpl');
-      }
-
-      // 4. Flush weight data
-      if (_weightManager != null) {
-        if (persistChanges) {
-          await _weightManager!.saveWeights(force: true);
-        }
-        if (isCloseInstance) {
-          _weightManager!.dispose();
-        }
-      }
-
-      // 5. Persist and dispose data managers via CacheManager
-      // This handles TableDataManager, IndexManager, VectorIndexManager, SchemaManager
-      await cacheManager.dispose();
-
-      // 6. Final storage flush and close
-      // This must be the absolute last storage instruction to release handles on Windows
-      try {
-        await storage.flushAll(closeHandles: true);
-        if (closeStorage) {
-          await storage.close(isMigrationInstance: isMigrationInstance);
-        }
-      } catch (e) {
-        Logger.warn('Storage flush/close failed: $e', label: 'DataStoreImpl');
-      }
-    });
-
-    // 7. Cleanup remaining non-storage managers
-    if (isCloseInstance) {
-      readViewManager.dispose();
-      _resourceManager?.dispose();
-      CrontabManager.dispose();
-      lockManager = null;
-    }
-  }
-
   /// Set key-value pair
   Future<DbResult> setValue(
     String key,
@@ -5918,6 +6475,7 @@ class DataStoreImpl {
         failedKeys: [key],
       );
     }
+
     if (ttl != null && ttl <= Duration.zero) {
       return DbResult.error(
         type: ResultType.validationFailed,
@@ -5928,44 +6486,84 @@ class DataStoreImpl {
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final now = DateTime.now();
+    final expiresAtIso = expiresAt?.toIso8601String() ??
+        (ttl != null ? now.add(ttl).toIso8601String() : null);
+
+    // Build data for upsert
+    final data = {
+      _kvKeyField: key,
+      _kvValueField: jsonEncode(value),
+      _kvUpdatedAtField: now.toIso8601String(),
+      _kvExpiresAtField: expiresAtIso,
+    };
+
+    final schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return DbResult.error(
+        type: ResultType.notFound,
+        message: 'KV table not found',
+        failedKeys: [key],
+      );
+    }
+
+    return await batchUpsert(tableName, [data]);
+  }
+
+  Future<DbResult> setValueMany(
+    Map<String, dynamic> items, {
+    Duration? ttl,
+    DateTime? expiresAt,
+    bool isGlobal = false,
+    bool allowPartialErrors = true,
+  }) async {
+    await ensureInitialized();
+    if (items.isEmpty) {
+      return DbResult.success(message: 'No items to set');
+    }
+
+    if (ttl != null && expiresAt != null) {
+      return DbResult.error(
+        type: ResultType.validationFailed,
+        message: 'ttl and expiresAt are mutually exclusive',
+      );
+    }
+
+    if (ttl != null && ttl <= Duration.zero) {
+      return DbResult.error(
+        type: ResultType.validationFailed,
+        message: 'ttl must be greater than zero',
+      );
+    }
+
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return DbResult.error(
+        type: ResultType.notFound,
+        message: 'KV table not found',
+      );
+    }
+
+    final now = DateTime.now();
     final nowIso = now.toIso8601String();
     final expiresAtIso = expiresAt?.toIso8601String() ??
         (ttl != null ? now.add(ttl).toIso8601String() : null);
 
-    // Build data
-    final data = {
-      _kvKeyField: key,
-      _kvValueField: jsonEncode(value),
-      _kvUpdatedAtField: nowIso,
-      _kvExpiresAtField: expiresAtIso,
-    };
-
-    try {
-      final existing = await executeQuery(
-          tableName, QueryCondition()..where(_kvKeyField, '=', key));
-
-      if (existing.isEmpty) {
-        final result = await insert(tableName, data);
-        return result;
-      } else {
-        // Build update condition
-        final condition = QueryCondition()..where(_kvKeyField, '=', key);
-        final result = await updateInternal(
-          tableName,
-          data,
-          condition,
-        );
-        return result;
-      }
-    } catch (e) {
-      Logger.error('Set key-value pair failed: $e',
-          label: 'DataStore.setValue');
-      return DbResult.error(
-        type: ResultType.dbError,
-        message: 'Set key-value pair failed: $e',
-        failedKeys: [key],
-      );
+    final records = <Map<String, dynamic>>[];
+    final preparationYield = YieldController(
+        'DataStoreImpl.setValueMany.prepare',
+        checkInterval: 200);
+    for (final entry in items.entries) {
+      await preparationYield.maybeYield();
+      records.add({
+        _kvKeyField: entry.key,
+        _kvValueField: jsonEncode(entry.value),
+        _kvUpdatedAtField: nowIso,
+        _kvExpiresAtField: expiresAtIso,
+      });
     }
+    return await batchUpsert(tableName, records,
+        allowPartialErrors: allowPartialErrors);
   }
 
   /// Get key-value pair
@@ -7399,78 +7997,6 @@ class DataStoreImpl {
         label: 'DataStore.setPrimaryKeyConfig',
       );
       rethrow;
-    }
-  }
-
-  /// Validate if primary key value maintains ordering
-  Future<bool> _validatePrimaryKeyOrder(
-      String tableName, dynamic newId, PrimaryKeyType type) async {
-    try {
-      // Get table metadata
-      final fileMeta = await tableDataManager.getTableMeta(tableName);
-      if (fileMeta == null || fileMeta.totalRecords <= 0) {
-        return true; // New table, no need to check ordering
-      }
-
-      // Compare new ID with maximum ID
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return true; // Should not happen
-      }
-      final pkMatcher =
-          ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
-
-      // Convert newId to the correct type before comparison.
-      final pkFieldSchema = FieldSchema(
-          name: schema.primaryKey,
-          type: schema.primaryKeyConfig.getDefaultDataType());
-      final convertedNewId = pkFieldSchema.convertValue(newId);
-      if (convertedNewId == null) {
-        return true; // Cannot compare, assume valid to be safe.
-      }
-
-      // Prefer maxAutoIncrementId (cheap) and fall back to reading the max key from the global leaf tail.
-      dynamic lastMax = fileMeta.maxAutoIncrementId;
-      if (lastMax == null) {
-        try {
-          final last =
-              await tableTreePartitionManager.scanRecordsByPrimaryKeyRange(
-            tableName: tableName,
-            startKeyInclusive: Uint8List(0),
-            endKeyExclusive: Uint8List(0),
-            reverse: true,
-            limit: 1,
-          );
-          if (last.isNotEmpty) {
-            lastMax = last.first[schema.primaryKey];
-          }
-        } catch (_) {}
-      }
-      if (lastMax == null) {
-        return true; // Cannot determine maximum primary key value, skip check
-      }
-      final convertedLastMax = pkFieldSchema.convertValue(lastMax);
-      if (convertedLastMax == null) return true;
-
-      int compareResult = pkMatcher(convertedNewId, convertedLastMax);
-
-      // Determine if strict incremental ordering is required based on primary key type
-      switch (type) {
-        case PrimaryKeyType.sequential:
-        case PrimaryKeyType.timestampBased:
-        case PrimaryKeyType.datePrefixed:
-        case PrimaryKeyType.shortCode:
-          // Ordered primary keys should be strictly increasing
-          return compareResult > 0;
-        case PrimaryKeyType.none:
-          // Other primary key types, more relaxed check
-          return true;
-      }
-    } catch (e) {
-      Logger.error('Failed to check primary key ordering: $e',
-          label: 'DataStore._validatePrimaryKeyOrder');
-      // On error, allow insertion to be safe
-      return true;
     }
   }
 

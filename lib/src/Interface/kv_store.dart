@@ -42,6 +42,37 @@ class KvStore {
         ttl: ttl, expiresAt: expiresAt, isGlobal: isGlobal);
   }
 
+  /// Set multiple key-value pairs in a single operation.
+  /// 在单个操作中设置多个键值对。
+  ///
+  /// Parameters:
+  /// - [items]: A map of keys and values to store.
+  /// - [ttl]: Optional relative expiration duration for all items.
+  /// - [expiresAt]: Optional absolute expiration time for all items.
+  /// - [isGlobal]: If true, stores in the global space.
+  /// - [allowPartialErrors]: If true, partial write failures will not cause the entire operation to fail.
+  ///
+  /// 参数说明：
+  /// - [items]: 要存储的键值对 Map。
+  /// - [ttl]: 可选的相对过期时长（对所有项生效）。
+  /// - [expiresAt]: 可选的绝对过期时间点（对所有项生效）。
+  /// - [isGlobal]: 是否存储在全局空间。
+  /// - [allowPartialErrors]: 是否允许部分错误，如果为 true，则部分写入失败不会导致整个操作失败。
+
+  Future<DbResult> setMany(
+    Map<String, dynamic> items, {
+    Duration? ttl,
+    DateTime? expiresAt,
+    bool isGlobal = false,
+    bool allowPartialErrors = true,
+  }) {
+    return _db.setValueMany(items,
+        ttl: ttl,
+        expiresAt: expiresAt,
+        isGlobal: isGlobal,
+        allowPartialErrors: allowPartialErrors);
+  }
+
   /// Get a value by key.
   /// 根据键获取值。
   ///

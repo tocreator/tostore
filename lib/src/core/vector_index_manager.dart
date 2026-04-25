@@ -328,12 +328,13 @@ class VectorIndexManager {
     final pks = (nid2pk == null || nid2pk.btreeFirstLeaf.isNull)
         ? List<String?>.filled(sortedByNode.length, null, growable: false)
         : await _dataStore.indexTreePartitionManager
-            .lookupUniquePrimaryKeysBatch(
-            tableName: tableName,
-            indexName: meta.nid2pkIndexName,
-            meta: nid2pk,
-            uniqueKeys: keys,
-          );
+                ?.lookupUniquePrimaryKeysBatch(
+              tableName: tableName,
+              indexName: meta.nid2pkIndexName,
+              meta: nid2pk,
+              uniqueKeys: keys,
+            ) ??
+            <String>[];
     final entries = <VectorSearchResult>[];
     final searchYc = YieldController(
       'VectorIndexManager.vectorSearch.lookupPk',
@@ -899,13 +900,13 @@ class VectorIndexManager {
     }
 
     if (nid2pkDeltas.isNotEmpty) {
-      await _dataStore.indexTreePartitionManager.writeChanges(
+      await _dataStore.indexTreePartitionManager?.writeChanges(
         tableName: tableName,
         indexName: meta.nid2pkIndexName,
         indexMeta: meta.nodeIdToPkMeta!,
         deltas: nid2pkDeltas,
       );
-      await _dataStore.indexTreePartitionManager.writeChanges(
+      await _dataStore.indexTreePartitionManager?.writeChanges(
         tableName: tableName,
         indexName: meta.pk2nidIndexName,
         indexMeta: meta.pkToNodeIdMeta!,
@@ -1053,22 +1054,24 @@ class VectorIndexManager {
     var pk2nidMeta = meta.pkToNodeIdMeta!;
 
     await Future.wait([
-      _dataStore.indexTreePartitionManager.writeChanges(
-        tableName: tableName,
-        indexName: meta.nid2pkIndexName,
-        indexMeta: nid2pkMeta,
-        deltas: nid2pkDeltas,
-        batchContext: batchContext,
-        concurrency: concurrency,
-      ),
-      _dataStore.indexTreePartitionManager.writeChanges(
-        tableName: tableName,
-        indexName: meta.pk2nidIndexName,
-        indexMeta: pk2nidMeta,
-        deltas: pk2nidDeltas,
-        batchContext: batchContext,
-        concurrency: concurrency,
-      ),
+      _dataStore.indexTreePartitionManager?.writeChanges(
+            tableName: tableName,
+            indexName: meta.nid2pkIndexName,
+            indexMeta: nid2pkMeta,
+            deltas: nid2pkDeltas,
+            batchContext: batchContext,
+            concurrency: concurrency,
+          ) ??
+          Future.value(),
+      _dataStore.indexTreePartitionManager?.writeChanges(
+            tableName: tableName,
+            indexName: meta.pk2nidIndexName,
+            indexMeta: pk2nidMeta,
+            deltas: pk2nidDeltas,
+            batchContext: batchContext,
+            concurrency: concurrency,
+          ) ??
+          Future.value(),
     ]);
 
     // Re-read the updated metas in parallel
@@ -1090,7 +1093,7 @@ class VectorIndexManager {
     final nid2pk = meta.nodeIdToPkMeta;
     if (nid2pk == null || nid2pk.btreeFirstLeaf.isNull) return null;
     final pk =
-        await _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+        await _dataStore.indexTreePartitionManager?.lookupUniquePrimaryKey(
       tableName: tableName,
       indexName: meta.nid2pkIndexName,
       meta: nid2pk,
@@ -1105,7 +1108,7 @@ class VectorIndexManager {
     final pk2nid = meta.pkToNodeIdMeta;
     if (pk2nid == null || pk2nid.btreeFirstLeaf.isNull) return null;
     final result =
-        await _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+        await _dataStore.indexTreePartitionManager?.lookupUniquePrimaryKey(
       tableName: tableName,
       indexName: meta.pk2nidIndexName,
       meta: pk2nid,

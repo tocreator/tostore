@@ -28,6 +28,8 @@ void main() async {
         if (message.contains("value 'tx_user1'") || // Transaction test
             message.contains("value 'tx_user4'") || // Transaction test
             message.contains("value 'upsert_user'") || // Upsert test
+            message.contains(
+                "value 'buffer_test_user'") || // Buffer robustness test
             message.contains("value '3'") || // Edge case test
             message
                 .contains("value '4'") || // Edge case test (potential artifact)

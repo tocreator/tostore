@@ -72,6 +72,7 @@ class QueryExecutor {
   }) async {
     final optimizer = _dataStore.getQueryOptimizer();
     if (optimizer == null) {
+      if (!_dataStore.isInitialized) return ExecuteResult.empty();
       throw StateError('Query optimizer not initialized');
     }
 
@@ -1971,6 +1972,8 @@ class QueryExecutor {
 
         while (shouldContinue()) {
           await yieldController.maybeYield();
+          if (!_dataStore.isInitialized) break;
+
           loops++;
           if (loops > maxLoops) break;
 

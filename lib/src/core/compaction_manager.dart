@@ -150,7 +150,7 @@ final class CompactionManager {
           if (task.kind == _CompactionKind.table) {
             final TreePagePtr? hint = _tableHint[task.tableName];
             final next =
-                await _dataStore.tableTreePartitionManager.compactLeafChain(
+                await _dataStore.tableTreePartitionManager?.compactLeafChain(
               tableName: task.tableName,
               startFrom: task.cursor ?? hint,
               maxVisitedLeaves: maxVisitedLeaves,
@@ -165,7 +165,7 @@ final class CompactionManager {
             final TreePagePtr? hint =
                 _indexHint['${task.tableName}:${task.indexName}'];
             final next =
-                await _dataStore.indexTreePartitionManager.compactLeafChain(
+                await _dataStore.indexTreePartitionManager?.compactLeafChain(
               tableName: task.tableName,
               indexName: task.indexName!,
               startFrom: task.cursor ?? hint,

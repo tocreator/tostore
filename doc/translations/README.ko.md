@@ -33,7 +33,7 @@
 - **시작하기**: [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - **아키텍처 및 모델**: [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - **고급 쿼리**: [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- **고급 및 성능**: [KV 고급 작업](#kv-advanced) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- **고급 및 성능**: [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - **운영 및 보안**: [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
@@ -448,8 +448,21 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
 
 ### <a id="kv-advanced"></a>키-값 고급 작업 (db.kv)
 
-더 복잡한 Key-Value 시나리오의 경우 `db.kv` 네임스페이스를 사용하는 것이 좋습니다. 더 풍부한 메서드 세트를 제공합니다.
-모든 메서드는 선택적 `isGlobal` 매개변수를 지원합니다. `true`는 글로벌 공간 공유 데이터를 나타내며, `false`(기본값)는 현재 공간을 나타냅니다.
+### <a id="kv-advanced"></a>키-값 고급 작업 (db.kv)
+
+더 복잡한 Key-Value 시나리오의 경우 `db.kv` 네임스페이스를 사용하는 것이 좋습니다. 공간 격리, 글로벌 공유 및 다양한 데이터 타입을 지원하는 완전한 API 세트를 제공합니다.
+
+- **기본 액세스 (Basic Access)**
+  ```dart
+  // 값 설정 (String, int, bool, double, Map, List 등 지원)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // 원시 동적 타입 값 가져오기
+  dynamic val = await db.kv.get('key');
+
+  // 단일 키 삭제
+  await db.kv.remove('key');
+  ```
 
 - **타입 안정성이 보장된 읽기 (Type-Safe Getters)**
   수동 타입 변환 없이 목표 형식의 데이터를 직접 가져옵니다:
@@ -459,6 +472,19 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
   bool? isVip = await db.kv.getBool('is_vip');
   Map<String, dynamic>? profile = await db.kv.getMap('profile');
   List<String>? tags = await db.kv.getList<String>('tags');
+  ```
+
+- **일괄 작업 (Bulk Operations)**
+  한 번의 작업으로 여러 키-값 쌍을 효율적으로 처리합니다:
+  ```dart
+  // 일괄 설정
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'ko_KR',
+  });
+
+  // 일괄 삭제
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
   ```
 
 - **원자적 카운터 (Atomic Increment)**
@@ -471,7 +497,6 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
   ```
 
 - **키 공간 탐색 및 관리 (Discovery & Management)**
-  접두사 기반 키 검색, 총 개수 통계 및 대량 삭제를 지원합니다:
   ```dart
   // 'setting_'으로 시작하는 모든 키 가져오기
   final keys = await db.kv.getKeys(prefix: 'setting_');
@@ -481,9 +506,6 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
 
   // 키 존재 여부 및 만료 확인
   final exists = await db.kv.exists('config_cache');
-
-  // 여러 키를 한 번에 삭제
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
 
   // 현재 공간의 모든 KV 데이터 삭제
   await db.kv.clear();
@@ -498,6 +520,56 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
   // 기존 키의 만료 시간 업데이트 (7일 후 만료)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **반응형 모니터링 (Reactive Watch)**
+  ```dart
+  // 단일 키 모니터링
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // 여러 키의 변경 스냅샷 모니터링
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **전역 공유 매개변수 (isGlobal)**
+  위의 모든 메서드는 선택적 `isGlobal` 매개변수를 지원합니다. `true`는 전역 공간(모든 공간에서 공유)에서의 작업을, `false`(기본값)는 현재 격리된 공간에서의 작업을 나타냅니다.
+
+
+### <a id="bulk-operations"></a>일괄 작업 (Bulk Operations)
+
+ToStore는 대규모 데이터 처리량에 최적화된 전용 일괄 처리 인터페이스를 제공합니다. 이러한 인터페이스는 병렬 작업 분산 및 타임 슬라이싱 스케줄링 메커니즘을 내장하고 있어, 고성능 쓰기 작업을 수행할 때 UI 메인 스레드에 미치는 영향을 효과적으로 줄여줍니다.
+
+| 인터페이스 | 핵심 용도 | 데이터 요구 사항 | 특징 |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | 다수 레코드 일괄 삽입 | 모든 필수(non-nullable) 필드 포함 | 순수 삽입, 최고 성능 |
+| `batchUpsert` | 존재하면 업데이트, 없으면 삽입 | **모든 필수(non-nullable) 필드 포함** | 전체 동기화, 기본 키 또는 고유 필드 기반 자동 판별 |
+| `batchUpdate` | 기존 레코드 일괄 부분 업데이트 | **기본 키 또는 고유 필드** + 업데이트 필드 | 증분 업데이트, 기존 레코드 수정에 특화 |
+
+- **일괄 삽입 (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **지능형 일괄 동기화 (batchUpsert)**
+  기본 키 또는 고유 필드를 기반으로 '삽입' 또는 '업데이트'를 자동으로 식별합니다. 데이터의 전체 동기화 시나리오에서 주로 사용됩니다.
+  > [!IMPORTANT]
+  > **데이터 요구 사항**: 삽입 작업이 발생할 수 있으므로, `batchUpsert`는 각 레코드에 모든 필수(`nullable: false`) 필드가 포함되어야 합니다.
+
+- **고효율 일괄 업데이트 (batchUpdate)**
+  기존 레코드를 업데이트하는 데 특화되어 있습니다. 각 레코드는 식별자로서의 기본 키 또는 고유 필드와 수정할 필드를 포함해야 합니다.
+  > [!TIP]
+  > **부분 업데이트**: `batchUpdate`는 제공된 필드만 업데이트하며 모든 필수 필드를 포함할 필요가 없으므로 증분 수정 시나리오에 적합합니다.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // 고유 필드 username으로 식별하여 age 업데이트
+    {'id': '1002', 'status': 'active'}, // 기본 키를 직접 지정할 수도 있음
+  ]);
+  ```
+
+> [!TIP]
+> `allowPartialErrors: true`를 설정하면 개별 데이터 오류(예: 단일 레코드 충돌)가 전체 일괄 작업을 중단시키지 않도록 할 수 있습니다.
 
 
 ### <a id="vector-advanced"></a>벡터 필드, 벡터 인덱스 및 벡터 검색
@@ -604,7 +676,7 @@ const TableSchema(
 
 
 ### 지능형 스토리지(Upsert)
-ToStore에서는 `data`에 포함된 기본 키 또는 고유 키를 기준으로 업데이트할지 삽입할지 결정합니다. `where`은 여기서 지원되지 않습니다. 충돌 대상은 데이터 자체에 의해 결정됩니다.
+ToStore에서는 `data`에 포함된 기본 키 또는 고유 필드를 기준으로 업데이트할지 삽입할지 결정합니다. `where`은 여기서 지원되지 않습니다. 충돌 대상은 데이터 자체에 의해 결정됩니다.
 
 ```dart
 // By primary key
@@ -614,7 +686,7 @@ final result = await db.upsert('users', {
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// 고유 키 기준（레코드는 고유 제약 조건에 참여하는 모든 필드와 필수 필드를 포함해야 합니다）
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',

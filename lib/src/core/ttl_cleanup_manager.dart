@@ -50,6 +50,9 @@ class TtlCleanupManager {
   bool _planCacheFullyLoaded = false;
   final Map<String, _TtlCleanupPlan> _planCache = <String, _TtlCleanupPlan>{};
 
+  /// Timer for startup one-shot trigger
+  Timer? _startupTimer;
+
   TtlCleanupManager(this._dataStore);
 
   void registerCleanupTask() {
@@ -61,13 +64,16 @@ class TtlCleanupManager {
       // One-shot delayed trigger shortly after startup so short-lived/mobile
       // apps don't have to wait for the next cron tick. Does not block the
       // main thread and is still subject to ttlCleanupIntervalMs throttling.
-      Timer(const Duration(seconds: 10), () {
+      _startupTimer = Timer(const Duration(seconds: 10), () {
         _onScheduleTick();
       });
     } catch (_) {}
   }
 
   void unregisterCleanupTask() {
+    _startupTimer?.cancel();
+    _startupTimer = null;
+
     if (_cleanupRegistered) {
       try {
         CrontabManager.removeCallback(
@@ -114,6 +120,7 @@ class TtlCleanupManager {
   }
 
   void _onScheduleTick() {
+    if (!_dataStore.isInitialized) return;
     if (_cleanupRunning) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastCleanupMs < _dataStore.config.ttlCleanupIntervalMs) {
@@ -296,7 +303,7 @@ class TtlCleanupManager {
               }
 
               if (deltas.isNotEmpty) {
-                await _dataStore.indexTreePartitionManager.writeChanges(
+                await _dataStore.indexTreePartitionManager?.writeChanges(
                   tableName: plan.tableName,
                   indexName: ttlIndexName,
                   indexMeta: meta,
@@ -660,8 +667,10 @@ class TtlCleanupManager {
         );
       }
     } catch (e) {
-      Logger.warn('TTL cleanup cycle failed: $e',
-          label: 'TtlCleanupManager._runCleanupCycle');
+      if (_dataStore.isInitialized) {
+        Logger.warn('TTL cleanup cycle failed: $e',
+            label: 'TtlCleanupManager._runCleanupCycle');
+      }
     } finally {
       // If this cycle did not see any backlog, it is safe to release the
       // background lease and allow CrontabManager to enter idle-sleep.

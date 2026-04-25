@@ -269,8 +269,7 @@ class IndexManager {
     final endExclusive = Uint8List(prefix.length + 5);
     endExclusive.setRange(0, prefix.length, prefix);
     endExclusive[prefix.length] = 0xFF;
-
-    return _dataStore.indexTreePartitionManager.searchByKeyRange(
+    final result = await _dataStore.indexTreePartitionManager?.searchByKeyRange(
       tableName: tableName,
       indexName: indexName,
       meta: meta,
@@ -278,6 +277,7 @@ class IndexManager {
       endKeyExclusive: endExclusive,
       limit: limit,
     );
+    return result ?? IndexSearchResult.empty();
   }
 
   Future<void> removeInternalKvExpiryIndexEntryByRawKey(
@@ -314,7 +314,7 @@ class IndexManager {
         return;
       }
 
-      await _dataStore.indexTreePartitionManager.writeChanges(
+      await _dataStore.indexTreePartitionManager?.writeChanges(
         tableName: tableName,
         indexName: _internalKvExpiryActualIndexName,
         indexMeta: meta,
@@ -660,16 +660,17 @@ class IndexManager {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
     if (!isMemoryMode) {
-      return _dataStore.indexTreePartitionManager.searchByKeyRange(
-        tableName: tableName,
-        indexName: indexName,
-        meta: meta,
-        startKeyInclusive: startKeyInclusive,
-        endKeyExclusive: endKeyExclusive,
-        reverse: reverse,
-        limit: limit,
-        offset: offset,
-      );
+      return _dataStore.indexTreePartitionManager?.searchByKeyRange(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            startKeyInclusive: startKeyInclusive,
+            endKeyExclusive: endKeyExclusive,
+            reverse: reverse,
+            limit: limit,
+            offset: offset,
+          ) ??
+          IndexSearchResult.empty();
     }
 
     // Memory mode: index data cache is the primary index store.
@@ -698,7 +699,7 @@ class IndexManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
     if (isMemoryMode) return null;
-    return _dataStore.indexTreePartitionManager.lookupUniquePrimaryKey(
+    return _dataStore.indexTreePartitionManager?.lookupUniquePrimaryKey(
       tableName: tableName,
       indexName: indexName,
       meta: meta,
@@ -1153,7 +1154,8 @@ class IndexManager {
       String tableName, Map<String, dynamic> data,
       {bool isUpdate = false,
       String? txId,
-      TableSchema? schemaOverride}) async {
+      TableSchema? schemaOverride,
+      bool skipBufferCheck = false}) async {
     try {
       final schema = schemaOverride ??
           await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -1192,27 +1194,30 @@ class IndexManager {
       if (!isUpdate && primaryValue != null) {
         final pkStr = primaryValue.toString();
         // 0) Fast-path: check pending in-memory reservations (buffer overlay)
-        try {
-          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
-            tableName,
-            'pk',
-            pkStr,
-            pkStr, // Self ID is the PK itself
-            transactionId: currentTxId,
-          );
-          if (conflict) {
-            Logger.warn(
-              "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
-              label: 'IndexManager.checkUniqueConstraints',
+        if (!skipBufferCheck) {
+          try {
+            final conflictId = writeBuf.hasUniqueKeyOwnedByOther(
+              tableName,
+              'pk',
+              primaryValue,
+              isUpdate ? pkStr : null,
+              transactionId: currentTxId,
             );
-            return UniqueViolation(
-              tableName: tableName,
-              fields: [primaryKey],
-              value: primaryValue,
-              indexName: 'pk',
-            );
-          }
-        } catch (_) {}
+            if (conflictId != null) {
+              Logger.warn(
+                "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
+                label: 'IndexManager.checkUniqueConstraints',
+              );
+              return UniqueViolation(
+                tableName: tableName,
+                fields: [primaryKey],
+                value: primaryValue,
+                indexName: 'pk',
+                existingPrimaryKey: conflictId,
+              );
+            }
+          } catch (_) {}
+        }
 
         if (isMemoryMode) {
           // Memory mode: table TreeCache is the committed store.
@@ -1229,8 +1234,8 @@ class IndexManager {
           // 1) Persisted check: use tree-partitioned table data.
           try {
             final exists = await _dataStore.tableTreePartitionManager
-                .existsPrimaryKey(tableName, pkStr);
-            if (exists &&
+                ?.existsPrimaryKey(tableName, pkStr);
+            if (exists == true &&
                 !_isPrimaryKeyHiddenByDeleteOverlay(
                   tableName,
                   pkStr,
@@ -1298,29 +1303,31 @@ class IndexManager {
       // Helper to check buffer for conflicts
       UniqueViolation? checkInBuffer(_UniqueConstraint constraint,
           {bool transactionOnly = false}) {
+        if (skipBufferCheck) return null;
         try {
           final compositeKey = constraint.canonicalKey;
           if (compositeKey != null) {
-            final selfId = primaryValue?.toString();
-            final bool conflict;
+            final String? selfIdToIgnore =
+                isUpdate ? primaryValue?.toString() : null;
+            final String? conflictId;
             if (transactionOnly) {
-              conflict = writeBuf.hasUniqueKeyOwnedByOtherTransaction(
+              conflictId = writeBuf.hasUniqueKeyOwnedByOtherTransaction(
                 tableName,
                 constraint.indexName,
                 compositeKey,
-                selfId,
+                selfIdToIgnore,
                 transactionId: currentTxId,
               );
             } else {
-              conflict = writeBuf.hasUniqueKeyOwnedByOther(
+              conflictId = writeBuf.hasUniqueKeyOwnedByOther(
                 tableName,
                 constraint.indexName,
                 compositeKey,
-                selfId,
+                selfIdToIgnore,
                 transactionId: currentTxId,
               );
             }
-            if (conflict) {
+            if (conflictId != null) {
               Logger.warn(
                   "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (buffer/reservation)",
                   label: 'IndexManager.checkUniqueConstraints');
@@ -1329,6 +1336,7 @@ class IndexManager {
                 fields: constraint.fields,
                 value: constraint.value,
                 indexName: constraint.indexName,
+                existingPrimaryKey: conflictId,
               );
             }
           }
@@ -1399,6 +1407,12 @@ class IndexManager {
           // Get index metadata
           final meta = await getIndexMeta(tableName, indexName);
           if (meta == null || meta.totalEntries <= 0) {
+            final tableMeta =
+                await _dataStore.tableDataManager.getTableMeta(tableName);
+            if (tableMeta == null || tableMeta.totalRecords <= 0) {
+              // Verified empty table on disk; no persistent conflict possible.
+              continue;
+            }
             for (final constraint in indexConstraints) {
               final existingPk = await _findExistingPrimaryKeyByConstraint(
                 tableName: tableName,
@@ -1458,12 +1472,13 @@ class IndexManager {
 
           // Batch check existence using BinaryFuseFilter + grouped I/O
           final exists =
-              await _dataStore.indexTreePartitionManager.existsUniqueKeysBatch(
-            tableName: tableName,
-            indexName: indexName,
-            meta: meta,
-            uniqueKeys: keyBytes,
-          );
+              await _dataStore.indexTreePartitionManager?.existsUniqueKeysBatch(
+                    tableName: tableName,
+                    indexName: indexName,
+                    meta: meta,
+                    uniqueKeys: keyBytes,
+                  ) ??
+                  <bool>[];
 
           final positiveKeyBytes = <Uint8List>[];
           final positiveConstraintIndices = <int>[];
@@ -1484,12 +1499,13 @@ class IndexManager {
           }
 
           final existingPks = await _dataStore.indexTreePartitionManager
-              .lookupUniquePrimaryKeysBatch(
-            tableName: tableName,
-            indexName: indexName,
-            meta: meta,
-            uniqueKeys: positiveKeyBytes,
-          );
+                  ?.lookupUniquePrimaryKeysBatch(
+                tableName: tableName,
+                indexName: indexName,
+                meta: meta,
+                uniqueKeys: positiveKeyBytes,
+              ) ??
+              <String>[];
 
           // Check results
           for (int j = 0; j < positiveConstraintIndices.length; j++) {
@@ -1552,26 +1568,42 @@ class IndexManager {
     }
   }
 
-  /// Batch unique check for INSERTs.
+  /// Batch unique check for INSERTs or UPDATEs.
+  ///
+  /// - For INSERT: Validates primary key and all unique indexes.
+  /// - For UPDATE: Validates unique indexes ONLY if the indexed fields have changed.
+  ///
+  /// [records] The full merged records to check.
+  /// [changedFieldsMap] Optional map of changed field sets keyed by primary key string.
+  /// If [isUpdate] is true, only indexes whose fields overlap with changed fields are checked.
   ///
   /// Returns a list aligned with [records], where each entry is either null (no violation)
   /// or a [UniqueViolation] describing the first detected conflict for that record.
-  Future<List<UniqueViolation?>> checkUniqueConstraintsBatchForInsert(
-    String tableName,
-    List<Map<String, dynamic>> records, {
-    TableSchema? schemaOverride,
-    String? transactionId,
-  }) async {
+  Future<List<UniqueViolation?>> checkUniqueConstraintsBatch(
+      String tableName, List<Map<String, dynamic>> records,
+      {bool isUpdate = false,
+      String? transactionId,
+      TableSchema? schemaOverride,
+      bool resolveInPlace = false,
+      bool skipBufferCheck = false,
+      Map<String, Set<String>>? changedFieldsMap}) async {
     if (records.isEmpty) return const <UniqueViolation?>[];
 
     final yieldController =
-        YieldController('IndexManager.checkUniqueConstraintsBatchForInsert');
+        YieldController('IndexManager.checkUniqueConstraintsBatch');
 
     final schema = schemaOverride ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return List<UniqueViolation?>.filled(records.length, null,
           growable: false);
+    }
+
+    // Validation: If provided, changedFieldsMap must align by size (or be subset).
+    if (changedFieldsMap != null && changedFieldsMap.length > records.length) {
+      // Note: Map could be smaller if some records had no changes, but not larger.
+      Logger.warn(
+          'IndexManager.checkUniqueConstraintsBatch: changedFieldsMap size exceeds records length');
     }
 
     final bool isMemoryMode =
@@ -1584,29 +1616,59 @@ class IndexManager {
     final violations =
         List<UniqueViolation?>.filled(records.length, null, growable: false);
 
-    // 1) Primary key uniqueness (only for custom PK inserts).
-    if (schema.primaryKeyConfig.type == PrimaryKeyType.none) {
+    // 1) Primary key uniqueness (only for INSERTs with custom PKs).
+    // 1) Primary key check (only if not an update of the same record)
+    if (!isUpdate) {
       final pkList = <String>[];
+      final pkSeen = <String>{};
+
       for (int i = 0; i < records.length; i++) {
         final r = records[i];
         await yieldController.maybeYield();
-        final pk = r[primaryKey]?.toString();
-        if (pk != null && pk.isNotEmpty) {
-          pkList.add(pk);
-          final conflict = writeBuf.hasUniqueKeyOwnedByOther(
-            tableName,
-            'pk',
-            pk,
-            pk,
-            transactionId: txId,
-          );
-          if (conflict) {
+        final pkValue = r[primaryKey];
+        if (pkValue != null) {
+          final pk = pkValue.toString();
+          if (pk.isEmpty) continue;
+
+          // A) Intra-batch PK conflict
+          if (pkSeen.contains(pk)) {
             violations[i] = UniqueViolation(
               tableName: tableName,
               fields: [primaryKey],
               value: pk,
               indexName: 'pk',
+              existingPrimaryKey: pk,
             );
+            if (resolveInPlace) {
+              records[i][primaryKey] = pkValue;
+            }
+            continue;
+          }
+          pkSeen.add(pk);
+
+          pkList.add(pk);
+          // B) WriteBuffer PK conflict
+          if (!skipBufferCheck) {
+            // Use raw pkValue for buffer check to ensure type matching (e.g. int vs String)
+            final conflictId = writeBuf.hasUniqueKeyOwnedByOther(
+              tableName,
+              'pk',
+              pkValue,
+              isUpdate ? pk : null,
+              transactionId: txId,
+            );
+            if (conflictId != null) {
+              violations[i] = UniqueViolation(
+                tableName: tableName,
+                fields: [primaryKey],
+                value: pk,
+                indexName: 'pk',
+                existingPrimaryKey: conflictId,
+              );
+              if (resolveInPlace) {
+                records[i][primaryKey] = pkValue;
+              }
+            }
           }
         }
       }
@@ -1614,7 +1676,6 @@ class IndexManager {
       if (pkList.isNotEmpty) {
         final Set<String> existing;
         if (isMemoryMode) {
-          // Memory mode: table TreeCache is the committed store.
           final set = <String>{};
           for (final pk in pkList) {
             await yieldController.maybeYield();
@@ -1625,10 +1686,8 @@ class IndexManager {
           existing = set;
         } else {
           existing = await _dataStore.tableTreePartitionManager
-              .existingPrimaryKeysBatch(
-            tableName,
-            pkList,
-          );
+                  ?.existingPrimaryKeysBatch(tableName, pkList) ??
+              <String>{};
         }
 
         if (existing.isNotEmpty) {
@@ -1648,7 +1707,11 @@ class IndexManager {
                 fields: [primaryKey],
                 value: pk,
                 indexName: 'pk',
+                existingPrimaryKey: pk,
               );
+              if (resolveInPlace) {
+                records[i][primaryKey] = pk;
+              }
             }
           }
         }
@@ -1662,51 +1725,105 @@ class IndexManager {
     if (uniqueIndexes.isEmpty) return violations;
 
     for (final idx in uniqueIndexes) {
-      // Increment index weight for uniqueness check
-      _dataStore.weightManager?.incrementAccess(
-        WeightType.indexData,
-        '$tableName:${idx.actualIndexName}',
-        spaceName: _dataStore.currentSpaceName,
-      );
-
       final indexName = idx.actualIndexName;
       if (indexName.isEmpty) continue;
 
-      // Skip records already known to violate earlier constraints.
-      bool hasCandidate = false;
+      // Skip this index entirely if no records have changes that impact it.
+      bool hasPotentialCandidate = false;
       for (int i = 0; i < records.length; i++) {
-        if (violations[i] == null) {
-          hasCandidate = true;
-          break;
+        if (violations[i] != null) continue;
+        final r = records[i];
+
+        // FOR UPDATE: Check if any fields in this index were actually changed.
+        // If changedFieldsMap is null, we assume the index IS impacted (safe fallback).
+        if (isUpdate && changedFieldsMap != null) {
+          final pk = r[primaryKey]?.toString();
+          final changed = changedFieldsMap[pk];
+          if (changed == null) continue; // No changes recorded for this PK
+
+          bool indexImpacted = false;
+          for (final f in idx.fields) {
+            if (changed.contains(f)) {
+              indexImpacted = true;
+              break;
+            }
+          }
+          if (!indexImpacted) continue;
         }
+
+        hasPotentialCandidate = true;
+        break;
       }
-      if (!hasCandidate) break;
+      if (!hasPotentialCandidate) continue;
+
+      // Increment index weight for uniqueness check
+      _dataStore.weightManager?.incrementAccess(
+        WeightType.indexData,
+        '$tableName:$indexName',
+        spaceName: _dataStore.currentSpaceName,
+      );
+
+      // 1. WriteBuffer check (uncommitted data) AND Intra-batch check
+      final Map<dynamic, int> batchSeen = {};
 
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
         if (violations[i] != null) continue;
 
+        // FOR UPDATE: Skip if fields in this index didn't change (fallback to true if map is null)
+        if (isUpdate && changedFieldsMap != null) {
+          final r = records[i];
+          final pk = r[primaryKey]?.toString();
+          final changed = changedFieldsMap[pk];
+          if (changed == null || !idx.fields.any((f) => changed.contains(f))) {
+            continue;
+          }
+        }
+
         final r = records[i];
         final recordId = r[primaryKey]?.toString();
-        if (recordId == null || recordId.isEmpty) continue;
-
         final canKey = schema.createCanonicalIndexKey(idx.fields, r);
         if (canKey == null) continue;
 
-        final conflict = writeBuf.hasUniqueKeyOwnedByOther(
-          tableName,
-          indexName,
-          canKey,
-          recordId,
-          transactionId: txId,
-        );
-        if (conflict) {
+        // A) Intra-batch conflict check
+        if (batchSeen.containsKey(canKey)) {
+          final existingPk =
+              records[batchSeen[canKey]!][primaryKey]?.toString();
           violations[i] = UniqueViolation(
             tableName: tableName,
             fields: idx.fields,
             value: canKey,
             indexName: indexName,
+            existingPrimaryKey: existingPk,
           );
+          if (resolveInPlace && existingPk != null) {
+            records[i][primaryKey] = existingPk;
+          }
+          continue;
+        }
+        batchSeen[canKey] = i;
+
+        // B) WriteBuffer conflict check
+        if (!skipBufferCheck) {
+          final conflictId = writeBuf.hasUniqueKeyOwnedByOther(
+            tableName,
+            indexName,
+            canKey,
+            isUpdate ? recordId : null,
+            transactionId: txId,
+          );
+          if (conflictId != null) {
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: canKey,
+              indexName: indexName,
+              existingPrimaryKey: conflictId,
+            );
+            if (resolveInPlace) {
+              records[i][primaryKey] = conflictId;
+            }
+          }
         }
       }
 
@@ -1716,9 +1833,20 @@ class IndexManager {
         for (int i = 0; i < records.length; i++) {
           await yieldController.maybeYield();
           if (violations[i] != null) continue;
+
+          // FOR UPDATE: Skip if fields in this index didn't change
+          if (isUpdate && changedFieldsMap != null) {
+            final r = records[i];
+            final pk = r[primaryKey]?.toString();
+            final changed = changedFieldsMap[pk];
+            if (changed == null ||
+                !idx.fields.any((f) => changed.contains(f))) {
+              continue;
+            }
+          }
+
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
-          if (recordId == null || recordId.isEmpty) continue;
 
           final vals = <dynamic>[];
           bool ok = true;
@@ -1742,7 +1870,11 @@ class IndexManager {
               fields: idx.fields,
               value: (idx.fields.length == 1) ? vals.first : vals,
               indexName: indexName,
+              existingPrimaryKey: existingPk,
             );
+            if (resolveInPlace) {
+              records[i][primaryKey] = existingPk;
+            }
           }
         }
         // Continue to next index (no disk path).
@@ -1752,12 +1884,20 @@ class IndexManager {
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
       final meta = await getIndexMeta(tableName, indexName);
       if (meta == null || meta.totalEntries <= 0) {
+        // Fast path for brand new tables: if meta is missing or index is empty,
+        // and the table metadata also indicates 0 records, we can skip the heavy disk scan.
+        final tableMeta =
+            await _dataStore.tableDataManager.getTableMeta(tableName);
+        if (tableMeta == null || tableMeta.totalRecords <= 0) {
+          // Verified empty table on disk; no persistent conflict possible.
+          continue;
+        }
+
         for (int i = 0; i < records.length; i++) {
           await yieldController.maybeYield();
           if (violations[i] != null) continue;
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
-          if (recordId == null || recordId.isEmpty) continue;
 
           final vals = <dynamic>[];
           bool ok = true;
@@ -1784,7 +1924,11 @@ class IndexManager {
               fields: idx.fields,
               value: idx.fields.length == 1 ? vals.first : vals,
               indexName: indexName,
+              existingPrimaryKey: existingPk,
             );
+            if (resolveInPlace) {
+              records[i][primaryKey] = existingPk;
+            }
           }
         }
         continue;
@@ -1796,7 +1940,15 @@ class IndexManager {
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
         if (violations[i] != null) continue;
+
         final r = records[i];
+        if (isUpdate && changedFieldsMap != null) {
+          final pk = r[primaryKey]?.toString();
+          final changed = changedFieldsMap[pk];
+          if (changed == null || !idx.fields.any((f) => changed.contains(f))) {
+            continue;
+          }
+        }
 
         final comps = <Uint8List>[];
         bool ok = true;
@@ -1826,62 +1978,64 @@ class IndexManager {
       if (keyBytes.isEmpty) continue;
 
       final exists =
-          await _dataStore.indexTreePartitionManager.existsUniqueKeysBatch(
-        tableName: tableName,
-        indexName: indexName,
-        meta: meta,
-        uniqueKeys: keyBytes,
-      );
+          await _dataStore.indexTreePartitionManager?.existsUniqueKeysBatch(
+                tableName: tableName,
+                indexName: indexName,
+                meta: meta,
+                uniqueKeys: keyBytes,
+              ) ??
+              <bool>[];
 
-      final positiveRecordIdxs = <int>[];
-      final positiveKeyBytes = <Uint8List>[];
+      final List<int> positiveRecordIdxs = [];
+      final List<Uint8List> positiveKeyBytes = [];
       for (int j = 0; j < exists.length; j++) {
-        if (!exists[j]) {
-          continue;
+        if (exists[j]) {
+          positiveRecordIdxs.add(recordIdxs[j]);
+          positiveKeyBytes.add(keyBytes[j]);
         }
-        final i = recordIdxs[j];
-        if (i < 0 || i >= violations.length) continue;
-        if (violations[i] != null) continue;
-        positiveRecordIdxs.add(i);
-        positiveKeyBytes.add(keyBytes[j]);
       }
 
-      if (positiveKeyBytes.isEmpty) {
-        continue;
-      }
+      if (positiveKeyBytes.isEmpty) continue;
 
       final existingPks = await _dataStore.indexTreePartitionManager
-          .lookupUniquePrimaryKeysBatch(
-        tableName: tableName,
-        indexName: indexName,
-        meta: meta,
-        uniqueKeys: positiveKeyBytes,
-      );
+              ?.lookupUniquePrimaryKeysBatch(
+            tableName: tableName,
+            indexName: indexName,
+            meta: meta,
+            uniqueKeys: positiveKeyBytes,
+          ) ??
+          <String>[];
 
       for (int j = 0; j < positiveRecordIdxs.length; j++) {
         final i = positiveRecordIdxs[j];
-        if (i < 0 || i >= violations.length) continue;
         if (violations[i] != null) continue;
 
-        final existingPk = j < existingPks.length ? existingPks[j] : null;
-        if (existingPk != null &&
-            existingPk.isNotEmpty &&
-            _isPrimaryKeyHiddenByDeleteOverlay(
-              tableName,
-              existingPk,
-              transactionId: txId,
-            )) {
-          continue;
-        }
+        final String? existingPk =
+            j < existingPks.length ? existingPks[j] : null;
 
-        final r = records[i];
-        final vals = idx.fields.map((f) => r[f]).toList(growable: false);
-        violations[i] = UniqueViolation(
-          tableName: tableName,
-          fields: idx.fields,
-          value: (idx.fields.length == 1) ? vals.first : vals,
-          indexName: indexName,
-        );
+        if (existingPk != null && existingPk.isNotEmpty) {
+          final recordId = records[i][primaryKey]?.toString();
+          if (isUpdate && existingPk == recordId) continue;
+
+          if (!_isPrimaryKeyHiddenByDeleteOverlay(
+            tableName,
+            existingPk,
+            transactionId: txId,
+          )) {
+            final r = records[i];
+            final vals = idx.fields.map((f) => r[f]).toList(growable: false);
+            violations[i] = UniqueViolation(
+              tableName: tableName,
+              fields: idx.fields,
+              value: (idx.fields.length == 1) ? vals.first : vals,
+              indexName: indexName,
+              existingPrimaryKey: existingPk,
+            );
+            if (resolveInPlace) {
+              records[i][primaryKey] = existingPk;
+            }
+          }
+        }
       }
     }
 
@@ -2282,12 +2436,13 @@ class IndexManager {
       if (keys.isEmpty) continue;
 
       final existingOwners = await _dataStore.indexTreePartitionManager
-          .lookupUniquePrimaryKeysBatch(
-        tableName: tableName,
-        indexName: index.actualIndexName,
-        meta: meta,
-        uniqueKeys: keys,
-      );
+              ?.lookupUniquePrimaryKeysBatch(
+            tableName: tableName,
+            indexName: index.actualIndexName,
+            meta: meta,
+            uniqueKeys: keys,
+          ) ??
+          <String>[];
 
       for (int i = 0; i < existingOwners.length; i++) {
         final existingOwner = existingOwners[i];
@@ -2600,7 +2755,7 @@ class IndexManager {
         if (deltas.isEmpty) {
           return;
         }
-        await _dataStore.indexTreePartitionManager.writeChanges(
+        await _dataStore.indexTreePartitionManager?.writeChanges(
           tableName: tableName,
           indexName: indexName,
           indexMeta: meta,
@@ -2648,6 +2803,27 @@ class IndexManager {
 
     // Await vector index write that was dispatched in parallel with B+Tree tasks.
     if (vectorFuture != null) await vectorFuture;
+  }
+
+  /// Probe the WriteBuffer for a specific unique key.
+  /// Returns the record ID if found, null otherwise.
+  String? _probeBufferForUniqueIndex(
+    String tableName,
+    String indexName,
+    dynamic compositeKey,
+  ) {
+    final writeBuf = _dataStore.writeBufferManager;
+    final currentTxId = TransactionContext.getCurrentTransactionId();
+
+    // The buffer manager keeps a specialized index for unique keys
+    // to prevent intra-batch conflicts. We can leverage it for fast lookups.
+    return writeBuf.hasUniqueKeyOwnedByOther(
+      tableName,
+      indexName,
+      compositeKey,
+      null, // Passing null as selfRecordId to find ANY owner
+      transactionId: currentTxId,
+    );
   }
 
   /// Searches an index using a structured condition, with optimizations for performance and memory.
@@ -2855,6 +3031,23 @@ class IndexManager {
             return IndexSearchResult.empty();
           }
 
+          if (meta.isUnique) {
+            final bufferId = _probeBufferForUniqueIndex(
+              tableName,
+              indexName,
+              last.value,
+            );
+            if (bufferId != null) {
+              return IndexSearchResult(
+                primaryKeys: [bufferId],
+                entries: [
+                  IndexSearchEntry(primaryKey: bufferId, keyBytes: prefix)
+                ],
+                indexWasUsed: true,
+              );
+            }
+          }
+
           return await _searchIndexByKeyRangeLogical(
             tableName: tableName,
             indexName: indexName,
@@ -2901,6 +3094,24 @@ class IndexManager {
           for (final item in items) {
             await yieldController.maybeYield();
             if (remaining == 0) break;
+
+            if (meta.isUnique) {
+              final bufferId = _probeBufferForUniqueIndex(
+                tableName,
+                indexName,
+                item.$1,
+              );
+              if (bufferId != null) {
+                out.add(bufferId);
+                entriesOut.add(
+                    IndexSearchEntry(primaryKey: bufferId, keyBytes: item.$2));
+                if (remaining > 0) {
+                  remaining--;
+                  if (remaining <= 0) break;
+                }
+                continue;
+              }
+            }
 
             final start = applyCursorStart(item.$2);
             final end = applyCursorEnd(upperBoundExclusiveForPrefix(item.$2));
@@ -3657,7 +3868,7 @@ class IndexManager {
     // Include both data cache and page cache (B+Tree pages)
     final dataCacheSize = _indexDataCache.estimatedTotalSizeBytes;
     final pageCacheSize =
-        _dataStore.indexTreePartitionManager.getCurrentPageCacheSize();
+        _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
     return dataCacheSize + pageCacheSize;
   }
 

@@ -61,6 +61,26 @@ class TransactionManager {
   bool _cleanupRegistered = false;
   int _lastPeriodicCleanupMs = 0;
   bool _cleanupRunning = false;
+  Function()? _cleanupCallback;
+
+  /// Dispose transaction manager and remove crontab callbacks
+  void dispose() {
+    if (_cleanupCallback != null) {
+      CrontabManager.removeCallback(
+          ExecuteInterval.minutes5, _cleanupCallback!);
+      _cleanupCallback = null;
+    }
+    _cleanupRegistered = false;
+    _activeTransactions.clear();
+    _txnStatusCache.clear();
+    _txnWriteSets.clear();
+    _recentCommittedWrites.clear();
+    _logSizeCache?.clear();
+    _txnHeavyDeletes.clear();
+    _txnHeavyUpdates.clear();
+    _txnCascadeDeletes.clear();
+    _txnCascadeUpdates.clear();
+  }
 
   /// Periodic cleanup of transaction-related in-memory metadata
   Future<void> periodicCleanup({int? nowMs, int? ttlMs}) async {
@@ -174,7 +194,7 @@ class TransactionManager {
     // Register periodic cleanup via CrontabManager (idempotent)
     try {
       if (!_cleanupRegistered && _dataStore.config.enableTransactionCleanup) {
-        CrontabManager.addCallback(ExecuteInterval.minutes5, () async {
+        _cleanupCallback = () async {
           try {
             final now = DateTime.now().millisecondsSinceEpoch;
             if (now - _lastPeriodicCleanupMs <
@@ -185,7 +205,8 @@ class TransactionManager {
             await periodicCleanup(
                 nowMs: now, ttlMs: _dataStore.config.transactionMetaTtlMs);
           } catch (_) {}
-        });
+        };
+        CrontabManager.addCallback(ExecuteInterval.minutes5, _cleanupCallback!);
         _cleanupRegistered = true;
       }
     } catch (_) {}
@@ -603,15 +624,6 @@ class TransactionManager {
       int processedSinceLastCheckpoint = 0;
       const int checkpointEvery = 1000; // persist progress every N operations
 
-      Future<void> maybeCheckpoint() async {
-        processedSinceLastCheckpoint++;
-        if (processedSinceLastCheckpoint >= checkpointEvery) {
-          await _persistPlanProgress(plan.transactionId, progress['inserts']!,
-              progress['updates']!, progress['deletes']!);
-          processedSinceLastCheckpoint = 0;
-        }
-      }
-
       // Cache primary key names per table to reduce schema IO
       final Map<String, String> pkByTable = <String, String>{};
 
@@ -629,41 +641,115 @@ class TransactionManager {
       for (final entry in plan.inserts.entries) {
         final table = entry.key;
         final recs = entry.value;
-        final startIdx = progress['inserts']![table] ?? 0;
-        for (int i = startIdx; i < recs.length; i++) {
-          await yieldController.maybeYield();
-          final rec = Map<String, dynamic>.from(recs[i]);
-          rec.remove('_oldValues'); // inserts do not use oldValues
-          final uniqueKeysList = rec.remove('_uniqueKeys') as List?;
-          final uniqueKeys = uniqueKeysList
-              ?.map((e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
-              .toList();
+        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        if (schema == null) {
+          Logger.warn(
+              'Schema not found for table $table during applyCommitPlan',
+              label: 'TxnManager');
+          continue;
+        }
 
-          await _dataStore.tableDataManager.addToBuffer(
-              table, rec, BufferOperationType.insert,
-              uniqueKeyRefs: uniqueKeys);
-          progress['inserts']![table] = i + 1;
-          await maybeCheckpoint();
+        final startIdx = progress['inserts']![table] ?? 0;
+        const int batchSize = 1000;
+
+        for (int i = startIdx; i < recs.length; i += batchSize) {
+          await yieldController.maybeYield();
+          final end =
+              (i + batchSize < recs.length) ? i + batchSize : recs.length;
+
+          final List<Map<String, dynamic>> records = [];
+          final List<List<UniqueKeyRef>> uniqueKeysList = [];
+
+          for (int j = i; j < end; j++) {
+            final rec = Map<String, dynamic>.from(recs[j]);
+            rec.remove('_oldValues'); // inserts do not use oldValues
+            final uks = rec.remove('_uniqueKeys') as List?;
+            uniqueKeysList.add(uks
+                    ?.map(
+                        (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
+                    .toList() ??
+                const <UniqueKeyRef>[]);
+            records.add(rec);
+          }
+
+          await _dataStore.tableDataManager.addBatchToBuffer(
+            tableName: table,
+            records: records,
+            operation: BufferOperationType.insert,
+            schema: schema,
+            uniqueKeyRefsList: uniqueKeysList,
+            transactionId: plan.transactionId,
+          );
+
+          progress['inserts']![table] = end;
+          processedSinceLastCheckpoint += (end - i);
+          if (processedSinceLastCheckpoint >= checkpointEvery) {
+            await _persistPlanProgress(plan.transactionId, progress['inserts']!,
+                progress['updates']!, progress['deletes']!);
+            processedSinceLastCheckpoint = 0;
+          }
         }
       }
       for (final entry in plan.updates.entries) {
         final table = entry.key;
         final recs = entry.value;
-        final startIdx = progress['updates']![table] ?? 0;
-        for (int i = startIdx; i < recs.length; i++) {
-          await yieldController.maybeYield();
-          final rec = Map<String, dynamic>.from(recs[i]);
-          final old = rec.remove('_oldValues') as Map<String, dynamic>?;
-          final uniqueKeysList = rec.remove('_uniqueKeys') as List?;
-          final uniqueKeys = uniqueKeysList
-              ?.map((e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
-              .toList();
+        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        if (schema == null) {
+          Logger.warn(
+              'Schema not found for table $table during applyCommitPlan',
+              label: 'TxnManager');
+          continue;
+        }
 
-          await _dataStore.tableDataManager.addToBuffer(
-              table, rec, BufferOperationType.update,
-              oldValues: old, uniqueKeyRefs: uniqueKeys);
-          progress['updates']![table] = i + 1;
-          await maybeCheckpoint();
+        final startIdx = progress['updates']![table] ?? 0;
+        const int batchSize = 1000;
+
+        for (int i = startIdx; i < recs.length; i += batchSize) {
+          await yieldController.maybeYield();
+          final end =
+              (i + batchSize < recs.length) ? i + batchSize : recs.length;
+
+          final List<Map<String, dynamic>> records = [];
+          final List<List<UniqueKeyRef>> uniqueKeysList = [];
+          final Map<String, Map<String, dynamic>> oldRecordsMap = {};
+
+          final pkName = schema.primaryKey;
+
+          for (int j = i; j < end; j++) {
+            final rec = Map<String, dynamic>.from(recs[j]);
+            final old = rec.remove('_oldValues') as Map<String, dynamic>?;
+            final uks = rec.remove('_uniqueKeys') as List?;
+
+            final rId = rec[pkName]?.toString();
+            if (rId != null && old != null) {
+              oldRecordsMap[rId] = old;
+            }
+
+            uniqueKeysList.add(uks
+                    ?.map(
+                        (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
+                    .toList() ??
+                const <UniqueKeyRef>[]);
+            records.add(rec);
+          }
+
+          await _dataStore.tableDataManager.addBatchToBuffer(
+            tableName: table,
+            records: records,
+            operation: BufferOperationType.update,
+            schema: schema,
+            uniqueKeyRefsList: uniqueKeysList,
+            oldRecordsMap: oldRecordsMap,
+            transactionId: plan.transactionId,
+          );
+
+          progress['updates']![table] = end;
+          processedSinceLastCheckpoint += (end - i);
+          if (processedSinceLastCheckpoint >= checkpointEvery) {
+            await _persistPlanProgress(plan.transactionId, progress['inserts']!,
+                progress['updates']!, progress['deletes']!);
+            processedSinceLastCheckpoint = 0;
+          }
         }
       }
       for (final entry in plan.deletes.entries) {

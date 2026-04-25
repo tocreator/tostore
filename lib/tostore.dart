@@ -125,26 +125,37 @@ class ToStore implements DataStoreInterface {
     return _instances[instanceKey]!;
   }
 
-  /// Open database instance (Single step initialization)
-  /// This method gets/creates the instance and initializes it.
-  /// Preferred way to obtain a initialized ToStore instance.
+  /// Open a database instance (Single-step initialization).
   ///
+  /// This is the preferred way to obtain an initialized ToStore instance.
   /// For multi-instance scenarios, different [dbName] or [dbPath] will return different instances.
   ///
-  /// 打开数据库实例（一步初始化）
-  /// 获取或创建实例并完成初始化。
-  /// 获取已初始化 ToStore 实例的首选方式。
+  /// [dbPath] Database root path.
+  /// [dbName] Database name (instances are stored in dbPath/dbName/).
+  /// [config] Database configuration.
+  /// [schemas] Initial table schemas for automatic migration.
+  /// [onConfigure] Callback invoked when the database is being configured.
+  /// [onCreate] Callback invoked when the database is first created.
+  /// [onOpen] Callback invoked when the database is successfully opened.
+  /// [reinitialize] If true, forces a re-initialization (close then open).
+  /// [noPersistOnClose] If true, skips flushing the buffer during close (used with reinitialize).
+  /// [applyActiveSpaceOnDefault] If true, uses the last active space when opening the 'default' space.
   ///
-  /// 多实例场景下，不同的 [dbName] 或 [dbPath] 将返回不同的实例。
+  /// 打开数据库实例（一步初始化）。
   ///
-  /// Examples:
-  /// ```dart
-  /// final db = await ToStore.open(
-  ///   dbName: 'my_db',
-  ///   schemas: [UserSchema],
-  /// );
-  /// ```
-  /// [applyActiveSpaceOnDefault] When true (default) and config.spaceName is default, use stored activeSpace so first open lands in last used space. Set false when you want to open strictly in default space (e.g. after logout).
+  /// 获取或创建实例并完成初始化的首选方式。
+  /// 在多实例场景下，不同的 [dbName] 或 [dbPath] 会返回不同的实例。
+  ///
+  /// [dbPath] 数据库根路径。
+  /// [dbName] 数据库名称（实例存储在 dbPath/dbName/ 目录下）。
+  /// [config] 数据库配置。
+  /// [schemas] 初始表结构定义，用于自动化迁移。
+  /// [onConfigure] 数据库配置时的回调。
+  /// [onCreate] 数据库首次创建时的回调。
+  /// [onOpen] 数据库打开成功后的回调。
+  /// [reinitialize] 为 true 时强制重新初始化（先关闭后打开）。
+  /// [noPersistOnClose] 为 true 时关闭时不落盘缓冲数据（与 reinitialize 配合使用）。
+  /// [applyActiveSpaceOnDefault] 为 true 时，打开 'default' 空间将自动切换到上次活跃的空间。
   static Future<ToStore> open({
     String? dbPath,
     String? dbName,
@@ -241,6 +252,14 @@ class ToStore implements DataStoreInterface {
   /// - [reinitialize]: When true, force a re-open of the database (close then open).
   /// - [noPersistOnClose]: Used together with `reinitialize`. When true, do NOT persist pending
   ///
+  /// Examples:
+  /// ```dart
+  /// final db = await ToStore.open(
+  ///   dbName: 'my_db',
+  ///   schemas: [UserSchema],
+  /// );
+  /// ```
+  ///
   /// 初始化数据库
   /// 在任何操作前确保引擎已就绪。
   ///
@@ -274,9 +293,11 @@ class ToStore implements DataStoreInterface {
     );
   }
 
-  /// Create table with schema
-  /// [schema] Table schema definition
-  /// Returns [DbResult] to allow graceful error handling for business logic errors
+  /// Create a database table with the provided schema.
+  ///
+  /// [schema] The table schema definition.
+  /// Returns a [DbResult] indicating success or failure.
+  ///
   /// Example:
   /// ```dart
   /// final result = await db.createTable(
@@ -305,10 +326,10 @@ class ToStore implements DataStoreInterface {
   /// }
   /// ```
   ///
-  /// 创建数据表
-  /// [schema] 表结构定义
-  /// 返回 [DbResult] 方便处理业务逻辑错误
-  /// 全局表数据共享，其他表在切换空间后数据隔离
+  /// 创建数据表。
+  ///
+  /// [schema] 表结构定义。
+  /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> createTable(TableSchema schema) async {
     return await _impl.createTable(schema);
@@ -338,15 +359,17 @@ class ToStore implements DataStoreInterface {
     return await _impl.createTables(schemas);
   }
 
-  /// Insert data into table
-  /// [tableName] Table name
-  /// [data] Data to insert
-  /// Returns the operation result with primary key if successful
+  /// Insert a record into a table.
   ///
-  /// 插入数据
-  /// [tableName] 表名
-  /// [data] 要插入的数据
-  /// 返回操作结果，包含主键信息
+  /// [tableName] The name of the table.
+  /// [data] The map of fields and values to insert.
+  /// Returns a [DbResult] containing the primary key of the inserted record.
+  ///
+  /// 插入单条数据。
+  ///
+  /// [tableName] 表名。
+  /// [data] 要插入的数据（键值对）。
+  /// 返回操作结果 [DbResult]，成功时包含主键信息。
   @override
   Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
     _checkSystemTableAccess(
@@ -355,16 +378,21 @@ class ToStore implements DataStoreInterface {
     return await _impl.insert(tableName, data);
   }
 
-  /// Query builder for chain-style operations
+  /// Get a query builder for chain-style operations.
+  ///
+  /// [tableName] The name of the table to query.
+  /// Returns a [QueryBuilder] to build and execute the query.
+  ///
   /// Example:
   /// ```dart
   /// await db.query('table_name')
-  ///         .where('id', '=', 1)
-  ///         .or()
-  ///         .where('name', '!=', 'marley');
+  ///         .where('id', '=', 1);
   /// ```
   ///
-  /// 查询构建器，支持链式操作
+  /// 查询构建器，支持链式操作。
+  ///
+  /// [tableName] 表名。
+  /// 返回 [QueryBuilder] 用于构建和执行查询。
   @override
   QueryBuilder query(String tableName) {
     _checkSystemTableAccess(
@@ -373,7 +401,10 @@ class ToStore implements DataStoreInterface {
     return QueryBuilder(_impl, tableName);
   }
 
-  /// Stream query data for a table, supports filtering
+  /// Get a stream query builder for reactive data updates.
+  ///
+  /// [tableName] The name of the table to watch.
+  /// Returns a [StreamQueryBuilder] to build and listen to data changes.
   ///
   /// Example:
   /// ```dart
@@ -390,7 +421,10 @@ class ToStore implements DataStoreInterface {
   ///   print(user);
   /// }
   /// ```
-  /// 流式查询，支持链式操作条件过滤
+  /// 流式查询构建器，支持响应式数据更新。
+  ///
+  /// [tableName] 表名。
+  /// 返回 [StreamQueryBuilder] 用于构建和监听数据变化。
   @override
   StreamQueryBuilder streamQuery(String tableName) {
     _checkSystemTableAccess(
@@ -399,9 +433,13 @@ class ToStore implements DataStoreInterface {
     return StreamQueryBuilder(_impl, tableName);
   }
 
-  /// Upsert: if row exists (by primary key or unique index in data), update; otherwise insert.
-  /// [tableName] Table name
-  /// [data] Data; must include pk or all fields of one unique index, plus required fields.
+  /// Upsert a record: updates if it exists, otherwise inserts.
+  ///
+  /// Existing rows are located via primary key or unique indexes.
+  ///
+  /// [tableName] The name of the table.
+  /// [data] The data map to insert or update.
+  /// Returns a [DbResult] indicating success or failure.
   ///
   /// Example:
   /// ```dart
@@ -409,9 +447,11 @@ class ToStore implements DataStoreInterface {
   /// await db.upsert('users', {'username': 'john', 'email': 'john@example.com'});
   /// ```
   ///
-  /// 自动存储数据，存在则更新，不存在则插入
-  /// [tableName] 表名
-  /// [data] 要插入或更新的数据
+  /// 自动存储数据：如果记录存在（基于主键或唯一索引）则更新，否则插入。
+  ///
+  /// [tableName] 表名。
+  /// [data] 要插入或更新的数据。
+  /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> upsert(String tableName, Map<String, dynamic> data) {
     _checkSystemTableAccess(
@@ -420,12 +460,15 @@ class ToStore implements DataStoreInterface {
     return _impl.upsert(tableName, data);
   }
 
-  /// Perform approximate nearest neighbor (ANN) vector similarity search.
+  /// Perform an approximate nearest neighbor (ANN) vector similarity search.
   ///
-  /// Searches the NGH vector index on [fieldName] in [tableName] for the
-  /// top-[topK] records most similar to [queryVector].
-  ///
-  /// Returns [VectorSearchResult] list sorted by similarity score.
+  /// [tableName] The name of the table.
+  /// [fieldName] The name of the vector field.
+  /// [queryVector] The target vector to search for.
+  /// [topK] Number of most similar results to return.
+  /// [efSearch] Search width for NGH (HNSW-style) algorithm (higher is more accurate but slower).
+  /// [distanceThreshold] Maximum distance for results to be included.
+  /// Returns a list of [VectorSearchResult] sorted by similarity.
   ///
   /// Example:
   /// ```dart
@@ -440,13 +483,15 @@ class ToStore implements DataStoreInterface {
   /// }
   /// ```
   ///
-  /// 向量相似度搜索
-  /// [tableName] 表名
-  /// [fieldName] 向量字段名称
-  /// [queryVector] 查询向量
-  /// [topK] 返回结果数量
-  /// [beamWidth] 搜索宽度
-  /// [distanceThreshold] 距离阈值
+  /// 向量相似度搜索（ANN 搜索）。
+  ///
+  /// [tableName] 表名。
+  /// [fieldName] 向量字段名称。
+  /// [queryVector] 查询目标向量。
+  /// [topK] 返回最相似的结果数量。
+  /// [efSearch] NGH 算法的搜索宽度（值越大越精确，但速度越慢）。
+  /// [distanceThreshold] 距离阈值，超过此值的记录将被过滤。
+  /// 返回按相似度排序的 [VectorSearchResult] 列表。
   Future<List<VectorSearchResult>> vectorSearch(
     String tableName, {
     required String fieldName,
@@ -467,24 +512,33 @@ class ToStore implements DataStoreInterface {
     );
   }
 
-  /// Switch space for scenarios like user switching
-  /// Data isolation between spaces, global tables unaffected
-  /// [spaceName] Space name, default is 'default'
-  /// [keepActive] When true, saves as active space in global config; when opening with default space, init uses it so one open lands in the right space.
+  /// Switch to a different data space.
   ///
-  /// 切换空间，用于用户切换等场景
-  /// 不同空间数据隔离，全局表数据不受影响
-  /// [spaceName] 空间名称，默认为'default'
-  /// [keepActive] 为 true 时将该空间记为活跃空间，下次启动可由业务根据 activeSpace 决定初始空间
+  /// Data is isolated between spaces, except for global tables.
+  ///
+  /// [spaceName] The name of the space to switch to (default is 'default').
+  /// [keepActive] If true, saves this space as the active space for the next session.
+  /// Returns true if the switch was successful.
+  ///
+  /// 切换到不同的数据空间。
+  ///
+  /// 不同空间的数据是相互隔离的，但全局表不受影响。
+  ///
+  /// [spaceName] 要切换的空间名称（默认为 'default'）。
+  /// [keepActive] 为 true 时，将该空间记为活跃空间，下次启动时可自动切换。
+  /// 返回 true 表示切换成功。
   @override
   Future<bool> switchSpace(
       {String spaceName = 'default', bool keepActive = true}) {
     return _impl.switchSpace(spaceName: spaceName, keepActive: keepActive);
   }
 
-  /// Update data in table
-  /// [tableName] Table name
-  /// [data] Data to update
+  /// Get an update builder to modify records.
+  ///
+  /// [tableName] The name of the table.
+  /// [data] Initial fields and values to update.
+  /// Returns an [UpdateBuilder] to specify conditions and execute the update.
+  ///
   /// Example:
   /// ```dart
   /// // Update with condition
@@ -501,9 +555,11 @@ class ToStore implements DataStoreInterface {
   ///         .allowPartialErrors();
   /// ```
   ///
-  /// 更新数据
-  /// [tableName] 表名
-  /// [data] 要更新的数据
+  /// 获取更新构建器，用于修改记录。
+  ///
+  /// [tableName] 表名。
+  /// [data] 初始更新字段和值。
+  /// 返回 [UpdateBuilder] 用于指定条件并执行更新。
   @override
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]) {
@@ -513,33 +569,21 @@ class ToStore implements DataStoreInterface {
     return UpdateBuilder(_impl, tableName, data);
   }
 
-  /// Batch insert multiple records
-  /// [tableName] Table name
-  /// [dataList] List of records to insert
-  /// [allowPartialErrors] Whether to continue when some records fail to insert (defaults to true)
-  /// Returns the operation result with successful and failed keys
+  /// Batch insert multiple records.
   ///
-  /// Example:
-  /// ```dart
-  /// // Insert multiple records and continue even if some fail (default behavior)
-  /// final result = await db.batchInsert('users', [
-  ///   {'name': 'John', 'email': 'john@example.com'},
-  ///   {'name': 'Jane', 'email': 'jane@example.com'}
-  /// ]);
+  /// [tableName] Table name.
+  /// [dataList] List of records to insert.
+  /// [allowPartialErrors] Whether to continue when some records fail to insert (defaults to true).
   ///
-  /// // Check results
-  /// print('Successful: ${result.successCount}, Failed: ${result.failedCount}');
+  /// Returns the operation result with successful and failed keys.
   ///
-  /// // Stop on first error
-  /// final strictResult = await db.batchInsert('users', records,
-  ///   allowPartialErrors: false);
-  /// ```
+  /// 批量插入多条记录。
   ///
-  /// 批量插入数据
-  /// [tableName] 表名
-  /// [dataList] 要插入的数据列表
-  /// [allowPartialErrors] 当部分记录插入失败时是否继续处理其他记录(默认为true)
-  /// 返回操作结果，包含成功和失败的主键信息
+  /// [tableName] 表名。
+  /// [dataList] 要插入的数据列表。
+  /// [allowPartialErrors] 当部分记录插入失败时是否继续处理其他记录（默认为 true）。
+  ///
+  /// 返回包含成功和失败主键信息的操作结果。
   @override
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList,
@@ -561,11 +605,36 @@ class ToStore implements DataStoreInterface {
   /// - For each record, existing rows are located using unique indexes; if found, the row is updated,
   ///   otherwise a new row is inserted.
   /// - When the table has no unique constraints, this operation is not supported and will return an error.
+  /// [tableName] Table name.
+  /// [dataList] List of records to upsert.
+  /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
   ///
-  /// 批量 UPSERT 数据（基于唯一约束判断插入或更新）
-  /// [tableName] 表名
-  /// [dataList] 记录列表
-  /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录(默认为 true)
+  ///  ///
+  /// Example:
+  /// ```dart
+  /// // Insert multiple records and continue even if some fail (default behavior)
+  /// final result = await db.batchInsert('users', [
+  ///   {'name': 'John', 'email': 'john@example.com'},
+  ///   {'name': 'Jane', 'email': 'jane@example.com'}
+  /// ]);
+  ///
+  /// // Check results
+  /// print('Successful: ${result.successCount}, Failed: ${result.failedCount}');
+  ///
+  /// // Stop on first error
+  /// final strictResult = await db.batchInsert('users', records,
+  ///   allowPartialErrors: false);
+  /// ```
+  ///
+  /// 批量 UPSERT 数据（基于唯一约束判断插入或更新）。
+  ///
+  /// - 每条记录必须包含除主键外的所有非空（nullable=false）字段，以及参与唯一索引的所有字段。
+  /// - 对于每条记录，系统会通过唯一索引定位现有行；如果找到则更新，否则插入新行。
+  /// - 当表没有定义唯一约束时，不支持此操作并会返回错误。
+  ///
+  /// [tableName] 表名。
+  /// [dataList] 记录列表。
+  /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
   @override
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> dataList,
@@ -580,19 +649,61 @@ class ToStore implements DataStoreInterface {
     );
   }
 
-  /// Set key-value pair
-  /// [key] Key
-  /// [value] Value
-  /// [ttl] Relative expiration duration. Mutually exclusive with [expiresAt].
-  /// [expiresAt] Absolute expiration time. Mutually exclusive with [ttl].
-  /// [isGlobal] Whether it's global key-value pair, default false
+  /// Batch update multiple records based on primary key.
   ///
-  /// 设置键值对
-  /// [key] 键
-  /// [value] 值
-  /// [ttl] 相对过期时间。与 [expiresAt] 互斥。
-  /// [expiresAt] 绝对过期时间。与 [ttl] 互斥。
-  /// [isGlobal] 是否为全局键值对，默认false
+  /// - Each record must contain the primary key.
+  /// - Only the fields provided in the record will be updated (partial update).
+  /// [tableName] Table name.
+  /// [dataList] List of records to update.
+  /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
+  ///
+  /// Example:
+  /// ```dart
+  /// final result = await db.batchUpdate('users', [
+  ///   {'id': 1, 'name': 'John'},
+  ///   {'id': 2, 'age': 30}
+  /// ]);
+  /// ```
+  ///
+  /// 批量更新数据（基于主键判断）。
+  ///
+  /// - 每条记录必须包含主键。
+  /// - 仅更新记录中提供的字段（增量更新/局部更新）。
+  ///
+  /// [tableName] 表名。
+  /// [dataList] 记录列表。
+  /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
+  @override
+  Future<DbResult> batchUpdate(
+      String tableName, List<Map<String, dynamic>> dataList,
+      {bool allowPartialErrors = true}) async {
+    _checkSystemTableAccess(
+        tableName, 'cannot be batchUpdated manually', 'ToStore.batchUpdate');
+
+    return await _impl.batchUpdate(
+      tableName,
+      dataList,
+      allowPartialErrors: allowPartialErrors,
+    );
+  }
+
+  /// Set a key-value pair in the KV store.
+  ///
+  /// [key] The unique identifier for the value.
+  /// [value] The data to store.
+  /// [ttl] Relative expiration duration (mutually exclusive with [expiresAt]).
+  /// [expiresAt] Absolute expiration time (mutually exclusive with [ttl]).
+  /// [isGlobal] If true, the value is shared across all spaces.
+  /// Returns a [DbResult] indicating success or failure.
+  ///
+  /// 在 KV 存储中设置键值对。
+  ///
+  /// [key] 键。
+  /// [value] 值。
+  /// [ttl] 相对过期时间（与 [expiresAt] 互斥）。
+  /// [expiresAt] 绝对过期时间（与 [ttl] 互斥）。
+  /// [isGlobal] 为 true 时，该键值对在所有空间共享。
+  /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> setValue(
     String key,
@@ -610,29 +721,41 @@ class ToStore implements DataStoreInterface {
     );
   }
 
-  /// Get key-value pair
-  /// [key] Key
-  /// [isGlobal] Whether it's global key-value pair, default false
+  /// Get a value from the KV store.
   ///
-  /// 获取键值对
-  /// [key] 键
-  /// [isGlobal] 是否为全局键值对，默认false
+  /// [key] The unique identifier for the value.
+  /// [isGlobal] If true, looks up the value in the global space.
+  /// Returns the stored value, or null if it does not exist or has expired.
+  ///
+  /// 从 KV 存储中获取值。
+  ///
+  /// [key] 键。
+  /// [isGlobal] 为 true 时，从全局空间查找。
+  /// 返回存储的值；如果不存在或已过期，则返回 null。
   @override
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
     return await _impl.getValue(key, isGlobal: isGlobal);
   }
 
-  /// Watch key-value pair changes and emit the latest value immediately
-  /// [key] Key
-  /// [isGlobal] Whether it's global key-value pair, default false
-  /// [defaultValue] Fallback value when the key does not exist
-  /// [distinct] Whether to suppress repeated emissions with the same stored value
+  /// Watch a key-value pair for changes.
   ///
-  /// 监听键值对变化，并立即发出当前值
-  /// [key] 键
-  /// [isGlobal] 是否为全局键值对，默认false
-  /// [defaultValue] 当键不存在时使用的默认值
-  /// [distinct] 是否抑制相同存储值的重复发射
+  /// Emits the current value immediately upon subscription.
+  ///
+  /// [key] The unique identifier for the value.
+  /// [isGlobal] If true, watches the value in the global space.
+  /// [defaultValue] The value to emit if the key does not exist.
+  /// [distinct] If true, suppresses consecutive identical values.
+  /// Returns a [Stream] of the value.
+  ///
+  /// 监听键值对的变化。
+  ///
+  /// 订阅时会立即发出当前值。
+  ///
+  /// [key] 键。
+  /// [isGlobal] 为 true 时，监听全局空间的值。
+  /// [defaultValue] 当键不存在时使用的默认值。
+  /// [distinct] 为 true 时，抑制连续重复的值。
+  /// 返回该值的 [Stream]。
   @override
   Stream<T?> watchValue<T>(String key,
       {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
@@ -644,17 +767,21 @@ class ToStore implements DataStoreInterface {
     );
   }
 
-  /// Watch multiple key-value pairs and emit the latest snapshot immediately
-  /// Missing keys are included with `null` values in the emitted map.
-  /// [keys] Key list
-  /// [isGlobal] Whether it's global key-value pair, default false
-  /// [distinct] Whether to suppress repeated emissions with the same stored value
+  /// Watch multiple key-value pairs for changes.
   ///
-  /// 监听多个键值对，并立即发出最新快照
-  /// 对于不存在的键，会在返回的 Map 中以 `null` 填充
-  /// [keys] 键列表
-  /// [isGlobal] 是否为全局键值对，默认false
-  /// [distinct] 是否抑制相同存储值的重复发射
+  /// [keys] The list of keys to watch.
+  /// [isGlobal] If true, watches the values in the global space.
+  /// [distinct] If true, suppresses emissions if the snapshot has not changed.
+  /// Returns a [Stream] of the snapshot map.
+  ///
+  /// 监听多个键值对的变化。
+  ///
+  /// 订阅时会立即发出包含所有键值的快照 Map。
+  ///
+  /// [keys] 要监听的键列表。
+  /// [isGlobal] 为 true 时，监听全局空间的值。
+  /// [distinct] 为 true 时，如果快照未发生变化则抑制发射。
+  /// 返回快照 Map 的 [Stream]。
   @override
   Stream<Map<String, dynamic>> watchValues(Iterable<String> keys,
       {bool isGlobal = false, bool distinct = true}) {
@@ -677,15 +804,17 @@ class ToStore implements DataStoreInterface {
     return await _impl.removeValue(key, isGlobal: isGlobal);
   }
 
-  /// Create database backup
-  /// [compress] Whether to compress the backup into a zip file, default is true
-  /// [scope] Backup scope, default is BackupScope.currentSpaceWithGlobal
-  /// Returns backup file path
+  /// Create a backup of the database.
   ///
-  /// 备份数据库
-  /// [compress] 是否压缩备份为 zip 文件，默认为 true
-  /// [scope] 备份范围，默认为 BackupScope.currentSpaceWithGlobal
-  /// 返回备份文件路径
+  /// [compress] If true, compresses the backup into a ZIP file.
+  /// [scope] The scope of the backup (e.g., current space, global data).
+  /// Returns the file path of the created backup.
+  ///
+  /// 创建数据库备份。
+  ///
+  /// [compress] 为 true 时，将备份压缩为 ZIP 文件。
+  /// [scope] 备份范围（如：当前空间、全局数据等）。
+  /// 返回生成的备份文件路径。
   @override
   Future<String> backup(
       {bool compress = true,
@@ -740,8 +869,11 @@ class ToStore implements DataStoreInterface {
         isolation: isolation);
   }
 
-  /// Delete data from table
-  /// Chain operations with optional conditions
+  /// Get a delete builder to remove records.
+  ///
+  /// [tableName] The name of the table.
+  /// Returns a [DeleteBuilder] to specify conditions and execute deletion.
+  ///
   /// Example:
   /// ```dart
   /// await db.delete('users')
@@ -753,8 +885,10 @@ class ToStore implements DataStoreInterface {
   ///         .allowPartialErrors();
   /// ```
   ///
-  /// 删除数据
-  /// 链式操作，支持带条件删除
+  /// 获取删除构建器，用于删除记录。
+  ///
+  /// [tableName] 表名。
+  /// 返回 [DeleteBuilder] 用于指定条件并执行删除。
   @override
   DeleteBuilder delete(String tableName) {
     _checkSystemTableAccess(
@@ -778,13 +912,15 @@ class ToStore implements DataStoreInterface {
     return await _impl.dropTable(tableName);
   }
 
-  /// Clear all data in table
-  /// [tableName] Table name
-  /// Returns [DbResult] to allow graceful error handling for business logic errors
+  /// Clear all data in a table.
   ///
-  /// 清空表数据
-  /// [tableName] 表名
-  /// 返回 [DbResult] 方便处理业务逻辑错误
+  /// [tableName] The name of the table to clear.
+  /// Returns a [DbResult] indicating success or failure.
+  ///
+  /// 清空表数据。
+  ///
+  /// [tableName] 表名。
+  /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> clear(String tableName) async {
     _checkSystemTableAccess(
@@ -798,8 +934,14 @@ class ToStore implements DataStoreInterface {
   /// This method only checks whether the table structure exists and can be used,
   /// not whether the table contains any rows.
   ///
+  /// [tableName] The name of the table to check.
+  /// Returns true if the table structure exists.
+  ///
   /// 检查当前数据库中是否已经存在指定表的结构定义（与 Space 无关），仅代表该表可以被使用，
   /// 不代表表中是否已有数据。
+  ///
+  /// [tableName] 要检查的表名。
+  /// 如果表结构存在则返回 true。
   @override
   Future<bool> tableExists(String tableName) async {
     return await _impl.tableExists(tableName);
@@ -807,9 +949,11 @@ class ToStore implements DataStoreInterface {
 
   /// Get table schema
   /// [tableName] Table name
+  /// Returns the [TableSchema] if found, otherwise null.
   ///
   /// 获取表结构
   /// [tableName] 表名
+  /// 返回表结构 [TableSchema]，若未找到则返回 null。
   @override
   Future<TableSchema?> getTableSchema(String tableName) async {
     return await _impl.schemaManager?.getTableSchema(tableName);
@@ -825,6 +969,9 @@ class ToStore implements DataStoreInterface {
   /// - Created time
   /// - Global flag
   ///
+  /// [tableName] The name of the table to retrieve info for.
+  /// Returns [TableInfo] containing metadata, or null if not found.
+  ///
   /// 获取表信息，包括：
   /// - 记录数量
   /// - 缓存数量
@@ -834,6 +981,9 @@ class ToStore implements DataStoreInterface {
   /// - 最后修改时间
   /// - 创建时间
   /// - 是否全局表
+  ///
+  /// [tableName] 要获取信息的表名。
+  /// 返回包含元数据的 [TableInfo]，若未找到则返回 null。
   @override
   Future<TableInfo?> getTableInfo(String tableName) async {
     return await _impl.getTableInfo(tableName);
@@ -853,6 +1003,7 @@ class ToStore implements DataStoreInterface {
 
   /// Get current database version number
   /// Only used for user-defined maintenance, not involved in any database internal logic.
+  ///
   /// 获取当前数据库版本号
   /// 仅由用户自定义维护，不参与数据库内部任何逻辑。
   @override

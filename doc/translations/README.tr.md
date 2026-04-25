@@ -33,7 +33,7 @@
 - **Başlarken**: [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - **Mimari ve Model**: [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - **Gelişmiş Sorgular**: [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- **Gelişmiş ve Performans**: [Gelişmiş KV İşlemleri](#kv-advanced) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- **Gelişmiş ve Performans**: [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - **Operasyonlar ve Güvenlik**: [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
@@ -448,11 +448,22 @@ ToStore, karmaşık iş senaryoları için zengin bir dizi gelişmiş yetenek sa
 
 ### <a id="kv-advanced"></a>Gelişmiş Anahtar-Değer İşlemleri (db.kv)
 
-Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanılması önerilir. Daha kapsamlı bir yöntem seti sunar.
-Aşağıdaki tüm yöntemler isteğe bağlı `isGlobal` parametresini destekler: `true` küresel olarak paylaşılan verileri, `false` (varsayılan) ise mevcut alanı temsil eder.
+Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanılması önerilir. Alan izolasyonu, küresel paylaşım ve çeşitli veri türleri ile tam bir API seti sunar.
+
+- **Temel Erişim (Basic Access)**
+  ```dart
+  // Değer ata (String, int, bool, double, Map, List vb. destekler)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // Ham dinamik değeri al
+  dynamic val = await db.kv.get('key');
+
+  // Tek bir anahtarı kaldır
+  await db.kv.remove('key');
+  ```
 
 - **Tür Güvenli Okuma (Type-Safe Getters)**
-  Verileri manuel tür dönüştürme olmadan doğrudan hedef formatta alın:
+  Verileri manuel dönüşüm olmadan doğrudan hedef formatta alın:
   ```dart
   String? name = await db.kv.getString('user_name');
   int? age = await db.kv.getInt('user_age');
@@ -461,7 +472,20 @@ Aşağıdaki tüm yöntemler isteğe bağlı `isGlobal` parametresini destekler:
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
-- **Atomik Sayaç (Atomic Increment)**
+- **Toplu İşlemler (Bulk Operations)**
+  Birden fazla anahtar-değer çiftini tek bir işlemde verimli bir şekilde işleyin:
+  ```dart
+  // Toplu atama
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'tr_TR',
+  });
+
+  // Toplu kaldırma
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
+- **Atomik Sayaçlar (Atomic Increment)**
   Yüksek eşzamanlı senaryolarda sayısal değerleri güvenli bir şekilde artırın veya azaltın:
   ```dart
   // 1 artır (varsayılan)
@@ -470,34 +494,80 @@ Aşağıdaki tüm yöntemler isteğe bağlı `isGlobal` parametresini destekler:
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **Anahtar Alanı Keşfi ve Yönetimi**
-  Önek tabanlı anahtar alma, toplam istatistikler ve toplu silme işlemlerini destekler:
+- **Keşif ve Yönetim (Discovery & Management)**
   ```dart
   // 'setting_' ile başlayan tüm anahtarları al
   final keys = await db.kv.getKeys(prefix: 'setting_');
 
-  // Mevcut alandaki toplam anahtar-değer çifti sayısını al
+  // Mevcut alandaki toplam anahtar sayısını say
   final count = await db.kv.count();
 
   // Bir anahtarın mevcut olup olmadığını ve süresinin dolup dolmadığını kontrol et
   final exists = await db.kv.exists('config_cache');
 
-  // Birden fazla anahtarı aynı anda sil
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
-
-  // Mevcut alanın tüm KV verilerini temizle
+  // Mevcut alandaki tüm KV verilerini temizle
   await db.kv.clear();
   ```
 
 - **Yaşam Döngüsü Yönetimi (TTL)**
-  Mevcut anahtarların sona erme süresini al veya güncelle:
+  Mevcut anahtarların sona erme ayarlarını inceleyin veya güncelleyin:
   ```dart
-  // Kalan sona erme süresini al
+  // Kalan süreyi al
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Mevcut bir anahtarın sona erme süresini güncelle (7 gün içinde sona erer)
+  // Mevcut bir anahtar için TTL'yi güncelle (7 gün içinde sona erer)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **Reaktif İzleme (Reactive Watch)**
+  ```dart
+  // Tek bir anahtarı izle
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // Birden fazla anahtarın anlık görüntüsünü izle
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **Küresel Paylaşım (isGlobal)**
+  Yukarıdaki tüm yöntemler isteğe bağlı `isGlobal` parametresini destekler: küresel alan için `true` (tüm alanlar arasında paylaşılır), mevcut izole alan için `false` (varsayılan).
+
+
+### <a id="bulk-operations"></a>Toplu İşlemler (Bulk Operations)
+
+ToStore, büyük ölçekli veri çıkışı için optimize edilmiş özel toplu işleme arayüzleri sağlar. Bu arayüzler, yoğun yazma işlemleri sırasında kullanıcı arayüzünün yanıt verebilirliğini sağlamak için paralel görev dağıtımı ve zaman dilimleme (time-slicing) çizelgelemesini entegre eder.
+
+| Yöntem | Temel Amaç | Veri Gereksinimleri | Özellikler |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | Kayıtları toplu ekleme | Boş bırakılamaz tüm alanları içermelidir | Saf ekleme, maksimum performans |
+| `batchUpsert` | Akıllı Senkronizasyon (Upsert) | **Boş bırakılamaz tüm alanları içermelidir** | Tam senkronizasyon, birincil anahtar veya benzersiz alan ile tanımlanır |
+| `batchUpdate` | Kayıtları toplu güncelleme | **Birincil anahtar veya benzersiz alan** + Güncellenecek alanlar | Mevcut kayıtlar için kısmi güncellemeler |
+
+- **Toplu Ekleme (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **Akıllı Toplu Senkronizasyon (batchUpsert)**
+  Birincil anahtar veya benzersiz alanlara göre "Ekleme" veya "Güncelleme" işlemini otomatik olarak tanımlar. Tam veri senkronizasyonu için yaygındır.
+  > [!IMPORTANT]
+  > **Veri Gereksinimleri**: Bir ekleme işlemi tetiklenebileceğinden, `batchUpsert` her kaydın boş bırakılamaz tüm alanları (`nullable: false`) içermesini gerektirir.
+
+- **Yüksek Performanslı Toplu Güncelleme (batchUpdate)**
+  Özellikle mevcut kayıtları güncellemek içindir. Her kayıt, bir tanımlayıcı olarak birincil anahtar veya benzersiz alanın yanı sıra değiştirilecek alanları içermelidir.
+  > [!TIP]
+  > **Kısmi Güncellemeler**: `batchUpdate` yalnızca sağlanan alanları değiştirir ve boş bırakılamaz tüm alanların mevcut olmasını gerektirmez, bu da onu artımlı güncellemeler için ideal kılar.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // Benzersiz alan 'username' ile tanımla ve 'age' alanını güncelle
+    {'id': '1002', 'status': 'active'}, // Doğrudan birincil anahtarı da kullanabilir
+  ]);
+  ```
+
+> [!TIP]
+> Münferit kayıt hatalarının (örneğin benzersiz kısıtlama ihlali) tüm toplu işlemi reddetmemesini sağlamak için `allowPartialErrors: true` ayarını yapabilirsiniz.
 
 
 ### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Vektör Arama
@@ -603,26 +673,26 @@ const TableSchema(
 ```
 
 
-### Akıllı Depolama (Yukarı Ekle)
-ToStore, `data`'de bulunan birincil anahtara veya benzersiz anahtara göre güncelleme veya ekleme kararı verir. `where` burada desteklenmemektedir; çakışma hedefi verilerin kendisi tarafından belirlenir.
+### Akıllı Depolama (Upsert)
+ToStore, `data`'de bulunan birincil anahtara veya benzersiz alana göre güncelleme veya ekleme kararı verir. `where` burada desteklenmemektedir; çakışma hedefi verilerin kendisi tarafından belirlenir.
 
 ```dart
-// By primary key
+// Birincil anahtara göre
 final result = await db.upsert('users', {
   'id': 1,
   'username': 'john',
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// Benzersiz alana göre (kayıt, benzersiz bir kısıtlamaya katılan tüm alanları ve gerekli alanları içermelidir)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',
   'age': 26,
 });
 
-// Batch upsert (supports atomic mode or partial-success mode)
-// allowPartialErrors: true means some rows may fail while others still succeed
+// Toplu upsert (atomik modu veya kısmi başarı modunu destekler)
+// allowPartialErrors: true, bazı satırlar başarısız olurken diğerlerinin yine de başarılı olabileceği anlamına gelir
 final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},

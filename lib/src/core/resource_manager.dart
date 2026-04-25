@@ -418,6 +418,47 @@ class ResourceManager {
   /// Get memory threshold (MB)
   int getMemoryThresholdMB() => _memoryThresholdInMB;
 
+  int? _effectivePrewarmThresholdMB;
+
+  /// Initialize and cache the effective prewarm threshold (MB).
+  ///
+  /// This is computed once during startup because it is used by high-frequency
+  /// pressure checks and prewarm budgeting.
+  Future<int> initializeEffectivePrewarmThresholdMB(
+      DataStoreConfig config) async {
+    final cached = _effectivePrewarmThresholdMB;
+    if (cached != null) return cached;
+
+    final configured = config.prewarmThresholdMB;
+    if (configured != null) {
+      _effectivePrewarmThresholdMB = configured;
+      return configured;
+    }
+
+    try {
+      final availableMemoryMB =
+          await PlatformHandler.getAvailableSystemMemoryMB();
+      final dynamicThreshold = (availableMemoryMB * 0.30).floor();
+      _effectivePrewarmThresholdMB =
+          max(dynamicThreshold, _getMinimumPrewarmThresholdMB());
+    } catch (e) {
+      _effectivePrewarmThresholdMB = _getMinimumPrewarmThresholdMB();
+    }
+    return _effectivePrewarmThresholdMB!;
+  }
+
+  /// Get the cached effective prewarm threshold (MB).
+  int getEffectivePrewarmThresholdMB() {
+    return _effectivePrewarmThresholdMB ?? _getMinimumPrewarmThresholdMB();
+  }
+
+  static int _getMinimumPrewarmThresholdMB() {
+    if (PlatformHandler.isWeb) return 32;
+    if (PlatformHandler.isMobile) return 32;
+    if (PlatformHandler.isServerEnvironment) return 256;
+    return 128;
+  }
+
   /// Get current resource status
   ResourceStatus get status => _status;
 
@@ -500,7 +541,10 @@ class ResourceManager {
 
   /// Clean up all resources
   void dispose() {
-    // No need to explicitly cancel callbacks in CrontabManager, it will be automatically cleaned up with database closure
+    // Deregister periodic monitor callback from CrontabManager
+    CrontabManager.removeCallback(
+        ExecuteInterval.seconds30, _checkResourceUsage);
+
     _cacheEvictionCallbacks.updateAll((key, value) => null);
     _dataStore = null;
     _initialized = false;

@@ -564,6 +564,7 @@ class TableDataManager {
 
   /// Update statistics if needed (full scan once per day)
   Future<void> _updateTableStatisticsIfNeeded() async {
+    if (!_dataStore.isInitialized) return;
     try {
       final config = await _dataStore.getSpaceConfig();
       if (config != null && config.needUpdateStatistics()) {
@@ -808,6 +809,8 @@ class TableDataManager {
   Future<void> dispose({bool persistChanges = true}) async {
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
+    CrontabManager.removeCallback(
+        ExecuteInterval.hour24, _updateTableStatisticsIfNeeded);
 
     try {
       if (persistChanges) {
@@ -1172,49 +1175,42 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
-  /// High-performance batch insert into WAL + write buffer.
-  ///
-  /// This is the core hot path used by `DataStoreImpl.batchInsert`.
-  /// It avoids per-record schema lookups, per-record record-count awaits, and per-record cache puts.
-  ///
-  /// Returns per-record success/failure recordIds (primary keys as strings).
+  /// Unified internal batch processor for high-throughput writes.
+  /// Handles Transactions, Memory-Mode, and Persistent WAL+Buffer paths.
   Future<({List<String> successRecordIds, List<String> failedRecordIds})>
-      addInsertBatchToBuffer(
-    String tableName,
-    List<Map<String, dynamic>> records, {
+      addBatchToBuffer({
+    required String tableName,
+    required List<Map<String, dynamic>> records,
+    required BufferOperationType operation,
     required TableSchema schema,
     required List<List<UniqueKeyRef>> uniqueKeyRefsList,
+    Map<String, Map<String, dynamic>>? oldRecordsMap,
+    String? transactionId,
     DateTime? timestamp,
   }) async {
     if (records.isEmpty) {
       return (
         successRecordIds: const <String>[],
-        failedRecordIds: const <String>[],
+        failedRecordIds: const <String>[]
       );
     }
 
-    if (records.length != uniqueKeyRefsList.length) {
-      throw ArgumentError(
-          'records and uniqueKeyRefsList length mismatch: ${records.length} vs ${uniqueKeyRefsList.length}');
-    }
-
     final pkName = schema.primaryKey;
-
-    // Transaction-aware interception (consistent with addToBuffer()).
-    final String? currentTxId = TransactionContext.getCurrentTransactionId();
+    final String? currentTxId =
+        transactionId ?? TransactionContext.getCurrentTransactionId();
     final bool applyingCommit = TransactionContext.isApplyingCommit();
+    final DateTime ts = timestamp ?? DateTime.now();
+    final String tsIso = ts.toIso8601String();
+    final successIds = <String>[];
+    final failedIds = <String>[];
 
+    // 1. Transaction Path: Defer operations until commit
     if (currentTxId != null && !applyingCommit) {
       final byTable = _txnDeferredOps.putIfAbsent(
           currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
       final map =
           byTable.putIfAbsent(tableName, () => <String, TxnDeferredOp>{});
-
-      final success = <String>[];
-      final failed = <String>[];
-
-      final yieldController =
-          YieldController('TableDataManager.addInsertBatchToBuffer.tx');
+      final yieldController = YieldController('TableDataManager._addBatch.tx');
 
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
@@ -1226,12 +1222,14 @@ class TableDataManager {
         }
 
         try {
-          final rec = Map<String, dynamic>.from(r);
           final uniqueRefs = uniqueKeyRefsList[i];
+          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+
           map[recordId] = TxnDeferredOp(
-            BufferOperationType.insert,
-            rec,
+            operation,
+            Map<String, dynamic>.from(r),
             uniqueKeyRefs: uniqueRefs,
+            oldValues: oldR,
           );
 
           // Register unique keys with WriteBufferManager for cross-txn conflict detection.
@@ -1243,28 +1241,20 @@ class TableDataManager {
               uniqueKeys: uniqueRefs,
             );
           }
-
-          success.add(recordId);
+          successIds.add(recordId);
         } catch (e) {
           Logger.warn(
-            'Failed to register txn deferred insert for $tableName pk=$recordId: $e',
-            label: 'TableDataManager.addInsertBatchToBuffer.tx',
-          );
-          failed.add(recordId);
+              'Txn deferred batch op failed: $tableName pk=$recordId: $e');
+          failedIds.add(recordId);
         }
       }
-
-      return (successRecordIds: success, failedRecordIds: failed);
+      return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
-    // -------------------- Memory mode: TreeCache-only batch insert (no WAL, no write queue, no IO) --------------------
+    // 2. Memory Mode Path: Direct cache writes (no WAL/IO)
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
-      final successIds = <String>[];
-      final failedIds = <String>[];
       final yieldController =
-          YieldController('TableDataManager.addInsertBatchToBuffer.memory');
-
-      // Ensure comparator is registered once.
+          YieldController('TableDataManager._addBatch.memory');
       _registerTableComparator(tableName, schema);
 
       for (int i = 0; i < records.length; i++) {
@@ -1275,63 +1265,61 @@ class TableDataManager {
           continue;
         }
         try {
-          // Primary store write.
-          cacheTableRecord(tableName, recordId, r, schema, force: true);
+          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
 
-          // Primary index write.
-          if (_dataStore.indexManager != null) {
-            await _dataStore.indexManager!.updateIndexDataCache(
-              tableName,
-              recordId,
-              null,
-              r,
-              force: true,
-            );
+          if (operation == BufferOperationType.delete) {
+            // Memory mode: Removal from primary cache
+            removeTableRecord(tableName, recordId);
+
+            _tableRecordCounts[tableName] =
+                (_tableRecordCounts[tableName] ?? 0) - successIds.length;
+            _needSaveStats = true;
+
+            // Memory mode: Index erasure (newData is null)
+            if (_dataStore.indexManager != null) {
+              await _dataStore.indexManager!.updateIndexDataCache(
+                  tableName, recordId, r, null,
+                  force: true);
+            }
+          } else {
+            if (operation == BufferOperationType.insert) {
+              _tableRecordCounts[tableName] =
+                  (_tableRecordCounts[tableName] ?? 0) + successIds.length;
+              _needSaveStats = true;
+            }
+            // Memory mode: Update primary cache
+            cacheTableRecord(tableName, recordId, r, schema, force: true);
+
+            // Memory mode: Index update
+            if (_dataStore.indexManager != null) {
+              await _dataStore.indexManager!.updateIndexDataCache(
+                  tableName, recordId, oldR, r,
+                  force: true);
+            }
           }
-
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn(
-            'Memory batch insert failed: table=$tableName pk=$recordId err=$e',
-            label: 'TableDataManager.addInsertBatchToBuffer.memory',
-          );
+          Logger.warn('Memory batch op failed: $tableName pk=$recordId: $e');
           failedIds.add(recordId);
         }
-      }
-
-      if (successIds.isNotEmpty) {
-        _tableRecordCounts[tableName] =
-            (_tableRecordCounts[tableName] ?? 0) + successIds.length;
-        _needSaveStats = true;
       }
 
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
-    // WAL + write buffer path (non-transactional or applying commit)
-    final DateTime ts = timestamp ?? DateTime.now();
-    final String tsIso = ts.toIso8601String();
-
-    final successIds = <String>[];
-    final failedIds = <String>[];
-
-    // Prepare arrays for single buffer enqueue pass
+    // 3. Persistent Path: WAL + Write Buffer
     final recordIds = <String>[];
     final entries = <BufferEntry>[];
-    final uniqueKeysList = <List<UniqueKeyRef>>[];
-    final recordsForCache = <Map<String, dynamic>>[];
-
+    final finalUniqueKeysList = <List<UniqueKeyRef>>[];
     final yieldController =
-        YieldController('TableDataManager.addInsertBatchToBuffer');
+        YieldController('TableDataManager._addBatch.persistent');
 
-    // Reuse a single WAL entry map to avoid 10k+ map allocations.
-    // Safe because WalManager.append() defensively copies the map.
-    final baseWalEntry = <String, dynamic>{
-      'op': BufferOperationType.insert.index,
-      'table': tableName,
-      'ts': tsIso,
-      if (currentTxId != null) 'txId': currentTxId,
-    };
+    // Prepare WAL entries for batching
+    final walEntries = <Map<String, dynamic>>[];
+    final validBatchRecords = <Map<String, dynamic>>[];
+    final validBatchRecordIds = <String>[];
+    final validBatchUniqueKeys = <List<UniqueKeyRef>>[];
+    final validBatchOldValues = <Map<String, dynamic>?>[];
 
     for (int i = 0; i < records.length; i++) {
       await yieldController.maybeYield();
@@ -1341,37 +1329,77 @@ class TableDataManager {
         continue;
       }
 
-      try {
-        baseWalEntry['data'] = r;
-        final walPointer = await _dataStore.walManager.append(baseWalEntry);
+      final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+      final walData = r;
+      final walOldValues =
+          operation == BufferOperationType.update ? oldR : null;
 
-        entries.add(BufferEntry(
-          data: r,
-          operation: BufferOperationType.insert,
-          timestamp: ts,
-          transactionId: currentTxId,
-          walPointer: walPointer,
-          oldValues: null,
-        ));
-        recordIds.add(recordId);
-        uniqueKeysList.add(uniqueKeyRefsList[i]);
-        recordsForCache.add(r);
+      walEntries.add({
+        'op': operation.index,
+        'table': tableName,
+        'ts': tsIso,
+        if (currentTxId != null) 'txId': currentTxId,
+        'data': walData,
+        if (walOldValues != null) 'oldValues': walOldValues,
+      });
+
+      validBatchRecords.add(r);
+      validBatchRecordIds.add(recordId);
+      validBatchUniqueKeys.add(uniqueKeyRefsList[i]);
+      validBatchOldValues.add(walOldValues);
+    }
+
+    if (walEntries.isNotEmpty) {
+      try {
+        // High-performance batch WAL queuing
+        final pointers = await _dataStore.walManager.appendBatch(walEntries);
+
+        for (int i = 0; i < validBatchRecordIds.length; i++) {
+          entries.add(BufferEntry(
+            data: validBatchRecords[i],
+            operation: operation,
+            timestamp: ts,
+            transactionId: currentTxId,
+            walPointer: pointers[i],
+            oldValues: validBatchOldValues[i],
+          ));
+          recordIds.add(validBatchRecordIds[i]);
+          if (operation != BufferOperationType.delete) {
+            finalUniqueKeysList.add(validBatchUniqueKeys[i]);
+          }
+        }
       } catch (e) {
-        Logger.warn(
-          'Batch insert WAL append failed: table=$tableName pk=$recordId error=$e',
-          label: 'TableDataManager.addInsertBatchToBuffer',
+        Logger.error('Persistent batch WAL append failed: $tableName: $e');
+        // Fallback or fail whole batch? Fail whole batch for consistency.
+        return (
+          successRecordIds: const <String>[],
+          failedRecordIds: records
+              .map((r) => r[pkName]?.toString() ?? '')
+              .where((id) => id.isNotEmpty)
+              .toList()
         );
-        failedIds.add(recordId);
       }
     }
 
     if (recordIds.isNotEmpty) {
-      await _dataStore.writeBufferManager.addInsertBatch(
-        tableName: tableName,
-        recordIds: recordIds,
-        entries: entries,
-        uniqueKeysList: uniqueKeysList,
-      );
+      if (operation == BufferOperationType.insert) {
+        await _dataStore.writeBufferManager.addInsertBatch(
+            tableName: tableName,
+            recordIds: recordIds,
+            entries: entries,
+            uniqueKeysList: finalUniqueKeysList);
+      } else if (operation == BufferOperationType.update) {
+        await _dataStore.writeBufferManager.addUpdateBatch(
+            tableName: tableName,
+            recordIds: recordIds,
+            entries: entries,
+            uniqueKeysList: finalUniqueKeysList);
+      } else if (operation == BufferOperationType.delete) {
+        // For batch delete, we use the standard batch processor which handles
+        // tombstone entries and buffer merging.
+        await _dataStore.writeBufferManager.addDeleteBatch(
+            tableName: tableName, recordIds: recordIds, entries: entries);
+      }
       successIds.addAll(recordIds);
       _needSaveStats = true;
     }
@@ -1444,6 +1472,7 @@ class TableDataManager {
       return s;
     }();
 
+    final List<Map<String, dynamic>> trimmedRecords = [];
     final yieldController =
         YieldController('TableDataManager.addToDeleteBuffer');
     for (final record in records) {
@@ -1464,11 +1493,17 @@ class TableDataManager {
           trimmed[k] = record[k];
         }
       }
+      trimmedRecords.add(trimmed);
+    }
 
-      await addToBuffer(
-        tableName,
-        trimmed,
-        BufferOperationType.delete,
+    if (trimmedRecords.isNotEmpty) {
+      await addBatchToBuffer(
+        tableName: tableName,
+        records: trimmedRecords,
+        operation: BufferOperationType.delete,
+        schema: schema,
+        uniqueKeyRefsList:
+            List.filled(trimmedRecords.length, const <UniqueKeyRef>[]),
       );
     }
 
@@ -1988,14 +2023,14 @@ class TableDataManager {
       if (fileMeta != null) {
         try {
           final last = await _dataStore.tableTreePartitionManager
-              .scanRecordsByPrimaryKeyRange(
+              ?.scanRecordsByPrimaryKeyRange(
             tableName: tableName,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
             reverse: true,
             limit: 1,
           );
-          if (last.isNotEmpty) {
+          if (last != null && last.isNotEmpty) {
             maxFromPartitions = last.first[schema.primaryKey];
           }
         } catch (_) {}
@@ -2256,6 +2291,9 @@ class TableDataManager {
       if (!isMemoryMode) {
         // File mode: stream from global B+Tree leaf chain.
         final rangeManager = _dataStore.tableTreePartitionManager;
+        if (rangeManager == null) {
+          return;
+        }
         await for (final record in rangeManager.streamRecordsByPrimaryKeyRange(
           tableName: tableName,
           startKeyInclusive: Uint8List(0),
@@ -2586,6 +2624,7 @@ class TableDataManager {
         for (final pNo in partitionNosToProcess) {
           tasks.add(() async {
             if (effectiveController.isStopped) return;
+            if (rangeManager == null) return;
             final records = await rangeManager.loadPartitionDataByNo(
               tableName: tableName,
               partitionNo: pNo,
@@ -2662,6 +2701,7 @@ class TableDataManager {
           for (final pNo in chunkPartitions) {
             tasks.add(() async {
               if (effectiveController.isStopped) return null;
+              if (rangeManager == null) return null;
               final records = await rangeManager.loadPartitionDataByNo(
                 tableName: tableName,
                 partitionNo: pNo,
@@ -2720,7 +2760,7 @@ class TableDataManager {
             final r = results[i];
             if (r == null) continue;
             final (pNo, inserts, updates, deletes) = r;
-            await rangeManager.writeChanges(
+            await rangeManager?.writeChanges(
               tableName: tableName,
               inserts: inserts,
               updates: updates,
@@ -2973,7 +3013,7 @@ class TableDataManager {
             await processFunction(List<Map<String, dynamic>>.from(batch), -1);
         batch.clear();
         if (processed.isEmpty) return;
-        await rangeManager.writeChanges(
+        await rangeManager?.writeChanges(
           tableName: targetTableName,
           inserts: processed,
           updates: const [],
@@ -2985,6 +3025,7 @@ class TableDataManager {
 
       // Use sourceSchema to decode old data correctly during migration
       // This ensures old data is decoded using the old schema structure
+      if (rangeManager == null) return;
       await for (final r in rangeManager.streamRecordsByPrimaryKeyRange(
         tableName: sourceTableName,
         startKeyInclusive: Uint8List(0),
@@ -3395,7 +3436,7 @@ class TableDataManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    await _dataStore.tableTreePartitionManager.writeChanges(
+    await _dataStore.tableTreePartitionManager?.writeChanges(
       tableName: tableName,
       inserts: inserts,
       updates: updates,
@@ -3440,8 +3481,11 @@ class TableDataManager {
     if (missingKeys.isNotEmpty) {
       final pkMatcher =
           ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+      if (_dataStore.tableTreePartitionManager == null) {
+        return TableScanResult(records: []);
+      }
       final diskResults =
-          await _dataStore.tableTreePartitionManager.queryRecordsBatch(
+          await _dataStore.tableTreePartitionManager?.queryRecordsBatch(
         tableName: tableName,
         primaryKey: schema.primaryKey,
         keyComparator: pkMatcher,
@@ -3449,6 +3493,9 @@ class TableDataManager {
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
       );
+      if (diskResults == null) {
+        return TableScanResult(records: []);
+      }
 
       // Read-Through: Cache the results fetched from disk (Asynchronously)
       if (diskResults.isNotEmpty) {
@@ -3488,7 +3535,8 @@ class TableDataManager {
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
     if (!isMemoryMode) {
-      await _dataStore.tableTreePartitionManager.forEachRecordByPrimaryKeyRange(
+      await _dataStore.tableTreePartitionManager
+          ?.forEachRecordByPrimaryKeyRange(
         tableName: tableName,
         startKeyInclusive: startKeyInclusive,
         endKeyExclusive: endKeyExclusive,
@@ -3630,6 +3678,9 @@ class TableDataManager {
     bool decodeRecord = true,
   }) async {
     final rangeMgr = _dataStore.tableTreePartitionManager;
+    if (rangeMgr == null) {
+      return [];
+    }
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 

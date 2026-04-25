@@ -40,6 +40,9 @@ class IntegrityChecker {
 
       // Sample first few records
       int validatedCount = 0;
+      if (rangeManager == null) {
+        return false;
+      }
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
         tableName: tableName,
         startKeyInclusive: Uint8List(0),
@@ -233,6 +236,10 @@ class IntegrityChecker {
       // For large-scale data, use sampling validation (first/last few records)
       const int sampleSize = 10;
       final rangeManager = _dataStore.tableTreePartitionManager;
+
+      if (rangeManager == null) {
+        return false;
+      }
 
       // Sample first few records
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
@@ -582,6 +589,10 @@ class IntegrityChecker {
           const int maxSamples = 5;
           final rangeManager = _dataStore.tableTreePartitionManager;
           int validatedCount = 0;
+
+          if (rangeManager == null) {
+            return false;
+          }
 
           // Sample first few records
           await for (var record in rangeManager.streamRecordsByPrimaryKeyRange(

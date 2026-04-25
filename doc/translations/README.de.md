@@ -33,7 +33,7 @@
 - **Erste Schritte**: [Why ToStore](#why-tostore) | [Hauptmerkmale](#key-features) | [Installationsanleitung](#installation) | [KV-Modus](#quick-start-kv) | [Tabellenmodus](#quick-start-table) | [Speichermodus](#quick-start-memory)
 - **Architektur & Modell**: [Schemadefinition](#schema-definition) | [Verteilte Architektur](#distributed-architecture) | [Kaskadierende Fremdschlüssel](#foreign-keys) | [Mobil/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primärschlüsselalgorithmen](#primary-key-examples)
 - **Erweiterte Abfragen**: [Erweiterte Abfragen (JOIN)](#query-advanced) | [Aggregation & Statistik](#aggregation-stats) | [Komplexe Logik (Abfragebedingung)](#query-condition) | [Reaktive Abfrage (beobachten)](#reactive-query) | [Streaming-Anfrage](#streaming-query)
-- **Erweitert und Leistung**: [KV-Erweiterte Operationen](#kv-advanced) | [Vektorsuche](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Abfragecache](#query-cache) | [Atomausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
+- **Erweitert und Leistung**: [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Vektorsuche](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
 - **Betrieb und Sicherheit**: [Administration](#database-maintenance) | [Sicherheitskonfiguration](#security-config) | [Fehlerbehandlung](#error-handling) | [Leistung und Diagnose](#performance) | [Weitere Ressourcen](#more-resources)
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
@@ -448,11 +448,22 @@ ToStore bietet eine Vielzahl erweiterter Funktionen für komplexe Geschäftsszen
 
 ### <a id="kv-advanced"></a>Fortgeschrittene Key-Value-Operationen (db.kv)
 
-Für komplexere Key-Value-Szenarien wird die Verwendung des `db.kv`-Namespace empfohlen. Er bietet einen umfassenderen Satz an Methoden.
-Alle folgenden Methoden unterstützen den optionalen Parameter `isGlobal`: `true` steht für global geteilte Daten, `false` (Standard) für den aktuellen Space.
+Für komplexere Key-Value-Szenarien wird empfohlen, den Namespace `db.kv` zu verwenden. Er bietet einen vollständigen Satz von APIs mit Speicherplatzisolierung, globaler Freigabe und mehreren Datentypen.
 
-- **Typsicheres Abrufen (Type-Safe Getters)**
-  Erhalten Sie Daten direkt im Zielformat, ohne manuelle Typkonvertierung:
+- **Grundlegender Zugriff (Basic Access)**
+  ```dart
+  // Wert setzen (unterstützt String, int, bool, double, Map, List usw.)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // Rohwert für dynamischen Typ abrufen
+  dynamic val = await db.kv.get('key');
+
+  // Einzelnen Schlüssel entfernen
+  await db.kv.remove('key');
+  ```
+
+- **Typsichere Getter (Type-Safe Getters)**
+  Rufen Sie Daten direkt im Zielformat ab, ohne manuelle Konvertierung:
   ```dart
   String? name = await db.kv.getString('user_name');
   int? age = await db.kv.getInt('user_age');
@@ -461,43 +472,102 @@ Alle folgenden Methoden unterstützen den optionalen Parameter `isGlobal`: `true
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
-- **Atomarer Zähler (Atomic Increment)**
-  Sicheres Erhöhen oder Verringern von numerischen Werten in hochgradig parallelen Szenarien:
+- **Stapeloperationen (Bulk Operations)**
+  Verarbeiten Sie effizient mehrere Key-Value-Paare in einer einzigen Operation:
   ```dart
-  // Um 1 erhöhen (Standardwert)
+  // Stapelweises Setzen
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'de_DE',
+  });
+
+  // Stapelweises Entfernen
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
+- **Atomare Zähler (Atomic Increment)**
+  Erhöhen oder verringern Sie numerische Werte sicher in Szenarien mit hoher Parallelität:
+  ```dart
+  // Um 1 erhöhen (Standard)
   await db.kv.setIncrement('view_count');
-  // Um 5 verringern (negativen Betrag übergeben)
+  // Um 5 verringern (einen negativen Wert übergeben)
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **Key-Space Exploration & Management**
-  Unterstützt Präfix-basierte Schlüsselabfrage, Gesamtstatistik und Massenlöschung:
+- **Erkundung & Verwaltung (Discovery & Management)**
   ```dart
   // Alle Schlüssel abrufen, die mit 'setting_' beginnen
   final keys = await db.kv.getKeys(prefix: 'setting_');
 
-  // Gesamtzahl der Schlüssel-Wert-Paare im aktuellen Space abrufen
+  // Gesamtzahl der Schlüssel im aktuellen Bereich zählen
   final count = await db.kv.count();
 
   // Prüfen, ob ein Schlüssel existiert und nicht abgelaufen ist
   final exists = await db.kv.exists('config_cache');
 
-  // Mehrere Schlüssel auf einmal löschen
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
-
-  // Alle KV-Daten des aktuellen Space löschen
+  // Alle KV-Daten im aktuellen Bereich löschen
   await db.kv.clear();
   ```
 
 - **Lebenszyklus-Management (TTL)**
-  Abrufen oder Aktualisieren der Ablaufzeit vorhandener Schlüssel:
+  Ablauf-Einstellungen für vorhandene Schlüssel prüfen oder aktualisieren:
   ```dart
-  // Verbleibende Ablaufzeit abrufen
+  // Verbleibende Dauer abrufen
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Ablaufzeit eines vorhandenen Schlüssels aktualisieren (läuft in 7 Tagen ab)
+  // TTL für einen vorhandenen Schlüssel aktualisieren (läuft in 7 Tagen ab)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **Reaktive Überwachung (Reactive Watch)**
+  ```dart
+  // Einzelnen Schlüssel überwachen
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // Snapshot mehrerer Schlüssel überwachen
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **Globale Freigabe (isGlobal)**
+  Alle oben genannten Methoden unterstützen den optionalen Parameter `isGlobal`: `true` für den globalen Bereich (über alle Bereiche hinweg geteilt), `false` (Standard) für den aktuellen isolierten Bereich.
+
+
+### <a id="bulk-operations"></a>Stapeloperationen (Bulk Operations)
+
+ToStore bietet spezialisierte Schnittstellen für die Stapelverarbeitung, die für einen hohen Datendurchsatz optimiert sind. Diese Schnittstellen nutzen parallele Aufgabenverteilung und Time-Slicing, um die Reaktionsfähigkeit der Benutzeroberfläche bei intensiven Schreibvorgängen zu gewährleisten.
+
+| Methode | Hauptzweck | Datenanforderungen | Merkmale |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | Datensätze stapelweise einfügen | Muss alle nicht-nullbaren Felder enthalten | Reines Einfügen, höchste Leistung |
+| `batchUpsert` | Intelligente Synchronisation (Upsert) | **Muss alle nicht-nullbaren Felder enthalten** | Vollständige Synchronisation, Identifizierung über Primärschlüssel oder eindeutiges Feld |
+| `batchUpdate` | Datensätze stapelweise aktualisieren | **Primärschlüssel oder eindeutiges Feld** + Aktualisierungsfelder | Partielle Aktualisierungen für vorhandene Datensätze |
+
+- **Stapelweises Einfügen (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **Intelligente Stapel-Synchronisation (batchUpsert)**
+  Identifiziert automatisch "Einfügen" oder "Aktualisieren" basierend auf dem Primärschlüssel oder eindeutigen Feldern. Häufig für die vollständige Datensynchronisation verwendet.
+  > [!IMPORTANT]
+  > **Datenanforderungen**: Da ein Einfügevorgang ausgelöst werden kann, erfordert `batchUpsert`, dass jeder Datensatz alle nicht-nullbaren (`nullable: false`) Felder enthält.
+
+- **Hochleistungs-Stapelaktualisierung (batchUpdate)**
+  Speziell für die Aktualisierung vorhandener Datensätze. Jeder Datensatz muss einen Primärschlüssel oder ein eindeutiges Feld als Bezeichner enthalten, zusammen mit den zu ändernden Feldern.
+  > [!TIP]
+  > **Partielle Aktualisierungen**: `batchUpdate` ändert nur die bereitgestellten Felder und erfordert nicht alle nicht-nullbaren Felder, was es ideal für inkrementelle Aktualisierungen macht.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // Über eindeutiges Feld 'username' identifizieren und 'age' aktualisieren
+    {'id': '1002', 'status': 'active'}, // Kann auch den Primärschlüssel direkt verwenden
+  ]);
+  ```
+
+> [!TIP]
+> Sie können `allowPartialErrors: true` festlegen, um sicherzustellen, dass Fehler bei einzelnen Datensätzen (z. B. eine Verletzung einer eindeutigen Einschränkung) nicht die gesamte Stapeloperation ablehnen.
 
 
 ### <a id="vector-advanced"></a>Vektorfelder, Vektorindizes und Vektorsuche
@@ -604,25 +674,25 @@ const TableSchema(
 
 
 ### Intelligenter Speicher (Upsert)
-ToStore entscheidet anhand des in `data` enthaltenen Primärschlüssels oder eindeutigen Schlüssels, ob aktualisiert oder eingefügt wird. `where` wird hier nicht unterstützt; Das Konfliktziel wird durch die Daten selbst bestimmt.
+ToStore entscheidet basierend auf dem Primärschlüssel oder dem eindeutigen Feld in `data`, ob aktualisiert oder eingefügt wird. `where` wird hier nicht unterstützt; das Ziel des Konflikts wird durch die Daten selbst bestimmt.
 
 ```dart
-// By primary key
+// Nach Primärschlüssel
 final result = await db.upsert('users', {
   'id': 1,
   'username': 'john',
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// Nach eindeutigem Schlüssel (der Datensatz muss alle Felder enthalten, die an einer eindeutigen Einschränkung beteiligt sind, plus Pflichtfelder)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',
   'age': 26,
 });
 
-// Batch upsert (supports atomic mode or partial-success mode)
-// allowPartialErrors: true means some rows may fail while others still succeed
+// Batch Upsert (unterstützt atomaren Modus oder Modus für Teilerfolg)
+// allowPartialErrors: true bedeutet, dass einige Zeilen fehlschlagen können, während andere erfolgreich sind
 final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},

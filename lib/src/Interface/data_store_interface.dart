@@ -50,6 +50,11 @@ abstract class DataStoreInterface {
       String tableName, List<Map<String, dynamic>> records,
       {bool allowPartialErrors = true});
 
+  /// batch update data based on primary keys or unique identifiers.
+  Future<DbResult> batchUpdate(
+      String tableName, List<Map<String, dynamic>> records,
+      {bool allowPartialErrors = true});
+
   /// update data
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]);

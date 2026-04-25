@@ -71,7 +71,8 @@ class BatchCheckContext {
       String recordId, List<UniqueKeyRef> uniqueKeys) {
     // 1. Check ALL keys first
     for (final uk in uniqueKeys) {
-      if (_hasUniqueKeyOwnedByOther(uk, recordId)) {
+      final conflictId = _hasUniqueKeyOwnedByOther(uk, recordId);
+      if (conflictId != null) {
         final inferredFields =
             uk.indexName.isNotEmpty ? [uk.indexName] : const <String>[];
         throw UniqueViolation(
@@ -79,6 +80,7 @@ class BatchCheckContext {
           fields: inferredFields,
           value: uk.compositeKey,
           indexName: uk.indexName,
+          existingPrimaryKey: conflictId,
         );
       }
     }
@@ -177,14 +179,16 @@ class BatchCheckContext {
     }
   }
 
-  bool _hasUniqueKeyOwnedByOther(UniqueKeyRef uk, String? selfRecordId) {
+  String? _hasUniqueKeyOwnedByOther(UniqueKeyRef uk, String? selfRecordId) {
     // 1. Check main buffer
     if (mainBuf != null) {
       final owners = mainBuf!.uniqueKeyOwners[uk.indexName]?[uk.internalKey];
       if (owners != null && owners.isNotEmpty) {
-        if (selfRecordId == null) return true;
-        if (owners.length > 1) return true;
-        if (!owners.contains(selfRecordId)) return true;
+        if (selfRecordId == null) return owners.first;
+        if (!owners.contains(selfRecordId)) return owners.first;
+        if (owners.length > 1) {
+          return owners.firstWhere((id) => id != selfRecordId);
+        }
       }
     }
     // 2. Check global txn
@@ -197,16 +201,18 @@ class BatchCheckContext {
           if (recordIds.isEmpty) continue;
 
           if (transactionId != null && txId == transactionId) {
-            if (selfRecordId == null) return true;
-            if (recordIds.length > 1) return true;
-            if (!recordIds.contains(selfRecordId)) return true;
+            if (selfRecordId == null) return recordIds.first;
+            if (!recordIds.contains(selfRecordId)) return recordIds.first;
+            if (recordIds.length > 1) {
+              return recordIds.firstWhere((id) => id != selfRecordId);
+            }
           } else {
-            return true;
+            return recordIds.first;
           }
         }
       }
     }
-    return false;
+    return null;
   }
 
   // Duplicated helper for context to avoid refactoring entire class to static
@@ -1310,7 +1316,7 @@ class WriteBufferManager {
         tableName, transactionId, mainBuf, txnBuf, globalIndices);
   }
 
-  bool hasUniqueKeyOwnedByOther(String tableName, String indexName,
+  String? hasUniqueKeyOwnedByOther(String tableName, String indexName,
       dynamic compositeKey, String? selfRecordId,
       {String? transactionId, dynamic internalKey}) {
     internalKey ??= _toInternalKey(compositeKey);
@@ -1319,11 +1325,11 @@ class WriteBufferManager {
     if (mainBuf != null) {
       final owners = mainBuf.uniqueKeyOwners[indexName]?[internalKey];
       if (owners != null && owners.isNotEmpty) {
-        // If owner is self, valid. If owner is different, invalid.
-        // If multiple owners (shouldn't happen for unique), invalid.
-        if (selfRecordId == null) return true;
-        if (owners.length > 1) return true;
-        if (!owners.contains(selfRecordId)) return true;
+        if (selfRecordId == null) return owners.first;
+        if (!owners.contains(selfRecordId)) return owners.first;
+        if (owners.length > 1) {
+          return owners.firstWhere((id) => id != selfRecordId);
+        }
       }
     }
 
@@ -1335,24 +1341,24 @@ class WriteBufferManager {
         final txId = entry.key;
         final recordIds = entry.value;
         if (recordIds.isEmpty) {
-          continue; // should not happen if maintained correctly
+          continue;
         }
 
         // If checking check against OWN transaction
         if (transactionId != null && txId == transactionId) {
-          if (selfRecordId == null) return true;
-          // If multiple records in same tx have same key -> duplicate!
-          if (recordIds.length > 1) return true;
-          // If single record, must be self
-          if (!recordIds.contains(selfRecordId)) return true;
+          if (selfRecordId == null) return recordIds.first;
+          if (!recordIds.contains(selfRecordId)) return recordIds.first;
+          if (recordIds.length > 1) {
+            return recordIds.firstWhere((id) => id != selfRecordId);
+          }
         } else {
-          // Conflict with OTHER transaction (regardless of recordId, assuming unique key cannot be shared across txns until commit)
-          return true;
+          // Conflict with OTHER transaction
+          return recordIds.first;
         }
       }
     }
 
-    return false;
+    return null;
   }
 
   /// Check if a unique key is owned by another transaction (transaction-only check).
@@ -1363,8 +1369,8 @@ class WriteBufferManager {
   ///
   /// Returns true if the key is owned by another transaction (or by another record
   /// in the same transaction if selfRecordId is provided).
-  bool hasUniqueKeyOwnedByOtherTransaction(String tableName, String indexName,
-      dynamic compositeKey, String? selfRecordId,
+  String? hasUniqueKeyOwnedByOtherTransaction(String tableName,
+      String indexName, dynamic compositeKey, String? selfRecordId,
       {String? transactionId, dynamic internalKey}) {
     internalKey ??= _toInternalKey(compositeKey);
 
@@ -1376,24 +1382,24 @@ class WriteBufferManager {
         final txId = entry.key;
         final recordIds = entry.value;
         if (recordIds.isEmpty) {
-          continue; // should not happen if maintained correctly
+          continue;
         }
 
         // If checking against OWN transaction
         if (transactionId != null && txId == transactionId) {
-          if (selfRecordId == null) return true;
-          // If multiple records in same tx have same key -> duplicate!
-          if (recordIds.length > 1) return true;
-          // If single record, must be self
-          if (!recordIds.contains(selfRecordId)) return true;
+          if (selfRecordId == null) return recordIds.first;
+          if (!recordIds.contains(selfRecordId)) return recordIds.first;
+          if (recordIds.length > 1) {
+            return recordIds.firstWhere((id) => id != selfRecordId);
+          }
         } else {
-          // Conflict with OTHER transaction (regardless of recordId, assuming unique key cannot be shared across txns until commit)
-          return true;
+          // Conflict with OTHER transaction
+          return recordIds.first;
         }
       }
     }
 
-    return false;
+    return null;
   }
 
   /// Try to reserve unique keys for a record.
@@ -1404,6 +1410,7 @@ class WriteBufferManager {
     required String recordId,
     required List<UniqueKeyRef> uniqueKeys,
     String? transactionId,
+    bool isUpdate = false,
   }) {
     if (uniqueKeys.isEmpty) return null;
 
@@ -1417,9 +1424,10 @@ class WriteBufferManager {
     // 1. Check ALL keys first to fail fast without modifying state
     for (int i = 0; i < uniqueKeys.length; i++) {
       final uk = uniqueKeys[i];
-      if (hasUniqueKeyOwnedByOther(
-          tableName, uk.indexName, uk.compositeKey, recordId,
-          transactionId: transactionId, internalKey: internalKeys[i])) {
+      final conflictId = hasUniqueKeyOwnedByOther(
+          tableName, uk.indexName, uk.compositeKey, isUpdate ? recordId : null,
+          transactionId: transactionId, internalKey: internalKeys[i]);
+      if (conflictId != null) {
         final inferredFields =
             uk.indexName.isNotEmpty ? [uk.indexName] : const <String>[];
         throw UniqueViolation(
@@ -1427,6 +1435,7 @@ class WriteBufferManager {
           fields: inferredFields,
           value: uk.compositeKey,
           indexName: uk.indexName,
+          existingPrimaryKey: conflictId,
         );
       }
     }
@@ -1538,6 +1547,238 @@ class WriteBufferManager {
         transactionId: transactionId,
       );
     }
+  }
+
+  /// High-performance batch update into buffer + ordered write queue.
+  ///
+  /// Notes:
+  /// - All [entries] must be UPDATE operations with non-null WAL pointers.
+  /// - Caller must ensure unique-key reservations are done before calling.
+  Future<void> addUpdateBatch({
+    required String tableName,
+    required List<String> recordIds,
+    required List<BufferEntry> entries,
+    required List<List<UniqueKeyRef>> uniqueKeysList,
+  }) async {
+    if (recordIds.isEmpty) return;
+    if (recordIds.length != entries.length ||
+        recordIds.length != uniqueKeysList.length) {
+      throw ArgumentError(
+          'addUpdateBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}, uniqueKeysList=${uniqueKeysList.length}');
+    }
+
+    final buf = _ensureTable(tableName);
+    final yieldController =
+        YieldController('WriteBufferManager.addUpdateBatch');
+    final batchSize = _dataStore.config.writeBatchSize;
+    final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
+    const int emitChunk = 1000;
+
+    for (int i = 0; i < recordIds.length; i++) {
+      await yieldController.maybeYield();
+      if (i % emitChunk == 0) {
+        await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
+        await _dataStore.parallelJournalManager.waitUntilQueueBelow(
+          backpressureCap,
+          timeout: const Duration(seconds: 120),
+        );
+      }
+
+      final recordId = recordIds[i];
+      final entry = entries[i];
+      final uniqueKeys = uniqueKeysList[i];
+
+      // Handle insert-then-update merge logic
+      final prior = buf.records[recordId];
+      BufferEntry effectiveEntry = entry;
+      bool skipQueueEnqueue = false;
+
+      if (prior != null) {
+        if (prior.operation == BufferOperationType.insert) {
+          // Merge UPDATE into existing INSERT
+          final mergedData = Map<String, dynamic>.from(prior.data);
+          mergedData.addAll(entry.data);
+
+          effectiveEntry = BufferEntry(
+            data: mergedData,
+            operation: BufferOperationType.insert,
+            timestamp: prior.timestamp,
+            transactionId: prior.transactionId,
+            walPointer: prior.walPointer,
+            oldValues: null,
+          );
+          skipQueueEnqueue = true; // Insert is already in queue
+        } else if (prior.operation == BufferOperationType.update) {
+          // Merge UPDATE into existing UPDATE
+          final mergedData = Map<String, dynamic>.from(prior.data);
+          mergedData.addAll(entry.data);
+
+          effectiveEntry = BufferEntry(
+            data: mergedData,
+            operation: BufferOperationType.update,
+            timestamp: prior.timestamp,
+            transactionId: prior.transactionId,
+            walPointer: prior.walPointer,
+            oldValues: prior.oldValues ?? entry.oldValues,
+          );
+        }
+      }
+
+      // 1) Update buffer storage
+      buf.records[recordId] = effectiveEntry;
+
+      // Maintain insertedKeys status (crucial for coalesced INSERT+UPDATE)
+      if (effectiveEntry.operation == BufferOperationType.insert) {
+        buf.insertedKeys.add(recordId);
+      } else {
+        buf.insertedKeys.remove(recordId);
+      }
+
+      // 2) Update unique indexes (thoroughly remove old, then add new)
+      final existingKeys = buf.recordIdToUniqueKeys.remove(recordId);
+      if (existingKeys != null) {
+        for (final uk in existingKeys) {
+          final internalKey = uk.internalKey;
+
+          // Remove from index entries
+          final set = buf.uniqueIndexEntries[uk.indexName];
+          set?.remove(internalKey);
+          if (set != null && set.isEmpty) {
+            buf.uniqueIndexEntries.remove(uk.indexName);
+          }
+
+          // Remove from owners map
+          final ownersByKey = buf.uniqueKeyOwners[uk.indexName];
+          final owners = ownersByKey?[internalKey];
+          owners?.remove(recordId);
+          if (owners != null && owners.isEmpty) {
+            ownersByKey?.remove(internalKey);
+          }
+          if (ownersByKey != null && ownersByKey.isEmpty) {
+            buf.uniqueKeyOwners.remove(uk.indexName);
+          }
+        }
+      }
+
+      if (uniqueKeys.isNotEmpty) {
+        buf.recordIdToUniqueKeys[recordId] = uniqueKeys;
+        for (final uk in uniqueKeys) {
+          final internalKey = uk.internalKey;
+          buf.uniqueIndexEntries
+              .putIfAbsent(uk.indexName, () => <dynamic>{})
+              .add(internalKey);
+          buf.uniqueKeyOwners
+              .putIfAbsent(uk.indexName, () => <dynamic, Set<String>>{})
+              .putIfAbsent(internalKey, () => <String>{})
+              .add(recordId);
+        }
+      }
+
+      // 3) Enqueue for write
+      if (!skipQueueEnqueue) {
+        _writeQueue.add(WriteQueueEntry(
+          tableName: tableName,
+          recordId: recordId,
+          operationType: effectiveEntry.operation,
+          walPointer: effectiveEntry.walPointer!,
+        ));
+      }
+    }
+
+    _emitSizeChanged();
+    CrontabManager.notifyActivity();
+  }
+
+  /// Adds a batch of delete operations to the write buffer.
+  Future<void> addDeleteBatch({
+    required String tableName,
+    required List<String> recordIds,
+    required List<BufferEntry> entries,
+  }) async {
+    if (recordIds.isEmpty) return;
+    if (recordIds.length != entries.length) {
+      throw ArgumentError(
+          'addDeleteBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}');
+    }
+
+    // Update record count once (batch optimized).
+    await _dataStore.tableDataManager.updateTableRecordCountDelta(
+      tableName,
+      deleteDelta: recordIds.length,
+    );
+
+    final buf = _ensureTable(tableName);
+    final yieldController =
+        YieldController('WriteBufferManager.addDeleteBatch');
+    final batchSize = _dataStore.config.writeBatchSize;
+    final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
+    const int emitChunk = 1000;
+
+    for (int i = 0; i < recordIds.length; i++) {
+      await yieldController.maybeYield();
+      if (i % emitChunk == 0) {
+        await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
+        await _dataStore.parallelJournalManager.waitUntilQueueBelow(
+          backpressureCap,
+          timeout: const Duration(seconds: 120),
+        );
+      }
+
+      final recordId = recordIds[i];
+      final entry = entries[i];
+
+      // 1. Handle Operation Coalescing (Merge/Cancel)
+      final prior = buf.records[recordId];
+      bool skipBufferStore = false;
+
+      if (prior != null && prior.operation == BufferOperationType.insert) {
+        // Cancel: drop the pending INSERT from buffer
+        // Note: The insert is already in the queue, so we must still enqueue a delete
+        // to tombstone it in WAL during flush.
+        buf.records.remove(recordId);
+        skipBufferStore = true;
+      }
+
+      // 2. Clean up Unique Key Index Reservations
+      // When a record is deleted, we must release its unique keys in the buffer.
+      final existingUniqueKeys = buf.recordIdToUniqueKeys.remove(recordId);
+      if (existingUniqueKeys != null) {
+        for (final uk in existingUniqueKeys) {
+          final internalKey = _toInternalKey(uk.compositeKey);
+          final set = buf.uniqueIndexEntries[uk.indexName];
+          set?.remove(internalKey);
+          if (set != null && set.isEmpty) {
+            buf.uniqueIndexEntries.remove(uk.indexName);
+          }
+          final ownersByKey = buf.uniqueKeyOwners[uk.indexName];
+          final owners = ownersByKey?[internalKey];
+          owners?.remove(recordId);
+          if (owners != null && owners.isEmpty) {
+            ownersByKey?.remove(internalKey);
+          }
+          if (ownersByKey != null && ownersByKey.isEmpty) {
+            buf.uniqueKeyOwners.remove(uk.indexName);
+          }
+        }
+      }
+
+      // 3. Update Buffer State
+      buf.insertedKeys.remove(recordId);
+      if (!skipBufferStore) {
+        buf.records[recordId] = entry;
+      }
+
+      // 4. Enqueue to Write Queue (as a tombstone)
+      _writeQueue.add(WriteQueueEntry(
+        tableName: tableName,
+        recordId: recordId,
+        operationType: entry.operation,
+        walPointer: entry.walPointer!,
+      ));
+    }
+
+    _emitSizeChanged();
+    CrontabManager.notifyActivity();
   }
 }
 

@@ -88,7 +88,9 @@ class DataStoreConfig {
   final bool? enablePrewarmCache;
 
   /// The threshold in megabytes for automatic cache prewarming when [enablePrewarmCache] is true.
-  final int prewarmThresholdMB;
+  ///
+  /// If null, the engine will derive a threshold from available memory at startup.
+  final int? prewarmThresholdMB;
 
   /// Log segment file size in bytes.
   /// Defaults to a fraction of the main data partition size.
@@ -170,7 +172,7 @@ class DataStoreConfig {
     DistributedNodeConfig? distributedNodeConfig,
     this.cacheMemoryBudgetMB,
     this.enablePrewarmCache,
-    int? prewarmThresholdMB,
+    this.prewarmThresholdMB,
     int? maxLogPartitionFileSize,
     this.logPartitionCycle = 900000,
     bool? enableJournal,
@@ -214,8 +216,6 @@ class DataStoreConfig {
         maxQueryOffset = maxQueryOffset ?? 10000,
         distributedNodeConfig =
             distributedNodeConfig ?? const DistributedNodeConfig(),
-        prewarmThresholdMB =
-            prewarmThresholdMB ?? _getDefaultPrewarmThreshold(),
         maxOpenFiles = maxOpenFiles ?? _getDefaultMaxOpenHandles(),
         recoveryFlushPolicy =
             recoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
@@ -390,20 +390,6 @@ class DataStoreConfig {
     }
     // Desktop
     return half.clamp(1, 5);
-  }
-
-  static int _getDefaultPrewarmThreshold() {
-    int cpuCount = PlatformHandler.recommendedConcurrency;
-    if (PlatformHandler.isServerEnvironment) {
-      // Servers have high-performance I/O, so we can be more aggressive.
-      return 256 + (cpuCount * 25);
-    }
-    if (PlatformHandler.isDesktop) {
-      // Desktops usually have fast SSDs.
-      return 64 + (cpuCount * 15);
-    }
-    // Mobile devices have slower storage and more constrained memory.
-    return 20 + (cpuCount * 10);
   }
 
   static int _getDefaultMaxOpenHandles() {

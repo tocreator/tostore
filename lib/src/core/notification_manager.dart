@@ -13,6 +13,9 @@ class NotificationManager {
   // Keep track of subscriptions by ID for easy removal
   final Map<String, QuerySubscription> _activeSubscriptions = {};
 
+  // Keep track of controllers for explicit closing in dispose()
+  final Map<String, StreamController<ChangeEvent>> _controllers = {};
+
   final Map<String, TableSchema> _schemas;
 
   NotificationManager([List<TableSchema> schemas = const []])
@@ -27,12 +30,15 @@ class NotificationManager {
     final id = '${DateTime.now().microsecondsSinceEpoch}_${condition.hashCode}';
 
     final controller = StreamController<ChangeEvent>();
+    _controllers[id] = controller;
 
     final subscription = QuerySubscription(
       id: id,
       condition: condition,
       callback: (event) {
-        controller.add(event as ChangeEvent);
+        if (!controller.isClosed) {
+          controller.add(event as ChangeEvent);
+        }
       },
     );
 
@@ -50,7 +56,6 @@ class NotificationManager {
     // When the user cancels the stream subscription, we remove the query subscription
     streamSub.onDone(() {
       _unregister(tableName, id);
-      controller.close();
     });
 
     return streamSub;
@@ -60,6 +65,10 @@ class NotificationManager {
     if (_activeSubscriptions.containsKey(id)) {
       final sub = _activeSubscriptions.remove(id)!;
       _indexes[tableName]?.remove(sub);
+    }
+    final controller = _controllers.remove(id);
+    if (controller != null && !controller.isClosed) {
+      controller.close();
     }
   }
 
@@ -112,5 +121,20 @@ class NotificationManager {
     final matcher =
         ConditionRecordMatcher.prepare(condition, _schemas, tableName);
     return matcher.matches(record);
+  }
+
+  /// Clear all subscriptions and indexes
+  void dispose() {
+    _activeSubscriptions.clear();
+    _indexes.clear();
+    _schemas.clear();
+
+    // Explicitly close all controllers to release listeners and their closures
+    for (final controller in _controllers.values) {
+      if (!controller.isClosed) {
+        controller.close();
+      }
+    }
+    _controllers.clear();
   }
 }

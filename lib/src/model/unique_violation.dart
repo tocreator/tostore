@@ -12,11 +12,16 @@ class UniqueViolation {
   /// Internal index name (optional).
   final String? indexName;
 
+  /// The primary key of the existing record that caused the violation (optional).
+  /// This is useful for resolving record identities during upsert or batch updates.
+  final String? existingPrimaryKey;
+
   UniqueViolation({
     required this.tableName,
     required this.fields,
     required this.value,
     this.indexName,
+    this.existingPrimaryKey,
   });
 
   /// Returns a user-friendly message describing the violation,
@@ -28,7 +33,12 @@ class UniqueViolation {
     // Optional fields segment, only shown when we know the fields that participate in the constraint
     final String fieldsSegment = hasFields ? " ($fieldsStr)" : '';
 
-    return "Unique constraint violation on '$tableName'$fieldsSegment with value: $value";
+    String msg =
+        "Unique constraint violation on '$tableName'$fieldsSegment with value: $value";
+    if (existingPrimaryKey != null) {
+      msg += " (Existing PK: $existingPrimaryKey)";
+    }
+    return msg;
   }
 
   @override

@@ -43,6 +43,9 @@ class DbResult {
   /// (some items succeeded, some failed - typically used in batch operations)
   bool get isPartialSuccess => type == ResultType.partialSuccess;
 
+  /// Whether the operation failed (not success and not partial success)
+  bool get isFailed => !isSuccess && !isPartialSuccess;
+
   /// Create a success result
   static DbResult success({
     String? successKey,

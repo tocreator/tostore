@@ -8,18 +8,18 @@ All notable changes to this project will be documented in this file.
 - Fixed `upsert` validation for numeric unique keys
 - Optimized database lifecycle resilience during space switching and closure.
 
+### Added
+- Added `batchUpdate` bulk update interface.
+- Added `db.kv` namespace for advanced Key-Value operations (e.g., `db.kv.get()`, `db.kv.clear()`, `db.kv.count()`, `db.kv.setMany()`).
+
 ### Changed
 - Standardized the database shutdown and cleanup pipeline for improved stability.
 - Improved documentation navigation compatibility
 - Optimized memory cleanup
 - Optimized `count()` performance
-- Refactored Key-Value storage API to group methods under `db.kv.*` (e.g., `db.kv.clear()`, `db.kv.count()`).
 - Enhanced system table protection to prevent accidental manual deletion/clearing of critical internal tables.
-- Optimized Key-Value query performance.
+- Optimized query channel performance, significantly improving the performance of data operations including queries, bulk inserts, and bulk updates.
 - Optimized resource-aware scheduling for improved resource management.
-- Optimized query channel performance.
-
-
 
 
 

@@ -33,7 +33,7 @@
 - **Getting Started**: [Why ToStore](#why-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#quick-start-kv) | [Table Mode](#quick-start-table) | [Memory Mode](#quick-start-memory)
 - **Architecture & Model**: [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys) | [Mobile/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primary Key Algorithms](#primary-key-examples)
 - **Advanced Queries**: [Advanced Queries (JOIN)](#query-advanced) | [Aggregation & Statistics](#aggregation-stats) | [Complex Logic (QueryCondition)](#query-condition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- **Advanced & Performance**: [Advanced KV](#kv-advanced) | [Vector Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Efficient Pagination](#query-pagination) | [Query Cache](#query-cache) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- **Advanced & Performance**: [Advanced KV](#kv-advanced) | [Bulk Operations](#bulk-operations) | [Vector Search](#vector-advanced) | [Table-level TTL](#ttl-config) | [Efficient Pagination](#query-pagination) | [Query Cache](#query-cache) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - **Operations & Security**: [Administration](#database-maintenance) | [Security Configuration](#security-config) | [Error Handling](#error-handling) | [Performance & Diagnostics](#performance) | [More Resources](#more-resources)
 
 ## <a id="why-tostore"></a>Why Choose ToStore?
@@ -448,11 +448,22 @@ ToStore provides a rich set of advanced capabilities for complex business scenar
 
 ### <a id="kv-advanced"></a>Advanced Key-Value Operations (db.kv)
 
-For more complex Key-Value scenarios, it is recommended to use the `db.kv` namespace. It provides a richer set of methods:
-All methods support the optional `isGlobal` parameter: `true` for globally shared data, `false` (default) for current space.
+For more complex Key-Value scenarios, it is recommended to use the `db.kv` namespace. It provides a complete set of APIs with space isolation, global sharing, and multiple data types.
+
+- **Basic Access**
+  ```dart
+  // Set value (supports String, int, bool, double, Map, List, etc.)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // Get raw dynamic value
+  dynamic val = await db.kv.get('key');
+
+  // Remove a single key
+  await db.kv.remove('key');
+  ```
 
 - **Type-Safe Getters**
-  Retrieve data directly in the desired format without manual casting:
+  Retrieve data directly in the target format without manual casting:
   ```dart
   String? name = await db.kv.getString('user_name');
   int? age = await db.kv.getInt('user_age');
@@ -461,7 +472,20 @@ All methods support the optional `isGlobal` parameter: `true` for globally share
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
-- **Atomic Counters (setIncrement)**
+- **Bulk Operations**
+  Efficiently process multiple key-value pairs in a single operation:
+  ```dart
+  // Bulk set
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'en_US',
+  });
+
+  // Bulk remove
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
+- **Atomic Counters**
   Safely increment or decrement numeric values in high-concurrency scenarios:
   ```dart
   // Increment by 1 (default)
@@ -471,7 +495,6 @@ All methods support the optional `isGlobal` parameter: `true` for globally share
   ```
 
 - **Discovery & Management**
-  Scan for keys by prefix, count total keys, and perform bulk removals:
   ```dart
   // Get all keys starting with 'setting_'
   final keys = await db.kv.getKeys(prefix: 'setting_');
@@ -481,9 +504,6 @@ All methods support the optional `isGlobal` parameter: `true` for globally share
 
   // Check if a key exists and is not expired
   final exists = await db.kv.exists('config_cache');
-
-  // Remove multiple keys at once
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
 
   // Clear all KV data in the current space
   await db.kv.clear();
@@ -495,9 +515,59 @@ All methods support the optional `isGlobal` parameter: `true` for globally share
   // Get remaining duration
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Update TTL for an existing key
+  // Update TTL for an existing key (expires in 7 days)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **Reactive Watching**
+  ```dart
+  // Watch a single key
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // Watch a snapshot of multiple keys
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **Global Sharing (isGlobal)**
+  All the above methods support the optional `isGlobal` parameter: `true` for global space (shared across all spaces), `false` (default) for the current isolated space.
+
+
+### <a id="bulk-operations"></a>Bulk Operations
+
+ToStore provides specialized bulk processing interfaces optimized for large-scale data throughput. These interfaces utilize parallel task distribution and time-slicing to ensure UI responsiveness during heavy write operations.
+
+| Method | Core Purpose | Data Requirements | Characteristics |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | Insert new records in bulk | Must contain all non-nullable fields | Pure insert, highest performance |
+| `batchUpsert` | Insert or update (upsert) in bulk | **Must contain all non-nullable fields** | Full synchronization, identified by Primary Key or Unique Field |
+| `batchUpdate` | Update existing records in bulk | **Primary Key or Unique Field** + Update Fields | Partial updates for existing records |
+
+- **Bulk Insert (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **Intelligent Bulk Synchronization (batchUpsert)**
+  Automatically identifies "Insert" or "Update" based on Primary Key or Unique Fields. Common for full data synchronization.
+  > [!IMPORTANT]
+  > **Data Requirements**: Since an insert might be triggered, `batchUpsert` requires every record to contain all non-nullable (`nullable: false`) fields.
+
+- **High-Performance Bulk Update (batchUpdate)**
+  Specifically for updating existing records. Each record must include a Primary Key or Unique Field as the identifier, along with the fields to be modified.
+  > [!TIP]
+  > **Partial Updates**: `batchUpdate` only modifies the provided fields and does not require all non-nullable fields, making it ideal for incremental updates.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // Identify by unique field 'username' and update 'age'
+    {'id': '1002', 'status': 'active'}, // Can also use Primary Key directly
+  ]);
+  ```
+
+> [!TIP]
+> You can set `allowPartialErrors: true` to ensure that individual record failures (e.g., a single constraint violation) do not reject the entire batch operation.
 
 
 ### <a id="vector-advanced"></a>Vector Fields, Vector Indexes & Vector Search
@@ -604,7 +674,7 @@ const TableSchema(
 
 
 ### Intelligent Storage (Upsert)
-ToStore decides whether to update or insert based on the primary key or unique key included in `data`. `where` is not supported here; the conflict target is determined by the data itself.
+ToStore decides whether to update or insert based on the primary key or unique field included in `data`. `where` is not supported here; the conflict target is determined by the data itself.
 
 ```dart
 // By primary key
@@ -614,7 +684,7 @@ final result = await db.upsert('users', {
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// By unique key (the record must contain all fields from a unique field plus required fields)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',

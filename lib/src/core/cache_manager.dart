@@ -36,7 +36,7 @@ final class CacheManager {
       }
       try {
         // Then evict page cache (B+Tree pages)
-        await _dataStore.tableTreePartitionManager.evictPageCache(ratio: 0.3);
+        await _dataStore.tableTreePartitionManager?.evictPageCache(ratio: 0.3);
       } catch (e) {
         Logger.warn('Evict page cache failed: $e',
             label: 'CacheManager.tableData');
@@ -47,7 +47,7 @@ final class CacheManager {
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
       try {
         // Evict B+Tree page cache
-        await _dataStore.indexTreePartitionManager.evictPageCache(ratio: 0.3);
+        await _dataStore.indexTreePartitionManager?.evictPageCache(ratio: 0.3);
       } catch (e) {
         Logger.warn('Evict index page cache failed: $e',
             label: 'CacheManager.indexData');
@@ -107,7 +107,7 @@ final class CacheManager {
     final recordCacheSize =
         _dataStore.tableDataManager.getCurrentTableRecordCacheSize();
     final pageCacheSize =
-        _dataStore.tableTreePartitionManager.getCurrentPageCacheSize();
+        _dataStore.tableTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
     return recordCacheSize + pageCacheSize;
   }
 
@@ -152,8 +152,8 @@ final class CacheManager {
     ]);
 
     _dataStore.queryExecutor.clearAllQueryCacheSync();
-    _dataStore.tableTreePartitionManager.clearPageCacheSync();
-    _dataStore.indexTreePartitionManager.clearPageCacheSync();
+    _dataStore.tableTreePartitionManager?.clearPageCacheSync();
+    _dataStore.indexTreePartitionManager?.clearPageCacheSync();
     _dataStore.weightManager?.clearMemory();
     _dataStore.clearAllTtlPlanCache();
     _statsCache.clear();
@@ -188,7 +188,7 @@ final class CacheManager {
         _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
       }
       if (invalidateTablePages) {
-        _dataStore.tableTreePartitionManager.clearPageCacheForTable(tableName);
+        _dataStore.tableTreePartitionManager?.clearPageCacheForTable(tableName);
       }
       if (invalidateSchema) {
         _dataStore.schemaManager?.removeCachedTableSchema(tableName);
@@ -205,7 +205,7 @@ final class CacheManager {
         await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
       }
       if (invalidateIndexPages) {
-        _dataStore.indexTreePartitionManager.clearPageCacheForTable(tableName);
+        _dataStore.indexTreePartitionManager?.clearPageCacheForTable(tableName);
       }
 
       if (invalidateVectorCache) {

@@ -26,6 +26,10 @@ class StorageAdapter implements StorageInterface {
   /// Guard against concurrent flushAll executions
   bool _flushInProgress = false;
 
+  /// Guard against I/O after close
+  bool _isClosed = false;
+  bool get isClosed => _isClosed;
+
   /// Global scheduler and activity tracking (shared across adapters)
   static final Set<StorageAdapter> _instances = <StorageAdapter>{};
   static DateTime? _lastWriteAt;
@@ -246,6 +250,7 @@ class StorageAdapter implements StorageInterface {
       {bool append = false,
       bool flush = true,
       bool closeHandleAfterFlush = false}) async {
+    if (_isClosed) return;
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -319,6 +324,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> writeAsBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    if (_isClosed) return;
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -386,6 +392,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<String?> readAsString(String path) async {
+    if (_isClosed) return null;
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -405,6 +412,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> deleteFile(String path) async {
+    if (_isClosed) return;
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_deleteOpPrefix);
 
@@ -427,11 +435,15 @@ class StorageAdapter implements StorageInterface {
   Future<bool> existsDirectory(String path) => _storage.existsDirectory(path);
 
   @override
-  Future<bool> existsFile(String path) => _storage.existsFile(path);
+  Future<bool> existsFile(String path) async {
+    if (_isClosed) return false;
+    return _storage.existsFile(path);
+  }
 
   @override
   Future<List<String>> listDirectory(String path,
       {bool recursive = false}) async {
+    if (_isClosed) return <String>[];
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_listOpPrefix);
 
@@ -451,6 +463,8 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> close({bool isMigrationInstance = false}) async {
+    if (_isClosed) return;
+    _isClosed = true;
     if (!isMigrationInstance) {
       await _storage.close();
     }

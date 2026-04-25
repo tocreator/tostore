@@ -33,7 +33,7 @@
 - **Per iniziare**: [Perché ToStore](#why-tostore) | [Caratteristiche principali](#key-features) | [Guida all'installazione](#installation) | [Modalità KV](#quick-start-kv) | [Modalità tabella](#quick-start-table) | [Modalità memoria](#quick-start-memory)
 - **Architettura e modello**: [Definizione dello schema](#schema-definition) | [Architettura distribuita](#distributed-architecture) | [Chiavi esterne a cascata](#foreign-keys) | [Cellulare/Desktop](#mobile-integration) | [Server/Agente](#server-integration) | [Algoritmi a chiave primaria](#primary-key-examples)
 - **Query avanzate**: [Query avanzate (JOIN)](#query-advanced) | [Aggregazione e statistiche](#aggregation-stats) | [Logica complessa (Condizione query)](#query-condition) | [Query reattiva (guarda)](#reactive-query) | [Query sullo streaming](#streaming-query)
-- **Avanzate e prestazioni**: [Operazioni avanzate KV](#kv-advanced) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Impostazione efficiente](#query-pagination) | [Query Cache](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
+- **Avanzate e prestazioni**: [KV avanzate](#kv-advanced) | [Operazioni in blocco](#bulk-operations) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Paginazione efficiente](#query-pagination) | [Cache delle query](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
 - **Operazioni e sicurezza**: [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Altre risorse](#more-resources)
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
@@ -448,11 +448,22 @@ ToStore fornisce un ricco set di funzionalità avanzate per scenari aziendali co
 
 ### <a id="kv-advanced"></a>Operazioni avanzate chiave-valore (db.kv)
 
-Per scenari chiave-valore più complessi, si consiglia di utilizzare lo spazio dei nomi `db.kv`. Fornisce un set più completo di metodi.
-Tutti i metodi seguenti supportano il parametro opzionale `isGlobal`: `true` indica dati condivisi a livello globale, `false` (predefinito) per lo spazio corrente.
+Per scenari chiave-valore più complessi, si consiglia di utilizzare lo spazio dei nomi `db.kv`. Fornisce un set completo di API con isolamento dello spazio, condivisione globale e diversi tipi di dati.
 
-- **Lettura sicura dei tipi (Type-Safe Getters)**
-  Ottieni i dati direttamente nel formato di destinazione senza conversione manuale dei tipi:
+- **Accesso di base (Basic Access)**
+  ```dart
+  // Imposta valore (supporta String, int, bool, double, Map, List, ecc.)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // Ottieni valore dinamico grezzo
+  dynamic val = await db.kv.get('key');
+
+  // Rimuovi una singola chiave
+  await db.kv.remove('key');
+  ```
+
+- **Getter sicuri per i tipi (Type-Safe Getters)**
+  Recupera i dati direttamente nel formato di destinazione senza conversione manuale:
   ```dart
   String? name = await db.kv.getString('user_name');
   int? age = await db.kv.getInt('user_age');
@@ -461,43 +472,102 @@ Tutti i metodi seguenti supportano il parametro opzionale `isGlobal`: `true` ind
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
-- **Contatore atomico (Atomic Increment)**
+- **Operazioni in blocco (Bulk Operations)**
+  Elabora in modo efficiente più coppie chiave-valore in un'unica operazione:
+  ```dart
+  // Imposta in blocco
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'it_IT',
+  });
+
+  // Rimuovi in blocco
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
+- **Contatori atomici (Atomic Increment)**
   Aumenta o diminuisci i valori numerici in modo sicuro in scenari ad alta concorrenza:
   ```dart
   // Incrementa di 1 (predefinito)
   await db.kv.setIncrement('view_count');
-  // Decrementa di 5 (passando un valore negativo)
+  // Decrementa di 5 (passa un valore negativo)
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **Esplorazione e gestione dello spazio delle chiavi**
-  Supporta il recupero delle chiavi basato su prefisso, statistiche totali e cancellazione di massa:
+- **Esplorazione e gestione (Discovery & Management)**
   ```dart
   // Ottieni tutte le chiavi che iniziano con 'setting_'
   final keys = await db.kv.getKeys(prefix: 'setting_');
 
-  // Ottieni il numero totale di coppie chiave-valore nello spazio corrente
+  // Conta il totale delle chiavi nello spazio attuale
   final count = await db.kv.count();
 
   // Verifica se una chiave esiste e non è scaduta
   final exists = await db.kv.exists('config_cache');
 
-  // Rimuovi più chiavi contemporaneamente
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
-
-  // Cancella tutti i dati KV dello spazio corrente
+  // Cancella tutti i dati KV nello spazio attuale
   await db.kv.clear();
   ```
 
 - **Gestione del ciclo di vita (TTL)**
-  Ottieni o aggiorna il tempo di scadenza delle chiavi esistenti:
+  Ispeziona o aggiorna le impostazioni di scadenza per le chiavi esistenti:
   ```dart
-  // Ottieni il tempo di scadenza rimanente
+  // Ottieni la durata rimanente
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Aggiorna il tempo di scadenza di una chiave esistente (scade tra 7 giorni)
+  // Aggiorna il TTL per una chiave esistente (scade tra 7 giorni)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **Monitoraggio reattivo (Reactive Watch)**
+  ```dart
+  // Monitora una singola chiave
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // Monitora uno snapshot di più chiavi
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **Condivisione globale (isGlobal)**
+  Tutti i metodi sopra indicati supportano il parametro opzionale `isGlobal`: `true` per lo spazio globale (condiviso tra tutti gli spazi), `false` (predefinito) per lo spazio isolato attuale.
+
+
+### <a id="bulk-operations"></a>Operazioni in blocco (Bulk Operations)
+
+ToStore fornisce interfacce di elaborazione in blocco specializzate, ottimizzate per throughput di dati su larga scala. Queste interfacce integrano la distribuzione parallela dei compiti e la pianificazione time-slicing per garantire la reattività dell'interfaccia utente durante operazioni di scrittura intensive.
+
+| Metodo | Scopo principale | Requisiti dei dati | Caratteristiche |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | Inserimento record in blocco | Deve contenere tutti i campi non nullabili | Inserimento puro, massime prestazioni |
+| `batchUpsert` | Sincronizzazione intelligente (Upsert) | **Deve contenere tutti i campi non nullabili** | Sincronizzazione completa, identificata da chiave primaria o campo univoco |
+| `batchUpdate` | Aggiornamento record in blocco | **Chiave primaria o campo univoco** + Campi da aggiornare | Aggiornamenti parziali per record esistenti |
+
+- **Inserimento in blocco (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **Sincronizzazione intelligente in blocco (batchUpsert)**
+  Identifica automaticamente "Inserimento" o "Aggiornamento" in base alla chiave primaria o ai campi univoci. Comune per la sincronizzazione completa dei dati.
+  > [!IMPORTANT]
+  > **Requisiti dei dati**: Poiché potrebbe essere attivato un inserimento, `batchUpsert` richiede che ogni record contenga tutti i campi non nullabili (`nullable: false`).
+
+- **Aggiornamento in blocco ad alte prestazioni (batchUpdate)**
+  Specifico per l'aggiornamento di record esistenti. Ogni record deve includere una chiave primaria o un campo univoco come identificatore, insieme ai campi da modificare.
+  > [!TIP]
+  > **Aggiornamenti parziali**: `batchUpdate` modifica solo i campi forniti e non richiede tutti i campi non nullabili, rendendolo ideale per aggiornamenti incrementali.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // Identifica tramite campo univoco 'username' e aggiorna 'age'
+    {'id': '1002', 'status': 'active'}, // Può anche usare direttamente la chiave primaria
+  ]);
+  ```
+
+> [!TIP]
+> È possibile impostare `allowPartialErrors: true` per garantire che i fallimenti di singoli record (ad esempio, una violazione di vincolo univoco) non rifiutino l'intera operazione in blocco.
 
 
 ### <a id="vector-advanced"></a>Campi vettoriali, indici vettoriali e ricerca vettoriale
@@ -604,25 +674,25 @@ const TableSchema(
 
 
 ### Archiviazione intelligente (Upsert)
-ToStore decide se aggiornare o inserire in base alla chiave primaria o chiave univoca inclusa in `data`. `where` non è supportato qui; l'obiettivo del conflitto è determinato dai dati stessi.
+ToStore decide se aggiornare o inserire in base alla chiave primaria o al campo univoco incluso in `data`. `where` non è supportato qui; l'obiettivo del conflitto è determinato dai dati stessi.
 
 ```dart
-// By primary key
+// Per chiave primaria
 final result = await db.upsert('users', {
   'id': 1,
   'username': 'john',
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// Per chiave univoca (il record deve contenere tutti i campi che partecipano a un vincolo univoco più i campi obbligatori)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',
   'age': 26,
 });
 
-// Batch upsert (supports atomic mode or partial-success mode)
-// allowPartialErrors: true means some rows may fail while others still succeed
+// Batch upsert (supporta modalità atomica o modalità successo parziale)
+// allowPartialErrors: true significa che alcune righe possono fallire mentre altre hanno comunque successo
 final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},

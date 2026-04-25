@@ -118,6 +118,11 @@ class DatabaseTester {
         {'name': 'KV Store Operations', 'test': _testKvStoreOperations},
         {'name': 'Basic CRUD', 'test': _testBasicCrud},
         {'name': 'Non-Nullable Constraint', 'test': _testNonNullConstraint},
+        {
+          'name': 'Buffer Pipeline Robustness',
+          'test': _testBufferPipelineRobustness
+        },
+        {'name': 'Batch Operations Benchmark', 'test': _testBatchOperations},
         {'name': 'Upsert Logic', 'test': _testUpsert},
         {'name': 'JOIN Queries', 'test': _testJoinQueries},
         {'name': 'Multi-Space Isolation', 'test': _testMultiSpace},
@@ -282,12 +287,10 @@ class DatabaseTester {
 
   Future<DataStoreConfig> _buildSchemaAutoUpgradeTestConfig() async {
     final resolvedDbPath = await _resolveSchemaAutoUpgradeTestDbPath();
-    final uniqueSuffix =
-        '${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(1 << 20)}';
 
     return db.config.copyWith(
       dbPath: resolvedDbPath,
-      dbName: '${db.config.dbName}_schema_upgrade_validation_$uniqueSuffix',
+      dbName: '${db.config.dbName}_schema_upgrade_validation',
       spaceName: 'default',
       enableLog: true,
       logLevel: LogLevel.warn,
@@ -575,6 +578,9 @@ class DatabaseTester {
     ToStore? reopenedDb;
 
     try {
+      // This prevents disk bloat and ensures a clean state for the new test.
+      await _deleteSchemaAutoUpgradeTestDatabase(config);
+
       oldDb = await ToStore.open(
         dbPath: config.dbPath,
         dbName: config.dbName,
@@ -840,6 +846,207 @@ class DatabaseTester {
       await _closeQuietly(migratedDb);
       await _closeQuietly(reopenedDb);
       await _deleteSchemaAutoUpgradeTestDatabase(config);
+    }
+
+    return isTestPassed;
+  }
+
+  /// Benchmarks and validates batch operations.
+  Future<bool> _testBatchOperations() async {
+    log.add('--- Testing: Batch Operations Benchmark ---', LogType.debug);
+    bool isTestPassed = true;
+    try {
+      await _clearTablesSafely();
+
+      const int count = 100;
+      log.add('Preparing $count records for batch test...', LogType.info);
+
+      final insertRecords = List.generate(
+          count,
+          (i) => {
+                'username': 'batch_user_$i',
+                'email': 'batch_$i@test.com',
+                'age': 20 + (i % 50),
+                'is_active': true,
+              });
+
+      // 1. Benchmark Batch Insert
+      final sw = Stopwatch()..start();
+      final insertResult = await db.batchInsert('users', insertRecords);
+      sw.stop();
+      log.add('🚀 Batch Insert $count records took ${sw.elapsedMilliseconds}ms',
+          LogType.info);
+
+      isTestPassed &= _expect(
+          'Batch Insert should be successful', insertResult.isSuccess, true);
+      isTestPassed &= _expect('Batch Insert should affect $count rows',
+          insertResult.successCount, count);
+
+      if (!isTestPassed || insertResult.successKeys.isEmpty) return false;
+
+      // 2. Prepare Batch Update (Partial data)
+      final updateRecords = List.generate(
+          count,
+          (i) => {
+                'id': insertResult.successKeys[i],
+                'age': 30 + (i % 50),
+                'is_active': false,
+              });
+
+      // 3. Benchmark Batch Update
+      sw.reset();
+      sw.start();
+      final updateResult = await db.batchUpdate('users', updateRecords);
+      sw.stop();
+      log.add('🚀 Batch Update $count records took ${sw.elapsedMilliseconds}ms',
+          LogType.info);
+
+      isTestPassed &= _expect(
+          'Batch Update should be successful', updateResult.isSuccess, true);
+      isTestPassed &= _expect('Batch Update should affect $count rows',
+          updateResult.successCount, count);
+
+      // 4. Verify Correctness
+      log.add('Verifying data integrity after batch update...', LogType.info);
+
+      // Check middle record to avoid just checking boundaries
+      const middleIdx = count ~/ 2;
+      final middleId = insertResult.successKeys[middleIdx];
+      final user = await db.query('users').where('id', '=', middleId).first();
+
+      isTestPassed &=
+          _expect('User $middleId should exist', user != null, true);
+      if (user != null) {
+        isTestPassed &= _expect(
+            'User age should be updated', user['age'], 30 + (middleIdx % 50));
+        isTestPassed &=
+            _expect('User status should be updated', user['is_active'], false);
+        isTestPassed &= _expect('User username should be preserved',
+            user['username'], 'batch_user_$middleIdx');
+      }
+
+      // Check first and last
+      final firstUser = await db
+          .query('users')
+          .where('id', '=', insertResult.successKeys[0])
+          .first();
+      isTestPassed &=
+          _expect('First user age should be updated', firstUser?['age'], 30);
+
+      final lastUser = await db
+          .query('users')
+          .where('id', '=', insertResult.successKeys[count - 1])
+          .first();
+      isTestPassed &= _expect('Last user age should be updated',
+          lastUser?['age'], 30 + ((count - 1) % 50));
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testBatchOperations: $e\n$s');
+    }
+    return isTestPassed;
+  }
+
+  /// Validates the robustness of the write buffer pipeline.
+  /// Checks for coalescing, duplicate prevention, and partial updates visibility.
+  Future<bool> _testBufferPipelineRobustness() async {
+    log.add('--- Testing: Buffer Pipeline Robustness ---', LogType.debug);
+    bool isTestPassed = true;
+
+    try {
+      await _clearTablesSafely();
+
+      const String testUser = 'buffer_test_user';
+      const String testEmail = 'buffer@test.com';
+
+      // 1. Insert then Insert (Immediate duplicate check)
+      final firstInsert = await db.insert('users', {
+        'username': testUser,
+        'email': testEmail,
+        'age': 25,
+      });
+      isTestPassed &=
+          _expect('First insert should succeed', firstInsert.isSuccess, true);
+
+      // Immediate second insert with same username (unique)
+      final secondInsert = await db.insert('users', {
+        'username': testUser,
+        'email': 'another@test.com',
+      });
+      isTestPassed &= _expect('Immediate duplicate insert should be blocked',
+          secondInsert.isSuccess, false);
+      isTestPassed &= _expect('Duplicate error should be unique violation',
+          secondInsert.type, ResultType.uniqueViolation);
+
+      // 2. Insert then Partial Update (Merging test)
+      const String partialUser = 'partial_test_user';
+      final insertForUpdate = await db.insert('users', {
+        'username': partialUser,
+        'email': 'partial@test.com',
+        'age': 30,
+      });
+      final String? userId = insertForUpdate.successKeys.firstOrNull;
+      isTestPassed &= _expect(
+          'Insert for partial update should succeed', userId != null, true);
+
+      // Immediately update ONLY age
+      final partialUpdate = await db
+          .update('users', {'age': 31}).where('username', '=', partialUser);
+      isTestPassed &= _expect('Immediate partial update should succeed',
+          partialUpdate.isSuccess, true);
+
+      // Query immediately (should see merged data from buffer)
+      final mergedRecord =
+          await db.query('users').where('username', '=', partialUser).first();
+      isTestPassed &= _expect('Merged record should retain original email',
+          mergedRecord?['email'], 'partial@test.com');
+      isTestPassed &= _expect(
+          'Merged record should have updated age', mergedRecord?['age'], 31);
+
+      // 3. Insert then Delete (Cancel logic)
+      const String deleteUser = 'delete_me_fast';
+      await db.insert('users', {
+        'username': deleteUser,
+        'email': 'delete@test.com',
+      });
+
+      final immediateDelete =
+          await db.delete('users').where('username', '=', deleteUser);
+      isTestPassed &= _expect(
+          'Immediate delete should succeed', immediateDelete.isSuccess, true);
+
+      final deletedRecord =
+          await db.query('users').where('username', '=', deleteUser).first();
+      isTestPassed &= _expect('Record should be gone immediately after delete',
+          deletedRecord, null);
+
+      // 4. Consecutive Partial Updates
+      const String multiUpdateUser = 'multi_update_user';
+      await db.insert('users', {
+        'username': multiUpdateUser,
+        'email': 'multi@test.com',
+        'age': 20,
+      });
+
+      // Update 1: Change email
+      await db.update('users', {'email': 'multi_new@test.com'}).where(
+          'username', '=', multiUpdateUser);
+      // Update 2: Change age
+      await db
+          .update('users', {'age': 21}).where('username', '=', multiUpdateUser);
+
+      final finalRecord = await db
+          .query('users')
+          .where('username', '=', multiUpdateUser)
+          .first();
+      isTestPassed &= _expect('Multi-update: final email matches',
+          finalRecord?['email'], 'multi_new@test.com');
+      isTestPassed &=
+          _expect('Multi-update: final age matches', finalRecord?['age'], 21);
+      isTestPassed &= _expect('Multi-update: username (id) preserved',
+          finalRecord?['username'], multiUpdateUser);
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testBufferPipelineRobustness: $e\n$s');
     }
 
     return isTestPassed;

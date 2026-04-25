@@ -714,6 +714,73 @@ class WalManager {
     return WalPointer(partitionIndex: pIdx, entrySeq: _current.entrySeq);
   }
 
+  /// Append multiple WAL entries in a single batch. Returns their pointers.
+  ///
+  /// This is significantly faster than calling [append] in a loop for large
+  /// datasets (10k+ entries) because it minimizes microtask yields and allows
+  /// the background flush pump to process the entries more efficiently.
+  Future<List<WalPointer>> appendBatch(
+      List<Map<String, dynamic>> walEntries) async {
+    if (!_initialized) {
+      await initializeAndRecover();
+    }
+
+    if (walEntries.isEmpty) return const <WalPointer>[];
+
+    // If journal disabled, still create pseudo pointers to maintain order in memory
+    if (!_config.enableJournal) {
+      final List<WalPointer> result = [];
+      for (int i = 0; i < walEntries.length; i++) {
+        _current = WalPointer(
+          partitionIndex: _current.partitionIndex,
+          entrySeq: _current.entrySeq + 1,
+        );
+        result.add(WalPointer(partitionIndex: -1, entrySeq: _current.entrySeq));
+      }
+      return result;
+    }
+
+    final int pIdx = _current.partitionIndex;
+    final int dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
+    final String path = _dataStore.pathManager.getWalPartitionLogPath(
+      dirIndex,
+      pIdx,
+      spaceName: _dataStore.currentSpaceName,
+    );
+
+    final yieldController = YieldController('WalManager.appendBatch');
+    final List<WalPointer> pointers = [];
+    for (final entry in walEntries) {
+      await yieldController.maybeYield();
+      final int nextSeq = _current.entrySeq + 1;
+      _current = WalPointer(partitionIndex: pIdx, entrySeq: nextSeq);
+
+      // Embed physical WAL pointer into the entry itself for fast recovery.
+      final entryWithPtr = Map<String, dynamic>.from(entry)
+        ..['p'] = pIdx
+        ..['seq'] = nextSeq;
+
+      _walQueue.add(_QueuedWalEntry(
+        path: path,
+        rawEntry: entryWithPtr,
+        pointer: _current,
+      ));
+
+      pointers.add(_current);
+    }
+
+    // Initialize existing partition range on first write
+    if (_meta.existingStartPartitionIndex < 0 ||
+        _meta.existingEndPartitionIndex < 0) {
+      _meta.existingStartPartitionIndex = pIdx;
+      _meta.existingEndPartitionIndex = pIdx;
+      // We can persist update meta asynchronously
+      persistMeta(flush: false);
+    }
+
+    return pointers;
+  }
+
   /// Advance checkpoint after a batch has been safely flushed to data files.
   Future<void> advanceCheckpoint(WalPointer pointer) async {
     _meta.checkpoint = pointer;

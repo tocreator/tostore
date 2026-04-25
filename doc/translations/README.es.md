@@ -33,7 +33,7 @@
 - **Primeros pasos**: [Por qué almacenar](#why-tostore) | [Características clave](#key-features) | [Guía de instalación](#installation) | [Modo KV](#quick-start-kv) | [Modo tabla](#quick-start-table) | [Modo de memoria](#quick-start-memory)
 - **Arquitectura y modelo**: [Definición de esquema](#schema-definition) | [Arquitectura distribuida](#distributed-architecture) | [Claves externas en cascada](#foreign-keys) | [Móvil/Escritorio](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de clave primaria](#primary-key-examples)
 - **Consultas avanzadas**: [Consultas avanzadas (UNIRSE)](#query-advanced) | [Agregación y estadísticas](#aggregation-stats) | [Lógica compleja (Condición de consulta)](#query-condition) | [Consulta reactiva (ver)](#reactive-query) | [Consulta de transmisión](#streaming-query)
-- **Avanzado y rendimiento**: [Operaciones avanzadas de KV](#kv-advanced) | [Búsqueda vectorial](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
+- **Avanzado y rendimiento**: [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Búsqueda vectorial](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
 - **Operaciones y seguridad**: [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Más recursos](#more-resources)
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
@@ -448,11 +448,22 @@ ToStore proporciona un amplio conjunto de capacidades avanzadas para escenarios 
 
 ### <a id="kv-advanced"></a>Operaciones avanzadas de clave-valor (db.kv)
 
-Para escenarios de clave-valor más complejos, se recomienda utilizar el espacio de nombres `db.kv`. Proporciona un conjunto de métodos más completo.
-Todos los siguientes métodos admiten el parámetro opcional `isGlobal`: `true` para datos compartidos globalmente, `false` (por defecto) para el espacio actual.
+Para escenarios de clave-valor más complejos, se recomienda utilizar el espacio de nombres `db.kv`. Proporciona un conjunto completo de API con aislamiento de espacio, uso compartido global y múltiples tipos de datos.
 
-- **Obtención segura de tipos (Type-Safe Getters)**
-  Obtenga datos directamente en el formato de destino sin conversión de tipo manual:
+- **Acceso básico (Basic Access)**
+  ```dart
+  // Establecer valor (admite String, int, bool, double, Map, List, etc.)
+  await db.kv.set('key', 'value', ttl: Duration(hours: 1));
+  
+  // Obtener valor dinámico sin procesar
+  dynamic val = await db.kv.get('key');
+
+  // Eliminar una sola clave
+  await db.kv.remove('key');
+  ```
+
+- **Obtenedores con seguridad de tipos (Type-Safe Getters)**
+  Recupere datos directamente en el formato de destino sin conversión manual:
   ```dart
   String? name = await db.kv.getString('user_name');
   int? age = await db.kv.getInt('user_age');
@@ -461,43 +472,102 @@ Todos los siguientes métodos admiten el parámetro opcional `isGlobal`: `true` 
   List<String>? tags = await db.kv.getList<String>('tags');
   ```
 
-- **Contador atómico (Atomic Increment)**
+- **Operaciones por lotes (Bulk Operations)**
+  Procese de manera eficiente múltiples pares clave-valor en una sola operación:
+  ```dart
+  // Establecer por lotes
+  await db.kv.setMany({
+    'theme': 'dark',
+    'language': 'es_ES',
+  });
+
+  // Eliminar por lotes
+  await db.kv.removeKeys(['temp_1', 'temp_2']);
+  ```
+
+- **Contadores atómicos (Atomic Increment)**
   Incremente o decremente valores numéricos de forma segura en escenarios de alta concurrencia:
   ```dart
-  // Incrementar en 1 (valor predeterminado)
+  // Incrementar en 1 (predeterminado)
   await db.kv.setIncrement('view_count');
-  // Decrementar en 5 (pasando una cantidad negativa)
+  // Decrementar en 5 (pasar un valor negativo)
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **Exploración y gestión del espacio de claves (Discovery & Management)**
-  Admite la recuperación de claves basada en prefijos, estadísticas totales y eliminación masiva:
+- **Descubrimiento y gestión (Discovery & Management)**
   ```dart
   // Obtener todas las claves que comienzan con 'setting_'
   final keys = await db.kv.getKeys(prefix: 'setting_');
 
-  // Obtener el número total de pares clave-valor en el espacio actual
+  // Contar el total de claves en el espacio actual
   final count = await db.kv.count();
 
-  // Comprobar si una clave existe y no ha caducado
+  // Verificar si una clave existe y no ha expirado
   final exists = await db.kv.exists('config_cache');
 
-  // Eliminar varias claves a la vez
-  await db.kv.removeKeys(['temp_1', 'temp_2']);
-
-  // Limpiar todos los datos KV del espacio actual
+  // Limpiar todos los datos KV en el espacio actual
   await db.kv.clear();
   ```
 
 - **Gestión del ciclo de vida (TTL)**
-  Obtenga o actualice el tiempo de expiración de las claves existentes:
+  Inspeccione o actualice la configuración de expiración para claves existentes:
   ```dart
-  // Obtener el tiempo de expiración restante
+  // Obtener la duración restante
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Actualizar el tiempo de expiración de una clave existente (expira en 7 días)
+  // Actualizar TTL para una clave existente (expira en 7 días)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
+
+- **Monitoreo reactivo (Reactive Watch)**
+  ```dart
+  // Monitorear una sola clave
+  db.kv.watch<int>('unread_count').listen((count) => print(count));
+
+  // Monitorear una instantánea de múltiples claves
+  db.kv.watchValues(['theme', 'font_size']).listen((map) => print(map));
+  ```
+
+- **Uso compartido global (isGlobal)**
+  Todos los métodos anteriores admiten el parámetro opcional `isGlobal`: `true` para el espacio global (compartido entre todos los espacios), `false` (predeterminado) para el espacio aislado actual.
+
+
+### <a id="bulk-operations"></a>Operaciones por lotes (Bulk Operations)
+
+ToStore proporciona interfaces de procesamiento por lotes especializadas optimizadas para el rendimiento de datos a gran escala. Estas interfaces utilizan la distribución de tareas en paralelo y el fraccionamiento de tiempo para garantizar la capacidad de respuesta de la interfaz de usuario durante las operaciones de escritura intensivas.
+
+| Método | Propósito principal | Requisitos de datos | Características |
+| :--- | :--- | :--- | :--- |
+| `batchInsert` | Insertar registros por lotes | Debe contener todos los campos no nulos | Inserción pura, máximo rendimiento |
+| `batchUpsert` | Sincronización inteligente (Upsert) | **Debe contener todos los campos no nulos** | Sincronización completa, identificado por clave primaria o campo único |
+| `batchUpdate` | Actualizar registros por lotes | **Clave primaria o campo único** + Campos a actualizar | Actualizaciones parciales para registros existentes |
+
+- **Inserción por lotes (batchInsert)**
+  ```dart
+  await db.batchInsert('users', [
+    {'username': 'user1', 'email': '1@ex.com'},
+    {'username': 'user2', 'email': '2@ex.com'},
+  ]);
+  ```
+
+- **Sincronización inteligente por lotes (batchUpsert)**
+  Identifica automáticamente "Insertar" o "Actualizar" según la clave primaria o los campos únicos. Común para la sincronización completa de datos.
+  > [!IMPORTANT]
+  > **Requisitos de datos**: Debido a que se puede activar una inserción, `batchUpsert` requiere que cada registro contenga todos los campos no nulos (`nullable: false`).
+
+- **Actualización por lotes de alto rendimiento (batchUpdate)**
+  Específicamente para actualizar registros existentes. Cada registro debe incluir una clave primaria o un campo único como identificador, junto con los campos que se van a modificar.
+  > [!TIP]
+  > **Actualizaciones parciales**: `batchUpdate` solo modifica los campos proporcionados y no requiere todos los campos no nulos, lo que lo hace ideal para actualizaciones incrementales.
+  ```dart
+  await db.batchUpdate('users', [
+    {'username': 'john', 'age': 27}, // Identificar por campo único 'username' y actualizar 'age'
+    {'id': '1002', 'status': 'active'}, // También puede usar la clave primaria directamente
+  ]);
+  ```
+
+> [!TIP]
+> Puede establecer `allowPartialErrors: true` para asegurarse de que los fallos en registros individuales (por ejemplo, una violación de restricción única) no rechacen toda la operación por lotes.
 
 
 ### <a id="vector-advanced"></a>Campos vectoriales, índices vectoriales y búsqueda de vectores
@@ -604,25 +674,25 @@ const TableSchema(
 
 
 ### Almacenamiento inteligente (Upsert)
-ToStore decide si actualizar o insertar según la clave principal o la clave única incluida en `data`. `where` no es compatible aquí; el objetivo del conflicto está determinado por los propios datos.
+ToStore decide si actualizar o insertar en función de la clave primaria o el campo único incluido en `data`. `where` no se admite aquí; el objetivo del conflicto se determina por los propios datos.
 
 ```dart
-// By primary key
+// Por clave primaria
 final result = await db.upsert('users', {
   'id': 1,
   'username': 'john',
   'email': 'john@example.com',
 });
 
-// By unique key (the record must contain all fields from a unique index plus required fields)
+// Por clave única (el registro debe contener todos los campos que participan en una restricción única más los campos obligatorios)
 await db.upsert('users', {
   'username': 'john',
   'email': 'john@example.com',
   'age': 26,
 });
 
-// Batch upsert (supports atomic mode or partial-success mode)
-// allowPartialErrors: true means some rows may fail while others still succeed
+// Batch upsert (admite modo atómico o modo de éxito parcial)
+// allowPartialErrors: true significa que algunas filas pueden fallar mientras que otras aún tienen éxito
 final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},
