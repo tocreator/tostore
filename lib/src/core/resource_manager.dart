@@ -199,6 +199,8 @@ class ResourceManager {
     final systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
     final availableDiskMB = await _getAvailableDiskSpace();
 
+    _refreshEffectivePrewarmThresholdMB(availableMemoryMB);
+
     // Determine memory status
     ResourceStatus memoryStatus = ResourceStatus.normal;
     if (availableMemoryMB < systemMemoryMB * 0.02 || availableMemoryMB < 32) {
@@ -420,36 +422,39 @@ class ResourceManager {
 
   int? _effectivePrewarmThresholdMB;
 
-  /// Initialize and cache the effective prewarm threshold (MB).
+  /// Initialize or refresh the shared effective prewarm threshold (MB).
   ///
-  /// This is computed once during startup because it is used by high-frequency
-  /// pressure checks and prewarm budgeting.
-  Future<int> initializeEffectivePrewarmThresholdMB(
-      DataStoreConfig config) async {
-    final cached = _effectivePrewarmThresholdMB;
-    if (cached != null) return cached;
-
-    final configured = config.prewarmThresholdMB;
-    if (configured != null) {
-      _effectivePrewarmThresholdMB = configured;
-      return configured;
-    }
-
-    try {
-      final availableMemoryMB =
-          await PlatformHandler.getAvailableSystemMemoryMB();
-      final dynamicThreshold = (availableMemoryMB * 0.30).floor();
-      _effectivePrewarmThresholdMB =
-          max(dynamicThreshold, _getMinimumPrewarmThresholdMB());
-    } catch (e) {
-      _effectivePrewarmThresholdMB = _getMinimumPrewarmThresholdMB();
-    }
+  /// Startup cache prewarm and runtime query prewarm use the same dynamic
+  /// threshold. Resource polling refreshes it from available memory later.
+  Future<int> initializeEffectivePrewarmThresholdMB() async {
+    final availableMemoryMB =
+        await PlatformHandler.getAvailableSystemMemoryMB();
+    _refreshEffectivePrewarmThresholdMB(availableMemoryMB);
     return _effectivePrewarmThresholdMB!;
   }
 
-  /// Get the cached effective prewarm threshold (MB).
+  /// Get the latest effective runtime prewarm threshold (MB).
   int getEffectivePrewarmThresholdMB() {
     return _effectivePrewarmThresholdMB ?? _getMinimumPrewarmThresholdMB();
+  }
+
+  void _refreshEffectivePrewarmThresholdMB(int availableMemoryMB) {
+    try {
+      final minimum = _getMinimumPrewarmThresholdMB();
+      final memoryBased = max(
+        (availableMemoryMB * 0.3).floor(),
+        minimum,
+      );
+
+      final configured = _dataStore?.config.prewarmThresholdMB;
+      if (configured != null && configured > 0) {
+        _effectivePrewarmThresholdMB = max(1, min(configured, memoryBased));
+      } else {
+        _effectivePrewarmThresholdMB = memoryBased;
+      }
+    } catch (_) {
+      _effectivePrewarmThresholdMB = _getMinimumPrewarmThresholdMB();
+    }
   }
 
   static int _getMinimumPrewarmThresholdMB() {
@@ -547,6 +552,7 @@ class ResourceManager {
 
     _cacheEvictionCallbacks.updateAll((key, value) => null);
     _dataStore = null;
+    _effectivePrewarmThresholdMB = null;
     _initialized = false;
   }
 }

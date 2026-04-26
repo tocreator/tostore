@@ -5953,7 +5953,7 @@ class DataStoreImpl {
       }
 
       final effectivePrewarmThresholdMB =
-          await _resourceManager!.initializeEffectivePrewarmThresholdMB(config);
+          await _resourceManager!.initializeEffectivePrewarmThresholdMB();
       final effectivePrewarmBudgetBytes =
           effectivePrewarmThresholdMB * 1024 * 1024;
 
