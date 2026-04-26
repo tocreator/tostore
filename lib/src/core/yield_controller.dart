@@ -24,6 +24,13 @@ import 'dart:math' as math;
 /// ```
 /// Global settings for YieldController
 class YieldControllerSettings {
+  /// Whether yielding is enabled in the current isolate.
+  ///
+  /// Static fields are isolate-local in Dart. The main isolate enables yielding
+  /// during database initialization; compute worker isolates keep the default
+  /// disabled state and skip yield checks naturally.
+  bool enabled = false;
+
   /// Target time budget in milliseconds.
   /// Default is 8ms (optimized for 120fps UI).
   /// For backend servers, you can increase this to 50ms+ to reduce overhead.
@@ -56,6 +63,7 @@ class YieldController {
   final Stopwatch _stopwatch = Stopwatch();
   final int _budgetMs;
   final String _topic;
+  final bool _enabled;
 
   /// The current dynamic check interval (number of iterations between time checks).
   int _currentCheckInterval;
@@ -78,10 +86,14 @@ class YieldController {
     int? budgetMs,
     int checkInterval = 300,
   })  : _budgetMs = budgetMs ?? globalSettings.targetBudgetMs,
+        _enabled = globalSettings.enabled,
         // Initialize with learned interval if available, otherwise use default
         _currentCheckInterval = _topicIntervals.containsKey(_topic)
             ? _topicIntervals[_topic]!
             : checkInterval {
+    if (!_enabled) {
+      return;
+    }
     // Initialize smoothing buffer with the starting interval estimate
     for (int i = 0; i < _smoothingSampleSize; i++) {
       _recentSamples.add(_currentCheckInterval);
@@ -118,6 +130,8 @@ class YieldController {
   /// This eliminates async/await overhead for the common case where no yield
   /// is needed, which can save significant time in loops with millions of iterations.
   Future<void>? maybeYieldSync() {
+    if (!_enabled) return null;
+
     _iterationsSinceCheck++;
 
     // Fast path: skip check if within current interval (NO async overhead)
@@ -195,6 +209,7 @@ class YieldController {
   ///
   /// Does **not** clear learned history or smoothing buffer.
   void reset() {
+    if (!_enabled) return;
     _iterationsSinceCheck = 0;
     _stopwatch.reset();
   }

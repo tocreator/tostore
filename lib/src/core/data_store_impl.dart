@@ -682,6 +682,7 @@ class DataStoreImpl {
       );
 
       // Initialize YieldController global limit
+      YieldController.globalSettings.enabled = true;
       YieldController.globalSettings.targetBudgetMs = _config!.yieldDurationMs;
 
       final bool isMemoryMode =

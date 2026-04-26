@@ -17,6 +17,14 @@ enum LogLevel {
 
 /// global log config
 class LogConfig {
+  /// Whether logging has been initialized in the current isolate.
+  ///
+  /// Static fields are isolate-local in Dart. The main isolate enables logging
+  /// when database configuration is applied; compute worker isolates keep the
+  /// default disabled state unless explicitly configured.
+  static bool _initializedForCurrentIsolate = false;
+  static bool get initializedForCurrentIsolate => _initializedForCurrentIsolate;
+
   /// enable log
   static bool _enableLog = true;
   static bool get enableLog => _enableLog;
@@ -36,6 +44,7 @@ class LogConfig {
 
   /// Determine whether to show the log based on log type and configured log level
   static bool shouldLogType(LogType type) {
+    if (!_initializedForCurrentIsolate) return false;
     if (!_enableLog) return false;
 
     switch (_logLevel) {
@@ -63,6 +72,7 @@ class LogConfig {
     void Function(String message, LogType type, String label)? onLogHandler,
     String? publicLabel,
   }) {
+    _initializedForCurrentIsolate = true;
     if (enableLog != null) {
       _enableLog = enableLog;
     }
