@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:collection';
+import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
+import '../model/log_config.dart';
 
 class _IsolateTask<R> {
   final Completer<R> completer = Completer<R>();
@@ -104,8 +106,12 @@ class _IsolatePool {
         _sendPorts[id] = message;
         completer.complete(message);
       } else if (message is Map) {
-        // handle the task result
-        _handleTaskResult(id, message);
+        if (message['type'] == 'log') {
+          _handleWorkerLog(message);
+        } else {
+          // handle the task result
+          _handleTaskResult(id, message);
+        }
       }
     });
 
@@ -167,6 +173,7 @@ class _IsolatePool {
         _sendPorts[idleIsolateId]!.send({
           'function': task.function,
           'message': task.message,
+          'logConfig': LogConfig.snapshotForIsolate(),
           'taskId': _taskCount[idleIsolateId], // add task ID for debugging
         });
       }
@@ -224,11 +231,28 @@ class _IsolatePool {
     _initCompleter = null;
     _nextIsolateId = 0;
   }
+
+  void _handleWorkerLog(Map<dynamic, dynamic> message) {
+    final level = message['level'];
+    final text = message['message'];
+    final label = message['label'];
+
+    if (level is! int ||
+        level < 0 ||
+        level >= LogType.values.length ||
+        text is! String ||
+        label is! String) {
+      return;
+    }
+
+    Logger.logFromIsolate(text, LogType.values[level], label);
+  }
 }
 
 /// isolate worker entry point
 void _isolateEntryPoint(SendPort mainSendPort) {
   final receivePort = ReceivePort();
+  Logger.setIsolateLogForwarder(mainSendPort);
 
   // send the SendPort of this isolate back to the main isolate
   mainSendPort.send(receivePort.sendPort);
@@ -238,8 +262,13 @@ void _isolateEntryPoint(SendPort mainSendPort) {
     if (message is Map) {
       final function = message['function'];
       final taskMessage = message['message'];
+      final logConfig = message['logConfig'];
 
       try {
+        if (logConfig is Map) {
+          LogConfig.applyIsolateSnapshot(logConfig);
+        }
+
         // execute the function with minimal overhead
         final result = await function(taskMessage);
         mainSendPort.send({'result': result});

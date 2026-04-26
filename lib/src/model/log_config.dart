@@ -17,14 +17,6 @@ enum LogLevel {
 
 /// global log config
 class LogConfig {
-  /// Whether logging has been initialized in the current isolate.
-  ///
-  /// Static fields are isolate-local in Dart. The main isolate enables logging
-  /// when database configuration is applied; compute worker isolates keep the
-  /// default disabled state unless explicitly configured.
-  static bool _initializedForCurrentIsolate = false;
-  static bool get initializedForCurrentIsolate => _initializedForCurrentIsolate;
-
   /// enable log
   static bool _enableLog = true;
   static bool get enableLog => _enableLog;
@@ -44,7 +36,6 @@ class LogConfig {
 
   /// Determine whether to show the log based on log type and configured log level
   static bool shouldLogType(LogType type) {
-    if (!_initializedForCurrentIsolate) return false;
     if (!_enableLog) return false;
 
     switch (_logLevel) {
@@ -72,7 +63,6 @@ class LogConfig {
     void Function(String message, LogType type, String label)? onLogHandler,
     String? publicLabel,
   }) {
-    _initializedForCurrentIsolate = true;
     if (enableLog != null) {
       _enableLog = enableLog;
     }
@@ -83,6 +73,40 @@ class LogConfig {
       LogConfig.onLogHandler = onLogHandler;
     }
     if (publicLabel != null) {
+      Logger.setConfig(label: publicLabel);
+    }
+  }
+
+  /// A sendable snapshot used to initialize compute worker isolates.
+  static Map<String, Object?> snapshotForIsolate() {
+    return <String, Object?>{
+      'enableLog': _enableLog,
+      'logLevel': _logLevel.index,
+      'publicLabel': Logger.commonLabel,
+    };
+  }
+
+  /// Apply a log configuration snapshot inside a compute worker isolate.
+  ///
+  /// Callback handlers are intentionally not copied because closures are not
+  /// sendable between isolates. Worker logs are forwarded to the main isolate,
+  /// where the configured handler is invoked.
+  static void applyIsolateSnapshot(Map<dynamic, dynamic>? snapshot) {
+    if (snapshot == null) return;
+    final enableLog = snapshot['enableLog'];
+    if (enableLog is bool) {
+      _enableLog = enableLog;
+    }
+
+    final logLevelIndex = snapshot['logLevel'];
+    if (logLevelIndex is int &&
+        logLevelIndex >= 0 &&
+        logLevelIndex < LogLevel.values.length) {
+      _logLevel = LogLevel.values[logLevelIndex];
+    }
+
+    final publicLabel = snapshot['publicLabel'];
+    if (publicLabel is String) {
       Logger.setConfig(label: publicLabel);
     }
   }

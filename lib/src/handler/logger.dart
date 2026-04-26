@@ -13,10 +13,13 @@ enum LogType { info, debug, warn, error }
 class Logger {
   /// common label, for quick search
   static String _commonLabel = InternalConfig.publicLabel;
+  static String get commonLabel => _commonLabel;
 
   /// log handler callback
   static void Function(String message, LogType type, String label)?
       _onLogHandler;
+
+  static dynamic _isolateLogSendPort;
 
   /// config interface
   static void setConfig({
@@ -38,16 +41,25 @@ class Logger {
     }
   }
 
+  /// Configure worker isolates to forward logs back to the main isolate.
+  static void setIsolateLogForwarder(dynamic sendPort) {
+    _isolateLogSendPort = sendPort;
+  }
+
   /// print info log
   static void info(Object? message, {String? label}) {
     if (!LogConfig.shouldLogType(LogType.info)) {
       return;
     }
 
+    final forwardToMain = _isForwardingWorkerLogsToMain;
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-info"
         : "log-info  $label";
+    if (forwardToMain && _forwardToMainIsolate(text, LogType.info, label)) {
+      return;
+    }
     _log(text, label: label);
     _handler(text, LogType.info, label);
   }
@@ -58,10 +70,14 @@ class Logger {
       return;
     }
 
+    final forwardToMain = _isForwardingWorkerLogsToMain;
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-debug"
         : "log-debug  $label";
+    if (forwardToMain && _forwardToMainIsolate(text, LogType.debug, label)) {
+      return;
+    }
     _log(text, label: label);
     _handler(text, LogType.debug, label);
   }
@@ -72,11 +88,15 @@ class Logger {
       return;
     }
 
+    final forwardToMain = _isForwardingWorkerLogsToMain;
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-warn"
         : "log-warn  $label";
-    _log(text, label: "💡  $label");
+    if (forwardToMain && _forwardToMainIsolate(text, LogType.warn, label)) {
+      return;
+    }
+    _log(text, label: _consoleLabel(LogType.warn, label));
     _handler(text, LogType.warn, label);
   }
 
@@ -86,12 +106,60 @@ class Logger {
       return;
     }
 
+    final forwardToMain = _isForwardingWorkerLogsToMain;
     final text = toStringWithAll(message);
     label = label == null || !InternalConfig.showLoggerInternalLabel
         ? "log-error"
         : "log-error  $label";
-    _log(text, label: "🔴  $label");
+    if (forwardToMain && _forwardToMainIsolate(text, LogType.error, label)) {
+      return;
+    }
+    _log(text, label: _consoleLabel(LogType.error, label));
     _handler(text, LogType.error, label);
+  }
+
+  /// Replays a worker-isolate log on the main isolate.
+  static void logFromIsolate(String message, LogType type, String label) {
+    if (!LogConfig.shouldLogType(type)) {
+      return;
+    }
+
+    _log(message, label: _consoleLabel(type, label));
+    _handler(message, type, label);
+  }
+
+  // Static fields are isolate-local. The main isolate never sets this port;
+  // compute workers set it from their entry point so their logs can be replayed
+  // by the main isolate without recursively forwarding main-isolate logs.
+  static bool get _isForwardingWorkerLogsToMain => _isolateLogSendPort != null;
+
+  static bool _forwardToMainIsolate(
+    String message,
+    LogType type,
+    String label,
+  ) {
+    final sendPort = _isolateLogSendPort;
+    if (sendPort == null) return false;
+
+    sendPort.send(<String, Object?>{
+      'type': 'log',
+      'level': type.index,
+      'message': message,
+      'label': label,
+    });
+    return true;
+  }
+
+  static String _consoleLabel(LogType type, String label) {
+    switch (type) {
+      case LogType.warn:
+        return "\u{1F4A1}  $label";
+      case LogType.error:
+        return "\u{1F534}  $label";
+      case LogType.info:
+      case LogType.debug:
+        return label;
+    }
   }
 
   /// unified log handler
