@@ -12,6 +12,7 @@ import '../model/table_op_meta.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/wal_pointer.dart';
+import 'compute/compute_batch_planner.dart';
 import 'yield_controller.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
@@ -397,6 +398,82 @@ class WalManager {
 
   WalManager(this._dataStore) {
     _config = _dataStore.config;
+  }
+
+  int _estimateWalEntryBytes(Map<String, dynamic> entry) {
+    int size = 64;
+    for (final item in entry.entries) {
+      size += item.key.length * 2;
+      final value = item.value;
+      if (value == null) continue;
+      if (value is String) {
+        size += value.length * 2;
+      } else if (value is num || value is bool) {
+        size += 8;
+      } else if (value is Uint8List) {
+        size += value.length;
+      } else if (value is Map) {
+        size += value.length * 48;
+      } else if (value is List) {
+        size += value.length * 16;
+      } else {
+        size += 32;
+      }
+    }
+    return size;
+  }
+
+  Future<List<Uint8List>> _encodeWalEntriesBatch(
+    List<Map<String, dynamic>> entries,
+  ) async {
+    if (entries.isEmpty) return const <Uint8List>[];
+
+    final averageEntryBytes = ComputeBatchPlanner.estimateAverageItemBytes(
+      entries,
+      _estimateWalEntryBytes,
+    );
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: entries.length,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: entries.length,
+      averageItemBytes: averageEntryBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final encoderConfig = EncoderHandler.getCurrentEncodingState();
+
+    final tasks = <ComputeTask<BatchWalEncodeRequest, BatchWalEncodeResult>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(entries.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: batchEncodeWal,
+          message: BatchWalEncodeRequest(
+            entries: entries.sublist(range.start, range.end),
+            encoderConfig: encoderConfig,
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final encodedChunks = <Uint8List>[];
+    final mergeYield = YieldController(
+      'WalManager._encodeWalEntriesBatch',
+    );
+    for (final result in results) {
+      for (final chunk in result.encodedChunks) {
+        await mergeYield.maybeYield();
+        encodedChunks.add(chunk);
+      }
+    }
+    return encodedChunks;
   }
 
   WalMeta get meta => _meta;
@@ -1054,22 +1131,7 @@ class WalManager {
           final String path = entry.key;
           final List<Map<String, dynamic>> rawEntries = entry.value;
 
-          // Encode batch
-          // Use isolate if batch is large enough, satisfying user requirement
-          final useIsolate = rawEntries.length > 100;
-
-          final result = await ComputeManager.run(
-            ComputeTask(
-              function: batchEncodeWal,
-              message: BatchWalEncodeRequest(
-                entries: rawEntries,
-                encoderConfig: EncoderHandler.getCurrentEncodingState(),
-              ),
-            ),
-            useIsolate: useIsolate,
-          );
-
-          final List<Uint8List> chunks = result.encodedChunks;
+          final chunks = await _encodeWalEntriesBatch(rawEntries);
 
           // Combine all binary chunks for this path
           int totalLength = 0;

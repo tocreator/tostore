@@ -11,6 +11,8 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/table_schema.dart';
+import 'compute/compute_batch_planner.dart';
+import 'compute/vector_batch_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
@@ -38,6 +40,269 @@ class VectorIndexManager {
     _partitionManager = NghPartitionManager(_dataStore);
     _graphEngine = NghGraphEngine(_partitionManager);
     _vectorCache = VectorCache();
+  }
+
+  int _estimateVectorPrepareRecordBytes(
+    Map<String, dynamic> record,
+    String fieldName,
+    String? primaryKeyField,
+    int dimensions,
+  ) {
+    int size = 64;
+
+    if (primaryKeyField != null) {
+      final primaryKey = record[primaryKeyField];
+      if (primaryKey != null) {
+        size += primaryKey.toString().length * 2;
+      }
+    }
+
+    final value = record[fieldName];
+    if (value is VectorData) {
+      size += min(value.values.length, dimensions) * 8;
+    } else if (value is List) {
+      size += min(value.length, dimensions) * 8;
+    } else {
+      size += dimensions * 4;
+    }
+
+    return size;
+  }
+
+  int _estimateMinUsefulVectorTaskItems(int dimensions) {
+    if (dimensions >= 1024) return 64;
+    if (dimensions >= 512) return 128;
+    return ComputeBatchPlanner.minUsefulTaskItems;
+  }
+
+  Future<({List<Float32List> vectors, List<String> primaryKeys})>
+      _prepareInsertVectorsBatch({
+    required List<Map<String, dynamic>> records,
+    required String fieldName,
+    required String primaryKeyField,
+    required int dimensions,
+  }) async {
+    if (records.isEmpty) {
+      return (vectors: const <Float32List>[], primaryKeys: const <String>[]);
+    }
+
+    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
+      records,
+      (record) => _estimateVectorPrepareRecordBytes(
+        record,
+        fieldName,
+        primaryKeyField,
+        dimensions,
+      ),
+    );
+    final minUsefulVectorTaskItems =
+        _estimateMinUsefulVectorTaskItems(dimensions);
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: records.length,
+      minUsefulTaskItems: minUsefulVectorTaskItems,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: records.length,
+      averageItemBytes: averageRecordBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+
+    final tasks =
+        <ComputeTask<VectorBatchPrepareRequest, VectorBatchPrepareResult>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: prepareVectorBatchChunk,
+          message: VectorBatchPrepareRequest(
+            records: records.sublist(range.start, range.end),
+            fieldName: fieldName,
+            primaryKeyField: primaryKeyField,
+            dimensions: dimensions,
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final vectors = <Float32List>[];
+    final primaryKeys = <String>[];
+    final mergeYield = YieldController(
+      'VectorIndexManager._prepareInsertVectorsBatch',
+    );
+    for (final result in results) {
+      if (result.vectors.length != result.primaryKeys.length) {
+        throw StateError(
+          'Vector prepare result length mismatch: '
+          'vectors=${result.vectors.length}, '
+          'primaryKeys=${result.primaryKeys.length}',
+        );
+      }
+
+      for (int i = 0; i < result.vectors.length; i++) {
+        await mergeYield.maybeYield();
+        vectors.add(result.vectors[i]);
+        primaryKeys.add(result.primaryKeys[i]);
+      }
+    }
+
+    return (vectors: vectors, primaryKeys: primaryKeys);
+  }
+
+  Future<List<Uint8List>> _quantizeVectorsBatch({
+    required VectorQuantizer quantizer,
+    required List<Float32List> vectors,
+  }) async {
+    if (vectors.isEmpty) return const <Uint8List>[];
+
+    final averageVectorBytes =
+        max(1, quantizer.dimensions * 4 + quantizer.subspaces);
+    final minUsefulVectorTaskItems =
+        _estimateMinUsefulVectorTaskItems(quantizer.dimensions);
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: vectors.length,
+      minUsefulTaskItems: minUsefulVectorTaskItems,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: vectors.length,
+      averageItemBytes: averageVectorBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+
+    final tasks = <ComputeTask<BatchPqEncodeRequest, BatchPqEncodeResult>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(vectors.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: batchPqEncode,
+          message: BatchPqEncodeRequest(
+            vectors: vectors.sublist(range.start, range.end),
+            codebookData: quantizer.codebook.data,
+            subspaces: quantizer.subspaces,
+            centroids: quantizer.centroids,
+            subDimensions: quantizer.subDimensions,
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final pqCodes = <Uint8List>[];
+    final mergeYield = YieldController(
+      'VectorIndexManager._quantizeVectorsBatch',
+      checkInterval: 128,
+      budgetMs: 30,
+    );
+    for (final result in results) {
+      for (final code in result.codes) {
+        await mergeYield.maybeYield();
+        pqCodes.add(code);
+      }
+    }
+    return pqCodes;
+  }
+
+  Future<List<Float32List>> _collectTrainingSamplesBatch({
+    required List<Map<String, dynamic>> inserts,
+    required String fieldName,
+    required int dimensions,
+    int maxSamples = 2500,
+  }) async {
+    if (inserts.isEmpty || maxSamples <= 0) {
+      return const <Float32List>[];
+    }
+
+    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
+      inserts,
+      (record) => _estimateVectorPrepareRecordBytes(
+        record,
+        fieldName,
+        null,
+        dimensions,
+      ),
+    );
+    final minUsefulVectorTaskItems =
+        _estimateMinUsefulVectorTaskItems(dimensions);
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: inserts.length,
+      minUsefulTaskItems: minUsefulVectorTaskItems,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: inserts.length,
+      averageItemBytes: averageRecordBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+
+    final samples = <Float32List>[];
+    final mergeYield = YieldController(
+      'VectorIndexManager._collectTrainingSamplesBatch',
+      checkInterval: 64,
+      budgetMs: 30,
+    );
+    final waveItemCount = max(
+      maxSamples * 2,
+      actualTaskCount * minUsefulVectorTaskItems,
+    );
+
+    int start = 0;
+    while (start < inserts.length && samples.length < maxSamples) {
+      final end = min(start + waveItemCount, inserts.length);
+      final waveRecords = inserts.sublist(start, end);
+      final waveTaskCount =
+          useIsolate ? min(actualTaskCount, waveRecords.length) : 1;
+
+      final tasks =
+          <ComputeTask<VectorBatchPrepareRequest, VectorBatchPrepareResult>>[];
+      for (final range in ComputeBatchPlanner.splitRange(
+          waveRecords.length, waveTaskCount)) {
+        tasks.add(
+          ComputeTask(
+            function: prepareVectorBatchChunk,
+            message: VectorBatchPrepareRequest(
+              records: waveRecords.sublist(range.start, range.end),
+              fieldName: fieldName,
+              primaryKeyField: null,
+              dimensions: dimensions,
+            ),
+          ),
+        );
+      }
+
+      final results =
+          await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+      for (final result in results) {
+        for (final sample in result.vectors) {
+          await mergeYield.maybeYield();
+          samples.add(sample);
+          if (samples.length >= maxSamples) {
+            break;
+          }
+        }
+        if (samples.length >= maxSamples) {
+          break;
+        }
+      }
+
+      start = end;
+    }
+
+    return samples;
   }
 
   // =====================================================================
@@ -100,39 +365,23 @@ class VectorIndexManager {
 
       // ── Process inserts ──
       if (inserts.isNotEmpty) {
-        final vectors = <Float32List>[];
-        final pks = <String>[];
-
-        for (final record in inserts) {
-          await yc.maybeYield();
-          final vectorData = _extractVector(record, fieldName);
-          if (vectorData == null) continue;
-          final pk = record[pkName]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-
-          final f32 = _toFloat32(vectorData, meta.dimensions);
-          vectors.add(f32);
-          pks.add(pk);
-        }
+        final preparedVectors = await _prepareInsertVectorsBatch(
+          records: inserts,
+          fieldName: fieldName,
+          primaryKeyField: pkName,
+          dimensions: meta.dimensions,
+        );
+        final vectors = preparedVectors.vectors;
+        final pks = preparedVectors.primaryKeys;
 
         if (vectors.isNotEmpty) {
           final startNodeId = meta.nextNodeId;
 
           // Isolate: PQ encode only (no file I/O). Graph insert + flush on main.
-          final quantizeResult = await ComputeManager.run(
-            ComputeTask(
-              function: quantizeVectorsForNghTask,
-              message: QuantizeVectorsForNghArgs(
-                pqSubspaces: quantizer.codebook.subspaces,
-                pqCentroids: quantizer.codebook.centroids,
-                pqSubDimensions: quantizer.codebook.subDimensions,
-                pqData: quantizer.codebook.data,
-                vectors: vectors,
-              ),
-            ),
-            useIsolate: vectors.length > 256,
+          final pqCodes = await _quantizeVectorsBatch(
+            quantizer: quantizer,
+            vectors: vectors,
           );
-          final pqCodes = quantizeResult.pqCodes;
 
           // Main isolate: graph insert + flush (all NGH file read/write here)
           final insertResult = await _graphEngine.insertBatch(
@@ -499,19 +748,12 @@ class VectorIndexManager {
     }
 
     // Need to train — collect sample vectors from inserts
-    final samples = <Float32List>[];
-    final trainYc = YieldController(
-      'VectorIndexManager._getOrTrainQuantizer.samples',
-      checkInterval: 50,
-      budgetMs: 30,
+    final samples = await _collectTrainingSamplesBatch(
+      inserts: inserts,
+      fieldName: fieldName,
+      dimensions: meta.dimensions,
+      maxSamples: 2500,
     );
-    for (var si = 0; si < inserts.length && samples.length < 2500; si++) {
-      await trainYc.maybeYield();
-      final record = inserts[si];
-      final vec = _extractVector(record, fieldName);
-      if (vec == null) continue;
-      samples.add(_toFloat32(vec, meta.dimensions));
-    }
 
     if (samples.isEmpty) return null;
 
@@ -1139,18 +1381,6 @@ class VectorIndexManager {
   // =====================================================================
   // Private Helpers
   // =====================================================================
-
-  /// Extract vector data from a record's field value.
-  List<double>? _extractVector(Map<String, dynamic> record, String fieldName) {
-    final value = record[fieldName];
-    if (value == null) return null;
-    if (value is VectorData) return value.values;
-    if (value is List<double>) return value;
-    if (value is List<num>) {
-      return value.map((v) => v.toDouble()).toList(growable: false);
-    }
-    return null;
-  }
 
   /// Convert double list to Float32List, ensuring correct dimensions.
   Float32List _toFloat32(List<double> values, int dimensions) {

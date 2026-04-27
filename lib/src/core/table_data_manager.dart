@@ -20,6 +20,10 @@ import '../model/table_schema.dart';
 import '../model/transaction_models.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
+import 'compute/batch_match_runner.dart';
+import 'compute/compute_batch_planner.dart';
+import 'compute/delete_batch_prepare_compute.dart';
+import 'compute_manager.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'transaction_context.dart';
@@ -151,7 +155,7 @@ class TableDataManager {
     // Reserve a portion for range-partition caches (blocks + sparse index).
     final int maxBytes = max(1, (tableQuota * 0.55).toInt());
     _tableRecordCache = TreeCache<Map<String, dynamic>>(
-      sizeCalculator: _estimateRecordSizeBytes,
+      sizeCalculator: estimateRecordSizeBytes,
       maxByteThreshold: maxBytes,
       minByteThreshold: 50 * 1024 * 1024,
       comparatorFactory: _tableRecordComparatorFactory,
@@ -244,7 +248,7 @@ class TableDataManager {
       _tableRecordCache.put(
         [tableName, pk],
         record,
-        size: _estimateRecordSizeBytes(record),
+        size: estimateRecordSizeBytes(record),
       );
     }
   }
@@ -288,7 +292,7 @@ class TableDataManager {
       }
 
       final value = r;
-      final size = _estimateRecordSizeBytes(value);
+      final size = estimateRecordSizeBytes(value);
       _tableRecordCache.put(key, value, size: size);
     }
   }
@@ -412,7 +416,8 @@ class TableDataManager {
   }
 
   // -------------------- Record size estimation (TableRecordCache) --------------------
-  int _estimateRecordSizeBytes(Map<String, dynamic> record) {
+
+  int estimateRecordSizeBytes(Map<String, dynamic> record) {
     // Lightweight approximation with bounded traversal (avoid deep/full encoding).
     int size = 64; // base overhead
     if (record.isEmpty) return size;
@@ -1447,6 +1452,64 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
+  Future<List<Map<String, dynamic>>> _prepareDeleteBufferRecords({
+    required String tableName,
+    required List<Map<String, dynamic>> records,
+    required String primaryKey,
+    required List<String> requiredFields,
+  }) async {
+    if (records.isEmpty) return const <Map<String, dynamic>>[];
+
+    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
+      records,
+      estimateRecordSizeBytes,
+    );
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: records.length,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: records.length,
+      averageItemBytes: averageRecordBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+
+    final tasks =
+        <ComputeTask<DeleteBatchPrepareRequest, DeleteBatchPrepareResult>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: prepareDeleteBatchChunk,
+          message: DeleteBatchPrepareRequest(
+            tableName: tableName,
+            primaryKeyField: primaryKey,
+            requiredFields: requiredFields,
+            records: records.sublist(range.start, range.end),
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final trimmedRecords = <Map<String, dynamic>>[];
+    final mergeYield = YieldController(
+      'TableDataManager._prepareDeleteBufferRecords',
+    );
+    for (final result in results) {
+      for (final record in result.trimmedRecords) {
+        await mergeYield.maybeYield();
+        trimmedRecords.add(record);
+      }
+    }
+    return trimmedRecords;
+  }
+
   /// Add records to delete buffer - for batch deleting
   Future<void> addToDeleteBuffer(
       String tableName, List<Map<String, dynamic>> records) async {
@@ -1472,29 +1535,12 @@ class TableDataManager {
       return s;
     }();
 
-    final List<Map<String, dynamic>> trimmedRecords = [];
-    final yieldController =
-        YieldController('TableDataManager.addToDeleteBuffer');
-    for (final record in records) {
-      await yieldController.maybeYield();
-      final recordId = record[primaryKey]?.toString();
-      if (recordId == null) {
-        Logger.warn(
-          'Record in table $tableName does not have a primary key value, skipping',
-          label: 'TableDataManager.addToDeleteBuffer',
-        );
-        continue;
-      }
-
-      // Trim record to required fields to reduce WAL footprint.
-      final trimmed = <String, dynamic>{};
-      for (final k in needFields) {
-        if (record.containsKey(k)) {
-          trimmed[k] = record[k];
-        }
-      }
-      trimmedRecords.add(trimmed);
-    }
+    final trimmedRecords = await _prepareDeleteBufferRecords(
+      tableName: tableName,
+      records: records,
+      primaryKey: primaryKey,
+      requiredFields: needFields.toList(growable: false),
+    );
 
     if (trimmedRecords.isNotEmpty) {
       await addBatchToBuffer(
@@ -3321,6 +3367,21 @@ class TableDataManager {
     final results = <Map<String, dynamic>>[];
     // Snapshot values to avoid concurrent modification if yielding
     final recordValues = baseRecords.values.toList(growable: false);
+    if (matcher != null && !trackReadKeys && recordValues.length > 1000) {
+      final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+        schema: schema,
+        tableName: tableName,
+        condition: matcher.condition.build(),
+        records: recordValues,
+        estimateRecordBytes: estimateRecordSizeBytes,
+      );
+      for (final matchedIndex in matchResult.matchedIndices) {
+        await yieldController.maybeYield();
+        results.add(recordValues[matchedIndex]);
+      }
+      return results;
+    }
+
     for (final r in recordValues) {
       await yieldController.maybeYield();
       if (matcher != null && !matcher.matches(r)) continue;

@@ -20,6 +20,9 @@ import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
+import 'compute/compute_batch_planner.dart';
+import 'compute/unique_index_prepare_compute.dart';
+import 'compute_manager.dart';
 import 'data_store_impl.dart';
 import 'io_concurrency_planner.dart';
 import 'table_data_manager.dart';
@@ -55,6 +58,74 @@ class IndexManager {
       '$tableName#$indexName';
   String _getEmptyIndexRepairKey(String tableName, String indexName) =>
       '$tableName#$indexName';
+
+  int _estimateUniqueIndexPrepareRecordBytes(
+    Map<String, dynamic> record,
+    IndexSchema index,
+  ) {
+    return _dataStore.tableDataManager.estimateRecordSizeBytes(record) +
+        (index.fields.length * 64);
+  }
+
+  Future<List<PreparedUniqueIndexEntry>> _prepareUniqueIndexEntriesBatch({
+    required TableSchema schema,
+    required IndexSchema index,
+    required List<Map<String, dynamic>> records,
+    required List<List<String>?>? changedFieldsByRecord,
+  }) async {
+    if (records.isEmpty) {
+      return const <PreparedUniqueIndexEntry>[];
+    }
+
+    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
+      records,
+      (record) => _estimateUniqueIndexPrepareRecordBytes(record, index),
+    );
+    final maxSplittableTaskCount =
+        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+      itemCount: records.length,
+    );
+    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
+      itemCount: records.length,
+      averageItemBytes: averageRecordBytes,
+    );
+    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
+      maxSplittableTaskCount: maxSplittableTaskCount,
+    );
+    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+
+    final tasks =
+        <ComputeTask<UniqueIndexPrepareRequest, UniqueIndexPrepareResult>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: prepareUniqueIndexChunk,
+          message: UniqueIndexPrepareRequest(
+            schema: schema,
+            index: index,
+            records: records.sublist(range.start, range.end),
+            changedFieldsByRecord:
+                changedFieldsByRecord?.sublist(range.start, range.end),
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final merged = <PreparedUniqueIndexEntry>[];
+    final mergeYield =
+        YieldController('IndexManager._prepareUniqueIndexEntriesBatch');
+    for (final result in results) {
+      for (final entry in result.entries) {
+        await mergeYield.maybeYield();
+        merged.add(entry);
+      }
+    }
+    return merged;
+  }
 
   IndexManager(this._dataStore) {
     final res = _dataStore.resourceManager;
@@ -1615,6 +1686,27 @@ class IndexManager {
     final writeBuf = _dataStore.writeBufferManager;
     final violations =
         List<UniqueViolation?>.filled(records.length, null, growable: false);
+    List<List<String>?>? changedFieldsByRecord;
+    if (isUpdate && changedFieldsMap != null) {
+      changedFieldsByRecord =
+          List<List<String>?>.filled(records.length, null, growable: false);
+      final changedFieldsYield = YieldController(
+        'IndexManager.checkUniqueConstraintsBatch.changedFields',
+        checkInterval: 1024,
+      );
+      for (int i = 0; i < records.length; i++) {
+        await changedFieldsYield.maybeYield();
+        final pk = records[i][primaryKey]?.toString();
+        if (pk == null) {
+          continue;
+        }
+        final changed = changedFieldsMap[pk];
+        if (changed == null || changed.isEmpty) {
+          continue;
+        }
+        changedFieldsByRecord[i] = changed.toList(growable: false);
+      }
+    }
 
     // 1) Primary key uniqueness (only for INSERTs with custom PKs).
     // 1) Primary key check (only if not an update of the same record)
@@ -1727,32 +1819,21 @@ class IndexManager {
     for (final idx in uniqueIndexes) {
       final indexName = idx.actualIndexName;
       if (indexName.isEmpty) continue;
+      final preparedEntries = await _prepareUniqueIndexEntriesBatch(
+        schema: schema,
+        index: idx,
+        records: records,
+        changedFieldsByRecord: changedFieldsByRecord,
+      );
 
       // Skip this index entirely if no records have changes that impact it.
       bool hasPotentialCandidate = false;
       for (int i = 0; i < records.length; i++) {
         if (violations[i] != null) continue;
-        final r = records[i];
-
-        // FOR UPDATE: Check if any fields in this index were actually changed.
-        // If changedFieldsMap is null, we assume the index IS impacted (safe fallback).
-        if (isUpdate && changedFieldsMap != null) {
-          final pk = r[primaryKey]?.toString();
-          final changed = changedFieldsMap[pk];
-          if (changed == null) continue; // No changes recorded for this PK
-
-          bool indexImpacted = false;
-          for (final f in idx.fields) {
-            if (changed.contains(f)) {
-              indexImpacted = true;
-              break;
-            }
-          }
-          if (!indexImpacted) continue;
+        if (preparedEntries[i].canonicalKey != null) {
+          hasPotentialCandidate = true;
+          break;
         }
-
-        hasPotentialCandidate = true;
-        break;
       }
       if (!hasPotentialCandidate) continue;
 
@@ -1769,21 +1850,11 @@ class IndexManager {
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
         if (violations[i] != null) continue;
-
-        // FOR UPDATE: Skip if fields in this index didn't change (fallback to true if map is null)
-        if (isUpdate && changedFieldsMap != null) {
-          final r = records[i];
-          final pk = r[primaryKey]?.toString();
-          final changed = changedFieldsMap[pk];
-          if (changed == null || !idx.fields.any((f) => changed.contains(f))) {
-            continue;
-          }
-        }
+        final canKey = preparedEntries[i].canonicalKey;
+        if (canKey == null) continue;
 
         final r = records[i];
         final recordId = r[primaryKey]?.toString();
-        final canKey = schema.createCanonicalIndexKey(idx.fields, r);
-        if (canKey == null) continue;
 
         // A) Intra-batch conflict check
         if (batchSeen.containsKey(canKey)) {
@@ -1833,32 +1904,17 @@ class IndexManager {
         for (int i = 0; i < records.length; i++) {
           await yieldController.maybeYield();
           if (violations[i] != null) continue;
-
-          // FOR UPDATE: Skip if fields in this index didn't change
-          if (isUpdate && changedFieldsMap != null) {
-            final r = records[i];
-            final pk = r[primaryKey]?.toString();
-            final changed = changedFieldsMap[pk];
-            if (changed == null ||
-                !idx.fields.any((f) => changed.contains(f))) {
-              continue;
-            }
-          }
+          final canKey = preparedEntries[i].canonicalKey;
+          if (canKey == null) continue;
 
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
-
-          final vals = <dynamic>[];
-          bool ok = true;
-          for (final f in idx.fields) {
-            final v = r[f];
-            if (v == null) {
-              ok = false;
-              break;
-            }
-            vals.add(v);
-          }
-          if (!ok) continue;
+          final vals = idx.fields.length == 1
+              ? <dynamic>[canKey]
+              : (canKey is List && canKey.length == idx.fields.length
+                  ? List<dynamic>.from(canKey)
+                  : null);
+          if (vals == null) continue;
 
           final cacheKey = <dynamic>[tableName, indexName, ...vals];
           final existingPk = _indexDataCache.get(cacheKey);
@@ -1898,31 +1954,21 @@ class IndexManager {
           if (violations[i] != null) continue;
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
-
-          final vals = <dynamic>[];
-          bool ok = true;
-          for (final f in idx.fields) {
-            final v = r[f];
-            if (v == null) {
-              ok = false;
-              break;
-            }
-            vals.add(v);
-          }
-          if (!ok) continue;
+          final canKey = preparedEntries[i].canonicalKey;
+          if (canKey == null) continue;
 
           final existingPk = await _findExistingPrimaryKeyByConstraint(
             tableName: tableName,
             schema: schema,
             fields: idx.fields,
-            value: idx.fields.length == 1 ? vals.first : vals,
+            value: canKey,
             excludePrimaryKey: recordId,
           );
           if (existingPk != null) {
             violations[i] = UniqueViolation(
               tableName: tableName,
               fields: idx.fields,
-              value: idx.fields.length == 1 ? vals.first : vals,
+              value: canKey,
               indexName: indexName,
               existingPrimaryKey: existingPk,
             );
@@ -1940,38 +1986,10 @@ class IndexManager {
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
         if (violations[i] != null) continue;
+        final encodedKeyBytes = preparedEntries[i].encodedKeyBytes;
+        if (encodedKeyBytes == null) continue;
 
-        final r = records[i];
-        if (isUpdate && changedFieldsMap != null) {
-          final pk = r[primaryKey]?.toString();
-          final changed = changedFieldsMap[pk];
-          if (changed == null || !idx.fields.any((f) => changed.contains(f))) {
-            continue;
-          }
-        }
-
-        final comps = <Uint8List>[];
-        bool ok = true;
-        for (final f in idx.fields) {
-          final v = r[f];
-          if (v == null) {
-            ok = false;
-            break;
-          }
-          final c = schema.encodeFieldComponentToMemComparable(
-            f,
-            v,
-            truncateText: false,
-          );
-          if (c == null) {
-            ok = false;
-            break;
-          }
-          comps.add(c);
-        }
-        if (!ok || comps.isEmpty) continue;
-
-        keyBytes.add(MemComparableKey.encodeTuple(comps));
+        keyBytes.add(encodedKeyBytes);
         recordIdxs.add(i);
       }
 
@@ -2022,12 +2040,14 @@ class IndexManager {
             existingPk,
             transactionId: txId,
           )) {
-            final r = records[i];
-            final vals = idx.fields.map((f) => r[f]).toList(growable: false);
+            final canKey = preparedEntries[i].canonicalKey;
+            if (canKey == null) {
+              continue;
+            }
             violations[i] = UniqueViolation(
               tableName: tableName,
               fields: idx.fields,
-              value: (idx.fields.length == 1) ? vals.first : vals,
+              value: canKey,
               indexName: indexName,
               existingPrimaryKey: existingPk,
             );
@@ -2396,25 +2416,35 @@ class IndexManager {
   }) async {
     if (uniqueIndexes.isEmpty) return;
 
+    final recordList = records is List<Map<String, dynamic>>
+        ? records
+        : records.toList(growable: false);
+    if (recordList.isEmpty) return;
+
     final pkName = schema.primaryKey;
     for (final index in uniqueIndexes) {
       final meta = await getIndexMeta(tableName, index.actualIndexName);
       if (meta == null) continue;
 
+      final preparedEntries = await _prepareUniqueIndexEntriesBatch(
+        schema: schema,
+        index: index,
+        records: recordList,
+        changedFieldsByRecord: null,
+      );
       final keys = <Uint8List>[];
       final owners = <String>[];
       final seenInBatch = <String, String>{};
+      final batchYield =
+          YieldController('IndexManager._validateUniqueRebuildBatch.batch');
 
-      for (final record in records) {
+      for (int i = 0; i < recordList.length; i++) {
+        await batchYield.maybeYield();
+        final record = recordList[i];
         final pk = record[pkName]?.toString();
         if (pk == null || pk.isEmpty) continue;
 
-        final key = encodeIndexKeyFromRecord(
-          schema: schema,
-          meta: meta,
-          record: record,
-          pkValue: pk,
-        );
+        final key = preparedEntries[i].encodedKeyBytes;
         if (key == null || key.isEmpty) continue;
 
         final encodedKey = base64Encode(key);
@@ -2444,7 +2474,10 @@ class IndexManager {
           ) ??
           <String>[];
 
+      final diskYield =
+          YieldController('IndexManager._validateUniqueRebuildBatch.disk');
       for (int i = 0; i < existingOwners.length; i++) {
+        await diskYield.maybeYield();
         final existingOwner = existingOwners[i];
         if (existingOwner == null || existingOwner == owners[i]) {
           continue;

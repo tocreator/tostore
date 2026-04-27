@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../core/compute/batch_match_runner.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
 import '../core/transaction_context.dart';
@@ -1901,6 +1902,7 @@ class QueryExecutor {
       }
       final pkMatcher =
           ValueMatcher.getMatcher(tblSchema.getPrimaryKeyMatcherType());
+      final matcherCondition = matcher?.condition.build();
 
       // Decide whether the requested order can be produced directly by this index scan.
       // If orderBy does NOT match this index, we must scan the full index range and keep
@@ -2034,6 +2036,7 @@ class QueryExecutor {
           final recordByPk = <String, Map<String, dynamic>>{};
           if (isIndexOnlyCoverage) {
             final entries = indexResults.entries!;
+            final virtualRecords = <Map<String, dynamic>>[];
             for (int i = 0; i < entries.length; i++) {
               final entry = entries[i];
               final pk = entry.primaryKey;
@@ -2056,13 +2059,40 @@ class QueryExecutor {
                 virtualRec[indexSchema.fields[j]] = decoded[j];
               }
               virtualRec[tblSchema.primaryKey] = pk;
-
-              if ((matcher == null || matcher.matches(virtualRec)) &&
-                  (filter == null || filter(virtualRec))) {
-                outCount++;
-              }
-              // Always capture the last virtual record for potential resume logic
+              virtualRecords.add(virtualRec);
               recordByPk[pk] = virtualRec;
+            }
+
+            final matchedVirtualIndices = await _matchRecordIndicesIfNeeded(
+              schema: tblSchema,
+              tableName: tableName,
+              matcherCondition: matcherCondition,
+              records: virtualRecords,
+            );
+
+            if (matchedVirtualIndices != null) {
+              final matchedVirtualYieldController =
+                  YieldController('QueryExecutor._performIndexScan.virtual');
+              for (final matchedIndex in matchedVirtualIndices) {
+                await matchedVirtualYieldController.maybeYield();
+                final virtualRec = virtualRecords[matchedIndex];
+                if (filter != null && !filter(virtualRec)) {
+                  continue;
+                }
+                outCount++;
+                if (targetNeed > 0 && outCount >= targetNeed) {
+                  break;
+                }
+              }
+            } else {
+              for (final virtualRec in virtualRecords) {
+                if (filter == null || filter(virtualRec)) {
+                  outCount++;
+                  if (targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                }
+              }
             }
           } else {
             final records = pks.isEmpty
@@ -2081,6 +2111,7 @@ class QueryExecutor {
             }
 
             if (pks.isNotEmpty) {
+              final candidateRecords = <Map<String, dynamic>>[];
               for (final pk in pks) {
                 // Early break when target count reached
                 if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
@@ -2111,15 +2142,56 @@ class QueryExecutor {
                     continue;
                   }
                 }
+                candidateRecords.add(rec);
+              }
 
-                if ((matcher == null || matcher.matches(rec)) &&
-                    (filter == null || filter(rec))) {
+              final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
+                schema: tblSchema,
+                tableName: tableName,
+                matcherCondition: matcherCondition,
+                records: candidateRecords,
+              );
+
+              if (matchedCandidateIndices != null) {
+                final matchedCandidateYieldController = YieldController(
+                    'QueryExecutor._performIndexScan.candidates');
+                for (final matchedIndex in matchedCandidateIndices) {
+                  await matchedCandidateYieldController.maybeYield();
+                  final rec = candidateRecords[matchedIndex];
+                  if (filter != null && !filter(rec)) {
+                    continue;
+                  }
                   if (onlyCount) {
                     outCount++;
+                    if (targetNeed > 0 && outCount >= targetNeed) {
+                      break;
+                    }
                   } else if (aggregator != null) {
                     aggregator.accumulate(rec);
                   } else {
                     out.add(rec);
+                    if (out.length >= targetNeed) {
+                      break;
+                    }
+                  }
+                }
+              } else {
+                for (final rec in candidateRecords) {
+                  if (filter != null && !filter(rec)) {
+                    continue;
+                  }
+                  if (onlyCount) {
+                    outCount++;
+                    if (targetNeed > 0 && outCount >= targetNeed) {
+                      break;
+                    }
+                  } else if (aggregator != null) {
+                    aggregator.accumulate(rec);
+                  } else {
+                    out.add(rec);
+                    if (out.length >= targetNeed) {
+                      break;
+                    }
                   }
                 }
               }
@@ -2290,6 +2362,7 @@ class QueryExecutor {
         }
 
         if (pks.isNotEmpty) {
+          final candidateRecords = <Map<String, dynamic>>[];
           for (final pk in pks) {
             final rec = recordByPk[pk];
             if (rec == null) continue;
@@ -2308,9 +2381,36 @@ class QueryExecutor {
                 continue;
               }
             }
+            candidateRecords.add(rec);
+          }
 
-            if ((matcher == null || matcher.matches(rec)) &&
-                (filter == null || filter(rec))) {
+          final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
+            schema: tblSchema,
+            tableName: tableName,
+            matcherCondition: matcherCondition,
+            records: candidateRecords,
+          );
+
+          if (matchedCandidateIndices != null) {
+            final matchedCandidateYieldController = YieldController(
+                'QueryExecutor._performIndexScan.topKCandidates');
+            for (final matchedIndex in matchedCandidateIndices) {
+              await matchedCandidateYieldController.maybeYield();
+              final rec = candidateRecords[matchedIndex];
+              if (filter != null && !filter(rec)) {
+                continue;
+              }
+              if (onlyCount) {
+                fullOutCount++;
+              } else {
+                selector.offer(rec);
+              }
+            }
+          } else {
+            for (final rec in candidateRecords) {
+              if (filter != null && !filter(rec)) {
+                continue;
+              }
               if (onlyCount) {
                 fullOutCount++;
               } else {
@@ -2357,6 +2457,28 @@ class QueryExecutor {
           filter: filter,
           onlyCount: onlyCount);
     }
+  }
+
+  Future<List<int>?> _matchRecordIndicesIfNeeded({
+    required TableSchema schema,
+    required String tableName,
+    required Map<String, dynamic>? matcherCondition,
+    required List<Map<String, dynamic>> records,
+  }) async {
+    if (records.isEmpty ||
+        matcherCondition == null ||
+        matcherCondition.isEmpty) {
+      return null;
+    }
+
+    final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+      schema: schema,
+      tableName: tableName,
+      condition: matcherCondition,
+      records: records,
+      estimateRecordBytes: _estimateRecordSizeBytes,
+    );
+    return matchResult.matchedIndices;
   }
 
   /// apply sort

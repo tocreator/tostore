@@ -49,12 +49,21 @@ class ComputeManager {
     }
   }
 
-  /// Clamp the maximum number of splittable tasks to the available worker count.
+  /// Clamp the caller-estimated maximum splittable task count by the
+  /// available worker count.
   ///
-  /// Callers should first estimate a reasonable split count for the workload,
-  /// then use this method to cap that count by the current isolate pool size.
-  /// The goal is to keep each batch large enough to justify isolate overhead,
-  /// but this method does not impose any execution time target.
+  /// IMPORTANT:
+  /// - [maxTaskCount] must be the maximum splittable task count.
+  /// - It must NOT be the size of one large task.
+  /// - A practical rule is to estimate [maxTaskCount] so that each split task
+  ///   is expected to cost at least about 30ms of compute time, which is
+  ///   usually enough to amortize isolate overhead.
+  ///
+  /// Example:
+  /// - If 20_000 records can be split into 40 useful tasks (~500 records per
+  ///   task), pass `40`, not `1`.
+  /// - Then [clampTaskCount] will cap `40` by the worker count and return the
+  ///   actual dispatch task count.
   static int clampTaskCount(int maxTaskCount) {
     if (maxTaskCount <= 0) return 1;
     final concurrency = PlatformHandler.recommendedConcurrency;
