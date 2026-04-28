@@ -363,7 +363,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   bool _enableParallel = true; // Whether to enable parallel generation
   int _maxConcurrent = 4; // Maximum parallel count, default is 4
   static const int _minCountPerIsolate =
-      100; // Minimum number of IDs to generate for each isolate
+      300; // Minimum number of IDs to generate for each isolate
 
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
@@ -670,18 +670,19 @@ class TimeBasedIdGenerator implements IdGenerator {
       // Parallel generation control parameters
       final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
 
-      // Calculate the number of IDs to generate for each parallel task based on maximum concurrency and total demand
-      int parallelCount = min(_maxConcurrent, 8); // Maximum 8 parallel tasks
-      // Ensure each isolate at least processes a certain number of IDs
-      parallelCount = min(parallelCount, neededCount ~/ _minCountPerIsolate);
+      final int maxSplittableTaskCount =
+          max(1, neededCount ~/ _minCountPerIsolate);
+      int parallelCount = ComputeManager.clampTaskCount(maxSplittableTaskCount);
+      parallelCount = min(parallelCount, min(_maxConcurrent, 8));
       if (parallelCount < 1) parallelCount = 1;
 
       // Calculate the number of IDs to generate for each isolate
       final idsPerIsolate = neededCount ~/ parallelCount;
       final remainingIds = neededCount % parallelCount;
 
-      // Prepare parallel task list, use Map to store results for sequential merging
-      final tasks = <int, TimeBasedIdGenerateResult>{};
+      // Prepare ordered tasks so results can be merged deterministically.
+      final tasks = <ComputeTask<TimeBasedIdGenerateRequest,
+          TimeBasedIdGenerateResult>>[];
       int currentSequence = _sequenceMap[tableName] ?? 0;
       dynamic currentValue;
 
@@ -714,16 +715,12 @@ class TimeBasedIdGenerator implements IdGenerator {
           isHighGeneration: isHighGeneration,
         );
 
-        // Add task, record task index for order preservation
-        final task = await ComputeManager.run(
+        tasks.add(
           ComputeTask(
             function: generateTimeBasedIds,
             message: request,
           ),
-          useIsolate: true,
         );
-
-        tasks[i] = task;
 
         // Reserve sequence number space for next task
         if (isHighGeneration) {
@@ -756,12 +753,10 @@ class TimeBasedIdGenerator implements IdGenerator {
         }
       }
 
-      // Wait for all tasks to complete and collect results
-      final results = <TimeBasedIdGenerateResult>[];
-      // Process results in order, ensure ID order
-      for (int i = 0; i < parallelCount; i++) {
-        results.add(tasks[i]!);
-      }
+      final results = await ComputeManager.computeBatch(
+        tasks,
+        enableIsolate: true,
+      );
 
       final allGeneratedIds = <String>[];
       dynamic lastValue = currentValue;

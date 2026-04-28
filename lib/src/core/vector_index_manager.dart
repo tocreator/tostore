@@ -86,30 +86,24 @@ class VectorIndexManager {
       return (vectors: const <Float32List>[], primaryKeys: const <String>[]);
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      (record) => _estimateVectorPrepareRecordBytes(
-        record,
-        fieldName,
-        primaryKeyField,
-        dimensions,
-      ),
-    );
     final minUsefulVectorTaskItems =
         _estimateMinUsefulVectorTaskItems(dimensions);
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
       minUsefulTaskItems: minUsefulVectorTaskItems,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        (record) => _estimateVectorPrepareRecordBytes(
+          record,
+          fieldName,
+          primaryKeyField,
+          dimensions,
+        ),
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks =
         <ComputeTask<VectorBatchPrepareRequest, VectorBatchPrepareResult>>[];
@@ -161,23 +155,16 @@ class VectorIndexManager {
   }) async {
     if (vectors.isEmpty) return const <Uint8List>[];
 
-    final averageVectorBytes =
-        max(1, quantizer.dimensions * 4 + quantizer.subspaces);
     final minUsefulVectorTaskItems =
         _estimateMinUsefulVectorTaskItems(quantizer.dimensions);
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: vectors.length,
       minUsefulTaskItems: minUsefulVectorTaskItems,
+      estimateAverageItemBytes: () =>
+          max(1, quantizer.dimensions * 4 + quantizer.subspaces),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: vectors.length,
-      averageItemBytes: averageVectorBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks = <ComputeTask<BatchPqEncodeRequest, BatchPqEncodeResult>>[];
     for (final range
@@ -224,30 +211,24 @@ class VectorIndexManager {
       return const <Float32List>[];
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      inserts,
-      (record) => _estimateVectorPrepareRecordBytes(
-        record,
-        fieldName,
-        null,
-        dimensions,
-      ),
-    );
     final minUsefulVectorTaskItems =
         _estimateMinUsefulVectorTaskItems(dimensions);
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: inserts.length,
       minUsefulTaskItems: minUsefulVectorTaskItems,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        inserts,
+        (record) => _estimateVectorPrepareRecordBytes(
+          record,
+          fieldName,
+          null,
+          dimensions,
+        ),
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: inserts.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final samples = <Float32List>[];
     final mergeYield = YieldController(
@@ -790,7 +771,7 @@ class VectorIndexManager {
         final subspaces = meta.pqSubspaces;
         final subDim = dim ~/ subspaces;
         final k = min(256, n);
-        final futures = <Future<PqSubspaceResult>>[];
+        final tasks = <ComputeTask<PqTrainSubspaceRequest, PqSubspaceResult>>[];
 
         final subYc = YieldController(
           'VectorIndexManager._getOrTrainQuantizer.subSamples',
@@ -810,7 +791,7 @@ class VectorIndexManager {
             }
           }
 
-          futures.add(ComputeManager.run(
+          tasks.add(
             ComputeTask<PqTrainSubspaceRequest, PqSubspaceResult>(
               function: trainPqSubspace,
               message: PqTrainSubspaceRequest(
@@ -822,10 +803,21 @@ class VectorIndexManager {
                 subspaceIndex: m,
               ),
             ),
-          ));
+          );
         }
 
-        final results = await Future.wait(futures);
+        final workerTaskCount =
+            max(1, ComputeManager.clampTaskCount(tasks.length));
+        final results = <PqSubspaceResult>[];
+        for (int start = 0; start < tasks.length; start += workerTaskCount) {
+          final end = min(start + workerTaskCount, tasks.length);
+          results.addAll(
+            await ComputeManager.computeBatch(
+              tasks.sublist(start, end),
+              enableIsolate: true,
+            ),
+          );
+        }
 
         final fullData = Float32List(subspaces * k * subDim);
         for (final res in results) {

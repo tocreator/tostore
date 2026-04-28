@@ -778,9 +778,12 @@ class QueryExecutor {
             return PlanExecutionResult(const [], filteredResults.length, null);
           }
           if (aggregations != null && aggregations.isNotEmpty) {
-            final aggRes = _dataStore.tableDataManager.calculateAggregateResult(
-                filteredResults, aggregations,
-                groupBy: groupBy);
+            final aggRes =
+                await _dataStore.tableDataManager.calculateAggregateResultBatch(
+              filteredResults,
+              aggregations,
+              groupBy: groupBy,
+            );
             return PlanExecutionResult(const [], null, aggRes);
           }
           return PlanExecutionResult(filteredResults);
@@ -1264,8 +1267,12 @@ class QueryExecutor {
     }
 
     if (aggregations != null && aggregations.isNotEmpty) {
-      final aggRes = _dataStore.tableDataManager
-          .calculateAggregateResult(out, aggregations, groupBy: groupBy);
+      final aggRes =
+          await _dataStore.tableDataManager.calculateAggregateResultBatch(
+        out,
+        aggregations,
+        groupBy: groupBy,
+      );
       return TableScanResult(records: const [], aggregateResult: aggRes);
     }
 

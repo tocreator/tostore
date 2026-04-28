@@ -21,6 +21,7 @@ import '../model/table_schema.dart';
 import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import 'compute/compute_batch_planner.dart';
+import 'compute/index_delta_prepare_compute.dart';
 import 'compute/unique_index_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'data_store_impl.dart';
@@ -67,6 +68,183 @@ class IndexManager {
         (index.fields.length * 64);
   }
 
+  int _estimateIndexDeltaRecordBytes(
+    Map<String, dynamic> record,
+    List<String> fields,
+  ) {
+    return _dataStore.tableDataManager.estimateRecordSizeBytes(record) +
+        (fields.length * 64) +
+        96;
+  }
+
+  int _estimateIndexDeltaUpdateBytes(
+    IndexRecordUpdate update,
+    List<String> fields,
+  ) {
+    var size = _dataStore.tableDataManager.estimateRecordSizeBytes(
+          update.newValues,
+        ) +
+        (fields.length * 96) +
+        128;
+
+    final oldValues = update.oldValues;
+    if (oldValues != null) {
+      size += _dataStore.tableDataManager.estimateRecordSizeBytes(oldValues);
+    }
+    final changedFields = update.changedFields;
+    if (changedFields != null) {
+      size += changedFields.length * 24;
+    }
+    return size;
+  }
+
+  int _estimateIndexDeltaAverageItemBytes({
+    required List<Map<String, dynamic>> inserts,
+    required List<Map<String, dynamic>> deletes,
+    required List<IndexRecordUpdate> updates,
+    required List<String> fields,
+  }) {
+    final totalCount = inserts.length + deletes.length + updates.length;
+    if (totalCount <= 0) return 0;
+
+    int weightedBytes = 0;
+    if (inserts.isNotEmpty) {
+      weightedBytes += ComputeBatchPlanner.estimateAverageItemBytes(
+            inserts,
+            (record) => _estimateIndexDeltaRecordBytes(record, fields),
+          ) *
+          inserts.length;
+    }
+    if (deletes.isNotEmpty) {
+      weightedBytes += ComputeBatchPlanner.estimateAverageItemBytes(
+            deletes,
+            (record) => _estimateIndexDeltaRecordBytes(record, fields),
+          ) *
+          deletes.length;
+    }
+    if (updates.isNotEmpty) {
+      weightedBytes += ComputeBatchPlanner.estimateAverageItemBytes(
+            updates,
+            (update) => _estimateIndexDeltaUpdateBytes(update, fields),
+          ) *
+          updates.length;
+    }
+
+    return max(1, (weightedBytes / totalCount).ceil());
+  }
+
+  Future<List<DataBlockEntry>> _prepareIndexWriteDeltasBatch({
+    required TableSchema schema,
+    required String tableName,
+    required String indexName,
+    required String primaryKeyField,
+    required List<String> fields,
+    required bool isUnique,
+    required bool isInternalKvExpiryIndex,
+    required bool isInternalTtlIndex,
+    required String? batchIngestIso,
+    required List<Map<String, dynamic>> inserts,
+    required List<Map<String, dynamic>> deletes,
+    required List<IndexRecordUpdate> updates,
+  }) async {
+    final totalItemCount = inserts.length + deletes.length + updates.length;
+    if (totalItemCount <= 0) return const <DataBlockEntry>[];
+
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
+      itemCount: totalItemCount,
+      minUsefulTaskItems: 256,
+      estimateAverageItemBytes: () => _estimateIndexDeltaAverageItemBytes(
+        inserts: inserts,
+        deletes: deletes,
+        updates: updates,
+        fields: fields,
+      ),
+    );
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
+
+    final tasks =
+        <ComputeTask<IndexDeltaPrepareRequest, IndexDeltaPrepareResult>>[];
+    void addRecordTasks(
+      List<Map<String, dynamic>> records,
+      IndexDeltaOperationKind operationKind,
+    ) {
+      for (final range
+          in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+        tasks.add(
+          ComputeTask(
+            function: prepareIndexDeltaChunk,
+            message: IndexDeltaPrepareRequest(
+              schema: schema,
+              tableName: tableName,
+              indexName: indexName,
+              primaryKeyField: primaryKeyField,
+              fields: fields,
+              isUnique: isUnique,
+              isInternalKvExpiryIndex: isInternalKvExpiryIndex,
+              isInternalTtlIndex: isInternalTtlIndex,
+              batchIngestIso: batchIngestIso,
+              operationKind: operationKind,
+              records: records.sublist(range.start, range.end),
+              updates: const <IndexRecordUpdate>[],
+            ),
+          ),
+        );
+      }
+    }
+
+    void addUpdateTasks(List<IndexRecordUpdate> updateItems) {
+      for (final range in ComputeBatchPlanner.splitRange(
+          updateItems.length, actualTaskCount)) {
+        tasks.add(
+          ComputeTask(
+            function: prepareIndexDeltaChunk,
+            message: IndexDeltaPrepareRequest(
+              schema: schema,
+              tableName: tableName,
+              indexName: indexName,
+              primaryKeyField: primaryKeyField,
+              fields: fields,
+              isUnique: isUnique,
+              isInternalKvExpiryIndex: isInternalKvExpiryIndex,
+              isInternalTtlIndex: isInternalTtlIndex,
+              batchIngestIso: batchIngestIso,
+              operationKind: IndexDeltaOperationKind.update,
+              records: const <Map<String, dynamic>>[],
+              updates: updateItems.sublist(range.start, range.end),
+            ),
+          ),
+        );
+      }
+    }
+
+    if (inserts.isNotEmpty) {
+      addRecordTasks(inserts, IndexDeltaOperationKind.insert);
+    }
+    if (deletes.isNotEmpty) {
+      addRecordTasks(deletes, IndexDeltaOperationKind.delete);
+    }
+    if (updates.isNotEmpty) {
+      addUpdateTasks(updates);
+    }
+
+    if (tasks.isEmpty) return const <DataBlockEntry>[];
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+
+    final deltas = <DataBlockEntry>[];
+    final mergeYield =
+        YieldController('IndexManager._prepareIndexWriteDeltasBatch');
+    for (final result in results) {
+      for (final delta in result.deltas) {
+        await mergeYield.maybeYield();
+        deltas.add(delta);
+      }
+    }
+    return deltas;
+  }
+
   Future<List<PreparedUniqueIndexEntry>> _prepareUniqueIndexEntriesBatch({
     required TableSchema schema,
     required IndexSchema index,
@@ -77,22 +255,16 @@ class IndexManager {
       return const <PreparedUniqueIndexEntry>[];
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      (record) => _estimateUniqueIndexPrepareRecordBytes(record, index),
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        (record) => _estimateUniqueIndexPrepareRecordBytes(record, index),
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks =
         <ComputeTask<UniqueIndexPrepareRequest, UniqueIndexPrepareResult>>[];
@@ -2662,128 +2834,20 @@ class IndexManager {
         // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
         final String? batchIngestIso =
             isInternalTtlIndex ? DateTime.now().toIso8601String() : null;
-
-        Uint8List encodeUniquePutValue(String pk) {
-          final b = utf8.encode(pk);
-          final out = Uint8List(1 + b.length);
-          out[0] = 0;
-          out.setRange(1, out.length, b);
-          return out;
-        }
-
-        Uint8List encodeNonUniquePutValue() => Uint8List.fromList(const [0]);
-
-        Uint8List encodeDeleteValue() => Uint8List.fromList(const [1]);
-
-        Uint8List? encodeIdxKey(
-          Map<String, dynamic> record,
-          String pkValue, {
-          required bool forInsert,
-        }) {
-          if (isInternalKvExpiryIndex) {
-            return _encodeInternalKvExpiryIndexKey(
-              schema,
-              record[SystemTable.keyValueExpiresAtField],
-              pkValue,
-            );
-          }
-
-          if (isInternalTtlIndex) {
-            if (!forInsert || batchIngestIso == null) {
-              // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
-              return null;
-            }
-            final ttlComp = schema.encodeFieldComponentToMemComparable(
-              TableSchema.internalTtlIngestTsMsField,
-              batchIngestIso,
-              truncateText: false,
-            );
-            if (ttlComp == null) return null;
-            final ttlComps = <Uint8List>[ttlComp];
-            if (!isUnique) {
-              ttlComps.add(schema.encodePrimaryKeyComponent(pkValue));
-            }
-            return MemComparableKey.encodeTuple(ttlComps);
-          }
-
-          return encodeIndexKeyFromRecord(
-            schema: schema,
-            meta: meta!,
-            record: record,
-            pkValue: pkValue,
-          );
-        }
-
-        final deltas = <DataBlockEntry>[];
-
-        // Inserts - snapshot verified by caller? `inserts` is List<Map>
-        // Assuming inserts/updates/deletes are safe to iterate directly if local
-        final yieldControl = YieldController('IndexManager.writeChanges');
-
-        for (final r in insertsCopy) {
-          await yieldControl.maybeYield();
-          final pk = r[pkName]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-          final k = encodeIdxKey(r, pk, forInsert: true);
-          if (k == null || k.isEmpty) continue;
-          final v =
-              isUnique ? encodeUniquePutValue(pk) : encodeNonUniquePutValue();
-          deltas.add(DataBlockEntry(k, v));
-        }
-
-        // Deletes (record holds old values)
-        for (final r in deletesCopy) {
-          await yieldControl.maybeYield();
-          final pk = r[pkName]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-          final k = encodeIdxKey(r, pk, forInsert: false);
-          if (k == null || k.isEmpty) continue;
-          deltas.add(DataBlockEntry(k, encodeDeleteValue()));
-        }
-
-        // Updates
-        for (final u in updatesCopy) {
-          await yieldControl.maybeYield();
-          final pk = u.primaryKey.toString();
-          if (pk.isEmpty) continue;
-
-          // Reconstruct old record by overlaying oldValues onto newValues.
-          // This assumes missing keys in oldValues are unchanged.
-          final oldValues = u.oldValues;
-          if (oldValues == null) {
-            // Strict mode: cannot safely maintain indexes without old values.
-            throw StateError(
-                'Index update requires oldValues for $tableName.$indexName (pk=$pk)');
-          }
-
-          final oldRecord = Map<String, dynamic>.from(u.newValues);
-          oldRecord.addAll(oldValues);
-          oldRecord[pkName] = pk;
-          final newRecord = Map<String, dynamic>.from(u.newValues);
-          newRecord[pkName] = pk;
-
-          // If no indexed field changed, skip.
-          try {
-            if (!u.affectsIndexedFields(fields.toSet())) continue;
-          } catch (_) {}
-
-          final oldKey = encodeIdxKey(oldRecord, pk, forInsert: false);
-          final newKey = encodeIdxKey(newRecord, pk, forInsert: false);
-
-          if (oldKey != null &&
-              newKey != null &&
-              MemComparableKey.compare(oldKey, newKey) == 0) {
-            continue;
-          }
-          if (oldKey != null && oldKey.isNotEmpty) {
-            deltas.add(DataBlockEntry(oldKey, encodeDeleteValue()));
-          }
-          if (newKey != null && newKey.isNotEmpty) {
-            final v =
-                isUnique ? encodeUniquePutValue(pk) : encodeNonUniquePutValue();
-            deltas.add(DataBlockEntry(newKey, v));
-          }
-        }
+        final deltas = await _prepareIndexWriteDeltasBatch(
+          schema: schema,
+          tableName: tableName,
+          indexName: indexName,
+          primaryKeyField: pkName,
+          fields: fields,
+          isUnique: isUnique,
+          isInternalKvExpiryIndex: isInternalKvExpiryIndex,
+          isInternalTtlIndex: isInternalTtlIndex,
+          batchIngestIso: batchIngestIso,
+          inserts: insertsCopy,
+          deletes: deletesCopy,
+          updates: updatesCopy,
+        );
 
         if (deltas.isEmpty) {
           return;

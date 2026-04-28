@@ -76,6 +76,11 @@ class ComputeManager {
   /// Callers should split the workload into appropriately sized tasks first,
   /// then optionally use [clampTaskCount] to cap the final task count before
   /// invoking this method. This method focuses on dispatching the prepared
+  /// tasks:
+  /// - when [enableIsolate] is true, tasks are scheduled concurrently through
+  ///   the compute backend
+  /// - when [enableIsolate] is false, tasks are executed sequentially on the
+  ///   current isolate to avoid overlapping compute work on the UI thread
   static Future<List<R>> computeBatch<Q, R>(
     List<ComputeTask<Q, R>> tasks, {
     bool enableIsolate = true,
@@ -83,10 +88,24 @@ class ComputeManager {
   }) async {
     if (tasks.isEmpty) return <R>[];
 
+    if (!enableIsolate) {
+      final results = <R>[];
+      for (final task in tasks) {
+        results.add(
+          await run<Q, R>(
+            task,
+            useIsolate: false,
+            fallbackToMainThread: fallbackToMainThread,
+          ),
+        );
+      }
+      return results;
+    }
+
     final futures = tasks.map(
       (task) => run<Q, R>(
         task,
-        useIsolate: enableIsolate,
+        useIsolate: true,
         fallbackToMainThread: fallbackToMainThread,
       ),
     );

@@ -17,7 +17,7 @@ import '../model/parallel_journal_entry.dart';
 import '../model/stored_value.dart';
 import '../model/table_schema.dart';
 import 'btree_page.dart';
-import 'compute_manager.dart';
+import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
 import 'overflow_manager.dart';
@@ -1159,8 +1159,8 @@ final class TableTreePartitionManager {
         if (pending.isEmpty) return;
 
         final pageSize = meta.btreePageSize;
-
-        final req = BatchBTreePageEncodeRequest(
+        final res = await BTreePageEncodeBatchRunner.encode(
+          enableIsolate: useIsolateForPageEncode,
           pageSize: pageSize,
           encryptionTypeIndex: encTypeIndex,
           encoderConfig: encoderConfig,
@@ -1170,14 +1170,6 @@ final class TableTreePartitionManager {
           pageRedoTreeKindIndex:
               batchContext != null ? PageRedoTreeKind.table.index : null,
           pageRedoTableName: batchContext != null ? tableName : null,
-        );
-
-        final res = await ComputeManager.run(
-          ComputeTask(
-            function: batchEncodeBTreePages,
-            message: req,
-          ),
-          useIsolate: useIsolateForPageEncode,
         );
 
         final bytesList = res.pageBytes;

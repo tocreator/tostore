@@ -16,6 +16,25 @@ class ComputeTaskRange {
   int get length => end - start;
 }
 
+/// Execution plan for a pure-compute batch.
+class ComputeBatchDispatchPlan {
+  final int itemCount;
+  final int averageItemBytes;
+  final bool sampledAverageItemBytes;
+  final bool useIsolate;
+  final int dispatchTaskCount;
+  final int actualTaskCount;
+
+  const ComputeBatchDispatchPlan({
+    required this.itemCount,
+    required this.averageItemBytes,
+    required this.sampledAverageItemBytes,
+    required this.useIsolate,
+    required this.dispatchTaskCount,
+    required this.actualTaskCount,
+  });
+}
+
 /// Shared planner for large pure-compute batches.
 ///
 /// Goals:
@@ -64,14 +83,106 @@ class ComputeBatchPlanner {
     return count == 0 ? 0 : max(1, (total / count).ceil());
   }
 
+  /// Build an execution plan with a very cheap small-data fast path.
+  ///
+  /// Default behavior:
+  /// - If [itemCount] is below [minUsefulTaskItems], return a direct
+  ///   main-thread single-task plan immediately.
+  /// - Only when the item count is large enough do we sample average item
+  ///   bytes and decide isolate usage / task splitting.
+  ///
+  /// This keeps call sites from paying repeated size-estimation overhead for
+  /// obviously tiny workloads that should stay on the main thread.
+  static ComputeBatchDispatchPlan planTaskExecution({
+    required int itemCount,
+    required int Function() estimateAverageItemBytes,
+    int minUsefulTaskItems = ComputeBatchPlanner.minUsefulTaskItems,
+  }) {
+    final safeItemCount = max(0, itemCount);
+    final safeMinUsefulTaskItems = max(1, minUsefulTaskItems);
+
+    if (safeItemCount <= 0) {
+      return const ComputeBatchDispatchPlan(
+        itemCount: 0,
+        averageItemBytes: 0,
+        sampledAverageItemBytes: false,
+        useIsolate: false,
+        dispatchTaskCount: 1,
+        actualTaskCount: 1,
+      );
+    }
+
+    if (safeItemCount < safeMinUsefulTaskItems) {
+      return ComputeBatchDispatchPlan(
+        itemCount: safeItemCount,
+        averageItemBytes: 0,
+        sampledAverageItemBytes: false,
+        useIsolate: false,
+        dispatchTaskCount: 1,
+        actualTaskCount: 1,
+      );
+    }
+
+    final averageItemBytes = max(0, estimateAverageItemBytes());
+    final useIsolate = shouldUseIsolate(
+      itemCount: safeItemCount,
+      averageItemBytes: averageItemBytes,
+      minUsefulTaskItems: safeMinUsefulTaskItems,
+    );
+    final dispatchTaskCount = useIsolate
+        ? estimateDispatchTaskCount(
+            maxSplittableTaskCount: estimateMaxSplittableTaskCount(
+              itemCount: safeItemCount,
+              minUsefulTaskItems: safeMinUsefulTaskItems,
+            ),
+          )
+        : 1;
+
+    return ComputeBatchDispatchPlan(
+      itemCount: safeItemCount,
+      averageItemBytes: averageItemBytes,
+      sampledAverageItemBytes: true,
+      useIsolate: useIsolate,
+      dispatchTaskCount: dispatchTaskCount,
+      actualTaskCount: useIsolate ? dispatchTaskCount : 1,
+    );
+  }
+
   /// Estimate a memory-aware outer batch size for large compute preparation.
   static Future<int> estimateAdaptiveBatchItemCount({
     required int totalItemCount,
     required int averageItemBytes,
     int? maxBatchItemCount,
   }) async {
-    if (totalItemCount <= 0) return 0;
-    if (averageItemBytes <= 0) return min(totalItemCount, 1024);
+    final safeTotalItemCount = max(0, totalItemCount);
+    if (safeTotalItemCount <= 0) return 0;
+
+    final safeAverageItemBytes = max(0, averageItemBytes);
+    final safeMaxBatchItemCount =
+        maxBatchItemCount != null && maxBatchItemCount > 0
+            ? maxBatchItemCount
+            : null;
+    if (safeAverageItemBytes <= 0) {
+      return _clampBatchItemCount(
+        totalItemCount: safeTotalItemCount,
+        batchItemCount: 1024,
+        maxBatchItemCount: safeMaxBatchItemCount,
+      );
+    }
+
+    // Small batches that already fit within the minimum memory budget do not
+    // need an extra available-memory lookup.
+    final effectiveAverageItemBytes = max(
+      safeAverageItemBytes * 3,
+      safeAverageItemBytes + 256,
+    );
+    if (safeTotalItemCount * effectiveAverageItemBytes <= minBatchBytes) {
+      return _clampBatchItemCount(
+        totalItemCount: safeTotalItemCount,
+        batchItemCount: safeTotalItemCount,
+        maxBatchItemCount: safeMaxBatchItemCount,
+      );
+    }
 
     final memoryMB = await PlatformHandler.getAvailableSystemMemoryMB();
     final availableBytes = max(1, memoryMB) * 1024 * 1024;
@@ -82,13 +193,13 @@ class ComputeBatchPlanner {
     // Prepare phase temporarily holds both input records and prepared results.
     // Keep a conservative multiplier here so the memory-aware batch size better
     // reflects the actual resident footprint instead of just raw input bytes.
-    final effectiveAverageItemBytes =
-        max(averageItemBytes * 3, averageItemBytes + 256);
-    int batchItemCount = max(1, targetBatchBytes ~/ effectiveAverageItemBytes);
-    if (maxBatchItemCount != null && maxBatchItemCount > 0) {
-      batchItemCount = min(batchItemCount, maxBatchItemCount);
-    }
-    return min(totalItemCount, batchItemCount);
+    final batchItemCount =
+        max(1, targetBatchBytes ~/ effectiveAverageItemBytes);
+    return _clampBatchItemCount(
+      totalItemCount: safeTotalItemCount,
+      batchItemCount: batchItemCount,
+      maxBatchItemCount: safeMaxBatchItemCount,
+    );
   }
 
   /// Estimate the maximum number of tasks the current workload can be split into.
@@ -108,13 +219,17 @@ class ComputeBatchPlanner {
   static bool shouldUseIsolate({
     required int itemCount,
     required int averageItemBytes,
+    int minUsefulTaskItems = ComputeBatchPlanner.minUsefulTaskItems,
+    int minIsolateBytes = ComputeBatchPlanner.minIsolateBytes,
   }) {
     final safeItemCount = max(0, itemCount);
     final safeAverageItemBytes = max(0, averageItemBytes);
     final estimatedTotalBytes = safeItemCount * safeAverageItemBytes;
+    final safeMinUsefulTaskItems = max(1, minUsefulTaskItems);
+    final safeMinIsolateBytes = max(1, minIsolateBytes);
 
-    return safeItemCount >= minUsefulTaskItems ||
-        estimatedTotalBytes >= minIsolateBytes;
+    return safeItemCount >= safeMinUsefulTaskItems ||
+        estimatedTotalBytes >= safeMinIsolateBytes;
   }
 
   /// Clamp the maximum splittable task count to the actual dispatch count.
@@ -148,5 +263,17 @@ class ComputeBatchPlanner {
       offset = end;
     }
     return ranges;
+  }
+
+  static int _clampBatchItemCount({
+    required int totalItemCount,
+    required int batchItemCount,
+    int? maxBatchItemCount,
+  }) {
+    var safeBatchItemCount = max(1, batchItemCount);
+    if (maxBatchItemCount != null && maxBatchItemCount > 0) {
+      safeBatchItemCount = min(safeBatchItemCount, maxBatchItemCount);
+    }
+    return min(totalItemCount, safeBatchItemCount);
   }
 }

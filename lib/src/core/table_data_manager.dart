@@ -23,6 +23,7 @@ import '../query/query_executor.dart';
 import 'compute/batch_match_runner.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/delete_batch_prepare_compute.dart';
+import 'compute/query_aggregate_compute.dart';
 import 'compute_manager.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
@@ -1460,22 +1461,16 @@ class TableDataManager {
   }) async {
     if (records.isEmpty) return const <Map<String, dynamic>>[];
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      estimateRecordSizeBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        estimateRecordSizeBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks =
         <ComputeTask<DeleteBatchPrepareRequest, DeleteBatchPrepareResult>>[];
@@ -3962,13 +3957,13 @@ class TableDataManager {
       }
 
       if (aggregations != null && aggregations.isNotEmpty) {
-        final agg = QueryAggregator(aggregations, groupBy: groupBy);
-        for (final r in filtered) {
-          agg.accumulate(r);
-        }
         return TableScanResult(
           records: const [],
-          aggregateResult: agg.result,
+          aggregateResult: await calculateAggregateResultBatch(
+            filtered,
+            aggregations,
+            groupBy: groupBy,
+          ),
         );
       }
 
@@ -4294,8 +4289,11 @@ class TableDataManager {
       if (aggregations != null && aggregations.isNotEmpty) {
         return TableScanResult(
           records: const [],
-          aggregateResult:
-              calculateAggregateResult(out, aggregations, groupBy: groupBy),
+          aggregateResult: await calculateAggregateResultBatch(
+            out,
+            aggregations,
+            groupBy: groupBy,
+          ),
         );
       }
       return TableScanResult(
@@ -4396,8 +4394,11 @@ class TableDataManager {
     if (aggregations != null && aggregations.isNotEmpty) {
       return TableScanResult(
         records: const [],
-        aggregateResult: calculateAggregateResult(sortedList, aggregations,
-            groupBy: groupBy),
+        aggregateResult: await calculateAggregateResultBatch(
+          sortedList,
+          aggregations,
+          groupBy: groupBy,
+        ),
       );
     }
     return TableScanResult(
@@ -4413,6 +4414,59 @@ class TableDataManager {
       agg.accumulate(r);
     }
     return agg.result;
+  }
+
+  Future<dynamic> calculateAggregateResultBatch(
+    List<Map<String, dynamic>> records,
+    List<QueryAggregation> aggregations, {
+    List<String>? groupBy,
+  }) async {
+    if (records.isEmpty || aggregations.isEmpty) {
+      return calculateAggregateResult(records, aggregations, groupBy: groupBy);
+    }
+
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
+      itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        estimateRecordSizeBytes,
+      ),
+    );
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
+
+    if (!useIsolate && actualTaskCount <= 1) {
+      return calculateAggregateResult(records, aggregations, groupBy: groupBy);
+    }
+
+    final tasks =
+        <ComputeTask<QueryAggregateChunkRequest, QueryAggregationPartial>>[];
+    for (final range
+        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: aggregateQueryChunk,
+          message: QueryAggregateChunkRequest(
+            records: records.sublist(range.start, range.end),
+            aggregations: aggregations,
+            groupBy: groupBy,
+          ),
+        ),
+      );
+    }
+
+    final partials =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+    final aggregator = QueryAggregator(aggregations, groupBy: groupBy);
+    final mergeYield = YieldController(
+      'TableDataManager.calculateAggregateResultBatch.merge',
+    );
+    for (final partial in partials) {
+      await mergeYield.maybeYield();
+      aggregator.mergePartial(partial);
+    }
+    return aggregator.result;
   }
 }
 

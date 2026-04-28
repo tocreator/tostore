@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - Enhanced system table protection to prevent accidental manual deletion/clearing of critical internal tables.
 - Optimized query channel performance, significantly improving the performance of data operations including queries, bulk inserts, and bulk updates.
 - Optimized resource-aware scheduling for improved resource management.
+- Optimized dense computation and parallel thread scheduling for better isolate dispatch efficiency and high-volume batch processing performance.
 
 
 

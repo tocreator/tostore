@@ -1909,22 +1909,16 @@ class DataStoreImpl {
       return const <BatchInsertPreparedRecord>[];
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      tableDataManager.estimateRecordSizeBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        tableDataManager.estimateRecordSizeBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final skipPrimaryKeyFormatChecks = List<bool>.generate(
         records.length, (i) => autoPkRecords.contains(records[i]),
@@ -1970,22 +1964,16 @@ class DataStoreImpl {
       return const <IdentifierValidationRecordResult>[];
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      tableDataManager.estimateRecordSizeBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        tableDataManager.estimateRecordSizeBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks = <ComputeTask<BatchIdentifierValidationRequest,
         BatchIdentifierValidationResult>>[];
@@ -2061,20 +2049,13 @@ class DataStoreImpl {
       );
     }
 
-    final averageRecordBytes =
-        _estimateAverageUpdatePrepareBytes(records, existingRecords);
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          _estimateAverageUpdatePrepareBytes(records, existingRecords),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks =
         <ComputeTask<BatchUpdatePrepareRequest, BatchUpdatePrepareResult>>[];
@@ -2152,22 +2133,16 @@ class DataStoreImpl {
         )
         .toList(growable: false);
 
-    final averageItemBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      kvItems,
-      _estimateKeyValueBatchItemBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: kvItems.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        kvItems,
+        _estimateKeyValueBatchItemBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: kvItems.length,
-      averageItemBytes: averageItemBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks = <ComputeTask<KeyValueBatchPrepareRequest,
         KeyValueBatchPrepareResult>>[];
@@ -2214,22 +2189,16 @@ class DataStoreImpl {
       return const <UniformUpdatePreparedRecord>[];
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      existingRecords,
-      tableDataManager.estimateRecordSizeBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: existingRecords.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        existingRecords,
+        tableDataManager.estimateRecordSizeBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: existingRecords.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
 
     final tasks = <ComputeTask<UniformUpdatePrepareRequest,
         UniformUpdatePrepareResult>>[];
@@ -4768,28 +4737,40 @@ class DataStoreImpl {
         // Keep buffer/WAL flushes small, but let the pure-compute prepare stage
         // use larger memory-aware windows so it can be split across isolates.
         const int bufferBatchSize = 10000;
-        final int averageRecordBytes =
-            ComputeBatchPlanner.estimateAverageItemBytes(
-          recordsToProcess,
-          tableDataManager.estimateRecordSizeBytes,
-        );
+        const int directPrepareBatchItemThreshold = 500;
+        int? averageRecordBytes;
+
+        int resolveAverageRecordBytes() {
+          return averageRecordBytes ??=
+              ComputeBatchPlanner.estimateAverageItemBytes(
+            recordsToProcess,
+            tableDataManager.estimateRecordSizeBytes,
+          );
+        }
 
         int start = 0;
         while (start < recordsToProcess.length) {
           final int remainingRecordCount = recordsToProcess.length - start;
-          final remainingDispatchTaskCount =
-              ComputeBatchPlanner.estimateDispatchTaskCount(
-            maxSplittableTaskCount:
-                ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+          final int prepareBatchSize;
+          if (remainingRecordCount <= directPrepareBatchItemThreshold) {
+            prepareBatchSize = remainingRecordCount;
+          } else {
+            final remainingDispatchPlan = ComputeBatchPlanner.planTaskExecution(
               itemCount: remainingRecordCount,
-            ),
-          );
-          final int prepareBatchSize =
-              await ComputeBatchPlanner.estimateAdaptiveBatchItemCount(
-            totalItemCount: remainingRecordCount,
-            averageItemBytes: averageRecordBytes,
-            maxBatchItemCount: bufferBatchSize * remainingDispatchTaskCount,
-          );
+              estimateAverageItemBytes: resolveAverageRecordBytes,
+            );
+            final effectiveAverageRecordBytes =
+                remainingDispatchPlan.sampledAverageItemBytes
+                    ? remainingDispatchPlan.averageItemBytes
+                    : resolveAverageRecordBytes();
+            prepareBatchSize =
+                await ComputeBatchPlanner.estimateAdaptiveBatchItemCount(
+              totalItemCount: remainingRecordCount,
+              averageItemBytes: effectiveAverageRecordBytes,
+              maxBatchItemCount:
+                  bufferBatchSize * remainingDispatchPlan.actualTaskCount,
+            );
+          }
           final int end =
               min(start + max(1, prepareBatchSize), recordsToProcess.length);
           final currentRecords = recordsToProcess.sublist(start, end);

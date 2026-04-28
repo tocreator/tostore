@@ -50,6 +50,32 @@ class _AggState {
   int countAgg = 0;
 }
 
+class QueryAggregationStateSnapshot {
+  final num sumVal;
+  final num minVal;
+  final num maxVal;
+  final int countAgg;
+
+  const QueryAggregationStateSnapshot({
+    required this.sumVal,
+    required this.minVal,
+    required this.maxVal,
+    required this.countAgg,
+  });
+}
+
+class QueryAggregationPartial {
+  final List<QueryAggregationStateSnapshot> singleState;
+  final Map<String, List<QueryAggregationStateSnapshot>> groupedState;
+  final Map<String, Map<String, dynamic>> groupKeys;
+
+  const QueryAggregationPartial({
+    required this.singleState,
+    required this.groupedState,
+    required this.groupKeys,
+  });
+}
+
 class QueryAggregator {
   final List<QueryAggregation> aggregations;
   final List<String>? groupBy;
@@ -140,6 +166,79 @@ class QueryAggregator {
     final val = _extractValue(row, fieldName);
     if (val is num) return val;
     return null;
+  }
+
+  QueryAggregationPartial snapshot() {
+    return QueryAggregationPartial(
+      singleState: _singleState
+          .map(
+            (state) => QueryAggregationStateSnapshot(
+              sumVal: state.sumVal,
+              minVal: state.minVal,
+              maxVal: state.maxVal,
+              countAgg: state.countAgg,
+            ),
+          )
+          .toList(growable: false),
+      groupedState: {
+        for (final entry in _groupedState.entries)
+          entry.key: entry.value
+              .map(
+                (state) => QueryAggregationStateSnapshot(
+                  sumVal: state.sumVal,
+                  minVal: state.minVal,
+                  maxVal: state.maxVal,
+                  countAgg: state.countAgg,
+                ),
+              )
+              .toList(growable: false),
+      },
+      groupKeys: {
+        for (final entry in _groupKeys.entries)
+          entry.key: Map<String, dynamic>.from(entry.value),
+      },
+    );
+  }
+
+  void mergePartial(QueryAggregationPartial partial) {
+    if (groupBy == null || groupBy!.isEmpty) {
+      _mergeStateSnapshots(_singleState, partial.singleState);
+      return;
+    }
+
+    for (final entry in partial.groupedState.entries) {
+      final states = _groupedState.putIfAbsent(
+        entry.key,
+        () => List.generate(aggregations.length, (_) => _AggState()),
+      );
+      final keyData = partial.groupKeys[entry.key];
+      if (keyData != null && !_groupKeys.containsKey(entry.key)) {
+        _groupKeys[entry.key] = Map<String, dynamic>.from(keyData);
+      }
+      _mergeStateSnapshots(states, entry.value);
+    }
+  }
+
+  void _mergeStateSnapshots(
+    List<_AggState> target,
+    List<QueryAggregationStateSnapshot> source,
+  ) {
+    final int len =
+        target.length < source.length ? target.length : source.length;
+    for (int i = 0; i < len; i++) {
+      final dst = target[i];
+      final src = source[i];
+      dst.sumVal += src.sumVal;
+      if (src.countAgg > 0) {
+        if (src.minVal < dst.minVal) {
+          dst.minVal = src.minVal;
+        }
+        if (src.maxVal > dst.maxVal) {
+          dst.maxVal = src.maxVal;
+        }
+      }
+      dst.countAgg += src.countAgg;
+    }
   }
 
   // Used for single aggregation (backward compatibility)

@@ -13,6 +13,7 @@ import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/wal_pointer.dart';
 import 'compute/compute_batch_planner.dart';
+import 'compute/wal_decode_batch_runner.dart';
 import 'yield_controller.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
@@ -428,22 +429,16 @@ class WalManager {
   ) async {
     if (entries.isEmpty) return const <Uint8List>[];
 
-    final averageEntryBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      entries,
-      _estimateWalEntryBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: entries.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        entries,
+        _estimateWalEntryBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: entries.length,
-      averageItemBytes: averageEntryBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final actualTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final actualTaskCount = dispatchPlan.actualTaskCount;
     final encoderConfig = EncoderHandler.getCurrentEncodingState();
 
     final tasks = <ComputeTask<BatchWalEncodeRequest, BatchWalEncodeResult>>[];
@@ -1386,7 +1381,12 @@ class WalManager {
       if (fullData.isEmpty) {
         return WalPointer(partitionIndex: pIdx, entrySeq: 0);
       }
-      final allEntries = await WalEncoder.decodeFile(fullData, pIdx);
+      final encoderConfig = EncoderHandler.getCurrentEncodingState();
+      final allEntries = await WalDecodeBatchRunner.decodeFile(
+        fileBytes: fullData,
+        partitionIndex: pIdx,
+        encoderConfig: encoderConfig,
+      );
       return WalPointer(partitionIndex: pIdx, entrySeq: allEntries.length);
     } catch (e) {
       Logger.warn('readLastWalPointer failed: $e', label: 'WalManager');

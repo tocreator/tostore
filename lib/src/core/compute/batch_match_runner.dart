@@ -31,22 +31,16 @@ class ConditionBatchMatcher {
       );
     }
 
-    final averageRecordBytes = ComputeBatchPlanner.estimateAverageItemBytes(
-      records,
-      estimateRecordBytes,
-    );
-    final maxSplittableTaskCount =
-        ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        estimateRecordBytes,
+      ),
     );
-    final useIsolate = ComputeBatchPlanner.shouldUseIsolate(
-      itemCount: records.length,
-      averageItemBytes: averageRecordBytes,
-    );
-    final dispatchTaskCount = ComputeBatchPlanner.estimateDispatchTaskCount(
-      maxSplittableTaskCount: maxSplittableTaskCount,
-    );
-    final workerTaskCount = useIsolate ? dispatchTaskCount : 1;
+    final useIsolate = dispatchPlan.useIsolate;
+    final workerTaskCount = dispatchPlan.actualTaskCount;
 
     if (maxMatchCount == null) {
       final ranges =
@@ -64,8 +58,14 @@ class ConditionBatchMatcher {
       return _mergeResults(ranges, results);
     }
 
-    final splitTaskCount =
-        useIsolate ? max(workerTaskCount, maxSplittableTaskCount) : 1;
+    final splitTaskCount = useIsolate
+        ? max(
+            workerTaskCount,
+            ComputeBatchPlanner.estimateMaxSplittableTaskCount(
+              itemCount: records.length,
+            ),
+          )
+        : 1;
     final ranges =
         ComputeBatchPlanner.splitRange(records.length, splitTaskCount);
     final mergeYieldController =

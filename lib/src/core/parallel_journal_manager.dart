@@ -10,9 +10,7 @@ import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
-import '../handler/wal_encoder.dart';
 import '../model/buffer_entry.dart';
-import '../model/encoder_config.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/meta_info.dart';
@@ -20,7 +18,7 @@ import '../model/parallel_journal_entry.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import 'btree_page.dart';
-import 'compute_manager.dart';
+import 'compute/wal_decode_batch_runner.dart';
 import 'data_store_impl.dart';
 import 'io_concurrency_planner.dart';
 import 'page_redo_log_codec.dart';
@@ -990,6 +988,7 @@ class ParallelJournalManager {
               .add(op.cutoff);
         }
       } catch (_) {}
+      final encoderConfig = EncoderHandler.getCurrentEncodingState();
       final partitionYieldController = YieldController(
           'ParallelJournalManager._recoverFromWal.partition',
           checkInterval: 1);
@@ -1031,18 +1030,10 @@ class ParallelJournalManager {
 
           // Decode all entries from file using isolate for performance
           // Pass partition index for AAD verification
-          final request = WalDecodeRequest(
+          final entries = await WalDecodeBatchRunner.decodeFile(
             fileBytes: fileBytes,
             partitionIndex: p,
-            encoderConfig: EncoderHandler.getCurrentEncodingState(),
-          );
-
-          final entries = await ComputeManager.run(
-            ComputeTask(
-              function: _walDecodeTask,
-              message: request,
-            ),
-            useIsolate: fileBytes.length > 4096,
+            encoderConfig: encoderConfig,
           );
 
           // Process each entry
@@ -1903,6 +1894,7 @@ class ParallelJournalManager {
         );
       }
       final cap = _dataStore.config.logPartitionCycle;
+      final encoderConfig = EncoderHandler.getCurrentEncodingState();
       int p = startP;
       bool first = true;
       while (true) {
@@ -1942,7 +1934,11 @@ class ParallelJournalManager {
 
           // Decode all entries from file using length-prefix format
           // Pass partition index for AAD verification
-          final entries = await WalEncoder.decodeFile(fileBytes, p);
+          final entries = await WalDecodeBatchRunner.decodeFile(
+            fileBytes: fileBytes,
+            partitionIndex: p,
+            encoderConfig: encoderConfig,
+          );
 
           // Process each entry
           final yieldController =
@@ -2599,24 +2595,6 @@ class _WalOp {
   final Map<String, dynamic>? oldValues;
   final WalPointer? walPointer;
   _WalOp(this.op, this.data, {this.oldValues, this.walPointer});
-}
-
-class WalDecodeRequest {
-  final Uint8List fileBytes;
-  final int partitionIndex;
-  final EncoderConfig encoderConfig;
-
-  WalDecodeRequest({
-    required this.fileBytes,
-    required this.partitionIndex,
-    required this.encoderConfig,
-  });
-}
-
-Future<List<Map<String, dynamic>>> _walDecodeTask(
-    WalDecodeRequest request) async {
-  EncoderHandler.setEncodingState(request.encoderConfig);
-  return WalEncoder.decodeFile(request.fileBytes, request.partitionIndex);
 }
 
 class _WalRange {
