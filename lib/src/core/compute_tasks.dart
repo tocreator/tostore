@@ -1063,6 +1063,78 @@ class _IsolateBase62Encoder {
 Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
     TimeBasedIdGenerateRequest request) async {
   try {
+    // Create necessary constants and caches
+    const int maxSequence = 99999; // Sequence number limit
+    const int epochStartSeconds = 441763200; // Timestamp start point
+
+    Future<int> waitNextTimestamp(int lastTimestamp) async {
+      await Future.delayed(const Duration(milliseconds: 1));
+      int timestamp =
+          (DateTime.now().millisecondsSinceEpoch ~/ 1000) - epochStartSeconds;
+
+      if (timestamp > lastTimestamp) {
+        return timestamp;
+      }
+
+      int attempts = 1;
+      int delayMs = 1;
+      while (timestamp <= lastTimestamp && attempts < 200) {
+        attempts++;
+        delayMs = min(delayMs + 1, 50);
+        await Future.delayed(Duration(milliseconds: delayMs));
+        timestamp =
+            (DateTime.now().millisecondsSinceEpoch ~/ 1000) - epochStartSeconds;
+      }
+
+      return timestamp > lastTimestamp ? timestamp : lastTimestamp + 1;
+    }
+
+    Future<String> waitNextSecond(String lastDate) async {
+      await Future.delayed(const Duration(milliseconds: 1));
+
+      String buildNowDateString() {
+        final now = DateTime.now();
+        return '${now.year}'
+            '${now.month.toString().padLeft(2, '0')}'
+            '${now.day.toString().padLeft(2, '0')}'
+            '${now.hour.toString().padLeft(2, '0')}'
+            '${now.minute.toString().padLeft(2, '0')}'
+            '${now.second.toString().padLeft(2, '0')}';
+      }
+
+      String dateString = buildNowDateString();
+      if (dateString.compareTo(lastDate) > 0) {
+        return dateString;
+      }
+
+      int attempts = 1;
+      int delayMs = 1;
+      while (dateString.compareTo(lastDate) <= 0 && attempts < 200) {
+        attempts++;
+        delayMs = min(delayMs + 1, 50);
+        await Future.delayed(Duration(milliseconds: delayMs));
+        dateString = buildNowDateString();
+      }
+
+      if (dateString.compareTo(lastDate) > 0) {
+        return dateString;
+      }
+
+      try {
+        final fmt =
+            '${lastDate.substring(0, 8)}T${lastDate.substring(8, 10)}:${lastDate.substring(10, 12)}:${lastDate.substring(12, 14)}';
+        final dt = DateTime.parse(fmt).add(const Duration(seconds: 1));
+        return '${dt.year}'
+            '${dt.month.toString().padLeft(2, '0')}'
+            '${dt.day.toString().padLeft(2, '0')}'
+            '${dt.hour.toString().padLeft(2, '0')}'
+            '${dt.minute.toString().padLeft(2, '0')}'
+            '${dt.second.toString().padLeft(2, '0')}';
+      } catch (_) {
+        return buildNowDateString();
+      }
+    }
+
     // Create new random number seed for Random
     final random = Random(DateTime.now().millisecondsSinceEpoch);
 
@@ -1074,10 +1146,6 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
     dynamic currentValue = request.startValue;
     int sequence = request.startSequence;
     dynamic workingValue = currentValue;
-
-    // Create necessary constants and caches
-    const int maxSequence = 99999; // Sequence number limit
-    const int epochStartSeconds = 441763200; // Timestamp start point
 
     // Calculate nodeId digits
     int nodeIdDigits = 1;
@@ -1157,9 +1225,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
           // Check if sequence number exceeds limit
           if (sequence > maxSequence) {
-            // Sequence number insufficient, wait for next timestamp
-            workingValue = (DateTime.now().millisecondsSinceEpoch ~/ 1000) -
-                epochStartSeconds;
+            // Sequence number insufficient, move to a strictly newer timestamp.
+            workingValue = await waitNextTimestamp(workingValue as int);
             sequence = random.nextInt(1000) + 1;
           }
 
@@ -1181,6 +1248,7 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           numericIds.add(idValue);
         }
       }
+      currentValue = workingValue;
     } else if (request.keyType == PrimaryKeyType.datePrefixed) {
       // Date prefixed ID generation logic
       String dateString = workingValue as String;
@@ -1237,14 +1305,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
           // Check if sequence number exceeds limit
           if (sequence > maxSequence) {
-            // Sequence number insufficient, use current date
-            final now = DateTime.now();
-            dateString = '${now.year}'
-                '${now.month.toString().padLeft(2, '0')}'
-                '${now.day.toString().padLeft(2, '0')}'
-                '${now.hour.toString().padLeft(2, '0')}'
-                '${now.minute.toString().padLeft(2, '0')}'
-                '${now.second.toString().padLeft(2, '0')}';
+            // Sequence number insufficient, move to a strictly newer second.
+            dateString = await waitNextSecond(dateString);
             sequence = random.nextInt(1000) + 1;
           }
 

@@ -359,11 +359,11 @@ class TimeBasedIdGenerator implements IdGenerator {
   static final Map<String, DateTime> _lastInstanceAccessTime =
       {}; // record last access time of instance
 
-  // Parallel generation control related properties
+  // Isolate batch generation control related properties
   bool _enableParallel = true; // Whether to enable parallel generation
   int _maxConcurrent = 4; // Maximum parallel count, default is 4
   static const int _minCountPerIsolate =
-      300; // Minimum number of IDs to generate for each isolate
+      100; // Minimum number of IDs to generate for each isolate
 
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
@@ -545,14 +545,17 @@ class TimeBasedIdGenerator implements IdGenerator {
         final startTime = DateTime.now();
         int totalGenerated = 0;
 
-        // Check if parallel generation conditions are met
-        final canUseParallel =
-            _enableParallel && neededCount >= _minCountPerIsolate * 2;
+        // Offload a large ID batch to a single isolate only when it can
+        // amortize isolate startup and message transfer overhead.
+        final canUseIsolateBatch = _enableParallel &&
+            _maxConcurrent > 0 &&
+            neededCount >= _minCountPerIsolate * 2;
 
-        if (canUseParallel) {
-          // Parallel generate IDs
+        if (canUseIsolateBatch) {
+          // Generate one full batch in a single isolate to preserve
+          // sequence semantics and avoid cross-task range overlap.
           final generatedIds =
-              await _generateIdsInParallel(neededCount, latestRecentTotal);
+              await _generateIdsInIsolateBatch(neededCount, latestRecentTotal);
 
           // Add generated IDs to ID pool
           if (generatedIds.isNotEmpty) {
@@ -568,7 +571,7 @@ class TimeBasedIdGenerator implements IdGenerator {
                 duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
 
             Logger.debug(
-                'ID parallel generated: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
+                'ID isolate batch generated: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
                 'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
                 label: 'TimeBasedIdGenerator._refillIdPool');
           }
@@ -663,144 +666,65 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
   }
 
-  /// Parallel generate IDs
-  Future<List<String>> _generateIdsInParallel(
+  /// Generate one full ID batch in a single isolate.
+  ///
+  /// The name is kept for compatibility with existing call sites, but the
+  /// implementation intentionally avoids splitting the batch across multiple
+  /// tasks so timestamp/date sequence allocation stays reliable.
+  Future<List<String>> _generateIdsInIsolateBatch(
       int neededCount, int recentTotal) async {
     try {
-      // Parallel generation control parameters
       final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
+      final startSequence = _sequenceMap[tableName] ?? 0;
+      dynamic startValue;
+      bool useNewTimestamp = false;
 
-      final int maxSplittableTaskCount =
-          max(1, neededCount ~/ _minCountPerIsolate);
-      int parallelCount = ComputeManager.clampTaskCount(maxSplittableTaskCount);
-      parallelCount = min(parallelCount, min(_maxConcurrent, 8));
-      if (parallelCount < 1) parallelCount = 1;
-
-      // Calculate the number of IDs to generate for each isolate
-      final idsPerIsolate = neededCount ~/ parallelCount;
-      final remainingIds = neededCount % parallelCount;
-
-      // Prepare ordered tasks so results can be merged deterministically.
-      final tasks = <ComputeTask<TimeBasedIdGenerateRequest,
-          TimeBasedIdGenerateResult>>[];
-      int currentSequence = _sequenceMap[tableName] ?? 0;
-      dynamic currentValue;
-
-      // Get current base value
       if (keyType == PrimaryKeyType.timestampBased ||
           keyType == PrimaryKeyType.shortCode) {
-        currentValue = _getCurrentLogicalTimestamp();
+        final currentTimestamp = _getCurrentLogicalTimestamp();
+        final lastTimestamp = _lastValueMap[tableName] ?? currentTimestamp;
+        useNewTimestamp =
+            currentTimestamp > (lastTimestamp + 60) || !isHighGeneration;
+        startValue = useNewTimestamp ? currentTimestamp : lastTimestamp;
       } else {
-        currentValue = _getCurrentDateString();
+        final currentDateString = _getCurrentDateString();
+        final lastDate = _lastValueMap[tableName] ?? currentDateString;
+        useNewTimestamp =
+            currentDateString.compareTo(lastDate) != 0 || !isHighGeneration;
+        startValue = useNewTimestamp ? currentDateString : lastDate;
       }
 
-      // Create multiple generation tasks
-      for (int i = 0; i < parallelCount; i++) {
-        // Calculate the number of IDs to generate for this task
-        final countForThisIsolate = i == parallelCount - 1
-            ? idsPerIsolate + remainingIds
-            : idsPerIsolate;
-
-        // Create request
-        final request = TimeBasedIdGenerateRequest(
-          keyType: keyType,
-          nodeConfig: nodeConfig,
-          tableName: tableName,
-          count: countForThisIsolate,
-          startValue: currentValue,
-          startSequence: currentSequence,
-          useNewTimestamp: i >
-              0, // The first one uses current timestamp, others use new timestamp
-          useRandomStep: !isHighGeneration,
-          isHighGeneration: isHighGeneration,
-        );
-
-        tasks.add(
-          ComputeTask(
-            function: generateTimeBasedIds,
-            message: request,
+      final result = await ComputeManager.run(
+        ComputeTask(
+          function: generateTimeBasedIds,
+          message: TimeBasedIdGenerateRequest(
+            keyType: keyType,
+            nodeConfig: nodeConfig,
+            tableName: tableName,
+            count: neededCount,
+            startValue: startValue,
+            startSequence: startSequence,
+            useNewTimestamp: useNewTimestamp,
+            useRandomStep: !isHighGeneration,
+            isHighGeneration: isHighGeneration,
           ),
-        );
-
-        // Reserve sequence number space for next task
-        if (isHighGeneration) {
-          // High generation mode uses continuous sequence numbers
-          currentSequence += countForThisIsolate;
-          if (currentSequence > _maxSequence) {
-            // If sequence number is insufficient, use new timestamp value
-            if (keyType == PrimaryKeyType.timestampBased ||
-                keyType == PrimaryKeyType.shortCode) {
-              currentValue = _getCurrentLogicalTimestamp() +
-                  1; // +1 ensure it's a new timestamp
-            } else {
-              // Get next second string
-              final now = DateTime.now().add(const Duration(seconds: 1));
-              currentValue = '${now.year}'
-                  '${now.month.toString().padLeft(2, '0')}'
-                  '${now.day.toString().padLeft(2, '0')}'
-                  '${now.hour.toString().padLeft(2, '0')}'
-                  '${now.minute.toString().padLeft(2, '0')}'
-                  '${now.second.toString().padLeft(2, '0')}';
-            }
-            currentSequence = 0;
-          }
-        } else {
-          // Non-high generation mode uses different sequence number ranges
-          // Each task uses a different sequence number starting point to avoid conflicts
-          final step = _maxSequence ~/ (parallelCount + 1);
-          currentSequence += step;
-          if (currentSequence > _maxSequence) currentSequence = 1;
-        }
-      }
-
-      final results = await ComputeManager.computeBatch(
-        tasks,
-        enableIsolate: true,
+        ),
+        useIsolate: true,
       );
 
-      final allGeneratedIds = <String>[];
-      dynamic lastValue = currentValue;
-      int lastSequence = currentSequence;
-
-      // Process and merge results in original order
-      for (final result in results) {
-        if (result.success && result.ids.isNotEmpty) {
-          // Add generated IDs in order of task index, ensure correct order
-          allGeneratedIds.addAll(result.ids);
-
-          // Update latest value and sequence number
-          if (keyType == PrimaryKeyType.timestampBased ||
-              keyType == PrimaryKeyType.shortCode) {
-            // For timestamp, use larger value
-            if (result.lastValue is int &&
-                lastValue is int &&
-                result.lastValue > lastValue) {
-              lastValue = result.lastValue;
-            }
-          } else if (keyType == PrimaryKeyType.datePrefixed) {
-            // For date prefixed, compare string size
-            if (result.lastValue is String &&
-                lastValue is String &&
-                result.lastValue.compareTo(lastValue) > 0) {
-              lastValue = result.lastValue;
-            }
-          }
-
-          // Use the largest sequence number
-          if (result.lastSequence > lastSequence) {
-            lastSequence = result.lastSequence;
-          }
-        }
+      if (!result.success || result.ids.isEmpty) {
+        throw StateError(
+          result.errorMessage ?? 'Single isolate ID generation returned empty.',
+        );
       }
 
-      // Update state
-      _sequenceMap[tableName] = lastSequence;
-      _lastValueMap[tableName] = lastValue;
-      _lastValue = lastValue;
+      _sequenceMap[tableName] = result.lastSequence;
+      _lastValueMap[tableName] = result.lastValue;
+      _lastValue = result.lastValue;
 
-      return allGeneratedIds;
+      return result.ids;
     } catch (e) {
-      Logger.error('Parallel generate IDs failed: $e',
+      Logger.error('Single isolate ID generation failed: $e',
           label: 'TimeBasedIdGenerator._generateIdsInParallel');
 
       // If error occurs, fall back to traditional generation method

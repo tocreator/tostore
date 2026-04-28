@@ -1,9 +1,7 @@
 import 'dart:typed_data';
 
-import '../core/compute/compute_batch_planner.dart';
 import '../core/table_data_manager.dart';
 import '../core/compute_manager.dart';
-import '../core/yield_controller.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
@@ -52,84 +50,14 @@ class ValueMatcher {
     if (list.isEmpty || sortFields.isEmpty || list.length <= 1) {
       return list;
     }
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: list.length,
-      estimateAverageItemBytes: () => 0,
+    return await ComputeManager.run(
+      ComputeTask(
+        function: executeSort,
+        message: SortMessage(
+            list, sortFields, sortDirections, schemas, mainTableName),
+      ),
+      useIsolate: list.length >= 500,
     );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    if (!useIsolate && actualTaskCount <= 1) {
-      sortMapListWithIsolate(
-        list,
-        sortFields,
-        sortDirections,
-        schemas,
-        mainTableName,
-      );
-      return list;
-    }
-
-    final tasks = <ComputeTask<SortMessage, List<Map<String, dynamic>>>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(list.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: executeSort,
-          message: SortMessage(
-            list.sublist(range.start, range.end),
-            sortFields,
-            sortDirections,
-            schemas,
-            mainTableName,
-          ),
-        ),
-      );
-    }
-
-    final sortedChunks =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-    if (sortedChunks.length <= 1) {
-      return sortedChunks.first;
-    }
-
-    final comparator = _buildSortComparator(
-      sortFields,
-      sortDirections,
-      schemas,
-      mainTableName,
-    );
-    final mergeYield = YieldController('ValueMatcher.sortMapList.merge');
-    final merged = <Map<String, dynamic>>[];
-    final positions = List<int>.filled(sortedChunks.length, 0, growable: false);
-
-    while (true) {
-      int? bestChunkIndex;
-      Map<String, dynamic>? bestRecord;
-
-      for (int i = 0; i < sortedChunks.length; i++) {
-        final position = positions[i];
-        final chunk = sortedChunks[i];
-        if (position >= chunk.length) continue;
-
-        final candidate = chunk[position];
-        if (bestChunkIndex == null || comparator(candidate, bestRecord!) < 0) {
-          bestChunkIndex = i;
-          bestRecord = candidate;
-        }
-      }
-
-      if (bestChunkIndex == null || bestRecord == null) {
-        break;
-      }
-
-      await mergeYield.maybeYield();
-      merged.add(bestRecord);
-      positions[bestChunkIndex]++;
-    }
-
-    return merged;
   }
 
   static void sortMapListWithIsolate(
@@ -143,22 +71,6 @@ class ValueMatcher {
       return;
     }
 
-    final comparator = _buildSortComparator(
-      sortFields,
-      sortDirections,
-      schemas,
-      mainTableName,
-    );
-    list.sort(comparator);
-  }
-
-  static int Function(Map<String, dynamic> a, Map<String, dynamic> b)
-      _buildSortComparator(
-    List<String> sortFields,
-    List<bool> sortDirections,
-    Map<String, TableSchema> schemas,
-    String mainTableName,
-  ) {
     final matchers = <String, MatcherFunction>{};
     for (final field in sortFields) {
       if (!matchers.containsKey(field)) {
@@ -174,7 +86,7 @@ class ValueMatcher {
       }
     }
 
-    return (a, b) {
+    list.sort((a, b) {
       for (int i = 0; i < sortFields.length; i++) {
         final field = sortFields[i];
         final ascending = sortDirections[i];
@@ -190,7 +102,7 @@ class ValueMatcher {
         }
       }
       return 0;
-    };
+    });
   }
 
   static MatcherFunction getMatcher(MatcherType type) {

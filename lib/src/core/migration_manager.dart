@@ -468,30 +468,15 @@ class MigrationManager {
         batches.add(similarityRequests.sublist(i, end));
       }
 
-      final similarityTasks = <ComputeTask<BatchTableSimilarityRequest,
-          BatchTableSimilarityResult>>[
-        for (final batch in batches)
-          ComputeTask(
-            function: calculateBatchTableSimilarity,
-            message: BatchTableSimilarityRequest(requests: batch),
-          ),
-      ];
-
       // parallel processing all batches
-      final batchResults = <BatchTableSimilarityResult>[];
-      final workerTaskCount =
-          max(1, ComputeManager.clampTaskCount(similarityTasks.length));
-      for (int start = 0;
-          start < similarityTasks.length;
-          start += workerTaskCount) {
-        final end = min(start + workerTaskCount, similarityTasks.length);
-        batchResults.addAll(
-          await ComputeManager.computeBatch(
-            similarityTasks.sublist(start, end),
-            enableIsolate: similarityRequests.length > 20,
-          ),
-        );
-      }
+      final batchResults =
+          await Future.wait(batches.map((batch) => ComputeManager.run(
+                ComputeTask(
+                  function: calculateBatchTableSimilarity,
+                  message: BatchTableSimilarityRequest(requests: batch),
+                ),
+                useIsolate: similarityRequests.length > 20,
+              )));
 
       // merge all results
       final allResults = <TableSimilarityResult>[];
@@ -1651,30 +1636,15 @@ class MigrationManager {
       batches.add(similarityRequests.sublist(i, end));
     }
 
-    final similarityTasks =
-        <ComputeTask<BatchFieldSimilarityRequest, BatchFieldSimilarityResult>>[
-      for (final batch in batches)
-        ComputeTask(
-          function: calculateBatchFieldSimilarity,
-          message: BatchFieldSimilarityRequest(requests: batch),
-        ),
-    ];
-
     // parallel processing all batches
-    final batchResults = <BatchFieldSimilarityResult>[];
-    final workerTaskCount =
-        max(1, ComputeManager.clampTaskCount(similarityTasks.length));
-    for (int start = 0;
-        start < similarityTasks.length;
-        start += workerTaskCount) {
-      final end = min(start + workerTaskCount, similarityTasks.length);
-      batchResults.addAll(
-        await ComputeManager.computeBatch(
-          similarityTasks.sublist(start, end),
-          enableIsolate: similarityRequests.length > 100,
-        ),
-      );
-    }
+    final batchResults =
+        await Future.wait(batches.map((batch) => ComputeManager.run(
+              ComputeTask(
+                function: calculateBatchFieldSimilarity,
+                message: BatchFieldSimilarityRequest(requests: batch),
+              ),
+              useIsolate: similarityRequests.length > 100,
+            )));
 
     // merge all results
     final allResults = <FieldSimilarityResult>[];
@@ -2342,35 +2312,20 @@ class MigrationManager {
       batches.add(records.sublist(i, end));
     }
 
-    final migrationTasks = <ComputeTask<MigrationRecordProcessRequest,
-        MigrationRecordProcessResult>>[
-      for (final batch in batches)
-        ComputeTask(
-          function: processMigrationRecords,
-          message: MigrationRecordProcessRequest(
-            records: batch,
-            operations: operations,
-            oldSchema: oldSchema,
-            yieldDurationMs: _dataStore.config.yieldDurationMs,
-          ),
-        ),
-    ];
-
     // Parallel processing all batches
-    final batchResults = <MigrationRecordProcessResult>[];
-    final workerTaskCount =
-        max(1, ComputeManager.clampTaskCount(migrationTasks.length));
-    for (int start = 0;
-        start < migrationTasks.length;
-        start += workerTaskCount) {
-      final end = min(start + workerTaskCount, migrationTasks.length);
-      batchResults.addAll(
-        await ComputeManager.computeBatch(
-          migrationTasks.sublist(start, end),
-          enableIsolate: records.length > 500,
-        ),
-      );
-    }
+    final batchResults =
+        await Future.wait(batches.map((batch) => ComputeManager.run(
+              ComputeTask(
+                function: processMigrationRecords,
+                message: MigrationRecordProcessRequest(
+                  records: batch,
+                  operations: operations,
+                  oldSchema: oldSchema,
+                  yieldDurationMs: _dataStore.config.yieldDurationMs,
+                ),
+              ),
+              useIsolate: records.length > 500,
+            )));
 
     // Merge results
     final allProcessedRecords = <Map<String, dynamic>>[];
