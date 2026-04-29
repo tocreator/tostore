@@ -37,6 +37,8 @@ import 'yield_controller.dart';
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
   final DataStoreImpl _dataStore;
+  static const int _largePartitionStreamingThresholdBytes = 8 * 1024 * 1024;
+  static const int _largePartitionStreamingPagesPerBatch = 500;
 
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
@@ -2650,50 +2652,185 @@ class TableDataManager {
         }
       }
 
+      if (rangeManager == null) return;
+      var largeStreamingDemandPerPartition = 1;
+
+      Future<bool> shouldUseLargePartitionStreaming() async {
+        if (partitionNosToProcess.isEmpty) return false;
+        final size = await rangeManager.getPartitionFileSizeByNo(
+          tableName: tableName,
+          partitionNo: partitionNosToProcess.first,
+          metaOverride: meta,
+        );
+        final isLarge = size > _largePartitionStreamingThresholdBytes;
+        if (isLarge) {
+          final batchBytes = max(
+              1, meta.btreePageSize * _largePartitionStreamingPagesPerBatch);
+          largeStreamingDemandPerPartition =
+              max(1, (size + batchBytes - 1) ~/ batchBytes);
+        }
+        return isLarge;
+      }
+
+      Future<void> processLargePartitionReadOnly(int partitionNo) async {
+        var emittedBatch = false;
+        await for (final records
+            in rangeManager.streamPartitionDataPageBatchesByNo(
+          tableName: tableName,
+          partitionNo: partitionNo,
+          pagesPerBatch: _largePartitionStreamingPagesPerBatch,
+          encryptionKey: customKey,
+          encryptionKeyId: customKeyId,
+          decodeSchema: decodeSchema,
+        )) {
+          if (effectiveController.isStopped) return;
+          emittedBatch = true;
+          await processFunction(records, partitionNo, effectiveController);
+        }
+        if (!emittedBatch && !effectiveController.isStopped) {
+          await processFunction(
+              const <Map<String, dynamic>>[], partitionNo, effectiveController);
+        }
+      }
+
+      Future<void> processLargePartitionWrite(int partitionNo) async {
+        var emittedBatch = false;
+
+        Future<void> processBatch(List<Map<String, dynamic>> records) async {
+          final processed =
+              await processFunction(records, partitionNo, effectiveController);
+          if (effectiveController.isStopped) return;
+
+          final inserts = <Map<String, dynamic>>[];
+          final updates = <Map<String, dynamic>>[];
+          final deletes = <Map<String, dynamic>>[];
+          computeDelta(records, processed, inserts, updates, deletes);
+          if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
+            return;
+          }
+
+          BatchContext? batchContext;
+          if (journaling) {
+            batchContext = await _dataStore.parallelJournalManager
+                .beginMaintenanceBatch(table: tableName);
+          }
+          await rangeManager.writeChanges(
+            tableName: tableName,
+            inserts: inserts,
+            updates: updates,
+            deletes: deletes,
+            batchContext: batchContext,
+            encryptionKey: customKey,
+            encryptionKeyId: customKeyId,
+            allowLeafCompaction: false,
+            allowFreePageReuse: false,
+          );
+
+          if (journaling && batchContext != null) {
+            await _dataStore.parallelJournalManager
+                .completeMaintenanceBatch(batchContext: batchContext);
+            await persistRuntimeMetaIfNeeded();
+          }
+        }
+
+        await for (final records
+            in rangeManager.streamPartitionDataPageBatchesByNo(
+          tableName: tableName,
+          partitionNo: partitionNo,
+          pagesPerBatch: _largePartitionStreamingPagesPerBatch,
+          encryptionKey: customKey,
+          encryptionKeyId: customKeyId,
+          decodeSchema: decodeSchema,
+        )) {
+          if (effectiveController.isStopped) return;
+          emittedBatch = true;
+          await processBatch(records);
+        }
+
+        if (!emittedBatch && !effectiveController.isStopped) {
+          await processBatch(const <Map<String, dynamic>>[]);
+        }
+        if (!effectiveController.isStopped) {
+          await onPartitionFlushed?.call(partitionNo);
+        }
+      }
+
+      final useLargePartitionStreaming =
+          await shouldUseLargePartitionStreaming();
+
       if (onlyRead) {
         // Read-only: parallel load + process, no writeChanges, no journal batch.
-        final remainingPartitions = partitionNosToProcess.length;
-        final capacity = scheduler.capacityTokens(
-          WorkloadType.maintenance,
-          extraDemandTokens: remainingPartitions,
-        );
-        var concurrency = max(1, min(capacity, partitionNosToProcess.length));
-        if (maxConcurrent != null && maxConcurrent > 0) {
-          concurrency = min(concurrency, maxConcurrent);
-        }
-        final tasks = <Future<void> Function()>[];
-        for (final pNo in partitionNosToProcess) {
-          tasks.add(() async {
-            if (effectiveController.isStopped) return;
-            if (rangeManager == null) return;
-            final records = await rangeManager.loadPartitionDataByNo(
-              tableName: tableName,
-              partitionNo: pNo,
-              encryptionKey: customKey,
-              encryptionKeyId: customKeyId,
-              decodeSchema: decodeSchema,
+        if (useLargePartitionStreaming) {
+          final plannedDemand = max(1, partitionNosToProcess.length) *
+              largeStreamingDemandPerPartition;
+          WorkloadLease? lease;
+          try {
+            lease = await scheduler.acquire(
+              WorkloadType.maintenance,
+              requestedTokens: 1,
+              minTokens: 1,
+              totalPlannedTokens: plannedDemand,
+              label: 'processTablePartitions.$tableName.readOnly.large',
             );
-            await processFunction(records, pNo, effectiveController);
-          });
+            for (final pNo in partitionNosToProcess) {
+              if (effectiveController.isStopped) break;
+              await processLargePartitionReadOnly(pNo);
+            }
+          } finally {
+            lease?.release();
+          }
+          return;
         }
-        WorkloadLease? lease;
-        try {
-          lease = await scheduler.acquire(
+
+        for (int cursor = 0;
+            cursor < partitionNosToProcess.length &&
+                !effectiveController.isStopped;) {
+          final remainingPartitions = partitionNosToProcess.length - cursor;
+          final chunkEnd = min(cursor + 3, partitionNosToProcess.length);
+          final smallPartitions =
+              partitionNosToProcess.sublist(cursor, chunkEnd);
+          cursor = chunkEnd;
+          final capacity = scheduler.capacityTokens(
             WorkloadType.maintenance,
-            requestedTokens: concurrency,
-            minTokens: 1,
-            totalPlannedTokens: remainingPartitions,
-            label: 'processTablePartitions.$tableName.readOnly',
+            extraDemandTokens: remainingPartitions,
           );
-          await ParallelProcessor.execute<void>(
-            tasks,
-            concurrency: lease.asConcurrency(1),
-            controller: effectiveController,
-            label: 'processTablePartitions.$tableName',
-            continueOnError: false,
-          );
-        } finally {
-          lease?.release();
+          var concurrency = max(1, min(capacity, smallPartitions.length));
+          if (maxConcurrent != null && maxConcurrent > 0) {
+            concurrency = min(concurrency, maxConcurrent);
+          }
+          final tasks = <Future<void> Function()>[];
+          for (final smallPNo in smallPartitions) {
+            tasks.add(() async {
+              if (effectiveController.isStopped) return;
+              final records = await rangeManager.loadPartitionDataByNo(
+                tableName: tableName,
+                partitionNo: smallPNo,
+                encryptionKey: customKey,
+                encryptionKeyId: customKeyId,
+                decodeSchema: decodeSchema,
+              );
+              await processFunction(records, smallPNo, effectiveController);
+            });
+          }
+          WorkloadLease? lease;
+          try {
+            lease = await scheduler.acquire(
+              WorkloadType.maintenance,
+              requestedTokens: concurrency,
+              minTokens: 1,
+              totalPlannedTokens: remainingPartitions,
+              label: 'processTablePartitions.$tableName.readOnly',
+            );
+            await ParallelProcessor.execute<void>(
+              tasks,
+              concurrency: lease.asConcurrency(1),
+              controller: effectiveController,
+              label: 'processTablePartitions.$tableName',
+              continueOnError: false,
+            );
+          } finally {
+            lease?.release();
+          }
         }
         return;
       }
@@ -2702,15 +2839,62 @@ class TableDataManager {
       // page redo is deleted and metadata advanced after each chunk.
       final yc = YieldController('TableDataManager.processTablePartitions',
           checkInterval: 100);
+      final largePartitionNos = useLargePartitionStreaming
+          ? partitionNosToProcess.toList(growable: true)
+          : partitionNosToProcess;
+      var knownPartitionCount = partitionCount;
       for (int chunkStart = 0;
-          chunkStart < partitionNosToProcess.length &&
-              !effectiveController.isStopped;
-          chunkStart += 3) {
+          chunkStart < largePartitionNos.length &&
+              !effectiveController.isStopped;) {
         await yc.maybeYield();
-        final chunkEnd = min(chunkStart + 3, partitionNosToProcess.length);
-        final chunkPartitions =
-            partitionNosToProcess.sublist(chunkStart, chunkEnd);
-        final remainingPartitions = partitionNosToProcess.length - chunkStart;
+        final remainingPartitions = largePartitionNos.length - chunkStart;
+        final remainingLargeStreamingDemand =
+            max(1, remainingPartitions) * largeStreamingDemandPerPartition;
+
+        if (useLargePartitionStreaming) {
+          final currentPartitionNo = largePartitionNos[chunkStart];
+          if (!await acquireWriteLocks()) {
+            return;
+          }
+          try {
+            WorkloadLease? lease;
+            try {
+              lease = await scheduler.acquire(
+                WorkloadType.maintenance,
+                requestedTokens: 1,
+                minTokens: 1,
+                totalPlannedTokens: remainingLargeStreamingDemand,
+                label: 'processTablePartitions.$tableName.large',
+              );
+              await processLargePartitionWrite(currentPartitionNo);
+            } finally {
+              lease?.release();
+            }
+          } finally {
+            releaseWriteLocks();
+          }
+          chunkStart++;
+          if (targetPartitionNos == null) {
+            final latestMeta = await getTableMeta(tableName);
+            final latestPartitionCount =
+                latestMeta?.btreePartitionCount ?? knownPartitionCount;
+            if (latestPartitionCount > knownPartitionCount) {
+              for (int pNo = knownPartitionCount;
+                  pNo < latestPartitionCount;
+                  pNo++) {
+                if (startPartitionNo == null || pNo >= startPartitionNo) {
+                  largePartitionNos.add(pNo);
+                }
+              }
+              knownPartitionCount = latestPartitionCount;
+            }
+          }
+          continue;
+        }
+
+        final chunkEnd = min(chunkStart + 3, largePartitionNos.length);
+        final chunkPartitions = largePartitionNos.sublist(chunkStart, chunkEnd);
+        chunkStart = chunkEnd;
 
         if (!await acquireWriteLocks()) {
           return;
@@ -2742,7 +2926,6 @@ class TableDataManager {
           for (final pNo in chunkPartitions) {
             tasks.add(() async {
               if (effectiveController.isStopped) return null;
-              if (rangeManager == null) return null;
               final records = await rangeManager.loadPartitionDataByNo(
                 tableName: tableName,
                 partitionNo: pNo,
@@ -2801,7 +2984,7 @@ class TableDataManager {
             final r = results[i];
             if (r == null) continue;
             final (pNo, inserts, updates, deletes) = r;
-            await rangeManager?.writeChanges(
+            await rangeManager.writeChanges(
               tableName: tableName,
               inserts: inserts,
               updates: updates,

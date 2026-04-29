@@ -528,6 +528,8 @@ final class TableTreePartitionManager {
     int? concurrency,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool allowLeafCompaction = true,
+    bool allowFreePageReuse = true,
   }) async {
     final sw = Stopwatch()..start();
     final totalRecords = inserts.length + updates.length + deletes.length;
@@ -757,10 +759,12 @@ final class TableTreePartitionManager {
 
     Future<TreePagePtr> allocatePage() async {
       // Prefer page reuse in the active partition (O(1) freelist pop).
-      final activePartitionNo = meta.btreePartitionCount - 1;
-      final reused = await popFreePage(activePartitionNo);
-      if (reused != null) {
-        return reused;
+      if (allowFreePageReuse) {
+        final activePartitionNo = meta.btreePartitionCount - 1;
+        final reused = await popFreePage(activePartitionNo);
+        if (reused != null) {
+          return reused;
+        }
       }
 
       final pageSize = meta.btreePageSize;
@@ -1054,7 +1058,8 @@ final class TableTreePartitionManager {
         // Delete cannot cause overflow; stage lazily.
         markLeafDirty(leafPtr, leaf);
         // Opportunistic compaction: only compute parent frames if underfull.
-        if (meta.btreeHeight > 0 &&
+        if (allowLeafCompaction &&
+            meta.btreeHeight > 0 &&
             isLeafUnderfull(leaf) &&
             leaf.keys.isNotEmpty) {
           final frames = <_Frame>[];
@@ -1175,7 +1180,9 @@ final class TableTreePartitionManager {
 
     // Lightweight trigger: enqueue background compaction when deletes happen.
     // This is O(1) and deduplicated by CompactionManager.
-    if (lastDeleteLeafPtr != null && !lastDeleteLeafPtr.isNull) {
+    if (allowLeafCompaction &&
+        lastDeleteLeafPtr != null &&
+        !lastDeleteLeafPtr.isNull) {
       try {
         _dataStore.compactionManager
             .enqueueTable(tableName, hint: lastDeleteLeafPtr);
@@ -2087,6 +2094,165 @@ final class TableTreePartitionManager {
       if (leaf.find(keyBytes) != null) out.add(pk);
     }
     return out;
+  }
+
+  /// Return the current physical partition file size, or zero if it is missing.
+  Future<int> getPartitionFileSizeByNo({
+    required String tableName,
+    required int partitionNo,
+    TableMeta? metaOverride,
+  }) async {
+    final meta = metaOverride ??
+        await _dataStore.tableDataManager.getTableMeta(tableName);
+    if (meta == null) return 0;
+    if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
+      return 0;
+    }
+    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    if (!await _storage.existsFile(path)) return 0;
+    return _storage.getFileSize(path);
+  }
+
+  Future<({List<Map<String, dynamic>> records, bool reachedEnd})>
+      _loadPartitionDataPageRangeByNo({
+    required String tableName,
+    required int partitionNo,
+    required int startPageNo,
+    required int pageLimit,
+    TableMeta? metaSnapshot,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    TableSchema? decodeSchema,
+  }) async {
+    if (pageLimit <= 0) {
+      return (records: const <Map<String, dynamic>>[], reachedEnd: false);
+    }
+
+    final schema = decodeSchema ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
+    if (schema == null) {
+      return (records: const <Map<String, dynamic>>[], reachedEnd: true);
+    }
+    final meta = metaSnapshot ??
+        await _dataStore.tableDataManager.getTableMeta(tableName);
+    if (meta == null) {
+      return (records: const <Map<String, dynamic>>[], reachedEnd: true);
+    }
+    if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
+      return (records: const <Map<String, dynamic>>[], reachedEnd: true);
+    }
+
+    final path = await _partitionFilePath(tableName, meta, partitionNo);
+
+    final fieldStruct = schema.fields
+        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
+        .toList(growable: false);
+
+    final pageSize = meta.btreePageSize;
+    final fromPage = max(TableMeta.firstDataPageNo, startPageNo);
+    final toPage = fromPage + pageLimit;
+
+    final out = <Map<String, dynamic>>[];
+    final yc = YieldController(
+        'TableTreePartitionManager.loadPartitionDataPageRangeByNo',
+        checkInterval: 1);
+    for (int pageNo = fromPage; pageNo < toPage; pageNo++) {
+      await yc.maybeYield();
+      final ptr = TreePagePtr(partitionNo, pageNo);
+      final offset = pageNo * pageSize;
+      final raw = await _storage.readAsBytesAt(path, offset, length: pageSize);
+      if (raw.isEmpty) {
+        return (records: out, reachedEnd: true);
+      }
+
+      LeafPage leaf;
+      try {
+        final parsed = BTreePageIO.parsePageBytes(raw);
+        if (parsed.type == BTreePageType.free ||
+            parsed.type == BTreePageType.internal ||
+            parsed.type == BTreePageType.meta) {
+          continue;
+        }
+        if (parsed.type != BTreePageType.leaf) {
+          continue;
+        }
+        final payload = BTreePageCodec.decodePayload(
+          parsed.encodedPayload,
+          config: _config,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          aad: _aad(ptr, parsed.type),
+        );
+        leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
+      } catch (e) {
+        throw StateError('Corrupted B+Tree page while streaming partition: '
+            'table=$tableName ptr=$ptr path=$path offset=$offset err=$e');
+      }
+
+      if (leaf.keys.isEmpty) continue;
+      for (int i = 0; i < leaf.keys.length; i++) {
+        final decoded = await _decodeStoredRecord(
+          tableName: tableName,
+          meta: meta,
+          storedValue: leaf.values[i],
+          fieldStruct: fieldStruct,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        if (decoded == null) continue;
+        final pk = MemComparableKey.decodeLastText(leaf.keys[i]);
+        out.add(pk != null
+            ? TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded)
+            : decoded);
+      }
+    }
+    return (records: out, reachedEnd: false);
+  }
+
+  /// Stream records from a physical partition in fixed page batches.
+  ///
+  /// This keeps maintenance callers from materializing a very large partition
+  /// file as one in-memory list.
+  Stream<List<Map<String, dynamic>>> streamPartitionDataPageBatchesByNo({
+    required String tableName,
+    required int partitionNo,
+    int pagesPerBatch = 500,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    TableSchema? decodeSchema,
+  }) async* {
+    if (pagesPerBatch <= 0) pagesPerBatch = 500;
+
+    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    if (meta == null) return;
+    if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
+      return;
+    }
+
+    final yc = YieldController(
+        'TableTreePartitionManager.streamPartitionDataPageBatchesByNo',
+        checkInterval: 1);
+
+    for (int pageNo = TableMeta.firstDataPageNo;; pageNo += pagesPerBatch) {
+      await yc.maybeYield();
+      final batch = await _loadPartitionDataPageRangeByNo(
+        tableName: tableName,
+        partitionNo: partitionNo,
+        startPageNo: pageNo,
+        pageLimit: pagesPerBatch,
+        metaSnapshot: meta,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        decodeSchema: decodeSchema,
+      );
+      final records = batch.records;
+      if (records.isNotEmpty) {
+        yield records;
+      }
+      if (batch.reachedEnd) {
+        break;
+      }
+    }
   }
 
   /// Load all records from a *physical* partition file (partitionNo).
