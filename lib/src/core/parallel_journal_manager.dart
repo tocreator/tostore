@@ -637,6 +637,7 @@ class ParallelJournalManager {
                 // Best-effort: fill missing oldValues from persisted table data (batch lookup).
                 final missingOld = <String>[];
                 for (final u in updates) {
+                  await yieldController.maybeYield();
                   if (u.oldValues != null) continue;
                   final pk = u.data[pkName]?.toString();
                   if (pk == null || pk.isEmpty) continue;
@@ -663,6 +664,7 @@ class ParallelJournalManager {
                 idxInserts.addAll(insertRecords);
                 final idxUpdates = <IndexRecordUpdate>[];
                 for (final u in updates) {
+                  await yieldController.maybeYield();
                   final pk = u.data[pkName]?.toString();
                   if (pk == null || pk.isEmpty) continue;
                   final oldVals = u.oldValues ?? oldByPk[pk];

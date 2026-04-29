@@ -1,11 +1,11 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import '../handler/common.dart';
-import 'migration_config.dart';
 import '../handler/platform_handler.dart';
 import '../model/log_config.dart';
-import 'dart:math';
+import 'migration_config.dart';
 
 /// data store config
 class DataStoreConfig {

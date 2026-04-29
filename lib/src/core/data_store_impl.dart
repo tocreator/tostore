@@ -50,9 +50,9 @@ import '../upgrades/version_upgrade_manager.dart';
 import 'backup_manager.dart';
 import 'cache_manager.dart';
 import 'compaction_manager.dart';
-import 'compute/batch_match_runner.dart';
 import 'compute/batch_identifier_compute.dart';
 import 'compute/batch_insert_compute.dart';
+import 'compute/batch_match_runner.dart';
 import 'compute/batch_update_compute.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/kv_batch_prepare_compute.dart';
@@ -69,7 +69,6 @@ import 'key_manager.dart';
 import 'lock_manager.dart';
 import 'migration_manager.dart';
 import 'notification_manager.dart';
-
 import 'overflow_manager.dart';
 import 'parallel_journal_manager.dart';
 import 'path_manager.dart';
@@ -4736,7 +4735,7 @@ class DataStoreImpl {
       try {
         // Keep buffer/WAL flushes small, but let the pure-compute prepare stage
         // use larger memory-aware windows so it can be split across isolates.
-        const int bufferBatchSize = 10000;
+        const int bufferBatchSize = 100000;
         const int directPrepareBatchItemThreshold = 500;
         int? averageRecordBytes;
 

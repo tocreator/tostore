@@ -962,15 +962,19 @@ final class TableTreePartitionManager {
 
     final putOps = <_TableOp>[];
     for (final op in opList) {
+      await yc.maybeYield();
       if (op.type == _OpType.put) {
         putOps.add(op);
       }
     }
     if (putOps.isNotEmpty) {
+      final putRecords = <Map<String, dynamic>>[];
+      for (final op in putOps) {
+        await yc.maybeYield();
+        putRecords.add(op.record);
+      }
       final encodedRecords = await _encodeRecordPayloadsForWrite(
-        records: [
-          for (final op in putOps) op.record,
-        ],
+        records: putRecords,
         primaryKeyField: schema.primaryKey,
         fieldStruct: fieldStruct,
       );
@@ -1188,7 +1192,7 @@ final class TableTreePartitionManager {
     if (dirtyLeaves.isNotEmpty || dirtyInternals.isNotEmpty) {
       final stageYc = YieldController(
         'TableTreePartitionManager.writeChanges.stagePages',
-        checkInterval: 40,
+        checkInterval: 5,
       );
 
       final int? encTypeIndex = _config.encryptionConfig?.encryptionType.index;

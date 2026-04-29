@@ -84,7 +84,7 @@ class YieldController {
   YieldController(
     this._topic, {
     int? budgetMs,
-    int checkInterval = 300,
+    int checkInterval = 256,
   })  : _budgetMs = budgetMs ?? globalSettings.targetBudgetMs,
         _enabled = globalSettings.enabled,
         // Initialize with learned interval if available, otherwise use default
@@ -108,7 +108,7 @@ class YieldController {
   /// - If budget is exceeded, yields to the event loop (`Future.delayed`).
   /// - Updates the adaptive interval based on throughput.
   Future<void> maybeYield() async {
-    final f = maybeYieldSync();
+    final f = _maybeYieldSync();
     if (f != null) await f;
   }
 
@@ -129,7 +129,7 @@ class YieldController {
   ///
   /// This eliminates async/await overhead for the common case where no yield
   /// is needed, which can save significant time in loops with millions of iterations.
-  Future<void>? maybeYieldSync() {
+  Future<void>? _maybeYieldSync() {
     if (!_enabled) return null;
 
     _iterationsSinceCheck++;
