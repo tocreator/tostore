@@ -1479,23 +1479,48 @@ Future<BatchWalEncodeResult> batchEncodeWal(
 /// One B+Tree page encode unit for isolate/off-main-thread execution.
 ///
 /// NOTE:
-/// - This object must remain isolate-sendable (only primitives + typed data).
+/// - This object must remain isolate-sendable (primitives, typed data, and
+///   B+Tree page DTOs composed from those values).
 /// - Do NOT use `TransferableTypedData` here to keep web / non-isolate platforms compatible.
 final class BTreePageEncodeItem {
-  /// `BTreePageType.index`
+  /// Index into [BTreePageType.values].
   final int typeIndex;
   final int partitionNo;
   final int pageNo;
 
-  /// Plaintext payload bytes (NOT encrypted).
-  final Uint8List payload;
+  /// Plaintext payload bytes (NOT encrypted), when the caller already encoded it.
+  final Uint8List? payload;
+
+  /// Optional raw page objects. When present, payload encoding is also done by
+  /// the compute worker so large dirty-page batches do less work on the caller.
+  final LeafPage? leafPage;
+  final InternalPage? internalPage;
 
   const BTreePageEncodeItem({
     required this.typeIndex,
     required this.partitionNo,
     required this.pageNo,
     required this.payload,
-  });
+  })  : leafPage = null,
+        internalPage = null;
+
+  BTreePageEncodeItem.leaf({
+    required this.partitionNo,
+    required this.pageNo,
+    required LeafPage page,
+  })  : typeIndex = BTreePageType.leaf.index,
+        payload = null,
+        leafPage = page,
+        internalPage = null;
+
+  BTreePageEncodeItem.internal({
+    required this.partitionNo,
+    required this.pageNo,
+    required InternalPage page,
+  })  : typeIndex = BTreePageType.internal.index,
+        payload = null,
+        leafPage = null,
+        internalPage = page;
 }
 
 /// Batch request for encoding multiple B+Tree pages.
@@ -1592,14 +1617,19 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   for (int i = 0; i < pages.length; i++) {
     await yieldController.maybeYield();
     final p = pages[i];
+    if (p.typeIndex < 0 || p.typeIndex >= BTreePageType.values.length) {
+      throw StateError('Invalid BTree page type index: ${p.typeIndex}');
+    }
+    final pageType = BTreePageType.values[p.typeIndex];
+    final plainPayload = _resolveBTreePagePayload(p, pageType);
 
     final Uint8List encodedPayload;
     if (encType == null) {
       // No encryption config: keep payload as-is (no header).
-      encodedPayload = p.payload;
+      encodedPayload = plainPayload;
     } else {
       encodedPayload = EncoderHandler.encodeBytes(
-        p.payload,
+        plainPayload,
         customKey: request.customKey,
         keyId: request.customKeyId,
         encryptionType: encType,
@@ -1614,14 +1644,14 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       throw StateError(
         'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
         '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
-        'plainPayload=${p.payload.length}, typeIndex=${p.typeIndex}, '
+        'plainPayload=${plainPayload.length}, typeIndex=${p.typeIndex}, '
         'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
         'encryptionTypeIndex=${request.encryptionTypeIndex}, keyId=$keyId).',
       );
     }
 
     final pageBytes = BTreePageIO.buildPageBytes(
-      type: BTreePageType.values[p.typeIndex],
+      type: pageType,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
@@ -1661,6 +1691,40 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   }
 
   return BatchBTreePageEncodeResult(out, pageRedoBytes);
+}
+
+Uint8List _resolveBTreePagePayload(
+  BTreePageEncodeItem item,
+  BTreePageType pageType,
+) {
+  final payload = item.payload;
+  if (payload != null) return payload;
+
+  switch (pageType) {
+    case BTreePageType.leaf:
+      final page = item.leafPage;
+      if (page == null) {
+        throw StateError('Leaf page encode item is missing leafPage');
+      }
+      return page.encodePayload();
+    case BTreePageType.internal:
+      final page = item.internalPage;
+      if (page == null) {
+        throw StateError('Internal page encode item is missing internalPage');
+      }
+      return page.encodePayload();
+    case BTreePageType.meta:
+    case BTreePageType.free:
+    case BTreePageType.overflow:
+    case BTreePageType.nghMeta:
+    case BTreePageType.nghGraph:
+    case BTreePageType.nghPqCode:
+    case BTreePageType.nghRawVector:
+    case BTreePageType.nghCodebook:
+      throw StateError(
+        'BTree page encode item for $pageType requires a prebuilt payload',
+      );
+  }
 }
 
 // ============================================================================

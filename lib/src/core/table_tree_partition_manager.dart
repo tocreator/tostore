@@ -18,6 +18,9 @@ import '../model/stored_value.dart';
 import '../model/table_schema.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
+import 'compute/compute_batch_planner.dart';
+import 'compute/table_record_encode_compute.dart';
+import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
 import 'overflow_manager.dart';
@@ -38,6 +41,7 @@ final class TableTreePartitionManager {
   final DataStoreImpl _dataStore;
   DataStoreConfig get _config => _dataStore.config;
   StorageAdapter get _storage => _dataStore.storage;
+  static const int _recordEncodeMinUsefulTaskItems = 256;
 
   String keyOfPtr(TreePagePtr p) => '${p.partitionNo}:${p.pageNo}';
 
@@ -97,6 +101,65 @@ final class TableTreePartitionManager {
       groupDepth: 1, // Group by tableName
       debugLabel: 'TableInternalPageCache',
     );
+  }
+
+  Future<List<Uint8List>> _encodeRecordPayloadsForWrite({
+    required List<Map<String, dynamic>> records,
+    required String primaryKeyField,
+    required List<FieldStructure> fieldStruct,
+  }) async {
+    if (records.isEmpty) return const <Uint8List>[];
+
+    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
+      itemCount: records.length,
+      minUsefulTaskItems: _recordEncodeMinUsefulTaskItems,
+      estimateAverageItemBytes: () =>
+          ComputeBatchPlanner.estimateAverageItemBytes(
+        records,
+        _dataStore.tableDataManager.estimateRecordSizeBytes,
+      ),
+    );
+
+    final actualTaskCount = dispatchPlan.actualTaskCount;
+    final useIsolate = dispatchPlan.useIsolate;
+    final tasks =
+        <ComputeTask<TableRecordEncodeRequest, TableRecordEncodeResult>>[];
+
+    for (final range
+        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
+      tasks.add(
+        ComputeTask(
+          function: encodeTableRecordChunk,
+          message: TableRecordEncodeRequest(
+            primaryKeyField: primaryKeyField,
+            fieldStructure: fieldStruct,
+            records: records.sublist(range.start, range.end),
+          ),
+        ),
+      );
+    }
+
+    final results =
+        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+    final merged = <Uint8List>[];
+    final mergeYield = YieldController(
+      'TableTreePartitionManager._encodeRecordPayloadsForWrite',
+    );
+
+    for (final result in results) {
+      for (final encoded in result.encodedRecords) {
+        await mergeYield.maybeYield();
+        merged.add(encoded);
+      }
+    }
+
+    if (merged.length != records.length) {
+      throw StateError(
+        'Encoded record count mismatch: expected=${records.length}, '
+        'actual=${merged.length}',
+      );
+    }
+    return merged;
   }
 
   /// Estimate size in bytes for a LeafPage
@@ -897,12 +960,25 @@ final class TableTreePartitionManager {
     final Map<String, Uint8List> preEncoded = {};
     int totalOverflowChunks = 0;
 
+    final putOps = <_TableOp>[];
     for (final op in opList) {
-      await yc.maybeYield();
       if (op.type == _OpType.put) {
-        final rec = Map<String, dynamic>.from(op.record);
-        rec.remove(schema.primaryKey);
-        final encoded = BinarySchemaCodec.encodeRecord(rec, fieldStruct);
+        putOps.add(op);
+      }
+    }
+    if (putOps.isNotEmpty) {
+      final encodedRecords = await _encodeRecordPayloadsForWrite(
+        records: [
+          for (final op in putOps) op.record,
+        ],
+        primaryKeyField: schema.primaryKey,
+        fieldStruct: fieldStruct,
+      );
+
+      for (int i = 0; i < putOps.length; i++) {
+        await yc.maybeYield();
+        final op = putOps[i];
+        final encoded = encodedRecords[i];
         preEncoded[op.pk] = encoded;
 
         if (_dataStore.overflowManager
@@ -1200,14 +1276,14 @@ final class TableTreePartitionManager {
         pendingPtrs.clear();
       }
 
-      // Build payloads and encode in chunks to bound peak memory.
-      // Check actual encoded payload length to avoid page overflow (same as index).
+      // Encode in chunks to bound peak memory. Use exact payload-size
+      // estimates first; split paths still validate actual payload bytes.
       for (final entry in dirtyLeaves.entries) {
         await stageYc.maybeYield();
         final ptr = entry.key;
         final leaf = entry.value;
-        final payload = leaf.encodePayload();
-        if (!payloadFitsInPage(payload.length)) {
+        final payloadLength = leaf.estimatePayloadSize();
+        if (!payloadFitsInPage(payloadLength)) {
           final frames = <_Frame>[];
           await descendToLeaf(
               leaf.keys.isEmpty ? leaf.highKey : leaf.keys.first, frames);
@@ -1260,11 +1336,10 @@ final class TableTreePartitionManager {
           ));
         } else {
           pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
+          pending.add(BTreePageEncodeItem.leaf(
             partitionNo: ptr.partitionNo,
             pageNo: ptr.pageNo,
-            payload: payload,
+            page: leaf,
           ));
         }
         if (pending.length >= chunkSize) {
@@ -1276,8 +1351,8 @@ final class TableTreePartitionManager {
         await stageYc.maybeYield();
         final ptr = entry.key;
         final node = entry.value;
-        final payload = node.encodePayload();
-        if (!payloadFitsInPage(payload.length)) {
+        final payloadLength = node.estimatePayloadSize();
+        if (!payloadFitsInPage(payloadLength)) {
           final frames = <_Frame>[];
           await descendToLeaf(
               node.maxKeys.isEmpty ? Uint8List(0) : node.maxKeys.first, frames);
@@ -1335,11 +1410,10 @@ final class TableTreePartitionManager {
           ));
         } else {
           pendingPtrs.add(ptr);
-          pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
+          pending.add(BTreePageEncodeItem.internal(
             partitionNo: ptr.partitionNo,
             pageNo: ptr.pageNo,
-            payload: payload,
+            page: node,
           ));
         }
         if (pending.length >= chunkSize) {

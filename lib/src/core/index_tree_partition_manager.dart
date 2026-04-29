@@ -1076,8 +1076,8 @@ final class IndexTreePartitionManager {
           await stageYc.maybeYield();
           final ptr = entry.key;
           final leaf = entry.value;
-          final payload = leaf.encodePayload();
-          if (!payloadFitsInPage(payload.length)) {
+          final payloadLength = leaf.estimatePayloadSize();
+          if (!payloadFitsInPage(payloadLength)) {
             final frames = <_IFrame>[];
             await descendToLeaf(
                 leaf.keys.isEmpty ? leaf.highKey : leaf.keys.first, frames);
@@ -1130,11 +1130,10 @@ final class IndexTreePartitionManager {
             ));
           } else {
             pendingPtrs.add(ptr);
-            pending.add(BTreePageEncodeItem(
-              typeIndex: BTreePageType.leaf.index,
+            pending.add(BTreePageEncodeItem.leaf(
               partitionNo: ptr.partitionNo,
               pageNo: ptr.pageNo,
-              payload: payload,
+              page: leaf,
             ));
           }
           if (pending.length >= chunkSize) {
@@ -1150,8 +1149,8 @@ final class IndexTreePartitionManager {
           await stageYc.maybeYield();
           final ptr = entry.key;
           final node = entry.value;
-          final payload = node.encodePayload();
-          if (!payloadFitsInPage(payload.length)) {
+          final payloadLength = node.estimatePayloadSize();
+          if (!payloadFitsInPage(payloadLength)) {
             final frames = <_IFrame>[];
             await descendToLeaf(
                 node.maxKeys.isEmpty ? Uint8List(0) : node.maxKeys.first,
@@ -1210,11 +1209,10 @@ final class IndexTreePartitionManager {
             ));
           } else {
             pendingPtrs.add(ptr);
-            pending.add(BTreePageEncodeItem(
-              typeIndex: BTreePageType.internal.index,
+            pending.add(BTreePageEncodeItem.internal(
               partitionNo: ptr.partitionNo,
               pageNo: ptr.pageNo,
-              payload: payload,
+              page: node,
             ));
           }
           if (pending.length >= chunkSize) {
