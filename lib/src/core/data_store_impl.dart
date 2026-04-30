@@ -31,6 +31,7 @@ import '../model/memory_info.dart';
 import '../model/migration_config.dart';
 import '../model/migration_task.dart';
 import '../model/ngh_index_meta.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/result_type.dart';
 import '../model/space_config.dart';
@@ -2557,9 +2558,9 @@ class DataStoreImpl {
             message: 'Deferred heavy update recorded in transaction',
           ));
         }
-        // Heavy update execution path (not in transaction or during commit)
-        // Use processTablePartitions for batch processing to avoid memory overflow
-        // Concurrency check for heavy operations (global throttling of processTablePartitions)
+        // Heavy update execution path (not in transaction or during commit).
+        // Page-batch streaming keeps large partition files bounded in memory.
+        // Concurrency check for heavy operations (global throttling of partition maintenance).
         if (_heavyUpdateOperationsInProgress >=
             _maxConcurrentPartitionMaintenances) {
           final completer = Completer<void>();
@@ -2610,23 +2611,8 @@ class DataStoreImpl {
             }
           } catch (_) {}
 
-          // Determine the batch size threshold based on record cache size, with a 200MB default.
-          final effectiveRecordCacheSize =
-              resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
-          final maxBatchMemorySizeInBytes = effectiveRecordCacheSize * 0.2;
-
-          // Calculate max partitions in a batch based on memory limits and max partition file size.
-          final maxPartitionsInBatch = (config.maxPartitionFileSize > 0
-                  ? (maxBatchMemorySizeInBytes / config.maxPartitionFileSize)
-                  : 10)
-              .ceil()
-              .clamp(1, 100);
-
-          final recordsInBatch = <Map<String, dynamic>>[];
-          final partitionsInBatch = <int>[];
-          final oldRecordsInBatch = <Map<String, dynamic>>[];
-
           final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
+          final insertedPrimaryKeysThisUpdate = <String>{};
           final Set<String> indexedFieldNames = <String>{primaryKey}..addAll(
               <IndexSchema>[
                 ...?schemaManager?.getAllIndexesFor(schema),
@@ -2637,19 +2623,33 @@ class DataStoreImpl {
               ].expand((i) => i.fields),
             );
 
-          Future<void> flushIndexUpdateBatch() async {
-            if (_indexManager == null || recordsInBatch.isEmpty) return;
-            final updates = <IndexRecordUpdate>[];
-            final int len =
-                min(recordsInBatch.length, oldRecordsInBatch.length);
+          Future<void> flushIndexUpdateBatch(
+            List<Map<String, dynamic>> originalRecords,
+            List<Map<String, dynamic>> updates,
+            List<Map<String, dynamic>> deletes,
+            List<Map<String, dynamic>> inserts,
+            BatchContext? batchContext,
+          ) async {
+            if (_indexManager == null ||
+                (updates.isEmpty && deletes.isEmpty && inserts.isEmpty)) {
+              return;
+            }
+            final indexUpdates = <IndexRecordUpdate>[];
+            final oldByPk = <String, Map<String, dynamic>>{};
+            for (final oldRec in originalRecords) {
+              final oldPk = oldRec[primaryKey]?.toString();
+              if (oldPk == null || oldPk.isEmpty) continue;
+              oldByPk[oldPk] = oldRec;
+            }
 
             final yieldController =
                 YieldController('DataStoreImpl._updateInternal.flushIndex');
-            for (int i = 0; i < len; i++) {
-              final newRec = recordsInBatch[i];
-              final oldRec = oldRecordsInBatch[i];
+            for (final newRec in updates) {
+              await yieldController.maybeYield();
               final pk = newRec[primaryKey]?.toString();
               if (pk == null || pk.isEmpty) continue;
+              final oldRec = oldByPk[pk];
+              if (oldRec == null) continue;
 
               final changed = <String>{};
               final oldVals = <String, dynamic>{};
@@ -2664,20 +2664,24 @@ class DataStoreImpl {
 
               if (changed.isEmpty) continue;
 
-              updates.add(IndexRecordUpdate(
+              indexUpdates.add(IndexRecordUpdate(
                 primaryKey: pk,
                 newValues: Map<String, dynamic>.from(newRec),
                 oldValues:
                     oldVals.isEmpty ? null : Map<String, dynamic>.from(oldVals),
                 changedFields: changed,
               ));
-              await yieldController.maybeYield();
             }
 
-            if (updates.isEmpty) return;
+            if (inserts.isEmpty && indexUpdates.isEmpty && deletes.isEmpty) {
+              return;
+            }
             await _indexManager?.writeChanges(
               tableName: tableName,
-              updates: updates,
+              inserts: inserts,
+              updates: indexUpdates,
+              deletes: deletes,
+              batchContext: batchContext,
             );
           }
 
@@ -2693,261 +2697,288 @@ class DataStoreImpl {
             }
           }
 
-          // build a process function, to check if each partition's record matches the update condition
-          Future<List<Map<String, dynamic>>> processFunction(
-              records, partitionNo, controller) async {
-            // record original count
-            int originalCount = records.length;
-
-            // Create a new list with all records (do not filter out)
-            final resultRecords = List<Map<String, dynamic>>.from(records);
-
-            // collect updated records
-            final updatedRecordsInPartition = <Map<String, dynamic>>[];
-            final oldRecordsInPartition = <Map<String, dynamic>>[];
-            final matchedRecordIndices = <int>[];
-            final matchedRecords = <Map<String, dynamic>>[];
-            final remainingMatchBudget =
-                limit == null ? null : max(0, limit - totalUpdated);
-            if (remainingMatchBudget == 0) {
-              if (!controller.isStopped) {
-                controller.stop();
-              }
-              return resultRecords;
-            }
-            final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-              schema: schema,
-              tableName: tableName,
-              condition: conditionMap,
-              records: resultRecords,
-              estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
-              maxMatchCount: remainingMatchBudget,
-            );
-            final matchedYieldController =
-                YieldController('DataStoreImpl._updateInternal.matched');
-            for (final matchedIndex in matchResult.matchedIndices) {
-              await matchedYieldController.maybeYield();
-              if (limit != null && totalUpdated >= limit) {
-                if (!controller.isStopped) {
-                  controller.stop();
-                }
-                continue;
-              }
-
-              totalUpdated++;
-              matchedRecordIndices.add(matchedIndex);
-              matchedRecords.add(resultRecords[matchedIndex]);
-            }
-
-            if (matchedRecords.isNotEmpty) {
-              final preparedMatchedRecords = await _prepareUniformUpdateRecords(
-                schema,
+          await tableDataManager.streamPartitionPageBatches(
+            tableName: tableName,
+            startPartitionNo: startPartitionNo,
+            partitionConcurrency: 1,
+            prefetchNextPageBatch: !isPrimaryKeyUpdate,
+            onPartition: (partitionNo, batches, controller) async {
+              await tableDataManager.withTableWriteLock(
                 tableName,
-                validData,
-                matchedRecords,
-              );
-              final applyYieldController =
-                  YieldController('DataStoreImpl._updateInternal.process');
+                (tableLock) async {
+                  await for (final batch in batches) {
+                    if (controller.shouldStopCurrentBatch) break;
 
-              for (int matchedIndex = 0;
-                  matchedIndex < matchedRecords.length;
-                  matchedIndex++) {
-                final record = matchedRecords[matchedIndex];
-                final updatedRecord =
-                    preparedMatchedRecords[matchedIndex].updatedRecord;
-
-                // Verify unique constraints for heavy update (bypass buffer/reservation)
-                if (uniqueFieldsToCheck.isNotEmpty && _indexManager != null) {
-                  try {
-                    final uniqueCheckData = <String, dynamic>{
-                      primaryKey: updatedRecord[primaryKey],
-                    };
-                    for (final f in uniqueFieldsToCheck) {
-                      uniqueCheckData[f] = updatedRecord[f];
+                    final records = batch.records;
+                    final originalCount = records.length;
+                    final remainingMatchBudget =
+                        limit == null ? null : max(0, limit - totalUpdated);
+                    if (remainingMatchBudget == 0) {
+                      if (!controller.isStopped) {
+                        controller.stop();
+                      }
+                      break;
                     }
 
-                    final violation =
-                        await _indexManager!.checkUniqueConstraints(
-                      tableName,
-                      uniqueCheckData,
-                      isUpdate: true,
-                      // checkDiskOnly: false (default) - MUST check buffer for conflicts to avoid duplication,
-                      // even though we don't add to buffer.
-                      // checkInBuffer() is read-only and won't add to buffer.
+                    final matchResult =
+                        await ConditionBatchMatcher.matchRecordIndices(
+                      schema: schema,
+                      tableName: tableName,
+                      condition: conditionMap,
+                      records: records,
+                      estimateRecordBytes:
+                          tableDataManager.estimateRecordSizeBytes,
+                      maxMatchCount: remainingMatchBudget,
                     );
 
-                    if (violation != null) {
-                      Logger.warn(
-                          '[Unique Constraint Violation] Skipping record during heavy update - ${violation.message}',
-                          label: 'DataStore.updateInternal');
+                    final matchedRecords = <Map<String, dynamic>>[];
+                    final matchedYieldController = YieldController(
+                        'DataStoreImpl._updateInternal.matched');
+                    for (final matchedIndex in matchResult.matchedIndices) {
+                      await matchedYieldController.maybeYield();
+                      final candidate = records[matchedIndex];
+                      final candidatePk = candidate[primaryKey]?.toString();
+                      if (candidatePk != null &&
+                          insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
+                        continue;
+                      }
+                      if (limit != null && totalUpdated >= limit) {
+                        if (!controller.isStopped) {
+                          controller.stop();
+                        }
+                        continue;
+                      }
+
+                      totalUpdated++;
+                      matchedRecords.add(candidate);
+                    }
+
+                    final inserts = <Map<String, dynamic>>[];
+                    final updates = <Map<String, dynamic>>[];
+                    final deletes = <Map<String, dynamic>>[];
+                    final cacheKeysToRemove = <String>{};
+
+                    if (matchedRecords.isNotEmpty) {
+                      final preparedMatchedRecords =
+                          await _prepareUniformUpdateRecords(
+                        schema,
+                        tableName,
+                        validData,
+                        matchedRecords,
+                      );
+                      final applyYieldController = YieldController(
+                          'DataStoreImpl._updateInternal.process');
+
+                      for (int matchedIndex = 0;
+                          matchedIndex < matchedRecords.length;
+                          matchedIndex++) {
+                        final record = matchedRecords[matchedIndex];
+                        final updatedRecord =
+                            preparedMatchedRecords[matchedIndex].updatedRecord;
+
+                        // Verify unique constraints for heavy update (bypass buffer/reservation)
+                        if (uniqueFieldsToCheck.isNotEmpty &&
+                            _indexManager != null) {
+                          try {
+                            final uniqueCheckData = <String, dynamic>{
+                              primaryKey: updatedRecord[primaryKey],
+                            };
+                            for (final f in uniqueFieldsToCheck) {
+                              uniqueCheckData[f] = updatedRecord[f];
+                            }
+
+                            final violation =
+                                await _indexManager!.checkUniqueConstraints(
+                              tableName,
+                              uniqueCheckData,
+                              isUpdate: true,
+                              // checkDiskOnly: false (default) - MUST check buffer for conflicts to avoid duplication,
+                              // even though we don't add to buffer.
+                              // checkInBuffer() is read-only and won't add to buffer.
+                            );
+
+                            if (violation != null) {
+                              Logger.warn(
+                                  '[Unique Constraint Violation] Skipping record during heavy update - ${violation.message}',
+                                  label: 'DataStore.updateInternal');
+                              continue;
+                            }
+                          } catch (e) {
+                            Logger.error(
+                                'Unique constraint check failed during heavy update: $e',
+                                label: 'DataStore.updateInternal');
+                            continue;
+                          }
+                        }
+
+                        // Validate foreign key constraints if needed
+                        if (_foreignKeyManager != null) {
+                          try {
+                            await _foreignKeyManager!
+                                .validateForeignKeyConstraints(
+                              tableName: tableName,
+                              data: updatedRecord,
+                              operation: ForeignKeyOperation.update,
+                            );
+                          } catch (e) {
+                            Logger.error(
+                                'Foreign key constraint validation failed during heavy update: $e',
+                                label: 'DataStore.updateInternal');
+                            // Skip this record in heavy update (continue processing others)
+                            continue;
+                          }
+
+                          // Handle foreign key constraints for primary key update in heavy update path
+                          // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately,
+                          // only CASCADE operations can be deferred
+                          if (isPrimaryKeyUpdate) {
+                            final oldPkValue = record[primaryKey];
+                            final newPkValue = updatedRecord[primaryKey];
+                            if (oldPkValue != null &&
+                                newPkValue != null &&
+                                oldPkValue != newPkValue) {
+                              // Phase 1: Always check RESTRICT/NO ACTION constraints immediately
+                              try {
+                                await _foreignKeyManager!
+                                    .checkRestrictConstraintsForUpdate(
+                                  tableName: tableName,
+                                  oldPkValues: oldPkValue,
+                                );
+                              } catch (e) {
+                                Logger.error(
+                                    'RESTRICT constraint check failed during heavy update: $e',
+                                    label: 'DataStore.updateInternal');
+                                // Skip this record
+                                continue;
+                              }
+
+                              // Phase 2: Handle CASCADE/SET NULL/SET DEFAULT operations
+                              // CRITICAL: For heavy update, execute cascade immediately for each record
+                              // to ensure atomicity. If cascade fails, the update should also fail.
+                              // This prevents partial updates where some records are updated but cascade fails.
+                              try {
+                                await _foreignKeyManager!.handleCascadeUpdate(
+                                  tableName: tableName,
+                                  oldPkValues: oldPkValue,
+                                  newPkValues: newPkValue,
+                                  visitedTables: null,
+                                  skipRestrictCheck:
+                                      true, // RESTRICT already checked above
+                                );
+                              } catch (e) {
+                                Logger.error(
+                                    'Cascade update failed during heavy update: $e',
+                                    label: 'DataStore.updateInternal');
+                                // Skip this record - don't update if cascade fails
+                                // This ensures data consistency: if cascade fails, the update is also skipped
+                                continue;
+                              }
+                            }
+                          }
+                        }
+
+                        // get record primary key value
+                        final pkValue = record[primaryKey];
+                        if (pkValue != null) {
+                          final pkValueStr = pkValue.toString();
+                          // Add to updated keys list (with limit)
+                          if (updatedKeys.length < maxUpdatedKeysToReturn) {
+                            updatedKeys.add(pkValueStr);
+                          }
+
+                          // remove from write queue (if exists)
+                          tableDataManager.removeRecordFromBuffer(
+                              tableName, pkValueStr);
+                          cacheKeysToRemove.add(pkValueStr);
+                        }
+                        final newPkValue = updatedRecord[primaryKey];
+                        if (newPkValue != null && newPkValue != pkValue) {
+                          final newPkValueStr = newPkValue.toString();
+                          insertedPrimaryKeysThisUpdate.add(newPkValueStr);
+                          tableDataManager.removeRecordFromBuffer(
+                            tableName,
+                            newPkValueStr,
+                          );
+                          cacheKeysToRemove.add(newPkValueStr);
+                          deletes.add(record);
+                          inserts.add(updatedRecord);
+                        } else {
+                          updates.add(updatedRecord);
+                        }
+
+                        notificationManager.notify(ChangeEvent(
+                          type: ChangeType.update,
+                          tableName: tableName,
+                          record: updatedRecord,
+                          oldRecord: record,
+                        ));
+
+                        await applyYieldController.maybeYield();
+                      }
+                    }
+
+                    totalProcessed += originalCount;
+
+                    if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
+                      if (controller.shouldStopCurrentBatch) break;
                       continue;
                     }
-                  } catch (e) {
-                    Logger.error(
-                        'Unique constraint check failed during heavy update: $e',
-                        label: 'DataStore.updateInternal');
-                    continue;
-                  }
-                }
 
-                // Validate foreign key constraints if needed
-                if (_foreignKeyManager != null) {
-                  try {
-                    await _foreignKeyManager!.validateForeignKeyConstraints(
-                      tableName: tableName,
-                      data: updatedRecord,
-                      operation: ForeignKeyOperation.update,
-                    );
-                  } catch (e) {
-                    Logger.error(
-                        'Foreign key constraint validation failed during heavy update: $e',
-                        label: 'DataStore.updateInternal');
-                    // Skip this record in heavy update (continue processing others)
-                    continue;
-                  }
-
-                  // Handle foreign key constraints for primary key update in heavy update path
-                  // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately,
-                  // only CASCADE operations can be deferred
-                  if (isPrimaryKeyUpdate) {
-                    final oldPkValue = record[primaryKey];
-                    final newPkValue = updatedRecord[primaryKey];
-                    if (oldPkValue != null &&
-                        newPkValue != null &&
-                        oldPkValue != newPkValue) {
-                      // Phase 1: Always check RESTRICT/NO ACTION constraints immediately
-                      try {
-                        await _foreignKeyManager!
-                            .checkRestrictConstraintsForUpdate(
-                          tableName: tableName,
-                          oldPkValues: oldPkValue,
-                        );
-                      } catch (e) {
-                        Logger.error(
-                            'RESTRICT constraint check failed during heavy update: $e',
-                            label: 'DataStore.updateInternal');
-                        // Skip this record
-                        continue;
-                      }
-
-                      // Phase 2: Handle CASCADE/SET NULL/SET DEFAULT operations
-                      // CRITICAL: For heavy update, execute cascade immediately for each record
-                      // to ensure atomicity. If cascade fails, the update should also fail.
-                      // This prevents partial updates where some records are updated but cascade fails.
-                      try {
-                        await _foreignKeyManager!.handleCascadeUpdate(
-                          tableName: tableName,
-                          oldPkValues: oldPkValue,
-                          newPkValues: newPkValue,
-                          visitedTables: null,
-                          skipRestrictCheck:
-                              true, // RESTRICT already checked above
-                        );
-                      } catch (e) {
-                        Logger.error(
-                            'Cascade update failed during heavy update: $e',
-                            label: 'DataStore.updateInternal');
-                        // Skip this record - don't update if cascade fails
-                        // This ensures data consistency: if cascade fails, the update is also skipped
-                        continue;
-                      }
+                    BatchContext? batchContext;
+                    if (config.enableJournal) {
+                      batchContext = await parallelJournalManager
+                          .beginMaintenanceBatch(table: tableName);
                     }
+
+                    await tableDataManager.writeChanges(
+                      tableName: tableName,
+                      inserts: inserts,
+                      updates: updates,
+                      deletes: deletes,
+                      batchContext: batchContext,
+                      tableLock: tableLock,
+                      recordCountInsertDelta: inserts.length,
+                      recordCountDeleteDelta: deletes.length,
+                    );
+
+                    await tableDataManager.removeTableRecords(
+                      tableName,
+                      cacheKeysToRemove.toList(growable: false),
+                    );
+                    await flushIndexUpdateBatch(
+                      records,
+                      updates,
+                      deletes,
+                      inserts,
+                      batchContext,
+                    );
+
+                    if (config.enableJournal && batchContext != null) {
+                      await parallelJournalManager.completeMaintenanceBatch(
+                        batchContext: batchContext,
+                      );
+                      await tableDataManager.persistRuntimeMetaIfNeeded();
+                    }
+
+                    if (controller.shouldStopCurrentBatch) break;
                   }
-                }
+                },
+                operationPrefix: 'direct_page_batches_',
+              );
 
-                // Store old record for index diff only after the update is accepted.
-                oldRecordsInPartition.add(Map<String, dynamic>.from(record));
-
-                // get record primary key value
-                final pkValue = record[primaryKey];
-                if (pkValue != null) {
-                  final pkValueStr = pkValue.toString();
-                  // Add to updated keys list (with limit)
-                  if (updatedKeys.length < maxUpdatedKeysToReturn) {
-                    updatedKeys.add(pkValueStr);
-                  }
-
-                  // remove from write queue (if exists)
-                  tableDataManager.removeRecordFromBuffer(
-                      tableName, pkValueStr);
-                }
-
-                // Replace record with updated version
-                resultRecords[matchedRecordIndices[matchedIndex]] =
-                    updatedRecord;
-                updatedRecordsInPartition.add(updatedRecord);
-
-                notificationManager.notify(ChangeEvent(
-                  type: ChangeType.update,
-                  tableName: tableName,
-                  record: updatedRecord,
-                  oldRecord: record,
-                ));
-
-                await applyYieldController.maybeYield();
+              if (!controller.isStopped) {
+                try {
+                  await walManager.updateLargeUpdateCheckpoint(
+                    opId: largeUpdateOpId,
+                    lastProcessedPartitionNo: partitionNo,
+                    updatedSoFar: totalUpdated,
+                  );
+                } catch (_) {}
+                return PartitionStreamAction.continueScan;
               }
-            }
-
-            totalProcessed += originalCount;
-
-            if (updatedRecordsInPartition.isNotEmpty) {
-              recordsInBatch.addAll(updatedRecordsInPartition);
-              oldRecordsInBatch.addAll(oldRecordsInPartition);
-              partitionsInBatch.add(partitionNo);
-
-              // Flush the batch when the number of partitions with updates reaches the calculated threshold.
-              if (partitionsInBatch.length >= maxPartitionsInBatch) {
-                // Invalidate records from cache
-                await tableDataManager.removeTableRecords(
-                    tableName,
-                    recordsInBatch
-                        .map((r) => r[primaryKey]?.toString())
-                        .where((k) => k != null)
-                        .map((k) => k!)
-                        .toList());
-
-                await flushIndexUpdateBatch();
-
-                recordsInBatch.clear();
-                oldRecordsInBatch.clear();
-                partitionsInBatch.clear();
-              }
-            }
-
-            return resultRecords;
-          }
-
-          // use processTablePartitions to process all partitions (skip global maintenance lock; no journal)
-          await tableDataManager.processTablePartitions(
-            tableName: tableName,
-            processFunction: processFunction,
-            startPartitionNo: startPartitionNo,
-            skipMaintenanceGlobalLock: true,
-            onPartitionFlushed: (int partitionNo) async {
-              try {
-                await walManager.updateLargeUpdateCheckpoint(
-                  opId: largeUpdateOpId,
-                  lastProcessedPartitionNo: partitionNo,
-                  updatedSoFar: totalUpdated,
-                );
-              } catch (_) {}
+              return controller.stopAction;
             },
           );
-
-          // Process any remaining records in the last batch
-          if (recordsInBatch.isNotEmpty) {
-            // Invalidate records from cache
-            await tableDataManager.removeTableRecords(
-              tableName,
-              recordsInBatch
-                  .map((r) => r[primaryKey]?.toString())
-                  .where((k) => k != null)
-                  .map((k) => k!)
-                  .toList(),
-            );
-
-            await flushIndexUpdateBatch();
-          }
 
           // Complete large update tracking in WAL meta
           try {
@@ -3747,7 +3778,7 @@ class DataStoreImpl {
             message: 'Deferred heavy delete recorded in transaction',
           ));
         }
-        // Concurrency check for heavy operations (global throttling of processTablePartitions)
+        // Concurrency check for heavy operations (global throttling of partition maintenance).
         if (_heavyDeleteOperationsInProgress >=
             _maxConcurrentPartitionMaintenances) {
           final completer = Completer<void>();
@@ -3796,207 +3827,188 @@ class DataStoreImpl {
             }
           } catch (_) {}
 
-          // Determine the batch size threshold based on record cache size, with a 200MB default.
-          final effectiveRecordCacheSize =
-              resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
-          final maxBatchMemorySizeInBytes = effectiveRecordCacheSize * 0.2;
-
-          // Calculate max partitions in a batch based on memory limits and max partition file size.
-          // This avoids per-record size calculation and provides a stable batch size.
-          final maxPartitionsInBatch = (config.maxPartitionFileSize > 0
-                  ? (maxBatchMemorySizeInBytes / config.maxPartitionFileSize)
-                  : 10)
-              .ceil()
-              .clamp(1,
-                  100); // Clamp to a reasonable range to avoid excessive memory usage
-
-          final recordsInBatch = <Map<String, dynamic>>[];
-          final partitionsInBatch = <int>[];
-
-          Future<void> flushIndexDeleteBatch() async {
-            if (_indexManager == null || recordsInBatch.isEmpty) return;
+          Future<void> flushIndexDeleteBatch(
+            List<Map<String, dynamic>> records,
+            BatchContext? batchContext,
+          ) async {
+            if (_indexManager == null || records.isEmpty) return;
             await _indexManager!.writeChanges(
               tableName: tableName,
-              deletes: recordsInBatch,
+              deletes: records,
+              batchContext: batchContext,
             );
           }
 
-          // build a process function, to check if each partition's record matches the delete condition
-          Future<List<Map<String, dynamic>>> processFunction(
-              records, partitionNo, controller) async {
-            // record original count
-            int originalCount = records.length;
-
-            // Create a new list with all records (do not filter out)
-            final resultRecords = List<Map<String, dynamic>>.from(records);
-
-            // collect deleted records
-            final deletedRecordsInPartition = <Map<String, dynamic>>[];
-            final remainingMatchBudget =
-                limit == null ? null : max(0, limit - deletedCount);
-            if (remainingMatchBudget == 0) {
-              if (!controller.isStopped) {
-                controller.stop();
-              }
-              return resultRecords;
-            }
-
-            final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-              schema: schema,
-              tableName: tableName,
-              condition: conditionMap,
-              records: resultRecords,
-              estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
-              maxMatchCount: remainingMatchBudget,
-            );
-            bool allDeleted = matchResult.completedAllRecords &&
-                matchResult.liveRecordCount > 0 &&
-                matchResult.matchedIndices.length ==
-                    matchResult.liveRecordCount;
-
-            final yieldController =
-                YieldController('DataStoreImpl._deleteInternal.process');
-            // replace deleted records with _deleted_:true marker, instead of removing
-            for (final matchedIndex in matchResult.matchedIndices) {
-              await yieldController.maybeYield();
-              final record = resultRecords[matchedIndex];
-              // Apply limit before processing the record for deletion
-              if (limit != null && deletedCount >= limit) {
-                if (!controller.isStopped) {
-                  controller.stop();
-                }
-                allDeleted = false;
-                continue;
-              }
-
-              // CRITICAL: Process each record atomically - check RESTRICT and execute CASCADE immediately
-              // This ensures data consistency: if cascade fails, the record deletion is also rolled back
-              final pkValue = record[primaryKey];
-              if (pkValue == null) {
-                allDeleted = false;
-                continue;
-              }
-
-              // Phase 1: Check RESTRICT/NO ACTION constraints immediately
-              if (_foreignKeyManager != null) {
-                try {
-                  await _foreignKeyManager!.checkRestrictConstraintsForDelete(
-                    tableName: tableName,
-                    deletedPkValues: pkValue,
-                  );
-                } catch (e) {
-                  Logger.error(
-                      'RESTRICT constraint check failed in heavy delete: $e',
-                      label: 'DataStore.deleteInternal');
-                  // Stop processing and propagate error to ensure transaction rollback
-                  if (!controller.isStopped) {
-                    controller.stop();
-                  }
-                  rethrow; // This will be caught by the outer try-catch
-                }
-
-                // Phase 2: Execute CASCADE operations immediately for this record
-                // CRITICAL: Execute cascade immediately, not in batch, to ensure atomicity
-                // If cascade fails, the record deletion should also fail (transaction rollback)
-                try {
-                  await _foreignKeyManager!.handleCascadeDelete(
-                    tableName: tableName,
-                    deletedPkValues: pkValue,
-                    skipRestrictCheck: true, // RESTRICT already checked above
-                  );
-                } catch (e) {
-                  Logger.error(
-                      'Cascade delete failed in heavy delete for record: $e',
-                      label: 'DataStore.deleteInternal');
-                  // Stop processing and propagate error to ensure transaction rollback
-                  if (!controller.isStopped) {
-                    controller.stop();
-                  }
-                  rethrow; // This will be caught by the outer try-catch
-                }
-              }
-
-              // Phase 3: Only after RESTRICT check and CASCADE succeed, mark record for deletion
-              deletedCount++;
-
-              // add to deleted records list
-              deletedRecordsInPartition.add(record);
-
-              notificationManager.notify(ChangeEvent(
-                type: ChangeType.delete,
-                tableName: tableName,
-                oldRecord: record,
-              ));
-
-              final pkValueStr = pkValue.toString();
-              if (deletedKeys.length < maxDeletedKeysToReturn) {
-                deletedKeys.add(pkValueStr);
-              }
-
-              tableDataManager.removeRecordFromBuffer(tableName, pkValueStr);
-              resultRecords[matchedIndex] = {'_deleted_': true};
-              await yieldController.maybeYield();
-            }
-
-            totalProcessed += originalCount;
-
-            if (deletedRecordsInPartition.isNotEmpty) {
-              recordsInBatch.addAll(deletedRecordsInPartition);
-              partitionsInBatch.add(partitionNo);
-
-              // Flush the batch when the number of partitions with deletions reaches the calculated threshold.
-              if (partitionsInBatch.length >= maxPartitionsInBatch) {
-                await tableDataManager.removeTableRecords(
-                  tableName,
-                  recordsInBatch
-                      .map((r) => r[primaryKey]?.toString())
-                      .where((k) => k != null)
-                      .map((k) => k!)
-                      .toList(),
-                );
-                await flushIndexDeleteBatch();
-
-                recordsInBatch.clear();
-                partitionsInBatch.clear();
-              }
-
-              // Optimized: if all records are deleted, return empty list, directly remove the partition, more efficient
-              if (allDeleted) {
-                return [];
-              }
-            }
-
-            return resultRecords;
-          }
-
-          // use processTablePartitions to process all partitions (skip global maintenance lock; no journal)
-          await tableDataManager.processTablePartitions(
+          await tableDataManager.streamPartitionPageBatches(
             tableName: tableName,
-            processFunction: processFunction,
             startPartitionNo: startPartitionNo,
-            skipMaintenanceGlobalLock: true,
-            onPartitionFlushed: (int partitionNo) async {
-              try {
-                await walManager.updateLargeDeleteCheckpoint(
-                  opId: largeDeleteOpId,
-                  lastProcessedPartitionNo: partitionNo,
-                  deletedSoFar: deletedCount,
-                );
-              } catch (_) {}
+            partitionConcurrency: 1,
+            onPartition: (partitionNo, batches, controller) async {
+              await tableDataManager.withTableWriteLock(
+                tableName,
+                (tableLock) async {
+                  await for (final batch in batches) {
+                    if (controller.shouldStopCurrentBatch) break;
+
+                    final records = batch.records;
+                    final originalCount = records.length;
+                    final remainingMatchBudget =
+                        limit == null ? null : max(0, limit - deletedCount);
+                    if (remainingMatchBudget == 0) {
+                      if (!controller.isStopped) {
+                        controller.stop();
+                      }
+                      break;
+                    }
+
+                    final matchResult =
+                        await ConditionBatchMatcher.matchRecordIndices(
+                      schema: schema,
+                      tableName: tableName,
+                      condition: conditionMap,
+                      records: records,
+                      estimateRecordBytes:
+                          tableDataManager.estimateRecordSizeBytes,
+                      maxMatchCount: remainingMatchBudget,
+                    );
+
+                    final deletes = <Map<String, dynamic>>[];
+                    final cacheKeysToRemove = <String>[];
+                    final yieldController = YieldController(
+                        'DataStoreImpl._deleteInternal.process');
+                    for (final matchedIndex in matchResult.matchedIndices) {
+                      await yieldController.maybeYield();
+                      final record = records[matchedIndex];
+                      // Apply limit before processing the record for deletion
+                      if (limit != null && deletedCount >= limit) {
+                        if (!controller.isStopped) {
+                          controller.stop();
+                        }
+                        continue;
+                      }
+
+                      // CRITICAL: Process each record atomically - check RESTRICT and execute CASCADE immediately
+                      // This ensures data consistency: if cascade fails, the record deletion is also rolled back
+                      final pkValue = record[primaryKey];
+                      if (pkValue == null) {
+                        continue;
+                      }
+
+                      // Phase 1: Check RESTRICT/NO ACTION constraints immediately
+                      if (_foreignKeyManager != null) {
+                        try {
+                          await _foreignKeyManager!
+                              .checkRestrictConstraintsForDelete(
+                            tableName: tableName,
+                            deletedPkValues: pkValue,
+                          );
+                        } catch (e) {
+                          Logger.error(
+                              'RESTRICT constraint check failed in heavy delete: $e',
+                              label: 'DataStore.deleteInternal');
+                          // Stop processing and propagate error to ensure transaction rollback
+                          if (!controller.isStopped) {
+                            controller.stop();
+                          }
+                          rethrow; // This will be caught by the outer try-catch
+                        }
+
+                        // Phase 2: Execute CASCADE operations immediately for this record
+                        // CRITICAL: Execute cascade immediately, not in batch, to ensure atomicity
+                        // If cascade fails, the record deletion should also fail (transaction rollback)
+                        try {
+                          await _foreignKeyManager!.handleCascadeDelete(
+                            tableName: tableName,
+                            deletedPkValues: pkValue,
+                            skipRestrictCheck:
+                                true, // RESTRICT already checked above
+                          );
+                        } catch (e) {
+                          Logger.error(
+                              'Cascade delete failed in heavy delete for record: $e',
+                              label: 'DataStore.deleteInternal');
+                          // Stop processing and propagate error to ensure transaction rollback
+                          if (!controller.isStopped) {
+                            controller.stop();
+                          }
+                          rethrow; // This will be caught by the outer try-catch
+                        }
+                      }
+
+                      // Phase 3: Only after RESTRICT check and CASCADE succeed, mark record for deletion
+                      deletedCount++;
+                      deletes.add(record);
+
+                      notificationManager.notify(ChangeEvent(
+                        type: ChangeType.delete,
+                        tableName: tableName,
+                        oldRecord: record,
+                      ));
+
+                      final pkValueStr = pkValue.toString();
+                      if (deletedKeys.length < maxDeletedKeysToReturn) {
+                        deletedKeys.add(pkValueStr);
+                      }
+
+                      tableDataManager.removeRecordFromBuffer(
+                          tableName, pkValueStr);
+                      cacheKeysToRemove.add(pkValueStr);
+                      await yieldController.maybeYield();
+                    }
+
+                    totalProcessed += originalCount;
+
+                    if (deletes.isEmpty) {
+                      if (controller.shouldStopCurrentBatch) break;
+                      continue;
+                    }
+
+                    BatchContext? batchContext;
+                    if (config.enableJournal) {
+                      batchContext = await parallelJournalManager
+                          .beginMaintenanceBatch(table: tableName);
+                    }
+
+                    await tableDataManager.writeChanges(
+                      tableName: tableName,
+                      deletes: deletes,
+                      batchContext: batchContext,
+                      tableLock: tableLock,
+                      recordCountDeleteDelta: deletes.length,
+                    );
+
+                    await tableDataManager.removeTableRecords(
+                      tableName,
+                      cacheKeysToRemove,
+                    );
+                    await flushIndexDeleteBatch(deletes, batchContext);
+
+                    if (config.enableJournal && batchContext != null) {
+                      await parallelJournalManager.completeMaintenanceBatch(
+                        batchContext: batchContext,
+                      );
+                      await tableDataManager.persistRuntimeMetaIfNeeded();
+                    }
+
+                    if (controller.shouldStopCurrentBatch) break;
+                  }
+                },
+                operationPrefix: 'direct_page_batches_',
+              );
+
+              if (!controller.isStopped) {
+                try {
+                  await walManager.updateLargeDeleteCheckpoint(
+                    opId: largeDeleteOpId,
+                    lastProcessedPartitionNo: partitionNo,
+                    deletedSoFar: deletedCount,
+                  );
+                } catch (_) {}
+                return PartitionStreamAction.continueScan;
+              }
+              return controller.stopAction;
             },
           );
-
-          // Process any remaining records in the last batch
-          if (recordsInBatch.isNotEmpty) {
-            await tableDataManager.removeTableRecords(
-                tableName,
-                recordsInBatch
-                    .map((r) => r[primaryKey]?.toString())
-                    .where((k) => k != null)
-                    .map((k) => k!)
-                    .toList());
-            await flushIndexDeleteBatch();
-          }
 
           // Complete large delete tracking in WAL meta
           try {

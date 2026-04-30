@@ -1755,9 +1755,8 @@ class IndexSchema {
       // Match using lowercase to be more forgiving
       switch (typeStr.toLowerCase()) {
         case 'hash':
-          return IndexType.hash;
         case 'bitmap':
-          return IndexType.bitmap;
+          return IndexType.btree;
         case 'vector':
           return IndexType.vector;
         default:
@@ -1922,8 +1921,6 @@ enum DataType {
 /// index type enum
 enum IndexType {
   btree, // default, btree index
-  hash, // hash index
-  bitmap, // bitmap index
   vector, // vector similarity index
 }
 

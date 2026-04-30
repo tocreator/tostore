@@ -528,8 +528,6 @@ final class TableTreePartitionManager {
     int? concurrency,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
-    bool allowLeafCompaction = true,
-    bool allowFreePageReuse = true,
   }) async {
     final sw = Stopwatch()..start();
     final totalRecords = inserts.length + updates.length + deletes.length;
@@ -759,12 +757,10 @@ final class TableTreePartitionManager {
 
     Future<TreePagePtr> allocatePage() async {
       // Prefer page reuse in the active partition (O(1) freelist pop).
-      if (allowFreePageReuse) {
-        final activePartitionNo = meta.btreePartitionCount - 1;
-        final reused = await popFreePage(activePartitionNo);
-        if (reused != null) {
-          return reused;
-        }
+      final activePartitionNo = meta.btreePartitionCount - 1;
+      final reused = await popFreePage(activePartitionNo);
+      if (reused != null) {
+        return reused;
       }
 
       final pageSize = meta.btreePageSize;
@@ -1058,8 +1054,7 @@ final class TableTreePartitionManager {
         // Delete cannot cause overflow; stage lazily.
         markLeafDirty(leafPtr, leaf);
         // Opportunistic compaction: only compute parent frames if underfull.
-        if (allowLeafCompaction &&
-            meta.btreeHeight > 0 &&
+        if (meta.btreeHeight > 0 &&
             isLeafUnderfull(leaf) &&
             leaf.keys.isNotEmpty) {
           final frames = <_Frame>[];
@@ -1180,9 +1175,7 @@ final class TableTreePartitionManager {
 
     // Lightweight trigger: enqueue background compaction when deletes happen.
     // This is O(1) and deduplicated by CompactionManager.
-    if (allowLeafCompaction &&
-        lastDeleteLeafPtr != null &&
-        !lastDeleteLeafPtr.isNull) {
+    if (lastDeleteLeafPtr != null && !lastDeleteLeafPtr.isNull) {
       try {
         _dataStore.compactionManager
             .enqueueTable(tableName, hint: lastDeleteLeafPtr);
@@ -2156,14 +2149,33 @@ final class TableTreePartitionManager {
     final yc = YieldController(
         'TableTreePartitionManager.loadPartitionDataPageRangeByNo',
         checkInterval: 1);
+    final startOffset = fromPage * pageSize;
+    final readLength = (toPage - fromPage) * pageSize;
+    final rawRange = await _storage.readAsBytesAt(
+      path,
+      startOffset,
+      length: readLength,
+    );
+    if (rawRange.isEmpty) {
+      return (records: out, reachedEnd: true);
+    }
+
     for (int pageNo = fromPage; pageNo < toPage; pageNo++) {
       await yc.maybeYield();
       final ptr = TreePagePtr(partitionNo, pageNo);
-      final offset = pageNo * pageSize;
-      final raw = await _storage.readAsBytesAt(path, offset, length: pageSize);
-      if (raw.isEmpty) {
+      final pageOffsetInRange = (pageNo - fromPage) * pageSize;
+      if (pageOffsetInRange >= rawRange.length) {
         return (records: out, reachedEnd: true);
       }
+      final available = rawRange.length - pageOffsetInRange;
+      if (available < pageSize) {
+        return (records: out, reachedEnd: true);
+      }
+      final raw = Uint8List.sublistView(
+        rawRange,
+        pageOffsetInRange,
+        pageOffsetInRange + pageSize,
+      );
 
       LeafPage leaf;
       try {
@@ -2185,6 +2197,7 @@ final class TableTreePartitionManager {
         );
         leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
       } catch (e) {
+        final offset = pageNo * pageSize;
         throw StateError('Corrupted B+Tree page while streaming partition: '
             'table=$tableName ptr=$ptr path=$path offset=$offset err=$e');
       }
@@ -2217,6 +2230,7 @@ final class TableTreePartitionManager {
     required String tableName,
     required int partitionNo,
     int pagesPerBatch = 500,
+    bool prefetchNextPageBatch = false,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
@@ -2228,23 +2242,51 @@ final class TableTreePartitionManager {
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return;
     }
+    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    if (!await _storage.existsFile(path)) return;
+    final size = await _storage.getFileSize(path);
+    final snapshotPageCount =
+        (size + meta.btreePageSize - 1) ~/ meta.btreePageSize;
+    if (snapshotPageCount <= TableMeta.firstDataPageNo) {
+      return;
+    }
 
     final yc = YieldController(
         'TableTreePartitionManager.streamPartitionDataPageBatchesByNo',
         checkInterval: 1);
 
-    for (int pageNo = TableMeta.firstDataPageNo;; pageNo += pagesPerBatch) {
-      await yc.maybeYield();
-      final batch = await _loadPartitionDataPageRangeByNo(
+    Future<({List<Map<String, dynamic>> records, bool reachedEnd})> loadBatch(
+      int pageNo,
+    ) {
+      final pageLimit = min(pagesPerBatch, snapshotPageCount - pageNo);
+      return _loadPartitionDataPageRangeByNo(
         tableName: tableName,
         partitionNo: partitionNo,
         startPageNo: pageNo,
-        pageLimit: pagesPerBatch,
+        pageLimit: pageLimit,
         metaSnapshot: meta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         decodeSchema: decodeSchema,
       );
+    }
+
+    Future<({List<Map<String, dynamic>> records, bool reachedEnd})>? pending;
+
+    for (int pageNo = TableMeta.firstDataPageNo; pageNo < snapshotPageCount;) {
+      await yc.maybeYield();
+      final pageLimit = min(pagesPerBatch, snapshotPageCount - pageNo);
+      final batchFuture = pending ?? loadBatch(pageNo);
+      pending = null;
+      final batch = await batchFuture;
+      final nextPageNo = pageNo + pageLimit;
+
+      if (prefetchNextPageBatch &&
+          !batch.reachedEnd &&
+          nextPageNo < snapshotPageCount) {
+        pending = loadBatch(nextPageNo);
+      }
+
       final records = batch.records;
       if (records.isNotEmpty) {
         yield records;
@@ -2252,6 +2294,7 @@ final class TableTreePartitionManager {
       if (batch.reachedEnd) {
         break;
       }
+      pageNo = nextPageNo;
     }
   }
 

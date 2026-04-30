@@ -2535,42 +2535,43 @@ class IndexManager {
       }
 
       // 2) Scan table partitions and build indexes via applyIndexInserts
-      await _dataStore.tableDataManager.processTablePartitions(
+      await _dataStore.tableDataManager.streamPartitionPageBatches(
         tableName: tableName,
-        onlyRead: true,
-        processFunction: (records, partitionIndex, controller) async {
-          // Only write the entire partition at once, avoiding cutting the aligned partition data into multiple pieces and improving throughput.
-          final Map<dynamic, Map<String, dynamic>> newByPk = {};
-          final int maxConcurrency = _dataStore.config.maxConcurrency;
-          final yieldControl =
-              YieldController('IndexManager.processTablePartitions');
+        onPartition: (partitionNo, batches, controller) async {
+          await for (final batch in batches) {
+            final records = batch.records;
+            final Map<dynamic, Map<String, dynamic>> newByPk = {};
+            final int maxConcurrency = _dataStore.config.maxConcurrency;
+            final yieldControl =
+                YieldController('IndexManager.streamPartitionPageBatches');
 
-          for (int i = 0; i < records.length; i++) {
-            await yieldControl.maybeYield();
-            final rec = records[i];
-            if (isDeletedRecord(rec)) continue;
-            final pk = rec[primaryKey];
-            if (pk == null) continue;
-            newByPk[pk] = rec;
-          }
+            for (int i = 0; i < records.length; i++) {
+              await yieldControl.maybeYield();
+              final rec = records[i];
+              if (isDeletedRecord(rec)) continue;
+              final pk = rec[primaryKey];
+              if (pk == null) continue;
+              newByPk[pk] = rec;
+            }
 
-          if (newByPk.isNotEmpty) {
-            await _validateUniqueRebuildBatch(
-              tableName: tableName,
-              schema: tableSchema,
-              uniqueIndexes: uniqueIndexes,
-              records: newByPk.values,
-            );
-            await _dataStore.indexManager?.writeChanges(
-              tableName: tableName,
-              inserts: newByPk.values.toList(growable: false),
-              schemaOverride: tableSchema,
-              targetIndexesOverride: indexesToBuild,
-              concurrency: maxConcurrency > 0 ? maxConcurrency : null,
-            );
-            await Future.delayed(Duration.zero);
+            if (newByPk.isNotEmpty) {
+              await _validateUniqueRebuildBatch(
+                tableName: tableName,
+                schema: tableSchema,
+                uniqueIndexes: uniqueIndexes,
+                records: newByPk.values,
+              );
+              await _dataStore.indexManager?.writeChanges(
+                tableName: tableName,
+                inserts: newByPk.values.toList(growable: false),
+                schemaOverride: tableSchema,
+                targetIndexesOverride: indexesToBuild,
+                concurrency: maxConcurrency > 0 ? maxConcurrency : null,
+              );
+              await Future.delayed(Duration.zero);
+            }
           }
-          return records;
+          return PartitionStreamAction.continueScan;
         },
       );
     } catch (e, stack) {

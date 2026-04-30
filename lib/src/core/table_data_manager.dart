@@ -37,7 +37,6 @@ import 'yield_controller.dart';
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
   final DataStoreImpl _dataStore;
-  static const int _largePartitionStreamingThresholdBytes = 8 * 1024 * 1024;
   static const int _largePartitionStreamingPagesPerBatch = 500;
 
   // Table refresh status flags
@@ -47,9 +46,6 @@ class TableDataManager {
   bool isTableBeingCleared(String tableName) {
     return _tableFlushingFlags.containsKey(tableName);
   }
-
-  // List of tables currently being processed, for concurrency control
-  final Set<String> _processingTables = {};
 
   // Store table partition size configuration (in bytes)
   final Map<String, int> _tablePartitionSizes = {};
@@ -849,7 +845,6 @@ class TableDataManager {
       _fileSizes.clear();
       _lastModifiedTimes.clear();
       _tablePartitionSizes.clear();
-      _processingTables.clear();
       _tableFlushingFlags.clear();
       _pkComparators.clear();
       _totalTableCount = 0;
@@ -2470,544 +2465,165 @@ class TableDataManager {
     }
   }
 
-  /// Process table partitions with multiple operations at once
-  /// Note: This method is used to directly modify partition data, if you need to read data while ensuring partition order, please use ParallelProcessor.execute
+  /// Stream physical partitions as fixed-size page batches.
   ///
-  /// [decodeSchema] - Optional schema to use for decoding records from partition files.
-  /// If provided, uses this schema instead of current table schema.
-  /// This is critical for migration scenarios where old data must be decoded
-  /// using the old schema before applying schema changes.
-  Future<void> processTablePartitions({
+  /// The callback receives one partition at a time when [partitionConcurrency]
+  /// is 1. Callers that need partition-number checkpoints should keep it at 1
+  /// and update the checkpoint after the callback finishes that partition.
+  Future<void> streamPartitionPageBatches({
     required String tableName,
     TableSchema? decodeSchema,
-    required Future<List<Map<String, dynamic>>> Function(
-      List<Map<String, dynamic>> records,
-      int partitionNo,
-      ParallelController controller,
-    ) processFunction,
-    bool onlyRead =
-        false, // if true, only read records from partitions, do not write records
-    int? maxConcurrent,
+    int? startPartitionNo,
+    List<int>? targetPartitionNos,
+    int pagesPerBatch = _largePartitionStreamingPagesPerBatch,
+    int partitionConcurrency = 1,
+    bool prefetchNextPageBatch = false,
     Uint8List? customKey,
     int? customKeyId,
-    int?
-        startPartitionNo, // Specify the start partition number (0-based) for processing
-    List<int>?
-        targetPartitionNos, // Optional: specific partition numbers to process
-    ParallelController? controller,
-    bool skipMaintenanceGlobalLock = false,
-    Future<void> Function(int partitionNo)? onPartitionFlushed,
+    PartitionStreamController? controller,
+    required Future<PartitionStreamAction> Function(
+      int partitionNo,
+      Stream<PartitionPageBatch> batches,
+      PartitionStreamController controller,
+    ) onPartition,
   }) async {
-    // Serialize writes with table-level exclusive lock to avoid concurrent flush/writeRecords.
-    // Read-only tasks are allowed to run concurrently (no exclusive locks).
-    final lockKey = 'table_$tableName';
-    String? operationId;
-    bool lockAcquired = false;
+    final meta = await getTableMeta(tableName);
+    if (meta == null) return;
+    final rangeManager = _dataStore.tableTreePartitionManager;
+    if (rangeManager == null) return;
 
-    // Acquire global maintenance lock ONLY for write operations to keep journal batches consistent,
-    // unless explicitly skipped (for large delete parallelization).
-    final maintenanceLockKey = 'maintenance_process_partitions';
-    String? maintenanceOpId;
-    bool maintenanceLockAcquired = false;
+    final int partitionCount = meta.btreePartitionCount;
+    final allNos =
+        List<int>.generate(partitionCount, (i) => i, growable: false);
 
-    Future<bool> acquireWriteLocks() async {
-      if (onlyRead) {
-        return true;
-      }
-
-      if (!skipMaintenanceGlobalLock && _dataStore.lockManager != null) {
-        maintenanceOpId = GlobalIdGenerator.generate('maint_lock_');
-        maintenanceLockAcquired = await _dataStore.lockManager!
-            .acquireExclusiveLock(maintenanceLockKey, maintenanceOpId!);
-        if (!maintenanceLockAcquired) {
-          Logger.warn(
-              'Another maintenance task is running, skipping processTablePartitions for $tableName',
-              label: 'TableDataManager.processTablePartitions');
-          maintenanceOpId = null;
-          return false;
-        }
-      }
-
-      if (_dataStore.lockManager != null) {
-        operationId = GlobalIdGenerator.generate('process_partitions_');
-        lockAcquired = await _dataStore.lockManager!
-            .acquireExclusiveLock(lockKey, operationId!);
-        if (!lockAcquired) {
-          Logger.warn(
-              'Failed to acquire exclusive lock for processTablePartitions: $tableName',
-              label: 'TableDataManager.processTablePartitions');
-          if (maintenanceLockAcquired && maintenanceOpId != null) {
-            _dataStore.lockManager!
-                .releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
-            maintenanceLockAcquired = false;
-            maintenanceOpId = null;
-          }
-          operationId = null;
-          return false;
-        }
-        _processingTables.add(tableName);
-      } else {
-        if (_processingTables.contains(tableName)) {
-          Logger.debug(
-              'Table $tableName is being processed by another operation, skipping processTablePartitions',
-              label: 'TableDataManager.processTablePartitions');
-          if (maintenanceLockAcquired && maintenanceOpId != null) {
-            _dataStore.lockManager
-                ?.releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
-            maintenanceLockAcquired = false;
-            maintenanceOpId = null;
-          }
-          return false;
-        }
-        _processingTables.add(tableName);
-      }
-      return true;
+    List<int> partitionNos;
+    if (targetPartitionNos != null && targetPartitionNos.isNotEmpty) {
+      partitionNos = targetPartitionNos
+          .where((n) => n >= 0 && n < partitionCount)
+          .toList(growable: false)
+        ..sort();
+    } else if (startPartitionNo != null && startPartitionNo >= 0) {
+      partitionNos =
+          allNos.where((n) => n >= startPartitionNo).toList(growable: false);
+    } else {
+      partitionNos = allNos;
     }
 
-    void releaseWriteLocks() {
-      if (onlyRead) {
-        return;
-      }
-
-      _processingTables.remove(tableName);
-      if (lockAcquired &&
-          _dataStore.lockManager != null &&
-          operationId != null) {
-        _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId!);
-      }
-      if (maintenanceLockAcquired &&
-          _dataStore.lockManager != null &&
-          maintenanceOpId != null) {
-        _dataStore.lockManager!
-            .releaseExclusiveLock(maintenanceLockKey, maintenanceOpId!);
-      }
-
-      lockAcquired = false;
-      maintenanceLockAcquired = false;
-      operationId = null;
-      maintenanceOpId = null;
+    if (partitionNos.isEmpty) return;
+    if (pagesPerBatch <= 0) {
+      pagesPerBatch = _largePartitionStreamingPagesPerBatch;
     }
 
-    try {
-      final meta = await getTableMeta(tableName);
-      if (meta == null) return;
+    final effectiveController = controller ?? PartitionStreamController();
 
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) return;
-      final primaryKey = schema.primaryKey;
-
-      // partitions are physical shards: [0 .. btreePartitionCount-1]
-      final int partitionCount = meta.btreePartitionCount;
-      final List<int> allNos =
-          List<int>.generate(partitionCount, (i) => i, growable: false);
-
-      List<int> partitionNosToProcess;
-      if (targetPartitionNos != null && targetPartitionNos.isNotEmpty) {
-        // Use specified partition numbers, filtered to valid range
-        partitionNosToProcess = targetPartitionNos
-            .where((n) => n >= 0 && n < partitionCount)
-            .toList(growable: false)
-          ..sort();
-      } else if (startPartitionNo != null && startPartitionNo >= 0) {
-        // Start from specified partition number
-        partitionNosToProcess =
-            allNos.where((n) => n >= startPartitionNo).toList(growable: false);
-      } else {
-        // Process all partitions
-        partitionNosToProcess = allNos;
+    Stream<PartitionPageBatch> batchStream(int partitionNo) async* {
+      var emitted = false;
+      await for (final records
+          in rangeManager.streamPartitionDataPageBatchesByNo(
+        tableName: tableName,
+        partitionNo: partitionNo,
+        pagesPerBatch: pagesPerBatch,
+        prefetchNextPageBatch: prefetchNextPageBatch,
+        encryptionKey: customKey,
+        encryptionKeyId: customKeyId,
+        decodeSchema: decodeSchema,
+      )) {
+        if (effectiveController.shouldStopCurrentBatch) break;
+        emitted = true;
+        yield PartitionPageBatch(partitionNo: partitionNo, records: records);
+        if (effectiveController.shouldStopCurrentBatch) break;
       }
 
-      final effectiveController = controller ?? ParallelController();
-      final rangeManager = _dataStore.tableTreePartitionManager;
-      final journaling = _dataStore.config.enableJournal && !onlyRead;
-      final scheduler = _dataStore.workloadScheduler;
-
-      // Helper: compute delta (inserts/updates/deletes) from records vs processed.
-      void computeDelta(
-        List<Map<String, dynamic>> records,
-        List<Map<String, dynamic>> processed,
-        List<Map<String, dynamic>> outInserts,
-        List<Map<String, dynamic>> outUpdates,
-        List<Map<String, dynamic>> outDeletes,
-      ) {
-        final originalByPk = <String, Map<String, dynamic>>{};
-        for (final r in records) {
-          final pk = r[primaryKey]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-          originalByPk[pk] = r;
-        }
-        final processedPks = <String>{};
-        for (final r in processed) {
-          final pk = r[primaryKey]?.toString();
-          if (pk == null || pk.isEmpty) continue;
-          processedPks.add(pk);
-          if (originalByPk.containsKey(pk)) {
-            outUpdates.add(r);
-          } else {
-            outInserts.add(r);
-          }
-        }
-        for (final e in originalByPk.entries) {
-          if (!processedPks.contains(e.key)) outDeletes.add(e.value);
-        }
-      }
-
-      if (rangeManager == null) return;
-      var largeStreamingDemandPerPartition = 1;
-
-      Future<bool> shouldUseLargePartitionStreaming() async {
-        if (partitionNosToProcess.isEmpty) return false;
-        final size = await rangeManager.getPartitionFileSizeByNo(
-          tableName: tableName,
-          partitionNo: partitionNosToProcess.first,
-          metaOverride: meta,
+      if (!emitted && !effectiveController.shouldStopCurrentBatch) {
+        yield PartitionPageBatch(
+          partitionNo: partitionNo,
+          records: const <Map<String, dynamic>>[],
+          isEmptyPartition: true,
         );
-        final isLarge = size > _largePartitionStreamingThresholdBytes;
-        if (isLarge) {
-          final batchBytes = max(
-              1, meta.btreePageSize * _largePartitionStreamingPagesPerBatch);
-          largeStreamingDemandPerPartition =
-              max(1, (size + batchBytes - 1) ~/ batchBytes);
-        }
-        return isLarge;
       }
+    }
 
-      Future<void> processLargePartitionReadOnly(int partitionNo) async {
-        var emittedBatch = false;
-        await for (final records
-            in rangeManager.streamPartitionDataPageBatchesByNo(
-          tableName: tableName,
-          partitionNo: partitionNo,
-          pagesPerBatch: _largePartitionStreamingPagesPerBatch,
-          encryptionKey: customKey,
-          encryptionKeyId: customKeyId,
-          decodeSchema: decodeSchema,
-        )) {
-          if (effectiveController.isStopped) return;
-          emittedBatch = true;
-          await processFunction(records, partitionNo, effectiveController);
-        }
-        if (!emittedBatch && !effectiveController.isStopped) {
-          await processFunction(
-              const <Map<String, dynamic>>[], partitionNo, effectiveController);
-        }
+    Future<PartitionStreamAction> runPartition(int partitionNo) async {
+      if (effectiveController.isStopped) {
+        return effectiveController.stopAction;
       }
+      final action = await onPartition(
+        partitionNo,
+        batchStream(partitionNo),
+        effectiveController,
+      );
+      if (action == PartitionStreamAction.stopAfterBatch) {
+        effectiveController.stopAfterBatch();
+      } else if (action == PartitionStreamAction.stopAfterPartition) {
+        effectiveController.stopAfterPartition();
+      }
+      return action;
+    }
 
-      Future<void> processLargePartitionWrite(int partitionNo) async {
-        var emittedBatch = false;
+    final yc = YieldController(
+      'TableDataManager.streamPartitionPageBatches',
+      checkInterval: 50,
+    );
 
-        Future<void> processBatch(List<Map<String, dynamic>> records) async {
-          final processed =
-              await processFunction(records, partitionNo, effectiveController);
-          if (effectiveController.isStopped) return;
+    if (partitionConcurrency <= 1) {
+      WorkloadLease? lease;
+      try {
+        lease = await _dataStore.workloadScheduler.acquire(
+          WorkloadType.maintenance,
+          requestedTokens: 1,
+          minTokens: 1,
+          totalPlannedTokens: partitionNos.length,
+          label: 'streamPartitionPageBatches.$tableName',
+        );
+        for (final partitionNo in partitionNos) {
+          await yc.maybeYield();
+          if (effectiveController.isStopped) break;
+          final action = await runPartition(partitionNo);
+          if (action != PartitionStreamAction.continueScan ||
+              effectiveController.isStopped) {
+            break;
+          }
+        }
+      } finally {
+        lease?.release();
+      }
+      return;
+    }
 
-          final inserts = <Map<String, dynamic>>[];
-          final updates = <Map<String, dynamic>>[];
-          final deletes = <Map<String, dynamic>>[];
-          computeDelta(records, processed, inserts, updates, deletes);
-          if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
+    final parallelController = ParallelController();
+    final concurrency = max(1, min(partitionConcurrency, partitionNos.length));
+    final tasks = <Future<void> Function()>[
+      for (final partitionNo in partitionNos)
+        () async {
+          if (effectiveController.isStopped) {
+            parallelController.stop();
             return;
           }
-
-          BatchContext? batchContext;
-          if (journaling) {
-            batchContext = await _dataStore.parallelJournalManager
-                .beginMaintenanceBatch(table: tableName);
+          await runPartition(partitionNo);
+          if (effectiveController.isStopped) {
+            parallelController.stop();
           }
-          await rangeManager.writeChanges(
-            tableName: tableName,
-            inserts: inserts,
-            updates: updates,
-            deletes: deletes,
-            batchContext: batchContext,
-            encryptionKey: customKey,
-            encryptionKeyId: customKeyId,
-            allowLeafCompaction: false,
-            allowFreePageReuse: false,
-          );
+        },
+    ];
 
-          if (journaling && batchContext != null) {
-            await _dataStore.parallelJournalManager
-                .completeMaintenanceBatch(batchContext: batchContext);
-            await persistRuntimeMetaIfNeeded();
-          }
-        }
-
-        await for (final records
-            in rangeManager.streamPartitionDataPageBatchesByNo(
-          tableName: tableName,
-          partitionNo: partitionNo,
-          pagesPerBatch: _largePartitionStreamingPagesPerBatch,
-          encryptionKey: customKey,
-          encryptionKeyId: customKeyId,
-          decodeSchema: decodeSchema,
-        )) {
-          if (effectiveController.isStopped) return;
-          emittedBatch = true;
-          await processBatch(records);
-        }
-
-        if (!emittedBatch && !effectiveController.isStopped) {
-          await processBatch(const <Map<String, dynamic>>[]);
-        }
-        if (!effectiveController.isStopped) {
-          await onPartitionFlushed?.call(partitionNo);
-        }
-      }
-
-      final useLargePartitionStreaming =
-          await shouldUseLargePartitionStreaming();
-
-      if (onlyRead) {
-        // Read-only: parallel load + process, no writeChanges, no journal batch.
-        if (useLargePartitionStreaming) {
-          final plannedDemand = max(1, partitionNosToProcess.length) *
-              largeStreamingDemandPerPartition;
-          WorkloadLease? lease;
-          try {
-            lease = await scheduler.acquire(
-              WorkloadType.maintenance,
-              requestedTokens: 1,
-              minTokens: 1,
-              totalPlannedTokens: plannedDemand,
-              label: 'processTablePartitions.$tableName.readOnly.large',
-            );
-            for (final pNo in partitionNosToProcess) {
-              if (effectiveController.isStopped) break;
-              await processLargePartitionReadOnly(pNo);
-            }
-          } finally {
-            lease?.release();
-          }
-          return;
-        }
-
-        for (int cursor = 0;
-            cursor < partitionNosToProcess.length &&
-                !effectiveController.isStopped;) {
-          final remainingPartitions = partitionNosToProcess.length - cursor;
-          final chunkEnd = min(cursor + 3, partitionNosToProcess.length);
-          final smallPartitions =
-              partitionNosToProcess.sublist(cursor, chunkEnd);
-          cursor = chunkEnd;
-          final capacity = scheduler.capacityTokens(
-            WorkloadType.maintenance,
-            extraDemandTokens: remainingPartitions,
-          );
-          var concurrency = max(1, min(capacity, smallPartitions.length));
-          if (maxConcurrent != null && maxConcurrent > 0) {
-            concurrency = min(concurrency, maxConcurrent);
-          }
-          final tasks = <Future<void> Function()>[];
-          for (final smallPNo in smallPartitions) {
-            tasks.add(() async {
-              if (effectiveController.isStopped) return;
-              final records = await rangeManager.loadPartitionDataByNo(
-                tableName: tableName,
-                partitionNo: smallPNo,
-                encryptionKey: customKey,
-                encryptionKeyId: customKeyId,
-                decodeSchema: decodeSchema,
-              );
-              await processFunction(records, smallPNo, effectiveController);
-            });
-          }
-          WorkloadLease? lease;
-          try {
-            lease = await scheduler.acquire(
-              WorkloadType.maintenance,
-              requestedTokens: concurrency,
-              minTokens: 1,
-              totalPlannedTokens: remainingPartitions,
-              label: 'processTablePartitions.$tableName.readOnly',
-            );
-            await ParallelProcessor.execute<void>(
-              tasks,
-              concurrency: lease.asConcurrency(1),
-              controller: effectiveController,
-              label: 'processTablePartitions.$tableName',
-              continueOnError: false,
-            );
-          } finally {
-            lease?.release();
-          }
-        }
-        return;
-      }
-
-      // Write path: process in chunks; each chunk = one maintenance batch so
-      // page redo is deleted and metadata advanced after each chunk.
-      final yc = YieldController('TableDataManager.processTablePartitions',
-          checkInterval: 100);
-      final largePartitionNos = useLargePartitionStreaming
-          ? partitionNosToProcess.toList(growable: true)
-          : partitionNosToProcess;
-      var knownPartitionCount = partitionCount;
-      for (int chunkStart = 0;
-          chunkStart < largePartitionNos.length &&
-              !effectiveController.isStopped;) {
-        await yc.maybeYield();
-        final remainingPartitions = largePartitionNos.length - chunkStart;
-        final remainingLargeStreamingDemand =
-            max(1, remainingPartitions) * largeStreamingDemandPerPartition;
-
-        if (useLargePartitionStreaming) {
-          final currentPartitionNo = largePartitionNos[chunkStart];
-          if (!await acquireWriteLocks()) {
-            return;
-          }
-          try {
-            WorkloadLease? lease;
-            try {
-              lease = await scheduler.acquire(
-                WorkloadType.maintenance,
-                requestedTokens: 1,
-                minTokens: 1,
-                totalPlannedTokens: remainingLargeStreamingDemand,
-                label: 'processTablePartitions.$tableName.large',
-              );
-              await processLargePartitionWrite(currentPartitionNo);
-            } finally {
-              lease?.release();
-            }
-          } finally {
-            releaseWriteLocks();
-          }
-          chunkStart++;
-          if (targetPartitionNos == null) {
-            final latestMeta = await getTableMeta(tableName);
-            final latestPartitionCount =
-                latestMeta?.btreePartitionCount ?? knownPartitionCount;
-            if (latestPartitionCount > knownPartitionCount) {
-              for (int pNo = knownPartitionCount;
-                  pNo < latestPartitionCount;
-                  pNo++) {
-                if (startPartitionNo == null || pNo >= startPartitionNo) {
-                  largePartitionNos.add(pNo);
-                }
-              }
-              knownPartitionCount = latestPartitionCount;
-            }
-          }
-          continue;
-        }
-
-        final chunkEnd = min(chunkStart + 3, largePartitionNos.length);
-        final chunkPartitions = largePartitionNos.sublist(chunkStart, chunkEnd);
-        chunkStart = chunkEnd;
-
-        if (!await acquireWriteLocks()) {
-          return;
-        }
-
-        try {
-          BatchContext? batchContext;
-          if (journaling) {
-            batchContext = await _dataStore.parallelJournalManager
-                .beginMaintenanceBatch(table: tableName);
-          }
-
-          final capacity = scheduler.capacityTokens(
-            WorkloadType.maintenance,
-            extraDemandTokens: remainingPartitions,
-          );
-          var concurrency = max(1, min(capacity, chunkPartitions.length));
-          if (maxConcurrent != null && maxConcurrent > 0) {
-            concurrency = min(concurrency, maxConcurrent);
-          }
-          final tasks = <Future<
-                  (
-                    int,
-                    List<Map<String, dynamic>>,
-                    List<Map<String, dynamic>>,
-                    List<Map<String, dynamic>>
-                  )?>
-              Function()>[];
-          for (final pNo in chunkPartitions) {
-            tasks.add(() async {
-              if (effectiveController.isStopped) return null;
-              final records = await rangeManager.loadPartitionDataByNo(
-                tableName: tableName,
-                partitionNo: pNo,
-                encryptionKey: customKey,
-                encryptionKeyId: customKeyId,
-                decodeSchema: decodeSchema,
-              );
-              final processed =
-                  await processFunction(records, pNo, effectiveController);
-              if (effectiveController.isStopped) return null;
-              final inserts = <Map<String, dynamic>>[];
-              final updates = <Map<String, dynamic>>[];
-              final deletes = <Map<String, dynamic>>[];
-              computeDelta(records, processed, inserts, updates, deletes);
-              if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
-                return null;
-              }
-              return (pNo, inserts, updates, deletes);
-            });
-          }
-
-          List<
-              (
-                int,
-                List<Map<String, dynamic>>,
-                List<Map<String, dynamic>>,
-                List<Map<String, dynamic>>
-              )?> results;
-          WorkloadLease? lease;
-          try {
-            lease = await scheduler.acquire(
-              WorkloadType.maintenance,
-              requestedTokens: concurrency,
-              minTokens: 1,
-              totalPlannedTokens: remainingPartitions,
-              label: 'processTablePartitions.$tableName',
-            );
-            results = await ParallelProcessor.execute<
-                (
-                  int,
-                  List<Map<String, dynamic>>,
-                  List<Map<String, dynamic>>,
-                  List<Map<String, dynamic>>
-                )?>(
-              tasks,
-              concurrency: lease.asConcurrency(1),
-              controller: effectiveController,
-              label: 'processTablePartitions.$tableName',
-              continueOnError: false,
-            );
-          } finally {
-            lease?.release();
-          }
-
-          for (var i = 0; i < chunkPartitions.length; i++) {
-            final r = results[i];
-            if (r == null) continue;
-            final (pNo, inserts, updates, deletes) = r;
-            await rangeManager.writeChanges(
-              tableName: tableName,
-              inserts: inserts,
-              updates: updates,
-              deletes: deletes,
-              batchContext: batchContext,
-              encryptionKey: customKey,
-              encryptionKeyId: customKeyId,
-            );
-            await onPartitionFlushed?.call(pNo);
-          }
-
-          if (journaling && batchContext != null) {
-            // Complete this chunk only: delete this chunk's page redo log now (not whole table).
-            await _dataStore.parallelJournalManager
-                .completeMaintenanceBatch(batchContext: batchContext);
-            await persistRuntimeMetaIfNeeded();
-          }
-        } finally {
-          releaseWriteLocks();
-        }
-      }
+    WorkloadLease? lease;
+    try {
+      lease = await _dataStore.workloadScheduler.acquire(
+        WorkloadType.maintenance,
+        requestedTokens: concurrency,
+        minTokens: 1,
+        totalPlannedTokens: partitionNos.length,
+        label: 'streamPartitionPageBatches.$tableName.parallel',
+      );
+      await ParallelProcessor.execute<void>(
+        tasks,
+        concurrency: lease.asConcurrency(1),
+        controller: parallelController,
+        label: 'streamPartitionPageBatches.$tableName',
+        continueOnError: false,
+      );
     } finally {
-      releaseWriteLocks();
+      lease?.release();
     }
   }
 
@@ -3033,111 +2649,190 @@ class TableDataManager {
     _txnDeferredOps.remove(txId);
   }
 
-  /// high performance table data cleanup, including physical files and memory cache
-  Future<void> clearTable(String tableName) async {
-    // Mark that table is being flushed to prevent other operations from interfering
-    _tableFlushingFlags[tableName] = true;
-    _maxIdsDirty[tableName] = false; // Proactively stop background flush
-    // lock this table to ensure data consistency
-    final lockKey = 'table_$tableName';
-    final operationId = GlobalIdGenerator.generate('clear_table_');
-    bool acquired = await _dataStore.lockManager!
-        .acquireExclusiveLock(lockKey, operationId);
+  String _tableLockResource(String tableName) => 'table_$tableName';
+
+  Future<TableWriteLock> acquireTableWriteLock(
+    String tableName, {
+    String operationPrefix = 'table_write_',
+  }) async {
+    final lockManager = _dataStore.lockManager;
+    if (lockManager == null) {
+      throw StateError(
+        'Cannot acquire table write lock after database shutdown: $tableName',
+      );
+    }
+
+    final lockKey = _tableLockResource(tableName);
+    final operationId = GlobalIdGenerator.generate(operationPrefix);
+
+    final acquired = await lockManager.acquireExclusiveLock(
+      lockKey,
+      operationId,
+    );
     if (!acquired) {
-      Logger.warn('Failed to acquire exclusive lock for clearTable: $tableName',
-          label: 'TableDataManager.clearTable');
+      throw TimeoutException(
+        'Timed out waiting for table write lock: $tableName',
+        Duration(milliseconds: lockManager.baseLockTimeout),
+      );
+    }
+    return TableWriteLock._(
+      tableName: tableName,
+      resource: lockKey,
+      operationId: operationId,
+    );
+  }
+
+  void releaseTableWriteLock(TableWriteLock lock) {
+    if (lock._released) return;
+    if (lock.tableName.isEmpty) {
+      throw StateError('Invalid table write lock');
+    }
+    _dataStore.lockManager?.releaseExclusiveLock(
+      lock.resource,
+      lock.operationId,
+    );
+    lock._released = true;
+  }
+
+  Future<void> withTableWriteLock(
+    String tableName,
+    Future<void> Function(TableWriteLock lock) action, {
+    TableWriteLock? tableLock,
+    String operationPrefix = 'table_write_',
+  }) async {
+    if (tableLock != null) {
+      // Borrowed from an outer withTableWriteLock scope to avoid same-table
+      // re-entry deadlocks. It is validated here, not acquired or released.
+      tableLock.validateBorrowedFor(tableName);
+      return action(tableLock);
+    }
+
+    if (_dataStore.lockManager == null) {
+      Logger.debug(
+        'Skip table write lock after database shutdown: $tableName',
+        label: 'TableDataManager.withTableWriteLock',
+      );
       return;
     }
+
+    final lock = await acquireTableWriteLock(
+      tableName,
+      operationPrefix: operationPrefix,
+    );
     try {
-      // First, update statistics by subtracting this table's counts
-      try {
-        final fileMeta = await getTableMeta(tableName);
-        if (fileMeta != null) {
-          // Subtract this table's records and size from the totals
-          _totalRecordCount = max(0, _totalRecordCount - fileMeta.totalRecords);
-          _totalDataSizeBytes =
-              max(0, _totalDataSizeBytes - fileMeta.totalSizeInBytes);
+      return await action(lock);
+    } finally {
+      releaseTableWriteLock(lock);
+    }
+  }
 
-          // Mark statistics as needing to be saved
-          _needSaveStats = true;
-        }
-      } catch (e) {
-        Logger.warn('Failed to update stats during clearTable for $tableName',
-            label: 'TableDataManager.clearTable');
-      }
+  /// high performance table data cleanup, including physical files and memory cache
+  Future<void> clearTable(String tableName) async {
+    // Admission flag: set before acquiring the table lock so pending flushes
+    // that acquire the lock earlier than clearTable can still yield to clear.
+    _tableFlushingFlags[tableName] = true;
+    _maxIdsDirty[tableName] = false; // Proactively stop background flush
+    try {
+      await withTableWriteLock(
+        tableName,
+        (_) async {
+          // First, update statistics by subtracting this table's counts
+          try {
+            final fileMeta = await getTableMeta(tableName);
+            if (fileMeta != null) {
+              // Subtract this table's records and size from the totals
+              _totalRecordCount =
+                  max(0, _totalRecordCount - fileMeta.totalRecords);
+              _totalDataSizeBytes =
+                  max(0, _totalDataSizeBytes - fileMeta.totalSizeInBytes);
 
-      await _dataStore.writeBufferManager.clearTable(tableName);
-
-      // 2. directly delete the entire partition directory
-      bool deletedDir = false;
-      try {
-        final dataPath = await _dataStore.pathManager.getDataDirPath(tableName);
-        if (await _dataStore.storage.existsDirectory(dataPath)) {
-          await _dataStore.storage.deleteDirectory(dataPath);
-          // delete and recreate empty directory, ensure directory structure is complete
-          await _dataStore.storage.ensureDirectoryExists(dataPath);
-          Logger.debug(
-              'deleted entire partition directory for table $tableName',
-              label: 'TableDataManager.clearTable');
-          deletedDir = true;
-        }
-      } catch (e) {
-        Logger.error('delete table $tableName partition directory failed: $e',
-            label: 'TableDataManager.clearTable');
-      }
-
-      // 3. create empty table meta
-      final prevMeta = await getTableMeta(tableName);
-      final int pageSize = prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
-      // If we failed to delete the directory, avoid reusing old partition files:
-      // bump partition count so new writes allocate a fresh partitionNo.
-      final int newPartitionCount =
-          deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
-      final emptyMeta = TableMeta.createEmpty(
-        name: tableName,
-        pageSize: pageSize,
-        partitionCount: newPartitionCount,
-      );
-
-      // 4. update table meta
-      await updateTableMeta(tableName, emptyMeta);
-
-      // 5. clean ID generator related resources
-      _idGenerators.remove(tableName);
-      _idGeneratorPending.remove(tableName);
-
-      // 6. handle auto increment ID reset
-      try {
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableName);
-        if (schema == null) {
-          return;
-        }
-        if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
-          // Reset maxId in FileMeta to "0"
-          final fileMeta = await getTableMeta(tableName);
-          if (fileMeta != null) {
-            final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: "0");
-            await updateTableMeta(tableName, updatedMeta);
+              // Mark statistics as needing to be saved
+              _needSaveStats = true;
+            }
+          } catch (e) {
+            Logger.warn(
+                'Failed to update stats during clearTable for $tableName',
+                label: 'TableDataManager.clearTable');
           }
 
-          // update memory cache
-          _maxIds[tableName] = "0";
-          _maxIdsDirty[tableName] = false; // Already saved to FileMeta
+          await _dataStore.writeBufferManager.clearTable(tableName);
 
-          // clean ID generator resources
-          _idRanges.remove(tableName);
-        }
-      } catch (e) {
-        Logger.error('reset table $tableName auto increment ID failed: $e',
-            label: 'TableDataManager.clearTable');
-      }
+          // 2. directly delete the entire partition directory
+          bool deletedDir = false;
+          try {
+            final dataPath =
+                await _dataStore.pathManager.getDataDirPath(tableName);
+            if (await _dataStore.storage.existsDirectory(dataPath)) {
+              await _dataStore.storage.deleteDirectory(dataPath);
+              // delete and recreate empty directory, ensure directory structure is complete
+              await _dataStore.storage.ensureDirectoryExists(dataPath);
+              Logger.debug(
+                  'deleted entire partition directory for table $tableName',
+                  label: 'TableDataManager.clearTable');
+              deletedDir = true;
+            }
+          } catch (e) {
+            Logger.error(
+                'delete table $tableName partition directory failed: $e',
+                label: 'TableDataManager.clearTable');
+          }
 
-      // 7. clean other caches
-      _tableMetaCache.remove(tableName);
-      _fileSizes.remove(tableName);
-      _lastModifiedTimes.remove(tableName);
-      _checkedOrderedRange.remove(tableName);
+          // 3. create empty table meta
+          final prevMeta = await getTableMeta(tableName);
+          final int pageSize =
+              prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
+          // If we failed to delete the directory, avoid reusing old partition files:
+          // bump partition count so new writes allocate a fresh partitionNo.
+          final int newPartitionCount =
+              deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
+          final emptyMeta = TableMeta.createEmpty(
+            name: tableName,
+            pageSize: pageSize,
+            partitionCount: newPartitionCount,
+          );
+
+          // 4. update table meta
+          await updateTableMeta(tableName, emptyMeta);
+
+          // 5. clean ID generator related resources
+          _idGenerators.remove(tableName);
+          _idGeneratorPending.remove(tableName);
+
+          // 6. handle auto increment ID reset
+          try {
+            final schema =
+                await _dataStore.schemaManager?.getTableSchema(tableName);
+            if (schema == null) {
+              return;
+            }
+            if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+              // Reset maxId in FileMeta to "0"
+              final fileMeta = await getTableMeta(tableName);
+              if (fileMeta != null) {
+                final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: "0");
+                await updateTableMeta(tableName, updatedMeta);
+              }
+
+              // update memory cache
+              _maxIds[tableName] = "0";
+              _maxIdsDirty[tableName] = false; // Already saved to FileMeta
+
+              // clean ID generator resources
+              _idRanges.remove(tableName);
+            }
+          } catch (e) {
+            Logger.error('reset table $tableName auto increment ID failed: $e',
+                label: 'TableDataManager.clearTable');
+          }
+
+          // 7. clean other caches
+          _tableMetaCache.remove(tableName);
+          _fileSizes.remove(tableName);
+          _lastModifiedTimes.remove(tableName);
+          _checkedOrderedRange.remove(tableName);
+        },
+        operationPrefix: 'clear_table_',
+      );
     } catch (e) {
       Logger.error('clear table $tableName failed: $e',
           label: 'TableDataManager.clearTable');
@@ -3145,9 +2840,6 @@ class TableDataManager {
     } finally {
       // clear table flush flag
       _tableFlushingFlags.remove(tableName);
-      if (acquired) {
-        _dataStore.lockManager!.releaseExclusiveLock(lockKey, operationId);
-      }
     }
   }
 
@@ -3169,48 +2861,38 @@ class TableDataManager {
     // Store opId for each table: tableName -> opId
     final tableOpIds = <String, String>{};
     final acquiredKeys = <String, bool>{};
+    final lockManager = _dataStore.lockManager;
+    if (lockManager == null) {
+      Logger.debug(
+        'Skip rewriteRecordsFromSourceTable after database shutdown',
+        label: 'TableDataManager.rewriteRecordsFromSourceTable',
+      );
+      return;
+    }
 
     try {
-      if (_dataStore.lockManager != null) {
-        for (final t in tablesToLock) {
-          // Generate unique opId for each lock request to satisfy LockManager constraint
-          final opId = GlobalIdGenerator.generate('rewrite_records_${t}_');
-          tableOpIds[t] = opId;
+      for (final t in tablesToLock) {
+        // Generate unique opId for each lock request to satisfy LockManager constraint
+        final opId = GlobalIdGenerator.generate('rewrite_records_${t}_');
+        tableOpIds[t] = opId;
 
-          final lk = 'table_$t';
-          final ok =
-              await _dataStore.lockManager!.acquireExclusiveLock(lk, opId);
-          if (!ok) {
-            Logger.warn('Failed to acquire lock for $t, abort rewrite',
-                label: 'TableDataManager.rewriteRecordsFromSourceTable');
-            // release any previous locks
-            for (final prev in tablesToLock) {
-              if (prev == t) break;
-              final plk = 'table_$prev';
-              final prevOpId = tableOpIds[prev];
-              if (acquiredKeys[plk] == true && prevOpId != null) {
-                _dataStore.lockManager!.releaseExclusiveLock(plk, prevOpId);
-              }
+        final lk = 'table_$t';
+        final ok = await lockManager.acquireExclusiveLock(lk, opId);
+        if (!ok) {
+          Logger.warn('Failed to acquire lock for $t, abort rewrite',
+              label: 'TableDataManager.rewriteRecordsFromSourceTable');
+          // release any previous locks
+          for (final prev in tablesToLock) {
+            if (prev == t) break;
+            final plk = 'table_$prev';
+            final prevOpId = tableOpIds[prev];
+            if (acquiredKeys[plk] == true && prevOpId != null) {
+              lockManager.releaseExclusiveLock(plk, prevOpId);
             }
-            return;
           }
-          acquiredKeys['table_$t'] = true;
-          _processingTables.add(t);
+          return;
         }
-      } else {
-        for (final t in tablesToLock) {
-          if (_processingTables.contains(t)) {
-            Logger.debug('Table $t is being processed, abort rewrite',
-                label: 'TableDataManager.rewriteRecordsFromSourceTable');
-            // rollback adds
-            for (final prev in tablesToLock) {
-              if (prev == t) break;
-              _processingTables.remove(prev);
-            }
-            return;
-          }
-          _processingTables.add(t);
-        }
+        acquiredKeys['table_$t'] = true;
       }
 
       // Get source table schema for decoding old data
@@ -3277,15 +2959,12 @@ class TableDataManager {
         label: 'TableDataManager.rewriteRecordsFromSourceTable',
       );
     } finally {
-      // Release locks and processing flags
+      // Release locks
       for (final t in tablesToLock) {
-        _processingTables.remove(t);
         final lk = 'table_$t';
         final opId = tableOpIds[t];
-        if (_dataStore.lockManager != null &&
-            (acquiredKeys[lk] == true) &&
-            opId != null) {
-          _dataStore.lockManager!.releaseExclusiveLock(lk, opId);
+        if (acquiredKeys[lk] == true && opId != null) {
+          lockManager.releaseExclusiveLock(lk, opId);
         }
       }
     }
@@ -3598,7 +3277,6 @@ class TableDataManager {
     _idGeneratorPending.remove(tableName);
     _idRanges.remove(tableName);
     _checkedOrderedRange.remove(tableName);
-    _processingTables.remove(tableName);
     _tableFlushingFlags.remove(tableName);
   }
 
@@ -3665,6 +3343,9 @@ class TableDataManager {
   /// [concurrency]        - Optional: total number of concurrent processing tokens
   /// [encryptionKey]      - Optional: encrypt key
   /// [encryptionKeyId]    - Optional: encrypt key id
+  /// [tableLock]          - Optional: existing table-level write lock.
+  /// [recordCountInsertDelta]/[recordCountDeleteDelta] - Optional logical
+  /// count deltas for direct writes that bypass WriteBufferManager statistics.
   Future<void> writeChanges({
     required String tableName,
     List<Map<String, dynamic>> inserts = const [],
@@ -3674,17 +3355,43 @@ class TableDataManager {
     int? concurrency,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    TableWriteLock? tableLock,
+    int recordCountInsertDelta = 0,
+    int recordCountDeleteDelta = 0,
   }) async {
-    await _dataStore.tableTreePartitionManager?.writeChanges(
-      tableName: tableName,
-      inserts: inserts,
-      updates: updates,
-      deletes: deletes,
-      batchContext: batchContext,
-      concurrency: concurrency,
-      encryptionKey: encryptionKey,
-      encryptionKeyId: encryptionKeyId,
+    final int recordCountDelta =
+        recordCountInsertDelta - recordCountDeleteDelta;
+    if (recordCountDelta != 0) {
+      // Load before the physical write so applying the explicit delta below
+      // does not accidentally double-count against freshly updated metadata.
+      await _ensureRecordCountLoaded(tableName);
+    }
+
+    await withTableWriteLock(
+      tableName,
+      (lock) async {
+        await _dataStore.tableTreePartitionManager?.writeChanges(
+          tableName: tableName,
+          inserts: inserts,
+          updates: updates,
+          deletes: deletes,
+          batchContext: batchContext,
+          concurrency: concurrency,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+      },
+      tableLock: tableLock,
+      operationPrefix: 'write_changes_',
     );
+
+    if (recordCountDelta != 0) {
+      await updateTableRecordCountDelta(
+        tableName,
+        insertDelta: recordCountInsertDelta,
+        deleteDelta: recordCountDeleteDelta,
+      );
+    }
   }
 
   /// Batch query with full consistency checking (Txn > Cache > Buffer > Disk).
@@ -4684,4 +4391,76 @@ class TxnDeferredOp {
 
   const TxnDeferredOp(this.type, this.data,
       {this.uniqueKeyRefs, this.oldValues});
+}
+
+enum PartitionStreamAction {
+  continueScan,
+  stopAfterBatch,
+  stopAfterPartition,
+}
+
+final class PartitionPageBatch {
+  final int partitionNo;
+  final List<Map<String, dynamic>> records;
+  final bool isEmptyPartition;
+
+  const PartitionPageBatch({
+    required this.partitionNo,
+    required this.records,
+    this.isEmptyPartition = false,
+  });
+}
+
+final class PartitionStreamController {
+  bool _stopRequested = false;
+  PartitionStreamAction _stopAction = PartitionStreamAction.continueScan;
+
+  bool get isStopped => _stopRequested;
+  PartitionStreamAction get stopAction => _stopAction;
+  bool get shouldStopCurrentBatch =>
+      _stopAction == PartitionStreamAction.stopAfterBatch;
+
+  void stopAfterBatch() {
+    _stopRequested = true;
+    _stopAction = PartitionStreamAction.stopAfterBatch;
+  }
+
+  void stopAfterPartition() {
+    _stopRequested = true;
+    _stopAction = PartitionStreamAction.stopAfterPartition;
+  }
+
+  void stop() {
+    stopAfterBatch();
+  }
+}
+
+final class TableWriteLock {
+  final String tableName;
+  final String resource;
+  final String operationId;
+  bool _released = false;
+
+  TableWriteLock._({
+    required this.tableName,
+    required this.resource,
+    required this.operationId,
+  });
+
+  bool get isReleased => _released;
+
+  void markReleased() {
+    _released = true;
+  }
+
+  void validateBorrowedFor(String expectedTableName) {
+    if (_released) {
+      throw StateError('Table write lock already released: $tableName');
+    }
+    if (tableName != expectedTableName) {
+      throw StateError(
+        'Table write lock mismatch: expected $expectedTableName, got $tableName',
+      );
+    }
+  }
 }

@@ -7,8 +7,10 @@ import 'data_store_impl.dart';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/logger.dart';
 import '../handler/encoder.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/space_config.dart';
 import '../model/system_table.dart';
+import 'table_data_manager.dart';
 
 /// Manages the logic for migrating encryption keys.
 /// When the encryptionKey in DataStoreConfig changes,
@@ -284,14 +286,50 @@ class KeyManager {
     final tableNames = await _dataStore.getTableNames();
 
     for (final tableName in tableNames) {
-      // Concurrent partition processing interface
-      await _dataStore.tableDataManager.processTablePartitions(
+      await _dataStore.tableDataManager.streamPartitionPageBatches(
         tableName: tableName,
-        processFunction: (records, partitionIndex, controller) async {
-          return records;
-        },
         customKey: newKey,
         customKeyId: newKeyId,
+        partitionConcurrency: 1,
+        prefetchNextPageBatch: true,
+        onPartition: (partitionNo, batches, controller) async {
+          await _dataStore.tableDataManager.withTableWriteLock(
+            tableName,
+            (tableLock) async {
+              await for (final batch in batches) {
+                if (controller.shouldStopCurrentBatch) break;
+                final records = batch.records;
+                if (records.isEmpty) continue;
+
+                BatchContext? batchContext;
+                if (_dataStore.config.enableJournal) {
+                  batchContext = await _dataStore.parallelJournalManager
+                      .beginMaintenanceBatch(table: tableName);
+                }
+
+                await _dataStore.tableDataManager.writeChanges(
+                  tableName: tableName,
+                  updates: records,
+                  batchContext: batchContext,
+                  encryptionKey: newKey,
+                  encryptionKeyId: newKeyId,
+                  tableLock: tableLock,
+                );
+
+                if (_dataStore.config.enableJournal && batchContext != null) {
+                  await _dataStore.parallelJournalManager
+                      .completeMaintenanceBatch(batchContext: batchContext);
+                  await _dataStore.tableDataManager
+                      .persistRuntimeMetaIfNeeded();
+                }
+              }
+            },
+            operationPrefix: 'key_migrate_page_batches_',
+          );
+          return controller.isStopped
+              ? controller.stopAction
+              : PartitionStreamAction.continueScan;
+        },
       );
 
       // Only log migration completion for user tables, not system tables

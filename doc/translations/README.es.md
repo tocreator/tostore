@@ -295,7 +295,7 @@ const userSchema = TableSchema(
       indexName: 'idx_users_status_created_at', // Optional index name
       fields: ['status', 'created_at'], // Composite index fields
       unique: false, // Whether it is a unique index
-      type: IndexType.btree, // Index type: btree/hash/bitmap/vector
+      type: IndexType.btree, // Index type: btree/vector
     ),
   ],
   foreignKeys: const [], // Optional foreign-key constraints; see "Foreign Keys & Cascading"

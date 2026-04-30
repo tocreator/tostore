@@ -162,7 +162,7 @@ class SchemaManager {
     return entry.uniqueIndexes;
   }
 
-  /// Get all non-vector (B+Tree / hash / bitmap) indexes for a table.
+  /// Get all non-vector (B+Tree) indexes for a table.
   ///
   /// Use this instead of [getAllIndexesFor] when the caller assumes
   /// B+Tree-compatible index operations (create, rebuild, write, integrity check).
@@ -1198,7 +1198,7 @@ class _IndexListCacheEntry {
   final List<IndexSchema> uniqueIndexes;
   final List<IndexSchema> vectorIndexes;
 
-  /// All non-vector indexes (btree / hash / bitmap).
+  /// All non-vector indexes (btree).
   final List<IndexSchema> btreeIndexes;
 
   const _IndexListCacheEntry({

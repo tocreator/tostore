@@ -7,11 +7,13 @@ import '../handler/logger.dart';
 import '../model/meta_info.dart';
 import '../model/migration_meta.dart';
 import '../model/migration_task.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
+import 'table_data_manager.dart';
 
 /// Migration manager for handling database version upgrades
 ///
@@ -2214,16 +2216,55 @@ class MigrationManager {
 
           // Process data migration in place after any physical rename is done.
           if (needDataMigration) {
-            await migrationInstance.tableDataManager.processTablePartitions(
+            await migrationInstance.tableDataManager.streamPartitionPageBatches(
               tableName: currentTableName,
               decodeSchema:
                   oldSchema, // Critical: use old schema to decode old data
-              processFunction: (records, partitionIndex, controller) async {
-                final migratedRecords = await _applyMigrationOperations(
-                    records, sortedOperations,
-                    oldSchema: oldSchema);
+              partitionConcurrency: 1,
+              prefetchNextPageBatch: true,
+              onPartition: (partitionNo, batches, controller) async {
+                await migrationInstance.tableDataManager.withTableWriteLock(
+                  currentTableName,
+                  (tableLock) async {
+                    await for (final batch in batches) {
+                      if (controller.shouldStopCurrentBatch) break;
 
-                return migratedRecords;
+                      final records = batch.records;
+                      if (records.isEmpty) continue;
+                      final migratedRecords = await _applyMigrationOperations(
+                          records, sortedOperations,
+                          oldSchema: oldSchema);
+                      if (migratedRecords.isEmpty) continue;
+
+                      BatchContext? batchContext;
+                      if (migrationInstance.config.enableJournal) {
+                        batchContext = await migrationInstance
+                            .parallelJournalManager
+                            .beginMaintenanceBatch(table: currentTableName);
+                      }
+
+                      await migrationInstance.tableDataManager.writeChanges(
+                        tableName: currentTableName,
+                        updates: migratedRecords,
+                        batchContext: batchContext,
+                        tableLock: tableLock,
+                      );
+
+                      if (migrationInstance.config.enableJournal &&
+                          batchContext != null) {
+                        await migrationInstance.parallelJournalManager
+                            .completeMaintenanceBatch(
+                                batchContext: batchContext);
+                        await migrationInstance.tableDataManager
+                            .persistRuntimeMetaIfNeeded();
+                      }
+                    }
+                  },
+                  operationPrefix: 'migration_page_batches_',
+                );
+                return controller.isStopped
+                    ? controller.stopAction
+                    : PartitionStreamAction.continueScan;
               },
             );
           }

@@ -598,151 +598,156 @@ class ParallelJournalManager {
 
           tasks.add(() async {
             try {
-              final lockKey = 'table_$table';
-              final opId = GlobalIdGenerator.generate('flush_batch_unified_');
-              bool locked = false;
-              try {
-                if (_dataStore.tableDataManager.isTableBeingCleared(table)) {
-                  return;
-                }
-
-                // Verify epoch hasn't changed (O(1) check for table clear race)
-                if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
-                  Logger.info(
-                      "Skipping stale batch for table $table because it was cleared/reset.",
-                      label: "ParallelJournalManager");
-                  return;
-                }
-                locked = await (_dataStore.lockManager
-                        ?.acquireExclusiveLock(lockKey, opId) ??
-                    true);
-                if (!locked) {
-                  Logger.warn('Skip write due to lock not acquired: $table',
-                      label: 'ParallelJournalManager');
-                  return;
-                }
-                // Unified flush: parallelize table data and index maintenance
-                final schema =
-                    await _dataStore.schemaManager?.getTableSchema(table);
-                if (schema == null) return;
-                final pkName = schema.primaryKey;
-
-                final insertRecords =
-                    inserts.map((e) => e.data).toList(growable: false);
-                final updateRecords =
-                    updates.map((e) => e.data).toList(growable: false);
-                final deleteRecords =
-                    deletes.map((e) => e.data).toList(growable: false);
-
-                // Best-effort: fill missing oldValues from persisted table data (batch lookup).
-                final missingOld = <String>[];
-                for (final u in updates) {
-                  await yieldController.maybeYield();
-                  if (u.oldValues != null) continue;
-                  final pk = u.data[pkName]?.toString();
-                  if (pk == null || pk.isEmpty) continue;
-                  missingOld.add(pk);
-                }
-                final oldByPk = <String, Map<String, dynamic>>{};
-                if (missingOld.isNotEmpty) {
-                  try {
-                    final olds =
-                        await _dataStore.tableDataManager.queryRecordsBatch(
-                      table,
-                      missingOld,
-                    );
-                    for (final r in olds.records) {
-                      final pk = r[pkName]?.toString();
-                      if (pk == null || pk.isEmpty) continue;
-                      oldByPk[pk] = r;
-                    }
-                  } catch (_) {}
-                }
-
-                // Prepare Index Updates (CPU bound mostly, but writes are IO)
-                final idxInserts = <Map<String, dynamic>>[];
-                idxInserts.addAll(insertRecords);
-                final idxUpdates = <IndexRecordUpdate>[];
-                for (final u in updates) {
-                  await yieldController.maybeYield();
-                  final pk = u.data[pkName]?.toString();
-                  if (pk == null || pk.isEmpty) continue;
-                  final oldVals = u.oldValues ?? oldByPk[pk];
-                  if (oldVals == null) {
-                    // Cannot safely remove old index entries; treat as insert-only.
-                    idxInserts.add(u.data);
-                    continue;
-                  }
-                  idxUpdates.add(IndexRecordUpdate(
-                    primaryKey: pk,
-                    newValues: Map<String, dynamic>.from(u.data),
-                    oldValues: Map<String, dynamic>.from(oldVals),
-                  ));
-                }
-
-                // Execute Table Write and Index Write in Parallel
-                // Compute per-table token budgets (data vs indexes) from planned batch plan.
-                // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
-                //
-                // allIndexes includes vector indexes — used to decide whether to call writeChanges.
-                // btreeIndexes excludes vector indexes — used for B+Tree budget calculation.
-                // IndexManager.writeChanges internally intercepts vector-type and dispatches
-                // to VectorIndexManager, so a single entry point handles both.
-                final allIndexes = <IndexSchema>[
-                  ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
-                  ...?_dataStore.indexManager
-                      ?.getEngineManagedBtreeIndexes(table, schema),
-                ];
-                final btreeIndexCount =
-                    allIndexes.where((i) => i.type != IndexType.vector).length;
-                final split = IoConcurrencyPlanner.splitPerTableBudget(
-                  perTableTokens: perTableTokenBudget,
-                  indexCount: btreeIndexCount,
-                );
-
-                // 1) Table Data
-                final tableWriteFuture =
-                    _dataStore.tableDataManager.writeChanges(
-                  tableName: table,
-                  inserts: insertRecords,
-                  updates: updateRecords,
-                  deletes: deleteRecords,
-                  batchContext: currentBatchContext,
-                  concurrency: split.tableDataTokens,
-                );
-
-                // 2) All indexes (B+Tree + Vector) via single IndexManager entry point.
-                Future<void> indexWrite() async {
-                  if (allIndexes.isEmpty) return;
-                  await (_dataStore.indexManager?.writeChanges(
-                        tableName: table,
-                        inserts: idxInserts,
-                        updates: idxUpdates,
-                        deletes: deleteRecords,
-                        batchContext: currentBatchContext,
-                        concurrency: split.indexTokens,
-                      ) ??
-                      Future.value());
-                }
-
-                if (allIndexes.isEmpty) {
-                  await tableWriteFuture;
-                } else if (split.runInParallel) {
-                  await Future.wait([tableWriteFuture, indexWrite()]);
-                } else {
-                  await tableWriteFuture;
-                  await indexWrite();
-                }
-
-                // Cleanup in-memory buffers for this table IMMEDIATELY after it is written.
-                if (tableQueueItems.isNotEmpty) {
-                  await _bufferManager.cleanupAfterBatch(tableQueueItems);
-                }
-              } finally {
-                if (locked && _dataStore.lockManager != null) {
-                  _dataStore.lockManager!.releaseExclusiveLock(lockKey, opId);
-                }
+              if (_dataStore.tableDataManager.isTableBeingCleared(table)) {
+                return;
               }
+              if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
+                Logger.info(
+                    "Skipping stale batch for table $table because it was cleared/reset.",
+                    label: "ParallelJournalManager");
+                return;
+              }
+
+              await _dataStore.tableDataManager.withTableWriteLock(
+                table,
+                (tableLock) async {
+                  // clearTable sets this admission flag before it gets the
+                  // table lock. A flush may win the lock race after that, so
+                  // re-check here and let clearTable proceed first.
+                  if (_dataStore.tableDataManager.isTableBeingCleared(table)) {
+                    return;
+                  }
+
+                  // Verify epoch hasn't changed (O(1) check for table clear race)
+                  if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
+                    Logger.info(
+                        "Skipping stale batch for table $table because it was cleared/reset.",
+                        label: "ParallelJournalManager");
+                    return;
+                  }
+
+                  // Unified flush: parallelize table data and index maintenance
+                  final schema =
+                      await _dataStore.schemaManager?.getTableSchema(table);
+                  if (schema == null) return;
+                  final pkName = schema.primaryKey;
+
+                  final insertRecords =
+                      inserts.map((e) => e.data).toList(growable: false);
+                  final updateRecords =
+                      updates.map((e) => e.data).toList(growable: false);
+                  final deleteRecords =
+                      deletes.map((e) => e.data).toList(growable: false);
+
+                  // Best-effort: fill missing oldValues from persisted table data (batch lookup).
+                  final missingOld = <String>[];
+                  for (final u in updates) {
+                    await yieldController.maybeYield();
+                    if (u.oldValues != null) continue;
+                    final pk = u.data[pkName]?.toString();
+                    if (pk == null || pk.isEmpty) continue;
+                    missingOld.add(pk);
+                  }
+                  final oldByPk = <String, Map<String, dynamic>>{};
+                  if (missingOld.isNotEmpty) {
+                    try {
+                      final olds =
+                          await _dataStore.tableDataManager.queryRecordsBatch(
+                        table,
+                        missingOld,
+                      );
+                      for (final r in olds.records) {
+                        final pk = r[pkName]?.toString();
+                        if (pk == null || pk.isEmpty) continue;
+                        oldByPk[pk] = r;
+                      }
+                    } catch (_) {}
+                  }
+
+                  // Prepare Index Updates (CPU bound mostly, but writes are IO)
+                  final idxInserts = <Map<String, dynamic>>[];
+                  idxInserts.addAll(insertRecords);
+                  final idxUpdates = <IndexRecordUpdate>[];
+                  for (final u in updates) {
+                    await yieldController.maybeYield();
+                    final pk = u.data[pkName]?.toString();
+                    if (pk == null || pk.isEmpty) continue;
+                    final oldVals = u.oldValues ?? oldByPk[pk];
+                    if (oldVals == null) {
+                      // Cannot safely remove old index entries; treat as insert-only.
+                      idxInserts.add(u.data);
+                      continue;
+                    }
+                    idxUpdates.add(IndexRecordUpdate(
+                      primaryKey: pk,
+                      newValues: Map<String, dynamic>.from(u.data),
+                      oldValues: Map<String, dynamic>.from(oldVals),
+                    ));
+                  }
+
+                  // Execute Table Write and Index Write in Parallel
+                  // Compute per-table token budgets (data vs indexes) from planned batch plan.
+                  // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
+                  //
+                  // allIndexes includes vector indexes — used to decide whether to call writeChanges.
+                  // btreeIndexes excludes vector indexes — used for B+Tree budget calculation.
+                  // IndexManager.writeChanges internally intercepts vector-type and dispatches
+                  // to VectorIndexManager, so a single entry point handles both.
+                  final allIndexes = <IndexSchema>[
+                    ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+                    ...?_dataStore.indexManager
+                        ?.getEngineManagedBtreeIndexes(table, schema),
+                  ];
+                  final btreeIndexCount = allIndexes
+                      .where((i) => i.type != IndexType.vector)
+                      .length;
+                  final split = IoConcurrencyPlanner.splitPerTableBudget(
+                    perTableTokens: perTableTokenBudget,
+                    indexCount: btreeIndexCount,
+                  );
+
+                  // 1) Table Data
+                  final tableWriteFuture =
+                      _dataStore.tableDataManager.writeChanges(
+                    tableName: table,
+                    inserts: insertRecords,
+                    updates: updateRecords,
+                    deletes: deleteRecords,
+                    batchContext: currentBatchContext,
+                    concurrency: split.tableDataTokens,
+                    tableLock: tableLock,
+                  );
+
+                  // 2) All indexes (B+Tree + Vector) via single IndexManager entry point.
+                  Future<void> indexWrite() async {
+                    if (allIndexes.isEmpty) return;
+                    await (_dataStore.indexManager?.writeChanges(
+                          tableName: table,
+                          inserts: idxInserts,
+                          updates: idxUpdates,
+                          deletes: deleteRecords,
+                          batchContext: currentBatchContext,
+                          concurrency: split.indexTokens,
+                        ) ??
+                        Future.value());
+                  }
+
+                  if (allIndexes.isEmpty) {
+                    await tableWriteFuture;
+                  } else if (split.runInParallel) {
+                    await Future.wait([tableWriteFuture, indexWrite()]);
+                  } else {
+                    await tableWriteFuture;
+                    await indexWrite();
+                  }
+
+                  // Cleanup in-memory buffers for this table IMMEDIATELY after it is written.
+                  if (tableQueueItems.isNotEmpty) {
+                    await _bufferManager.cleanupAfterBatch(tableQueueItems);
+                  }
+                },
+                operationPrefix: 'flush_batch_unified_',
+              );
 
               if (journaling && currentBatchContext != null) {
                 final totalCount =
@@ -2023,7 +2028,7 @@ class ParallelJournalManager {
     );
   }
 
-  /// Begin an ad-hoc batch for table maintenance (e.g., processTablePartitions) so recovery can reconcile partial progress.
+  /// Begin an ad-hoc batch for table maintenance so recovery can reconcile partial progress.
   Future<BatchContext> beginMaintenanceBatch({required String table}) async {
     if (!_dataStore.config.enableJournal) return BatchContext.maintenance('');
     // Register pending maintenance batch

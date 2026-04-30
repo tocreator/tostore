@@ -311,7 +311,7 @@ const userSchema = TableSchema(
       indexName: 'idx_users_status_created_at', // 索引名，可选
       fields: ['status', 'created_at'], // 复合索引字段列表
       unique: false, // 是否唯一索引
-      type: IndexType.btree, // 索引类型：btree/hash/bitmap/vector
+      type: IndexType.btree, // 索引类型：btree/vector
     ),
   ],
   foreignKeys: const [], // 外键约束列表，可选；完整示例见下文“外键与级联约束”
