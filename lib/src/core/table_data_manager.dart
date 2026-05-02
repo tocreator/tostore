@@ -1282,7 +1282,7 @@ class TableDataManager {
             if (_dataStore.indexManager != null) {
               await _dataStore.indexManager!.updateIndexDataCache(
                   tableName, recordId, r, null,
-                  force: true);
+                  overrideSchema: schema, force: true);
             }
           } else {
             if (operation == BufferOperationType.insert) {
@@ -1297,7 +1297,7 @@ class TableDataManager {
             if (_dataStore.indexManager != null) {
               await _dataStore.indexManager!.updateIndexDataCache(
                   tableName, recordId, oldR, r,
-                  force: true);
+                  overrideSchema: schema, force: true);
             }
           }
           successIds.add(recordId);
@@ -1358,17 +1358,41 @@ class TableDataManager {
         final pointers = await _dataStore.walManager.appendBatch(walEntries);
 
         for (int i = 0; i < validBatchRecordIds.length; i++) {
+          final recordId = validBatchRecordIds[i];
+          final r = validBatchRecords[i];
+          final oldR = validBatchOldValues[i];
+
           entries.add(BufferEntry(
-            data: validBatchRecords[i],
+            data: r,
             operation: operation,
             timestamp: ts,
             transactionId: currentTxId,
             walPointer: pointers[i],
-            oldValues: validBatchOldValues[i],
+            oldValues: oldR,
           ));
-          recordIds.add(validBatchRecordIds[i]);
+          recordIds.add(recordId);
           if (operation != BufferOperationType.delete) {
             finalUniqueKeysList.add(validBatchUniqueKeys[i]);
+          }
+
+          if (operation == BufferOperationType.update) {
+            cacheTableRecord(tableName, recordId, r, schema);
+            await _dataStore.indexManager?.updateIndexDataCache(
+              tableName,
+              recordId,
+              oldR,
+              r,
+              overrideSchema: schema,
+            );
+          } else if (operation == BufferOperationType.delete) {
+            removeTableRecord(tableName, recordId);
+            await _dataStore.indexManager?.updateIndexDataCache(
+              tableName,
+              recordId,
+              r,
+              null,
+              overrideSchema: schema,
+            );
           }
         }
       } catch (e) {

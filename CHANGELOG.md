@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.1.2
+
+### Fixed
+- Urgently fixed cache update issues for new key-value update operations (e.g., `setMany`) introduced in 3.1.1.
+- Urgently fixed cache update issues for new table batch update operations (e.g., `batchUpdate`) introduced in 3.1.1.
+
+### Changed
+- Improved comprehensive benchmark testing for all new interfaces to prevent similar issues in future releases.
+
 ## 3.1.1
 
 ### Fixed

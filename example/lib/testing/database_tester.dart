@@ -123,7 +123,7 @@ class DatabaseTester {
           'test': _testBufferPipelineRobustness
         },
         {'name': 'Batch Operations Benchmark', 'test': _testBatchOperations},
-        {'name': 'Upsert Logic', 'test': _testUpsert},
+        {'name': 'Upsert and Cache Synchronization', 'test': _testUpsertAndCacheSync},
         {'name': 'JOIN Queries', 'test': _testJoinQueries},
         {'name': 'Multi-Space Isolation', 'test': _testMultiSpace},
         {'name': 'Foreign Key Operations', 'test': _testForeignKeyOperations},
@@ -1219,9 +1219,9 @@ class DatabaseTester {
     return isTestPassed;
   }
 
-  /// Tests the upsert logic.
-  Future<bool> _testUpsert() async {
-    log.add('--- Testing: Upsert Logic ---', LogType.debug);
+  /// Tests the upsert and cache synchronization logic.
+  Future<bool> _testUpsertAndCacheSync() async {
+    log.add('--- Testing: Upsert and Cache Synchronization ---', LogType.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1248,9 +1248,108 @@ class DatabaseTester {
       final dataAfterUpdate = await db.query('users');
       isTestPassed &= _expect('Upsert-update should not create a new user',
           dataAfterUpdate.length, 1);
+
+      // Cache Synchronization Verification
+      final q1 = await db.query('users').whereEqual('username', 'upsert_user').first();
+      isTestPassed &= _expect('Cached read matches current age 40', q1?['age'], 40);
+
+      // Perform a new upsert to test cache invalidation/synchronization on update
+      await db.upsert('users', {
+        'username': 'upsert_user',
+        'email': 'upsert@test.com',
+        'age': 50,
+      });
+      final q2 = await db.query('users').whereEqual('username', 'upsert_user').first();
+      isTestPassed &= _expect('Upsert-update should immediately set age to 50 in cache', q2?['age'], 50);
+
+      // Perform delete to test cache sync on delete
+      await db.delete('users').whereEqual('username', 'upsert_user');
+      final q3 = await db.query('users').whereEqual('username', 'upsert_user').first();
+      isTestPassed &= _expect('Query returns null after delete due to cache clear', q3, null);
+
+      // 4. Test batchUpsert cache synchronization
+      await db.batchUpsert('users', [
+        {'username': 'batch_upsert_u1', 'email': 'bu1@test.com', 'age': 20},
+        {'username': 'batch_upsert_u2', 'email': 'bu2@test.com', 'age': 25},
+      ]);
+      // Query to load them into the cache
+      final qbu1 = await db.query('users').whereEqual('username', 'batch_upsert_u1').first();
+      final qbu2 = await db.query('users').whereEqual('username', 'batch_upsert_u2').first();
+      isTestPassed &= _expect('batch_upsert_u1 age in cache', qbu1?['age'], 20);
+      isTestPassed &= _expect('batch_upsert_u2 age in cache', qbu2?['age'], 25);
+
+      // Now update them via batchUpsert
+      await db.batchUpsert('users', [
+        {'username': 'batch_upsert_u1', 'email': 'bu1@test.com', 'age': 30},
+        {'username': 'batch_upsert_u2', 'email': 'bu2@test.com', 'age': 35},
+      ]);
+      // Immediately read again to ensure cache is updated
+      final qbu1Updated = await db.query('users').whereEqual('username', 'batch_upsert_u1').first();
+      final qbu2Updated = await db.query('users').whereEqual('username', 'batch_upsert_u2').first();
+      isTestPassed &= _expect('batch_upsert_u1 updated age from cache', qbu1Updated?['age'], 30);
+      isTestPassed &= _expect('batch_upsert_u2 updated age from cache', qbu2Updated?['age'], 35);
+
+      // 5. Test normal update cache synchronization
+      await db.update('users', {'age': 45}).whereEqual('username', 'batch_upsert_u1');
+      final qup = await db.query('users').whereEqual('username', 'batch_upsert_u1').first();
+      isTestPassed &= _expect('normal update syncs with cache correctly', qup?['age'], 45);
+
+      // 6. Test delete cache sync with normal delete
+      await db.delete('users').whereEqual('username', 'batch_upsert_u1');
+      final qupDel = await db.query('users').whereEqual('username', 'batch_upsert_u1').first();
+      isTestPassed &= _expect('Deleted user query returns null due to cache removal', qupDel, null);
+
+      // 7. Test batchUpdate cache synchronization
+      // Insert first
+      await db.batchInsert('users', [
+        {'username': 'batch_update_u1', 'email': 'bu_up1@test.com', 'age': 20},
+        {'username': 'batch_update_u2', 'email': 'bu_up2@test.com', 'age': 25},
+      ]);
+      // Load into cache
+      final qbuUp1 = await db.query('users').whereEqual('username', 'batch_update_u1').first();
+      final qbuUp2 = await db.query('users').whereEqual('username', 'batch_update_u2').first();
+      isTestPassed &= _expect('batch_update_u1 age in cache', qbuUp1?['age'], 20);
+      isTestPassed &= _expect('batch_update_u2 age in cache', qbuUp2?['age'], 25);
+
+      // Extract generated primary keys to update
+      final id1 = qbuUp1?['id'];
+      final id2 = qbuUp2?['id'];
+
+      // Perform batchUpdate
+      await db.batchUpdate('users', [
+        {'id': id1, 'username': 'batch_update_u1', 'email': 'bu_up1@test.com', 'age': 30},
+        {'id': id2, 'username': 'batch_update_u2', 'email': 'bu_up2@test.com', 'age': 35},
+      ]);
+
+      // Immediately read again to ensure cache is updated
+      final qbuUp1Updated = await db.query('users').whereEqual('username', 'batch_update_u1').first();
+      final qbuUp2Updated = await db.query('users').whereEqual('username', 'batch_update_u2').first();
+      isTestPassed &= _expect('batch_update_u1 updated age from cache', qbuUp1Updated?['age'], 30);
+      isTestPassed &= _expect('batch_update_u2 updated age from cache', qbuUp2Updated?['age'], 35);
+
+      // 8. Test setValueMany cache synchronization
+      await db.kv.setMany({
+        'kv_batch_k1': 'value_v1',
+        'kv_batch_k2': 'value_v2',
+      });
+      // Load into cache
+      final qkv1 = await db.kv.get('kv_batch_k1');
+      final qkv2 = await db.kv.get('kv_batch_k2');
+      isTestPassed &= _expect('KV batch first value matches', qkv1, 'value_v1');
+      isTestPassed &= _expect('KV batch second value matches', qkv2, 'value_v2');
+
+      // Update via setValueMany again
+      await db.kv.setMany({
+        'kv_batch_k1': 'value_v1_new',
+        'kv_batch_k2': 'value_v2_new',
+      });
+      final qkv1Updated = await db.kv.get('kv_batch_k1');
+      final qkv2Updated = await db.kv.get('kv_batch_k2');
+      isTestPassed &= _expect('KV batch first updated value matches from cache', qkv1Updated, 'value_v1_new');
+      isTestPassed &= _expect('KV batch second updated value matches from cache', qkv2Updated, 'value_v2_new');
     } catch (e, s) {
       isTestPassed = false;
-      _failTest('Exception in _testUpsert: $e\n$s');
+      _failTest('Exception in _testUpsertAndCacheSync: $e\n$s');
     }
     return isTestPassed;
   }

@@ -591,9 +591,10 @@ class IndexManager {
   /// Update full index cache based on record changes
   Future<void> updateIndexDataCache(String tableName, String pk,
       Map<String, dynamic>? oldData, Map<String, dynamic>? newData,
-      {bool force = false}) async {
+      {TableSchema? overrideSchema, bool force = false}) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema = overrideSchema ??
+          await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) return;
       final indexes = <IndexSchema>[
         ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
@@ -677,7 +678,7 @@ class IndexManager {
       }
     } catch (e) {
       Logger.warn('Failed to update index cache: $e',
-          label: 'IndexManager.updateFullIndexCache');
+          label: 'IndexManager.updateIndexDataCache');
     }
   }
 
