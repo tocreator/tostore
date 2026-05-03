@@ -10,7 +10,7 @@
 ///
 /// ToStore provides a distributed data foundation for immersive virtual-real fusion,
 /// multimodal interaction, 3D spatial features, generative AI, and semantic vector space modeling.
-library tostore;
+library;
 
 import 'dart:async';
 

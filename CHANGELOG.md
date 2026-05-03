@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.1.3
+
+### Changed
+- Updated `lints` package version to `^6.1.0` for improved static analysis.
+
 ## 3.1.2
 
 ### Fixed
