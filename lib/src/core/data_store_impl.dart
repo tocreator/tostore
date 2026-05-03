@@ -7464,7 +7464,71 @@ class DataStoreImpl {
               ))
           .toList(growable: false);
 
-      final newSchema = schema.copyWith(fields: fields, indexes: indexes);
+      final newSchema = schema.copyWith(
+        fields: fields,
+        indexes: indexes,
+        ttlConfig: schema.ttlConfig?.sourceField == oldName
+            ? schema.ttlConfig!.copyWith(sourceField: newName)
+            : schema.ttlConfig,
+        foreignKeys: schema.foreignKeys
+            .map((fk) => fk.copyWith(
+                  fields: fk.fields
+                      .map((f) => f == oldName ? newName : f)
+                      .toList(growable: false),
+                ))
+            .toList(growable: false),
+      );
+
+      final oldAllIndexes = schema.getAllIndexes();
+      final newAllIndexes = newSchema.getAllIndexes();
+
+      // We must rename the underlying index directories BEFORE saving the new schema
+      for (final oldIdx in oldAllIndexes) {
+        final expectedNewFields = oldIdx.fields
+            .map((f) => f == oldName ? newName : f)
+            .toList(growable: false);
+        IndexSchema? newIdx;
+        for (final idx in newAllIndexes) {
+          if (oldIdx.indexName != null &&
+              idx.indexName != null &&
+              oldIdx.indexName == idx.indexName) {
+            newIdx = idx;
+            break;
+          }
+          bool fieldsEqual = true;
+          if (idx.fields.length != expectedNewFields.length) {
+            fieldsEqual = false;
+          } else {
+            for (int i = 0; i < idx.fields.length; i++) {
+              if (idx.fields[i] != expectedNewFields[i]) {
+                fieldsEqual = false;
+                break;
+              }
+            }
+          }
+          if (idx.indexName == null && fieldsEqual) {
+            newIdx = idx;
+            break;
+          }
+        }
+
+        if (newIdx != null) {
+          final oldActual = oldIdx.actualIndexName;
+          final newActual = newIdx.actualIndexName;
+
+          // Only call renameIndex if the physical name changed OR if its fields are affected by the renamed field
+          bool usesRenamedField = oldIdx.fields.contains(oldName);
+          if (oldActual != newActual || usesRenamedField) {
+            await indexManager?.renameIndex(
+              tableName,
+              oldIndexName: oldActual,
+              newIndexName: newActual,
+              newFields: newIdx.fields,
+            );
+          }
+        }
+      }
+
       await schemaManager?.saveTableSchema(tableName, newSchema);
     } catch (e) {
       Logger.error(

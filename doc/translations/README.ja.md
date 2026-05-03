@@ -30,11 +30,11 @@
 </p>
 
 ## クイックナビゲーション
-- **はじめに**: [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
-- **アーキテクチャとモデル**: [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
-- **高度なクエリ**: [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
-- **高度な機能とパフォーマンス**: [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
-- **運用とセキュリティ**: [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [その他のリソース](#more-resources)
+- [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
+- [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
+- [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
+- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
+- [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [その他のリソース](#more-resources)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
 

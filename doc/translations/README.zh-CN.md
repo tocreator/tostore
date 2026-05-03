@@ -36,11 +36,11 @@
 
 
 ## 快速导航
-- **快速上手**：[为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
-- **架构与模型**：[表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
-- **深度查询**：[高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- **进阶与性能**：[KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
-- **运维与安全**：[管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
+- [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
+- [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
+- [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
 
 
 ## <a id="why-tostore"></a>为什么选择 ToStore？

@@ -30,11 +30,11 @@
 </p>
 
 ## Hızlı Gezinme
-- **Başlarken**: [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
-- **Mimari ve Model**: [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
-- **Gelişmiş Sorgular**: [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- **Gelişmiş ve Performans**: [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
-- **Operasyonlar ve Güvenlik**: [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
+- [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
+- [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
+- [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 

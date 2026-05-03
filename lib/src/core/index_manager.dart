@@ -2500,6 +2500,149 @@ class IndexManager {
     }
   }
 
+  /// Rename index directory and metadata (used when field is renamed or index is logically renamed)
+  Future<void> renameIndex(
+    String tableName, {
+    required String oldIndexName,
+    required String newIndexName,
+    required List<String> newFields,
+  }) async {
+    final lockMgr = _dataStore.lockManager;
+    final indexLockOpId = GlobalIdGenerator.generate('rename_index_');
+
+    // Use consistent lock keys for both old and new index names
+    final oldLockKey = 'index:$tableName:$oldIndexName';
+    final newLockKey = 'index:$tableName:$newIndexName';
+
+    // Sort keys to prevent deadlocks when acquiring multiple locks
+    final lockKeys = oldIndexName == newIndexName
+        ? [oldLockKey]
+        : (oldLockKey.compareTo(newLockKey) < 0
+            ? [oldLockKey, newLockKey]
+            : [newLockKey, oldLockKey]);
+
+    final acquiredLocks = <String>[];
+
+    try {
+      if (lockMgr != null) {
+        for (final key in lockKeys) {
+          final opId = '${indexLockOpId}_$key';
+          final locked = await lockMgr.acquireExclusiveLock(key, opId);
+          if (!locked) {
+            throw StateError(
+                'Failed to acquire lock for renaming index $tableName: $key');
+          }
+          acquiredLocks.add(key);
+        }
+      }
+
+      final oldIndexPath =
+          await _dataStore.pathManager.getIndexPath(tableName, oldIndexName);
+      final newIndexPath =
+          await _dataStore.pathManager.getIndexPath(tableName, newIndexName);
+
+      // flush to disk to avoid losing pending writes
+      await _dataStore.flush();
+
+      // Invalidate caches
+      _indexDataCache.remove([tableName, oldIndexName]);
+      _indexDataCache.remove([tableName, newIndexName]);
+      _indexMetaCache.remove([tableName, oldIndexName]);
+      _indexMetaCache.remove([tableName, newIndexName]);
+      _dataStore.vectorIndexManager
+          ?.clearCacheForIndex(tableName, oldIndexName);
+      _dataStore.vectorIndexManager
+          ?.clearCacheForIndex(tableName, newIndexName);
+
+      if (oldIndexName != newIndexName) {
+        final oldExists =
+            await _dataStore.storage.existsDirectory(oldIndexPath);
+        final newExists =
+            await _dataStore.storage.existsDirectory(newIndexPath);
+
+        if (oldExists) {
+          if (newExists) {
+            // Both exist, assuming new is incomplete from previous failed attempt
+            await _dataStore.storage.deleteDirectory(newIndexPath);
+          }
+          await _dataStore.storage.moveDirectory(oldIndexPath, newIndexPath);
+        } else if (!newExists) {
+          // Neither exist, maybe index wasn't physically created yet.
+          return;
+        }
+      }
+
+      // Update B+Tree IndexMeta
+      final metaPath = await _dataStore.pathManager
+          .getIndexMetaPath(tableName, newIndexName);
+      if (await _dataStore.storage.existsFile(metaPath)) {
+        final metaStr = await _dataStore.storage.readAsString(metaPath);
+        if (metaStr != null && metaStr.isNotEmpty) {
+          final meta = IndexMeta.fromJson(jsonDecode(metaStr));
+          final updatedMeta =
+              meta.copyWith(name: newIndexName, fields: newFields);
+          await _dataStore.storage
+              .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+        }
+      }
+
+      // Update NghIndexMeta (if it's a vector index)
+      final nghMetaPath =
+          await _dataStore.pathManager.getNghMetaPath(tableName, newIndexName);
+      if (await _dataStore.storage.existsFile(nghMetaPath)) {
+        final metaStr = await _dataStore.storage.readAsString(nghMetaPath);
+        if (metaStr != null && metaStr.isNotEmpty) {
+          final json = jsonDecode(metaStr) as Map<String, dynamic>;
+          json['name'] = newIndexName;
+          if (newFields.isNotEmpty) {
+            json['fieldName'] = newFields.first;
+          }
+
+          final oldNid2pk = '${oldIndexName}__nid2pk';
+          final newNid2pk = '${newIndexName}__nid2pk';
+          final oldPk2nid = '${oldIndexName}__pk2nid';
+          final newPk2nid = '${newIndexName}__pk2nid';
+
+          if (json['nodeIdToPkMeta'] != null) {
+            json['nodeIdToPkMeta']['name'] = newNid2pk;
+          }
+          if (json['pkToNodeIdMeta'] != null) {
+            json['pkToNodeIdMeta']['name'] = newPk2nid;
+          }
+
+          await _dataStore.storage.writeAsString(nghMetaPath, jsonEncode(json));
+
+          if (oldIndexName != newIndexName) {
+            await renameIndex(
+              tableName,
+              oldIndexName: oldNid2pk,
+              newIndexName: newNid2pk,
+              newFields: const ['__nodeId'],
+            );
+            await renameIndex(
+              tableName,
+              oldIndexName: oldPk2nid,
+              newIndexName: newPk2nid,
+              newFields: const ['__pk'],
+            );
+          }
+        }
+      }
+    } catch (e) {
+      Logger.error('Failed to rename index: $e',
+          label: 'IndexManager.renameIndex');
+      rethrow;
+    } finally {
+      if (lockMgr != null) {
+        // Release locks in reverse order of acquisition
+        for (final key in acquiredLocks.reversed) {
+          final opId = '${indexLockOpId}_$key';
+          lockMgr.releaseExclusiveLock(key, opId);
+        }
+      }
+    }
+  }
+
   /// Compare two field lists with order preserved.
   bool _areFieldListsEqual(List<String> a, List<String> b) {
     if (a.length != b.length) return false;

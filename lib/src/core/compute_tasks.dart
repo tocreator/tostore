@@ -736,13 +736,10 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
           break;
 
         case MigrationType.addIndex:
-          // Index operation does not affect record data
-          break;
-
         case MigrationType.removeIndex:
-          break;
-
         case MigrationType.modifyIndex:
+        case MigrationType.renameIndex:
+          // Index operations do not affect record data
           break;
 
         case MigrationType.renameTable:

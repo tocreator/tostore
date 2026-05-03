@@ -1194,6 +1194,13 @@ class VectorIndexManager {
     _partitionManager.clearPageCacheForTable(tableName);
   }
 
+  /// Clear all caches for a specific index.
+  void clearCacheForIndex(String tableName, String indexName) {
+    _vectorCache.clearForIndex(tableName, indexName);
+    _partitionManager.clearFullyCachedForIndex(tableName, indexName);
+    _partitionManager.clearPageCacheForIndex(tableName, indexName);
+  }
+
   /// Clear all caches.
   Future<void> dispose() async {
     // Wait for all ongoing metadata loading

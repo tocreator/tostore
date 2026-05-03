@@ -30,11 +30,11 @@
 </p>
 
 ## Быстрая навигация
-- **Начало работы**: [Почему ToStore](#why-tostore) | [Основные характеристики](#key-features) | [Руководство по установке](#installation) | [Режим КВ](#quick-start-kv) | [Режим таблицы](#quick-start-table) | [Режим памяти](#quick-start-memory)
-- **Архитектура и модель**: [Определение схемы](#schema-definition) | [Распределенная архитектура](#distributed-architecture) | [Каскадирование внешних ключей](#foreign-keys) | [Мобильный/Настольный компьютер](#mobile-integration) | [Сервер/Агент](#server-integration) | [Алгоритмы первичного ключа](#primary-key-examples)
-- **Расширенные запросы**: [Расширенные запросы (ПРИСОЕДИНИТЬСЯ)](#query-advanced) | [Агрегация и статистика](#aggregation-stats) | [Сложная логика (QueryCondition)](#query-condition) | [Реактивный запрос (смотреть)](#reactive-query) | [Запрос потоковой передачи](#streaming-query)
-- **Дополнительно и производительность**: [Продвинутый KV](#kv-advanced) | [Массовые операции](#bulk-operations) | [Векторный поиск](#vector-advanced) | [TTL на уровне таблицы](#ttl-config) | [Эффективное разбиение на страницы](#query-pagination) | [Кэш запросов](#query-cache) | [Атомарные выражения](#atomic-expressions) | [Транзакции](#transactions)
-- **Операции и безопасность**: [Администрирование](#database-maintenance) | [Конфигурация безопасности](#security-config) | [Обработка ошибок](#error-handling) | [Производительность и диагностика](#performance) | [Дополнительные ресурсы](#more-resources)
+- [Почему ToStore](#why-tostore) | [Основные характеристики](#key-features) | [Руководство по установке](#installation) | [Режим КВ](#quick-start-kv) | [Режим таблицы](#quick-start-table) | [Режим памяти](#quick-start-memory)
+- [Определение схемы](#schema-definition) | [Распределенная архитектура](#distributed-architecture) | [Каскадирование внешних ключей](#foreign-keys) | [Мобильный/Настольный компьютер](#mobile-integration) | [Сервер/Агент](#server-integration) | [Алгоритмы первичного ключа](#primary-key-examples)
+- [Расширенные запросы (ПРИСОЕДИНИТЬСЯ)](#query-advanced) | [Агрегация и статистика](#aggregation-stats) | [Сложная логика (QueryCondition)](#query-condition) | [Реактивный запрос (смотреть)](#reactive-query) | [Запрос потоковой передачи](#streaming-query)
+- [Продвинутый KV](#kv-advanced) | [Массовые операции](#bulk-operations) | [Векторный поиск](#vector-advanced) | [TTL на уровне таблицы](#ttl-config) | [Эффективное разбиение на страницы](#query-pagination) | [Кэш запросов](#query-cache) | [Атомарные выражения](#atomic-expressions) | [Транзакции](#transactions)
+- [Администрирование](#database-maintenance) | [Конфигурация безопасности](#security-config) | [Обработка ошибок](#error-handling) | [Производительность и диагностика](#performance) | [Дополнительные ресурсы](#more-resources)
 
 ## <a id="why-tostore"></a>Почему стоит выбрать ToStore?
 

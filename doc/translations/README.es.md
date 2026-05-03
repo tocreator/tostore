@@ -30,11 +30,11 @@
 </p>
 
 ## Navegación rápida
-- **Primeros pasos**: [Por qué almacenar](#why-tostore) | [Características clave](#key-features) | [Guía de instalación](#installation) | [Modo KV](#quick-start-kv) | [Modo tabla](#quick-start-table) | [Modo de memoria](#quick-start-memory)
-- **Arquitectura y modelo**: [Definición de esquema](#schema-definition) | [Arquitectura distribuida](#distributed-architecture) | [Claves externas en cascada](#foreign-keys) | [Móvil/Escritorio](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de clave primaria](#primary-key-examples)
-- **Consultas avanzadas**: [Consultas avanzadas (UNIRSE)](#query-advanced) | [Agregación y estadísticas](#aggregation-stats) | [Lógica compleja (Condición de consulta)](#query-condition) | [Consulta reactiva (ver)](#reactive-query) | [Consulta de transmisión](#streaming-query)
-- **Avanzado y rendimiento**: [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Búsqueda vectorial](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
-- **Operaciones y seguridad**: [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Más recursos](#more-resources)
+- [Por qué almacenar](#why-tostore) | [Características clave](#key-features) | [Guía de instalación](#installation) | [Modo KV](#quick-start-kv) | [Modo tabla](#quick-start-table) | [Modo de memoria](#quick-start-memory)
+- [Definición de esquema](#schema-definition) | [Arquitectura distribuida](#distributed-architecture) | [Claves externas en cascada](#foreign-keys) | [Móvil/Escritorio](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de clave primaria](#primary-key-examples)
+- [Consultas avanzadas (UNIRSE)](#query-advanced) | [Agregación y estadísticas](#aggregation-stats) | [Lógica compleja (Condición de consulta)](#query-condition) | [Consulta reactiva (ver)](#reactive-query) | [Consulta de transmisión](#streaming-query)
+- [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Búsqueda vectorial](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
+- [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Más recursos](#more-resources)
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
 

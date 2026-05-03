@@ -4,6 +4,7 @@ import 'dart:math';
 
 import '../Interface/chain_builder.dart';
 import '../handler/logger.dart';
+import '../model/business_error.dart';
 import '../model/meta_info.dart';
 import '../model/migration_meta.dart';
 import '../model/migration_task.dart';
@@ -233,9 +234,13 @@ class MigrationManager {
         final migrateSuccess = await processMigrationTasks();
 
         if (!migrateSuccess) {
-          Logger.warn(
+          Logger.error(
             'Some migration tasks failed, please check the log for details',
             label: 'MigrationManager.migrate',
+          );
+          throw const BusinessError(
+            'Some migration tasks failed',
+            type: BusinessErrorType.migrationError,
           );
         } else {
           Logger.info(
@@ -755,6 +760,10 @@ class MigrationManager {
         return tableName;
 
       case MigrationType.removeIndex:
+        // Index operations are handled in each space's migration instance
+        return tableName;
+
+      case MigrationType.renameIndex:
         // Index operations are handled in each space's migration instance
         return tableName;
 
@@ -1308,16 +1317,34 @@ class MigrationManager {
     TableSchema newSchema,
     List<MigrationOperation> operations,
   ) {
+    final oldIndexes = oldSchema.getAllIndexes();
+    final newIndexes = newSchema.getAllIndexes();
+
+    // Build field rename mapping
+    final fieldRenames = <String, String>{};
+    for (final op in operations) {
+      if (op.type == MigrationType.renameField &&
+          op.fieldName != null &&
+          op.newName != null) {
+        fieldRenames[op.fieldName!] = op.newName!;
+      }
+    }
+
     // First mark all old indexes as to be removed
-    final indexesToRemove = List<IndexSchema>.from(oldSchema.indexes);
+    final indexesToRemove = List<IndexSchema>.from(oldIndexes);
 
     // Check for added and modified indexes
-    for (var newIndex in newSchema.indexes) {
+    for (var newIndex in newIndexes) {
       // Try to find matching index in old schema
       IndexSchema? matchedOldIndex;
 
-      for (var oldIndex in oldSchema.indexes) {
-        if (_areIndexesSame(oldIndex, newIndex)) {
+      for (var oldIndex in indexesToRemove) {
+        // Map old index fields to new names using rename operations
+        final mappedOldFields =
+            oldIndex.fields.map((f) => fieldRenames[f] ?? f).toList();
+        final mappedOldIndex = oldIndex.copyWith(fields: mappedOldFields);
+
+        if (_areIndexesSame(mappedOldIndex, newIndex)) {
           matchedOldIndex = oldIndex;
           break;
         }
@@ -1333,8 +1360,30 @@ class MigrationManager {
         // Found matching old index, remove from to-be-deleted list
         indexesToRemove.remove(matchedOldIndex);
 
-        // Check if modification is needed
-        if (_isIndexModified(matchedOldIndex, newIndex)) {
+        // Check if rename is needed
+        if (matchedOldIndex.actualIndexName != newIndex.actualIndexName) {
+          operations.add(MigrationOperation(
+            type: MigrationType.renameIndex,
+            indexName: matchedOldIndex.actualIndexName,
+            newName: newIndex.actualIndexName,
+            fields: newIndex.fields,
+          ));
+
+          // After rename, it might also be modified (e.g. type changed)
+          if (matchedOldIndex.unique != newIndex.unique ||
+              matchedOldIndex.type != newIndex.type ||
+              matchedOldIndex.vectorConfig != newIndex.vectorConfig) {
+            operations.add(MigrationOperation(
+              type: MigrationType.modifyIndex,
+              indexName: newIndex.actualIndexName, // It will be renamed first
+              index: newIndex,
+              fields: newIndex.fields,
+              unique: newIndex.unique,
+            ));
+          }
+        }
+        // Check if modification is needed (no rename)
+        else if (_isIndexModified(matchedOldIndex, newIndex)) {
           operations.add(MigrationOperation(
             type: MigrationType.modifyIndex,
             indexName: matchedOldIndex.actualIndexName,
@@ -1367,8 +1416,10 @@ class MigrationManager {
 
   /// Check if two indexes are the same
   bool _areIndexesSame(IndexSchema a, IndexSchema b) {
-    if (a.indexName != null && b.indexName != null) {
-      return a.indexName == b.indexName;
+    if (a.indexName != null &&
+        b.indexName != null &&
+        a.indexName == b.indexName) {
+      return true;
     }
     return _areIndexFieldsEqual(a.fields, b.fields);
   }
@@ -1388,9 +1439,9 @@ class MigrationManager {
 
   /// Check if index is modified
   bool _isIndexModified(IndexSchema oldIndex, IndexSchema newIndex) {
-    if ((oldIndex.indexName ?? '') != (newIndex.indexName ?? '')) {
-      return true;
-    }
+    // Note: indexName change is handled by renameIndex, not modifyIndex.
+    // ModifyIndex causes a full rebuild (drop + recreate), so it should only trigger
+    // if structural configuration (like uniqueness, type, vector config, or fields) changes.
     return oldIndex.unique != newIndex.unique ||
         oldIndex.type != newIndex.type ||
         oldIndex.vectorConfig != newIndex.vectorConfig ||
@@ -2185,6 +2236,13 @@ class MigrationManager {
                 await migrationInstance.indexManager
                     ?.removeIndex(currentTableName, fields: fieldsToRemove);
               }
+            } else if (operation.type == MigrationType.renameIndex) {
+              await migrationInstance.indexManager?.renameIndex(
+                currentTableName,
+                oldIndexName: operation.indexName!,
+                newIndexName: operation.newName!,
+                newFields: operation.fields ?? [],
+              );
             } else if (operation.type == MigrationType.modifyIndex) {
               await migrationInstance.indexManager?.modifyIndex(
                 currentTableName,
@@ -2286,9 +2344,9 @@ class MigrationManager {
         );
       }
 
-      // if auto generated task, ensure schema consistency with async operation
+      // if auto generated task, ensure schema consistency
       if (renameOp == null && currentTask.isAutoGenerated) {
-        _asyncEnsureSchemaConsistency(currentTask);
+        await _ensureSchemaConsistency(currentTask);
       }
 
       // calculate and print total time
@@ -2499,9 +2557,13 @@ class MigrationManager {
           if (_pendingTasks.isNotEmpty) {
             final success = await processMigrationTasks();
             if (!success) {
-              Logger.warn(
+              Logger.error(
                 'Some recovered migration tasks failed, please check the log for details',
                 label: 'MigrationManager.initialize',
+              );
+              throw const BusinessError(
+                'Some recovered migration tasks failed',
+                type: BusinessErrorType.migrationError,
               );
             }
           }
@@ -2673,59 +2735,56 @@ class MigrationManager {
   }
 
   /// Asynchronously ensure schema consistency for auto-generated tasks
-  void _asyncEnsureSchemaConsistency(MigrationTask task) {
-    // Execute asynchronously without waiting
-    Future(() async {
+  Future<void> _ensureSchemaConsistency(MigrationTask task) async {
+    try {
+      // Get the final table name (considering table renaming)
+      String targetTableName = task.tableName;
+
+      // Check if there's a rename table operation
+      MigrationOperation? renameOp;
       try {
-        // Get the final table name (considering table renaming)
-        String targetTableName = task.tableName;
-
-        // Check if there's a rename table operation
-        MigrationOperation? renameOp;
-        try {
-          renameOp = task.operations.firstWhere(
-            (op) => op.type == MigrationType.renameTable,
-          );
-          // If there's a rename operation, use the new table name
-          if (renameOp.newTableName != null) {
-            targetTableName = renameOp.newTableName!;
-          }
-        } catch (e) {
-          // No rename operation found, continue using original table name
-        }
-
-        // Get both schemas for comparison
-        final initialSchema = _dataStore.getInitialSchemas();
-        final definitionSchema = initialSchema.firstWhere(
-          (s) => s.name == targetTableName,
-          orElse: () => throw Exception('Schema not found in initial schema'),
+        renameOp = task.operations.firstWhere(
+          (op) => op.type == MigrationType.renameTable,
         );
-
-        final currentSchema =
-            await _dataStore.schemaManager?.getTableSchema(targetTableName);
-
-        // Convert schemas to JSON for deep comparison
-        final definitionJson = jsonEncode(definitionSchema.toJson());
-        final currentJson =
-            currentSchema != null ? jsonEncode(currentSchema.toJson()) : null;
-
-        // Only update if schemas are different
-        if (currentJson == null || definitionJson != currentJson) {
-          await _dataStore.schemaManager!
-              .saveTableSchema(targetTableName, definitionSchema);
-        } else {
-          Logger.debug(
-            'Schema for table [$targetTableName] is already consistent with definition',
-            label: 'MigrationManager._asyncEnsureSchemaConsistency',
-          );
+        // If there's a rename operation, use the new table name
+        if (renameOp.newTableName != null) {
+          targetTableName = renameOp.newTableName!;
         }
-      } catch (e, stack) {
-        Logger.error(
-          'Async schema consistency check failed: $e\n$stack',
-          label: 'MigrationManager._asyncEnsureSchemaConsistency',
+      } catch (e) {
+        // No rename operation found, continue using original table name
+      }
+
+      // Get both schemas for comparison
+      final initialSchema = _dataStore.getInitialSchemas();
+      final definitionSchema = initialSchema.firstWhere(
+        (s) => s.name == targetTableName,
+        orElse: () => throw Exception('Schema not found in initial schema'),
+      );
+
+      final currentSchema =
+          await _dataStore.schemaManager?.getTableSchema(targetTableName);
+
+      // Convert schemas to JSON for deep comparison
+      final definitionJson = jsonEncode(definitionSchema.toJson());
+      final currentJson =
+          currentSchema != null ? jsonEncode(currentSchema.toJson()) : null;
+
+      // Only update if schemas are different
+      if (currentJson == null || definitionJson != currentJson) {
+        await _dataStore.schemaManager!
+            .saveTableSchema(targetTableName, definitionSchema);
+      } else {
+        Logger.debug(
+          'Schema for table [$targetTableName] is already consistent with definition',
+          label: 'MigrationManager._ensureSchemaConsistency',
         );
       }
-    });
+    } catch (e, stack) {
+      Logger.error(
+        'Schema consistency check failed: $e\n$stack',
+        label: 'MigrationManager._ensureSchemaConsistency',
+      );
+    }
   }
 
   Future<void> _syncAutoGeneratedSchemaToDefinition(

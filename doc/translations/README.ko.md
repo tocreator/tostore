@@ -30,11 +30,11 @@
 </p>
 
 ## 빠른 탐색
-- **시작하기**: [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
-- **아키텍처 및 모델**: [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
-- **고급 쿼리**: [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- **고급 및 성능**: [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
-- **운영 및 보안**: [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
+- [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
+- [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
+- [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
+- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
 

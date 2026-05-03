@@ -134,6 +134,7 @@ enum MigrationType {
   addIndex,
   removeIndex,
   modifyIndex,
+  renameIndex,
   renameTable,
   setPrimaryKeyConfig,
   setTableTtlConfig,
