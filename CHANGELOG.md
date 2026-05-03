@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Urgently fixed cache update issues for new key-value update operations (e.g., `setMany`) introduced in 3.1.1.
 - Urgently fixed cache update issues for new table batch update operations (e.g., `batchUpdate`) introduced in 3.1.1.
+- Fixed glibc `statvfs` FFI struct field padding on 64-bit Linux to prevent memory heap corruption and crashes when retrieving disk free space.
 
 ### Changed
 - Improved comprehensive benchmark testing for all new interfaces to prevent similar issues in future releases.

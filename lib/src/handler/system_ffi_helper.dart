@@ -344,4 +344,20 @@ base class STATVFS extends Struct {
   external int flag;
   @UnsignedLong()
   external int namemax;
+
+  // Linux glibc has unsigned int __f_spare[6] at the end of struct statvfs
+  // to maintain binary compatibility. Adding these fields ensures Dart allocates
+  // the correct size (112 bytes instead of 88 bytes) to prevent memory/heap corruption.
+  @Int32()
+  external int fSpare0;
+  @Int32()
+  external int fSpare1;
+  @Int32()
+  external int fSpare2;
+  @Int32()
+  external int fSpare3;
+  @Int32()
+  external int fSpare4;
+  @Int32()
+  external int fSpare5;
 }
