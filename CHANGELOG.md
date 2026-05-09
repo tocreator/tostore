@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.1.4
+
+### Fixed
+- Fixed missing `.watch()` notifications for table clearing, drop table, restoration, and batch insert operations.
+
+
 ## 3.1.3
 
 ### Changed

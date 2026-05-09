@@ -3,6 +3,7 @@ enum ChangeType {
   insert,
   update,
   delete,
+  clear,
 }
 
 /// Event payload for data changes

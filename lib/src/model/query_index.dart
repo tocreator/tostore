@@ -29,6 +29,12 @@ class QueryIndex {
   // Queries with no conditions (watch all)
   final List<QuerySubscription> _globalSubscriptions = [];
 
+  /// Check if the index has no subscriptions
+  bool get isEmpty =>
+      _equalityIndex.isEmpty &&
+      _complexIndex.isEmpty &&
+      _globalSubscriptions.isEmpty;
+
   void add(QuerySubscription subscription) {
     final conditionMap = subscription.condition.build();
 
@@ -162,5 +168,23 @@ class QueryIndex {
       _complexIndex[field] = [];
     }
     _complexIndex[field]!.add(sub);
+  }
+
+  /// Get all unique subscriptions in the index
+  Set<QuerySubscription> getAllSubscriptions() {
+    final all = <QuerySubscription>{};
+    all.addAll(_globalSubscriptions);
+
+    for (var fieldMap in _equalityIndex.values) {
+      for (var list in fieldMap.values) {
+        all.addAll(list);
+      }
+    }
+
+    for (var list in _complexIndex.values) {
+      all.addAll(list);
+    }
+
+    return all;
   }
 }

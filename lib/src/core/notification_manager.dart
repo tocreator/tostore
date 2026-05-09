@@ -21,6 +21,17 @@ class NotificationManager {
   NotificationManager([List<TableSchema> schemas = const []])
       : _schemas = {for (var s in schemas) s.name: s};
 
+  /// Check if there are any active subscriptions for a table
+  bool hasListeners(String tableName) {
+    final index = _indexes[tableName];
+    return index != null && !index.isEmpty;
+  }
+
+  /// Get all table names that have at least one active subscription
+  Iterable<String> getActiveTables() {
+    return _indexes.entries.where((e) => !e.value.isEmpty).map((e) => e.key);
+  }
+
   /// Register a listener for a specific query
   StreamSubscription<ChangeEvent> register(
     String tableName,
@@ -76,6 +87,15 @@ class NotificationManager {
   void notify(ChangeEvent event) {
     final index = _indexes[event.tableName];
     if (index == null) return;
+
+    // For clear operation, we notify all subscriptions on the table
+    if (event.type == ChangeType.clear) {
+      final allSubs = index.getAllSubscriptions();
+      for (var sub in allSubs) {
+        sub.callback(event);
+      }
+      return;
+    }
 
     // We need to check both the new record (to see if it matches now)
     // AND the old record (to see if it matched before).

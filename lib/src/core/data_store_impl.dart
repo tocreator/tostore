@@ -2371,6 +2371,15 @@ class DataStoreImpl {
       await backupManager.restore(backupPath,
           deleteAfterRestore: deleteAfterRestore,
           cleanupBeforeRestore: cleanupBeforeRestore);
+
+      // Notify all listeners to refresh, as the entire data state has changed.
+      for (final tableName in notificationManager.getActiveTables()) {
+        notificationManager.notify(ChangeEvent(
+          type: ChangeType.clear,
+          tableName: tableName,
+        ));
+      }
+
       return true;
     } catch (e) {
       Logger.error(
@@ -2906,12 +2915,14 @@ class DataStoreImpl {
                           updates.add(updatedRecord);
                         }
 
-                        notificationManager.notify(ChangeEvent(
-                          type: ChangeType.update,
-                          tableName: tableName,
-                          record: updatedRecord,
-                          oldRecord: record,
-                        ));
+                        if (notificationManager.hasListeners(tableName)) {
+                          notificationManager.notify(ChangeEvent(
+                            type: ChangeType.update,
+                            tableName: tableName,
+                            record: updatedRecord,
+                            oldRecord: record,
+                          ));
+                        }
 
                         await applyYieldController.maybeYield();
                       }
@@ -3310,12 +3321,14 @@ class DataStoreImpl {
             transactionId: txId,
           );
 
-          notificationManager.notify(ChangeEvent(
-            type: ChangeType.update,
-            tableName: tableName,
-            record: updatedRecord,
-            oldRecord: record,
-          ));
+          if (notificationManager.hasListeners(tableName)) {
+            notificationManager.notify(ChangeEvent(
+              type: ChangeType.update,
+              tableName: tableName,
+              record: updatedRecord,
+              oldRecord: record,
+            ));
+          }
 
           // Add to success keys list
           successKeys.add(recordKey);
@@ -3447,6 +3460,12 @@ class DataStoreImpl {
 
       //  reset index
       await _indexManager?.resetIndexes(tableName);
+
+      // Notify watchers that the table has been cleared
+      notificationManager.notify(ChangeEvent(
+        type: ChangeType.clear,
+        tableName: tableName,
+      ));
 
       // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
       // or before checkpoint), the clear/drop op does not need to stay in
@@ -3750,12 +3769,14 @@ class DataStoreImpl {
         // Add records to delete buffer instead of directly writing to file
         await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
 
-        for (final record in recordsToDelete) {
-          notificationManager.notify(ChangeEvent(
-            type: ChangeType.delete,
-            tableName: tableName,
-            oldRecord: record,
-          ));
+        if (notificationManager.hasListeners(tableName)) {
+          for (final record in recordsToDelete) {
+            notificationManager.notify(ChangeEvent(
+              type: ChangeType.delete,
+              tableName: tableName,
+              oldRecord: record,
+            ));
+          }
         }
 
         return finish(DbResult.success(
@@ -3939,11 +3960,13 @@ class DataStoreImpl {
                       deletedCount++;
                       deletes.add(record);
 
-                      notificationManager.notify(ChangeEvent(
-                        type: ChangeType.delete,
-                        tableName: tableName,
-                        oldRecord: record,
-                      ));
+                      if (notificationManager.hasListeners(tableName)) {
+                        notificationManager.notify(ChangeEvent(
+                          type: ChangeType.delete,
+                          tableName: tableName,
+                          oldRecord: record,
+                        ));
+                      }
 
                       final pkValueStr = pkValue.toString();
                       if (deletedKeys.length < maxDeletedKeysToReturn) {
@@ -4522,6 +4545,13 @@ class DataStoreImpl {
 
         Logger.info('Table $tableName has been successfully deleted',
             label: 'DataStore.dropTable');
+
+        // Notify watchers that the table has been dropped/cleared
+        notificationManager.notify(ChangeEvent(
+          type: ChangeType.clear,
+          tableName: tableName,
+        ));
+
         return finish(DbResult.success(
           message: 'Table $tableName dropped successfully',
         ));
@@ -4959,7 +4989,19 @@ class DataStoreImpl {
               transactionId: txId,
             );
 
-            if (bufferResult.successRecordIds.isNotEmpty) {
+            if (bufferResult.successRecordIds.isNotEmpty &&
+                notificationManager.hasListeners(tableName)) {
+              final successSet = bufferResult.successRecordIds.toSet();
+              for (final record in batchRecordsForBuffer) {
+                final pkVal = record[primaryKey]?.toString();
+                if (pkVal != null && successSet.contains(pkVal)) {
+                  notificationManager.notify(ChangeEvent(
+                    type: ChangeType.insert,
+                    tableName: tableName,
+                    record: record,
+                  ));
+                }
+              }
               successKeys.addAll(bufferResult.successRecordIds);
             }
 
@@ -6004,14 +6046,18 @@ class DataStoreImpl {
             }
           }
 
-          for (int k = 0; k < recordsToCommit.length; k++) {
-            if (commitResult.successRecordIds.contains(commitPkVals[k])) {
-              notificationManager.notify(ChangeEvent(
-                type: ChangeType.update,
-                tableName: tableName,
-                record: recordsToCommit[k],
-                oldRecord: oldRecordsToCommit[k],
-              ));
+          if (commitResult.successRecordIds.isNotEmpty &&
+              notificationManager.hasListeners(tableName)) {
+            final successSet = commitResult.successRecordIds.toSet();
+            for (int k = 0; k < recordsToCommit.length; k++) {
+              if (successSet.contains(commitPkVals[k])) {
+                notificationManager.notify(ChangeEvent(
+                  type: ChangeType.update,
+                  tableName: tableName,
+                  record: recordsToCommit[k],
+                  oldRecord: oldRecordsToCommit[k],
+                ));
+              }
             }
           }
         }
