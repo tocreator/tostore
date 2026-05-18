@@ -54,8 +54,12 @@ class BinarySchemaCodec {
     try {
       final r = _Reader(data);
       final fieldCount = r.u16be();
-      if (fieldCount != fieldStructure.length) {
-        // Field count mismatch - may be old format or corrupted
+      if (fieldCount > maxFieldCount) {
+        return null;
+      }
+      if (fieldCount > fieldStructure.length) {
+        // Stored payload has more fields than expected.
+        // Caller may retry with a legacy/old layout decoder.
         return null;
       }
 

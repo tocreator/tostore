@@ -50,6 +50,8 @@ final class TableTreePartitionManager {
     required TableMeta meta,
     required Uint8List storedValue,
     required List<FieldStructure> fieldStruct,
+    bool allowLegacyMigrationFallback = true,
+    Uint8List? primaryKeyBytes,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
@@ -66,7 +68,60 @@ final class TableTreePartitionManager {
     } else {
       bytes = sv.inlineBytes;
     }
-    return BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+    final migrationManager = _dataStore.migrationManager;
+    final hasRuntimeMigration = migrationManager != null &&
+        migrationManager.hasRuntimeMigrationForTable(tableName);
+
+    if (allowLegacyMigrationFallback && hasRuntimeMigration) {
+      final preferLegacy = migrationManager.shouldPreferLegacyDecodeForKey(
+        tableName,
+        primaryKeyBytes,
+      );
+      if (preferLegacy) {
+        final legacyDecoded =
+            migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
+        if (legacyDecoded != null) {
+          return legacyDecoded;
+        }
+      }
+    }
+
+    final decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+
+    if (decoded != null) {
+      if (allowLegacyMigrationFallback && hasRuntimeMigration) {
+        return migrationManager.normalizeRecordForReadSync(tableName, decoded);
+      }
+      return decoded;
+    }
+
+    if (!allowLegacyMigrationFallback || !hasRuntimeMigration) {
+      return null;
+    }
+
+    return migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
+  }
+
+  Future<List<FieldStructure>> _resolveStorageFieldStructure({
+    required String tableName,
+    required TableSchema schema,
+    List<FieldStructure>? override,
+  }) async {
+    if (override != null) {
+      return override;
+    }
+
+    final resolved = await _dataStore.schemaManager?.getStorageFieldStructure(
+      tableName,
+      schema: schema,
+    );
+    if (resolved != null && resolved.isNotEmpty) {
+      return resolved;
+    }
+
+    return schema.fields
+        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
+        .toList(growable: false);
   }
 
   // Instance-level page cache for read operations (cross-method calls)
@@ -528,6 +583,8 @@ final class TableTreePartitionManager {
     int? concurrency,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    List<FieldStructure>? fieldStructureOverride,
+    TableSchema? schemaOverride,
   }) async {
     final sw = Stopwatch()..start();
     final totalRecords = inserts.length + updates.length + deletes.length;
@@ -536,15 +593,18 @@ final class TableTreePartitionManager {
       return;
     }
 
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = schemaOverride ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       throw StateError('Table schema not found: $tableName');
     }
 
     // Values-only encoding structure.
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+      override: fieldStructureOverride,
+    );
 
     var meta = await _dataStore.tableDataManager.getTableMeta(tableName) ??
         await _createInitialTableMeta(tableName);
@@ -1991,9 +2051,10 @@ final class TableTreePartitionManager {
         await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return const <Map<String, dynamic>>[];
 
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+    );
 
     final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
     if (meta == null || (meta.btreeFirstLeaf).isNull) {
@@ -2036,6 +2097,7 @@ final class TableTreePartitionManager {
           meta: meta,
           storedValue: leaf.values[pos],
           fieldStruct: fieldStruct,
+          primaryKeyBytes: keyBytes,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
@@ -2116,6 +2178,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     if (pageLimit <= 0) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: false);
@@ -2137,9 +2200,11 @@ final class TableTreePartitionManager {
 
     final path = await _partitionFilePath(tableName, meta, partitionNo);
 
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+      override: decodeFieldStructureOverride,
+    );
 
     final pageSize = meta.btreePageSize;
     final fromPage = max(TableMeta.firstDataPageNo, startPageNo);
@@ -2209,6 +2274,8 @@ final class TableTreePartitionManager {
           meta: meta,
           storedValue: leaf.values[i],
           fieldStruct: fieldStruct,
+          allowLegacyMigrationFallback: decodeSchema == null,
+          primaryKeyBytes: leaf.keys[i],
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
@@ -2234,6 +2301,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async* {
     if (pagesPerBatch <= 0) pagesPerBatch = 500;
 
@@ -2268,6 +2336,7 @@ final class TableTreePartitionManager {
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
       );
     }
 
@@ -2313,6 +2382,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
@@ -2329,9 +2399,11 @@ final class TableTreePartitionManager {
     final size = await _storage.getFileSize(path);
     if (size <= meta.btreePageSize) return const <Map<String, dynamic>>[];
 
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+      override: decodeFieldStructureOverride,
+    );
 
     final pageSize = meta.btreePageSize;
     final pageCount = (size + pageSize - 1) ~/ pageSize;
@@ -2357,6 +2429,8 @@ final class TableTreePartitionManager {
           meta: meta,
           storedValue: leaf.values[i],
           fieldStruct: fieldStruct,
+          allowLegacyMigrationFallback: decodeSchema == null,
+          primaryKeyBytes: leaf.keys[i],
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
@@ -2386,15 +2460,18 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async* {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
 
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+      override: decodeFieldStructureOverride,
+    );
 
     final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
     if (meta == null || meta.btreeFirstLeaf.isNull) return;
@@ -2495,6 +2572,8 @@ final class TableTreePartitionManager {
             meta: meta,
             storedValue: leaf.values[i],
             fieldStruct: fieldStruct,
+            allowLegacyMigrationFallback: decodeSchema == null,
+            primaryKeyBytes: k,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
@@ -2537,6 +2616,8 @@ final class TableTreePartitionManager {
             meta: meta,
             storedValue: leaf.values[i],
             fieldStruct: fieldStruct,
+            allowLegacyMigrationFallback: decodeSchema == null,
+            primaryKeyBytes: k,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
@@ -2597,9 +2678,10 @@ final class TableTreePartitionManager {
   }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
-    final fieldStruct = schema.fields
-        .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
-        .toList(growable: false);
+    final fieldStruct = await _resolveStorageFieldStructure(
+      tableName: tableName,
+      schema: schema,
+    );
     final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return;
 
@@ -2696,6 +2778,7 @@ final class TableTreePartitionManager {
               meta: meta,
               storedValue: leaf.values[i],
               fieldStruct: fieldStruct,
+              primaryKeyBytes: k,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
             );
@@ -2744,6 +2827,7 @@ final class TableTreePartitionManager {
               meta: meta,
               storedValue: leaf.values[i],
               fieldStruct: fieldStruct,
+              primaryKeyBytes: k,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
             );

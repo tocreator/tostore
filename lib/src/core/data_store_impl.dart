@@ -28,7 +28,6 @@ import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/log_config.dart';
 import '../model/memory_info.dart';
-import '../model/migration_config.dart';
 import '../model/migration_task.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
@@ -76,6 +75,7 @@ import 'path_manager.dart';
 import 'read_view_manager.dart';
 import 'resource_manager.dart';
 import 'schema_manager.dart';
+import 'shared_engine_registry.dart';
 import 'storage_adapter.dart';
 import 'table_data_manager.dart';
 import 'table_tree_partition_manager.dart';
@@ -101,8 +101,6 @@ class DataStoreImpl {
 
   static final Map<String, DataStoreImpl> _instances = {};
 
-  // Internal reserved field for TTL ingest-time source (ISO8601 datetime string).
-  static const String _systemIngestTsMsField = '_system_ingest_ts_ms';
   static const String _kvKeyField = SystemTable.keyValueKeyField;
   static const String _kvValueField = SystemTable.keyValueValueField;
   static const String _kvUpdatedAtField = SystemTable.keyValueUpdatedAtField;
@@ -180,6 +178,8 @@ class DataStoreImpl {
     }
     return _keyManager!;
   }
+
+  IntegrityChecker? get integrityChecker => _integrityChecker;
 
   PathManager get pathManager {
     if (_pathManager == null) {
@@ -348,6 +348,13 @@ class DataStoreImpl {
   /// Get current space name
   String get currentSpaceName => _currentSpaceName;
 
+  /// Generate a globally unique resource key for LockManager including space and db context.
+  String getScopedResourceKey(String resource) {
+    if (instancePath == null) return resource;
+    // Use path.join to maintain hierarchical locking properties for directory-like resources.
+    return path.join(instancePath!, _currentSpaceName, resource);
+  }
+
   /// Get query optimizer
   QueryOptimizer? getQueryOptimizer() => _queryOptimizer;
 
@@ -515,19 +522,25 @@ class DataStoreImpl {
   }
 
   // Helper method to load the space configuration from the space_config.json file and update the cache
-  Future<SpaceConfig?> getSpaceConfig({bool nowGetFromFile = false}) async {
-    if (!nowGetFromFile && _spaceConfigCache != null) {
+  Future<SpaceConfig?> getSpaceConfig({
+    bool nowGetFromFile = false,
+    String? spaceName,
+  }) async {
+    final resolvedSpaceName = spaceName ?? _currentSpaceName;
+    final shouldUseCurrentCache = spaceName == null;
+    if (!nowGetFromFile && shouldUseCurrentCache && _spaceConfigCache != null) {
       return _spaceConfigCache;
     }
 
     final spaceFilePath =
-        pathManager.getSpaceConfigPath(spaceName: _currentSpaceName);
+        pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
 
     try {
       final content = await storage.readAsString(spaceFilePath) ?? "";
       if (content.isEmpty) {
-        // If SpaceConfig doesn't exist and KeyManager is available, create it
-        if (_keyManager != null) {
+        // Only auto-create for the current space; callers reading another space
+        // should not implicitly mutate that space.
+        if (_keyManager != null && shouldUseCurrentCache) {
           final spaceConfig = await _keyManager!.createKeySpaceConfig();
           await saveSpaceConfigToFile(spaceConfig);
           return spaceConfig;
@@ -535,9 +548,12 @@ class DataStoreImpl {
         return null;
       }
 
-      _spaceConfigCache =
+      final parsed =
           SpaceConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
-      return _spaceConfigCache;
+      if (shouldUseCurrentCache) {
+        _spaceConfigCache = parsed;
+      }
+      return parsed;
     } catch (e) {
       Logger.error('Failed to parse init config: $e');
       return null;
@@ -545,14 +561,18 @@ class DataStoreImpl {
   }
 
   /// Save space config to file
-  Future<void> saveSpaceConfigToFile(SpaceConfig config) async {
+  Future<void> saveSpaceConfigToFile(SpaceConfig config,
+      {String? spaceName}) async {
     try {
+      final resolvedSpaceName = spaceName ?? _currentSpaceName;
       final spaceFilePath =
-          pathManager.getSpaceConfigPath(spaceName: _currentSpaceName);
+          pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
 
       final content = jsonEncode(config.toJson());
       await storage.writeAsString(spaceFilePath, content);
-      _spaceConfigCache = config;
+      if (resolvedSpaceName == _currentSpaceName) {
+        _spaceConfigCache = config;
+      }
     } catch (e) {
       Logger.error('Failed to save space config: $e', label: 'spaceConfig');
     }
@@ -587,6 +607,12 @@ class DataStoreImpl {
     // For system operations during initialization, allow if base initialization is complete
     // This is needed for operations like foreign key system table updates during table creation
     if (isSystemOp && _baseInitialized && _initializing) {
+      return;
+    }
+
+    // Migration instance might share LockManager/Scheduler, ensure it's "initialized"
+    // even if it bypasses full DSI initialization.
+    if (isMigrationInstance && _baseInitialized) {
       return;
     }
 
@@ -716,9 +742,11 @@ class DataStoreImpl {
         );
       }
 
-      // Initialize global workload scheduler using maxIoConcurrency as total token capacity.
-      workloadScheduler =
-          WorkloadScheduler(globalMax: _config!.maxIoConcurrency);
+      // Initialize or get shared workload scheduler using maxIoConcurrency as total token capacity.
+      workloadScheduler = SharedEngineRegistry.getWorkloadScheduler(
+        _instanceKey,
+        _config!.maxIoConcurrency,
+      );
       workloadScheduler.onPressureChanged = updatePressureStatus;
 
       // Configure the global parallel processor with sensible defaults
@@ -734,10 +762,11 @@ class DataStoreImpl {
       // Ensure _currentSpaceName is synchronized with config.spaceName
       _currentSpaceName = _config!.spaceName;
 
+      lockManager = SharedEngineRegistry.getLockManager(_instanceKey);
       storage = isMemoryMode
-          ? StorageAdapter.forStorage(const NoopStorageImpl())
-          : StorageAdapter();
-      lockManager = LockManager();
+          ? StorageAdapter.forStorage(const NoopStorageImpl(),
+              lockManager: lockManager!)
+          : StorageAdapter(lockManager: lockManager!);
 
       // Configure storage runtime and flush policy based on DataStoreConfig
       await storage.configure(
@@ -927,41 +956,6 @@ class DataStoreImpl {
         .toList(growable: false);
   }
 
-  String? _resolveTtlSourceField(TableTtlConfig? ttl) {
-    if (ttl == null) return null;
-    final source = ttl.sourceField;
-    if (source == null || source.isEmpty) {
-      return _systemIngestTsMsField;
-    }
-    return source;
-  }
-
-  bool _isTtlConfigEquivalent(TableTtlConfig? a, TableTtlConfig? b) {
-    if (identical(a, b)) return true;
-    if (a == null || b == null) return false;
-    final aSource = (a.sourceField == null || a.sourceField!.isEmpty)
-        ? null
-        : a.sourceField;
-    final bSource = (b.sourceField == null || b.sourceField!.isEmpty)
-        ? null
-        : b.sourceField;
-    return a.ttlMs == b.ttlMs && aSource == bSource;
-  }
-
-  TableSchema _copySchemaWithTtlConfig(
-      TableSchema schema, TableTtlConfig? ttlConfig) {
-    return TableSchema(
-      name: schema.name,
-      primaryKeyConfig: schema.primaryKeyConfig,
-      fields: schema.fields,
-      indexes: schema.indexes,
-      foreignKeys: schema.foreignKeys,
-      isGlobal: schema.isGlobal,
-      tableId: schema.tableId,
-      ttlConfig: ttlConfig,
-    );
-  }
-
   /// Setup tables and handle upgrades
   Future<void> _startSetupAndUpgrade() async {
     try {
@@ -1045,7 +1039,11 @@ class DataStoreImpl {
         // Perform automatic table structure migration
         final migrationSchemas = getInitialSchemas(systemOnly: systemOnly);
 
-        await autoSchemaMigrate(migrationSchemas, systemOnly: systemOnly);
+        await migrationManager?.migrate(
+          migrationSchemas,
+          batchSize: config.migrationConfig?.batchSize ?? 1000,
+          systemOnly: systemOnly,
+        );
 
         if (systemSchemaChanged) {
           await schemaManager?.updateSystemSchemaHash(systemSchemas);
@@ -1061,104 +1059,6 @@ class DataStoreImpl {
         label: 'DataStoreImpl._startSetupAndUpgrade',
       );
       rethrow;
-    }
-  }
-
-  /// Automatic table structure migration - based on table structure hash comparison.
-  /// Uses maintenance mode: user operations are suspended until migration completes
-  /// to avoid conflicts with schema/data changes.
-  Future<void> autoSchemaMigrate(List<TableSchema> schemas,
-      {bool systemOnly = false}) async {
-    String backupPath = '';
-    final migrationConfig = config.migrationConfig ?? const MigrationConfig();
-
-    final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-    for (var schema in schemas) {
-      if (!schema.validateTableSchema(
-        reservedTableNames: reservedSystemTableNames,
-        allowReservedTableNames: SystemTable.isKnownSystemTable(schema.name),
-        allowInternalTableNamePrefix:
-            SystemTable.isKnownSystemTable(schema.name),
-        allowOtherInternalFields: SystemTable.isKnownSystemTable(schema.name),
-      )) {
-        throw const BusinessError(
-          'Invalid table structure',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-    }
-
-    // Backup before entering maintenance so restore is available on failure
-    if (migrationConfig.backupBeforeMigrate) {
-      backupPath = await backup();
-    }
-
-    // Enter maintenance: block new user lock acquisitions and wait for quiescent state.
-    // Migration runs as system operation so it can acquire locks; user ops wait until exitMaintenance.
-    try {
-      Logger.info(
-        'Entering maintenance for table structure migration (user ops will wait)',
-        label: 'DataStoreImpl.autoSchemaMigrate',
-      );
-      final entered = await lockManager?.enterMaintenance(
-              timeout: config.transactionTimeout) ??
-          true;
-      if (!entered) {
-        Logger.warn(
-          'Maintenance enter timeout (quiescent not reached), proceeding with migration',
-          label: 'DataStoreImpl.autoSchemaMigrate',
-        );
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to enter maintenance for migration: $e',
-        label: 'DataStoreImpl.autoSchemaMigrate',
-      );
-      rethrow;
-    }
-
-    try {
-      await TransactionContext.runAsSystemOperation(() async {
-        await migrationManager?.migrate(
-          schemas,
-          batchSize: migrationConfig.batchSize,
-          systemOnly: systemOnly,
-        );
-
-        if (migrationConfig.validateAfterMigrate) {
-          final isValid = await _validateMigration(schemas);
-          if (!isValid && migrationConfig.strictMode) {
-            throw const BusinessError(
-              'Migration validation failed',
-              type: BusinessErrorType.migrationError,
-            );
-          }
-        }
-      });
-
-      if (backupPath.isNotEmpty) {
-        await storage.deleteDirectory(backupPath);
-      }
-
-      Logger.info(
-        'Table structure auto-migration completed',
-        label: 'DataStoreImpl.autoSchemaMigrate',
-      );
-    } catch (e, stack) {
-      Logger.error(
-        'Table structure auto-migration failed: $e\n$stack',
-        label: 'DataStoreImpl.autoSchemaMigrate',
-      );
-      if (backupPath.isNotEmpty) {
-        await restore(backupPath, deleteAfterRestore: true);
-      }
-      rethrow;
-    } finally {
-      lockManager?.exitMaintenance();
-      Logger.info(
-        'Exited maintenance after table structure migration',
-        label: 'DataStoreImpl.autoSchemaMigrate',
-      );
     }
   }
 
@@ -1218,6 +1118,10 @@ class DataStoreImpl {
           } catch (_) {}
         }
 
+        if (migrationManager != null) {
+          await migrationManager!.stopAllMigrations();
+        }
+
         // Flush and stop write pipelines
         try {
           if (persistChanges) {
@@ -1257,6 +1161,8 @@ class DataStoreImpl {
           }
         } catch (e) {
           Logger.warn('Storage flush/close failed: $e', label: 'DataStoreImpl');
+        } finally {
+          lockManager?.exitMaintenance();
         }
       });
 
@@ -1278,6 +1184,7 @@ class DataStoreImpl {
       transactionManager?.dispose();
       notificationManager.dispose();
       _resourceManager?.dispose();
+      migrationManager?.dispose();
 
       _globalConfigCache = null;
       _spaceConfigCache = null;
@@ -1320,6 +1227,7 @@ class DataStoreImpl {
       // Only remove from factory cache if requested
       if (removeRegistry && _instances[_instanceKey] == this) {
         _instances.remove(_instanceKey);
+        SharedEngineRegistry.remove(_instanceKey);
       }
 
       if (removeRegistry || closeStorage) {
@@ -4989,20 +4897,22 @@ class DataStoreImpl {
               transactionId: txId,
             );
 
-            if (bufferResult.successRecordIds.isNotEmpty &&
-                notificationManager.hasListeners(tableName)) {
-              final successSet = bufferResult.successRecordIds.toSet();
-              for (final record in batchRecordsForBuffer) {
-                final pkVal = record[primaryKey]?.toString();
-                if (pkVal != null && successSet.contains(pkVal)) {
-                  notificationManager.notify(ChangeEvent(
-                    type: ChangeType.insert,
-                    tableName: tableName,
-                    record: record,
-                  ));
+            if (bufferResult.successRecordIds.isNotEmpty) {
+              successKeys.addAll(bufferResult.successRecordIds);
+
+              if (notificationManager.hasListeners(tableName)) {
+                final successSet = bufferResult.successRecordIds.toSet();
+                for (final record in batchRecordsForBuffer) {
+                  final pkVal = record[primaryKey]?.toString();
+                  if (pkVal != null && successSet.contains(pkVal)) {
+                    notificationManager.notify(ChangeEvent(
+                      type: ChangeType.insert,
+                      tableName: tableName,
+                      record: record,
+                    ));
+                  }
                 }
               }
-              successKeys.addAll(bufferResult.successRecordIds);
             }
 
             bool hadFailures = false;
@@ -6535,68 +6445,6 @@ class DataStoreImpl {
       return true;
     }
 
-    // Check if global configuration has migration tasks
-    final globalConfig = await getGlobalConfig();
-    if (globalConfig?.hasMigrationTask == true) {
-      // Check if currently migrating the space to switch to
-      bool isTargetSpaceMigrating = false;
-
-      if (migrationManager != null) {
-        // Check if current migration tasks include the target space
-        isTargetSpaceMigrating =
-            await migrationManager!.isSpaceBeingMigrated(spaceName);
-      }
-
-      if (isTargetSpaceMigrating) {
-        // 1. Adjust space priority, prioritize migrating this space
-        final updatedSpaces = List<String>.from(globalConfig!.spaceNames)
-          ..remove(spaceName)
-          ..insert(0, spaceName);
-        final updatedConfig =
-            globalConfig.copyWith(spaceNames: updatedSpaces.toSet());
-        await saveGlobalConfig(updatedConfig);
-
-        // 2. Wait for this space's migration to complete
-        Logger.info(
-          'Space [$spaceName] is being migrated, waiting for migration to complete before switching',
-          label: 'DataStoreImpl.switchSpace',
-        );
-
-        // Use timeout protection to avoid infinite waiting
-        bool migrationCompleted = false;
-        try {
-          migrationCompleted = await migrationManager!.waitForSpaceMigration(
-              spaceName,
-              timeout: const Duration(minutes: 5));
-        } catch (e) {
-          Logger.error(
-            'Error occurred while waiting for space migration to complete: $e',
-            label: 'DataStoreImpl.switchSpace',
-          );
-        }
-
-        if (!migrationCompleted) {
-          Logger.warn(
-            'Timeout waiting for space [$spaceName] migration to complete, cannot switch space',
-            label: 'DataStoreImpl.switchSpace',
-          );
-          return false;
-        }
-
-        // Migration completed, continue switching space
-        Logger.info(
-          'Space [$spaceName] migration has completed, continuing switch',
-          label: 'DataStoreImpl.switchSpace',
-        );
-      } else {
-        // Currently migrating other spaces, but not the target space
-        Logger.info(
-          'Migration tasks are in progress, but do not affect switching to space [$spaceName]',
-          label: 'DataStoreImpl.switchSpace',
-        );
-      }
-    }
-
     final oldSpaceName = _currentSpaceName;
     try {
       // 1. Unified shutdown logic for the current space via close()
@@ -7325,359 +7173,6 @@ class DataStoreImpl {
     );
   }
 
-  Future<void> setTableTtlConfig(
-    String tableName,
-    TableTtlConfig? ttlConfig, {
-    TableTtlConfig? previousTtlConfig,
-    bool updateSchema = true,
-    bool syncIndexes = true,
-  }) async {
-    final schema = await schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      throw BusinessError(
-        'Table $tableName not found',
-        type: BusinessErrorType.schemaError,
-      );
-    }
-
-    final schemaChanged = !_isTtlConfigEquivalent(schema.ttlConfig, ttlConfig);
-    if (!schemaChanged && !syncIndexes) {
-      return;
-    }
-
-    var updatedSchema =
-        schemaChanged ? _copySchemaWithTtlConfig(schema, ttlConfig) : schema;
-
-    final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-    final bool isSystemTableName = SystemTable.isKnownSystemTable(tableName);
-    final bool allowSystemSchema =
-        isSystemTableName && TransactionContext.isSystemOperation();
-
-    if (!updatedSchema.validateTableSchema(
-      reservedTableNames: reservedSystemTableNames,
-      allowReservedTableNames: allowSystemSchema,
-      allowInternalTableNamePrefix: allowSystemSchema,
-      allowOtherInternalFields: allowSystemSchema,
-    )) {
-      throw BusinessError(
-        'Invalid TTL configuration for table $tableName',
-        type: BusinessErrorType.schemaError,
-      );
-    }
-
-    if (updateSchema && schemaChanged) {
-      await schemaManager?.saveTableSchema(tableName, updatedSchema);
-    }
-
-    if (!syncIndexes) {
-      return;
-    }
-
-    final oldSchemaForCoverage = previousTtlConfig != null
-        ? _copySchemaWithTtlConfig(schema, previousTtlConfig)
-        : schema;
-
-    final oldSourceField =
-        _resolveTtlSourceField(previousTtlConfig ?? schema.ttlConfig);
-    final newSourceField = _resolveTtlSourceField(updatedSchema.ttlConfig);
-
-    final oldSchemaIndexes = oldSchemaForCoverage.getAllIndexes();
-    final newSchemaIndexes = updatedSchema.getAllIndexes();
-
-    if (oldSourceField != null && oldSourceField != newSourceField) {
-      final stillCovered = newSchemaIndexes.any(
-        (i) => i.fields.isNotEmpty && i.fields.first == oldSourceField,
-      );
-      if (!stillCovered) {
-        await indexManager?.removeIndex(tableName, indexName: oldSourceField);
-      }
-    }
-
-    if (newSourceField != null && newSourceField != oldSourceField) {
-      final existedBefore = oldSchemaIndexes.any(
-        (i) => i.fields.isNotEmpty && i.fields.first == newSourceField,
-      );
-      if (!existedBefore) {
-        await indexManager?.createIndex(
-          tableName,
-          IndexSchema(indexName: newSourceField, fields: [newSourceField]),
-        );
-      }
-    }
-
-    if (newSourceField != null) {
-      await indexManager?.createIndex(
-        tableName,
-        IndexSchema(indexName: newSourceField, fields: [newSourceField]),
-      );
-    }
-  }
-
-  /// Add field to table
-  Future<void> addField(
-    String tableName,
-    FieldSchema field,
-  ) async {
-    final schema = await schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      return;
-    }
-
-    // Check if field already exists
-    if (schema.fields.any((f) => f.name == field.name)) {
-      Logger.warn(
-        'Field ${field.name} already exists in table $tableName',
-        label: "DataStore.addField",
-      );
-      return;
-    }
-
-    // Add field to schema
-    final newFields = [...schema.fields, field];
-    final newSchema = schema.copyWith(fields: newFields);
-
-    // Update schema file
-    await schemaManager?.saveTableSchema(tableName, newSchema);
-  }
-
-  /// Drop field from table
-  Future<void> removeField(
-    String tableName,
-    String fieldName,
-  ) async {
-    final schema = await schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      return;
-    }
-
-    // Check if field exists
-    if (!schema.fields.any((f) => f.name == fieldName)) {
-      Logger.warn(
-        'Field $fieldName not found in table $tableName',
-        label: "DataStore.removeField",
-      );
-      return;
-    }
-
-    final indexesToRemove = schema
-        .getAllIndexes()
-        .where((index) => index.fields.contains(fieldName))
-        .toList(growable: false);
-    for (final index in indexesToRemove) {
-      await indexManager?.removeIndex(tableName,
-          indexName: index.actualIndexName);
-    }
-
-    // Remove field from schema
-    final newFields = schema.fields.where((f) => f.name != fieldName).toList();
-    final newIndexes = schema.indexes
-        .where((index) => !index.fields.contains(fieldName))
-        .toList(growable: false);
-    final newSchema = schema.copyWith(fields: newFields, indexes: newIndexes);
-
-    // Update schema file
-    await schemaManager?.saveTableSchema(tableName, newSchema);
-  }
-
-  /// Rename field
-  Future<void> renameField(
-    String tableName,
-    String oldName,
-    String newName,
-  ) async {
-    try {
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return;
-      }
-      // Update schema
-      final fields = List<FieldSchema>.from(schema.fields);
-      final oldFieldIndex = fields.indexWhere((f) => f.name == oldName);
-      if (oldFieldIndex == -1) {
-        Logger.warn(
-          'Field $oldName not found in table $tableName',
-          label: "DataStore.renameField",
-        );
-        return;
-      }
-      fields[oldFieldIndex] = fields[oldFieldIndex].copyWith(name: newName);
-
-      final indexes = schema.indexes
-          .map((index) => index.copyWith(
-                fields: index.fields
-                    .map((field) => field == oldName ? newName : field)
-                    .toList(growable: false),
-              ))
-          .toList(growable: false);
-
-      final newSchema = schema.copyWith(
-        fields: fields,
-        indexes: indexes,
-        ttlConfig: schema.ttlConfig?.sourceField == oldName
-            ? schema.ttlConfig!.copyWith(sourceField: newName)
-            : schema.ttlConfig,
-        foreignKeys: schema.foreignKeys
-            .map((fk) => fk.copyWith(
-                  fields: fk.fields
-                      .map((f) => f == oldName ? newName : f)
-                      .toList(growable: false),
-                ))
-            .toList(growable: false),
-      );
-
-      final oldAllIndexes = schema.getAllIndexes();
-      final newAllIndexes = newSchema.getAllIndexes();
-
-      // We must rename the underlying index directories BEFORE saving the new schema
-      for (final oldIdx in oldAllIndexes) {
-        final expectedNewFields = oldIdx.fields
-            .map((f) => f == oldName ? newName : f)
-            .toList(growable: false);
-        IndexSchema? newIdx;
-        for (final idx in newAllIndexes) {
-          if (oldIdx.indexName != null &&
-              idx.indexName != null &&
-              oldIdx.indexName == idx.indexName) {
-            newIdx = idx;
-            break;
-          }
-          bool fieldsEqual = true;
-          if (idx.fields.length != expectedNewFields.length) {
-            fieldsEqual = false;
-          } else {
-            for (int i = 0; i < idx.fields.length; i++) {
-              if (idx.fields[i] != expectedNewFields[i]) {
-                fieldsEqual = false;
-                break;
-              }
-            }
-          }
-          if (idx.indexName == null && fieldsEqual) {
-            newIdx = idx;
-            break;
-          }
-        }
-
-        if (newIdx != null) {
-          final oldActual = oldIdx.actualIndexName;
-          final newActual = newIdx.actualIndexName;
-
-          // Only call renameIndex if the physical name changed OR if its fields are affected by the renamed field
-          bool usesRenamedField = oldIdx.fields.contains(oldName);
-          if (oldActual != newActual || usesRenamedField) {
-            await indexManager?.renameIndex(
-              tableName,
-              oldIndexName: oldActual,
-              newIndexName: newActual,
-              newFields: newIdx.fields,
-            );
-          }
-        }
-      }
-
-      await schemaManager?.saveTableSchema(tableName, newSchema);
-    } catch (e) {
-      Logger.error(
-        'Failed to rename field: $e',
-        label: 'DataStoreImpl.renameField',
-      );
-      rethrow;
-    }
-  }
-
-  /// Modify a field in the table schema
-  Future<void> modifyField(
-    String tableName,
-    String fieldName,
-    FieldSchemaUpdate newField,
-  ) async {
-    try {
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        throw BusinessError(
-          'Table $tableName not found',
-          type: BusinessErrorType.invalidData,
-        );
-      }
-
-      // Check if field exists
-      final oldField = schema.fields.firstWhere(
-        (f) => f.name == fieldName,
-        orElse: () {
-          Logger.warn(
-            'Field $fieldName not found in table $tableName',
-            label: "DataStore.modifyField",
-          );
-          return FieldSchema(name: fieldName, type: DataType.text);
-        },
-      );
-
-      // create updated field, handle explicitly set to null case
-      dynamic updatedDefaultValue = oldField.defaultValue;
-      if (newField.isExplicitlySet('defaultValue')) {
-        updatedDefaultValue = newField.defaultValue;
-      }
-
-      int? updatedMaxLength = oldField.maxLength;
-      if (newField.isExplicitlySet('maxLength')) {
-        updatedMaxLength = newField.maxLength;
-      }
-
-      int? updatedMinLength = oldField.minLength;
-      if (newField.isExplicitlySet('minLength')) {
-        updatedMinLength = newField.minLength;
-      }
-
-      num? updatedMinValue = oldField.minValue;
-      if (newField.isExplicitlySet('minValue')) {
-        updatedMinValue = newField.minValue;
-      }
-
-      num? updatedMaxValue = oldField.maxValue;
-      if (newField.isExplicitlySet('maxValue')) {
-        updatedMaxValue = newField.maxValue;
-      }
-
-      String? updatedComment = oldField.comment;
-      if (newField.isExplicitlySet('comment')) {
-        updatedComment = newField.comment;
-      }
-
-      DefaultValueType updatedDefaultValueType = oldField.defaultValueType;
-      if (newField.isExplicitlySet('defaultValueType')) {
-        updatedDefaultValueType =
-            newField.defaultValueType ?? DefaultValueType.none;
-      }
-
-      final updatedField = oldField.copyWith(
-        type: newField.type ?? oldField.type,
-        nullable: newField.nullable ?? oldField.nullable,
-        defaultValue: updatedDefaultValue,
-        unique: newField.unique ?? oldField.unique,
-        comment: updatedComment,
-        minLength: updatedMinLength,
-        maxLength: updatedMaxLength,
-        minValue: updatedMinValue,
-        maxValue: updatedMaxValue,
-        defaultValueType: updatedDefaultValueType,
-      );
-
-      // Update schema
-      final fields = List<FieldSchema>.from(schema.fields);
-      final fieldIndex = fields.indexWhere((f) => f.name == fieldName);
-      fields[fieldIndex] = updatedField;
-
-      final newSchema = schema.copyWith(fields: fields);
-      await schemaManager?.saveTableSchema(tableName, newSchema);
-    } catch (e) {
-      Logger.error(
-        'Failed to modify field: $e',
-        label: 'DataStoreImpl.modifyField',
-      );
-      rethrow;
-    }
-  }
-
   /// Rename table storage and metadata as part of a migration task.
   ///
   /// This is intentionally more conservative than normal write paths:
@@ -7700,11 +7195,11 @@ class DataStoreImpl {
       throw StateError('Database managers are not initialized');
     }
 
-    final existingOldSchema =
-        oldSchemaSnapshot ?? await schemaMgr.getTableSchema(oldTableName);
+    final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
+    final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
     final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
     if (updateSchema &&
-        existingOldSchema != null &&
+        actualOldSchema != null &&
         existingNewSchema != null &&
         oldTableName != newTableName) {
       throw StateError(
@@ -7778,8 +7273,10 @@ class DataStoreImpl {
         );
       }
 
-      if (updateSchema && existingOldSchema != null) {
+      if (updateSchema && actualOldSchema != null) {
         await schemaMgr.renameTableSchema(oldTableName, renamedSchema);
+      }
+      if (updateSchema) {
         await _updateSchemasReferencingRenamedTable(
           oldTableName,
           newTableName,
@@ -8098,35 +7595,6 @@ class DataStoreImpl {
     await tableDataManager.removeTable(tableName);
   }
 
-  /// Validate migration result
-  Future<bool> _validateMigration(List<TableSchema> schemas) async {
-    try {
-      if (_integrityChecker == null) {
-        Logger.error(
-          'IntegrityChecker not initialized',
-          label: 'DataStoreImpl._validateMigration',
-        );
-        return false;
-      }
-
-      for (var schema in schemas) {
-        if (!await _integrityChecker!.validateMigration(
-          schema.name,
-          schema,
-        )) {
-          return false;
-        }
-      }
-      return true;
-    } catch (e) {
-      Logger.error(
-        'Migration validation failed: $e',
-        label: 'DataStoreImpl._validateMigration',
-      );
-      return false;
-    }
-  }
-
   /// Get global configuration
   Future<GlobalConfig?> getGlobalConfig() async {
     try {
@@ -8235,71 +7703,6 @@ class DataStoreImpl {
       Logger.error('Error checking if table exists in current space: $e',
           label: 'DataStoreImpl.tableExistsInCurrentSpace');
       return false;
-    }
-  }
-
-  /// Set table's primary key configuration
-  Future<void> setPrimaryKeyConfig(
-      String tableName, PrimaryKeyConfig config) async {
-    try {
-      // 1. Get table structure
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null || schema.fields.isEmpty) {
-        throw BusinessError(
-          'Table $tableName not found',
-          type: BusinessErrorType.schemaError,
-        );
-      }
-
-      final newSchema = schema.copyWith(primaryKeyConfig: config);
-
-      // 4. If settings haven't changed, return directly
-      if (schema.primaryKeyConfig.type == config.type &&
-          schema.primaryKeyConfig.isOrdered == config.isOrdered &&
-          schema.primaryKeyConfig.name == config.name) {
-        // For sequential auto-increment mode, check detailed configuration
-        if (config.type == PrimaryKeyType.sequential &&
-            schema.primaryKeyConfig.sequentialConfig?.toJson().toString() ==
-                config.sequentialConfig?.toJson().toString()) {
-          return;
-        }
-        // For timestamp or date prefix mode, no need for additional configuration checks
-        if (config.type == PrimaryKeyType.timestampBased ||
-            config.type == PrimaryKeyType.datePrefixed ||
-            config.type == PrimaryKeyType.shortCode) {
-          return;
-        }
-      }
-
-      // 5. If primary key generation method has changed, output warning
-      if (schema.primaryKeyConfig.type != config.type) {
-        Logger.warn(
-          'Primary key generation method changed: table[$tableName] from ${schema.primaryKeyConfig.type} to ${config.type}, existing record primary key values will be preserved, this change only affects new records',
-          label: 'DataStoreImpl.setPrimaryKeyConfig',
-        );
-      }
-
-      try {
-        // 6. Update table structure
-        await schemaManager?.saveTableSchema(tableName, newSchema);
-
-        Logger.info(
-          'Table $tableName primary key configuration has been updated to ${config.type}',
-          label: 'DataStore.setPrimaryKeyConfig',
-        );
-      } catch (e) {
-        Logger.error(
-          'Failed to update primary key configuration: $e',
-          label: 'DataStore.setPrimaryKeyConfig',
-        );
-        rethrow;
-      }
-    } catch (e) {
-      Logger.error(
-        'Failed to set primary key configuration: $e',
-        label: 'DataStore.setPrimaryKeyConfig',
-      );
-      rethrow;
     }
   }
 

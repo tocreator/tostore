@@ -3,6 +3,7 @@ import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
 import '../model/business_error.dart';
 import 'v2_upgrade.dart';
+import 'v3_upgrade.dart';
 
 /// Manage database major version upgrades (GlobalConfig/SpaceConfig/table data).
 /// Each major upgrade should be implemented in separate files under version_upgrades/
@@ -55,11 +56,10 @@ class VersionUpgradeManager {
         await v2Upgrade.execute(globalConfig);
       }
 
-      // Future version upgrades can be added here:
-      // if (currentVersion < 3 && engineVersion >= 3) {
-      //   final v3Upgrade = V3Upgrade(_dataStore);
-      //   await v3Upgrade.execute(globalConfig);
-      // }
+      if (currentVersion < 3 && engineVersion >= 3) {
+        final v3Upgrade = V3Upgrade(_dataStore);
+        await v3Upgrade.execute(globalConfig);
+      }
     } catch (e, stack) {
       if (e is BusinessError) rethrow;
 

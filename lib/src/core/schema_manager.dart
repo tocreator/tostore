@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:path/path.dart' show dirname;
 
+import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../model/meta_info.dart';
 import '../model/system_table.dart';
@@ -35,12 +36,22 @@ class SchemaManager {
   final Map<String, _IndexListCacheEntry> _indexListCache =
       <String, _IndexListCacheEntry>{};
 
+  /// Per-table stable storage layout cache.
+  final Map<String, FieldStorageLayout> _tableFieldLayoutCache =
+      <String, FieldStorageLayout>{};
+
+  /// Per-table cached storage field structure derived from layout + schema.
+  final Map<String, List<FieldStructure>> _storageFieldStructCache =
+      <String, List<FieldStructure>>{};
+
   // Directory mapping cache for schema partitions
   DirectoryMapping? _directoryMapping;
   int _currentPartitionDirIndex = 0;
 
   // Loading futures to prevent thundering herd on concurrent schema reads
   final Map<String, Future<TableSchema?>> _schemaLoadingFutures = {};
+
+  static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
 
   SchemaManager(this._dataStore);
 
@@ -71,12 +82,15 @@ class SchemaManager {
     _ensureTableSchemaCache().put(tableName, schema);
     // Rebuild index cache for this table in O(indexCount) time.
     _indexListCache[tableName] = _buildIndexListCache(schema);
+    _storageFieldStructCache.remove(tableName);
   }
 
   /// Remove cached schema for [tableName].
   void removeCachedTableSchema(String tableName) {
     _tableSchemaCache?.remove(tableName);
     _indexListCache.remove(tableName);
+    _tableFieldLayoutCache.remove(tableName);
+    _storageFieldStructCache.remove(tableName);
   }
 
   /// Current schema cache size in bytes (incremental tracked).
@@ -101,6 +115,8 @@ class SchemaManager {
     }
     _tableSchemaCache?.clear();
     _indexListCache.clear();
+    _tableFieldLayoutCache.clear();
+    _storageFieldStructCache.clear();
     _schemaMeta = null;
     _directoryMapping = null;
     _schemaLoadingFutures.clear();
@@ -141,6 +157,329 @@ class SchemaManager {
     }
 
     return size;
+  }
+
+  int _estimateFieldStorageLayoutSize(FieldStorageLayout layout) {
+    int size = 96;
+    size += layout.slots.length * 64;
+    for (final slot in layout.slots) {
+      size += slot.fieldName.length * 2;
+      size += (slot.fieldId?.length ?? 0) * 2;
+    }
+    return size;
+  }
+
+  String? _normalizeFieldId(FieldSchema field) {
+    final id = field.fieldId;
+    if (id == null) return null;
+    final trimmed = id.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  FieldStorageLayout _createInitialFieldStorageLayout(TableSchema schema) {
+    // NOTE: the Primary Key is stored in the physical B-Tree key
+    // and is NOT included in the data slots (Value portion) by default to save space
+    // back into the decoded record Map during read operations.
+    final slots = <FieldStorageSlot>[];
+    for (int i = 0; i < schema.fields.length; i++) {
+      final field = schema.fields[i];
+      slots.add(FieldStorageSlot(
+        slotId: i,
+        fieldId: _normalizeFieldId(field),
+        fieldName: field.name,
+        typeIndex: field.type.index,
+        deleted: false,
+      ));
+    }
+    return FieldStorageLayout(nextSlotId: slots.length, slots: slots);
+  }
+
+  FieldStorageLayout? _tryParseFieldStorageLayout(dynamic raw) {
+    if (raw is Map<String, dynamic>) {
+      return FieldStorageLayout.fromJson(raw);
+    }
+    if (raw is Map) {
+      return FieldStorageLayout.fromJson(Map<String, dynamic>.from(raw));
+    }
+    return null;
+  }
+
+  FieldStorageLayout _evolveFieldStorageLayout({
+    required FieldStorageLayout? existingLayout,
+    required TableSchema nextSchema,
+    Map<String, String> renameHints = const <String, String>{},
+  }) {
+    if (existingLayout == null || existingLayout.slots.isEmpty) {
+      return _createInitialFieldStorageLayout(nextSchema);
+    }
+
+    final slots = List<FieldStorageSlot>.from(existingLayout.slots);
+    var nextSlotId = existingLayout.nextSlotId;
+
+    final activeBySlotId = <int, FieldStorageSlot>{};
+    final activeByFieldId = <String, FieldStorageSlot>{};
+    final activeByFieldName = <String, FieldStorageSlot>{};
+    for (final slot in slots) {
+      if (slot.deleted) continue;
+      activeBySlotId[slot.slotId] = slot;
+      final slotFieldId = slot.fieldId;
+      if (slotFieldId != null &&
+          slotFieldId.isNotEmpty &&
+          !activeByFieldId.containsKey(slotFieldId)) {
+        activeByFieldId[slotFieldId] = slot;
+      }
+      if (!activeByFieldName.containsKey(slot.fieldName)) {
+        activeByFieldName[slot.fieldName] = slot;
+      }
+    }
+
+    final matchedSlotIds = <int>{};
+    final updatesBySlotId = <int, FieldStorageSlot>{};
+    final appended = <FieldStorageSlot>[];
+
+    for (final field in nextSchema.fields) {
+      FieldStorageSlot? matched;
+      final fieldId = _normalizeFieldId(field);
+      if (fieldId != null) {
+        matched = activeByFieldId[fieldId];
+      }
+
+      if (matched == null) {
+        final hintedOldName = renameHints[field.name];
+        if (hintedOldName != null && hintedOldName.isNotEmpty) {
+          matched = activeByFieldName[hintedOldName];
+        }
+      }
+
+      matched ??= activeByFieldName[field.name];
+
+      if (matched != null) {
+        matchedSlotIds.add(matched.slotId);
+        updatesBySlotId[matched.slotId] = matched.copyWith(
+          fieldId: fieldId ?? matched.fieldId,
+          fieldName: field.name,
+          typeIndex: field.type.index,
+          deleted: false,
+        );
+        continue;
+      }
+
+      appended.add(FieldStorageSlot(
+        slotId: nextSlotId,
+        fieldId: fieldId,
+        fieldName: field.name,
+        typeIndex: field.type.index,
+        deleted: false,
+      ));
+      nextSlotId++;
+    }
+
+    final evolved = <FieldStorageSlot>[];
+    for (final slot in slots) {
+      final updated = updatesBySlotId[slot.slotId];
+      if (updated != null) {
+        evolved.add(updated);
+        continue;
+      }
+      if (!slot.deleted && !matchedSlotIds.contains(slot.slotId)) {
+        evolved.add(slot.copyWith(deleted: true));
+      } else {
+        evolved.add(slot);
+      }
+    }
+    evolved.addAll(appended);
+
+    return FieldStorageLayout(
+      version: existingLayout.version,
+      nextSlotId: nextSlotId,
+      slots: evolved,
+    );
+  }
+
+  bool _canReuseExistingFieldStorageLayout(
+    FieldStorageLayout layout,
+    TableSchema schema, {
+    Map<String, String> renameHints = const <String, String>{},
+  }) {
+    // Rename hints mean caller expects logical name remap; recompute is required.
+    if (renameHints.isNotEmpty) {
+      return false;
+    }
+
+    if (schema.fields.isEmpty) {
+      // Reuse as-is: empty logical fields can coexist with deleted historical slots.
+      return true;
+    }
+
+    final activeSlots = <FieldStorageSlot>[
+      for (final slot in layout.slots)
+        if (!slot.deleted) slot,
+    ];
+
+    if (activeSlots.length != schema.fields.length) {
+      return false;
+    }
+
+    final activeByFieldId = <String, FieldStorageSlot>{};
+    final activeByName = <String, FieldStorageSlot>{};
+    for (final slot in activeSlots) {
+      final fieldId = slot.fieldId;
+      if (fieldId != null &&
+          fieldId.isNotEmpty &&
+          !activeByFieldId.containsKey(fieldId)) {
+        activeByFieldId[fieldId] = slot;
+      }
+      if (!activeByName.containsKey(slot.fieldName)) {
+        activeByName[slot.fieldName] = slot;
+      }
+    }
+
+    for (final field in schema.fields) {
+      final fieldId = _normalizeFieldId(field);
+      final matched = (fieldId != null ? activeByFieldId[fieldId] : null) ??
+          activeByName[field.name];
+      if (matched == null) {
+        return false;
+      }
+      if (matched.fieldName != field.name ||
+          matched.typeIndex != field.type.index) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  List<FieldStructure> _buildStorageFieldStructureFromLayout(
+    FieldStorageLayout layout,
+  ) {
+    if (layout.slots.isEmpty) {
+      return const <FieldStructure>[];
+    }
+    final out = <FieldStructure>[];
+    for (final slot in layout.slots) {
+      final name = slot.deleted
+          ? '$_deletedSlotFieldPrefix${slot.slotId}'
+          : slot.fieldName;
+      out.add(FieldStructure(name: name, typeIndex: slot.typeIndex));
+    }
+    return List<FieldStructure>.unmodifiable(out);
+  }
+
+  /// Get stable storage field layout for a table.
+  ///
+  /// Falls back to schema-derived layout for legacy metadata that does not have
+  /// persisted layout information yet.
+  Future<FieldStorageLayout> getTableFieldLayout(
+    String tableName, {
+    TableSchema? schema,
+  }) async {
+    final cached = _tableFieldLayoutCache[tableName];
+    if (cached != null) {
+      if (schema == null) {
+        return cached;
+      }
+      final cachedSchema = getCachedTableSchema(tableName);
+      if (cachedSchema != null && identical(cachedSchema, schema)) {
+        return cached;
+      }
+    }
+
+    final partitionIndex = await getTablePartition(tableName);
+    if (partitionIndex != null) {
+      final partitionMeta = await _loadPartitionMeta(partitionIndex);
+      if (partitionMeta != null) {
+        final raw = partitionMeta.tableFieldLayouts[tableName];
+        final parsed = _tryParseFieldStorageLayout(raw);
+        if (parsed != null) {
+          _tableFieldLayoutCache[tableName] = parsed;
+          return parsed;
+        }
+      }
+    }
+
+    final resolvedSchema = schema ?? await getTableSchema(tableName);
+    if (resolvedSchema == null) {
+      return const FieldStorageLayout(
+          nextSlotId: 0, slots: <FieldStorageSlot>[]);
+    }
+
+    final derived = _createInitialFieldStorageLayout(resolvedSchema);
+    _tableFieldLayoutCache[tableName] = derived;
+    return derived;
+  }
+
+  /// Get stable storage field structure used by the record binary codec.
+  Future<List<FieldStructure>> getStorageFieldStructure(
+    String tableName, {
+    TableSchema? schema,
+    FieldStorageLayout? layoutOverride,
+  }) async {
+    if (layoutOverride != null) {
+      return _buildStorageFieldStructureFromLayout(layoutOverride);
+    }
+
+    final resolvedSchema = schema ?? await getTableSchema(tableName);
+    if (resolvedSchema == null) {
+      return const <FieldStructure>[];
+    }
+
+    final cachedSchema = getCachedTableSchema(tableName);
+    final useCache = schema == null ||
+        (cachedSchema != null && identical(cachedSchema, resolvedSchema));
+    if (useCache) {
+      final cached = _storageFieldStructCache[tableName];
+      if (cached != null) {
+        return cached;
+      }
+    }
+
+    final layout = await getTableFieldLayout(tableName, schema: resolvedSchema);
+    final struct = _buildStorageFieldStructureFromLayout(layout);
+    if (useCache) {
+      _storageFieldStructCache[tableName] = struct;
+    }
+    return struct;
+  }
+
+  /// Persist only table field layout without modifying schema payload.
+  Future<void> saveTableFieldLayout(
+    String tableName,
+    FieldStorageLayout layout, {
+    TableSchema? schema,
+  }) async {
+    final resolvedSchema = schema ?? await getTableSchema(tableName);
+    if (resolvedSchema == null) {
+      throw StateError('Table schema not found: $tableName');
+    }
+    await saveTableSchema(
+      tableName,
+      resolvedSchema,
+      layoutOverride: layout,
+    );
+  }
+
+  /// Normalize a decoded record to user schema shape:
+  /// - drop unknown/internal storage fields
+  /// - fill missing fields with default values
+  /// - output in schema field order
+  Map<String, dynamic> normalizeRecordToSchema(
+    TableSchema schema,
+    Map<String, dynamic> record, {
+    bool includePrimaryKey = true,
+  }) {
+    final out = <String, dynamic>{};
+    if (includePrimaryKey && record.containsKey(schema.primaryKey)) {
+      out[schema.primaryKey] = record[schema.primaryKey];
+    }
+    for (final field in schema.fields) {
+      if (record.containsKey(field.name)) {
+        out[field.name] = record[field.name];
+      } else {
+        out[field.name] = field.getDefaultValue();
+      }
+    }
+    return out;
   }
 
   /// Get consolidated index list for a table (explicit + implicit).
@@ -328,6 +667,7 @@ class SchemaManager {
       tableNames: [],
       tableSizes: {},
       tableSchemas: {},
+      tableFieldLayouts: {},
       timestamps: Timestamps(
         created: DateTime.now(),
         modified: DateTime.now(),
@@ -431,10 +771,15 @@ class SchemaManager {
   }
 
   /// save table schema, auto manage partitions
-  Future<void> saveTableSchema(String tableName, TableSchema schema) async {
+  Future<void> saveTableSchema(
+    String tableName,
+    TableSchema schema, {
+    FieldStorageLayout? layoutOverride,
+    Map<String, String> fieldRenameHints = const <String, String>{},
+  }) async {
     try {
       final meta = await getSchemaMeta();
-      final contentSize = _estimateTableSchemaSize(schema);
+      var contentSize = _estimateTableSchemaSize(schema);
 
       // find suitable partition
       int targetPartition = await _findSuitablePartition(meta, contentSize);
@@ -461,6 +806,24 @@ class SchemaManager {
 
       // update partition meta
       final schemaObject = schema.toJson();
+      final existingLayout = _tryParseFieldStorageLayout(
+          partitionMeta.tableFieldLayouts[tableName]);
+      final resolvedLayout = layoutOverride ??
+          ((existingLayout != null &&
+                  _canReuseExistingFieldStorageLayout(
+                    existingLayout,
+                    schema,
+                    renameHints: fieldRenameHints,
+                  ))
+              ? existingLayout
+              : _evolveFieldStorageLayout(
+                  existingLayout: existingLayout,
+                  nextSchema: schema,
+                  renameHints: fieldRenameHints,
+                ));
+      final layoutObject = resolvedLayout.toJson();
+      contentSize += _estimateFieldStorageLayoutSize(resolvedLayout);
+
       final oldSize = partitionMeta.tableSizes[tableName] ?? 0;
 
       // calculate new partition size (if update, subtract old size)
@@ -481,6 +844,10 @@ class SchemaManager {
           ...partitionMeta.tableSchemas,
           tableName: schemaObject,
         },
+        tableFieldLayouts: {
+          ...partitionMeta.tableFieldLayouts,
+          tableName: layoutObject,
+        },
         timestamps: Timestamps(
           created: partitionMeta.timestamps.created,
           modified: DateTime.now(),
@@ -498,6 +865,8 @@ class SchemaManager {
 
       // Cache the new schema
       cacheTableSchema(tableName, schema);
+      _tableFieldLayoutCache[tableName] = resolvedLayout;
+      _storageFieldStructCache.remove(tableName);
 
       // Precise TTL cache update (no global invalidate).
       _dataStore.upsertTtlPlanForSchema(schema);
@@ -571,6 +940,12 @@ class SchemaManager {
 
         final schema = TableSchema.fromJson(schemaMap);
         cacheTableSchema(tableName, schema);
+        final layoutRaw = partitionMeta.tableFieldLayouts[tableName];
+        final parsedLayout = _tryParseFieldStorageLayout(layoutRaw);
+        if (parsedLayout != null) {
+          _tableFieldLayoutCache[tableName] = parsedLayout;
+          _storageFieldStructCache.remove(tableName);
+        }
         return schema;
       } catch (e) {
         Logger.error('Failed to parse table schema: $tableName, $e',
@@ -691,7 +1066,17 @@ class SchemaManager {
         );
       }
 
-      final newSize = _estimateTableSchemaSize(newSchema);
+      final oldLayout = _tryParseFieldStorageLayout(
+              partitionMeta.tableFieldLayouts[oldTableName]) ??
+          _tableFieldLayoutCache[oldTableName] ??
+          _createInitialFieldStorageLayout(newSchema);
+      final newLayout = _evolveFieldStorageLayout(
+        existingLayout: oldLayout,
+        nextSchema: newSchema,
+      );
+
+      final newSize = _estimateTableSchemaSize(newSchema) +
+          _estimateFieldStorageLayoutSize(newLayout);
       final oldSize = partitionMeta.tableSizes[oldTableName] ?? 0;
       final tableNames = <String>[];
       var inserted = false;
@@ -719,12 +1104,17 @@ class SchemaManager {
           Map<String, dynamic>.from(partitionMeta.tableSchemas)
             ..remove(oldTableName)
             ..[newTableName] = newSchema.toJson();
+      final updatedTableLayouts =
+          Map<String, dynamic>.from(partitionMeta.tableFieldLayouts)
+            ..remove(oldTableName)
+            ..[newTableName] = newLayout.toJson();
 
       final updatedPartitionMeta = partitionMeta.copyWith(
         fileSizeInBytes: partitionMeta.fileSizeInBytes + newSize - oldSize,
         tableNames: tableNames,
         tableSizes: updatedTableSizes,
         tableSchemas: updatedTableSchemas,
+        tableFieldLayouts: updatedTableLayouts,
         timestamps: Timestamps(
           created: partitionMeta.timestamps.created,
           modified: DateTime.now(),
@@ -740,6 +1130,9 @@ class SchemaManager {
 
       removeCachedTableSchema(oldTableName);
       cacheTableSchema(newTableName, newSchema);
+      _tableFieldLayoutCache[newTableName] = newLayout;
+      _tableFieldLayoutCache.remove(oldTableName);
+      _storageFieldStructCache.remove(newTableName);
       _dataStore.removeTtlPlanForTable(oldTableName);
       _dataStore.upsertTtlPlanForSchema(newSchema);
     } catch (e) {
@@ -783,6 +1176,8 @@ class SchemaManager {
             .toList(),
         tableSizes: Map.from(partitionMeta.tableSizes)..remove(tableName),
         tableSchemas: Map.from(partitionMeta.tableSchemas)..remove(tableName),
+        tableFieldLayouts: Map.from(partitionMeta.tableFieldLayouts)
+          ..remove(tableName),
         timestamps: Timestamps(
           created: partitionMeta.timestamps.created,
           modified: DateTime.now(),
@@ -983,6 +1378,7 @@ class SchemaManager {
           // get table schema
           final schema = overloadedMeta.tableSchemas[tableName];
           if (schema == null) continue;
+          final fieldLayout = overloadedMeta.tableFieldLayouts[tableName];
 
           Logger.debug(
             'Moving table $tableName from partition $overloadedIndex to partition $targetPartition (size: $tableSize bytes)',
@@ -1024,6 +1420,10 @@ class SchemaManager {
               tableSchemas: {
                 ...targetPartitionMeta.tableSchemas,
                 tableName: schema,
+              },
+              tableFieldLayouts: {
+                ...targetPartitionMeta.tableFieldLayouts,
+                if (fieldLayout != null) tableName: fieldLayout,
               },
               timestamps: Timestamps(
                 created: targetPartitionMeta.timestamps.created,

@@ -15,11 +15,11 @@ class InternalConfig {
   static const String publicLabel = 'tostore';
 
   /// engine/storage version (global config + space config)
-  static const int engineVersion = 2;
+  static const int engineVersion = 3;
   static const int legacyEngineVersion = 0; // legacy file default value
 
   /// schema version (table schemas + schema partitions)
-  static const int schemaVersion = 1;
+  static const int schemaVersion = 2;
   static const int legacySchemaVersion = 0; // legacy file default value
 
   /// table data version (table data files + partitions)

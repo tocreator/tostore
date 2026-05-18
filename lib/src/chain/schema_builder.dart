@@ -260,26 +260,17 @@ class SchemaBuilder with FutureBuilderMixin {
   /// Get future result - returns migration task ID for tracking
   @override
   Future<String> get future async {
-    // create migration task
+    // create migration task (schema is updated immediately; data migration runs async)
     final task = await _dataStore.migrationManager?.addMigrationTask(
         _tableName, _operations,
-        startProcessing: false,
+        startProcessing: true,
         allowAfterDataMigration: _allowAfterDataMigration);
 
     if (task == null) {
       return ''; // Return empty string to indicate creation failed
     }
 
-    // Create task ID
-    final taskId = task.taskId;
-
-    // Start task processing and wait for completion
-    try {
-      await _dataStore.migrationManager?.processMigrationTasks();
-      return taskId;
-    } catch (e) {
-      // Return task ID even if failed, for subsequent query
-      return taskId;
-    }
+    // Return immediately; caller can poll status via queryMigrationTaskStatus
+    return task.taskId;
   }
 }

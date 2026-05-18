@@ -651,6 +651,9 @@ class TransactionManager {
 
         final startIdx = progress['inserts']![table] ?? 0;
         const int batchSize = 1000;
+        final migrationManager = _dataStore.migrationManager;
+        final hasRuntimeMigration = migrationManager != null &&
+            migrationManager.hasRuntimeMigrationForTable(table);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
           await yieldController.maybeYield();
@@ -664,12 +667,15 @@ class TransactionManager {
             final rec = Map<String, dynamic>.from(recs[j]);
             rec.remove('_oldValues'); // inserts do not use oldValues
             final uks = rec.remove('_uniqueKeys') as List?;
+            final normalizedRec = (hasRuntimeMigration)
+                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                : rec;
             uniqueKeysList.add(uks
                     ?.map(
                         (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
                     .toList() ??
                 const <UniqueKeyRef>[]);
-            records.add(rec);
+            records.add(normalizedRec);
           }
 
           await _dataStore.tableDataManager.addBatchToBuffer(
@@ -703,6 +709,9 @@ class TransactionManager {
 
         final startIdx = progress['updates']![table] ?? 0;
         const int batchSize = 1000;
+        final migrationManager = _dataStore.migrationManager;
+        final hasRuntimeMigration = migrationManager != null &&
+            migrationManager.hasRuntimeMigrationForTable(table);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
           await yieldController.maybeYield();
@@ -719,10 +728,16 @@ class TransactionManager {
             final rec = Map<String, dynamic>.from(recs[j]);
             final old = rec.remove('_oldValues') as Map<String, dynamic>?;
             final uks = rec.remove('_uniqueKeys') as List?;
+            final normalizedRec = (hasRuntimeMigration)
+                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                : rec;
+            final normalizedOld = (hasRuntimeMigration)
+                ? migrationManager.normalizeOldValuesForReadSync(table, old)
+                : old;
 
-            final rId = rec[pkName]?.toString();
-            if (rId != null && old != null) {
-              oldRecordsMap[rId] = old;
+            final rId = normalizedRec[pkName]?.toString();
+            if (rId != null && normalizedOld != null) {
+              oldRecordsMap[rId] = normalizedOld;
             }
 
             uniqueKeysList.add(uks
@@ -730,7 +745,7 @@ class TransactionManager {
                         (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
                     .toList() ??
                 const <UniqueKeyRef>[]);
-            records.add(rec);
+            records.add(normalizedRec);
           }
 
           await _dataStore.tableDataManager.addBatchToBuffer(
@@ -765,14 +780,20 @@ class TransactionManager {
           final batch = <Map<String, dynamic>>[];
           final cacheKeys = <String>[];
           String? pkName;
+          final migrationManager = _dataStore.migrationManager;
+          final hasRuntimeMigration = migrationManager != null &&
+              migrationManager.hasRuntimeMigrationForTable(table);
           for (int j = i; j < end; j++) {
             await yieldController.maybeYield();
             final rec = Map<String, dynamic>.from(recs[j]);
             rec.remove('_oldValues'); // delete: old values not used
-            batch.add(rec);
+            final normalizedRec = (hasRuntimeMigration)
+                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                : rec;
+            batch.add(normalizedRec);
             try {
               pkName ??= await ensurePk(table);
-              final k = rec[pkName]?.toString();
+              final k = normalizedRec[pkName]?.toString();
               if (k != null && k.isNotEmpty) cacheKeys.add(k);
             } catch (_) {}
           }

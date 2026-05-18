@@ -946,7 +946,6 @@ class WalManager {
       final cap = _config.logPartitionCycle;
       final checkpoint = _meta.checkpoint.partitionIndex;
 
-      // Iterate from start → end (cycle-aware)
       int idx = start;
       final toDelete = <int>[];
       final yieldController = YieldController(

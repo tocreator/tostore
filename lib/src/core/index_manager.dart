@@ -32,6 +32,16 @@ import 'tree_cache.dart';
 import 'weight_manager.dart';
 import 'yield_controller.dart';
 
+class IndexBuildCancelledException implements Exception {
+  final String tableName;
+  final String indexName;
+
+  const IndexBuildCancelledException(this.tableName, this.indexName);
+
+  @override
+  String toString() => 'Index build cancelled for $tableName.$indexName';
+}
+
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
 class IndexManager {
@@ -54,6 +64,7 @@ class IndexManager {
   // Loading futures to prevent thundering herd on concurrent meta loads
   final Map<String, Future<IndexMeta?>> _metaLoadingFutures = {};
   final Map<String, Future<void>> _emptyIndexRepairFutures = {};
+  final Map<String, Future<void>> _indexBuildFutures = {};
 
   String _getMetaLoadingKey(String tableName, String indexName) =>
       '$tableName#$indexName';
@@ -1115,7 +1126,40 @@ class IndexManager {
   }
 
   /// create index
-  Future<void> createIndex(String tableName, IndexSchema schema) async {
+  Future<void> createIndex(
+    String tableName,
+    IndexSchema schema, {
+    TableSchema? tableSchemaOverride,
+    PartitionStreamController? controller,
+  }) async {
+    final buildKey = _getMetaLoadingKey(tableName, schema.actualIndexName);
+    final existingBuild = _indexBuildFutures[buildKey];
+    if (existingBuild != null) {
+      return existingBuild;
+    }
+
+    final buildFuture = _createIndexInternal(
+      tableName,
+      schema,
+      tableSchemaOverride: tableSchemaOverride,
+      controller: controller,
+    );
+    _indexBuildFutures[buildKey] = buildFuture;
+    try {
+      await buildFuture;
+    } finally {
+      if (_indexBuildFutures[buildKey] == buildFuture) {
+        _indexBuildFutures.remove(buildKey);
+      }
+    }
+  }
+
+  Future<void> _createIndexInternal(
+    String tableName,
+    IndexSchema schema, {
+    TableSchema? tableSchemaOverride,
+    PartitionStreamController? controller,
+  }) async {
     final indexName = schema.actualIndexName;
     final lockMgr = _dataStore.lockManager;
     final indexLockKey = 'index:$tableName:$indexName';
@@ -1123,6 +1167,10 @@ class IndexManager {
     bool indexLocked = false;
 
     try {
+      if (controller?.isStopped ?? false) {
+        throw IndexBuildCancelledException(tableName, indexName);
+      }
+
       if (lockMgr != null) {
         indexLocked = await lockMgr.acquireExclusiveLock(
           indexLockKey,
@@ -1137,13 +1185,21 @@ class IndexManager {
       // Check if the index exists
       final meta = await getIndexMeta(tableName, indexName);
       if (meta != null) {
-        Logger.debug('Index already exists: $indexName',
-            label: 'IndexManager.createIndex');
-        return;
+        if (meta.isBuilding) {
+          Logger.warn(
+            'Detected incomplete index build for $tableName.$indexName, deleting stale artifacts before rebuild',
+            label: 'IndexManager.createIndex',
+          );
+          await _deletePhysicalIndexArtifacts(tableName, indexName);
+        } else {
+          Logger.debug('Index already exists: $indexName',
+              label: 'IndexManager.createIndex');
+          return;
+        }
       }
 
       // Get table structure
-      final tableSchema =
+      final tableSchema = tableSchemaOverride ??
           await _dataStore.schemaManager?.getTableSchema(tableName);
       if (tableSchema == null) {
         return;
@@ -1180,7 +1236,12 @@ class IndexManager {
       }
 
       // Use optimized index building
-      await _rebuildTableIndexes(tableName, tableSchema, [schema]);
+      await _rebuildTableIndexes(
+        tableName,
+        tableSchema,
+        [schema],
+        controller: controller,
+      );
 
       if (!SystemTable.isSystemTable(tableName)) {
         Logger.info('Created index for $tableName: $indexName',
@@ -1188,6 +1249,11 @@ class IndexManager {
       }
     } catch (e, stack) {
       await _deletePhysicalIndexArtifacts(tableName, indexName);
+      if (e is IndexBuildCancelledException) {
+        Logger.info('$e; partial artifacts removed',
+            label: 'IndexManager.createIndex');
+        rethrow;
+      }
       Logger.error('Failed to create index: $e\n$stack',
           label: 'IndexManager.createIndex');
       rethrow;
@@ -1650,7 +1716,7 @@ class IndexManager {
 
           // Get index metadata
           final meta = await getIndexMeta(tableName, indexName);
-          if (meta == null || meta.totalEntries <= 0) {
+          if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
             final tableMeta =
                 await _dataStore.tableDataManager.getTableMeta(tableName);
             if (tableMeta == null || tableMeta.totalRecords <= 0) {
@@ -2112,7 +2178,7 @@ class IndexManager {
 
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
       final meta = await getIndexMeta(tableName, indexName);
-      if (meta == null || meta.totalEntries <= 0) {
+      if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
         // Fast path for brand new tables: if meta is missing or index is empty,
         // and the table metadata also indicates 0 records, we can skip the heavy disk scan.
         final tableMeta =
@@ -2465,6 +2531,47 @@ class IndexManager {
     }
   }
 
+  /// Delete index files/metadata without changing table schema.
+  ///
+  /// Migration schema cutover already persisted the target schema. During the
+  /// async physical reconciliation phase we may still need to delete stale
+  /// index artifacts, but must not remove indexes from that target schema.
+  Future<void> deleteIndexArtifactsForMigration(
+    String tableName, {
+    required String indexName,
+  }) async {
+    final lockMgr = _dataStore.lockManager;
+    final indexLockKey = 'index:$tableName:$indexName';
+    final indexLockOpId = GlobalIdGenerator.generate('delete_index_artifacts_');
+    var indexLocked = false;
+
+    try {
+      if (lockMgr != null) {
+        indexLocked = await lockMgr.acquireExclusiveLock(
+          indexLockKey,
+          indexLockOpId,
+        );
+        if (!indexLocked) {
+          throw StateError(
+            'Failed to acquire lock for deleting index artifacts $tableName.$indexName',
+          );
+        }
+      }
+
+      await _deletePhysicalIndexArtifacts(tableName, indexName);
+    } catch (e) {
+      Logger.error(
+        'Failed to delete index artifacts for migration: $e',
+        label: 'IndexManager.deleteIndexArtifactsForMigration',
+      );
+      rethrow;
+    } finally {
+      if (indexLocked && lockMgr != null) {
+        lockMgr.releaseExclusiveLock(indexLockKey, indexLockOpId);
+      }
+    }
+  }
+
   /// delete index file
   /// @param tableName table name
   /// @param indexName index name
@@ -2658,7 +2765,8 @@ class IndexManager {
   /// @param rebuildPrimary Whether to rebuild primary key index
   /// @param indexesToBuild List of indexes to build
   Future<void> _rebuildTableIndexes(String tableName, TableSchema tableSchema,
-      List<IndexSchema> indexesToBuild) async {
+      List<IndexSchema> indexesToBuild,
+      {PartitionStreamController? controller}) async {
     try {
       final primaryKey = tableSchema.primaryKey;
       final uniqueIndexes = indexesToBuild
@@ -2673,6 +2781,7 @@ class IndexManager {
           tableName: tableName,
           fields: indexSchema.fields,
           isUnique: indexSchema.unique,
+          isBuilding: true,
         );
         await updateIndexMeta(
             tableName: tableName, indexName: indexName, updatedMeta: indexMeta);
@@ -2681,8 +2790,16 @@ class IndexManager {
       // 2) Scan table partitions and build indexes via applyIndexInserts
       await _dataStore.tableDataManager.streamPartitionPageBatches(
         tableName: tableName,
+        controller: controller,
         onPartition: (partitionNo, batches, controller) async {
           await for (final batch in batches) {
+            if (controller.isStopped) {
+              throw IndexBuildCancelledException(
+                tableName,
+                indexesToBuild.map((i) => i.actualIndexName).join(','),
+              );
+            }
+
             final records = batch.records;
             final Map<dynamic, Map<String, dynamic>> newByPk = {};
             final int maxConcurrency = _dataStore.config.maxConcurrency;
@@ -2715,9 +2832,37 @@ class IndexManager {
               await Future.delayed(Duration.zero);
             }
           }
+
+          if (controller.isStopped) {
+            throw IndexBuildCancelledException(
+              tableName,
+              indexesToBuild.map((i) => i.actualIndexName).join(','),
+            );
+          }
           return PartitionStreamAction.continueScan;
         },
       );
+
+      if (controller?.isStopped ?? false) {
+        throw IndexBuildCancelledException(
+          tableName,
+          indexesToBuild.map((i) => i.actualIndexName).join(','),
+        );
+      }
+
+      for (final indexSchema in indexesToBuild) {
+        if (indexSchema.type == IndexType.vector) continue;
+        final indexName = indexSchema.actualIndexName;
+        final builtMeta = await getIndexMeta(tableName, indexName);
+        if (builtMeta == null || !builtMeta.isBuilding) {
+          continue;
+        }
+        await updateIndexMeta(
+          tableName: tableName,
+          indexName: indexName,
+          updatedMeta: builtMeta.copyWith(isBuilding: false),
+        );
+      }
     } catch (e, stack) {
       Logger.error('Failed to rebuild table indexes: $e\n$stack',
           label: 'IndexManager._rebuildTableIndexes');
@@ -3111,6 +3256,9 @@ class IndexManager {
       if (meta == null) return IndexSearchResult.tableScan();
       final bool isMemoryMode =
           _dataStore.config.persistenceMode == PersistenceMode.memory;
+      if (!isMemoryMode && meta.isBuilding) {
+        return IndexSearchResult.tableScan();
+      }
       // In memory mode, the primary index store is [_indexDataCache], so B+Tree
       // pointers/entry counts may be unset or stale. We still allow searching.
       if (!isMemoryMode &&
@@ -3960,7 +4108,7 @@ class IndexManager {
 
               // Memory mode: serve unique lookup from _indexDataCache only (no disk fallback).
               if (isMemoryMode) {
-                final compositeKey = <dynamic>[tableName, indexName, ...v];
+                final compositeKey = <dynamic>[tableName, indexName, ...nativeVal!];
                 final pkValue = _indexDataCache.get(compositeKey);
                 if (pkValue is String &&
                     pkValue.isNotEmpty &&
@@ -3985,7 +4133,7 @@ class IndexManager {
                         IndexSearchEntry(primaryKey: pk, keyBytes: prefix));
                     if (!(_dataStore.resourceManager?.isLowMemoryMode ??
                         false)) {
-                      final compositeKey = [tableName, indexName, ...v];
+                      final compositeKey = [tableName, indexName, ...nativeVal!];
                       _indexDataCache.put(compositeKey, pk);
                     }
                   }
@@ -4023,10 +4171,10 @@ class IndexManager {
 
                 if (validatedPks.isNotEmpty) {
                   if (isUnique) {
-                    _indexDataCache
-                        .put([tableName, indexName, ...v], validatedPks.first);
+                    _indexDataCache.put(
+                        [tableName, indexName, ...nativeVal!], validatedPks.first);
                   } else {
-                    final prefixKey = <dynamic>[tableName, indexName, ...v];
+                    final prefixKey = <dynamic>[tableName, indexName, ...nativeVal!];
                     final yc = YieldController(
                         'IndexManager.hotspotPopulateNonUniqueIn');
                     for (final pk in validatedPks) {

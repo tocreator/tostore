@@ -1065,6 +1065,9 @@ class LockManager {
 
   /// Dispose resources
   void dispose() {
+    _maintenanceMode = false;
+    _shutdownMode = false;
+
     // Cancel all pending requests
     for (final resourceQueue in _resourceQueues.values) {
       for (final request in resourceQueue) {

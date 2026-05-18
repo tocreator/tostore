@@ -16,6 +16,8 @@ import 'btree_page.dart';
 import 'page_redo_log_codec.dart';
 import 'table_data_manager.dart';
 import 'yield_controller.dart';
+import '../model/buffer_entry.dart';
+import '../model/wal_pointer.dart';
 
 /// Table similarity calculation request
 class TableSimilarityRequest {
@@ -615,8 +617,8 @@ class MigrationRecordProcessRequest {
 
 /// Table record migration processing result
 class MigrationRecordProcessResult {
-  /// Processed records
-  final List<Map<String, dynamic>> migratedRecords;
+  /// Processed records wrapped in BufferEntries for immediate queuing
+  final List<BufferEntry> migratedEntries;
 
   /// Processing result status
   final bool success;
@@ -625,194 +627,245 @@ class MigrationRecordProcessResult {
   final String? errorMessage;
 
   MigrationRecordProcessResult({
-    required this.migratedRecords,
+    required this.migratedEntries,
     this.success = true,
     this.errorMessage,
   });
+}
+
+/// Apply forward migration operations to a single record synchronously.
+///
+/// This is used both for background batch migration and for runtime
+/// record normalization during the online migration period.
+Map<String, dynamic> applyMigrationOperationsSync(
+  Map<String, dynamic> record,
+  List<MigrationOperation> operations,
+  TableSchema? oldSchema, {
+  bool skipDeleted = true,
+}) {
+  if (skipDeleted && isDeletedRecord(record)) {
+    return record;
+  }
+
+  for (final operation in operations) {
+    switch (operation.type) {
+      case MigrationType.addField:
+        final field = operation.field;
+        if (field != null && !record.containsKey(field.name)) {
+          record[field.name] = field.getDefaultValue();
+        }
+        break;
+      case MigrationType.removeField:
+        final name = operation.fieldName;
+        if (name != null) {
+          record.remove(name);
+        }
+        break;
+      case MigrationType.renameField:
+        final oldName = operation.fieldName;
+        final newName = operation.newName;
+        if (oldName != null &&
+            newName != null &&
+            record.containsKey(oldName) &&
+            !record.containsKey(newName)) {
+          record[newName] = record[oldName];
+          record.remove(oldName);
+        }
+        break;
+      case MigrationType.modifyField:
+        final update = operation.fieldUpdate;
+        if (update != null && record.containsKey(update.name)) {
+          FieldSchema? oldField;
+          if (oldSchema != null) {
+            try {
+              oldField =
+                  oldSchema.fields.firstWhere((f) => f.name == update.name);
+            } catch (_) {
+              oldField = null;
+            }
+          }
+          applyFieldModification(
+            record,
+            update,
+            oldFieldSchema: oldField,
+          );
+        }
+        break;
+      case MigrationType.setPrimaryKeyConfig:
+        final oldPk = operation.oldPrimaryKeyConfig;
+        final newPk = operation.primaryKeyConfig;
+        if (oldPk != null &&
+            newPk != null &&
+            oldPk.name != newPk.name &&
+            record.containsKey(oldPk.name) &&
+            !record.containsKey(newPk.name)) {
+          record[newPk.name] = record[oldPk.name];
+          record.remove(oldPk.name);
+        }
+        break;
+      default:
+        // Other operations (indexes, renameTable, TTL, etc.) do not affect record payload directly
+        break;
+    }
+  }
+  return record;
+}
+
+/// Apply reverse migration operations to a single record synchronously.
+///
+/// This is used to "downgrade" a record written in new logical format back
+/// to the legacy format, typically when writing to a storage space that
+/// has not been physically migrated yet.
+Map<String, dynamic> applyMigrationReverseOperationsSync(
+  Map<String, dynamic> record,
+  List<MigrationOperation> operations,
+  TableSchema oldSchema,
+) {
+  final oldFieldByName = <String, FieldSchema>{
+    for (final field in oldSchema.fields) field.name: field,
+  };
+
+  // Process operations in REVERSE order to unwind changes correctly.
+  for (int i = operations.length - 1; i >= 0; i--) {
+    final operation = operations[i];
+    switch (operation.type) {
+      case MigrationType.addField:
+        final added = operation.field?.name;
+        if (added != null) {
+          record.remove(added);
+        }
+        break;
+      case MigrationType.removeField:
+        final removed = operation.fieldName;
+        if (removed == null || record.containsKey(removed)) {
+          break;
+        }
+        final oldField = oldFieldByName[removed];
+        record[removed] = oldField?.getDefaultValue();
+        break;
+      case MigrationType.renameField:
+        final oldName = operation.fieldName;
+        final newName = operation.newName;
+        if (oldName != null &&
+            newName != null &&
+            record.containsKey(newName) &&
+            !record.containsKey(oldName)) {
+          record[oldName] = record[newName];
+          record.remove(newName);
+        }
+        break;
+      case MigrationType.modifyField:
+        final update = operation.fieldUpdate;
+        if (update != null && record.containsKey(update.name)) {
+          final oldField = oldFieldByName[update.name];
+          if (oldField != null) {
+            _revertFieldModificationSync(record, update.name, oldField);
+          }
+        }
+        break;
+      case MigrationType.setPrimaryKeyConfig:
+        final oldPk = operation.oldPrimaryKeyConfig;
+        final newPk = operation.primaryKeyConfig;
+        if (oldPk != null &&
+            newPk != null &&
+            oldPk.name != newPk.name &&
+            record.containsKey(newPk.name) &&
+            !record.containsKey(oldPk.name)) {
+          record[oldPk.name] = record[newPk.name];
+          record.remove(newPk.name);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return record;
+}
+
+void _revertFieldModificationSync(
+  Map<String, dynamic> record,
+  String fieldName,
+  FieldSchema oldField,
+) {
+  if (!record.containsKey(fieldName)) return;
+
+  dynamic value = record[fieldName];
+  try {
+    value = oldField.convertValue(value);
+  } catch (_) {
+    value = oldField.getDefaultValue();
+  }
+
+  if (!oldField.nullable && value == null) {
+    value = oldField.getDefaultValue();
+  }
+
+  // Basic constraint recovery
+  if (value is String) {
+    if (oldField.maxLength != null && value.length > oldField.maxLength!) {
+      value = value.substring(0, oldField.maxLength!);
+    }
+  } else if (value is num) {
+    if (oldField.minValue != null && value < oldField.minValue!) {
+      value = oldField.minValue;
+    } else if (oldField.maxValue != null && value > oldField.maxValue!) {
+      value = oldField.maxValue;
+    }
+  }
+
+  if (!oldField.validateValue(value)) {
+    value = oldField.getDefaultValue();
+  }
+
+  record[fieldName] = value;
 }
 
 /// Process record migration
 Future<MigrationRecordProcessResult> processMigrationRecords(
     MigrationRecordProcessRequest request) async {
   try {
-    if (request.records.isEmpty || request.operations.isEmpty) {
+    if (request.records.isEmpty) {
       return MigrationRecordProcessResult(
-        migratedRecords: request.records,
+        migratedEntries: [],
         success: true,
       );
     }
 
-    var modifiedRecords = List<Map<String, dynamic>>.from(request.records);
-
-    // Create YieldController for async loop processing
     final yieldController = YieldController('ProcessMigrationRecords',
         budgetMs: request.yieldDurationMs);
 
-    // Use sorted operations, no need to reorder
-    for (var operation in request.operations) {
-      switch (operation.type) {
-        case MigrationType.addField:
-          final field = operation.field!;
-          final newRecords = <Map<String, dynamic>>[];
-          for (var record in modifiedRecords) {
-            await yieldController.maybeYield();
-            // Skip processing deleted records
-            if (isDeletedRecord(record)) {
-              newRecords.add(record);
-              continue;
-            }
-            if (!record.containsKey(field.name)) {
-              record[field.name] = field.getDefaultValue();
-            }
-            newRecords.add(record);
-          }
-          modifiedRecords = newRecords;
-          break;
+    final migratedEntries = <BufferEntry>[];
+    final timestamp = DateTime.now();
 
-        case MigrationType.removeField:
-          final fieldName = operation.fieldName!;
-          final newRecords = <Map<String, dynamic>>[];
-          for (var record in modifiedRecords) {
-            await yieldController.maybeYield();
-            // Skip processing deleted records
-            if (isDeletedRecord(record)) {
-              newRecords.add(record);
-              continue;
-            }
-            record.remove(fieldName);
-            newRecords.add(record);
-          }
-          modifiedRecords = newRecords;
-          break;
+    for (final record in request.records) {
+      await yieldController.maybeYield();
 
-        case MigrationType.renameField:
-          final oldName = operation.fieldName!;
-          final newName = operation.newName!;
-          final newRecords = <Map<String, dynamic>>[];
-          for (var record in modifiedRecords) {
-            await yieldController.maybeYield();
-            // Skip processing deleted records
-            if (isDeletedRecord(record)) {
-              newRecords.add(record);
-              continue;
-            }
-            if (record.containsKey(oldName)) {
-              record[newName] = record[oldName];
-              record.remove(oldName);
-            }
-            newRecords.add(record);
-          }
-          modifiedRecords = newRecords;
-          break;
+      final transformed = applyMigrationOperationsSync(
+        Map<String, dynamic>.from(record),
+        request.operations,
+        request.oldSchema,
+        skipDeleted: true,
+      );
 
-        case MigrationType.modifyField:
-          final fieldUpdate = operation.fieldUpdate!;
-          // Get old field information
-          FieldSchema? oldFieldSchema;
-          if (request.oldSchema != null) {
-            try {
-              oldFieldSchema = request.oldSchema!.fields
-                  .firstWhere((f) => f.name == fieldUpdate.name);
-            } catch (e) {
-              oldFieldSchema = null;
-            }
-          }
-          final newRecords = <Map<String, dynamic>>[];
-          for (var record in modifiedRecords) {
-            await yieldController.maybeYield();
-            // Skip processing deleted records
-            if (isDeletedRecord(record)) {
-              newRecords.add(record);
-              continue;
-            }
-            if (record.containsKey(fieldUpdate.name)) {
-              // Call the method to process field modification, pass old field information
-              record = _applyFieldModification(record, fieldUpdate,
-                  oldFieldSchema: oldFieldSchema);
-            }
-            newRecords.add(record);
-          }
-          modifiedRecords = newRecords;
-          break;
-
-        case MigrationType.addIndex:
-        case MigrationType.removeIndex:
-        case MigrationType.modifyIndex:
-        case MigrationType.renameIndex:
-          // Index operations do not affect record data
-          break;
-
-        case MigrationType.renameTable:
-          // Table rename operation does not affect current record data, but needs to be handled at a higher level
-          break;
-
-        case MigrationType.dropTable:
-          // Delete table operation does not affect record data
-          break;
-
-        case MigrationType.setPrimaryKeyConfig:
-          // Process primary key configuration changes, especially handle primary key name changes and data type changes
-          if (operation.oldPrimaryKeyConfig != null &&
-              operation.primaryKeyConfig != null) {
-            final oldConfig = operation.oldPrimaryKeyConfig!;
-            final newConfig = operation.primaryKeyConfig!;
-
-            // Process primary key name changes
-            if (oldConfig.name != newConfig.name) {
-              final newRecords = <Map<String, dynamic>>[];
-              for (var record in modifiedRecords) {
-                await yieldController.maybeYield();
-                // Skip processing deleted records
-                if (isDeletedRecord(record)) {
-                  newRecords.add(record);
-                  continue;
-                }
-                if (record.containsKey(oldConfig.name)) {
-                  // Copy old primary key field value to new primary key field
-                  record[newConfig.name] = record[oldConfig.name];
-                  // Delete old primary key field
-                  record.remove(oldConfig.name);
-                }
-                newRecords.add(record);
-              }
-              modifiedRecords = newRecords;
-            }
-          }
-          break;
-
-        case MigrationType.setTableTtlConfig:
-          // TTL config changes do not directly mutate record payload.
-          break;
-
-        case MigrationType.addForeignKey:
-          // Foreign key addition does not affect record data
-          // Data validation for foreign key constraints is handled at migration execution level
-          // (in MigrationManager._executeSchemaOperation)
-          break;
-
-        case MigrationType.removeForeignKey:
-          // Foreign key removal does not affect record data
-          // It only removes the constraint, existing data remains unchanged
-          break;
-
-        case MigrationType.modifyForeignKey:
-          // Foreign key modification (onDelete, onUpdate, enabled, etc.) does not affect record data
-          // It only changes cascade behavior, existing data remains unchanged
-          // Note: Core definition changes (fields, referencedTable, referencedFields)
-          // are not allowed and will throw exception during schema comparison
-          break;
-      }
+      migratedEntries.add(BufferEntry(
+        operation: BufferOperationType.update,
+        data: transformed,
+        timestamp: timestamp,
+        walPointer: const WalPointer(partitionIndex: -1, entrySeq: 0),
+      ));
     }
 
     return MigrationRecordProcessResult(
-      migratedRecords: modifiedRecords,
+      migratedEntries: migratedEntries,
       success: true,
     );
-  } catch (e) {
-    Logger.error('Failed to process migration records: $e',
-        label: 'processMigrationRecords');
+  } catch (e, stack) {
+    Logger.error(
+      'Failed to process migration records: $e\n$stack',
+      label: 'ComputeTasks.processMigrationRecords',
+    );
     return MigrationRecordProcessResult(
-      migratedRecords: request.records,
+      migratedEntries: [],
       success: false,
       errorMessage: e.toString(),
     );
@@ -820,7 +873,7 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
 }
 
 /// Apply field modification to a single record
-Map<String, dynamic> _applyFieldModification(
+Map<String, dynamic> applyFieldModification(
     Map<String, dynamic> record, FieldSchemaUpdate fieldUpdate,
     {FieldSchema? oldFieldSchema}) {
   // Create field schema for validation and get default value

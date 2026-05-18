@@ -47,9 +47,10 @@ class StorageAdapter implements StorageInterface {
   static const String _listOpPrefix = 'list-';
   static const String _deleteOpPrefix = 'delete-';
   static const String _writeOpSerializePrefix = 'write-serialize-';
-  StorageAdapter({StorageInterface? overrideStorage})
-      : _lockManager = LockManager(
-            baseLockTimeout: 300000, enableDeadlockDetection: true) {
+  StorageAdapter({
+    required LockManager lockManager,
+    StorageInterface? overrideStorage,
+  }) : _lockManager = lockManager {
     if (overrideStorage != null) {
       _storage = overrideStorage;
     } else {
@@ -66,8 +67,9 @@ class StorageAdapter implements StorageInterface {
 
   /// Create a storage adapter with a provided storage implementation.
   /// Used for pure in-memory mode (no IO) and testing.
-  StorageAdapter.forStorage(StorageInterface storage)
-      : this(overrideStorage: storage);
+  StorageAdapter.forStorage(StorageInterface storage,
+      {required LockManager lockManager})
+      : this(overrideStorage: storage, lockManager: lockManager);
 
   /// Unified configuration entry to reduce initialization redundancy
   Future<void> configure(
@@ -468,7 +470,6 @@ class StorageAdapter implements StorageInterface {
     if (!isMigrationInstance) {
       await _storage.close();
     }
-    _lockManager.dispose();
     _instances.remove(this);
   }
 

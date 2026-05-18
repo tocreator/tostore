@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../handler/logger.dart';
+import '../handler/binary_schema_codec.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
@@ -316,7 +317,10 @@ class TableDataManager {
 
         // Only cache if the record is NOT marked as deleted in the global write buffer.
         final bufferEntry =
-            _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+            _dataStore.writeBufferManager.getBufferedRecordForRead(
+          tableName,
+          pk,
+        );
         if (bufferEntry != null &&
             bufferEntry.operation == BufferOperationType.delete) {
           continue;
@@ -2316,7 +2320,10 @@ class TableDataManager {
 
         // Check buffer for updates/deletes (O(1) lookup)
         final bufferEntry =
-            _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+            _dataStore.writeBufferManager.getBufferedRecordForRead(
+          tableName,
+          pk,
+        );
         if (bufferEntry != null) {
           if (bufferEntry.operation == BufferOperationType.delete) {
             return null;
@@ -2458,8 +2465,10 @@ class TableDataManager {
         }
         if (shadowedByDelete) continue;
 
-        final entry =
-            _dataStore.writeBufferManager.getBufferedRecord(tableName, key);
+        final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
+          tableName,
+          key,
+        );
         if (entry != null &&
             entry.operation != BufferOperationType.delete &&
             !isDeletedRecord(entry.data)) {
@@ -2497,6 +2506,7 @@ class TableDataManager {
   Future<void> streamPartitionPageBatches({
     required String tableName,
     TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
     int? startPartitionNo,
     List<int>? targetPartitionNos,
     int pagesPerBatch = _largePartitionStreamingPagesPerBatch,
@@ -2551,6 +2561,7 @@ class TableDataManager {
         encryptionKey: customKey,
         encryptionKeyId: customKeyId,
         decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
       )) {
         if (effectiveController.shouldStopCurrentBatch) break;
         emitted = true;
@@ -2673,7 +2684,8 @@ class TableDataManager {
     _txnDeferredOps.remove(txId);
   }
 
-  String _tableLockResource(String tableName) => 'table_$tableName';
+  String _tableLockResource(String tableName) =>
+      _dataStore.getScopedResourceKey('table_$tableName');
 
   Future<TableWriteLock> acquireTableWriteLock(
     String tableName, {
@@ -3090,8 +3102,10 @@ class TableDataManager {
       // We iterate a snapshot of initial keys because baseRecords might change.
       final initialKeys = baseRecords.keys.toList(growable: false);
       for (final pk in initialKeys) {
-        final be =
-            _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+        final be = _dataStore.writeBufferManager.getBufferedRecordForRead(
+          tableName,
+          pk,
+        );
         if (be != null) {
           if (be.operation == BufferOperationType.delete) {
             baseRecords.remove(pk);
@@ -3112,8 +3126,10 @@ class TableDataManager {
 
         if (keyPredicate != null && !keyPredicate(key)) continue;
 
-        final entry =
-            _dataStore.writeBufferManager.getBufferedRecord(tableName, key);
+        final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
+          tableName,
+          key,
+        );
         if (entry == null) continue;
 
         final rec = entry.data;
@@ -3370,6 +3386,8 @@ class TableDataManager {
   /// [tableLock]          - Optional: existing table-level write lock.
   /// [recordCountInsertDelta]/[recordCountDeleteDelta] - Optional logical
   /// count deltas for direct writes that bypass WriteBufferManager statistics.
+  /// [fieldStructureOverride] - Optional physical field layout override.
+  /// [schemaOverride] - Optional schema override (primary-key extraction/encoding).
   Future<void> writeChanges({
     required String tableName,
     List<Map<String, dynamic>> inserts = const [],
@@ -3382,6 +3400,8 @@ class TableDataManager {
     TableWriteLock? tableLock,
     int recordCountInsertDelta = 0,
     int recordCountDeleteDelta = 0,
+    List<FieldStructure>? fieldStructureOverride,
+    TableSchema? schemaOverride,
   }) async {
     final int recordCountDelta =
         recordCountInsertDelta - recordCountDeleteDelta;
@@ -3403,6 +3423,8 @@ class TableDataManager {
           concurrency: concurrency,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
+          fieldStructureOverride: fieldStructureOverride,
+          schemaOverride: schemaOverride,
         );
       },
       tableLock: tableLock,
@@ -3734,11 +3756,11 @@ class TableDataManager {
       if (pk != null) {
         if (onlyCount) {
           // Skip if in buffer for onlyCount fast path to avoid double counting
-          if (bufferMgr.getBufferedRecord(tableName, pk) != null) {
+          if (bufferMgr.getBufferedRecordForRead(tableName, pk) != null) {
             return false;
           }
         } else {
-          final be = bufferMgr.getBufferedRecord(tableName, pk);
+          final be = bufferMgr.getBufferedRecordForRead(tableName, pk);
           if (be != null && be.operation == BufferOperationType.delete) {
             return false;
           }

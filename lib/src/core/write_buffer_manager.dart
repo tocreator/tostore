@@ -952,6 +952,45 @@ class WriteBufferManager {
     return _buffersByTable[tableName]?.records[recordId];
   }
 
+  /// Read-path accessor:
+  /// When a table is under runtime schema migration, normalize buffered records
+  /// to the latest schema shape so callers stay schema-consistent.
+  BufferEntry? getBufferedRecordForRead(String tableName, String recordId) {
+    final migrationManager = _dataStore.migrationManager;
+    var entry = getBufferedRecord(tableName, recordId);
+    if (entry == null) {
+      if (migrationManager == null ||
+          !migrationManager.hasRuntimeMigrationForTable(tableName)) {
+        return null;
+      }
+      final candidates =
+          migrationManager.getRuntimeReadTableCandidates(tableName);
+      for (final candidateTable in candidates) {
+        final candidateEntry = getBufferedRecord(candidateTable, recordId);
+        if (candidateEntry != null) {
+          entry = candidateEntry;
+          break;
+        }
+      }
+      if (entry == null) {
+        return null;
+      }
+    }
+    if (migrationManager == null ||
+        !migrationManager.hasRuntimeMigrationForTable(tableName)) {
+      return entry;
+    }
+    final normalizedData =
+        migrationManager.normalizeRecordForReadSync(tableName, entry.data);
+    final normalizedOldValues = migrationManager.normalizeOldValuesForReadSync(
+        tableName, entry.oldValues);
+    if (identical(normalizedData, entry.data) &&
+        identical(normalizedOldValues, entry.oldValues)) {
+      return entry;
+    }
+    return entry.copyWith(data: normalizedData, oldValues: normalizedOldValues);
+  }
+
   /// Get the maximum primary key value from the buffer for a table
   /// Optimized: Uses side-channel index of inserts to avoid scan.
   /// Returns the latest inserted key (assuming monotonic assumption).

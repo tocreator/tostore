@@ -673,6 +673,21 @@ class QueryExecutor {
         }
       }
 
+      // Single-table query tail normalization:
+      // - remove internal/deleted-slot payload fields
+      // - fill missing schema fields with defaults
+      // - enforce user-defined schema field order
+      if ((joins == null || joins.isEmpty) && results.isNotEmpty) {
+        final schemaMgr = _dataStore.schemaManager;
+        if (schemaMgr != null) {
+          results = List<Map<String, dynamic>>.generate(
+            results.length,
+            (i) => schemaMgr.normalizeRecordToSchema(schema, results[i]),
+            growable: false,
+          );
+        }
+      }
+
       // Use getTableRecordCount for accurate, buffer-aware record count (O(1) approach).
       int? tableTotalCount;
       try {
@@ -2054,7 +2069,7 @@ class QueryExecutor {
               // Skip if in buffer for onlyCount fast path to avoid double counting
               if (onlyCount &&
                   _dataStore.writeBufferManager
-                          .getBufferedRecord(tableName, pk) !=
+                          .getBufferedRecordForRead(tableName, pk) !=
                       null) {
                 continue;
               }
@@ -2137,13 +2152,13 @@ class QueryExecutor {
                 // Skip if in buffer for onlyCount
                 if (onlyCount) {
                   if (_dataStore.writeBufferManager
-                          .getBufferedRecord(tableName, pk) !=
+                          .getBufferedRecordForRead(tableName, pk) !=
                       null) {
                     continue;
                   }
                 } else {
                   final be = _dataStore.writeBufferManager
-                      .getBufferedRecord(tableName, pk);
+                      .getBufferedRecordForRead(tableName, pk);
                   if (be != null &&
                       be.operation == BufferOperationType.delete) {
                     continue;
@@ -2377,13 +2392,13 @@ class QueryExecutor {
             // Skip if in buffer for onlyCount
             if (onlyCount) {
               if (_dataStore.writeBufferManager
-                      .getBufferedRecord(tableName, pk) !=
+                      .getBufferedRecordForRead(tableName, pk) !=
                   null) {
                 continue;
               }
             } else {
               final be = _dataStore.writeBufferManager
-                  .getBufferedRecord(tableName, pk);
+                  .getBufferedRecordForRead(tableName, pk);
               if (be != null && be.operation == BufferOperationType.delete) {
                 continue;
               }

@@ -428,6 +428,162 @@ enum FileType {
   String toString() => key;
 }
 
+/// Stable storage slot metadata for a table field.
+///
+/// Slots are append-only identifiers for physical value ordering in record
+/// payloads. Logical schema field order can change independently.
+class FieldStorageSlot {
+  /// Stable slot id (monotonic in one table).
+  final int slotId;
+
+  /// Stable field id from schema, when available.
+  final String? fieldId;
+
+  /// Latest logical field name mapped to this slot.
+  final String fieldName;
+
+  /// DataType enum index persisted at the slot layer.
+  final int typeIndex;
+
+  /// Whether this slot is logically deleted.
+  final bool deleted;
+
+  const FieldStorageSlot({
+    required this.slotId,
+    this.fieldId,
+    required this.fieldName,
+    required this.typeIndex,
+    this.deleted = false,
+  });
+
+  FieldStorageSlot copyWith({
+    int? slotId,
+    String? fieldId,
+    String? fieldName,
+    int? typeIndex,
+    bool? deleted,
+  }) {
+    return FieldStorageSlot(
+      slotId: slotId ?? this.slotId,
+      fieldId: fieldId ?? this.fieldId,
+      fieldName: fieldName ?? this.fieldName,
+      typeIndex: typeIndex ?? this.typeIndex,
+      deleted: deleted ?? this.deleted,
+    );
+  }
+
+  factory FieldStorageSlot.fromJson(Map<String, dynamic> json) {
+    return FieldStorageSlot(
+      slotId: (json['slotId'] as num?)?.toInt() ?? 0,
+      fieldId: json['fieldId'] as String?,
+      fieldName: (json['fieldName'] as String?) ?? '',
+      typeIndex: (json['typeIndex'] as num?)?.toInt() ?? 0,
+      deleted: json['deleted'] as bool? ?? false,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'slotId': slotId,
+      if (fieldId != null) 'fieldId': fieldId,
+      'fieldName': fieldName,
+      'typeIndex': typeIndex,
+      if (deleted) 'deleted': true,
+    };
+  }
+}
+
+/// Stable field storage layout metadata for a table.
+class FieldStorageLayout {
+  /// Layout metadata version (not table schema version).
+  final int version;
+
+  /// Next allocatable slot id for append-only growth.
+  final int nextSlotId;
+
+  /// Ordered storage slots.
+  final List<FieldStorageSlot> slots;
+
+  const FieldStorageLayout({
+    this.version = 1,
+    required this.nextSlotId,
+    required this.slots,
+  });
+
+  FieldStorageLayout copyWith({
+    int? version,
+    int? nextSlotId,
+    List<FieldStorageSlot>? slots,
+  }) {
+    return FieldStorageLayout(
+      version: version ?? this.version,
+      nextSlotId: nextSlotId ?? this.nextSlotId,
+      slots: slots ?? List<FieldStorageSlot>.from(this.slots),
+    );
+  }
+
+  int get totalSlots => slots.length;
+
+  int get deletedSlotsCount {
+    var count = 0;
+    for (final slot in slots) {
+      if (slot.deleted) count++;
+    }
+    return count;
+  }
+
+  double get deletedSlotsRatio {
+    if (slots.isEmpty) return 0.0;
+    return deletedSlotsCount / slots.length;
+  }
+
+  FieldStorageLayout compactDeletedSlots() {
+    final active = slots.where((slot) => !slot.deleted).toList(growable: false);
+    final compacted = <FieldStorageSlot>[];
+    for (int i = 0; i < active.length; i++) {
+      compacted.add(active[i].copyWith(slotId: i));
+    }
+    return FieldStorageLayout(
+      version: version,
+      nextSlotId: compacted.length,
+      slots: compacted,
+    );
+  }
+
+  factory FieldStorageLayout.fromJson(Map<String, dynamic> json) {
+    final rawSlots = json['slots'];
+    final slots = <FieldStorageSlot>[];
+    if (rawSlots is List) {
+      for (final raw in rawSlots) {
+        if (raw is Map<String, dynamic>) {
+          slots.add(FieldStorageSlot.fromJson(raw));
+        } else if (raw is Map) {
+          slots.add(FieldStorageSlot.fromJson(Map<String, dynamic>.from(raw)));
+        }
+      }
+    }
+
+    int maxSlotId = -1;
+    for (final slot in slots) {
+      if (slot.slotId > maxSlotId) maxSlotId = slot.slotId;
+    }
+
+    return FieldStorageLayout(
+      version: (json['version'] as num?)?.toInt() ?? 1,
+      nextSlotId: (json['nextSlotId'] as num?)?.toInt() ?? (maxSlotId + 1),
+      slots: slots,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'version': version,
+      'nextSlotId': nextSlotId,
+      'slots': slots.map((slot) => slot.toJson()).toList(growable: false),
+    };
+  }
+}
+
 /// table schema partition file meta
 class SchemaPartitionMeta {
   /// partition version
@@ -448,6 +604,9 @@ class SchemaPartitionMeta {
   /// table schema data
   final Map<String, dynamic> tableSchemas;
 
+  /// stable field storage layout per table
+  final Map<String, dynamic> tableFieldLayouts;
+
   /// timestamps
   final Timestamps timestamps;
 
@@ -463,6 +622,7 @@ class SchemaPartitionMeta {
     required this.tableNames,
     required this.tableSizes,
     required this.tableSchemas,
+    required this.tableFieldLayouts,
     required this.timestamps,
     this.dirIndex,
   }) : version = version ?? InternalConfig.schemaVersion;
@@ -474,6 +634,7 @@ class SchemaPartitionMeta {
     List<String>? tableNames,
     Map<String, int>? tableSizes,
     Map<String, dynamic>? tableSchemas,
+    Map<String, dynamic>? tableFieldLayouts,
     Timestamps? timestamps,
     int? dirIndex,
   }) {
@@ -484,6 +645,7 @@ class SchemaPartitionMeta {
       tableNames: tableNames ?? List.from(this.tableNames),
       tableSizes: tableSizes ?? Map.from(this.tableSizes),
       tableSchemas: tableSchemas ?? Map.from(this.tableSchemas),
+      tableFieldLayouts: tableFieldLayouts ?? Map.from(this.tableFieldLayouts),
       timestamps: timestamps ?? this.timestamps,
       dirIndex: dirIndex ?? this.dirIndex,
     );
@@ -498,6 +660,9 @@ class SchemaPartitionMeta {
       tableNames: List<String>.from(json['tableNames'] as List),
       tableSizes: Map<String, int>.from(json['tableSizes'] as Map),
       tableSchemas: Map<String, dynamic>.from(json['tableSchemas'] as Map),
+      tableFieldLayouts: json['tableFieldLayouts'] is Map
+          ? Map<String, dynamic>.from(json['tableFieldLayouts'] as Map)
+          : <String, dynamic>{},
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       dirIndex: json['dirIndex'] as int?,
@@ -512,6 +677,7 @@ class SchemaPartitionMeta {
       'tableNames': tableNames,
       'tableSizes': tableSizes,
       'tableSchemas': tableSchemas,
+      'tableFieldLayouts': tableFieldLayouts,
       'timestamps': timestamps.toJson(),
       if (dirIndex != null) 'dirIndex': dirIndex,
     };
@@ -688,6 +854,9 @@ class IndexMeta {
   /// whether the index is unique
   final bool isUnique;
 
+  /// whether the index is still being backfilled
+  final bool isBuilding;
+
   /// total size of all partitions in bytes
   final int totalSizeInBytes;
 
@@ -729,6 +898,7 @@ class IndexMeta {
     required this.tableName,
     required this.fields,
     required this.isUnique,
+    this.isBuilding = false,
     required this.timestamps,
     this.totalSizeInBytes = 0,
     this.totalEntries = 0,
@@ -765,6 +935,7 @@ class IndexMeta {
     required String tableName,
     required List<String> fields,
     required bool isUnique,
+    bool isBuilding = false,
     int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
@@ -775,6 +946,7 @@ class IndexMeta {
       tableName: tableName,
       fields: fields,
       isUnique: isUnique,
+      isBuilding: isBuilding,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
       totalSizeInBytes: 0,
       totalEntries: 0,
@@ -794,6 +966,7 @@ class IndexMeta {
     String? tableName,
     List<String>? fields,
     bool? isUnique,
+    bool? isBuilding,
     int? bTreeOrder,
     Timestamps? timestamps,
     int? totalSizeInBytes,
@@ -812,6 +985,7 @@ class IndexMeta {
       tableName: tableName ?? this.tableName,
       fields: fields ?? List.from(this.fields),
       isUnique: isUnique ?? this.isUnique,
+      isBuilding: isBuilding ?? this.isBuilding,
       timestamps: timestamps ?? this.timestamps,
       totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
       totalEntries: totalEntries ?? this.totalEntries,
@@ -848,6 +1022,7 @@ class IndexMeta {
       tableName: json['tableName'] as String,
       fields: (json['fields'] as List).map((e) => e as String).toList(),
       isUnique: json['isUnique'] as bool,
+      isBuilding: json['isBuilding'] as bool? ?? false,
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       totalSizeInBytes: (json['totalSizeInBytes'] as num?)?.toInt() ?? 0,
@@ -872,6 +1047,7 @@ class IndexMeta {
       'tableName': tableName,
       'fields': fields,
       'isUnique': isUnique,
+      'isBuilding': isBuilding,
       'totalSizeInBytes': totalSizeInBytes,
       'totalEntries': totalEntries,
       'timestamps': timestamps.toJson(),
@@ -887,7 +1063,7 @@ class IndexMeta {
 
   @override
   String toString() {
-    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, isBuilding: $isBuilding, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
   }
 }
 

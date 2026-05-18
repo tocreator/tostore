@@ -4,11 +4,18 @@ import 'package:archive/archive.dart';
 import '../Interface/platform_interface.dart';
 import '../handler/logger.dart';
 import '../core/storage_adapter.dart';
+import '../core/lock_manager.dart';
+import '../core/shared_engine_registry.dart';
 
 /// Web platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
   static final Map<String, String> _tempDirs = {};
   static int _tempCounter = 0;
+
+  // Shared lock manager for platform-level storage operations
+  static final LockManager _lockManager = SharedEngineRegistry.getLockManager(
+    'platform_handler_web',
+  );
 
   @override
   bool get isMobile => false;
@@ -67,7 +74,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<String> createTempDirectory(String prefix) async {
     try {
-      final storage = StorageAdapter();
+      final storage = StorageAdapter(lockManager: _lockManager);
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final counter = _tempCounter++;
 
@@ -95,7 +102,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<void> deleteDirectory(String path, {bool recursive = true}) async {
     try {
-      final storage = StorageAdapter();
+      final storage = StorageAdapter(lockManager: _lockManager);
 
       // actually delete directory
       if (await storage.existsDirectory(path)) {
@@ -115,7 +122,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   Future<void> compressDirectory(String sourceDir, String targetZip) async {
     try {
       final archive = Archive();
-      final storage = StorageAdapter();
+      final storage = StorageAdapter(lockManager: _lockManager);
 
       // check if source directory exists
       if (!await storage.existsDirectory(sourceDir)) {
@@ -171,7 +178,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<void> extractZip(String zipPath, String targetDir) async {
     try {
-      final storage = StorageAdapter();
+      final storage = StorageAdapter(lockManager: _lockManager);
 
       // ensure target directory exists
       await storage.ensureDirectoryExists(targetDir);
@@ -224,7 +231,7 @@ class PlatformHandlerImpl implements PlatformInterface {
   @override
   Future<bool> verifyZipFile(String zipPath, {String? requiredFile}) async {
     try {
-      final storage = StorageAdapter();
+      final storage = StorageAdapter(lockManager: _lockManager);
 
       // Check if file exists
       if (!await storage.existsFile(zipPath)) {

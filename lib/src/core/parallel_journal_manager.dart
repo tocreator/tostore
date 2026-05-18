@@ -21,6 +21,7 @@ import 'btree_page.dart';
 import 'compute/wal_decode_batch_runner.dart';
 import 'data_store_impl.dart';
 import 'io_concurrency_planner.dart';
+import 'migration_manager.dart';
 import 'page_redo_log_codec.dart';
 import 'storage_adapter.dart';
 import 'wal_manager.dart';
@@ -63,6 +64,13 @@ class ParallelJournalManager {
   /// Check if currently in recovery mode (recovering from a pending batch)
   /// Returns true only when actively recovering a pending batch, not just when pending batches exist
   bool get isInRecoveryMode => _isRecovering;
+
+  /// Wait until background recovery (if any) is completed.
+  Future<void> waitUntilRecoveryCompleted() async {
+    while (_isRecovering) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
 
   /// Write backpressure: called by WriteBufferManager before enqueue.
   ///
@@ -273,10 +281,16 @@ class ParallelJournalManager {
     }
   }
 
-  void _scheduleFlushIfNeeded() {
+  void scheduleFlushIfNeeded() {
     if (!_running) return;
     if (_flushInProgress) return;
-    if (_bufferManager.isEmpty) return;
+
+    final hasNormalData = !_bufferManager.isEmpty;
+    final hasMigrationData =
+        _dataStore.migrationManager?.hasPreparedData ?? false;
+
+    if (!hasNormalData && !hasMigrationData) return;
+
     _flushInProgress = true;
     final fut = _pumpFlush();
     _loopFuture = fut;
@@ -362,7 +376,13 @@ class ParallelJournalManager {
     bool firstIteration = true;
     final int delayMs = _dataStore.config.maxFlushLatencyMs;
 
-    while (_running && !_bufferManager.isEmpty) {
+    final migrationManager = _dataStore.migrationManager;
+
+    while (_running &&
+        (!_bufferManager.isEmpty ||
+            (migrationManager
+                    ?.hasPreparedDataFor(_dataStore.currentSpaceName) ??
+                false))) {
       List<WriteQueueEntry> batch = const <WriteQueueEntry>[];
       try {
         // This is the first iteration, we need to ensure at least one batch is flushed.
@@ -387,58 +407,146 @@ class ParallelJournalManager {
         }
 
         final batchSw = Stopwatch()..start();
-        batch = _bufferManager.popBatch(batchSize);
-        if (batch.isEmpty) {
+
+        final int migrationRecordsCount;
+        List<MigrationPreparedBatch> migrationBatches = const [];
+
+        if (migrationManager != null) {
+          migrationBatches = migrationManager.pollMigrationBatches(
+              _dataStore.currentSpaceName, batchSize);
+        }
+
+        // Count actual migration records polled
+        int count = 0;
+        for (final mb in migrationBatches) {
+          count += mb.entries.length;
+        }
+        migrationRecordsCount = count;
+
+        // Calculate remaining capacity for normal writes
+        final int normalBatchSize = max(0, batchSize - migrationRecordsCount);
+
+        // Pop normal batch from buffer manager
+        if (normalBatchSize > 0) {
+          batch = _bufferManager.popBatch(normalBatchSize);
+        }
+
+        if (batch.isEmpty && migrationBatches.isEmpty) {
+          // Both queues are empty, but we might have arrived here due to notifyMigrationDataReady
+          // Just break the loop and wait for next schedule.
           break;
         }
 
-        Logger.debug("Executing batch with ${batch.length} items",
+        final migrationSuffix = migrationRecordsCount > 0
+            ? " and $migrationRecordsCount migration items"
+            : "";
+        Logger.debug(
+            "Executing batch with ${batch.length} normal items$migrationSuffix",
             label: "ParallelJournalManager._pumpFlush");
 
         firstIteration = false;
         // Compute WAL pointer range (exclude pseudo pointers where partitionIndex == -1)
-        final startPtr = batch.first.walPointer;
-        final endPtr = batch.last.walPointer;
+        final startPtr = batch.isNotEmpty
+            ? batch.first.walPointer
+            : const WalPointer(partitionIndex: -1, entrySeq: 0);
+        final endPtr = batch.isNotEmpty
+            ? batch.last.walPointer
+            : const WalPointer(partitionIndex: -1, entrySeq: 0);
 
         // Group by table and FINAL operation (derive from current buffer entry to allow coalescing and de-dup per PK)
         // Skip entries for tables that are being cleared to avoid race conditions where clearTable
         // deletes files while flush is processing queued operations.
-        final Map<String, Map<BufferOperationType, Map<String, BufferEntry>>>
-            grouped = {};
+        // Coalesce all records (migration + business) by PK to ensure consistency
+        final Map<String, Map<String, BufferEntry>> tablePkMap = {};
         final Map<String, int> tableEpochs = {};
-        // Track queue entries by table for granular cleanup
         final Map<String, List<WriteQueueEntry>> entriesByTable = {};
 
-        int totalBatchUniqueRecords = 0;
         final yieldController =
             YieldController('ParallelJournalManager._pumpFlush');
+
+        // Calculate the target checkpoint for each table in this batch
+        final Map<String, Uint8List?> targetCheckpoints = {};
+        for (final mb in migrationBatches) {
+          if (mb.checkpointKey != null) {
+            // migrationBatches are polled in order, so the latest one for a table wins
+            targetCheckpoints[mb.tableName] = mb.checkpointKey;
+          }
+        }
+
+        // 1. Process migration records (as the "oldest" data in this batch)
+        for (final mb in migrationBatches) {
+          final pkMap = tablePkMap.putIfAbsent(mb.tableName, () => {});
+          final schema =
+              await _dataStore.schemaManager?.getTableSchema(mb.tableName);
+          if (schema == null) continue;
+
+          for (final entry in mb.entries) {
+            final pk = entry.data[schema.primaryKey]?.toString();
+            if (pk == null) continue;
+
+            // Migration is the "base" data, added first.
+            // These entries were pre-constructed in MigrationManager to save CPU here.
+            pkMap[pk] = entry;
+            await yieldController.maybeYield();
+          }
+        }
+
+        // 2. Process business writes (as the "newer" data, overwriting migration)
         for (final e in batch) {
           await yieldController.maybeYield();
-          // Capture epoch for this table if not already captured in this batch
           tableEpochs.putIfAbsent(
               e.tableName, () => _bufferManager.getClearEpoch(e.tableName));
 
           final be = _bufferManager.getBufferedRecord(e.tableName, e.recordId);
-          if (be == null) continue; // may have been cleared by other flow
+          if (be == null) continue;
+
+          BufferEntry effectiveEntry = be;
+          final migrationManager = _dataStore.migrationManager;
+          if (migrationManager != null &&
+              migrationManager.shouldNormalizeBufferedWrite(
+                e.tableName,
+                be.walPointer,
+              )) {
+            final normalizedData = migrationManager.normalizeRecordForReadSync(
+              e.tableName,
+              be.data,
+            );
+            final normalizedOldValues =
+                migrationManager.normalizeOldValuesForReadSync(
+              e.tableName,
+              be.oldValues,
+            );
+            effectiveEntry = be.copyWith(
+                data: normalizedData, oldValues: normalizedOldValues);
+          }
 
           // Check if table is being cleared - if so, skip this entry to avoid race condition
           if (_dataStore.tableDataManager.isTableBeingCleared(e.tableName)) {
             continue;
           }
 
-          final currentOp = be.operation;
-          final byOp = grouped.putIfAbsent(e.tableName,
-              () => <BufferOperationType, Map<String, BufferEntry>>{});
-          final mapByPk =
-              byOp.putIfAbsent(currentOp, () => <String, BufferEntry>{});
-
-          if (!mapByPk.containsKey(e.recordId)) {
-            totalBatchUniqueRecords++;
-            mapByPk[e.recordId] = be;
-          }
+          // Business write ALWAYS overwrites migration data for the same PK
+          final pkMap = tablePkMap.putIfAbsent(e.tableName, () => {});
+          pkMap[e.recordId] = effectiveEntry;
 
           entriesByTable.putIfAbsent(e.tableName, () => []).add(e);
         }
+
+        // 3. Finalize 'grouped' structure from the coalesced PK maps
+        final Map<String, Map<BufferOperationType, Map<String, BufferEntry>>>
+            grouped = {};
+        int totalBatchUniqueRecords = 0;
+
+        tablePkMap.forEach((table, pkMap) {
+          final byOp = grouped.putIfAbsent(
+              table, () => <BufferOperationType, Map<String, BufferEntry>>{});
+          pkMap.forEach((pk, entry) {
+            final mapByOp = byOp.putIfAbsent(
+                entry.operation, () => <String, BufferEntry>{});
+            mapByOp[pk] = entry;
+            totalBatchUniqueRecords++;
+          });
+        });
 
         final journaling = _dataStore.config.enableJournal;
         // Register pending batch in WAL meta and write batch header (multi-batch)
@@ -631,22 +739,111 @@ class ParallelJournalManager {
                       await _dataStore.schemaManager?.getTableSchema(table);
                   if (schema == null) return;
                   final pkName = schema.primaryKey;
-
-                  final insertRecords =
+                  final logicalInsertRecords =
                       inserts.map((e) => e.data).toList(growable: false);
-                  final updateRecords =
-                      updates.map((e) => e.data).toList(growable: false);
-                  final deleteRecords =
+                  final logicalDeleteRecords =
                       deletes.map((e) => e.data).toList(growable: false);
+                  final migrationManager = _dataStore.migrationManager;
+                  final legacyFieldStruct =
+                      migrationManager?.getLegacyFieldStructureForWrite(table);
+                  final legacySchema =
+                      migrationManager?.getLegacySchemaForWrite(table);
+                  final hasLegacyPhysicalSplit = migrationManager != null &&
+                      legacyFieldStruct != null &&
+                      legacyFieldStruct.isNotEmpty &&
+                      migrationManager.hasRuntimeMigrationForTable(table);
 
-                  // Best-effort: fill missing oldValues from persisted table data (batch lookup).
+                  final insertRecords = <Map<String, dynamic>>[];
+                  final updateRecords = <Map<String, dynamic>>[];
+                  final deleteRecords = <Map<String, dynamic>>[];
+                  final legacyInsertRecords = <Map<String, dynamic>>[];
+                  final legacyUpdateRecords = <Map<String, dynamic>>[];
+                  final legacyDeleteRecords = <Map<String, dynamic>>[];
+
+                  void classifyForPhysicalWrite(
+                    BufferEntry entry,
+                    List<Map<String, dynamic>> latestBucket,
+                    List<Map<String, dynamic>> legacyBucket,
+                  ) {
+                    final data = entry.data;
+
+                    // 1. Migration records are ALWAYS written in latest format
+                    // These carry a pseudo-WAL pointer with partitionIndex -1.
+                    if (entry.walPointer?.partitionIndex == -1) {
+                      latestBucket.add(data);
+                      return;
+                    }
+
+                    if (!hasLegacyPhysicalSplit) {
+                      latestBucket.add(data);
+                      return;
+                    }
+
+                    // 2. Business writes are classified based on the batch checkpoint
+                    // to ensure they stay in the new format if the migration has already
+                    // moved past their PK in this flush cycle.
+                    final useLegacy = migrationManager
+                        .shouldStoreLegacyPhysicalFormatForRecord(
+                      table,
+                      data,
+                      batchCheckpoint: targetCheckpoints[table],
+                    );
+                    if (!useLegacy) {
+                      latestBucket.add(data);
+                      return;
+                    }
+                    legacyBucket.add(
+                      migrationManager.convertCurrentRecordToLegacyForWriteSync(
+                        table,
+                        data,
+                      ),
+                    );
+                  }
+
+                  // 1) Classification and Old Value Preparation
+                  if (!hasLegacyPhysicalSplit) {
+                    // Fast Path: No active migration for this table.
+                    insertRecords.addAll(logicalInsertRecords);
+                    deleteRecords.addAll(logicalDeleteRecords);
+                  } else {
+                    // Slow Path: PK-aware classification for online migration.
+                    for (final entry in inserts) {
+                      await yieldController.maybeYield();
+                      classifyForPhysicalWrite(
+                        entry,
+                        insertRecords,
+                        legacyInsertRecords,
+                      );
+                    }
+                    for (final entry in deletes) {
+                      await yieldController.maybeYield();
+                      classifyForPhysicalWrite(
+                        entry,
+                        deleteRecords,
+                        legacyDeleteRecords,
+                      );
+                    }
+                  }
+
+                  // Unified Updates Loop: Handles classification AND old value collection in one pass.
                   final missingOld = <String>[];
                   for (final u in updates) {
                     await yieldController.maybeYield();
-                    if (u.oldValues != null) continue;
-                    final pk = u.data[pkName]?.toString();
-                    if (pk == null || pk.isEmpty) continue;
-                    missingOld.add(pk);
+                    // Classification
+                    if (!hasLegacyPhysicalSplit) {
+                      updateRecords.add(u.data);
+                    } else {
+                      classifyForPhysicalWrite(
+                        u,
+                        updateRecords,
+                        legacyUpdateRecords,
+                      );
+                    }
+                    // Old values collection for index maintenance
+                    if (u.oldValues == null) {
+                      final pk = u.data[pkName]?.toString();
+                      if (pk != null && pk.isNotEmpty) missingOld.add(pk);
+                    }
                   }
                   final oldByPk = <String, Map<String, dynamic>>{};
                   if (missingOld.isNotEmpty) {
@@ -657,16 +854,32 @@ class ParallelJournalManager {
                         missingOld,
                       );
                       for (final r in olds.records) {
+                        await yieldController.maybeYield();
                         final pk = r[pkName]?.toString();
                         if (pk == null || pk.isEmpty) continue;
-                        oldByPk[pk] = r;
+
+                        var normalizedRecord = r;
+                        // IMPORTANT: If we are in migration, the queried record might be in LEGACY format.
+                        // We must normalize it to the NEW schema so IndexManager can correctly
+                        // calculate which index entries to remove (especially if fields were renamed).
+                        if (migrationManager != null &&
+                            migrationManager
+                                .hasRuntimeMigrationForTable(table)) {
+                          if (migrationManager
+                              .shouldPreferLegacyDecodeForRecord(table, r,
+                                  batchCheckpoint: targetCheckpoints[table])) {
+                            normalizedRecord = migrationManager
+                                .normalizeRecordForReadSync(table, r);
+                          }
+                        }
+                        oldByPk[pk] = normalizedRecord;
                       }
                     } catch (_) {}
                   }
 
                   // Prepare Index Updates (CPU bound mostly, but writes are IO)
                   final idxInserts = <Map<String, dynamic>>[];
-                  idxInserts.addAll(insertRecords);
+                  idxInserts.addAll(logicalInsertRecords);
                   final idxUpdates = <IndexRecordUpdate>[];
                   for (final u in updates) {
                     await yieldController.maybeYield();
@@ -707,16 +920,38 @@ class ParallelJournalManager {
                   );
 
                   // 1) Table Data
-                  final tableWriteFuture =
-                      _dataStore.tableDataManager.writeChanges(
-                    tableName: table,
-                    inserts: insertRecords,
-                    updates: updateRecords,
-                    deletes: deleteRecords,
-                    batchContext: currentBatchContext,
-                    concurrency: split.tableDataTokens,
-                    tableLock: tableLock,
-                  );
+                  Future<void> writeTableData() async {
+                    if (legacyInsertRecords.isNotEmpty ||
+                        legacyUpdateRecords.isNotEmpty ||
+                        legacyDeleteRecords.isNotEmpty) {
+                      await _dataStore.tableDataManager.writeChanges(
+                        tableName: table,
+                        inserts: legacyInsertRecords,
+                        updates: legacyUpdateRecords,
+                        deletes: legacyDeleteRecords,
+                        batchContext: currentBatchContext,
+                        concurrency: split.tableDataTokens,
+                        tableLock: tableLock,
+                        fieldStructureOverride: legacyFieldStruct,
+                        schemaOverride: legacySchema,
+                      );
+                    }
+                    if (insertRecords.isNotEmpty ||
+                        updateRecords.isNotEmpty ||
+                        deleteRecords.isNotEmpty) {
+                      await _dataStore.tableDataManager.writeChanges(
+                        tableName: table,
+                        inserts: insertRecords,
+                        updates: updateRecords,
+                        deletes: deleteRecords,
+                        batchContext: currentBatchContext,
+                        concurrency: split.tableDataTokens,
+                        tableLock: tableLock,
+                      );
+                    }
+                  }
+
+                  final tableWriteFuture = writeTableData();
 
                   // 2) All indexes (B+Tree + Vector) via single IndexManager entry point.
                   Future<void> indexWrite() async {
@@ -725,7 +960,7 @@ class ParallelJournalManager {
                           tableName: table,
                           inserts: idxInserts,
                           updates: idxUpdates,
-                          deletes: deleteRecords,
+                          deletes: logicalDeleteRecords,
                           batchContext: currentBatchContext,
                           concurrency: split.indexTokens,
                         ) ??
@@ -807,6 +1042,11 @@ class ParallelJournalManager {
             continueOnError: false,
           );
 
+          // 13) Handle migration completion callback after all tables in the batch are persisted
+          if (migrationBatches.isNotEmpty && migrationManager != null) {
+            await migrationManager.onMigrationBatchPersisted(migrationBatches);
+          }
+
           // ── Backpressure: measure per-record flush cost ──
           final batchElapsedUs = batchSw.elapsedMicroseconds;
           if (batch.isNotEmpty) {
@@ -871,7 +1111,7 @@ class ParallelJournalManager {
 
             if (_walManager.meta.pendingBatches.isEmpty) {
               _isRecovering = false;
-              _scheduleFlushIfNeeded(); // Trigger non-batch WAL write queue
+              scheduleFlushIfNeeded(); // Trigger non-batch WAL write queue
               Logger.debug('Parallel journal recovery completed.',
                   label: 'ParallelJournalManager');
             }
@@ -917,7 +1157,7 @@ class ParallelJournalManager {
     }
     // Whenever the buffer becomes non-empty, trigger a flush pump if not running.
     // The pump itself will handle batching and tail latency via maxFlushLatencyMs.
-    _scheduleFlushIfNeeded();
+    scheduleFlushIfNeeded();
     // Also notify WAL manager so that WAL append queue is flushed in a similar cadence.
     try {
       _walManager.scheduleFlushIfNeeded();
@@ -1282,7 +1522,7 @@ class ParallelJournalManager {
 
         // If data was added during recovery, trigger a normal flush
         if (_running && !_bufferManager.isEmpty) {
-          _scheduleFlushIfNeeded();
+          scheduleFlushIfNeeded();
         }
       }
     });
