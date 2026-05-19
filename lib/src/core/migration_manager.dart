@@ -3020,10 +3020,14 @@ class MigrationManager {
           }
 
           // task completed successfully, remove and clean up
-          _pendingTasks.removeAt(0);
+          _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
           await _cleanupTask(task);
           _unregisterRuntimeMigrationForTask(task);
         } catch (e, stack) {
+          if (e is _MigrationStoppedException) {
+            break;
+          }
+
           Logger.error(
             'Migration task execution failed: $e\n$stack',
             label: 'MigrationManager.processMigrationTasks',
@@ -3033,10 +3037,7 @@ class MigrationManager {
           success = false;
 
           // remove failed task, avoid infinite loop
-          if (_pendingTasks.isNotEmpty &&
-              _pendingTasks.first.taskId == task.taskId) {
-            _pendingTasks.removeAt(0);
-          }
+          _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
           _unregisterRuntimeMigrationForTask(task);
         }
       }
