@@ -1695,19 +1695,20 @@ class MigrationManager {
     }.toList()
       ..sort();
     final lockMgr = _dataStore.lockManager;
-    final lockOpId = 'schema_cutover_${DateTime.now().microsecondsSinceEpoch}';
-    final acquiredLocks = <String>[];
+    final acquiredLocks = <String, String>{};
     if (lockMgr != null) {
       for (final name in lockNames) {
         final resource = 'schema_table:$name';
-        final locked = await lockMgr.acquireExclusiveLock(resource, lockOpId);
+        final opId =
+            'schema_cutover_${name}_${DateTime.now().microsecondsSinceEpoch}';
+        final locked = await lockMgr.acquireExclusiveLock(resource, opId);
         if (!locked) {
-          for (final acquired in acquiredLocks.reversed) {
-            lockMgr.releaseExclusiveLock(acquired, lockOpId);
+          for (final entry in acquiredLocks.entries.toList().reversed) {
+            lockMgr.releaseExclusiveLock(entry.key, entry.value);
           }
           throw StateError('Failed to acquire schema cutover lock for $name');
         }
-        acquiredLocks.add(resource);
+        acquiredLocks[resource] = opId;
       }
     }
 
@@ -1757,8 +1758,8 @@ class MigrationManager {
       return currentTableName;
     } finally {
       if (lockMgr != null) {
-        for (final resource in acquiredLocks.reversed) {
-          lockMgr.releaseExclusiveLock(resource, lockOpId);
+        for (final entry in acquiredLocks.entries.toList().reversed) {
+          lockMgr.releaseExclusiveLock(entry.key, entry.value);
         }
       }
     }

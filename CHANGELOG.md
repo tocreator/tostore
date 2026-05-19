@@ -4,14 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## 3.1.4
 
+### Added
+- Added `next()` and `prev()` methods to `QueryResult` for seamless and stateful cursor-based pagination.
+
+### Changed
+- Renamed `nextCursor` and `prevCursor` to `nextCursorToken` and `prevCursorToken` to clarify their role as stateless pagination tokens.
+- Optimized cursor pagination resilience to fully support complex queries and multi-table joins.
+
 ### Fixed
 - Fixed missing `.watch()` notifications for table clearing, drop table, restoration, and batch insert operations.
 
-
-## 3.1.3
-
-### Changed
-- Updated `lints` package version to `^6.1.0` for improved static analysis.
 
 ## 3.1.2
 

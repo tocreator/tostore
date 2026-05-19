@@ -71,6 +71,32 @@ class QueryExecutor {
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
   }) async {
+    final schemaMgr = _dataStore.schemaManager;
+    if (schemaMgr == null) {
+      if (!_dataStore.isInitialized) return ExecuteResult.empty();
+      throw StateError('Schema manager not initialized');
+    }
+
+    final schema = await schemaMgr.getTableSchema(tableName);
+    if (schema == null) {
+      Logger.error('Table $tableName not found, cannot execute query.',
+          label: 'QueryExecutor.execute');
+      return const ExecuteResult.empty();
+    }
+
+    final schemas = <String, TableSchema>{tableName: schema};
+    if (condition != null && !condition.isEmpty) {
+      if (joins != null && joins.isNotEmpty) {
+        for (final join in joins) {
+          final joinSchema = await schemaMgr.getTableSchema(join.table);
+          if (joinSchema != null) {
+            schemas[join.table] = joinSchema;
+          }
+        }
+      }
+      condition.normalize(schemas, tableName);
+    }
+
     final optimizer = _dataStore.getQueryOptimizer();
     if (optimizer == null) {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
@@ -98,7 +124,9 @@ class QueryExecutor {
     return _executeWithPlan(
       plan,
       tableName,
+      schemas: schemas,
       condition: condition,
+      where: where,
       orderBy: orderBy,
       limit: limit,
       offset: offset,
@@ -236,7 +264,9 @@ class QueryExecutor {
   Future<ExecuteResult> _executeWithPlan(
     QueryPlan plan,
     String tableName, {
+    required Map<String, TableSchema> schemas,
     QueryCondition? condition,
+    Map<String, dynamic>? where,
     List<String>? orderBy,
     int? limit,
     int? offset,
@@ -372,48 +402,47 @@ class QueryExecutor {
 
       final stopwatch = Stopwatch()..start();
 
-      final schemas = <String, TableSchema>{};
+      final schema = schemas[tableName]!;
       ConditionRecordMatcher? matcher;
       ConditionRecordMatcher? postJoinMatcher;
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table $tableName not found, cannot execute query.',
-            label: 'QueryExecutor.execute');
-        return const ExecuteResult.empty();
-      }
-      schemas[tableName] = schema;
 
       // Decode cursor token if provided.
       final _QueryCursorToken? cursorToken =
           hasCursor ? _QueryCursorToken.tryDecode(cursor) : null;
-      if (cursorToken != null && cursorToken.tableName != tableName) {
-        throw BusinessError(
-          'Cursor does not match target table.',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'cursorTable': cursorToken.tableName,
-          },
-        );
+      if (cursorToken != null) {
+        if (cursorToken.tableName != tableName) {
+          throw BusinessError(
+            'Cursor does not match target table.',
+            type: BusinessErrorType.dbError,
+            data: {
+              'table': tableName,
+              'cursorTable': cursorToken.tableName,
+            },
+          );
+        }
+
+        // Validate query signature hash to prevent mismatched query cursors
+        if (cursorToken.querySigHash != null) {
+          final currentSigHash = _buildQuerySignatureHash(
+            tableName: tableName,
+            where: where,
+            orderBy: orderBy,
+          );
+          if (cursorToken.querySigHash != currentSigHash) {
+            throw BusinessError(
+              'Mismatched cursor: The query conditions or sorting used for this cursor do not match the current query parameters.',
+              type: BusinessErrorType.dbError,
+              data: {
+                'table': tableName,
+                'query': _deterministicJsonStringify(where),
+                'orderBy': orderBy,
+              },
+            );
+          }
+        }
       }
 
       if (condition != null && !condition.isEmpty) {
-        if (joins != null && joins.isNotEmpty) {
-          for (final join in joins) {
-            if (schemas.containsKey(join.table)) continue;
-            final joinSchema =
-                await _dataStore.schemaManager?.getTableSchema(join.table);
-            if (joinSchema != null) {
-              schemas[join.table] = joinSchema;
-            } else {
-              Logger.warn('Schema for joined table ${join.table} not found.',
-                  label: 'QueryExecutor.execute');
-            }
-          }
-        }
-        // Normalize condition values before preparing the matcher or executing the plan.
-        condition.normalize(schemas, tableName);
-
         final fullMatcher =
             ConditionRecordMatcher.prepare(condition, schemas, tableName);
 
@@ -652,6 +681,7 @@ class QueryExecutor {
               plan: plan,
               orderBy: orderBy,
               lastRecord: lastRec,
+              where: where,
               isBackward: false,
             );
           }
@@ -664,6 +694,7 @@ class QueryExecutor {
               plan: plan,
               orderBy: orderBy,
               lastRecord: firstRec,
+              where: where,
               isBackward: true,
             );
           }
@@ -2686,9 +2717,38 @@ class QueryExecutor {
       );
     }
     final spec = _resolveIndexSpecForCursor(schema, idxName);
-    if (orderBy.length != spec.fields.length) {
+
+    // Dynamic tie-breaker PK normalization:
+    // If the user specifies the primary key at the end of orderBy (e.g. ['age', 'score', 'id']
+    // on a composite index of ['age', 'score'] where 'id' is the primary key),
+    // we strip the trailing PK before index prefix checking since PK is already physically
+    // appended to all non-unique index keys for total stable sorting.
+    final cleanOrderBy = List<String>.from(orderBy);
+    if (cleanOrderBy.isNotEmpty) {
+      final lastParsed = _parseSortField(cleanOrderBy.last);
+      final lastField = lastParsed.field.contains('.')
+          ? lastParsed.field.split('.').last
+          : lastParsed.field;
+      if (lastField == schema.primaryKey) {
+        cleanOrderBy.removeLast();
+      }
+    }
+
+    if (cleanOrderBy.isEmpty && orderBy.isNotEmpty) {
       throw BusinessError(
-        'Index-key cursor pagination requires orderBy to match index fields exactly.',
+        'Index-key cursor pagination requires orderBy to include index fields.',
+        type: BusinessErrorType.dbError,
+        data: {
+          'table': tableName,
+          'index': idxName,
+          'orderBy': orderBy,
+        },
+      );
+    }
+
+    if (cleanOrderBy.length > spec.fields.length) {
+      throw BusinessError(
+        'Index-key cursor pagination requires orderBy to match index fields prefix.',
         type: BusinessErrorType.dbError,
         data: {
           'table': tableName,
@@ -2699,8 +2759,8 @@ class QueryExecutor {
       );
     }
     bool firstIsDesc = false;
-    for (int i = 0; i < orderBy.length; i++) {
-      String f = orderBy[i];
+    for (int i = 0; i < cleanOrderBy.length; i++) {
+      String f = cleanOrderBy[i];
       final parsed = _parseSortField(f);
       f = parsed.field;
       final isDesc = parsed.descending;
@@ -2735,40 +2795,6 @@ class QueryExecutor {
     }
   }
 
-  /// Validate index cursor support: all where conditions must be covered by index fields.
-  ///
-  /// Note: OR queries are converted to UNION plans by the optimizer, and UNION plans
-  /// are rejected before this validation. AND nodes are flattened by _optimizeAndOnly
-  /// into a flat field-to-condition map. The AND/OR check here is defensive programming
-  /// to handle edge cases or future code changes.
-  void _validateIndexCursorSupported({
-    required String tableName,
-    required TableSchema schema,
-    required String indexName,
-    required Map<String, dynamic> where,
-  }) {
-    final spec = _resolveIndexSpecForCursor(schema, indexName);
-    final fieldSet = spec.fields.toSet();
-    for (final e in where.entries) {
-      final k = e.key;
-      // Defensive: skip AND/OR nodes (should not appear in index scan where conditions
-      // as optimizer flattens them, but keep for robustness).
-      if (k == 'AND' || k == 'OR') continue;
-      if (!fieldSet.contains(k)) {
-        throw BusinessError(
-          'Cursor pagination for index scans requires that all query conditions are covered by the index fields.',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'index': indexName,
-            'unsupportedField': k,
-            'indexFields': spec.fields,
-          },
-        );
-      }
-    }
-  }
-
   bool _sameStringList(List<String> a, List<String> b) {
     if (identical(a, b)) return true;
     if (a.length != b.length) return false;
@@ -2776,16 +2802,6 @@ class QueryExecutor {
       if (a[i] != b[i]) return false;
     }
     return true;
-  }
-
-  List<String> _extractOrderByFieldNamesForCursor(List<String> orderBy) {
-    if (orderBy.isEmpty) return const <String>[];
-    final out = <String>[];
-    for (final raw in orderBy) {
-      final parsed = _parseSortField(raw);
-      out.add(_normalizeCursorFieldName(parsed.field));
-    }
-    return out;
   }
 
   bool Function(Map<String, dynamic>) _buildSortKeyCursorFilter({
@@ -2929,144 +2945,12 @@ class QueryExecutor {
     required List<String> orderBy,
     required _QueryCursorToken? cursorToken,
   }) {
+    if (cursorToken != null) {
+      return cursorToken.mode;
+    }
+
     final op = plan.operation;
     final pkOrder = _parsePrimaryKeyOrder(orderBy, schema.primaryKey);
-
-    if (cursorToken != null) {
-      if (cursorToken.mode == _CursorMode.primaryKey) {
-        if (op.type != QueryOperationType.tableScan) {
-          throw BusinessError(
-            'Primary-key cursor requires a TABLE SCAN plan.',
-            type: BusinessErrorType.dbError,
-            data: {'table': tableName, 'plan': op.type.toString()},
-          );
-        }
-        if (!pkOrder.isPkOrder) {
-          throw BusinessError(
-            'Primary-key cursor requires ordering by primary key.',
-            type: BusinessErrorType.dbError,
-            data: {'table': tableName, 'orderBy': orderBy},
-          );
-        }
-        // When navigating backward (isBackward=true), we reverse the scan direction,
-        // so pkOrder.reverse will be the opposite of the original cursor's reverse.
-        // The expected relationship is: pkOrder.reverse == (cursorToken.reverse XOR isBackward)
-        final bool expectedReverse =
-            cursorToken.reverse ^ cursorToken.isBackward;
-        if (expectedReverse != pkOrder.reverse) {
-          throw BusinessError(
-            'Cursor order does not match current orderBy.',
-            type: BusinessErrorType.dbError,
-            data: {
-              'table': tableName,
-              'orderBy': orderBy,
-              'cursorReverse': cursorToken.reverse,
-              'isBackward': cursorToken.isBackward,
-            },
-          );
-        }
-        return _CursorMode.primaryKey;
-      }
-
-      if (cursorToken.mode == _CursorMode.sortKey) {
-        // IMPORTANT:
-        // sort-key cursor requires a stable total ordering and a scan that can apply
-        // keyset filtering efficiently. For index scans, we only allow cursor pagination
-        // when orderBy matches the index key exactly (indexKey mode). Otherwise, keyset
-        // pagination would degrade to repeated full-range scans + post-sort, which is
-        // not acceptable for ultra-large datasets.
-        if (op.type != QueryOperationType.tableScan) {
-          throw BusinessError(
-            'Sort-key cursor is not supported for non-table-scan plans. '
-            'For index scans, ensure orderBy matches the index fields exactly to use index-key cursor pagination.',
-            type: BusinessErrorType.dbError,
-            data: {'table': tableName, 'plan': op.type.toString()},
-          );
-        }
-        if (orderBy.isEmpty) {
-          throw BusinessError(
-            'Sort-key cursor requires explicit orderBy.',
-            type: BusinessErrorType.dbError,
-            data: {'table': tableName},
-          );
-        }
-        final tokenFields = cursorToken.sortFields ?? const <String>[];
-        final curFields = _extractOrderByFieldNamesForCursor(orderBy);
-        final curDesc =
-            orderBy.map((e) => _parseSortField(e).descending).toList();
-        if (tokenFields.isEmpty || !_sameStringList(curFields, tokenFields)) {
-          throw BusinessError(
-            'Cursor orderBy fields do not match current query orderBy.',
-            type: BusinessErrorType.dbError,
-            data: {
-              'table': tableName,
-              'cursorFields': tokenFields,
-              'orderByFields': curFields,
-            },
-          );
-        }
-        final tokenDesc = cursorToken.sortDesc ?? const <bool>[];
-        if (tokenDesc.length == curDesc.length) {
-          for (int i = 0; i < curDesc.length; i++) {
-            final expected = tokenDesc[i] ^ cursorToken.isBackward;
-            if (curDesc[i] != expected) {
-              throw BusinessError(
-                'Cursor orderBy direction does not match current orderBy.',
-                type: BusinessErrorType.dbError,
-                data: {
-                  'table': tableName,
-                  'cursorDesc': tokenDesc,
-                  'orderByDesc': curDesc,
-                  'isBackward': cursorToken.isBackward,
-                },
-              );
-            }
-          }
-        }
-        return _CursorMode.sortKey;
-      }
-
-      // indexKey mode
-      if (op.type != QueryOperationType.indexScan) {
-        throw BusinessError(
-          'Index-key cursor requires an INDEX SCAN plan.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'plan': op.type.toString()},
-        );
-      }
-      final idxName = op.indexName ?? '';
-      if (idxName.isEmpty || cursorToken.indexName != idxName) {
-        throw BusinessError(
-          'Cursor does not match the index used by the query plan.',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'planIndex': idxName,
-            'cursorIndex': cursorToken.indexName,
-          },
-        );
-      }
-      final opVal = op.value;
-      final Map<String, dynamic> where = (opVal is Map<String, dynamic> &&
-              opVal['where'] is Map<String, dynamic>)
-          ? (opVal['where'] as Map<String, dynamic>)
-          : const <String, dynamic>{};
-      _validateIndexCursorSupported(
-        tableName: tableName,
-        schema: schema,
-        indexName: idxName,
-        where: where,
-      );
-      if (orderBy.isNotEmpty) {
-        _validateIndexOrderByForCursor(
-          tableName: tableName,
-          schema: schema,
-          plan: plan,
-          orderBy: orderBy,
-        );
-      }
-      return _CursorMode.indexKey;
-    }
 
     // First page: choose based on plan type.
     if (op.type == QueryOperationType.tableScan) {
@@ -3086,28 +2970,9 @@ class QueryExecutor {
           data: {'table': tableName},
         );
       }
-      final opVal = op.value;
-      final Map<String, dynamic> where = (opVal is Map<String, dynamic> &&
-              opVal['where'] is Map<String, dynamic>)
-          ? (opVal['where'] as Map<String, dynamic>)
-          : const <String, dynamic>{};
 
-      if (where.isNotEmpty) {
-        try {
-          _validateIndexCursorSupported(
-            tableName: tableName,
-            schema: schema,
-            indexName: idxName,
-            where: where,
-          );
-        } catch (e) {
-          // Do not fall back to sort-key cursor for index scans:
-          // - It would require repeated full-range scans + post-sort on each page.
-          // - Cursor semantics become "best effort" and can be surprising when
-          //   query fields and ordering fields are not aligned with the scan key.
-          return null;
-        }
-      }
+      // Check if orderBy aligns with index fields (or empty).
+      bool orderByAligned = true;
       if (orderBy.isNotEmpty) {
         try {
           _validateIndexOrderByForCursor(
@@ -3116,14 +2981,18 @@ class QueryExecutor {
             plan: plan,
             orderBy: orderBy,
           );
-        } catch (e) {
-          // If orderBy doesn't match the index, DO NOT return cursor pagination.
-          // This avoids non-standard cursor behavior for patterns like:
-          // - non-unique index equality query + sorting by other fields
-          return null;
+        } catch (_) {
+          orderByAligned = false;
         }
       }
-      return _CursorMode.indexKey;
+
+      if (orderByAligned) {
+        return _CursorMode.indexKey;
+      } else {
+        // If orderBy does not align with the index, fall back to sortKey cursor
+        // to filter correctly during TopK in-memory sort scan.
+        return orderBy.isNotEmpty ? _CursorMode.sortKey : _CursorMode.indexKey;
+      }
     }
 
     return null;
@@ -3136,8 +3005,15 @@ class QueryExecutor {
     required QueryPlan plan,
     required List<String>? orderBy,
     required Map<String, dynamic> lastRecord,
+    required Map<String, dynamic>? where,
     bool isBackward = false,
   }) {
+    final sigHash = _buildQuerySignatureHash(
+      tableName: tableName,
+      where: where,
+      orderBy: orderBy,
+    );
+
     if (mode == _CursorMode.primaryKey) {
       final pkName = schema.primaryKey;
       final pkVal =
@@ -3162,6 +3038,7 @@ class QueryExecutor {
         primaryKey: pkVal,
         reverse: pkOrder.reverse,
         isBackward: isBackward,
+        querySigHash: sigHash,
       ).encode();
     }
 
@@ -3215,6 +3092,7 @@ class QueryExecutor {
         sortDesc: sortDesc,
         sortKey: MemComparableKey.encodeTuple(comps),
         isBackward: isBackward,
+        querySigHash: sigHash,
       ).encode();
     }
 
@@ -3273,6 +3151,7 @@ class QueryExecutor {
       indexName: idxName,
       indexKey: MemComparableKey.encodeTuple(comps),
       isBackward: isBackward,
+      querySigHash: sigHash,
     ).encode();
   }
 
@@ -3523,6 +3402,7 @@ final class _QueryCursorToken {
   final int version;
   final _CursorMode mode;
   final String tableName;
+  final int? querySigHash;
 
   // primaryKey mode
   final String? primaryKey;
@@ -3552,6 +3432,7 @@ final class _QueryCursorToken {
     required this.sortDesc,
     required this.sortKey,
     this.isBackward = false,
+    this.querySigHash,
   });
 
   factory _QueryCursorToken.primaryKey({
@@ -3559,6 +3440,7 @@ final class _QueryCursorToken {
     required String primaryKey,
     required bool reverse,
     bool isBackward = false,
+    int? querySigHash,
   }) {
     return _QueryCursorToken._(
       version: _currentVersion,
@@ -3572,6 +3454,7 @@ final class _QueryCursorToken {
       sortDesc: null,
       sortKey: null,
       isBackward: isBackward,
+      querySigHash: querySigHash,
     );
   }
 
@@ -3580,6 +3463,7 @@ final class _QueryCursorToken {
     required String indexName,
     required Uint8List indexKey,
     bool isBackward = false,
+    int? querySigHash,
   }) {
     return _QueryCursorToken._(
       version: _currentVersion,
@@ -3593,6 +3477,7 @@ final class _QueryCursorToken {
       sortDesc: null,
       sortKey: null,
       isBackward: isBackward,
+      querySigHash: querySigHash,
     );
   }
 
@@ -3602,6 +3487,7 @@ final class _QueryCursorToken {
     required List<bool> sortDesc,
     required Uint8List sortKey,
     bool isBackward = false,
+    int? querySigHash,
   }) {
     return _QueryCursorToken._(
       version: _currentVersion,
@@ -3615,6 +3501,7 @@ final class _QueryCursorToken {
       sortDesc: List<bool>.from(sortDesc, growable: false),
       sortKey: sortKey,
       isBackward: isBackward,
+      querySigHash: querySigHash,
     );
   }
 
@@ -3626,6 +3513,7 @@ final class _QueryCursorToken {
           ? 'pk'
           : (mode == _CursorMode.indexKey ? 'idx' : 'sk'),
       'b': isBackward,
+      if (querySigHash != null) 's': querySigHash,
     };
 
     if (mode == _CursorMode.primaryKey) {
@@ -3673,6 +3561,8 @@ final class _QueryCursorToken {
         );
       }
 
+      final querySigHash = obj['s'] as int?;
+
       if (m == 'pk') {
         final pk = (obj['pk'] ?? '').toString();
         if (pk.isEmpty) {
@@ -3688,6 +3578,7 @@ final class _QueryCursorToken {
           primaryKey: pk,
           reverse: reverse,
           isBackward: isBackward,
+          querySigHash: querySigHash,
         );
       }
 
@@ -3714,6 +3605,7 @@ final class _QueryCursorToken {
           indexName: idx,
           indexKey: keyBytes,
           isBackward: isBackward,
+          querySigHash: querySigHash,
         );
       }
 
@@ -3758,6 +3650,7 @@ final class _QueryCursorToken {
           sortDesc: desc,
           sortKey: keyBytes,
           isBackward: isBackward,
+          querySigHash: querySigHash,
         );
       }
 
@@ -3775,4 +3668,65 @@ final class _QueryCursorToken {
       );
     }
   }
+}
+
+dynamic _toDeterministicObject(dynamic obj) {
+  if (obj is Map) {
+    final keys = obj.keys.toList();
+    keys.sort((a, b) => a.toString().compareTo(b.toString()));
+    final Map<String, dynamic> sortedMap = {};
+    for (final k in keys) {
+      sortedMap[k.toString()] = _toDeterministicObject(obj[k]);
+    }
+    return sortedMap;
+  } else if (obj is Iterable) {
+    if (obj is Set) {
+      final sortedList = obj.toList()
+        ..sort((a, b) => a.toString().compareTo(b.toString()));
+      return sortedList.map((e) => _toDeterministicObject(e)).toList();
+    }
+    return obj.map((e) => _toDeterministicObject(e)).toList();
+  } else if (obj is DateTime) {
+    // Normalize all DateTimes to UTC to avoid timezone signature mismatches
+    return obj.toUtc().toIso8601String();
+  } else if (obj is double && (obj.isNaN || obj.isInfinite)) {
+    // jsonEncode throws on NaN/Infinity. Stringify them to ensure safety.
+    return obj.toString();
+  } else if (obj == null || obj is num || obj is bool || obj is String) {
+    return obj;
+  } else {
+    try {
+      // Try calling toJson if the object supports it
+      final dynamic toJsonResult = (obj as dynamic).toJson();
+      return _toDeterministicObject(toJsonResult);
+    } catch (_) {
+      // Safely fall back to string representation to prevent jsonEncode crashes
+      return obj.toString();
+    }
+  }
+}
+
+String _deterministicJsonStringify(dynamic obj) {
+  return jsonEncode(_toDeterministicObject(obj));
+}
+
+int _fnv1aHash32(String str) {
+  final bytes = utf8.encode(str);
+  int hash = 2166136261;
+  for (final b in bytes) {
+    hash ^= b;
+    hash = (hash * 16777619) & 0xFFFFFFFF;
+  }
+  return hash;
+}
+
+int _buildQuerySignatureHash({
+  required String tableName,
+  required Map<String, dynamic>? where,
+  required List<String>? orderBy,
+}) {
+  final cleanWhere = _deterministicJsonStringify(where);
+  final cleanOrderBy = jsonEncode(orderBy ?? const <String>[]);
+  final sigStr = '$tableName|$cleanWhere|$cleanOrderBy';
+  return _fnv1aHash32(sigStr);
 }

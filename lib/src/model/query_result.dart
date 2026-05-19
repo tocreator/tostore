@@ -15,11 +15,19 @@ class QueryResult<T> {
   final String message;
 
   /// Cursor/keyset pagination: opaque token for the previous page.
-  final String? prevCursor;
+  final String? prevCursorToken;
 
   /// Cursor/keyset pagination: opaque token for the next page.
   /// - Non-null only when cursor pagination is used and there are more results.
-  final String? nextCursor;
+  final String? nextCursorToken;
+
+  /// Legacy getter for backward compatibility.
+  @Deprecated('Use nextCursorToken instead')
+  String? get nextCursor => nextCursorToken;
+
+  /// Legacy getter for backward compatibility.
+  @Deprecated('Use prevCursorToken instead')
+  String? get prevCursor => prevCursorToken;
 
   /// Whether there are more results beyond the current page.
   ///
@@ -39,20 +47,68 @@ class QueryResult<T> {
   /// Query execution time in milliseconds.
   final int? executionTimeMs;
 
+  /// Callback executors to fetch the next or previous page seamlessly.
+  /// These can automatically handle both cursor-based and offset-based pagination.
+  final Future<QueryResult<T>> Function()? _nextPageExecutor;
+  final Future<QueryResult<T>> Function()? _prevPageExecutor;
+
   QueryResult({
     required this.type,
     required this.data,
     this.message = '',
-    this.prevCursor,
-    this.nextCursor,
+    this.prevCursorToken,
+    this.nextCursorToken,
     this.hasMore = false,
     this.hasPrev = false,
     this.tableTotalCount,
     this.executionTimeMs,
-  });
+    Future<QueryResult<T>> Function()? nextPageExecutor,
+    Future<QueryResult<T>> Function()? prevPageExecutor,
+  })  : _nextPageExecutor = nextPageExecutor,
+        _prevPageExecutor = prevPageExecutor;
 
   /// Get the status code value
   int get code => type.code;
+
+  /// Seamlessly fetch the next page.
+  /// Automatically handles both cursor-based and offset-based pagination.
+  /// Returns an empty QueryResult with code success if there are no more results,
+  /// or a QueryResult with code error if pagination cannot be performed.
+  Future<QueryResult<T>> next() async {
+    final exec = _nextPageExecutor;
+    if (!hasMore || exec == null) {
+      return QueryResult.success(
+        data: const [],
+        hasMore: false,
+        hasPrev: hasPrev,
+        tableTotalCount: tableTotalCount,
+        message: exec == null
+            ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
+            : 'No more results available.',
+      );
+    }
+    return exec();
+  }
+
+  /// Seamlessly fetch the previous page.
+  /// Automatically handles both cursor-based and offset-based pagination.
+  /// Returns an empty QueryResult with code success if there are no previous results
+  /// or if pagination cannot be performed.
+  Future<QueryResult<T>> prev() async {
+    final exec = _prevPageExecutor;
+    if (!hasPrev || exec == null) {
+      return QueryResult.success(
+        data: const [],
+        hasMore: hasMore,
+        hasPrev: false,
+        tableTotalCount: tableTotalCount,
+        message: exec == null
+            ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
+            : 'No previous results available.',
+      );
+    }
+    return exec();
+  }
 
   /// create a success result
   factory QueryResult.success({
@@ -60,21 +116,27 @@ class QueryResult<T> {
     String message = '',
     String? prevCursor,
     String? nextCursor,
+    String? prevCursorToken,
+    String? nextCursorToken,
     bool hasMore = false,
     bool hasPrev = false,
     int? tableTotalCount,
     int? executionTimeMs,
+    Future<QueryResult<T>> Function()? nextPageExecutor,
+    Future<QueryResult<T>> Function()? prevPageExecutor,
   }) {
     return QueryResult(
       data: data,
       type: ResultType.success,
       message: message.isNotEmpty ? message : ResultType.success.message,
-      prevCursor: prevCursor,
-      nextCursor: nextCursor,
+      prevCursorToken: prevCursorToken ?? prevCursor,
+      nextCursorToken: nextCursorToken ?? nextCursor,
       hasMore: hasMore,
       hasPrev: hasPrev,
       tableTotalCount: tableTotalCount,
       executionTimeMs: executionTimeMs,
+      nextPageExecutor: nextPageExecutor,
+      prevPageExecutor: prevPageExecutor,
     );
   }
 
@@ -102,7 +164,7 @@ class QueryResult<T> {
   /// Override toString for easy debugging
   @override
   String toString() {
-    return 'QueryResult{code: $code, message: $message, data: $data, prevCursor: $prevCursor, nextCursor: $nextCursor, hasMore: $hasMore, hasPrev: $hasPrev, tableTotalCount: $tableTotalCount}';
+    return 'QueryResult{code: $code, message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, tableTotalCount: $tableTotalCount}';
   }
 
   /// for serialization
@@ -113,8 +175,8 @@ class QueryResult<T> {
       'data': data is List<Map<String, dynamic>>
           ? data
           : null, // only serialize data when T is Map<String, dynamic>
-      if (prevCursor != null) 'prevCursor': prevCursor,
-      if (nextCursor != null) 'nextCursor': nextCursor,
+      if (prevCursorToken != null) 'prevCursor': prevCursorToken,
+      if (nextCursorToken != null) 'nextCursor': nextCursorToken,
       'hasMore': hasMore,
       'hasPrev': hasPrev,
       if (tableTotalCount != null) 'tableTotalCount': tableTotalCount,
@@ -128,11 +190,11 @@ class QueryResult<T> {
       type: ResultType.fromCode(json['code'] as int),
       message: json['message'] as String? ?? '',
       data: (json['data'] as List?)
-              ?.map((e) => Map<String, dynamic>.from(e as Map<String, dynamic>))
+              ?.map((e) => Map<String, dynamic>.from(e as Map))
               .toList() ??
           [],
-      prevCursor: json['prevCursor'] as String?,
-      nextCursor: json['nextCursor'] as String?,
+      prevCursorToken: json['prevCursor'] as String?,
+      nextCursorToken: json['nextCursor'] as String?,
       hasMore: json['hasMore'] == true,
       hasPrev: json['hasPrev'] == true,
       tableTotalCount: json['tableTotalCount'] as int?,

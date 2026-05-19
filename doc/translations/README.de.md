@@ -888,53 +888,75 @@ final results = await db.query('heavy_table')
 ### <a id="query-pagination"></a>Abfrage und effiziente Paginierung
 
 > [!TIP]
-> **Für optimale Leistung immer `limit` angeben**: Es wird dringend empfohlen, in jeder Abfrage explizit `limit` anzugeben. Wenn es weggelassen wird, verwendet die Engine standardmäßig 1000 Zeilen. Die Kernabfrage-Engine ist schnell, aber die Serialisierung sehr großer Ergebnismengen in der Anwendungsschicht kann dennoch zu unnötigem Overhead führen.
+> **Geben Sie immer `limit` als Seitengröße an**: Es wird dringend empfohlen, in jeder Abfrage explizit ein `limit` festzulegen. Wenn es weggelassen wird, begrenzt die Engine die Abfrage standardmäßig auf 1.000 Datensätze, um das Laden zu großer Datenmengen auf einmal zu verhindern.
 
-ToStore bietet zwei Paginierungsmodi, sodass Sie je nach Skalierungs- und Leistungsanforderungen eine Auswahl treffen können:
+ToStore unterstützt Dual-Mode-Paginierung. Für unendliches Scrollen oder das Laden von Listen empfehlen wir dringend die integrierte **nahtlose Cursor-Paginierung**. Für das direkte Springen zu bestimmten Seiten reicht die einfache Offset-Paginierung aus:
 
-#### 1. Grundlegende Paginierung (Offset-Modus)
-Geeignet für relativ kleine Datensätze oder Fälle, in denen Sie präzise Seitensprünge benötigen.
+#### 1. Einfache Paginierung (Offset-Modus)
+Geeignet für Szenarien mit geringen Datenmengen (z. B. unter 10k) oder wenn Sie gezielt zu einer bestimmten Seite springen müssen.
 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
-    .offset(40) // Skip the first 40 rows
-    .limit(20); // Take 20 rows
+    .offset(40) // Die ersten 40 Zeilen überspringen
+    .limit(20); // 20 Zeilen abrufen
 ```
 > [!TIP]
-> Wenn `offset` sehr groß wird, muss die Datenbank viele Zeilen scannen und verwerfen, sodass die Leistung linear abnimmt. Für eine tiefe Paginierung bevorzugen Sie den **Cursormodus**.
+> Wenn der `offset` sehr groß wird, muss die Datenbank viele Zeilen scannen und verwerfen, wodurch die Leistung linear abnimmt. Für tiefe Paginierung oder größere Datensätze wird der **Cursor-Modus** empfohlen.
 
-#### 2. Cursor-Paginierung (Cursor-Modus)
-Ideal für große Datensätze und unendliches Scrollen. Durch die Verwendung von `nextCursor` fährt die Engine an der aktuellen Position fort und vermeidet die zusätzlichen Scankosten, die mit tiefen Offsets einhergehen.
+#### 2. Cursor-Paginierung (Cursor-Modus - Empfohlen)
+Ideal für riesige Datensätze und unendliches Scrollen. Indem die Startposition des aktuellen Seiten-Datenstroms aufgezeichnet wird, springt die Engine bei der Paginierung direkt dorthin (Seek). Historische Daten müssen nicht gescannt und verworfen werden, wodurch die Geschwindigkeit bei tiefer Paginierung stets konstant bleibt.
 
-> [!IMPORTANT]
-> Bei einigen komplexen Abfragen oder Sortierungen für nicht indizierte Felder greift die Engine möglicherweise auf einen vollständigen Scan zurück und gibt einen `null`-Cursor zurück, was bedeutet, dass die Paginierung derzeit für diese bestimmte Abfrage nicht unterstützt wird.
+* **Automatische Verwaltung**: Legen Sie die Seitengröße über das Limit fest und rufen Sie einfach `next()` oder `prev()` auf den nachfolgenden Seiten auf, um mühelos eine optimale Paginierungsleistung zu erzielen.
+* **Startpunkt-Verschiebung**: Unterstützt die Kombination mit `.offset(N)` bei der ersten Abfrage, um das Startfenster festzulegen. Danach rufen nachfolgende `next()`-Aufrufe direkt die folgenden Seiten ab.
 
 ```dart
-// First page
+// 1. Erste Abfrage starten
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Use the returned cursor to fetch the next page
-if (page1.nextCursor != null) {
+// 2. Nächste Seite abrufen
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('Anzahl der Einträge auf der nächsten Seite: \${page2.data.length}');
+  
+  // 3. Vorherige Seite abrufen
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('Daten der vorherigen Seite: \${prevPage.data}');
+  }
+}
+```
+
+##### Fortgeschrittenes Szenario: Zustandlose Token-basierte Cursor-Paginierung (Token-based Cursor)
+Wenn Sie Client-Server-APIs entwickeln oder den Paginierungsstatus über Prozesse oder Netzwerke hinweg serialisieren müssen, können Sie Cursor-Token verwenden.
+* Die erste Abfrage gibt die Token-Strings `nextCursorToken` und `prevCursorToken` zurück.
+* Die nachfolgende Abfrage übergibt das Token über `.cursor(token)` für eine gezielte Positionierung (Seek).
+* **Hinweis**: `cursor` und `offset` schließen sich gegenseitig aus. Der Aufruf von `cursor()` löscht automatisch einen zuvor gesetzten `offset` und umgekehrt.
+
+```dart
+// Erste Abfrage (z. B. auf der API-Serverseite)
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // Serialisieren und diesen Token an den Client zurückgeben
+
+// Wenn der Client die nächste Seite mit dem Token anfordert:
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Seek directly to the next position
+      .cursor(nextToken); // Token übergeben, um die Position exakt zu bestimmen und zu lesen
 }
-
-// Likewise, prevCursor enables efficient backward paging
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
-| Funktion | Offset-Modus | Cursormodus |
+| Funktion | Offset-Modus | Cursor-Modus |
 | :--- | :--- | :--- |
-| **Abfrageleistung** | Verliert mit zunehmender Seitentiefe | Stabil für Deep Paging |
-| **Am besten für** | Kleinere Datensätze, exakte Seitensprünge | **Massive Datensätze, unendliches Scrollen** |
-| **Konsistenz bei Änderungen** | Datenänderungen können dazu führen, dass Zeilen übersprungen werden | Vermeidet Duplikate und Auslassungen durch Datenänderungen |
+| **Abfrageleistung** | Nimmt mit zunehmender Seitenzahl ab | Konstante Geschwindigkeit bei tiefer Paginierung |
+| **Beste Eignung** | Kleinere Datensätze, exakte Seitensprünge | **Riesige Datensätze, unendliches Scrollen** |
+| **Konsistenz bei Änderungen** | Datenänderungen können zu doppelten oder übersprungenen Zeilen führen | Vermeidet Duplikate und Auslassungen durch Datenänderungen |
 
 
 ### <a id="foreign-keys"></a>Fremdschlüssel und Kaskadierung

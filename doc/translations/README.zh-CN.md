@@ -915,12 +915,12 @@ final results = await db.query('heavy_table')
 ### <a id="query-pagination"></a>查询与高效分页
 
 > [!TIP]
-> **显式指定 `limit` 以获得最佳性能**：强烈建议在查询时始终指定 `limit`。如果省略，引擎默认限制为 1000 条记录。虽然核心查询速度极快，但在应用层序列化大量记录可能会带来不必要的耗时开销。
+> **显式指定 `limit` 作为每页显示数量**：强烈建议在查询时始终指定 `limit`。如果省略，引擎默认限制为 1000 条记录以避免一次性查询过多数据。
 
-ToStore 提供双模式分页支持，您可以根据数据规模和性能需求灵活选择：
+ToStore 提供双模式分页支持。对于列表滚动或无限加载，极力推荐使用内置的**无缝游标分页**；对于特定页码跳转，使用基础分页即可：
 
 #### 1. 基础分页 (Offset Mode)
-适用于数据量较小（如万级以下）或需要精确跳转页码的场景。
+适用于数据量较小（如万级以下）或需要精确跳转特定页码的场景。
 
 ```dart
 final result = await db.query('users')
@@ -929,39 +929,61 @@ final result = await db.query('users')
     .limit(20); // 取 20 条
 ```
 > [!TIP]
-> 当 `offset` 非常大时，数据库需要扫描并丢弃大量记录，性能会线性下降。建议深度翻页时使用 **Cursor 模式**。
+> 当 `offset` 非常大时，数据库需要扫描并丢弃大量记录，性能会线性下降。建议深度翻页或数据量较大时使用 **Cursor 模式**。
 
-#### 2. 游标分页 (Cursor Mode)
-适合海量数据和无限滚动场景。利用 `nextCursor` 从当前位置继续读取，可避免深度翻页时 `offset` 带来的额外扫描。
+#### 2. 游标分页 (Cursor Mode - 推荐)
+适合海量数据和无限滚动场景。它通过记录当前页数据流的起始位置，在翻页时直接定位到该位置读取，避免了扫描和丢弃历史数据，使得深度翻页的速度始终恒定。
 
-> [!IMPORTANT]
-> 对于部分复杂的查询或针对未索引字段进行排序时，引擎可能会回退到全表扫描并返回 `null` 游标（即暂不支持该特定查询的分页）。
+* **自动管理**：设置 limit 每页显示数量，后续调用 `next()` 或 `prev()` 即可获得极佳的分页性能，简单快捷。
+* **起点定位**：支持在首次查询时配合 `.offset(N)` 定位起始窗口，后续直接调用 `next()` 即可获得下一页数据。
 
 ```dart
-// 第一页查询
+// 1. 发起初始查询
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// 使用返回的游标查询下一页
-if (page1.nextCursor != null) {
+// 2. 获取下一页
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('下一页数据数量: ${page2.data.length}');
+  
+  // 3. 获取上一页
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('返回上一页的数据: ${prevPage.data}');
+  }
+}
+```
+
+##### 高级场景：无状态令牌分页 (Token-based Cursor)
+如果您在进行前后端分离的 API 开发，或者需要在进程、网络传输间序列化分页状态，可以使用游标 Token。
+* 首次查询返回 `nextCursorToken` 和 `prevCursorToken` 字符串。
+* 下次查询通过 `.cursor(token)` 传入 Token 进行 seek。
+* **注意**：`cursor` 与 `offset` 属于互斥参数，调用 `cursor()` 将会自动清除已设置的 `offset`，反之亦然。
+
+```dart
+// 首次查询（例如在 API 服务端）
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // 序列化此 Token 返回给客户端
+
+// 客户端带上 Token 请求下一页时：
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // 传入游标，引擎将直接 seek 到对应位置
+      .cursor(nextToken); // 传入 Token，引擎将精确定位读取
 }
-
-// 同理，使用 prevCursor 可以实现高效回翻
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
 | 特性 | Offset 模式 | Cursor 模式 |
 | :--- | :--- | :--- |
 | **查询性能** | 随页数增加而下降 | 深度翻页时始终恒定 |
-| **适用范围** | 少量数据、精确跳转 | **海量数据、无限滚动** |
-| **数据一致性** | 数据变动后可能导致跳行 | 避免数据变动导致的重复或遗漏 |
+| **适用范围** | 少量数据、精确页码跳转 | **海量数据、无限滚动** |
+| **数据一致性** | 数据变动导致跳行/重复行 | 避免数据变动导致的重复或遗漏 |
 
 
 

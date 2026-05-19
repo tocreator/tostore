@@ -888,12 +888,12 @@ final results = await db.query('heavy_table')
 ### Query and Efficient Pagination
 
 > [!TIP]
-> **Always specify `limit` for best performance**: it is strongly recommended to explicitly provide `limit` in every query. If omitted, the engine defaults to 1000 rows. The core query engine is fast, but serializing very large result sets in the application layer can still add unnecessary overhead.
+> **Explicitly specify `limit` as the page size**: It is strongly recommended to always specify `limit` in your queries. If omitted, the engine defaults to 1000 records to prevent querying too much data at once.
 
-ToStore provides two pagination modes so you can choose based on scale and performance needs:
+ToStore provides dual-mode pagination support. For list scrolling or infinite loading, we highly recommend using the built-in **seamless cursor pagination**; for specific page jumping, basic pagination is sufficient:
 
 #### 1. Basic Pagination (Offset Mode)
-Suitable for relatively small datasets or cases where you need precise page jumps.
+Suitable for scenarios where the data volume is small (e.g., under 10k) or when you need to jump to a specific page precisely.
 
 ```dart
 final result = await db.query('users')
@@ -902,39 +902,61 @@ final result = await db.query('users')
     .limit(20); // Take 20 rows
 ```
 > [!TIP]
-> When `offset` becomes very large, the database must scan and discard many rows, so performance drops linearly. For deep pagination, prefer **Cursor Mode**.
+> When `offset` becomes very large, the database must scan and discard a large number of records, and performance degrades linearly. For deep pagination or larger datasets, it is recommended to use **Cursor Mode**.
 
-#### 2. Cursor Pagination (Cursor Mode)
-Ideal for massive datasets and infinite scrolling. By using `nextCursor`, the engine continues from the current position and avoids the extra scan cost that comes with deep offsets.
+#### 2. Cursor Pagination (Cursor Mode - Recommended)
+Ideal for massive datasets and infinite scrolling. By recording the starting position of the current page's data stream, it seeks directly to that position during pagination, avoiding scanning and discarding historical data, and keeping deep pagination speed constant.
 
-> [!IMPORTANT]
-> For some complex queries or sorts on non-indexed fields, the engine may fall back to a full scan and return a `null` cursor, which means pagination is not currently supported for that specific query.
+* **Automatic Management**: Set a limit for the page size, and simply call `next()` or `prev()` for subsequent pages to achieve excellent pagination performance, simply and quickly.
+* **Start Position Offsets**: Supports combining with `.offset(N)` in the initial query to locate the starting window, after which calling `next()` directly fetches the subsequent pages.
 
 ```dart
-// First page
+// 1. Initiate initial query
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Use the returned cursor to fetch the next page
-if (page1.nextCursor != null) {
+// 2. Fetch the next page
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('Next page items count: ${page2.data.length}');
+  
+  // 3. Fetch the previous page
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('Previous page data: ${prevPage.data}');
+  }
+}
+```
+
+##### Advanced Scenario: Stateless Token Pagination (Token-based Cursor)
+If you are building client-server APIs or need to serialize the pagination state across processes or networks, you can use cursor tokens.
+* The initial query returns `nextCursorToken` and `prevCursorToken` strings.
+* The subsequent query passes the token via `.cursor(token)` to seek.
+* **Note**: `cursor` and `offset` are mutually exclusive. Calling `cursor()` will automatically clear any set `offset`, and vice versa.
+
+```dart
+// Initial query (e.g., on API server-side)
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // Serialize and return this token to the client
+
+// When the client requests the next page with the token:
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Seek directly to the next position
+      .cursor(nextToken); // Pass token to seek and read precisely
 }
-
-// Likewise, prevCursor enables efficient backward paging
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
 | Feature | Offset Mode | Cursor Mode |
 | :--- | :--- | :--- |
-| **Query performance** | Degrades as pages deepen | Stable for deep paging |
-| **Best for** | Smaller datasets, exact page jumps | **Massive datasets, infinite scrolling** |
-| **Consistency under changes** | Data changes can cause skipped rows | Avoids duplicates and omissions caused by data changes |
+| **Query Performance** | Degrades as page count increases | Constant speed for deep paging |
+| **Best for** | Small datasets, exact page jumping | **Massive datasets, infinite scrolling** |
+| **Consistency under changes** | Data changes can cause skipped/duplicate rows | Avoids duplicates and omissions caused by data changes |
 
 
 ### Foreign Keys and Cascading

@@ -885,56 +885,78 @@ final results = await db.query('heavy_table')
 ```
 
 
-### <a id="query-pagination"></a>Sorgu ve Verimli Sayfalandırma
+### <a id="query-pagination"></a>Sorgu ve Etkin Sayfalama
 
 > [!TIP]
-> **En iyi performans için her zaman `limit`'yi belirtin**: Her sorguda açıkça `limit` sağlanması kesinlikle önerilir. Atlanırsa motor varsayılan olarak 1000 satıra ayarlanır. Çekirdek sorgu motoru hızlıdır ancak uygulama katmanında çok büyük sonuç kümelerinin serileştirilmesi yine de gereksiz ek yük getirebilir.
+> **Her zaman sayfa boyutu olarak `limit` belirtin**: Sorgularınızda her zaman `limit` belirtmeniz önemle tavsiye edilir. Belirtilmezse, motor tek seferde çok fazla verinin çekilmesini önlemek için varsayılan olarak 1.000 kayıtla sınırlandırır.
 
-ToStore, ölçek ve performans gereksinimlerine göre seçim yapabilmeniz için iki sayfalandırma modu sunar:
+ToStore, çift modlu sayfalama desteği sunar. Sonsuz kaydırma veya liste yükleme işlemleri için dahili **sorunsuz imleç (cursor) sayfalamasını** kullanmanızı önemle tavsiye ederiz; belirli sayfalara doğrudan atlamak için ise temel offset sayfalama yeterlidir:
 
-#### 1. Temel Sayfalandırma (Ofset Modu)
-Nispeten küçük veri kümeleri veya hassas sayfa atlamalarına ihtiyaç duyduğunuz durumlar için uygundur.
+#### 1. Temel Sayfalama (Offset Modu)
+Veri hacminin küçük olduğu (örneğin 10k altı) veya belirli bir sayfaya tam olarak atlamanız gereken durumlar için uygundur.
 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
-    .offset(40) // Skip the first 40 rows
-    .limit(20); // Take 20 rows
+    .offset(40) // İlk 40 satırı atla
+    .limit(20); // 20 satır al
 ```
 > [!TIP]
-> `offset` çok büyüdüğünde, veritabanının birçok satırı taraması ve atması gerekir, böylece performans doğrusal olarak düşer. Derin sayfalandırma için **İmleç Modu**'nu tercih edin.
+> `offset` değeri çok büyüdüğünde, veritabanının çok sayıda kaydı taraması ve atması gerekir, bu da performansı doğrusal olarak düşürür. Derin sayfalama veya daha büyük veri kümeleri için **İmleç Modu** önerilir.
 
-#### 2. İmleç Sayfalandırması (İmleç Modu)
-Büyük veri kümeleri ve sonsuz kaydırma için idealdir. `nextCursor` kullanıldığında, motor mevcut konumdan devam eder ve derin ofsetlerin getirdiği ekstra tarama maliyetinden kaçınır.
+#### 2. İmleç Sayfalama (Cursor Modu - Önerilen)
+Büyük veri kümeleri ve sonsuz kaydırma için idealdir. Geçerli sayfanın veri akışının başlangıç konumunu kaydederek, sayfalama sırasında doğrudan bu konuma konumlanır (seek). Geçmiş verileri taramaktan ve atmaktan kaçınarak derin sayfalama hızını her zaman sabit tutar.
 
-> [!IMPORTANT]
-> Dizine eklenmemiş alanlardaki bazı karmaşık sorgular veya sıralamalar için, motor tam taramaya geri dönebilir ve bir `null` imleci döndürebilir; bu, söz konusu sorgu için sayfalandırmanın şu anda desteklenmediği anlamına gelir.
+* **Otomatik Yönetim**: Sayfa boyutu için limit belirleyin ve sonraki sayfalar için doğrudan `next()` veya `prev()` çağrısı yaparak optimum sayfalama performansını zahmetsizce elde edin.
+* **Başlangıç Noktası Sapması**: İlk sorguda başlangıç penceresini konumlandırmak için `.offset(N)` kullanımını destekler; sonrasında `next()` çağrısı sonraki sayfaları doğrudan getirir.
 
 ```dart
-// First page
+// 1. İlk sorguyu başlat
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Use the returned cursor to fetch the next page
-if (page1.nextCursor != null) {
+// 2. Sonraki sayfayı getir
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('Sonraki sayfadaki öğe sayısı: \${page2.data.length}');
+  
+  // 3. Önceki sayfayı getir
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('Önceki sayfa verileri: \${prevPage.data}');
+  }
+}
+```
+
+##### Gelişmiş Senaryo: Durumsuz Belirteç Tabanlı İmleç Sayfalama (Token-based Cursor)
+İstemci-sunucu API'leri geliştiriyorsanız veya sayfalama durumunu süreçler veya ağlar arasında serileştirmeniz gerekiyorsa imleç belirteçlerini (token) kullanabilirsiniz.
+* İlk sorgu `nextCursorToken` ve `prevCursorToken` belirteç dizelerini döndürür.
+* Sonraki sorgu, doğrudan konumlanmak (seek) için `.cursor(token)` aracılığıyla belirteci iletir.
+* **Not**: `cursor` ve `offset` birbirini dışlar. `cursor()` çağrısı, önceden ayarlanmış tüm `offset` değerlerini otomatik olarak temizler ve tersi de geçerlidir.
+
+```dart
+// İlk sorgu (örneğin, API sunucu tarafında)
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // Bu belirteci serileştirip istemciye döndürün
+
+// İstemci belirteçle sonraki sayfayı talep ettiğinde:
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Seek directly to the next position
+      .cursor(nextToken); // Doğru şekilde konumlanmak ve okumak için belirteci iletin
 }
-
-// Likewise, prevCursor enables efficient backward paging
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
-| Özellik | Ofset Modu | İmleç Modu |
+| Özellik | Offset Modu | İmleç Modu |
 | :--- | :--- | :--- |
-| **Sorgu performansı** | Sayfalar derinleştikçe bozulur | Derin sayfalama için kararlı |
-| **En iyisi** | Daha küçük veri kümeleri, tam sayfa atlamaları | **Devasa veri kümeleri, sonsuz kaydırma** |
-| **Değişiklikler altında tutarlılık** | Veri değişiklikleri satırların atlanmasına neden olabilir | Veri değişikliklerinden kaynaklanan kopyaları ve atlamaları önler |
+| **Sorgu Performansı** | Sayfa sayısı arttıkça düşer | Derin sayfalama için sabit hız |
+| **En İyi Kullanım Yeri** | Küçük veri kümeleri, tam sayfa atlamaları | **Büyük veri kümeleri, sonsuz kaydırma** |
+| **Değişikliklerde Tutarlılık** | Veri değişiklikleri yinelenen veya atlanan satırlara neden olabilir | Veri değişikliklerinden kaynaklanan yinelemeleri ve eksiklikleri önler |
 
 
 ### <a id="foreign-keys"></a>Yabancı Anahtarlar ve Basamaklı

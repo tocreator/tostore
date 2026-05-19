@@ -268,8 +268,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         if (!mounted) return;
         setState(() {
           _tableData = result.data;
-          _nextCursor = result.nextCursor;
-          _prevCursor = result.prevCursor;
+          _nextCursor = result.nextCursorToken;
+          _prevCursor = result.prevCursorToken;
         });
       } else {
         // Cursor mode
@@ -308,8 +308,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         setState(() {
           _tableData = result.data;
-          _nextCursor = result.nextCursor;
-          _prevCursor = result.prevCursor;
+          _nextCursor = result.nextCursorToken;
+          _prevCursor = result.prevCursorToken;
         });
       }
 

@@ -700,9 +700,7 @@ class QueryCondition {
   /// set offset
   QueryCondition offset(int value) {
     _offset = value;
-    if (value > 0) {
-      _cursor = null;
-    }
+    _cursor = null;
     return this;
   }
 

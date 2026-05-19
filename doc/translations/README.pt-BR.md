@@ -885,56 +885,78 @@ final results = await db.query('heavy_table')
 ```
 
 
-### <a id="query-pagination"></a>Consulta e paginação eficiente
+### <a id="query-pagination"></a>Consulta e Paginação Eficiente
 
 > [!TIP]
-> **Sempre especifique `limit` para obter melhor desempenho**: é altamente recomendável fornecer `limit` explicitamente em cada consulta. Se omitido, o mecanismo será padronizado para 1.000 linhas. O mecanismo de consulta principal é rápido, mas a serialização de conjuntos de resultados muito grandes na camada de aplicativo ainda pode adicionar sobrecarga desnecessária.
+> **Especifique sempre o `limit` como tamanho da página**: É altamente recomendável sempre especificar o `limit` em suas consultas. Se omitido, o mecanismo limitará por padrão para 1.000 registros para evitar a consulta de muitos dados de uma só vez.
 
-ToStore fornece dois modos de paginação para que você possa escolher com base nas necessidades de escala e desempenho:
+O ToStore oferece suporte a paginação em modo duplo. Para rolagem de listas ou carregamento infinito, recomendamos fortemente o uso da **paginação por cursor integrada e contínua**; para saltar para páginas específicas, a paginação básica é suficiente:
 
 #### 1. Paginação Básica (Modo Offset)
-Adequado para conjuntos de dados relativamente pequenos ou casos em que você precisa de saltos de página precisos.
+Adequado para cenários onde o volume de dados é pequeno (por exemplo, abaixo de 10k) ou quando você precisa saltar para uma página específica com precisão.
 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
-    .offset(40) // Skip the first 40 rows
-    .limit(20); // Take 20 rows
+    .offset(40) // Pular as primeiras 40 linhas
+    .limit(20); // Obter 20 linhas
 ```
 > [!TIP]
-> Quando `offset` fica muito grande, o banco de dados deve varrer e descartar muitas linhas, então o desempenho cai linearmente. Para paginação profunda, prefira **Modo Cursor**.
+> Quando o `offset` se torna muito grande, o banco de dados deve escanear e descartar uma grande quantidade de registros, e o desempenho cai linearmente. Para paginação profunda ou conjuntos de dados maiores, recomenda-se usar o **Modo Cursor**.
 
-#### 2. Paginação do Cursor (Modo Cursor)
-Ideal para conjuntos de dados massivos e rolagem infinita. Ao usar `nextCursor`, o mecanismo continua a partir da posição atual e evita o custo extra de varredura que acompanha os deslocamentos profundos.
+#### 2. Paginação por Cursor (Modo Cursor - Recomendado)
+Ideal para conjuntos de dados massivos e rolagem infinita. Ao registrar a posição inicial do fluxo de dados da página atual, ele se posiciona diretamente nessa localização durante a paginação (seek), evitando escanear e descartar dados históricos, e mantendo a velocidade da paginação profunda sempre constante.
 
-> [!IMPORTANT]
-> Para algumas consultas complexas ou classificações em campos não indexados, o mecanismo pode voltar para uma verificação completa e retornar um cursor `null`, o que significa que a paginação não é atualmente suportada para essa consulta específica.
+* **Gerenciamento Automático**: Defina um limite para o tamanho da página e simplesmente chame `next()` ou `prev()` para as páginas subsequentes para obter um excelente desempenho de paginação de forma simples e rápida.
+* **Deslocamento do Ponto de Partida**: Suporta a combinação com `.offset(N)` na consulta inicial para localizar a janela de início, após a qual a chamada a `next()` busca diretamente as páginas subsequentes.
 
 ```dart
-// First page
+// 1. Iniciar consulta inicial
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Use the returned cursor to fetch the next page
-if (page1.nextCursor != null) {
+// 2. Buscar a próxima página
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('Quantidade de itens na próxima página: ${page2.data.length}');
+  
+  // 3. Buscar a página anterior
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('Dados da página anterior: ${prevPage.data}');
+  }
+}
+```
+
+##### Cenário Avançado: Paginação por Token Sem Estado (Token-based Cursor)
+Se você estiver desenvolvendo APIs cliente-servidor ou precisar serializar o estado da paginação entre processos ou redes, você pode usar tokens de cursor.
+* A consulta inicial retorna as strings `nextCursorToken` e `prevCursorToken`.
+* A consulta subsequente passa o token via `.cursor(token)` para posicionamento (seek).
+* **Nota**: `cursor` e `offset` são mutuamente exclusivos. Chamar `cursor()` limpará automaticamente qualquer `offset` definido, e vice-versa.
+
+```dart
+// Consulta inicial (por exemplo, no lado do servidor API)
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // Serializar e retornar este token para o cliente
+
+// Quando o cliente solicita a próxima página com o token:
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Seek directly to the next position
+      .cursor(nextToken); // Passar o token para se posicionar e ler com precisão
 }
-
-// Likewise, prevCursor enables efficient backward paging
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
-| Recurso | Modo de deslocamento | Modo Cursor |
+| Recurso | Modo Offset | Modo Cursor |
 | :--- | :--- | :--- |
-| **Desempenho de consulta** | Degrada à medida que as páginas se aprofundam | Estável para paginação profunda |
-| **Melhor para** | Conjuntos de dados menores, saltos de página exatos | **Conjuntos de dados enormes, rolagem infinita** |
-| **Consistência sob alterações** | Alterações de dados podem causar linhas ignoradas | Evita duplicatas e omissões causadas por alterações de dados |
+| **Desempenho da Consulta** | Degrada à medida que as páginas aumentam | Velocidade constante para paginação profunda |
+| **Melhor para** | Conjuntos de dados menores, saltos de página exatos | **Conjuntos de dados massivos, rolagem infinita** |
+| **Consistência sob alterações** | Alterações de dados podem causar linhas duplicadas ou ignoradas | Evita duplicados e omissões causados por alterações de dados |
 
 
 ### <a id="foreign-keys"></a>Chaves Estrangeiras e Cascata

@@ -64,9 +64,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   /// set offset
   SELF offset(int value) {
     _offset = value;
-    if (value > 0) {
-      _cursor = null;
-    }
+    _cursor = null;
     _onChanged();
     return _self;
   }

@@ -888,53 +888,75 @@ final results = await db.query('heavy_table')
 ### <a id="query-pagination"></a>Requête et pagination efficace
 
 > [!TIP]
-> **Toujours spécifier `limit` pour de meilleures performances** : il est fortement recommandé de fournir explicitement `limit` dans chaque requête. En cas d'omission, le moteur affiche par défaut 1 000 lignes. Le moteur de requête principal est rapide, mais la sérialisation de très grands ensembles de résultats dans la couche application peut encore ajouter une surcharge inutile.
+> **Spécifiez toujours `limit` comme taille de page** : Il est fortement recommandé de toujours spécifier `limit` dans vos requêtes. S'il est omis, le moteur limitera par défaut à 1 000 enregistrements pour éviter de charger trop de données à la fois.
 
-ToStore propose deux modes de pagination afin que vous puissiez choisir en fonction de vos besoins d'échelle et de performances :
+ToStore prend en charge la pagination en mode double. Pour le défilement infini ou le chargement de listes, nous recommandons fortement l'utilisation de la **pagination par curseur fluide intégrée** ; pour sauter directement à des pages spécifiques, la pagination offset de base suffit :
 
-#### 1. Pagination de base (mode décalage)
-Convient aux ensembles de données relativement petits ou aux cas où vous avez besoin de sauts de page précis.
+#### 1. Pagination de base (Mode Offset)
+Adapté aux scénarios où le volume de données est faible (par exemple, inférieur à 10k) ou lorsque vous devez sauter précisément à une page spécifique.
 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
-    .offset(40) // Skip the first 40 rows
-    .limit(20); // Take 20 rows
+    .offset(40) // Ignorer les 40 premières lignes
+    .limit(20); // Récupérer 20 lignes
 ```
 > [!TIP]
-> Lorsque `offset` devient très volumineux, la base de données doit analyser et supprimer de nombreuses lignes, de sorte que les performances chutent de manière linéaire. Pour une pagination approfondie, préférez le **Mode Curseur**.
+> Lorsque l'`offset` devient très grand, la base de données doit analyser et ignorer une grande quantité d'enregistrements, ce qui entraîne une baisse linéaire des performances. Pour une pagination profonde ou des ensembles de données plus volumineux, il est recommandé d'utiliser le **Mode Curseur**.
 
-#### 2. Pagination du curseur (mode curseur)
-Idéal pour les ensembles de données volumineux et le défilement infini. En utilisant `nextCursor`, le moteur continue à partir de la position actuelle et évite le coût d'analyse supplémentaire lié aux décalages profonds.
+#### 2. Pagination par curseur (Mode Curseur - Recommandé)
+Idéal pour les ensembles de données volumineux et le défilement infini. En enregistrant la position de départ du flux de données de la page actuelle, le moteur se positionne directement à cet emplacement lors de la pagination (seek), évitant ainsi d'analyser et d'ignorer les données historiques, maintenant ainsi une vitesse constante pour la pagination profonde.
 
-> [!IMPORTANT]
-> Pour certaines requêtes complexes ou tris sur des champs non indexés, le moteur peut revenir à une analyse complète et renvoyer un curseur `null`, ce qui signifie que la pagination n'est actuellement pas prise en charge pour cette requête spécifique.
+* **Gestion automatique** : Définissez une limite de taille de page et appelez simplement `next()` ou `prev()` pour les pages suivantes afin d'obtenir des performances de pagination optimales en toute simplicité.
+* **Décalage du point de départ** : Permet de combiner `.offset(N)` lors de la requête initiale pour localiser la fenêtre de départ, après quoi l'appel à `next()` récupère directement les pages suivantes.
 
 ```dart
-// First page
+// 1. Lancer la requête initiale
 final page1 = await db.query('users')
     .orderByDesc('id')
     .limit(20);
 
-// Use the returned cursor to fetch the next page
-if (page1.nextCursor != null) {
+// 2. Récupérer la page suivante
+if (page1.hasMore) {
+  final page2 = await page1.next(); 
+  print('Nombre d'éléments sur la page suivante : \${page2.data.length}');
+  
+  // 3. Récupérer la page précédente
+  if (page2.hasPrev) {
+    final prevPage = await page2.prev();
+    print('Données de la page précédente : \${prevPage.data}');
+  }
+}
+```
+
+##### Scénario avancé : Pagination par jeton sans état (Token-based Cursor)
+Si vous développez des API client-serveur ou si vous devez sérialiser l'état de la pagination entre des processus ou sur un réseau, vous pouvez utiliser des jetons de curseur (tokens).
+* La requête initiale renvoie les chaînes de jetons `nextCursorToken` et `prevCursorToken`.
+* La requête suivante transmet le jeton via `.cursor(token)` pour se positionner directement (seek).
+* **Remarque** : `cursor` et `offset` sont mutuellement exclusifs. Appeler `cursor()` effacera automatiquement tout `offset` défini, et vice-versa.
+
+```dart
+// Requête initiale (par exemple, côté serveur API)
+final page1 = await db.query('users')
+    .orderByDesc('id')
+    .limit(20);
+
+final String? nextToken = page1.nextCursorToken; // Sérialiser et renvoyer ce jeton au client
+
+// Lorsque le client demande la page suivante avec le jeton :
+if (nextToken != null) {
   final page2 = await db.query('users')
       .orderByDesc('id')
       .limit(20)
-      .cursor(page1.nextCursor); // Seek directly to the next position
+      .cursor(nextToken); // Transmettre le jeton pour se positionner et lire précisément
 }
-
-// Likewise, prevCursor enables efficient backward paging
-final prevPage = await db.query('users')
-    .limit(20)
-    .cursor(page2.prevCursor);
 ```
 
-| Fonctionnalité | Mode décalage | Mode curseur |
+| Fonctionnalité | Mode Offset | Mode Curseur |
 | :--- | :--- | :--- |
-| **Performances des requêtes** | Se dégrade à mesure que les pages s'approfondissent | Stable pour la pagination profonde |
-| **Idéal pour** | Ensembles de données plus petits, sauts de page exacts | **Ensembles de données massifs, défilement infini** |
-| **Cohérence sous modifications** | Les modifications de données peuvent entraîner l'omission de lignes | Évite les doublons et les omissions causés par les modifications de données |
+| **Performance de la requête** | Se dégrade à mesure que les pages augmentent | Vitesse constante pour la pagination profonde |
+| **Idéal pour** | Ensembles de données plus petits, sauts de page exacts | **Ensembles de données volumineux, défilement infini** |
+| **Cohérence lors des modifications** | Les modifications de données peuvent entraîner des doublons ou des sauts de lignes | Évite les doublons et les omissions causés par les modifications de données |
 
 
 ### <a id="foreign-keys"></a>Clés étrangères et cascade

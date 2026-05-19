@@ -4108,7 +4108,11 @@ class IndexManager {
 
               // Memory mode: serve unique lookup from _indexDataCache only (no disk fallback).
               if (isMemoryMode) {
-                final compositeKey = <dynamic>[tableName, indexName, ...nativeVal!];
+                final compositeKey = <dynamic>[
+                  tableName,
+                  indexName,
+                  ...nativeVal!
+                ];
                 final pkValue = _indexDataCache.get(compositeKey);
                 if (pkValue is String &&
                     pkValue.isNotEmpty &&
@@ -4133,7 +4137,11 @@ class IndexManager {
                         IndexSearchEntry(primaryKey: pk, keyBytes: prefix));
                     if (!(_dataStore.resourceManager?.isLowMemoryMode ??
                         false)) {
-                      final compositeKey = [tableName, indexName, ...nativeVal!];
+                      final compositeKey = [
+                        tableName,
+                        indexName,
+                        ...nativeVal!
+                      ];
                       _indexDataCache.put(compositeKey, pk);
                     }
                   }
@@ -4171,10 +4179,14 @@ class IndexManager {
 
                 if (validatedPks.isNotEmpty) {
                   if (isUnique) {
-                    _indexDataCache.put(
-                        [tableName, indexName, ...nativeVal!], validatedPks.first);
+                    _indexDataCache.put([tableName, indexName, ...nativeVal!],
+                        validatedPks.first);
                   } else {
-                    final prefixKey = <dynamic>[tableName, indexName, ...nativeVal!];
+                    final prefixKey = <dynamic>[
+                      tableName,
+                      indexName,
+                      ...nativeVal!
+                    ];
                     final yc = YieldController(
                         'IndexManager.hotspotPopulateNonUniqueIn');
                     for (final pk in validatedPks) {

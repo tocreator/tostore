@@ -68,7 +68,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             condition: _condition,
             orderBy: _orderBy,
             limit: _limit,
-            offset: nextOffset ?? _offset,
+            offset: nextCursor != null ? null : (nextOffset ?? _offset),
             cursor: nextCursor,
             joins: _joins,
             enableQueryCache: false, // Don't interfere with manual result cache
@@ -371,39 +371,76 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return result.aggregateResult;
   }
 
+  /// Clone the current QueryBuilder with all its filters, ordering, joins, cache, and limits intact.
+  QueryBuilder clone() {
+    final builder = QueryBuilder(_db, _tableName);
+    // Copy base ChainBuilder properties
+    builder._condition.condition(_condition);
+    if (_orderBy != null) builder._orderBy = List<String>.from(_orderBy!);
+    builder._limit = _limit;
+    builder._offset = _offset;
+    builder._cursor = _cursor;
+
+    // Copy QueryBuilder properties
+    if (_selectedFields != null) {
+      builder._selectedFields = List<String>.from(_selectedFields!);
+    }
+    builder._extraAggregations =
+        List<QueryAggregation>.from(_extraAggregations);
+    builder._joins.addAll(_joins);
+    if (_pendingForeignKeyJoins != null) {
+      builder._pendingForeignKeyJoins =
+          List<PendingForeignKeyJoin>.from(_pendingForeignKeyJoins!);
+    }
+    builder._enableQueryCache = _enableQueryCache;
+    builder._queryCacheExpiry = _queryCacheExpiry;
+    builder._distinct = _distinct;
+    if (_distinctFields != null) {
+      builder._distinctFields = List<String>.from(_distinctFields!);
+    }
+    if (_groupByFields != null) {
+      builder._groupByFields = List<String>.from(_groupByFields!);
+    }
+    if (_havingCondition != null) builder._havingCondition = _havingCondition;
+    if (_aggregations != null) {
+      builder._aggregations = List<QueryAggregation>.from(_aggregations!);
+    }
+
+    return builder;
+  }
+
   @override
   Future<QueryResult<Map<String, dynamic>>> get future async {
-    if (_future == null) {
-      final result = await _executeQuery();
-      final queryResult = QueryResult.success(
-        data: result.records,
-        prevCursor: result.prevCursor,
-        nextCursor: result.nextCursor,
-        hasMore: result.hasMore,
-        hasPrev: result.hasPrev,
-        tableTotalCount: result.tableTotalCount,
-        executionTimeMs: result.executionTimeMs,
-      );
-
-      // Trigger background pre-warm for next page if conditions are met
-      if (queryResult.hasMore) {
-        if (queryResult.nextCursor != null) {
-          _prewarm(nextCursor: queryResult.nextCursor);
-        } else {
-          // Offset-based pagination pre-warm: calculate and warm up next page
-          // Use default limit if not specified to ensure correct page boundary
-          final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-          if (effectiveLimit > 0) {
-            final currentOffset = _offset ?? 0;
-            _prewarm(nextOffset: currentOffset + effectiveLimit);
-          }
-        }
-      }
-
-      return queryResult;
-    }
+    final bool isFirstRun = _future == null;
+    _future ??= _executeQuery();
     final result = await _future!;
-    return QueryResult.success(
+
+    Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
+      final cloned = clone();
+      if (result.nextCursor != null) {
+        cloned.cursor(result.nextCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        cloned.offset(currentOffset + effectiveLimit);
+      }
+      return cloned.future;
+    }
+
+    Future<QueryResult<Map<String, dynamic>>> prevPageExecutor() async {
+      final cloned = clone();
+      if (result.prevCursor != null) {
+        cloned.cursor(result.prevCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        final newOffset = currentOffset - effectiveLimit;
+        cloned.offset(newOffset >= 0 ? newOffset : 0);
+      }
+      return cloned.future;
+    }
+
+    final queryResult = QueryResult.success(
       data: result.records,
       prevCursor: result.prevCursor,
       nextCursor: result.nextCursor,
@@ -411,7 +448,26 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasPrev: result.hasPrev,
       tableTotalCount: result.tableTotalCount,
       executionTimeMs: result.executionTimeMs,
+      nextPageExecutor: result.hasMore ? nextPageExecutor : null,
+      prevPageExecutor: result.hasPrev ? prevPageExecutor : null,
     );
+
+    // Trigger background pre-warm for next page if conditions are met (only on first execution)
+    if (isFirstRun && queryResult.hasMore) {
+      if (queryResult.nextCursorToken != null) {
+        _prewarm(nextCursor: queryResult.nextCursorToken);
+      } else {
+        // Offset-based pagination pre-warm: calculate and warm up next page
+        // Use default limit if not specified to ensure correct page boundary
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        if (effectiveLimit > 0) {
+          final currentOffset = _offset ?? 0;
+          _prewarm(nextOffset: currentOffset + effectiveLimit);
+        }
+      }
+    }
+
+    return queryResult;
   }
 
   /// Watch for changes matching this query
