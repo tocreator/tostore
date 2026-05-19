@@ -1976,7 +1976,7 @@ class MigrationManager {
           label: 'MigrationManager._compareSchemasAndGenerateOperations',
         );
         throw Exception(
-            'Changing the "isGlobal" property for an existing table ($tableName) with existing data is not supported. '
+            'Changing the "isGlobal" property (from ${oldSchema.isGlobal} to ${newSchema.isGlobal}) for an existing table ($tableName) with existing data is not supported. '
             'Please perform the data migration manually, or clear the table before changing "isGlobal".');
       }
 
