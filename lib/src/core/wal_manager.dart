@@ -82,8 +82,6 @@ class LargeDeleteMeta {
   final List<String>? orderBy;
   final int? limit;
   final int? offset;
-  int?
-      lastProcessedPartitionNo; // null means none processed yet, int is partition number (0-based)
   String? checkpointCursor; // Cursor checkpoint for queryEachBatch
   int deletedSoFar; // cumulative deleted rows (for limit semantics across crashes)
   String status; // 'running' | 'completed'
@@ -96,7 +94,6 @@ class LargeDeleteMeta {
     this.orderBy,
     this.limit,
     this.offset,
-    this.lastProcessedPartitionNo,
     this.checkpointCursor,
     required this.deletedSoFar,
     required this.status,
@@ -110,8 +107,6 @@ class LargeDeleteMeta {
         if (orderBy != null) 'orderBy': orderBy,
         if (limit != null) 'limit': limit,
         if (offset != null) 'offset': offset,
-        if (lastProcessedPartitionNo != null)
-          'lastProcessedPartitionNo': lastProcessedPartitionNo,
         if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
         'deletedSoFar': deletedSoFar,
         'status': status,
@@ -119,12 +114,6 @@ class LargeDeleteMeta {
       };
 
   static LargeDeleteMeta fromJson(Map<String, dynamic> json) {
-    // Backward compatibility: support both old String format and new int format
-    int? lastProcessedPartitionNo;
-    if (json.containsKey('lastProcessedPartitionNo')) {
-      lastProcessedPartitionNo =
-          (json['lastProcessedPartitionNo'] as num?)?.toInt();
-    }
     return LargeDeleteMeta(
       opId: (json['opId'] as String?) ?? '',
       table: (json['table'] as String?) ?? '',
@@ -133,7 +122,6 @@ class LargeDeleteMeta {
       orderBy: (json['orderBy'] as List?)?.map((e) => e.toString()).toList(),
       limit: (json['limit'] as num?)?.toInt(),
       offset: (json['offset'] as num?)?.toInt(),
-      lastProcessedPartitionNo: lastProcessedPartitionNo,
       checkpointCursor: json['checkpointCursor'] as String?,
       deletedSoFar: (json['deletedSoFar'] as num?)?.toInt() ?? 0,
       status: (json['status'] as String?) ?? 'running',
@@ -152,7 +140,6 @@ class LargeUpdateMeta {
   final List<String>? orderBy;
   final int? limit;
   final int? offset;
-  int? lastProcessedPartitionNo;
   String? checkpointCursor; // Cursor checkpoint for queryEachBatch
   int updatedSoFar; // cumulative updated rows (for limit semantics across crashes)
   String status; // 'running' | 'completed'
@@ -166,7 +153,6 @@ class LargeUpdateMeta {
     this.orderBy,
     this.limit,
     this.offset,
-    this.lastProcessedPartitionNo,
     this.checkpointCursor,
     required this.updatedSoFar,
     required this.status,
@@ -181,8 +167,6 @@ class LargeUpdateMeta {
         if (orderBy != null) 'orderBy': orderBy,
         if (limit != null) 'limit': limit,
         if (offset != null) 'offset': offset,
-        if (lastProcessedPartitionNo != null)
-          'lastProcessedPartitionNo': lastProcessedPartitionNo,
         if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
         'updatedSoFar': updatedSoFar,
         'status': status,
@@ -190,12 +174,6 @@ class LargeUpdateMeta {
       };
 
   static LargeUpdateMeta fromJson(Map<String, dynamic> json) {
-    // Backward compatibility: support both old String format and new int format
-    int? lastProcessedPartitionNo;
-    if (json.containsKey('lastProcessedPartitionNo')) {
-      lastProcessedPartitionNo =
-          (json['lastProcessedPartitionNo'] as num?)?.toInt();
-    }
     return LargeUpdateMeta(
       opId: (json['opId'] as String?) ?? '',
       table: (json['table'] as String?) ?? '',
@@ -206,7 +184,6 @@ class LargeUpdateMeta {
       orderBy: (json['orderBy'] as List?)?.map((e) => e.toString()).toList(),
       limit: (json['limit'] as num?)?.toInt(),
       offset: (json['offset'] as num?)?.toInt(),
-      lastProcessedPartitionNo: lastProcessedPartitionNo,
       checkpointCursor: json['checkpointCursor'] as String?,
       updatedSoFar: (json['updatedSoFar'] as num?)?.toInt() ?? 0,
       status: (json['status'] as String?) ?? 'running',
@@ -1580,7 +1557,6 @@ class WalManager {
     List<String>? orderBy,
     int? limit,
     int? offset,
-    int? startPartitionNo, // null means start from beginning
     String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
@@ -1594,7 +1570,6 @@ class WalManager {
       orderBy: orderBy,
       limit: limit,
       offset: offset,
-      lastProcessedPartitionNo: startPartitionNo,
       checkpointCursor: checkpointCursor,
       deletedSoFar: 0,
       status: 'running',
@@ -1606,14 +1581,12 @@ class WalManager {
   /// Update checkpoint for a running large delete operation.
   Future<void> updateLargeDeleteCheckpoint({
     required String opId,
-    required int? lastProcessedPartitionNo,
     required int deletedSoFar,
     String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     final m = _meta.largeDeletes[opId];
     if (m == null) return;
-    m.lastProcessedPartitionNo = lastProcessedPartitionNo;
     m.deletedSoFar = deletedSoFar;
     m.checkpointCursor = checkpointCursor;
     await persistMeta(flush: false);
@@ -1639,7 +1612,6 @@ class WalManager {
     List<String>? orderBy,
     int? limit,
     int? offset,
-    int? startPartitionNo, // null means start from beginning
     String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
@@ -1654,7 +1626,6 @@ class WalManager {
       orderBy: orderBy,
       limit: limit,
       offset: offset,
-      lastProcessedPartitionNo: startPartitionNo,
       checkpointCursor: checkpointCursor,
       updatedSoFar: 0,
       status: 'running',
@@ -1666,14 +1637,12 @@ class WalManager {
   /// Update checkpoint for a running large update operation.
   Future<void> updateLargeUpdateCheckpoint({
     required String opId,
-    required int? lastProcessedPartitionNo,
     required int updatedSoFar,
     String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     final m = _meta.largeUpdates[opId];
     if (m == null) return;
-    m.lastProcessedPartitionNo = lastProcessedPartitionNo;
     m.updatedSoFar = updatedSoFar;
     m.checkpointCursor = checkpointCursor;
     await persistMeta(flush: false);

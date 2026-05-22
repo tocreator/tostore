@@ -2321,8 +2321,7 @@ class DataStoreImpl {
     int? offset,
     bool allowAll = false,
     bool continueOnPartialErrors = false,
-    // Optional checkpoint to resume heavy update from a specific partition and updated count
-    int? checkpointStartPartitionNo,
+    // Optional checkpoint to resume heavy update from a previous cursor and updated count
     int? checkpointUpdatedSoFar,
     String? checkpointOpId,
     String? checkpointCursor,
@@ -2510,8 +2509,6 @@ class DataStoreImpl {
               ? checkpointOpId
               : GlobalIdGenerator.generate('large_update_');
 
-          // Use checkpoint partition number if provided
-          final int? startPartitionNo = checkpointStartPartitionNo;
           try {
             // Only create a new WAL large update entry when not resuming an existing op
             if (!hasCheckpointOp) {
@@ -2523,7 +2520,6 @@ class DataStoreImpl {
                 orderBy: orderBy,
                 limit: limit,
                 offset: offset,
-                startPartitionNo: startPartitionNo,
               );
               createdNewOp = true;
             }
@@ -2857,7 +2853,6 @@ class DataStoreImpl {
               try {
                 await walManager.updateLargeUpdateCheckpoint(
                   opId: largeUpdateOpId,
-                  lastProcessedPartitionNo: null,
                   updatedSoFar: totalUpdated,
                   checkpointCursor: nextCursor,
                 );
@@ -3380,8 +3375,7 @@ class DataStoreImpl {
     int? limit,
     int? offset,
     bool allowAll = false,
-    // Optional checkpoint to resume heavy delete from a specific partition and deleted count
-    int? checkpointStartPartitionNo,
+    // Optional checkpoint to resume heavy delete from a previous cursor and deleted count
     int? checkpointDeletedSoFar,
     String? checkpointOpId,
     String? checkpointCursor,
@@ -3709,10 +3703,6 @@ class DataStoreImpl {
               ? checkpointOpId
               : GlobalIdGenerator.generate('large_delete_');
 
-          // Use checkpoint partition number if provided
-          final int? startPartitionNo = checkpointStartPartitionNo;
-          // If no checkpoint, start from the beginning (null = all partitions)
-
           try {
             // Only create a new WAL large delete entry when not resuming an existing op
             if (!hasCheckpointOp) {
@@ -3723,7 +3713,6 @@ class DataStoreImpl {
                 orderBy: orderBy,
                 limit: limit,
                 offset: offset,
-                startPartitionNo: startPartitionNo,
               );
             }
           } catch (_) {}
@@ -3874,7 +3863,6 @@ class DataStoreImpl {
               try {
                 await walManager.updateLargeDeleteCheckpoint(
                   opId: largeDeleteOpId,
-                  lastProcessedPartitionNo: null,
                   deletedSoFar: deletedCount,
                   checkpointCursor: nextCursor,
                 );
@@ -3930,7 +3918,6 @@ class DataStoreImpl {
             limit: m.limit,
             offset: m.offset,
             allowAll: false,
-            checkpointStartPartitionNo: m.lastProcessedPartitionNo,
             checkpointDeletedSoFar: m.deletedSoFar,
             checkpointOpId: m.opId,
             checkpointCursor: m.checkpointCursor,
@@ -3961,7 +3948,6 @@ class DataStoreImpl {
             limit: m.limit,
             offset: m.offset,
             allowAll: false,
-            checkpointStartPartitionNo: m.lastProcessedPartitionNo,
             checkpointUpdatedSoFar: m.updatedSoFar,
             checkpointOpId: m.opId,
             checkpointCursor: m.checkpointCursor,
