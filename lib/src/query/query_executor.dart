@@ -3439,8 +3439,12 @@ class QueryExecutor {
     String? currentCursor = checkpointCursor;
     bool hasMore = true;
 
+    final globalToken = _dataStore.globalQueryCancelToken;
+
     while (hasMore) {
-      if (cancellationToken != null && cancellationToken.isCancelled) {
+      if ((cancellationToken != null && cancellationToken.isCancelled) ||
+          globalToken.isCancelled ||
+          !_dataStore.isInitialized) {
         break;
       }
 
@@ -3465,6 +3469,12 @@ class QueryExecutor {
 
       hasMore = result.hasMore;
       currentCursor = result.nextCursor;
+
+      if ((cancellationToken != null && cancellationToken.isCancelled) ||
+          globalToken.isCancelled ||
+          !_dataStore.isInitialized) {
+        break;
+      }
 
       // Invoke client callback. If callback returns false, stop batch processing.
       final shouldContinue = await onBatch(result.records, currentCursor);

@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -2793,6 +2793,7 @@ class IndexManager {
       await _dataStore.queryExecutor.queryEachBatch(
         tableName,
         batchSize: 1000,
+        cancellationToken: controller,
         onBatch: (records, nextCursor) async {
           if (controller?.isCancelled ?? false) {
             throw IndexBuildCancelledException(

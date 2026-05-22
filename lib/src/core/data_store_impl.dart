@@ -17,6 +17,7 @@ import '../handler/value_matcher.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
+import '../model/cancellation_token.dart';
 import '../model/change_event.dart';
 import '../model/config_info.dart';
 import '../model/data_store_config.dart';
@@ -129,6 +130,9 @@ class DataStoreImpl {
 
   bool get isInitialized => _isInitialized;
   final bool isMigrationInstance;
+
+  CancellationToken _globalQueryCancelToken = CancellationToken();
+  CancellationToken get globalQueryCancelToken => _globalQueryCancelToken;
 
   // Global prewarming state (centralized)
   bool _isGlobalPrewarming = false;
@@ -682,6 +686,7 @@ class DataStoreImpl {
             closeStorage: false,
             removeRegistry: false);
       }
+      _globalQueryCancelToken = CancellationToken();
       // Ensure this instance is re-registered after successful initialization
       // especially when initialize(reinitialize: true) called after close() removed it.
       if (!isMigrationInstance) {
@@ -1100,6 +1105,7 @@ class DataStoreImpl {
     // Immediately mark as uninitialized to block new operations
     _isInitialized = false;
     _baseInitialized = false;
+    _globalQueryCancelToken.cancel();
     await Future.delayed(Duration.zero);
 
     try {
