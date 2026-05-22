@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -38,7 +38,6 @@ import 'yield_controller.dart';
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
   final DataStoreImpl _dataStore;
-  static const int _largePartitionStreamingPagesPerBatch = 500;
 
   // Table refresh status flags
   final Map<String, bool> _tableFlushingFlags = {};
@@ -2268,7 +2267,7 @@ class TableDataManager {
 
   /// Stream records from a table.
   /// - File mode: traverse global B+Tree leaf chain + overlay buffer/transactions.
-  /// - Memory mode: traverse in‑memory TreeCache logical range + overlay buffer/transactions.
+  /// - Memory mode: traverse inmemory TreeCache logical range + overlay buffer/transactions.
   Stream<Map<String, dynamic>> streamRecords(String tableName,
       {Uint8List? customKey, int? customKeyId}) async* {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -2495,170 +2494,6 @@ class TableDataManager {
       }
     } finally {
       _dataStore.readViewManager.releaseReadView(viewId);
-    }
-  }
-
-  /// Stream physical partitions as fixed-size page batches.
-  ///
-  /// The callback receives one partition at a time when [partitionConcurrency]
-  /// is 1. Callers that need partition-number checkpoints should keep it at 1
-  /// and update the checkpoint after the callback finishes that partition.
-  Future<void> streamPartitionPageBatches({
-    required String tableName,
-    TableSchema? decodeSchema,
-    List<FieldStructure>? decodeFieldStructureOverride,
-    int? startPartitionNo,
-    List<int>? targetPartitionNos,
-    int pagesPerBatch = _largePartitionStreamingPagesPerBatch,
-    int partitionConcurrency = 1,
-    bool prefetchNextPageBatch = false,
-    Uint8List? customKey,
-    int? customKeyId,
-    PartitionStreamController? controller,
-    required Future<PartitionStreamAction> Function(
-      int partitionNo,
-      Stream<PartitionPageBatch> batches,
-      PartitionStreamController controller,
-    ) onPartition,
-  }) async {
-    final meta = await getTableMeta(tableName);
-    if (meta == null) return;
-    final rangeManager = _dataStore.tableTreePartitionManager;
-    if (rangeManager == null) return;
-
-    final int partitionCount = meta.btreePartitionCount;
-    final allNos =
-        List<int>.generate(partitionCount, (i) => i, growable: false);
-
-    List<int> partitionNos;
-    if (targetPartitionNos != null && targetPartitionNos.isNotEmpty) {
-      partitionNos = targetPartitionNos
-          .where((n) => n >= 0 && n < partitionCount)
-          .toList(growable: false)
-        ..sort();
-    } else if (startPartitionNo != null && startPartitionNo >= 0) {
-      partitionNos =
-          allNos.where((n) => n >= startPartitionNo).toList(growable: false);
-    } else {
-      partitionNos = allNos;
-    }
-
-    if (partitionNos.isEmpty) return;
-    if (pagesPerBatch <= 0) {
-      pagesPerBatch = _largePartitionStreamingPagesPerBatch;
-    }
-
-    final effectiveController = controller ?? PartitionStreamController();
-
-    Stream<PartitionPageBatch> batchStream(int partitionNo) async* {
-      var emitted = false;
-      await for (final records
-          in rangeManager.streamPartitionDataPageBatchesByNo(
-        tableName: tableName,
-        partitionNo: partitionNo,
-        pagesPerBatch: pagesPerBatch,
-        prefetchNextPageBatch: prefetchNextPageBatch,
-        encryptionKey: customKey,
-        encryptionKeyId: customKeyId,
-        decodeSchema: decodeSchema,
-        decodeFieldStructureOverride: decodeFieldStructureOverride,
-      )) {
-        if (effectiveController.shouldStopCurrentBatch) break;
-        emitted = true;
-        yield PartitionPageBatch(partitionNo: partitionNo, records: records);
-        if (effectiveController.shouldStopCurrentBatch) break;
-      }
-
-      if (!emitted && !effectiveController.shouldStopCurrentBatch) {
-        yield PartitionPageBatch(
-          partitionNo: partitionNo,
-          records: const <Map<String, dynamic>>[],
-          isEmptyPartition: true,
-        );
-      }
-    }
-
-    Future<PartitionStreamAction> runPartition(int partitionNo) async {
-      if (effectiveController.isStopped) {
-        return effectiveController.stopAction;
-      }
-      final action = await onPartition(
-        partitionNo,
-        batchStream(partitionNo),
-        effectiveController,
-      );
-      if (action == PartitionStreamAction.stopAfterBatch) {
-        effectiveController.stopAfterBatch();
-      } else if (action == PartitionStreamAction.stopAfterPartition) {
-        effectiveController.stopAfterPartition();
-      }
-      return action;
-    }
-
-    final yc = YieldController(
-      'TableDataManager.streamPartitionPageBatches',
-      checkInterval: 50,
-    );
-
-    if (partitionConcurrency <= 1) {
-      WorkloadLease? lease;
-      try {
-        lease = await _dataStore.workloadScheduler.acquire(
-          WorkloadType.maintenance,
-          requestedTokens: 1,
-          minTokens: 1,
-          totalPlannedTokens: partitionNos.length,
-          label: 'streamPartitionPageBatches.$tableName',
-        );
-        for (final partitionNo in partitionNos) {
-          await yc.maybeYield();
-          if (effectiveController.isStopped) break;
-          final action = await runPartition(partitionNo);
-          if (action != PartitionStreamAction.continueScan ||
-              effectiveController.isStopped) {
-            break;
-          }
-        }
-      } finally {
-        lease?.release();
-      }
-      return;
-    }
-
-    final parallelController = ParallelController();
-    final concurrency = max(1, min(partitionConcurrency, partitionNos.length));
-    final tasks = <Future<void> Function()>[
-      for (final partitionNo in partitionNos)
-        () async {
-          if (effectiveController.isStopped) {
-            parallelController.stop();
-            return;
-          }
-          await runPartition(partitionNo);
-          if (effectiveController.isStopped) {
-            parallelController.stop();
-          }
-        },
-    ];
-
-    WorkloadLease? lease;
-    try {
-      lease = await _dataStore.workloadScheduler.acquire(
-        WorkloadType.maintenance,
-        requestedTokens: concurrency,
-        minTokens: 1,
-        totalPlannedTokens: partitionNos.length,
-        label: 'streamPartitionPageBatches.$tableName.parallel',
-      );
-      await ParallelProcessor.execute<void>(
-        tasks,
-        concurrency: lease.asConcurrency(1),
-        controller: parallelController,
-        label: 'streamPartitionPageBatches.$tableName',
-        continueOnError: false,
-      );
-    } finally {
-      lease?.release();
     }
   }
 
@@ -3448,10 +3283,14 @@ class TableDataManager {
     List<dynamic> keys, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     if (keys.isEmpty) return TableScanResult(records: []);
 
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = decodeSchema ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return TableScanResult(records: []);
 
     final results = <Map<String, dynamic>>[];
@@ -3459,14 +3298,18 @@ class TableDataManager {
     final uniqueKeys = keys.toSet().toList();
 
     // 1. Try Cache
-    for (final key in uniqueKeys) {
-      final pk = key.toString();
-      final cached = _tableRecordCache.get([tableName, pk]);
-      if (cached != null) {
-        results.add(cached);
-      } else {
-        missingKeys.add(key);
+    if (!readFromFileOnly) {
+      for (final key in uniqueKeys) {
+        final pk = key.toString();
+        final cached = _tableRecordCache.get([tableName, pk]);
+        if (cached != null) {
+          results.add(cached);
+        } else {
+          missingKeys.add(key);
+        }
       }
+    } else {
+      missingKeys.addAll(uniqueKeys);
     }
 
     // 2. Try Disk
@@ -3484,13 +3327,16 @@ class TableDataManager {
         keys: missingKeys,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        schemaOverride: schema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        readFromFileOnly: readFromFileOnly,
       );
       if (diskResults == null) {
         return TableScanResult(records: []);
       }
 
       // Read-Through: Cache the results fetched from disk (Asynchronously)
-      if (diskResults.isNotEmpty) {
+      if (diskResults.isNotEmpty && !readFromFileOnly) {
         _asyncCacheDiskResults(
           tableName: tableName,
           diskResults: diskResults,
@@ -3522,6 +3368,9 @@ class TableDataManager {
     String? cursorPk,
     bool decodeRecord = true,
     required bool Function(Map<String, dynamic>) onRecord,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
@@ -3537,6 +3386,9 @@ class TableDataManager {
         recordPredicate: recordPredicate,
         onRecord: (r) => onRecord(r),
         decodeRecord: decodeRecord,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        readFromFileOnly: readFromFileOnly,
       );
       return;
     }
@@ -3668,6 +3520,9 @@ class TableDataManager {
     bool includeMax = true,
     String? cursorPk,
     bool decodeRecord = true,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async {
     final rangeMgr = _dataStore.tableTreePartitionManager;
     if (rangeMgr == null) {
@@ -3684,6 +3539,9 @@ class TableDataManager {
         reverse: reverse,
         limit: limit,
         recordPredicate: recordPredicate,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -3706,6 +3564,9 @@ class TableDataManager {
       includeMax: includeMax,
       cursorPk: cursorPk,
       decodeRecord: decodeRecord,
+      decodeSchema: decodeSchema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+      readFromFileOnly: readFromFileOnly,
       onRecord: (r) {
         out.add(r);
         return true;
@@ -3725,6 +3586,9 @@ class TableDataManager {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     // Increment table access weight for caching optimization
     _dataStore.weightManager?.incrementAccess(
@@ -3732,7 +3596,8 @@ class TableDataManager {
       tableName,
       spaceName: _dataStore.currentSpaceName,
     );
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = decodeSchema ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return TableScanResult(
           records: const [],
@@ -3752,17 +3617,19 @@ class TableDataManager {
       // Check Real-time WriteBuffer to filter out pending deletes.
       // This prevents "page gaps" where disk records are counted towards limit
       // but later removed during mergeConsistency.
-      final pk = r[primaryKey]?.toString();
-      if (pk != null) {
-        if (onlyCount) {
-          // Skip if in buffer for onlyCount fast path to avoid double counting
-          if (bufferMgr.getBufferedRecordForRead(tableName, pk) != null) {
-            return false;
-          }
-        } else {
-          final be = bufferMgr.getBufferedRecordForRead(tableName, pk);
-          if (be != null && be.operation == BufferOperationType.delete) {
-            return false;
+      if (!readFromFileOnly) {
+        final pk = r[primaryKey]?.toString();
+        if (pk != null) {
+          if (onlyCount) {
+            // Skip if in buffer for onlyCount fast path to avoid double counting
+            if (bufferMgr.getBufferedRecordForRead(tableName, pk) != null) {
+              return false;
+            }
+          } else {
+            final be = bufferMgr.getBufferedRecordForRead(tableName, pk);
+            if (be != null && be.operation == BufferOperationType.delete) {
+              return false;
+            }
           }
         }
       }
@@ -3841,7 +3708,13 @@ class TableDataManager {
         return TableScanResult(records: [], count: onlyCount ? 0 : null);
       }
 
-      final batchRes = await queryRecordsBatch(tableName, keys);
+      final batchRes = await queryRecordsBatch(
+        tableName,
+        keys,
+        readFromFileOnly: readFromFileOnly,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+      );
       final recs = batchRes.records;
 
       if (onlyCount) {
@@ -4104,6 +3977,9 @@ class TableDataManager {
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
           decodeRecord: (filter != null ||
               (matcher != null && matcher.fields.any((f) => f != primaryKey))),
+          decodeSchema: decodeSchema,
+          decodeFieldStructureOverride: decodeFieldStructureOverride,
+          readFromFileOnly: readFromFileOnly,
           onRecord: (r) {
             totalCount++;
             return true;
@@ -4131,6 +4007,9 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+          decodeSchema: decodeSchema,
+          decodeFieldStructureOverride: decodeFieldStructureOverride,
+          readFromFileOnly: readFromFileOnly,
           onRecord: (r) {
             agg.accumulate(r);
             return true;
@@ -4153,6 +4032,9 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+          decodeSchema: decodeSchema,
+          decodeFieldStructureOverride: decodeFieldStructureOverride,
+          readFromFileOnly: readFromFileOnly,
         );
         return TableScanResult(
           records: out,
@@ -4208,6 +4090,9 @@ class TableDataManager {
         includeMin: includeMin,
         includeMax: includeMax,
         cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        readFromFileOnly: readFromFileOnly,
       ));
       // Note: Sorting is handled by the upper layer (QueryExecutor._applySort),
       // so we skip sorting here to avoid redundant operations and improve performance.
@@ -4273,6 +4158,9 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+          decodeSchema: decodeSchema,
+          decodeFieldStructureOverride: decodeFieldStructureOverride,
+          readFromFileOnly: readFromFileOnly,
           onRecord: (r) {
             localTop.offer(r);
             return true;
@@ -4455,30 +4343,6 @@ final class PartitionPageBatch {
     required this.records,
     this.isEmptyPartition = false,
   });
-}
-
-final class PartitionStreamController {
-  bool _stopRequested = false;
-  PartitionStreamAction _stopAction = PartitionStreamAction.continueScan;
-
-  bool get isStopped => _stopRequested;
-  PartitionStreamAction get stopAction => _stopAction;
-  bool get shouldStopCurrentBatch =>
-      _stopAction == PartitionStreamAction.stopAfterBatch;
-
-  void stopAfterBatch() {
-    _stopRequested = true;
-    _stopAction = PartitionStreamAction.stopAfterBatch;
-  }
-
-  void stopAfterPartition() {
-    _stopRequested = true;
-    _stopAction = PartitionStreamAction.stopAfterPartition;
-  }
-
-  void stop() {
-    stopAfterBatch();
-  }
 }
 
 final class TableWriteLock {

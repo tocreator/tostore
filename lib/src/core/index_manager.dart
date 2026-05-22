@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -9,6 +9,7 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
 import '../model/business_error.dart';
+import '../model/cancellation_token.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/id_generator.dart';
@@ -911,6 +912,7 @@ class IndexManager {
     required bool reverse,
     int? limit,
     int? offset,
+    bool readFromFileOnly = false,
   }) async {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
@@ -924,6 +926,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: offset,
+            readFromFileOnly: readFromFileOnly,
           ) ??
           IndexSearchResult.empty();
     }
@@ -1130,7 +1133,7 @@ class IndexManager {
     String tableName,
     IndexSchema schema, {
     TableSchema? tableSchemaOverride,
-    PartitionStreamController? controller,
+    CancellationToken? controller,
   }) async {
     final buildKey = _getMetaLoadingKey(tableName, schema.actualIndexName);
     final existingBuild = _indexBuildFutures[buildKey];
@@ -1158,7 +1161,7 @@ class IndexManager {
     String tableName,
     IndexSchema schema, {
     TableSchema? tableSchemaOverride,
-    PartitionStreamController? controller,
+    CancellationToken? controller,
   }) async {
     final indexName = schema.actualIndexName;
     final lockMgr = _dataStore.lockManager;
@@ -1167,7 +1170,7 @@ class IndexManager {
     bool indexLocked = false;
 
     try {
-      if (controller?.isStopped ?? false) {
+      if (controller?.isCancelled ?? false) {
         throw IndexBuildCancelledException(tableName, indexName);
       }
 
@@ -2766,7 +2769,7 @@ class IndexManager {
   /// @param indexesToBuild List of indexes to build
   Future<void> _rebuildTableIndexes(String tableName, TableSchema tableSchema,
       List<IndexSchema> indexesToBuild,
-      {PartitionStreamController? controller}) async {
+      {CancellationToken? controller}) async {
     try {
       final primaryKey = tableSchema.primaryKey;
       final uniqueIndexes = indexesToBuild
@@ -2787,63 +2790,59 @@ class IndexManager {
             tableName: tableName, indexName: indexName, updatedMeta: indexMeta);
       }
 
-      // 2) Scan table partitions and build indexes via applyIndexInserts
-      await _dataStore.tableDataManager.streamPartitionPageBatches(
-        tableName: tableName,
-        controller: controller,
-        onPartition: (partitionNo, batches, controller) async {
-          await for (final batch in batches) {
-            if (controller.isStopped) {
-              throw IndexBuildCancelledException(
-                tableName,
-                indexesToBuild.map((i) => i.actualIndexName).join(','),
-              );
-            }
-
-            final records = batch.records;
-            final Map<dynamic, Map<String, dynamic>> newByPk = {};
-            final int maxConcurrency = _dataStore.config.maxConcurrency;
-            final yieldControl =
-                YieldController('IndexManager.streamPartitionPageBatches');
-
-            for (int i = 0; i < records.length; i++) {
-              await yieldControl.maybeYield();
-              final rec = records[i];
-              if (isDeletedRecord(rec)) continue;
-              final pk = rec[primaryKey];
-              if (pk == null) continue;
-              newByPk[pk] = rec;
-            }
-
-            if (newByPk.isNotEmpty) {
-              await _validateUniqueRebuildBatch(
-                tableName: tableName,
-                schema: tableSchema,
-                uniqueIndexes: uniqueIndexes,
-                records: newByPk.values,
-              );
-              await _dataStore.indexManager?.writeChanges(
-                tableName: tableName,
-                inserts: newByPk.values.toList(growable: false),
-                schemaOverride: tableSchema,
-                targetIndexesOverride: indexesToBuild,
-                concurrency: maxConcurrency > 0 ? maxConcurrency : null,
-              );
-              await Future.delayed(Duration.zero);
-            }
-          }
-
-          if (controller.isStopped) {
+      await _dataStore.queryExecutor.queryEachBatch(
+        tableName,
+        batchSize: 1000,
+        onBatch: (records, nextCursor) async {
+          if (controller?.isCancelled ?? false) {
             throw IndexBuildCancelledException(
               tableName,
               indexesToBuild.map((i) => i.actualIndexName).join(','),
             );
           }
-          return PartitionStreamAction.continueScan;
+
+          final Map<dynamic, Map<String, dynamic>> newByPk = {};
+          final int maxConcurrency = _dataStore.config.maxConcurrency;
+          final yieldControl =
+              YieldController('IndexManager.streamPartitionPageBatches');
+
+          for (int i = 0; i < records.length; i++) {
+            await yieldControl.maybeYield();
+            final rec = records[i];
+            if (isDeletedRecord(rec)) continue;
+            final pk = rec[primaryKey];
+            if (pk == null) continue;
+            newByPk[pk] = rec;
+          }
+
+          if (newByPk.isNotEmpty) {
+            await _validateUniqueRebuildBatch(
+              tableName: tableName,
+              schema: tableSchema,
+              uniqueIndexes: uniqueIndexes,
+              records: newByPk.values,
+            );
+            await _dataStore.indexManager?.writeChanges(
+              tableName: tableName,
+              inserts: newByPk.values.toList(growable: false),
+              schemaOverride: tableSchema,
+              targetIndexesOverride: indexesToBuild,
+              concurrency: maxConcurrency > 0 ? maxConcurrency : null,
+            );
+            await Future.delayed(Duration.zero);
+          }
+
+          if (controller?.isCancelled ?? false) {
+            throw IndexBuildCancelledException(
+              tableName,
+              indexesToBuild.map((i) => i.actualIndexName).join(','),
+            );
+          }
+          return true;
         },
       );
 
-      if (controller?.isStopped ?? false) {
+      if (controller?.isCancelled ?? false) {
         throw IndexBuildCancelledException(
           tableName,
           indexesToBuild.map((i) => i.actualIndexName).join(','),
@@ -3238,13 +3237,16 @@ class IndexManager {
     Uint8List? startAfterKey,
     bool reverse = false,
     List<String>? orderBy,
+    bool readFromFileOnly = false,
   }) async {
     // Increment index access weight for caching optimization
-    _dataStore.weightManager?.incrementAccess(
-      WeightType.indexData,
-      '$tableName:$indexName',
-      spaceName: _dataStore.currentSpaceName,
-    );
+    if (!readFromFileOnly) {
+      _dataStore.weightManager?.incrementAccess(
+        WeightType.indexData,
+        '$tableName:$indexName',
+        spaceName: _dataStore.currentSpaceName,
+      );
+    }
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) return IndexSearchResult.tableScan();
@@ -3447,6 +3449,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: effectiveOffset,
+            readFromFileOnly: readFromFileOnly,
           );
         }
 
@@ -3518,6 +3521,7 @@ class IndexManager {
               reverse: reverse,
               limit: remaining > 0 ? remaining : null,
               offset: null,
+              readFromFileOnly: readFromFileOnly,
             );
             out.addAll(res.primaryKeys);
             if (res.entries != null) {
@@ -3580,6 +3584,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: effectiveOffset,
+            readFromFileOnly: readFromFileOnly,
           );
         }
 
@@ -3625,6 +3630,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: effectiveOffset,
+            readFromFileOnly: readFromFileOnly,
           );
         }
 
@@ -3682,6 +3688,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: effectiveOffset,
+            readFromFileOnly: readFromFileOnly,
           );
         }
 
@@ -3819,6 +3826,7 @@ class IndexManager {
           reverse: reverse,
           limit: limit,
           offset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
         );
 
         final validatedPks = <String>[];
@@ -3883,6 +3891,7 @@ class IndexManager {
           reverse: reverse,
           limit: limit,
           offset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
         );
       }
 
@@ -3927,6 +3936,7 @@ class IndexManager {
           reverse: reverse,
           limit: limit,
           offset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
         );
       }
 
@@ -3948,6 +3958,7 @@ class IndexManager {
           reverse: reverse,
           limit: limit,
           offset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
         );
       }
 
@@ -4029,6 +4040,7 @@ class IndexManager {
             reverse: reverse,
             limit: limit,
             offset: effectiveOffset,
+            readFromFileOnly: readFromFileOnly,
           );
         }
         return IndexSearchResult.tableScan();
@@ -4158,6 +4170,7 @@ class IndexManager {
                 reverse: reverse,
                 limit: remaining > 0 ? remaining : null,
                 offset: null, // Offset is handled globally for IN
+                readFromFileOnly: readFromFileOnly,
               );
 
               // Hotspot populate: Populate cache if we did a full bucket scan (no cursor)

@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../core/compute/batch_match_runner.dart';
+import '../model/cancellation_token.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
 import '../core/transaction_context.dart';
@@ -14,6 +15,7 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
+import '../handler/binary_schema_codec.dart';
 import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
 import '../model/index_search.dart';
@@ -70,6 +72,7 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
   }) async {
     final schemaMgr = _dataStore.schemaManager;
     if (schemaMgr == null) {
@@ -137,6 +140,7 @@ class QueryExecutor {
       onlyCount: onlyCount,
       aggregations: aggregations,
       groupBy: groupBy,
+      readFromFileOnly: readFromFileOnly,
     );
   }
 
@@ -277,6 +281,9 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     try {
       // Cursor and offset are mutually exclusive at the API level.
@@ -515,9 +522,20 @@ class QueryExecutor {
         onlyCount: onlyCount,
         aggregations: aggregations,
         groupBy: groupBy,
+        readFromFileOnly: readFromFileOnly,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
       );
 
       if (onlyCount) {
+        if (readFromFileOnly) {
+          stopwatch.stop();
+          return ExecuteResult(
+            records: const [],
+            count: planResult.count ?? 0,
+            executionTimeMs: stopwatch.elapsedMilliseconds,
+          );
+        }
         // For count queries, we must merge the WriteBuffer content to account for
         // uncommitted inserts/updates that were NOT in the persistent index/table scan.
         final bufferResults =
@@ -767,8 +785,12 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = decodeSchema ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
@@ -789,7 +811,7 @@ class QueryExecutor {
     }
 
     // Query cache
-    if (enableQueryCache) {
+    if (enableQueryCache && !readFromFileOnly) {
       final cacheKey = QueryCacheKey(
         tableName: tableName,
         condition: condition ?? QueryCondition(),
@@ -839,7 +861,8 @@ class QueryExecutor {
 
     // Execute actual operation (range-partitioned IO; no full-table caching here)
     // Capture snapshot for consistency (Local View)
-    final int localViewId = _dataStore.readViewManager.registerReadView();
+    final int? localViewId =
+        readFromFileOnly ? null : _dataStore.readViewManager.registerReadView();
     try {
       List<Map<String, dynamic>> results;
       int? totalCount;
@@ -863,6 +886,9 @@ class QueryExecutor {
             onlyCount: onlyCount,
             aggregations: aggregations,
             groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
           );
           results = scanRes.records;
           totalCount = scanRes.count;
@@ -899,6 +925,9 @@ class QueryExecutor {
             onlyCount: onlyCount,
             aggregations: aggregations,
             groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
           );
           results = indexRes.records;
           totalCount = indexRes.count;
@@ -947,6 +976,9 @@ class QueryExecutor {
             onlyCount: onlyCount,
             aggregations: aggregations,
             groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
           );
           results = unionRes.records;
           totalCount = unionRes.count;
@@ -955,6 +987,9 @@ class QueryExecutor {
       }
 
       if (onlyCount) {
+        if (readFromFileOnly) {
+          return PlanExecutionResult(const [], totalCount ?? 0, null);
+        }
         // The tree scan only counts flushed (committed) records.
         // Unflushed write-buffer records must also be counted for consistency.
         final bufferMerged = await _dataStore.tableDataManager.mergeConsistency(
@@ -1080,19 +1115,22 @@ class QueryExecutor {
         bufferMergeLimit = null;
       }
 
-      results = await _dataStore.tableDataManager.mergeConsistency(
-        tableName,
-        results,
-        matcher: matcher,
-        limit: bufferMergeLimit,
-        orderBy: orderBy,
-        filter: bufferFilter,
-        reverse: reverseBuffer, // Pass reverse flag
-      );
+      if (!readFromFileOnly) {
+        results = await _dataStore.tableDataManager.mergeConsistency(
+          tableName,
+          results,
+          matcher: matcher,
+          limit: bufferMergeLimit,
+          orderBy: orderBy,
+          filter: bufferFilter,
+          reverse: reverseBuffer, // Pass reverse flag
+        );
+      }
 
       // Cache query results (skip if already full-table cached)
 
       if (enableQueryCache &&
+          !readFromFileOnly &&
           TransactionContext.getCurrentTransactionId() == null) {
         final cacheKey = QueryCacheKey(
           tableName: tableName,
@@ -1121,7 +1159,9 @@ class QueryExecutor {
 
       return PlanExecutionResult(results, totalCount, null);
     } finally {
-      _dataStore.readViewManager.releaseReadView(localViewId);
+      if (localViewId != null) {
+        _dataStore.readViewManager.releaseReadView(localViewId);
+      }
     }
   }
 
@@ -1142,8 +1182,12 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
-    final tblSchema = schemas[tableName] ??
+    final tblSchema = decodeSchema ??
+        schemas[tableName] ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
     if (tblSchema == null) {
       return TableScanResult(records: const [], count: onlyCount ? 0 : null);
@@ -1210,6 +1254,9 @@ class QueryExecutor {
                   startAfterPrimaryKey: startAfterPrimaryKey,
                   aggregations: null,
                   groupBy: null,
+                  readFromFileOnly: readFromFileOnly,
+                  decodeSchema: decodeSchema,
+                  decodeFieldStructureOverride: decodeFieldStructureOverride,
                 );
                 return scan.records;
               case QueryOperationType.indexScan:
@@ -1235,6 +1282,9 @@ class QueryExecutor {
                       false, // Must fetch records to deduplicate in UNION
                   aggregations: aggregations,
                   groupBy: groupBy,
+                  readFromFileOnly: readFromFileOnly,
+                  decodeSchema: decodeSchema,
+                  decodeFieldStructureOverride: decodeFieldStructureOverride,
                 ))
                     .records;
               case QueryOperationType.union:
@@ -1250,21 +1300,18 @@ class QueryExecutor {
                   if (c is QueryPlan) subPlans.add(c);
                 }
                 if (subPlans.isEmpty) return const <Map<String, dynamic>>[];
-                return (await _performUnionPlans(
-                  tableName,
-                  subPlans,
-                  schemas,
-                  limit: limit,
-                  offset: 0,
-                  orderBy: orderBy,
-                  startAfterPrimaryKey: startAfterPrimaryKey,
-                  startAfterIndexKey: startAfterIndexKey,
-                  reverse: reverse,
-                  onlyCount:
-                      false, // Must fetch records to deduplicate in UNION
-                  aggregations: aggregations,
-                  groupBy: groupBy,
-                ))
+                return (await _performUnionPlans(tableName, subPlans, schemas,
+                        limit: limit,
+                        offset: 0,
+                        orderBy: orderBy,
+                        startAfterPrimaryKey: startAfterPrimaryKey,
+                        startAfterIndexKey: startAfterIndexKey,
+                        reverse: reverse,
+                        onlyCount:
+                            false, // Must fetch records to deduplicate in UNION
+                        aggregations: aggregations,
+                        groupBy: groupBy,
+                        readFromFileOnly: readFromFileOnly))
                     .records;
             }
           },
@@ -1408,15 +1455,10 @@ class QueryExecutor {
       if (rightPlan == null) {
         return [];
       }
-      final rightPlanResult = await _executeQueryPlan(
-        rightPlan,
-        rightTableName,
-        rightTableCondition,
-        {rightTableName: rightSchema},
-        rightMatcher,
-        enableQueryCache: enableQueryCache,
-        queryCacheExpiry: queryCacheExpiry,
-      );
+      final rightPlanResult = await _executeQueryPlan(rightPlan, rightTableName,
+          rightTableCondition, {rightTableName: rightSchema}, rightMatcher,
+          enableQueryCache: enableQueryCache,
+          queryCacheExpiry: queryCacheExpiry);
       rightRecords = rightPlanResult.records;
     } else {
       // LEFT keys empty (e.g., RIGHT JOIN needs full right scan): route through normal pipeline
@@ -1431,17 +1473,12 @@ class QueryExecutor {
           ?.optimize(rightTableName, rightCondition.build());
       if (rightPlan != null) {
         // Use full pipeline (with overlay application)
-        final rightPlanResult = await _executeQueryPlan(
-          rightPlan,
-          rightTableName,
-          rightCondition,
-          {rightTableName: rightSchema},
-          null,
-          enableQueryCache: enableQueryCache,
-          limit: limit,
-          offset: offset,
-          queryCacheExpiry: queryCacheExpiry,
-        );
+        final rightPlanResult = await _executeQueryPlan(rightPlan,
+            rightTableName, rightCondition, {rightTableName: rightSchema}, null,
+            enableQueryCache: enableQueryCache,
+            limit: limit,
+            offset: offset,
+            queryCacheExpiry: queryCacheExpiry);
         rightRecords = rightPlanResult.records;
       } else {
         // Fallback: perform raw scan then apply overlays manually
@@ -1710,6 +1747,9 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     try {
       return await _dataStore.tableDataManager.searchTableData(
@@ -1723,6 +1763,9 @@ class QueryExecutor {
         onlyCount: onlyCount,
         aggregations: aggregations,
         groupBy: groupBy,
+        readFromFileOnly: readFromFileOnly,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
       );
     } catch (e) {
       Logger.error('Table scan failed: $e',
@@ -1883,9 +1926,13 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema = decodeSchema ??
+          await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
@@ -1937,7 +1984,8 @@ class QueryExecutor {
             filter: filter,
             onlyCount: onlyCount,
             aggregations: aggregations,
-            groupBy: groupBy);
+            groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly);
       }
       if (!onlyCount && limit != null && limit <= 0) {
         return TableScanResult(records: const []);
@@ -2054,6 +2102,7 @@ class QueryExecutor {
             startAfterKey: resumeKey,
             reverse: reverse,
             orderBy: orderBy,
+            readFromFileOnly: readFromFileOnly,
           );
 
           if (indexResults.requiresTableScan) {
@@ -2064,7 +2113,8 @@ class QueryExecutor {
                 filter: filter,
                 onlyCount: onlyCount,
                 aggregations: aggregations,
-                groupBy: groupBy);
+                groupBy: groupBy,
+                readFromFileOnly: readFromFileOnly);
           }
 
           final pks = indexResults.primaryKeys;
@@ -2153,6 +2203,9 @@ class QueryExecutor {
                 : (await _dataStore.tableDataManager.queryRecordsBatch(
                     tableName,
                     pks,
+                    readFromFileOnly: readFromFileOnly,
+                    decodeSchema: decodeSchema,
+                    decodeFieldStructureOverride: decodeFieldStructureOverride,
                   ))
                     .records;
 
@@ -2383,6 +2436,7 @@ class QueryExecutor {
           startAfterKey: resumeKey,
           reverse: reverse,
           orderBy: orderBy,
+          readFromFileOnly: readFromFileOnly,
         );
 
         if (indexResults.requiresTableScan) {
@@ -2391,7 +2445,8 @@ class QueryExecutor {
               offset: offset,
               orderBy: orderBy,
               filter: filter,
-              onlyCount: onlyCount);
+              onlyCount: onlyCount,
+              readFromFileOnly: readFromFileOnly);
         }
 
         final pks = indexResults.primaryKeys;
@@ -2403,6 +2458,9 @@ class QueryExecutor {
             : (await _dataStore.tableDataManager.queryRecordsBatch(
                 tableName,
                 pks,
+                readFromFileOnly: readFromFileOnly,
+                decodeSchema: decodeSchema,
+                decodeFieldStructureOverride: decodeFieldStructureOverride,
               ))
                 .records;
 
@@ -2508,7 +2566,8 @@ class QueryExecutor {
           offset: offset,
           orderBy: orderBy,
           filter: filter,
-          onlyCount: onlyCount);
+          onlyCount: onlyCount,
+          readFromFileOnly: readFromFileOnly);
     }
   }
 
@@ -3312,6 +3371,111 @@ class QueryExecutor {
     }
 
     return 64;
+  }
+
+  /// Construct a primary key cursor token for a table.
+  static String buildPrimaryKeyCursor(String tableName, String primaryKeyStr,
+      {bool reverse = false}) {
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'v': 1,
+      't': tableName,
+      'm': 'pk',
+      'b': false,
+      'pk': primaryKeyStr,
+      'r': reverse,
+    };
+    final jsonStr = jsonEncode(payload);
+    return base64Url.encode(utf8.encode(jsonStr));
+  }
+
+  /// Query data batch-by-batch using cursors directly from files (bypassing WriteBuffer and read views).
+  /// Enforces a flush before starting.
+  Future<void> queryEachBatch(
+    String tableName, {
+    required int batchSize,
+    required Future<bool> Function(
+            List<Map<String, dynamic>> batch, String? nextCursor)
+        onBatch,
+    QueryCondition? condition,
+    List<String>? orderBy,
+    String? checkpointCursor,
+    CancellationToken? cancellationToken,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+  }) async {
+    // 1. Force flush to ensure storage files are fully up-to-date
+    await _dataStore.flush(flushStorage: true);
+
+    // 2. Resolve Table Schema
+    final schemaMgr = _dataStore.schemaManager;
+    if (schemaMgr == null) {
+      throw StateError('Schema manager not initialized');
+    }
+    final schema = decodeSchema ?? await schemaMgr.getTableSchema(tableName);
+    if (schema == null) {
+      throw StateError('Table schema not found for $tableName');
+    }
+
+    final schemas = <String, TableSchema>{tableName: schema};
+    if (condition != null && !condition.isEmpty) {
+      condition.normalize(schemas, tableName);
+    }
+
+    // 3. Optimize query plan
+    final optimizer = _dataStore.getQueryOptimizer();
+    if (optimizer == null) {
+      throw StateError('Query optimizer not initialized');
+    }
+
+    final Map<String, dynamic>? where = condition?.build();
+    final plan = await optimizer.optimize(
+      tableName,
+      where,
+      orderBy: orderBy,
+      limit: batchSize,
+    );
+
+    // 4. Batch execution loop
+    String? currentCursor = checkpointCursor;
+    bool hasMore = true;
+
+    while (hasMore) {
+      if (cancellationToken != null && cancellationToken.isCancelled) {
+        break;
+      }
+
+      final result = await _executeWithPlan(
+        plan,
+        tableName,
+        schemas: schemas,
+        condition: condition,
+        where: where,
+        orderBy: orderBy,
+        limit: batchSize,
+        cursor: currentCursor,
+        enableQueryCache: false,
+        readFromFileOnly: true,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+      );
+
+      if (result.records.isEmpty) {
+        break;
+      }
+
+      hasMore = result.hasMore;
+      currentCursor = result.nextCursor;
+
+      // Invoke client callback. If callback returns false, stop batch processing.
+      final shouldContinue = await onBatch(result.records, currentCursor);
+      if (!shouldContinue) {
+        break;
+      }
+
+      if (currentCursor == null || currentCursor.isEmpty) {
+        break;
+      }
+    }
   }
 }
 

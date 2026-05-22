@@ -14,12 +14,13 @@ import '../model/migration_task.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
+import '../model/cancellation_token.dart';
+import '../query/query_executor.dart';
 import 'backup_manager.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'data_store_impl.dart';
 import 'index_manager.dart';
-import 'table_data_manager.dart';
 import 'transaction_context.dart';
 import 'crontab_manager.dart';
 import 'yield_controller.dart';
@@ -69,7 +70,7 @@ class MigrationManager {
   int _totalPreparedRecords = 0;
 
   // Active partition stream controllers for graceful cancellation
-  final Map<String, PartitionStreamController> _activeControllers = {};
+  final Map<String, CancellationToken> _activeControllers = {};
 
   // Active migration instances: spaceName -> DataStoreImpl
   final Map<String, DataStoreImpl> _activeMigrationInstances = {};
@@ -272,7 +273,7 @@ class MigrationManager {
     if (controller != null) {
       Logger.info('Stopping background migration for space [$spaceName]...',
           label: 'MigrationManager');
-      controller.stopAfterBatch();
+      controller.cancel();
       // Do not remove from _activeControllers yet, let the task finish
     }
 
@@ -3244,7 +3245,7 @@ class MigrationManager {
           _activeMigrationInstances[space] = migrationInstance;
         }
 
-        final migrationController = PartitionStreamController();
+        final migrationController = CancellationToken();
         _activeControllers[space] = migrationController;
 
         final spaceMigrationFuture = () async {
@@ -3323,10 +3324,6 @@ class MigrationManager {
 
               final sourcePkName = sourceSchema.primaryKey;
 
-              // Optimized default: 500 pages (~8MB) provides near-peak sequential throughput
-              // while keeping memory pressure predictable.
-              final int pagesPerBatch = 500;
-
               final tableMeta = await migrationInstance.tableDataManager
                   .getTableMeta(currentTableName);
               if (tableMeta != null) {
@@ -3334,78 +3331,102 @@ class MigrationManager {
                     currentTask.taskId, tableMeta.totalRecords);
               }
 
-              await migrationInstance.tableDataManager
-                  .streamPartitionPageBatches(
-                tableName: currentTableName,
-                decodeSchema: oldSchema,
-                decodeFieldStructureOverride: decodeFieldStructureOverride,
-                prefetchNextPageBatch: true,
-                pagesPerBatch: pagesPerBatch,
-                controller: migrationController,
-                onPartition: (partitionNo, batches, ctrl) async {
-                  await for (final batch in batches) {
-                    if (ctrl.isStopped) break;
+              final encodedCheckpoint =
+                  currentTask.checkpointKeyForSpace(space);
+              Uint8List? checkpointKey;
+              if (encodedCheckpoint != null && encodedCheckpoint.isNotEmpty) {
+                try {
+                  checkpointKey =
+                      Uint8List.fromList(base64Decode(encodedCheckpoint));
+                } catch (_) {}
+              }
 
-                    while (_totalPreparedRecords >= queueSoftCap &&
-                        !ctrl.isStopped) {
-                      await Future.delayed(const Duration(milliseconds: 100));
-                    }
-
-                    if (batch.records.isEmpty) continue;
-
-                    final migratedRecords = await _applyMigrationOperations(
-                      batch.records,
-                      sortedOperations,
-                      oldSchema: oldSchema,
-                    );
-
-                    if (migratedRecords.isNotEmpty) {
-                      final yieldController = YieldController(
-                          'MigrationManager.subBatching',
-                          checkInterval: 64);
-                      // Sub-batching: Split large results into 1000-record chunks.
-                      // This ensures PJM can poll precise amounts without overfilling or splitting.
-                      const int subBatchSize = 1000;
-                      for (int i = 0;
-                          i < migratedRecords.length;
-                          i += subBatchSize) {
-                        await yieldController.maybeYield();
-                        final int end =
-                            (i + subBatchSize < migratedRecords.length)
-                                ? i + subBatchSize
-                                : migratedRecords.length;
-                        final entries = migratedRecords.sublist(i, end);
-
-                        final lastRecord = entries.last.data;
-                        final sourcePk = lastRecord[sourcePkName]?.toString();
-                        Uint8List? sourcePkBytes;
-                        if (sourcePk != null) {
-                          try {
-                            sourcePkBytes = sourceSchema
-                                .encodePrimaryKeyComponent(sourcePk);
-                          } catch (_) {}
-                        }
-
-                        final preparedBatch = MigrationPreparedBatch(
-                          taskId: currentTask.taskId,
-                          tableName: currentTableName,
-                          spaceName: space,
-                          entries: entries,
-                          partitionNo: partitionNo,
-                          checkpointKey: sourcePkBytes,
-                        );
-
-                        _preparedBatches
-                            .putIfAbsent(space, () => Queue())
-                            .add(preparedBatch);
-                      }
-
-                      _totalPreparedRecords += migratedRecords.length;
-                      migrationInstance.parallelJournalManager
-                          .scheduleFlushIfNeeded();
+              String? startCursor;
+              if (checkpointKey != null && checkpointKey.isNotEmpty) {
+                try {
+                  final tuple = MemComparableKey.decodeTuple(checkpointKey);
+                  if (tuple.isNotEmpty) {
+                    final startPkStr = tuple.first?.toString();
+                    if (startPkStr != null) {
+                      startCursor = QueryExecutor.buildPrimaryKeyCursor(
+                          currentTableName, startPkStr);
                     }
                   }
-                  return PartitionStreamAction.continueScan;
+                } catch (_) {}
+              }
+
+              await migrationInstance.queryExecutor.queryEachBatch(
+                currentTableName,
+                batchSize: writeBatchSize,
+                checkpointCursor: startCursor,
+                cancellationToken: migrationController,
+                decodeSchema: oldSchema,
+                decodeFieldStructureOverride: decodeFieldStructureOverride,
+                onBatch: (records, nextCursor) async {
+                  if (migrationController.isCancelled) {
+                    return false;
+                  }
+
+                  while (_totalPreparedRecords >= queueSoftCap &&
+                      !migrationController.isCancelled) {
+                    await Future.delayed(const Duration(milliseconds: 100));
+                  }
+
+                  if (records.isEmpty) return true;
+
+                  final migratedRecords = await _applyMigrationOperations(
+                    records,
+                    sortedOperations,
+                    oldSchema: oldSchema,
+                  );
+
+                  if (migratedRecords.isNotEmpty) {
+                    final yieldController = YieldController(
+                        'MigrationManager.subBatching',
+                        checkInterval: 64);
+                    // Sub-batching: Split large results into 1000-record chunks.
+                    // This ensures PJM can poll precise amounts without overfilling or splitting.
+                    const int subBatchSize = 1000;
+                    for (int i = 0;
+                        i < migratedRecords.length;
+                        i += subBatchSize) {
+                      await yieldController.maybeYield();
+                      final int end =
+                          (i + subBatchSize < migratedRecords.length)
+                              ? i + subBatchSize
+                              : migratedRecords.length;
+                      final entries = migratedRecords.sublist(i, end);
+
+                      final lastRecord = entries.last.data;
+                      final sourcePk = lastRecord[sourcePkName]?.toString();
+                      Uint8List? sourcePkBytes;
+                      if (sourcePk != null) {
+                        try {
+                          sourcePkBytes =
+                              sourceSchema.encodePrimaryKeyComponent(sourcePk);
+                        } catch (_) {}
+                      }
+
+                      final preparedBatch = MigrationPreparedBatch(
+                        taskId: currentTask.taskId,
+                        tableName: currentTableName,
+                        spaceName: space,
+                        entries: entries,
+                        partitionNo: 0,
+                        checkpointKey: sourcePkBytes,
+                      );
+
+                      _preparedBatches
+                          .putIfAbsent(space, () => Queue())
+                          .add(preparedBatch);
+                    }
+
+                    _totalPreparedRecords += migratedRecords.length;
+                    migrationInstance.parallelJournalManager
+                        .scheduleFlushIfNeeded();
+                  }
+
+                  return true;
                 },
               );
 
@@ -3413,7 +3434,7 @@ class MigrationManager {
               // flushCompletely() waits until the PJM queue is fully drained to disk.
               await migrationInstance.parallelJournalManager.flushCompletely();
 
-              if (migrationController.isStopped) {
+              if (migrationController.isCancelled) {
                 throw _MigrationStoppedException(space);
               }
 
@@ -3879,7 +3900,7 @@ class MigrationManager {
     DataStoreImpl migrationInstance,
     String tableName, {
     required TableSchema? targetSchema,
-    required PartitionStreamController controller,
+    required CancellationToken controller,
   }) async {
     final schema = targetSchema ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -3890,7 +3911,7 @@ class MigrationManager {
     final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
         const <IndexSchema>[];
     for (final index in indexes) {
-      if (controller.isStopped) {
+      if (controller.isCancelled) {
         throw _MigrationStoppedException(migrationInstance.currentSpaceName);
       }
       try {

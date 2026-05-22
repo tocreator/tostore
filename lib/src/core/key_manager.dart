@@ -10,7 +10,6 @@ import '../handler/encoder.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/space_config.dart';
 import '../model/system_table.dart';
-import 'table_data_manager.dart';
 
 /// Manages the logic for migrating encryption keys.
 /// When the encryptionKey in DataStoreConfig changes,
@@ -286,49 +285,39 @@ class KeyManager {
     final tableNames = await _dataStore.getTableNames();
 
     for (final tableName in tableNames) {
-      await _dataStore.tableDataManager.streamPartitionPageBatches(
-        tableName: tableName,
-        customKey: newKey,
-        customKeyId: newKeyId,
-        partitionConcurrency: 1,
-        prefetchNextPageBatch: true,
-        onPartition: (partitionNo, batches, controller) async {
+      await _dataStore.queryExecutor.queryEachBatch(
+        tableName,
+        batchSize: 1000,
+        onBatch: (records, nextCursor) async {
+          if (records.isEmpty) return true;
+
           await _dataStore.tableDataManager.withTableWriteLock(
             tableName,
             (tableLock) async {
-              await for (final batch in batches) {
-                if (controller.shouldStopCurrentBatch) break;
-                final records = batch.records;
-                if (records.isEmpty) continue;
+              BatchContext? batchContext;
+              if (_dataStore.config.enableJournal) {
+                batchContext = await _dataStore.parallelJournalManager
+                    .beginMaintenanceBatch(table: tableName);
+              }
 
-                BatchContext? batchContext;
-                if (_dataStore.config.enableJournal) {
-                  batchContext = await _dataStore.parallelJournalManager
-                      .beginMaintenanceBatch(table: tableName);
-                }
+              await _dataStore.tableDataManager.writeChanges(
+                tableName: tableName,
+                updates: records,
+                batchContext: batchContext,
+                encryptionKey: newKey,
+                encryptionKeyId: newKeyId,
+                tableLock: tableLock,
+              );
 
-                await _dataStore.tableDataManager.writeChanges(
-                  tableName: tableName,
-                  updates: records,
-                  batchContext: batchContext,
-                  encryptionKey: newKey,
-                  encryptionKeyId: newKeyId,
-                  tableLock: tableLock,
-                );
-
-                if (_dataStore.config.enableJournal && batchContext != null) {
-                  await _dataStore.parallelJournalManager
-                      .completeMaintenanceBatch(batchContext: batchContext);
-                  await _dataStore.tableDataManager
-                      .persistRuntimeMetaIfNeeded();
-                }
+              if (_dataStore.config.enableJournal && batchContext != null) {
+                await _dataStore.parallelJournalManager
+                    .completeMaintenanceBatch(batchContext: batchContext);
+                await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
               }
             },
             operationPrefix: 'key_migrate_page_batches_',
           );
-          return controller.isStopped
-              ? controller.stopAction
-              : PartitionStreamAction.continueScan;
+          return true;
         },
       );
 

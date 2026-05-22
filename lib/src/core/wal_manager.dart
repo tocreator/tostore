@@ -84,6 +84,7 @@ class LargeDeleteMeta {
   final int? offset;
   int?
       lastProcessedPartitionNo; // null means none processed yet, int is partition number (0-based)
+  String? checkpointCursor; // Cursor checkpoint for queryEachBatch
   int deletedSoFar; // cumulative deleted rows (for limit semantics across crashes)
   String status; // 'running' | 'completed'
   final String createdAt; // ISO8601
@@ -96,6 +97,7 @@ class LargeDeleteMeta {
     this.limit,
     this.offset,
     this.lastProcessedPartitionNo,
+    this.checkpointCursor,
     required this.deletedSoFar,
     required this.status,
     required this.createdAt,
@@ -110,6 +112,7 @@ class LargeDeleteMeta {
         if (offset != null) 'offset': offset,
         if (lastProcessedPartitionNo != null)
           'lastProcessedPartitionNo': lastProcessedPartitionNo,
+        if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
         'deletedSoFar': deletedSoFar,
         'status': status,
         'createdAt': createdAt,
@@ -131,6 +134,7 @@ class LargeDeleteMeta {
       limit: (json['limit'] as num?)?.toInt(),
       offset: (json['offset'] as num?)?.toInt(),
       lastProcessedPartitionNo: lastProcessedPartitionNo,
+      checkpointCursor: json['checkpointCursor'] as String?,
       deletedSoFar: (json['deletedSoFar'] as num?)?.toInt() ?? 0,
       status: (json['status'] as String?) ?? 'running',
       createdAt:
@@ -149,6 +153,7 @@ class LargeUpdateMeta {
   final int? limit;
   final int? offset;
   int? lastProcessedPartitionNo;
+  String? checkpointCursor; // Cursor checkpoint for queryEachBatch
   int updatedSoFar; // cumulative updated rows (for limit semantics across crashes)
   String status; // 'running' | 'completed'
   final String createdAt; // ISO8601
@@ -162,6 +167,7 @@ class LargeUpdateMeta {
     this.limit,
     this.offset,
     this.lastProcessedPartitionNo,
+    this.checkpointCursor,
     required this.updatedSoFar,
     required this.status,
     required this.createdAt,
@@ -177,6 +183,7 @@ class LargeUpdateMeta {
         if (offset != null) 'offset': offset,
         if (lastProcessedPartitionNo != null)
           'lastProcessedPartitionNo': lastProcessedPartitionNo,
+        if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
         'updatedSoFar': updatedSoFar,
         'status': status,
         'createdAt': createdAt,
@@ -200,6 +207,7 @@ class LargeUpdateMeta {
       limit: (json['limit'] as num?)?.toInt(),
       offset: (json['offset'] as num?)?.toInt(),
       lastProcessedPartitionNo: lastProcessedPartitionNo,
+      checkpointCursor: json['checkpointCursor'] as String?,
       updatedSoFar: (json['updatedSoFar'] as num?)?.toInt() ?? 0,
       status: (json['status'] as String?) ?? 'running',
       createdAt:
@@ -1573,6 +1581,7 @@ class WalManager {
     int? limit,
     int? offset,
     int? startPartitionNo, // null means start from beginning
+    String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     if (!_initialized) {
@@ -1586,6 +1595,7 @@ class WalManager {
       limit: limit,
       offset: offset,
       lastProcessedPartitionNo: startPartitionNo,
+      checkpointCursor: checkpointCursor,
       deletedSoFar: 0,
       status: 'running',
       createdAt: DateTime.now().toIso8601String(),
@@ -1598,12 +1608,14 @@ class WalManager {
     required String opId,
     required int? lastProcessedPartitionNo,
     required int deletedSoFar,
+    String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     final m = _meta.largeDeletes[opId];
     if (m == null) return;
     m.lastProcessedPartitionNo = lastProcessedPartitionNo;
     m.deletedSoFar = deletedSoFar;
+    m.checkpointCursor = checkpointCursor;
     await persistMeta(flush: false);
   }
 
@@ -1628,6 +1640,7 @@ class WalManager {
     int? limit,
     int? offset,
     int? startPartitionNo, // null means start from beginning
+    String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     if (!_initialized) {
@@ -1642,6 +1655,7 @@ class WalManager {
       limit: limit,
       offset: offset,
       lastProcessedPartitionNo: startPartitionNo,
+      checkpointCursor: checkpointCursor,
       updatedSoFar: 0,
       status: 'running',
       createdAt: DateTime.now().toIso8601String(),
@@ -1654,12 +1668,14 @@ class WalManager {
     required String opId,
     required int? lastProcessedPartitionNo,
     required int updatedSoFar,
+    String? checkpointCursor,
   }) async {
     if (!_config.enableJournal) return;
     final m = _meta.largeUpdates[opId];
     if (m == null) return;
     m.lastProcessedPartitionNo = lastProcessedPartitionNo;
     m.updatedSoFar = updatedSoFar;
+    m.checkpointCursor = checkpointCursor;
     await persistMeta(flush: false);
   }
 

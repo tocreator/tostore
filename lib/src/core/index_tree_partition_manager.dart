@@ -221,6 +221,7 @@ final class IndexTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Map<String, LeafPage>? localCache,
+    bool readFromFileOnly = false,
   }) async {
     if (ptr.isNull) return LeafPage.empty();
 
@@ -271,7 +272,9 @@ final class IndexTreePartitionManager {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = leaf;
         }
-        _leafPageCache.put(cacheKey, leaf);
+        if (!readFromFileOnly) {
+          _leafPageCache.put(cacheKey, leaf);
+        }
       }
       return leaf;
     } catch (e) {
@@ -288,6 +291,7 @@ final class IndexTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Map<String, InternalPage>? localCache,
+    bool readFromFileOnly = false,
   }) async {
     if (ptr.isNull) return InternalPage.empty();
 
@@ -339,7 +343,9 @@ final class IndexTreePartitionManager {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = page;
         }
-        _internalPageCache.put(cacheKey, page);
+        if (!readFromFileOnly) {
+          _internalPageCache.put(cacheKey, page);
+        }
       }
       return page;
     } catch (e) {
@@ -369,6 +375,7 @@ final class IndexTreePartitionManager {
     Uint8List keyBytes, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final root = meta.btreeRoot;
     final firstLeaf = meta.btreeFirstLeaf;
@@ -377,7 +384,9 @@ final class IndexTreePartitionManager {
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
       final node = await _readInternal(tableName, indexName, meta, cur,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (node.children.isEmpty) return firstLeaf;
       final idx = node.childIndexForKey(keyBytes);
       cur = node.children[idx];
@@ -391,6 +400,7 @@ final class IndexTreePartitionManager {
     IndexMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final root = meta.btreeRoot;
     final lastLeaf = meta.btreeLastLeaf;
@@ -399,7 +409,9 @@ final class IndexTreePartitionManager {
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
       final node = await _readInternal(tableName, indexName, meta, cur,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (node.children.isEmpty) return lastLeaf;
       cur = node.children.last;
     }
@@ -413,6 +425,7 @@ final class IndexTreePartitionManager {
     IndexMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final root = meta.btreeRoot;
     final lastLeaf = meta.btreeLastLeaf;
@@ -425,6 +438,7 @@ final class IndexTreePartitionManager {
         meta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -436,6 +450,7 @@ final class IndexTreePartitionManager {
         lastLeaf,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
       final looksValid = leaf.next.isNull &&
           (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalEntries <= 0);
@@ -450,6 +465,7 @@ final class IndexTreePartitionManager {
       meta,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      readFromFileOnly: readFromFileOnly,
     );
   }
 
@@ -1774,6 +1790,7 @@ final class IndexTreePartitionManager {
     required Uint8List uniqueKey,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return null;
@@ -1784,10 +1801,13 @@ final class IndexTreePartitionManager {
       uniqueKey,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      readFromFileOnly: readFromFileOnly,
     );
     if (leafPtr.isNull) leafPtr = firstLeaf;
     final leaf = await _readLeaf(tableName, indexName, meta, leafPtr,
-        encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly);
     final idx = leaf.find(uniqueKey);
     if (idx == null) return null;
     final v = leaf.values[idx];
@@ -1810,6 +1830,7 @@ final class IndexTreePartitionManager {
     required List<Uint8List> uniqueKeys,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     if (uniqueKeys.isEmpty) return const [];
     final firstLeaf = meta.btreeFirstLeaf;
@@ -1825,6 +1846,7 @@ final class IndexTreePartitionManager {
         uniqueKeys[i],
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
       if (leafPtr.isNull) leafPtr = firstLeaf;
       leafPtrToKeyIndices.putIfAbsent(keyOfPtr(leafPtr), () => <int>[]).add(i);
@@ -1835,7 +1857,9 @@ final class IndexTreePartitionManager {
       final parts = entry.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
       final leaf = await _readLeaf(tableName, indexName, meta, ptr,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       for (final idx in entry.value) {
         final key = uniqueKeys[idx];
         final slot = leaf.find(key);
@@ -1916,6 +1940,7 @@ final class IndexTreePartitionManager {
     int? offset,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return IndexSearchResult.empty();
@@ -1937,6 +1962,7 @@ final class IndexTreePartitionManager {
           endKeyExclusive,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly,
         );
       } else {
         // Reverse scan from end (Infinity).
@@ -1948,6 +1974,7 @@ final class IndexTreePartitionManager {
           meta,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly,
         );
       }
     } else {
@@ -1959,6 +1986,7 @@ final class IndexTreePartitionManager {
         startKeyInclusive,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -1981,6 +2009,7 @@ final class IndexTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -1995,6 +2024,7 @@ final class IndexTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 

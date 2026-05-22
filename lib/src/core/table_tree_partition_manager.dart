@@ -358,6 +358,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Map<String, LeafPage>? localCache,
+    bool readFromFileOnly = false,
   }) async {
     if (ptr.isNull) return LeafPage.empty();
 
@@ -407,7 +408,9 @@ final class TableTreePartitionManager {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = leaf;
         }
-        _leafPageCache.put(cacheKey, leaf);
+        if (!readFromFileOnly) {
+          _leafPageCache.put(cacheKey, leaf);
+        }
       }
       return leaf;
     } catch (e) {
@@ -433,6 +436,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Map<String, InternalPage>? localCache,
+    bool readFromFileOnly = false,
   }) async {
     if (ptr.isNull) return InternalPage.empty();
 
@@ -483,7 +487,9 @@ final class TableTreePartitionManager {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = page;
         }
-        _internalPageCache.put(cacheKey, page);
+        if (!readFromFileOnly) {
+          _internalPageCache.put(cacheKey, page);
+        }
       }
       return page;
     } catch (e) {
@@ -498,13 +504,16 @@ final class TableTreePartitionManager {
     Uint8List keyBytes, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     if (meta.btreeRoot.isNull) return meta.btreeFirstLeaf;
     if (meta.btreeHeight <= 0) return meta.btreeRoot;
     TreePagePtr cur = meta.btreeRoot;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
       final node = await _readInternalPage(tableName, meta, cur,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (node.children.isEmpty) return meta.btreeFirstLeaf;
       final idx = node.childIndexForKey(keyBytes);
       cur = node.children[idx];
@@ -517,13 +526,16 @@ final class TableTreePartitionManager {
     TableMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     if (meta.btreeRoot.isNull) return meta.btreeLastLeaf;
     if (meta.btreeHeight <= 0) return meta.btreeRoot;
     TreePagePtr cur = meta.btreeRoot;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
       final node = await _readInternalPage(tableName, meta, cur,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (node.children.isEmpty) return meta.btreeLastLeaf;
       cur = node.children.last;
     }
@@ -536,6 +548,7 @@ final class TableTreePartitionManager {
     TableMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    bool readFromFileOnly = false,
   }) async {
     final root = meta.btreeRoot;
     final lastLeaf = meta.btreeLastLeaf;
@@ -547,6 +560,7 @@ final class TableTreePartitionManager {
         meta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -557,6 +571,7 @@ final class TableTreePartitionManager {
         lastLeaf,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
       final looksValid = leaf.next.isNull &&
           (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalRecords <= 0);
@@ -570,6 +585,7 @@ final class TableTreePartitionManager {
       meta,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      readFromFileOnly: readFromFileOnly,
     );
   }
 
@@ -2045,6 +2061,8 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? schemaOverride,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async {
     if (keys.isEmpty) return const <Map<String, dynamic>>[];
     final schema = schemaOverride ??
@@ -2054,6 +2072,7 @@ final class TableTreePartitionManager {
     final fieldStruct = await _resolveStorageFieldStructure(
       tableName: tableName,
       schema: schema,
+      override: decodeFieldStructureOverride,
     );
 
     final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
@@ -2070,7 +2089,9 @@ final class TableTreePartitionManager {
       pkStrings[i] = pk;
       final keyBytes = schema.encodePrimaryKeyComponent(pk);
       var ptr = await _locateLeafForKey(tableName, meta, keyBytes,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
       leafToIndexes
           .putIfAbsent('${ptr.partitionNo}:${ptr.pageNo}', () => <int>[])
@@ -2085,7 +2106,9 @@ final class TableTreePartitionManager {
       final parts = e.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
       final leaf = await _readLeafPage(tableName, meta, ptr,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       for (final idx in e.value) {
         final pk = pkStrings[idx];
         if (pk == null) continue;
@@ -2461,6 +2484,7 @@ final class TableTreePartitionManager {
     int? encryptionKeyId,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async* {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
@@ -2482,18 +2506,24 @@ final class TableTreePartitionManager {
     int startIndexInLeaf = -1;
     if (!reverse) {
       ptr = await _locateLeafForKey(tableName, meta, startKeyInclusive,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (ptr.isNull) ptr = meta.btreeFirstLeaf;
     } else {
       if (endKeyExclusive.isNotEmpty) {
         ptr = await _locateLeafForKey(tableName, meta, endKeyExclusive,
-            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
         if (ptr.isNull) ptr = meta.btreeLastLeaf;
       } else {
         // Fast path: trust meta.btreeLastLeaf when it still points to the
         // boundary leaf, and fall back to a full right-edge descent otherwise.
         ptr = await _locateRightmostLeafFast(tableName, meta,
-            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
       }
     }
 
@@ -2516,6 +2546,7 @@ final class TableTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -2530,6 +2561,7 @@ final class TableTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -2645,6 +2677,9 @@ final class TableTreePartitionManager {
     bool Function(Map<String, dynamic>)? recordPredicate,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async {
     final out = <Map<String, dynamic>>[];
     await forEachRecordByPrimaryKeyRange(
@@ -2656,6 +2691,9 @@ final class TableTreePartitionManager {
       recordPredicate: recordPredicate,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      decodeSchema: decodeSchema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+      readFromFileOnly: readFromFileOnly,
       onRecord: (r) {
         out.add(r);
         return true;
@@ -2675,12 +2713,17 @@ final class TableTreePartitionManager {
     bool decodeRecord = true,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool readFromFileOnly = false,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema = decodeSchema ??
+        await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) return;
     final fieldStruct = await _resolveStorageFieldStructure(
       tableName: tableName,
       schema: schema,
+      override: decodeFieldStructureOverride,
     );
     final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return;
@@ -2691,16 +2734,22 @@ final class TableTreePartitionManager {
     int startIndexInLeaf = -1;
     if (!reverse) {
       ptr = await _locateLeafForKey(tableName, meta, startKeyInclusive,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          readFromFileOnly: readFromFileOnly);
       if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
     } else {
       if (endKeyExclusive.isNotEmpty) {
         ptr = await _locateLeafForKey(tableName, meta, endKeyExclusive,
-            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
         if (ptr.isNull) ptr = (meta.btreeLastLeaf);
       } else {
         ptr = await _locateRightmostLeafFast(tableName, meta,
-            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
       }
     }
 
@@ -2721,6 +2770,7 @@ final class TableTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
@@ -2734,6 +2784,7 @@ final class TableTreePartitionManager {
         p,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
       );
     }
 
