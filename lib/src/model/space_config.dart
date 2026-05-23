@@ -9,6 +9,9 @@ class SpaceConfig {
   /// previous encryption key info (if any)
   final EncryptionKeyInfo? previous;
 
+  /// history encryption key list (at most 10)
+  final List<EncryptionKeyInfo> historyKeys;
+
   /// Internal engine/storage format version
   final int version;
 
@@ -35,6 +38,7 @@ class SpaceConfig {
   SpaceConfig({
     required this.current,
     this.previous,
+    List<EncryptionKeyInfo>? historyKeys,
     int? version,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
@@ -43,6 +47,7 @@ class SpaceConfig {
     this.totalDataSizeBytes = 0,
     this.lastStatisticsTime,
   })  : version = version ?? InternalConfig.engineVersion,
+        historyKeys = (historyKeys ?? const []).take(10).toList(),
         tableDirectoryMap = tableDirectoryMap ?? {},
         directoryUsageMap = directoryUsageMap ?? {};
 
@@ -53,6 +58,12 @@ class SpaceConfig {
         previous: json['previous'] != null
             ? EncryptionKeyInfo.fromJson(
                 json['previous'] as Map<String, dynamic>)
+            : null,
+        historyKeys: json['historyKeys'] != null
+            ? (json['historyKeys'] as List<dynamic>)
+                .map((e) =>
+                    EncryptionKeyInfo.fromJson(e as Map<String, dynamic>))
+                .toList()
             : null,
         version: resolveVersionValue(
             json['version'], InternalConfig.legacyEngineVersion),
@@ -81,6 +92,7 @@ class SpaceConfig {
     return {
       'current': current.toJson(),
       'previous': previous?.toJson(),
+      'historyKeys': historyKeys.map((e) => e.toJson()).toList(),
       'version': version,
       'tableDirectoryMap':
           tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
@@ -96,6 +108,7 @@ class SpaceConfig {
   SpaceConfig copyWith({
     EncryptionKeyInfo? current,
     EncryptionKeyInfo? previous,
+    List<EncryptionKeyInfo>? historyKeys,
     int? version,
     Map<String, TableDirectoryInfo>? tableDirectoryMap,
     Map<String, int>? directoryUsageMap,
@@ -107,6 +120,7 @@ class SpaceConfig {
     return SpaceConfig(
       current: current ?? this.current,
       previous: previous ?? this.previous,
+      historyKeys: historyKeys ?? this.historyKeys,
       version: version ?? this.version,
       tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
       directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
@@ -122,6 +136,7 @@ class SpaceConfig {
     return [
       current,
       if (previous != null) previous!,
+      ...historyKeys,
     ]..removeWhere((key) => key.key.isEmpty);
   }
 
@@ -129,6 +144,9 @@ class SpaceConfig {
   EncryptionKeyInfo? getKeyById(int keyId) {
     if (current.keyId == keyId) return current;
     if (previous?.keyId == keyId) return previous;
+    for (final key in historyKeys) {
+      if (key.keyId == keyId) return key;
+    }
     return null;
   }
 

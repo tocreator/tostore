@@ -643,6 +643,53 @@ class EncoderHandler {
     return _currentKeyId;
   }
 
+  /// Parse the keyId from encoded bytes header.
+  /// Returns null if the data is not encoded with any of our methods, or the header is malformed.
+  static int? parseKeyId(Uint8List bytes) {
+    if (bytes.isEmpty) return null;
+
+    List<int>? prefixBytes;
+    if (_hasPrefix(bytes, _utf8PrefixBytes)) {
+      prefixBytes = _utf8PrefixBytes;
+    } else if (_hasPrefix(bytes, _rawPrefixBytes)) {
+      prefixBytes = _rawPrefixBytes;
+    } else if (_hasPrefix(bytes, _chacha20PrefixBytes)) {
+      prefixBytes = _chacha20PrefixBytes;
+    } else if (_hasPrefix(bytes, _aesPrefixBytes)) {
+      prefixBytes = _aesPrefixBytes;
+    }
+
+    if (prefixBytes == null) return null;
+
+    int underscoreCount = 0;
+    int headerEndIndex = -1;
+
+    for (int i = prefixBytes.length; i < bytes.length; i++) {
+      if (bytes[i] == 95) {
+        // 95 is '_'
+        underscoreCount++;
+        if (underscoreCount == 2) {
+          headerEndIndex = i + 1;
+          break;
+        }
+      }
+    }
+
+    if (headerEndIndex == -1) return null;
+
+    try {
+      final headerBytes = bytes.sublist(0, headerEndIndex);
+      final headerStr = utf8.decode(headerBytes);
+      final keyIdMatch = RegExp(r'_k(\d+)_').firstMatch(headerStr);
+      if (keyIdMatch != null) {
+        return int.parse(keyIdMatch.group(1)!);
+      }
+    } catch (_) {
+      // Ignore decoding or parsing errors
+    }
+    return null;
+  }
+
   /// Get current complete encoding state, for isolate thread passing
   static EncoderConfig getCurrentEncodingState() {
     return EncoderConfig(

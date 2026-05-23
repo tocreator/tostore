@@ -10,6 +10,7 @@ import '../handler/encoder.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/space_config.dart';
 import '../model/system_table.dart';
+import '../model/meta_info.dart';
 
 /// Manages the logic for migrating encryption keys.
 /// When the encryptionKey in DataStoreConfig changes,
@@ -265,12 +266,18 @@ class KeyManager {
 
     // After successful migration, update init config by shifting current to previous and setting new key with incremented keyId
     try {
+      final oldPrevious = spaceConfig.previous;
+      final newHistory = [
+        if (oldPrevious != null) oldPrevious,
+        ...spaceConfig.historyKeys,
+      ];
       await _dataStore.saveSpaceConfigToFile(
         spaceConfig.copyWith(
           current: EncryptionKeyInfo(
               key: keyChangeInfo.encryptKey, keyId: keyChangeInfo.newKeyId),
           previous:
               spaceConfig.current, // Move current key to previous position
+          historyKeys: newHistory,
         ),
       );
     } catch (e) {
@@ -280,11 +287,65 @@ class KeyManager {
         'Encoding key change and data migration completed successfully');
   }
 
+  /// Check if the table's first and last leaf pages have already been migrated to the new keyId.
+  Future<bool> _isTableMigrated(String tableName, int targetKeyId) async {
+    try {
+      final tableMeta =
+          await _dataStore.tableDataManager.getTableMeta(tableName);
+      if (tableMeta == null || tableMeta.btreeFirstLeaf.isNull) {
+        return true; // No data, consider as migrated
+      }
+      final firstLeaf = tableMeta.btreeFirstLeaf;
+      final lastLeaf = tableMeta.btreeLastLeaf;
+      final btreePageSize = tableMeta.btreePageSize;
+
+      Future<bool> checkPage(TreePagePtr leaf) async {
+        if (leaf.isNull) return true;
+        final path = await _dataStore.pathManager
+            .getPartitionFilePathByNo(tableName, leaf.partitionNo);
+        final fileSize = await _dataStore.storage.getFileSize(path);
+
+        // BTreePageHeader size is 20, payload starts at offset 20. We read 32 bytes from there.
+        final offset = leaf.pageNo * btreePageSize + 20;
+        if (fileSize < offset + 32) {
+          return false;
+        }
+
+        final bytes =
+            await _dataStore.storage.readAsBytesAt(path, offset, length: 32);
+        final keyId = EncoderHandler.parseKeyId(bytes);
+        return keyId == targetKeyId;
+      }
+
+      // Check first leaf
+      final firstOk = await checkPage(firstLeaf);
+      if (!firstOk) return false;
+
+      // Check last leaf if different from first leaf
+      if (lastLeaf != firstLeaf) {
+        return await checkPage(lastLeaf);
+      }
+
+      return true;
+    } catch (e) {
+      Logger.error('Failed to check table migration state for $tableName: $e',
+          label: 'KeyManager._isTableMigrated');
+    }
+    return false;
+  }
+
   /// Data migration logic
   Future<void> _migrateData(Uint8List newKey, int newKeyId) async {
     final tableNames = await _dataStore.getTableNames();
 
     for (final tableName in tableNames) {
+      // Fast check if table is already migrated
+      if (await _isTableMigrated(tableName, newKeyId)) {
+        Logger.info(
+            'Table $tableName already migrated to keyId $newKeyId, skipping.');
+        continue;
+      }
+
       await _dataStore.queryExecutor.queryEachBatch(
         tableName,
         batchSize: 1000,
