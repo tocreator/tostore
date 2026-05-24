@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -3784,8 +3784,9 @@ class TableDataManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
+    TableMeta? fileMeta;
     if (!isMemoryMode) {
-      final fileMeta = await getTableMeta(tableName);
+      fileMeta = await getTableMeta(tableName);
       if (fileMeta == null || fileMeta.totalRecords <= 0) {
         return TableScanResult(
           records: const [],
@@ -4176,9 +4177,10 @@ class TableDataManager {
       final effectiveConcurrency = min(queryConcurrency, tasks.length);
 
       // Fast timeout estimation: Base 60s + (TotalMaxBytes / 2MB/s / concurrency)
-      // Assumes maxPartitionFileSize * 1.5 per task (main + incremental buffer).
+      // Since tasks.length is 1 for global leaf chain scan, we must use btreePartitionCount to estimate total bytes.
+      final partitionCount = fileMeta?.btreePartitionCount ?? 1;
       final estTotalBytes =
-          tasks.length * _dataStore.config.maxPartitionFileSize * 1.5;
+          partitionCount * _dataStore.config.maxPartitionFileSize * 1.5;
       final timeoutSeconds =
           60 + (estTotalBytes / (2097152 * effectiveConcurrency)).ceil();
 

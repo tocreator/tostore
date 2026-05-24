@@ -3298,8 +3298,8 @@ class IndexManager {
 
       List<dynamic>? normalizeValues(dynamic v, int n) {
         if (n <= 0) return const [];
-        if (n == 1) return <dynamic>[v];
         if (v is List && v.length == n) return v;
+        if (n == 1) return <dynamic>[v];
         return null;
       }
 
@@ -4048,28 +4048,31 @@ class IndexManager {
       }
 
       if (opUpper == 'IN' && condition.value is List) {
-        // Prepare (value, prefix) pairs
-        final items = <(dynamic, Uint8List)>[];
+        // Prepare (value, nativeVal, prefix) triplets
+        final items = <(dynamic, List<dynamic>, Uint8List)>[];
         for (final v in (condition.value as List)) {
-          final prefix = encodePrefix(v);
-          if (prefix != null) {
-            items.add((v, prefix));
+          final nativeVal = normalizeValues(v, fields.length);
+          if (nativeVal != null) {
+            final prefix = encodeLeadingValues(nativeVal);
+            if (prefix != null) {
+              items.add((v, nativeVal, prefix));
+            }
           }
         }
 
         // Sort based on index order (forward or reverse)
         // This ensures meaningful cursor traversal across the IN-list buckets.
         items.sort((a, b) {
-          final cmp = MemComparableKey.compare(a.$2, b.$2);
+          final cmp = MemComparableKey.compare(a.$3, b.$3);
           return reverse ? -cmp : cmp;
         });
 
         // Unique values only (consecutive)
         if (items.isNotEmpty) {
-          final uniqueItems = <(dynamic, Uint8List)>[];
+          final uniqueItems = <(dynamic, List<dynamic>, Uint8List)>[];
           for (int i = 0; i < items.length; i++) {
             if (i == 0 ||
-                MemComparableKey.compare(items[i].$2, items[i - 1].$2) != 0) {
+                MemComparableKey.compare(items[i].$3, items[i - 1].$3) != 0) {
               uniqueItems.add(items[i]);
             }
           }
@@ -4084,8 +4087,8 @@ class IndexManager {
         final yieldController = YieldController('index_search_in');
 
         for (final item in items) {
-          final v = item.$1;
-          final prefix = item.$2;
+          final nativeVal = item.$2;
+          final prefix = item.$3;
 
           await yieldController.maybeYield();
           if (remaining == 0) break;
@@ -4099,13 +4102,11 @@ class IndexManager {
             continue;
           }
 
-          final List<dynamic>? nativeVal = normalizeValues(v, fields.length);
           bool usedCache = false;
 
           // Try Cache with Native Key (ONLY if full bucket scan is requested)
           // i.e., start == prefix AND end == endBound (no cursor slicing in this bucket)
-          if (nativeVal != null &&
-              MemComparableKey.compare(start, prefix) == 0 &&
+          if (MemComparableKey.compare(start, prefix) == 0 &&
               MemComparableKey.compare(end, endBound) == 0) {
             final cacheRes = await checkCache(nativeVal, null, null);
             if (cacheRes != null) {
@@ -4124,7 +4125,7 @@ class IndexManager {
                 final compositeKey = <dynamic>[
                   tableName,
                   indexName,
-                  ...nativeVal!
+                  ...nativeVal
                 ];
                 final pkValue = _indexDataCache.get(compositeKey);
                 if (pkValue is String &&
@@ -4150,11 +4151,7 @@ class IndexManager {
                         IndexSearchEntry(primaryKey: pk, keyBytes: prefix));
                     if (!(_dataStore.resourceManager?.isLowMemoryMode ??
                         false)) {
-                      final compositeKey = [
-                        tableName,
-                        indexName,
-                        ...nativeVal!
-                      ];
+                      final compositeKey = [tableName, indexName, ...nativeVal];
                       _indexDataCache.put(compositeKey, pk);
                     }
                   }
@@ -4193,13 +4190,13 @@ class IndexManager {
 
                 if (validatedPks.isNotEmpty) {
                   if (isUnique) {
-                    _indexDataCache.put([tableName, indexName, ...nativeVal!],
+                    _indexDataCache.put([tableName, indexName, ...nativeVal],
                         validatedPks.first);
                   } else {
                     final prefixKey = <dynamic>[
                       tableName,
                       indexName,
-                      ...nativeVal!
+                      ...nativeVal
                     ];
                     final yc = YieldController(
                         'IndexManager.hotspotPopulateNonUniqueIn');
