@@ -997,7 +997,10 @@ class DataStoreImpl {
       // First run - create system tables and user tables
       if (needInitialize) {
         // Create system tables first (they have no foreign key dependencies)
-        final systemTablesResult = await createTables(systemSchemas);
+        final systemTablesResult = await createTables(
+          systemSchemas,
+          isSystemTable: true,
+        );
         if (!systemTablesResult.isSuccess) {
           Logger.warn(
             'Failed to create system tables: ${systemTablesResult.message}',
@@ -1245,7 +1248,10 @@ class DataStoreImpl {
 
   /// Create a single table
   /// Returns [DbResult] to allow graceful error handling for business logic errors
-  Future<DbResult> createTable(TableSchema schema) async {
+  Future<DbResult> createTable(
+    TableSchema schema, {
+    bool isSystemTable = false,
+  }) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'createTable', schema.name);
 
@@ -1270,10 +1276,9 @@ class DataStoreImpl {
       try {
         // Validate primary key configuration and field types
         final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-        final bool isSystemTableName =
+        final bool isKnownSystemTable =
             SystemTable.isKnownSystemTable(schema.name);
-        final bool allowSystemSchema =
-            isSystemTableName && TransactionContext.isSystemOperation();
+        final bool allowSystemSchema = isKnownSystemTable || isSystemTable;
         if (!schemaValid.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
           allowReservedTableNames: allowSystemSchema,
@@ -1464,7 +1469,10 @@ class DataStoreImpl {
   /// Create multiple tables
   /// Automatically sorts tables by foreign key dependencies to ensure correct creation order
   /// Returns [DbResult] to allow graceful error handling for business logic errors
-  Future<DbResult> createTables(List<TableSchema> schemas) async {
+  Future<DbResult> createTables(
+    List<TableSchema> schemas, {
+    bool isSystemTable = false,
+  }) async {
     if (schemas.isEmpty) {
       return DbResult.success(message: 'No tables to create');
     }
@@ -1478,7 +1486,10 @@ class DataStoreImpl {
     final List<String> failedKeys = [];
 
     for (var schema in sortedSchemas) {
-      final result = await createTable(schema);
+      final result = await createTable(
+        schema,
+        isSystemTable: isSystemTable,
+      );
       if (result.isSuccess) {
         successKeys.add(schema.name);
       } else {

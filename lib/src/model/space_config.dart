@@ -9,7 +9,7 @@ class SpaceConfig {
   /// previous encryption key info (if any)
   final EncryptionKeyInfo? previous;
 
-  /// history encryption key list (at most 10)
+  /// history encryption key list
   final List<EncryptionKeyInfo> historyKeys;
 
   /// Internal engine/storage format version
@@ -47,7 +47,7 @@ class SpaceConfig {
     this.totalDataSizeBytes = 0,
     this.lastStatisticsTime,
   })  : version = version ?? InternalConfig.engineVersion,
-        historyKeys = (historyKeys ?? const []).take(10).toList(),
+        historyKeys = (historyKeys ?? const []).toList(),
         tableDirectoryMap = tableDirectoryMap ?? {},
         directoryUsageMap = directoryUsageMap ?? {};
 
