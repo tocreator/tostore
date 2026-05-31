@@ -2,15 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import '../model/data_store_config.dart';
-import 'data_store_impl.dart';
 import '../handler/chacha20_poly1305.dart';
-import '../handler/logger.dart';
 import '../handler/encoder.dart';
-import '../model/parallel_journal_entry.dart';
+import '../handler/logger.dart';
+import '../model/data_store_config.dart';
+import '../model/key_migration_info.dart';
 import '../model/space_config.dart';
-import '../model/system_table.dart';
-import '../model/meta_info.dart';
+import 'data_store_impl.dart';
+import 'key_migration_progress.dart';
+import 'key_migration_runner.dart';
 
 /// Manages the logic for migrating encryption keys.
 /// When the encryptionKey in DataStoreConfig changes,
@@ -23,6 +23,9 @@ class KeyManager {
   // Cached generated keys from encryption config
   String? _cachedEncodingKey;
   String? _cachedEncryptionKey;
+  bool _keyMigrationScheduled = false;
+  Future<void>? _keyMigrationFuture;
+  KeyChangeInfo? _deferredKeyChangeInfo;
 
   KeyManager(DataStoreImpl dataStore) : _dataStore = dataStore;
 
@@ -77,9 +80,10 @@ class KeyManager {
     final encryptionKey = _getEncryptionKey();
     final aad = _generateAAD(keyId);
     final encryptedBytes = ChaCha20Poly1305.encrypt(
-        plaintext: plainKey,
-        key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
-        aad: aad);
+      plaintext: plainKey,
+      key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
+      aad: aad,
+    );
     return base64.encode(encryptedBytes);
   }
 
@@ -92,9 +96,10 @@ class KeyManager {
 
       final aad = _generateAAD(keyId);
       final decrypted = ChaCha20Poly1305.decrypt(
-          encryptedData: encodedBytes,
-          key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
-          aad: aad);
+        encryptedData: encodedBytes,
+        key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
+        aad: aad,
+      );
       if (isPlaintext) {
         return decrypted;
       }
@@ -128,19 +133,35 @@ class KeyManager {
       // This will handle key comparison and setup fallback keys including new key if changed
       keyChangeInfo = await updateEncoderHandlerKeys(spaceConfig);
     } catch (e) {
-      Logger.error('Failed to set Encoder key: $e',
-          label: 'KeyManager.initialize');
+      Logger.error(
+        'Failed to set Encoder key: $e',
+        label: 'KeyManager.initialize',
+      );
     }
 
-    // trigger key migration after setting up keys, pass the key change info to avoid redundant work
-    // If it is a migration instance, we skip the internal key migration as it will be handled by V2Upgrade
-    await migrateKey(keyChangeInfo,
-        skipMigration: _dataStore.isMigrationInstance);
+    if (_dataStore.isMigrationInstance) {
+      return;
+    }
+
+    if (keyChangeInfo?.hasChanged == true) {
+      _deferredKeyChangeInfo = keyChangeInfo;
+    }
   }
 
-  /// Update EncoderHandler with current and fallback keys
-  /// This method also checks if the encoding key has changed and prepares for migration
-  /// Returns KeyChangeInfo containing information about key changes
+  /// Start or resume key migration after [MigrationManager.initialize] has recovered schema tasks.
+  Future<void> startDeferredKeyMigrationWork() async {
+    if (_dataStore.isMigrationInstance) return;
+
+    final pendingChange = _deferredKeyChangeInfo;
+    _deferredKeyChangeInfo = null;
+
+    if (pendingChange != null) {
+      await _beginKeyMigration(pendingChange);
+    } else {
+      await _resumeKeyMigrationIfNeeded();
+    }
+  }
+
   Future<KeyChangeInfo?> updateEncoderHandlerKeys(
       SpaceConfig spaceConfig) async {
     final newKey = _getEncodingKey();
@@ -162,19 +183,29 @@ class KeyManager {
       }
     }
 
-    // Check if encoding key has changed
+    // Add history keys to fallback keys
+    for (final hist in spaceConfig.historyKeys) {
+      if (hist.key.isEmpty) continue;
+      final decoded = _decodeKey(hist.key, hist.keyId);
+      if (decoded != null) {
+        fallbackKeys[hist.keyId] = decoded;
+      }
+    }
+
     String? currentPlain;
     if (spaceConfig.current.key.isNotEmpty) {
       try {
         currentPlain = _decodeKey(
-            spaceConfig.current.key, spaceConfig.current.keyId,
-            isPlaintext: true);
+          spaceConfig.current.key,
+          spaceConfig.current.keyId,
+          isPlaintext: true,
+        );
       } catch (e) {
         Logger.error('Failed to decrypt current key: $e');
       }
     }
 
-    bool keyChanged = currentPlain != newKey;
+    final bool keyChanged = currentPlain != newKey;
     int keyIdToUse = spaceConfig.current.keyId;
     KeyChangeInfo? keyChangeInfo;
 
@@ -185,9 +216,9 @@ class KeyManager {
       fallbackKeys[newKeyId] = newDecodedKey;
       keyIdToUse = newKeyId;
       Logger.info(
-          'Encoding key changed, preparing for migration with new keyId: $newKeyId');
-
-      // Create key change info for migration
+        'Encoding key changed, preparing async migration with new keyId: $newKeyId',
+        label: 'KeyManager.updateEncoderHandlerKeys',
+      );
       keyChangeInfo = KeyChangeInfo(
         hasChanged: true,
         newKey: newDecodedKey,
@@ -214,193 +245,173 @@ class KeyManager {
         // Use keyId 1 for initial key creation
         final encryptedKey = _encryptKey(newKey, 1);
         return SpaceConfig(
-            current: EncryptionKeyInfo(key: encryptedKey, keyId: 1),
-            previous: null,
-            version: 0);
-      } else {
-        // If no key is provided, still create a valid config with an empty key.
-        Logger.info(
-            'No encoding key provided; creating space config with an empty key.');
-        return SpaceConfig(
-            current: const EncryptionKeyInfo(key: '', keyId: 0),
-            previous: null,
-            version: 0);
+          current: EncryptionKeyInfo(key: encryptedKey, keyId: 1),
+          previous: null,
+          version: 0,
+        );
       }
+      Logger.info(
+        'No encoding key provided; creating space config with an empty key.',
+      );
+      return SpaceConfig(
+        current: const EncryptionKeyInfo(key: '', keyId: 0),
+        previous: null,
+        version: 0,
+      );
     } catch (e) {
       Logger.error(
-          'Failed to create or encrypt key during first-time initialization: $e');
-      // Return a default empty config on error to allow the app to proceed.
+        'Failed to create or encrypt key during first-time initialization: $e',
+      );
       return SpaceConfig(
-          current: const EncryptionKeyInfo(key: '', keyId: 0),
-          previous: null,
-          version: 0);
+        current: const EncryptionKeyInfo(key: '', keyId: 0),
+        previous: null,
+        version: 0,
+      );
     }
   }
 
-  /// Compares the encryptionKey in the configuration with the saved old key.
-  /// If they are not the same, it performs data migration, encrypts the current key,
-  /// and replaces the content in the key file.
-  Future<void> migrateKey(KeyChangeInfo? keyChangeInfo,
-      {bool skipMigration = false}) async {
-    // If no key change info provided or no changes detected, skip migration
-    if (keyChangeInfo == null || !keyChangeInfo.hasChanged) {
-      return;
-    }
+  Future<void> _beginKeyMigration(KeyChangeInfo info) async {
+    final migrationManager = _dataStore.migrationManager;
+    if (migrationManager == null) return;
 
-    // Load space configuration from cache or file
-    SpaceConfig? spaceConfig = await _dataStore.getSpaceConfig();
-    if (spaceConfig == null) {
-      Logger.error('Space config not found during migration');
-      return;
-    }
-
-    if (!skipMigration) {
-      Logger.info('Encoding key has changed. Starting data migration...');
-      try {
-        await _migrateData(keyChangeInfo.newKey, keyChangeInfo.newKeyId);
-      } catch (e) {
-        Logger.error('Key data migration failed: $e');
+    final existing = await migrationManager.getKeyMigrationInfo();
+    if (existing != null && existing.isRunning) {
+      if (existing.targetKeyId != info.newKeyId) {
+        await _supersedeKeyMigration(info);
         return;
       }
+      _scheduleKeyMigrationRun(info);
+      return;
     }
 
-    // After successful migration, update init config by shifting current to previous and setting new key with incremented keyId
-    try {
-      final oldPrevious = spaceConfig.previous;
-      final newHistory = [
-        if (oldPrevious != null) oldPrevious,
-        ...spaceConfig.historyKeys,
-      ];
-      await _dataStore.saveSpaceConfigToFile(
-        spaceConfig.copyWith(
-          current: EncryptionKeyInfo(
-              key: keyChangeInfo.encryptKey, keyId: keyChangeInfo.newKeyId),
-          previous:
-              spaceConfig.current, // Move current key to previous position
-          historyKeys: newHistory,
-        ),
+    await migrationManager.persistKeyMigrationInfo(
+      KeyMigrationInfo(
+        targetKeyId: info.newKeyId,
+        status: KeyMigrationStatus.running,
+        createdAt: DateTime.now().toIso8601String(),
+      ),
+    );
+    _scheduleKeyMigrationRun(info);
+  }
+
+  Future<void> _resumeKeyMigrationIfNeeded() async {
+    final migrationManager = _dataStore.migrationManager;
+    if (migrationManager == null) return;
+
+    final info = await migrationManager.getKeyMigrationInfo();
+    if (info == null || !info.isRunning) return;
+
+    if (info.targetKeyId != EncoderHandler.getCurrentKeyId()) {
+      Logger.warn(
+        'Stale key migration meta (targetKeyId=${info.targetKeyId}, '
+        'current=${EncoderHandler.getCurrentKeyId()}); abandoning resume',
+        label: 'KeyManager._resumeKeyMigrationIfNeeded',
       );
-    } catch (e) {
-      Logger.error('Failed to update the init file after migration: $e');
+      return;
     }
+
+    final resumeInfo = _buildKeyChangeInfoForKeyId(info.targetKeyId);
+    if (resumeInfo == null) {
+      Logger.error(
+        'Cannot resume key migration: failed to rebuild KeyChangeInfo',
+        label: 'KeyManager._resumeKeyMigrationIfNeeded',
+      );
+      return;
+    }
+
     Logger.info(
-        'Encoding key change and data migration completed successfully');
+      'Resuming key migration for keyId ${info.targetKeyId}',
+      label: 'KeyManager._resumeKeyMigrationIfNeeded',
+    );
+    _scheduleKeyMigrationRun(resumeInfo);
   }
 
-  /// Check if the table's first and last leaf pages have already been migrated to the new keyId.
-  Future<bool> _isTableMigrated(String tableName, int targetKeyId) async {
+  Future<void> _supersedeKeyMigration(KeyChangeInfo info) async {
+    final spaceConfig = await _dataStore.getSpaceConfig();
+    final migrationManager = _dataStore.migrationManager;
+    if (spaceConfig == null || migrationManager == null) return;
+
+    final history = [...spaceConfig.historyKeys];
+    void addIfAbsent(EncryptionKeyInfo keyInfo) {
+      if (keyInfo.key.isEmpty) return;
+      if (history.any((k) => k.keyId == keyInfo.keyId)) return;
+      history.add(keyInfo);
+    }
+
+    addIfAbsent(spaceConfig.current);
+    if (spaceConfig.previous != null) {
+      addIfAbsent(spaceConfig.previous!);
+    }
+
+    await _dataStore.saveSpaceConfigToFile(
+      spaceConfig.copyWith(historyKeys: history),
+    );
+    await updateEncoderHandlerKeys(
+      (await _dataStore.getSpaceConfig()) ?? spaceConfig,
+    );
+
+    await KeyMigrationProgressStore.clearAll(_dataStore);
+    await migrationManager.clearKeyMigrationInfo();
+    await migrationManager.persistKeyMigrationInfo(
+      KeyMigrationInfo(
+        targetKeyId: info.newKeyId,
+        status: KeyMigrationStatus.running,
+        createdAt: DateTime.now().toIso8601String(),
+      ),
+    );
+    _scheduleKeyMigrationRun(info);
+  }
+
+  KeyChangeInfo? _buildKeyChangeInfoForKeyId(int keyId) {
+    final plain = _getEncodingKey();
+    if (plain.isEmpty) return null;
+    return KeyChangeInfo(
+      hasChanged: true,
+      newKey: EncoderHandler.generateKey(plain),
+      newKeyId: keyId,
+      encryptKey: _encryptKey(plain, keyId),
+    );
+  }
+
+  /// Cooperative pause for close / switchSpace; retains checkpoint for resume.
+  Future<void> pauseKeyMigration({
+    Duration timeout = const Duration(seconds: 120),
+  }) async {
+    KeyMigrationRunner.requestPause();
+    final future = _keyMigrationFuture;
+    if (future == null) return;
     try {
-      final tableMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
-      if (tableMeta == null || tableMeta.btreeFirstLeaf.isNull) {
-        return true; // No data, consider as migrated
-      }
-      final firstLeaf = tableMeta.btreeFirstLeaf;
-      final lastLeaf = tableMeta.btreeLastLeaf;
-      final btreePageSize = tableMeta.btreePageSize;
-
-      Future<bool> checkPage(TreePagePtr leaf) async {
-        if (leaf.isNull) return true;
-        final path = await _dataStore.pathManager
-            .getPartitionFilePathByNo(tableName, leaf.partitionNo);
-        final fileSize = await _dataStore.storage.getFileSize(path);
-
-        // BTreePageHeader size is 20, payload starts at offset 20. We read 32 bytes from there.
-        final offset = leaf.pageNo * btreePageSize + 20;
-        if (fileSize < offset + 32) {
-          return false;
-        }
-
-        final bytes =
-            await _dataStore.storage.readAsBytesAt(path, offset, length: 32);
-        final keyId = EncoderHandler.parseKeyId(bytes);
-        return keyId == targetKeyId;
-      }
-
-      // Check first leaf
-      final firstOk = await checkPage(firstLeaf);
-      if (!firstOk) return false;
-
-      // Check last leaf if different from first leaf
-      if (lastLeaf != firstLeaf) {
-        return await checkPage(lastLeaf);
-      }
-
-      return true;
-    } catch (e) {
-      Logger.error('Failed to check table migration state for $tableName: $e',
-          label: 'KeyManager._isTableMigrated');
-    }
-    return false;
-  }
-
-  /// Data migration logic
-  Future<void> _migrateData(Uint8List newKey, int newKeyId) async {
-    final tableNames = await _dataStore.getTableNames();
-
-    for (final tableName in tableNames) {
-      // Fast check if table is already migrated
-      if (await _isTableMigrated(tableName, newKeyId)) {
-        Logger.info(
-            'Table $tableName already migrated to keyId $newKeyId, skipping.');
-        continue;
-      }
-
-      await _dataStore.queryExecutor.queryEachBatch(
-        tableName,
-        batchSize: 1000,
-        onBatch: (records, nextCursor) async {
-          if (records.isEmpty) return true;
-
-          await _dataStore.tableDataManager.withTableWriteLock(
-            tableName,
-            (tableLock) async {
-              BatchContext? batchContext;
-              if (_dataStore.config.enableJournal) {
-                batchContext = await _dataStore.parallelJournalManager
-                    .beginMaintenanceBatch(table: tableName);
-              }
-
-              await _dataStore.tableDataManager.writeChanges(
-                tableName: tableName,
-                updates: records,
-                batchContext: batchContext,
-                encryptionKey: newKey,
-                encryptionKeyId: newKeyId,
-                tableLock: tableLock,
-              );
-
-              if (_dataStore.config.enableJournal && batchContext != null) {
-                await _dataStore.parallelJournalManager
-                    .completeMaintenanceBatch(batchContext: batchContext);
-                await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
-              }
-            },
-            operationPrefix: 'key_migrate_page_batches_',
-          );
-          return true;
-        },
+      await future.timeout(timeout);
+    } on TimeoutException {
+      Logger.warn(
+        'Key migration did not stop within ${timeout.inSeconds}s; '
+        'forcing shutdown flush',
+        label: 'KeyManager.pauseKeyMigration',
       );
+      await KeyMigrationRunner.pauseForShutdown(_dataStore);
+    } catch (_) {}
+  }
 
-      // Only log migration completion for user tables, not system tables
-      if (!SystemTable.isSystemTable(tableName)) {
-        Logger.info('Migration complete for table: $tableName');
-      }
+  void _scheduleKeyMigrationRun(KeyChangeInfo info) {
+    if (_keyMigrationScheduled) return;
+    _keyMigrationScheduled = true;
+    Logger.info(
+      'Scheduling background key migration for keyId ${info.newKeyId}',
+      label: 'KeyManager._scheduleKeyMigrationRun',
+    );
+    unawaited(_keyMigrationFuture = _runKeyMigration(info));
+  }
+
+  Future<void> _runKeyMigration(KeyChangeInfo info) async {
+    try {
+      await KeyMigrationRunner.run(
+        _dataStore,
+        targetKeyId: info.newKeyId,
+        keyChangeInfo: info,
+      );
+    } finally {
+      _keyMigrationScheduled = false;
+      _keyMigrationFuture = null;
     }
   }
-}
-
-/// Information about key changes during initialization
-class KeyChangeInfo {
-  final bool hasChanged;
-  final Uint8List newKey; // Key that can directly decode data
-  final int newKeyId;
-  final String encryptKey; // The encrypted key used for storage
-
-  KeyChangeInfo({
-    required this.hasChanged,
-    required this.newKey,
-    required this.newKeyId,
-    required this.encryptKey,
-  });
 }

@@ -541,6 +541,15 @@ class WriteBufferManager {
     // to the queue because the INSERT entry is already there and will be flushed with
     // the updated data. This preserves primary key ordering and prevents duplicate processing.
     if (!skipQueueEnqueue) {
+      // Invalidate any pending background write entries for this primary key, so that
+      // background tasks (keyMigration, schemaMigration, largeUpdate, largeDelete) cannot
+      // overwrite this newer online write during the next _pumpFlush cycle.
+      // This is an O(1) guard; _pumpFlush also enforces business-over-background priority,
+      // but early invalidation releases memory sooner.
+      if (!skipBufferStore) {
+        _dataStore.backgroundWriteScheduler
+            .handleOnlineWrite(tableName, recordId);
+      }
       // Write backpressure: measured-delay throttle (1 multiply + 1 compare)
       await _dataStore.parallelJournalManager.waitIfThrottled();
       // Update record count statistics (awaited to ensure consistency)
@@ -689,6 +698,9 @@ class WriteBufferManager {
         );
         continue;
       }
+      // Invalidate any pending background write entries for this primary key.
+      _dataStore.backgroundWriteScheduler
+          .handleOnlineWrite(tableName, recordId);
       _writeQueue.add(WriteQueueEntry(
         tableName: tableName,
         recordId: recordId,

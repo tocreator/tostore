@@ -60,9 +60,6 @@ class DataStoreConfig {
   /// Maximum concurrency for I/O-bound tasks (file processing)
   final int maxIoConcurrency;
 
-  /// Maximum number of concurrent table partition maintenances (e.g., processTablePartitions)
-  final int maxConcurrentPartitionMaintenances;
-
   /// Default query limit when the caller does not explicitly specify `limit`.
   ///
   /// - Set to a positive number (recommended) to avoid unbounded result sets that
@@ -189,7 +186,6 @@ class DataStoreConfig {
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
     int? ttlCleanupIntervalMs,
-    int? maxConcurrentPartitionMaintenances,
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
@@ -209,9 +205,6 @@ class DataStoreConfig {
             _getDefaultMaxIoConcurrent(
                 maxConcurrency ?? _getDefaultMaxConcurrent(),
                 maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize()),
-        maxConcurrentPartitionMaintenances =
-            maxConcurrentPartitionMaintenances ??
-                _getDefaultMaxConcurrentPartitionMaintenances(),
         defaultQueryLimit = defaultQueryLimit ?? 1000,
         maxQueryOffset = maxQueryOffset ?? 10000,
         distributedNodeConfig =
@@ -376,20 +369,6 @@ class DataStoreConfig {
     } else {
       return 8 * 1024 * 1024; // 8MB - desktop balanced
     }
-  }
-
-  /// Get default max concurrent processTablePartitions tasks
-  static int _getDefaultMaxConcurrentPartitionMaintenances() {
-    if (PlatformHandler.isWeb || PlatformHandler.isMobile) {
-      return 3;
-    }
-    final rc = PlatformHandler.recommendedConcurrency;
-    final half = (rc / 2).floor();
-    if (PlatformHandler.isServerEnvironment) {
-      return half.clamp(1, 10);
-    }
-    // Desktop
-    return half.clamp(1, 5);
   }
 
   static int _getDefaultMaxOpenHandles() {
@@ -606,8 +585,6 @@ class DataStoreConfig {
           json['transactionCleanupIntervalMs'] as int?,
       transactionMetaTtlMs: json['transactionMetaTtlMs'] as int?,
       ttlCleanupIntervalMs: json['ttlCleanupIntervalMs'] as int?,
-      maxConcurrentPartitionMaintenances:
-          json['maxConcurrentPartitionMaintenances'] as int?,
       defaultQueryLimit: (json['defaultQueryLimit'] is int)
           ? json['defaultQueryLimit'] as int
           : int.tryParse('${json['defaultQueryLimit']}'),
@@ -639,7 +616,6 @@ class DataStoreConfig {
       'maxConcurrency': maxConcurrency,
       'maxIoConcurrency': maxIoConcurrency,
       'distributedNodeConfig': distributedNodeConfig.toJson(),
-      'maxConcurrentPartitionMaintenances': maxConcurrentPartitionMaintenances,
       'cacheMemoryBudgetMB': cacheMemoryBudgetMB,
       'enablePrewarmCache': enablePrewarmCache,
       'prewarmThresholdMB': prewarmThresholdMB,
@@ -702,7 +678,6 @@ class DataStoreConfig {
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
     int? ttlCleanupIntervalMs,
-    int? maxConcurrentPartitionMaintenances,
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
@@ -726,8 +701,6 @@ class DataStoreConfig {
       maxIoConcurrency: maxIoConcurrency ?? this.maxIoConcurrency,
       distributedNodeConfig:
           distributedNodeConfig ?? this.distributedNodeConfig,
-      maxConcurrentPartitionMaintenances: maxConcurrentPartitionMaintenances ??
-          this.maxConcurrentPartitionMaintenances,
       cacheMemoryBudgetMB: cacheMemoryBudgetMB ?? this.cacheMemoryBudgetMB,
       enablePrewarmCache: enablePrewarmCache ?? this.enablePrewarmCache,
       prewarmThresholdMB: prewarmThresholdMB ?? this.prewarmThresholdMB,

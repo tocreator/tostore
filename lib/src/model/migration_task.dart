@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'background_write_mode.dart';
 import 'meta_info.dart';
 import 'table_schema.dart';
 import 'wal_pointer.dart';
@@ -38,6 +39,10 @@ class MigrationTask {
   final Map<String, String> spaceCheckpointKeys;
   // path to the pre-migration backup
   final String? backupPath;
+  // target write mode for background execution
+  final BackgroundWriteMode? writeMode;
+  // specific index names to build during execution (null means all)
+  final List<String>? specificIndexes;
 
   const MigrationTask({
     required this.taskId,
@@ -56,6 +61,8 @@ class MigrationTask {
     this.forceDataMigration = false,
     this.spaceCheckpointKeys = const <String, String>{},
     this.backupPath,
+    this.writeMode,
+    this.specificIndexes,
   });
 
   /// create from json
@@ -101,6 +108,11 @@ class MigrationTask {
               )
             : const <String, String>{},
         backupPath: json['backupPath'] as String?,
+        writeMode: json['writeMode'] != null
+            ? BackgroundWriteMode.values
+                .firstWhere((e) => e.name == json['writeMode'])
+            : null,
+        specificIndexes: (json['specificIndexes'] as List?)?.cast<String>(),
       );
 
   /// convert to json
@@ -122,6 +134,8 @@ class MigrationTask {
         if (spaceCheckpointKeys.isNotEmpty)
           'spaceCheckpointKeys': spaceCheckpointKeys,
         if (backupPath != null) 'backupPath': backupPath,
+        if (writeMode != null) 'writeMode': writeMode!.name,
+        if (specificIndexes != null) 'specificIndexes': specificIndexes,
       };
 
   String? checkpointKeyForSpace(String spaceName) =>
@@ -197,6 +211,8 @@ class MigrationTask {
     bool? forceDataMigration,
     Map<String, String>? spaceCheckpointKeys,
     String? backupPath,
+    BackgroundWriteMode? writeMode,
+    List<String>? specificIndexes,
   }) =>
       MigrationTask(
         taskId: taskId ?? this.taskId,
@@ -218,6 +234,8 @@ class MigrationTask {
         forceDataMigration: forceDataMigration ?? this.forceDataMigration,
         spaceCheckpointKeys: spaceCheckpointKeys ?? this.spaceCheckpointKeys,
         backupPath: backupPath ?? this.backupPath,
+        writeMode: writeMode ?? this.writeMode,
+        specificIndexes: specificIndexes ?? this.specificIndexes,
       );
 }
 

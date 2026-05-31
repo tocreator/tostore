@@ -31,11 +31,24 @@ class SystemTable {
     return _fkReferencesName;
   }
 
+  /// Key migration per-table progress (global table).
+  static const String keyMigrationProgressTableName = '_system_key_migration';
+
+  static const String keyMigrationTableNameField = 'table_name';
+  static const String keyMigrationSpaceNameField = 'space_name';
+  static const String keyMigrationStatusField = 'status';
+  static const String keyMigrationCheckpointField = 'checkpoint_key';
+  static const String keyMigrationProgressKeyField = 'progress_key';
+
+  /// Scope marker for global tables in key migration progress rows.
+  static const String globalMigrationScope = '__global__';
+
   // is a system table (current version)
   static bool isSystemTable(String tableName) {
     return tableName == _keyValueName ||
         tableName == _globalKeyValueName ||
-        tableName == _fkReferencesName;
+        tableName == _fkReferencesName ||
+        tableName == keyMigrationProgressTableName;
   }
 
   /// Names that have ever been system tables (current + deprecated).
@@ -48,6 +61,7 @@ class SystemTable {
     _fkReferencesName,
     _keyValueName,
     _globalKeyValueName,
+    keyMigrationProgressTableName,
     // Legacy system table names (append when a system table is removed):
     // 'legacy_sys_table',
   };
@@ -65,6 +79,7 @@ class SystemTable {
     _fkReferencesTable(),
     _kVTable(false),
     _kVTable(true),
+    _keyMigrationProgressTable(),
   ];
 
   /// Foreign key references system table
@@ -149,6 +164,49 @@ class SystemTable {
           IndexSchema(fields: ['referenced_table']),
           // Index on referencing_table for reverse lookup (optional, for completeness)
           IndexSchema(fields: ['referencing_table']),
+        ],
+      );
+
+  /// Per-table key migration checkpoint storage (global).
+  static TableSchema _keyMigrationProgressTable() => TableSchema(
+        name: keyMigrationProgressTableName,
+        tableId: keyMigrationProgressTableName,
+        isGlobal: true,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: keyMigrationProgressKeyField,
+          type: PrimaryKeyType.none,
+        ),
+        fields: const [
+          FieldSchema(
+            name: keyMigrationTableNameField,
+            fieldId: keyMigrationTableNameField,
+            type: DataType.text,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: keyMigrationSpaceNameField,
+            fieldId: keyMigrationSpaceNameField,
+            type: DataType.text,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: keyMigrationStatusField,
+            fieldId: keyMigrationStatusField,
+            type: DataType.text,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: keyMigrationCheckpointField,
+            fieldId: keyMigrationCheckpointField,
+            type: DataType.text,
+          ),
+        ],
+        indexes: const [
+          IndexSchema(
+            fields: [keyMigrationTableNameField, keyMigrationSpaceNameField],
+            unique: true,
+          ),
+          IndexSchema(fields: [keyMigrationStatusField]),
         ],
       );
 

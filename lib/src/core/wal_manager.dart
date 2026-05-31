@@ -78,6 +78,7 @@ class PendingParallelBatch {
 class LargeDeleteMeta {
   final String opId;
   final String table;
+  final String spaceName;
   final Map<String, dynamic> condition; // includes where map
   final List<String>? orderBy;
   final int? limit;
@@ -90,6 +91,7 @@ class LargeDeleteMeta {
   LargeDeleteMeta({
     required this.opId,
     required this.table,
+    required this.spaceName,
     required this.condition,
     this.orderBy,
     this.limit,
@@ -103,6 +105,7 @@ class LargeDeleteMeta {
   Map<String, dynamic> toJson() => {
         'opId': opId,
         'table': table,
+        'spaceName': spaceName,
         'condition': condition,
         if (orderBy != null) 'orderBy': orderBy,
         if (limit != null) 'limit': limit,
@@ -117,6 +120,7 @@ class LargeDeleteMeta {
     return LargeDeleteMeta(
       opId: (json['opId'] as String?) ?? '',
       table: (json['table'] as String?) ?? '',
+      spaceName: (json['spaceName'] as String?) ?? '__global__',
       condition:
           ((json['condition'] as Map?) ?? const {}).cast<String, dynamic>(),
       orderBy: (json['orderBy'] as List?)?.map((e) => e.toString()).toList(),
@@ -135,6 +139,7 @@ class LargeDeleteMeta {
 class LargeUpdateMeta {
   final String opId;
   final String table;
+  final String spaceName;
   final Map<String, dynamic> condition; // includes where map
   final Map<String, dynamic> updateData; // data to update
   final List<String>? orderBy;
@@ -148,6 +153,7 @@ class LargeUpdateMeta {
   LargeUpdateMeta({
     required this.opId,
     required this.table,
+    required this.spaceName,
     required this.condition,
     required this.updateData,
     this.orderBy,
@@ -162,6 +168,7 @@ class LargeUpdateMeta {
   Map<String, dynamic> toJson() => {
         'opId': opId,
         'table': table,
+        'spaceName': spaceName,
         'condition': condition,
         'updateData': updateData,
         if (orderBy != null) 'orderBy': orderBy,
@@ -177,6 +184,7 @@ class LargeUpdateMeta {
     return LargeUpdateMeta(
       opId: (json['opId'] as String?) ?? '',
       table: (json['table'] as String?) ?? '',
+      spaceName: (json['spaceName'] as String?) ?? '__global__',
       condition:
           ((json['condition'] as Map?) ?? const {}).cast<String, dynamic>(),
       updateData:
@@ -1553,6 +1561,7 @@ class WalManager {
   Future<void> beginLargeDelete({
     required String opId,
     required String table,
+    required String spaceName,
     required Map<String, dynamic> condition,
     List<String>? orderBy,
     int? limit,
@@ -1566,6 +1575,7 @@ class WalManager {
     _meta.largeDeletes[opId] = LargeDeleteMeta(
       opId: opId,
       table: table,
+      spaceName: spaceName,
       condition: condition,
       orderBy: orderBy,
       limit: limit,
@@ -1607,6 +1617,7 @@ class WalManager {
   Future<void> beginLargeUpdate({
     required String opId,
     required String table,
+    required String spaceName,
     required Map<String, dynamic> condition,
     required Map<String, dynamic> updateData,
     List<String>? orderBy,
@@ -1621,6 +1632,7 @@ class WalManager {
     _meta.largeUpdates[opId] = LargeUpdateMeta(
       opId: opId,
       table: table,
+      spaceName: spaceName,
       condition: condition,
       updateData: updateData,
       orderBy: orderBy,
@@ -1666,6 +1678,16 @@ class WalManager {
     if (m == null) return;
     // Remove immediately without marking as completed
     _meta.largeUpdates.remove(opId);
+    await persistMeta(flush: false);
+  }
+
+  /// Cancel and remove a large delete operation from WAL meta.
+  Future<void> cancelLargeDelete(String opId) async {
+    if (!_config.enableJournal) return;
+    final m = _meta.largeDeletes[opId];
+    if (m == null) return;
+    // Remove immediately without marking as completed
+    _meta.largeDeletes.remove(opId);
     await persistMeta(flush: false);
   }
 

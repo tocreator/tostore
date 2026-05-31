@@ -221,10 +221,16 @@ class TableSchema {
     bool allowOtherInternalFields = false,
   }) {
     // validate name format
-    final nameRegex = RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
+    final tableNameRegex = allowInternalTableNamePrefix
+        ? RegExp(r'^_?[a-zA-Z][a-zA-Z0-9_]*$')
+        : RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
+    final fieldNameRegex =
+        (allowInternalTableNamePrefix || allowOtherInternalFields)
+            ? RegExp(r'^_?[a-zA-Z][a-zA-Z0-9_]*$')
+            : RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$');
 
     // validate name format
-    if (name.isEmpty || !nameRegex.hasMatch(name)) {
+    if (name.isEmpty || !tableNameRegex.hasMatch(name)) {
       Logger.warn(
         'Invalid table name format',
         label: 'TableSchema.validateTable',
@@ -252,7 +258,7 @@ class TableSchema {
     }
 
     // validate primary key name format
-    if (primaryKey.isEmpty || !nameRegex.hasMatch(primaryKey)) {
+    if (primaryKey.isEmpty || !fieldNameRegex.hasMatch(primaryKey)) {
       Logger.warn(
         'Invalid primary key name format',
         label: 'TableSchema.validateTable',
@@ -262,7 +268,7 @@ class TableSchema {
 
     // validate field name format
     for (final field in fields) {
-      if (!nameRegex.hasMatch(field.name)) {
+      if (!fieldNameRegex.hasMatch(field.name)) {
         Logger.warn(
           'Invalid field name format',
           label: 'TableSchema.validateTable',
@@ -2580,10 +2586,10 @@ class VectorIndexConfig {
   /// Expansion factor during graph construction (ef_construction).
   ///
   /// Higher values build a better-quality graph but take longer.
-  /// Typical range: 64–256.
+  /// Typical range: 64-256.
   final int? constructionEf;
 
-  /// Diversity parameter for Robust Prune (α ≥ 1.0).
+  /// Diversity parameter for Robust Prune (α >= 1.0).
   ///
   /// Higher values produce more diverse neighbor selections, improving recall
   /// for high-dimensional data. Default 1.2.

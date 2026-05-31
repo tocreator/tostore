@@ -2,9 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
-## 3.1.4
+## 3.2.0
 
 ### Added
+- **Major improvement**: Added zero-impact background execution for heavy database maintenance tasks (including structure migrations, encryption key rotation, and massive deletions or updates), allowing long-running services and AI agents to upgrade and iterate seamlessly.
+- Added instant database shutdown and space switching by gracefully pausing background operations and resuming from checkpoints on next launch, eliminating potential delays.
+- Added dynamic field storage layout and optimized index building to support schema modifications (such as adding or dropping fields) without requiring full table data rewrites.
 - Added `next()` and `prev()` methods to `QueryResult` for seamless and stateful cursor-based pagination.
 
 ### Changed

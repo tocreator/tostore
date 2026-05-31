@@ -3393,8 +3393,8 @@ class QueryExecutor {
   Future<void> queryEachBatch(
     String tableName, {
     required int batchSize,
-    required Future<bool> Function(
-            List<Map<String, dynamic>> batch, String? nextCursor)
+    required Future<bool> Function(List<Map<String, dynamic>> batch,
+            String? currentCursor, String? nextCursor)
         onBatch,
     QueryCondition? condition,
     List<String>? orderBy,
@@ -3448,6 +3448,8 @@ class QueryExecutor {
         break;
       }
 
+      final startCursor = currentCursor;
+
       final result = await _executeWithPlan(
         plan,
         tableName,
@@ -3456,7 +3458,7 @@ class QueryExecutor {
         where: where,
         orderBy: orderBy,
         limit: batchSize,
-        cursor: currentCursor,
+        cursor: startCursor,
         enableQueryCache: false,
         readFromFileOnly: true,
         decodeSchema: decodeSchema,
@@ -3477,7 +3479,8 @@ class QueryExecutor {
       }
 
       // Invoke client callback. If callback returns false, stop batch processing.
-      final shouldContinue = await onBatch(result.records, currentCursor);
+      final shouldContinue =
+          await onBatch(result.records, startCursor, currentCursor);
       if (!shouldContinue) {
         break;
       }

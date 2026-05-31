@@ -24,7 +24,9 @@ class GlobalConfig {
   /// Active space name. Default is 'default'. Used on next open when opening with default space.
   final String? activeSpace;
 
-  /// whether there is a pending migration task
+  /// Fast-path flag: true while schema or key migration is still incomplete.
+  ///
+  /// Authoritative state is in migration_meta.json (task files + keyMigrationInfo).
   final bool hasMigrationTask;
 
   /// table directory mapping - record the directory index of each table

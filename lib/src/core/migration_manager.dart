@@ -6,25 +6,28 @@ import 'dart:typed_data';
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
+import '../model/background_write_entry.dart';
+import '../model/background_write_mode.dart';
+import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
+import '../model/cancellation_token.dart';
 import '../model/meta_info.dart';
+import '../model/key_migration_info.dart';
 import '../model/migration_meta.dart';
+import 'key_migration_progress.dart';
+import 'key_migration_runner.dart';
 import '../model/migration_task.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
-import '../model/cancellation_token.dart';
-import '../query/query_executor.dart';
 import 'backup_manager.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
-import 'data_store_impl.dart';
-import 'index_manager.dart';
-import 'transaction_context.dart';
 import 'crontab_manager.dart';
+import 'data_store_impl.dart';
+import 'transaction_context.dart';
 import 'yield_controller.dart';
-import 'dart:collection';
 
 /// Migration manager for handling database version upgrades
 ///
@@ -63,12 +66,6 @@ class MigrationManager {
   static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
   static const String _globalMigrationScope = '__global__';
 
-  // Migration data queue: spaceName -> Queue
-  final Map<String, Queue<MigrationPreparedBatch>> _preparedBatches = {};
-
-  // Total records in all prepared batches for backpressure calculation
-  int _totalPreparedRecords = 0;
-
   // Active partition stream controllers for graceful cancellation
   final Map<String, CancellationToken> _activeControllers = {};
 
@@ -78,19 +75,70 @@ class MigrationManager {
   // Active migration tasks: spaceName -> Future
   final Map<String, Future<void>> _activeSpaceMigrationTasks = {};
 
-  bool get hasPreparedData {
-    for (final q in _preparedBatches.values) {
-      if (q.isNotEmpty) return true;
+  // Key: tableName, Value: latest in-memory read cursor during active migration
+  final Map<String, String> _activeReadCursors = {};
+
+  /// Whether schema or key migration work is still pending.
+  static bool computeHasPendingMigrationWork({
+    required bool hasSchemaTasks,
+    required KeyMigrationInfo? keyMigrationInfo,
+  }) {
+    final hasKeyMigration =
+        keyMigrationInfo != null && keyMigrationInfo.isRunning;
+    return hasSchemaTasks || hasKeyMigration;
+  }
+
+  /// Read persisted key migration metadata.
+  Future<KeyMigrationInfo?> getKeyMigrationInfo() async {
+    final meta = await _getOrLoadMigrationMeta();
+    return meta.keyMigrationInfo;
+  }
+
+  /// Whether a key re-encryption migration is in progress (uses in-memory meta cache).
+  bool hasRunningKeyMigration() {
+    final info = _migrationMetaCache?.keyMigrationInfo;
+    return info != null && info.isRunning;
+  }
+
+  /// Persist key migration metadata and sync [GlobalConfig.hasMigrationTask].
+  Future<void> persistKeyMigrationInfo(KeyMigrationInfo info) async {
+    final meta = await _getOrLoadMigrationMeta();
+    await _saveMigrationMeta(meta.copyWith(keyMigrationInfo: info));
+    await syncHasMigrationTask();
+  }
+
+  /// Remove key migration metadata after successful completion.
+  Future<void> clearKeyMigrationInfo() async {
+    final meta = await _getOrLoadMigrationMeta();
+    if (meta.keyMigrationInfo == null) return;
+    await _saveMigrationMeta(meta.copyWith(clearKeyMigrationInfo: true));
+    await syncHasMigrationTask();
+  }
+
+  /// Single entry point to align [GlobalConfig.hasMigrationTask] with migration meta.
+  ///
+  /// Clears the flag only when both schema tasks and key migration are complete.
+  Future<void> syncHasMigrationTask() async {
+    final globalConfig = await _dataStore.getGlobalConfig();
+    if (globalConfig == null) return;
+
+    final meta = await _getOrLoadMigrationMeta();
+    final hasPending = computeHasPendingMigrationWork(
+      hasSchemaTasks: _pendingTasks.isNotEmpty,
+      keyMigrationInfo: meta.keyMigrationInfo,
+    );
+
+    if (globalConfig.hasMigrationTask != hasPending) {
+      await _dataStore.saveGlobalConfig(
+        globalConfig.copyWith(hasMigrationTask: hasPending),
+      );
     }
-    return false;
   }
 
-  bool hasPreparedDataFor(String spaceName) {
-    final queue = _preparedBatches[spaceName];
-    return queue != null && queue.isNotEmpty;
+  /// Get the active in-memory read cursor for a table undergoing migration
+  String? getActiveReadCursor(String tableName) {
+    return _activeReadCursors[tableName];
   }
-
-  int get totalPreparedRecords => _totalPreparedRecords;
 
   MigrationManager(this._dataStore) {
     _startPollingTimer();
@@ -104,13 +152,15 @@ class MigrationManager {
 
   void _triggerFlushes() {
     if (!_dataStore.isInitialized) return;
-    if (hasPreparedData) {
-      for (final space in _preparedBatches.keys) {
-        if (hasPreparedDataFor(space)) {
-          final instance = _activeMigrationInstances[space];
-          if (instance == null) continue;
-          instance.parallelJournalManager.scheduleFlushIfNeeded();
-        }
+    // Trigger flush for the primary datastore
+    if (!_dataStore.backgroundWriteScheduler.isEmpty) {
+      _dataStore.parallelJournalManager.scheduleFlushIfNeeded();
+    }
+    // Trigger flush for all active space migration instances
+    for (final space in _activeMigrationInstances.keys) {
+      final instance = _activeMigrationInstances[space];
+      if (instance != null && !instance.backgroundWriteScheduler.isEmpty) {
+        instance.parallelJournalManager.scheduleFlushIfNeeded();
       }
     }
   }
@@ -121,126 +171,151 @@ class MigrationManager {
 
   bool get hasPendingTasks => _pendingTasks.isNotEmpty;
 
+  /// Whether unfinished **schema** migration tasks exist (in memory or on disk).
+  ///
+  /// Does not include key migration; use [hasPendingKeyMigrationWork] for that.
+  Future<bool> hasPendingSchemaMigrationWork() async {
+    if (_pendingTasks.isNotEmpty) return true;
+    final meta = await _getOrLoadMigrationMeta();
+    if (meta.directoryMapping.idToDir.isEmpty) return false;
+    return (await _findUnfinishedSchemaTaskIdsForTable(null)).isNotEmpty;
+  }
+
+  /// Whether key re-encryption migration is still in progress (reads persisted meta).
+  Future<bool> hasPendingKeyMigrationWork() async {
+    final info = await getKeyMigrationInfo();
+    return info != null && info.isRunning;
+  }
+
+  /// Whether schema or key migration work is still pending (authoritative meta check).
+  Future<bool> hasAnyPendingMigrationWork() async {
+    if (await hasPendingSchemaMigrationWork()) return true;
+    return hasPendingKeyMigrationWork();
+  }
+
+  /// Get all currently pending migration tasks.
+  List<MigrationTask> get pendingTasks => List.unmodifiable(_pendingTasks);
+
+  /// Check if there is an unfinished migration task for the table that builds the specified index.
+  bool hasPendingIndexBuild(String tableName, String indexName) {
+    for (final task in _pendingTasks) {
+      if (task.tableName == tableName &&
+          task.pendingMigrationSpaces.isNotEmpty) {
+        if (task.specificIndexes == null ||
+            task.specificIndexes!.contains(indexName)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   bool hasRuntimeMigrationForTable(String tableName) {
     return _findRuntimeMigrationDescriptor(tableName) != null;
   }
 
-  /// Poll migration batches for a specific space, with dynamic quota management.
-  ///
-  /// Priority logic:
-  /// 1. Guaranteed minimum 10% of totalBatchSize to ensure progress.
-  /// 2. If business write queue is low, use all remaining capacity (totalBatchSize - businessQueueLength).
-  List<MigrationPreparedBatch> pollMigrationBatches(
-      String spaceName, int totalBatchSize) {
-    final effectiveSpace = (_preparedBatches[spaceName]?.isNotEmpty ?? false)
-        ? spaceName
-        : ((_preparedBatches[_globalMigrationScope]?.isNotEmpty ?? false)
-            ? _globalMigrationScope
-            : spaceName);
-    final queue = _preparedBatches[effectiveSpace];
-    if (queue == null || queue.isEmpty) return const [];
-
-    // 1. Guaranteed minimum progress (10% of totalBatchSize)
-    final int minQuota = max(1, totalBatchSize ~/ 10);
-
-    // 2. Idle-time capacity utilization
-    // Access the primary instance's buffer manager to see how much "spare" room we have
-    final int businessQueueLength = _dataStore.writeBufferManager.queueLength;
-    final int idleExtra = max(0, totalBatchSize - businessQueueLength);
-
-    // Dynamic quota: use more when system is idle, but keep a minimum floor.
-    final int allowedRecords = max(minQuota, idleExtra);
-
-    final result = <MigrationPreparedBatch>[];
-    int polledRecords = 0;
-
-    while (queue.isNotEmpty && polledRecords < allowedRecords) {
-      final nextBatch = queue.first;
-      if (polledRecords + nextBatch.entries.length > allowedRecords &&
-          result.isNotEmpty) {
-        // If adding this batch would exceed our dynamic quota significantly,
-        // and we already have some data, stop here.
-        break;
-      }
-
-      result.add(queue.removeFirst());
-      polledRecords += nextBatch.entries.length;
-      _totalPreparedRecords -= nextBatch.entries.length;
-    }
-
-    if (result.isNotEmpty) {
-      // If we still have data, notify again to keep the loop going
-      if (queue.isNotEmpty) {
-        final instance = _activeMigrationInstances[spaceName] ?? _dataStore;
-        instance.parallelJournalManager.scheduleFlushIfNeeded();
-      }
-    }
-
-    return result;
+  String? getPersistedCheckpointKey(String tableName, String spaceName) {
+    final task = _findTaskInMemoryByTableName(tableName);
+    if (task == null) return null;
+    return task.checkpointKeyForSpace(spaceName);
   }
 
-  /// Callback from ParallelJournalManager when migration batches have been safely persisted.
-  Future<void> onMigrationBatchPersisted(
-      List<MigrationPreparedBatch> batches) async {
-    if (batches.isEmpty) return;
+  MigrationTask? _findTaskInMemoryByTableName(String tableName) {
+    try {
+      return _pendingTasks.firstWhere((t) => t.tableName == tableName);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Callback when a batch of background write entries are successfully persisted.
+  Future<void> onBackgroundWritePersisted(
+      Map<String, BgTaskProgress> progressMap) async {
+    if (progressMap.isEmpty) return;
 
     final yieldController =
-        YieldController('MigrationManager.onMigrationBatchPersisted');
+        YieldController('MigrationManager.onBackgroundWritePersisted');
 
     try {
-      // Group by (taskId, spaceName) to avoid redundant persistence calls
-      final groupedCheckpoints = <String, Map<String, Uint8List>>{};
-      final processedRecords = <String, int>{};
-
-      for (final batch in batches) {
-        await yieldController.maybeYield();
-        if (batch.checkpointKey != null) {
-          final spaceMap =
-              groupedCheckpoints.putIfAbsent(batch.taskId, () => {});
-          spaceMap[batch.spaceName] = batch.checkpointKey!;
-        }
-        processedRecords[batch.taskId] =
-            (processedRecords[batch.taskId] ?? 0) + batch.entries.length;
-      }
+      final currentSpace = _dataStore.currentSpaceName;
 
       // Update task checkpoints atomically per task
-      for (final taskId in groupedCheckpoints.keys) {
+      for (final entry in progressMap.entries) {
         await yieldController.maybeYield();
+        final taskId = entry.key;
+        final progress = entry.value;
+
+        if (taskId.startsWith('large_delete_')) {
+          final op = _dataStore.walManager.meta.largeDeletes[taskId];
+          if (op != null) {
+            final nextDeletedSoFar = op.deletedSoFar + progress.count;
+            await _dataStore.walManager.updateLargeDeleteCheckpoint(
+              opId: taskId,
+              deletedSoFar: nextDeletedSoFar,
+              checkpointCursor: progress.checkpointKey,
+            );
+            await _dataStore.tableDataManager.updateTableRecordCountDelta(
+              op.table,
+              deleteDelta: progress.count,
+            );
+            await _dataStore.cacheManager.invalidateCache(op.table);
+          }
+          continue;
+        }
+
+        if (taskId.startsWith('large_update_')) {
+          final op = _dataStore.walManager.meta.largeUpdates[taskId];
+          if (op != null) {
+            final nextUpdatedSoFar = op.updatedSoFar + progress.count;
+            await _dataStore.walManager.updateLargeUpdateCheckpoint(
+              opId: taskId,
+              updatedSoFar: nextUpdatedSoFar,
+              checkpointCursor: progress.checkpointKey,
+            );
+            await _dataStore.cacheManager.invalidateCache(op.table);
+          }
+          continue;
+        }
+
+        final keyMigrationTable =
+            KeyMigrationRunner.tableNameFromTaskId(taskId);
+        if (keyMigrationTable != null) {
+          if (progress.checkpointKey != null) {
+            final scope = await KeyMigrationRunner.scopeForTable(
+                _dataStore, keyMigrationTable);
+            await KeyMigrationProgressStore.upsertRunning(
+              _dataStore,
+              tableName: keyMigrationTable,
+              spaceName: scope,
+              checkpointKey: progress.checkpointKey,
+            );
+          }
+          continue;
+        }
+
         final task = _findTaskInMemory(taskId);
         if (task == null) continue;
 
         MigrationTask updatedTask = task;
-        final spaceMap = groupedCheckpoints[taskId]!;
-        for (final entry in spaceMap.entries) {
+        if (progress.checkpointKey != null) {
+          final checkpointBytes = base64Decode(progress.checkpointKey!);
           updatedTask = _updateTaskCheckpointForSpace(
             updatedTask,
-            entry.key,
-            entry.value,
+            currentSpace,
+            checkpointBytes,
           );
         }
 
         await _saveMigrationTask(updatedTask);
         _updatePendingTaskInMemory(updatedTask);
         _rebuildRuntimeMigrations(updatedTask.tableName);
-      }
 
-      // Update telemetry and notify PJM for remaining data
-      for (final taskId in processedRecords.keys) {
-        await yieldController.maybeYield();
-        _telemetry.recordRecordsProcessed(taskId, processedRecords[taskId]!);
-      }
-
-      // Identify spaces that still have data and notify their PJM
-      final spacesWithData = batches.map((b) => b.spaceName).toSet();
-      for (final space in spacesWithData) {
-        if (hasPreparedDataFor(space)) {
-          final instance = _activeMigrationInstances[space] ?? _dataStore;
-          instance.parallelJournalManager.scheduleFlushIfNeeded();
-        }
+        // Update telemetry
+        _telemetry.recordRecordsProcessed(taskId, progress.count);
       }
     } catch (e) {
-      Logger.error('Failed to notify migration completion: $e',
-          label: 'MigrationManager.onMigrationBatchPersisted');
+      Logger.error('Failed to notify background write completion: $e',
+          label: 'MigrationManager.onBackgroundWritePersisted');
     }
   }
 
@@ -308,13 +383,6 @@ class MigrationManager {
     _activeControllers.remove(spaceName);
     _activeSpaceMigrationTasks.remove(spaceName);
     _activeMigrationInstances.remove(spaceName);
-
-    final queue = _preparedBatches.remove(spaceName);
-    if (queue != null) {
-      for (final batch in queue) {
-        _totalPreparedRecords -= batch.entries.length;
-      }
-    }
   }
 
   /// Whether a buffered write should be normalized through runtime migration
@@ -510,22 +578,51 @@ class MigrationManager {
   }
 
   /// Execute migration from old version to new version
-  Future<void> migrate(
-    List<TableSchema> schemas, {
+  Future<void> migrate({
+    required List<TableSchema> userSchemas,
+    required List<TableSchema> systemSchemas,
     int batchSize = 1000,
-    bool systemOnly = false,
     bool waitForCompletion = false,
   }) async {
     try {
-      var targetSchemas = schemas;
-      if (systemOnly) {
-        // Filter schemas to only include system tables
-        targetSchemas =
-            schemas.where((s) => SystemTable.isSystemTable(s.name)).toList();
+      final targetSchemas = <TableSchema>[];
+
+      // Validate system schemas (allow reserved names and system prefix)
+      for (final schema in systemSchemas) {
+        final reservedSystemTableNames = SystemTable.knownSystemTableNames;
+        if (!schema.validateTableSchema(
+          reservedTableNames: reservedSystemTableNames,
+          allowReservedTableNames: true,
+          allowInternalTableNamePrefix: true,
+          allowOtherInternalFields: true,
+        )) {
+          throw BusinessError(
+            'Invalid system schema definition for table ${schema.name}.',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+        targetSchemas.add(schema);
+      }
+
+      // Validate user-defined schemas (strict validation: no system prefix/reserved names)
+      for (final schema in userSchemas) {
+        final reservedSystemTableNames = SystemTable.knownSystemTableNames;
+        if (!schema.validateTableSchema(
+          reservedTableNames: reservedSystemTableNames,
+          allowReservedTableNames: false,
+          allowInternalTableNamePrefix: false,
+          allowOtherInternalFields: false,
+        )) {
+          throw BusinessError(
+            'Invalid user schema definition for table ${schema.name}. User tables cannot use system prefixes or reserved names.',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+        targetSchemas.add(schema);
       }
 
       Logger.info(
-        'Start database migration: involving ${targetSchemas.length} tables${systemOnly ? ' (systemOnly mode)' : ''}',
+        'Start database migration: involving ${targetSchemas.length} tables',
         label: 'MigrationManager.migrate',
       );
 
@@ -534,29 +631,11 @@ class MigrationManager {
         return;
       }
 
-      // Explicitly validate each user-defined schema for internal consistency
-      // before starting the migration process. This catches errors in mobile declarative
-      // definitions (e.g., index referencing non-existent field) early.
-      for (final schema in targetSchemas) {
-        if (!schema.validateTableSchema()) {
-          throw BusinessError(
-            'Invalid schema definition for table ${schema.name}. Please check field names, index fields, and foreign keys.',
-            type: BusinessErrorType.schemaError,
-          );
-        }
-      }
-
       // Get all existing tables
       var existingTables = await _dataStore.getTableNames();
-      if (systemOnly) {
-        // Only consider on-disk tables that are known system tables (current or legacy).
-        // User-created tables are never in this set, so they are never dropped in systemOnly mode.
-        // This list is code-only (SystemTable._knownSystemTableNames), not from user schemas,
-        // so server-side open() without schemas and runtime createTables() do not affect it.
-        existingTables = existingTables
-            .where((t) => SystemTable.isKnownSystemTable(t))
-            .toList();
-      }
+      existingTables = existingTables
+          .where((t) => !t.startsWith('_system_temp_op_conflict_'))
+          .toList();
 
       final allTasks = <MigrationTask>[];
 
@@ -568,7 +647,24 @@ class MigrationManager {
           await _detectRenamedTables(existingTables, targetSchemas);
       final renamedTables = detectRenameResult.renamedTables;
       final tablesToCreate = detectRenameResult.tablesToCreate;
-      final tablesToDrop = detectRenameResult.tablesToDrop;
+      final rawTablesToDrop = detectRenameResult.tablesToDrop;
+
+      final tablesToDrop = <String>[];
+      for (final tableName in rawTablesToDrop) {
+        final bool isSystem = SystemTable.isKnownSystemTable(tableName);
+        if (isSystem) {
+          tablesToDrop.add(tableName);
+        } else {
+          // For user tables:
+          // We only perform auto-drop for user tables if userSchemas is not empty
+          // (which means declarative user schemas are configured at startup).
+          // If userSchemas is empty, we must not drop any user tables, protecting
+          // runtime dynamically created tables (which are defined in server mode with schemas: []).
+          if (userSchemas.isNotEmpty) {
+            tablesToDrop.add(tableName);
+          }
+        }
+      }
 
       final renamedTableTargets = <String, String>{};
       for (final entry in renamedTables.entries) {
@@ -1073,65 +1169,15 @@ class MigrationManager {
       }
     }
 
-    // Check if there are existing migration tasks for this table
-    final hasPendingTask =
-        _pendingTasks.any((task) => task.tableName == tableName);
-
-    // Check if there are any unfinished migration tasks marked in global config
-    final globalConfig = await _dataStore.getGlobalConfig();
-    if (hasPendingTask || (globalConfig?.hasMigrationTask == true)) {
-      // If there are pending tasks, check if there are tasks for this table in migration metadata
-      final meta = await _getOrLoadMigrationMeta();
-      final allTaskFound = <String>[];
-
-      // Find possible tasks for the same table name
-      final tasksToRemove = <String>[];
-      for (final entry in meta.directoryMapping.idToDir.entries) {
-        try {
-          final taskId = entry.key;
-          final dirIndex = entry.value;
-          final taskPath =
-              _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
-
-          // Check if file exists
-          final fileExists = await _dataStore.storage.existsFile(taskPath);
-          if (!fileExists) {
-            // File doesn't exist but mapping has it - mark for cleanup
-            tasksToRemove.add(taskId);
-            continue;
-          }
-
-          final content = await _dataStore.storage.readAsString(taskPath);
-
-          if (content != null && content.isNotEmpty) {
-            final task = MigrationTask.fromJson(jsonDecode(content));
-            if (task.tableName == tableName &&
-                task.pendingMigrationSpaces.isNotEmpty) {
-              allTaskFound.add(taskId);
-            }
-          } else {
-            // File exists but is empty - mark for cleanup
-            tasksToRemove.add(taskId);
-          }
-        } catch (e) {
-          // File reading error - mark for cleanup
-          final taskId = entry.key;
-          tasksToRemove.add(taskId);
-        }
-      }
-
-      // Clean up orphaned mappings if any found
-      if (tasksToRemove.isNotEmpty) {
-        await _cleanupOrphanedMappings(tasksToRemove);
-      }
-
-      if (allTaskFound.isNotEmpty) {
-        Logger.info(
-          'Table [$tableName] already has ${allTaskFound.length} unfinished migration tasks (${allTaskFound.join(',')}), skipping adding new task',
-          label: 'MigrationManager._migrateExistingTable',
-        );
-        return null;
-      }
+    // Dedupe schema tasks only — key migration must not block new schema tasks here.
+    final existingTaskIds =
+        await _findUnfinishedSchemaTaskIdsForTable(tableName);
+    if (existingTaskIds.isNotEmpty) {
+      Logger.info(
+        'Table [$tableName] already has ${existingTaskIds.length} unfinished schema migration tasks (${existingTaskIds.join(',')}), skipping adding new task',
+        label: 'MigrationManager._migrateExistingTable',
+      );
+      return null;
     }
 
     final task = await addMigrationTask(
@@ -1150,7 +1196,9 @@ class MigrationManager {
       {bool isAutoGenerated = false,
       bool startProcessing = true,
       bool allowAfterDataMigration = false,
-      TableSchema? targetSchemaSnapshot}) async {
+      TableSchema? targetSchemaSnapshot,
+      BackgroundWriteMode? writeMode,
+      List<String>? specificIndexes}) async {
     try {
       if (operations.isEmpty) {
         throw ArgumentError('Migration operations cannot be empty');
@@ -1187,70 +1235,68 @@ class MigrationManager {
           );
         }
       } else {
-        // Deep validation of operations against current schema
-        for (final op in sortedOperations) {
-          switch (op.type) {
-            case MigrationType.addField:
-              final field = op.field;
-              if (field != null &&
-                  oldSchema.fields.any((f) => f.name == field.name)) {
-                throw BusinessError(
-                  'Cannot add field [${field.name}] to table [$tableName]: field already exists.',
-                  type: BusinessErrorType.migrationError,
-                );
-              }
-              break;
-            case MigrationType.removeField:
-            case MigrationType.renameField:
-            case MigrationType.modifyField:
-              final fieldName = op.fieldName ?? op.fieldUpdate?.name;
-              if (fieldName != null &&
-                  !oldSchema.fields.any((f) => f.name == fieldName)) {
-                throw BusinessError(
-                  'Cannot ${op.type.name} field [$fieldName] in table [$tableName]: field does not exist.',
-                  type: BusinessErrorType.migrationError,
-                );
-              }
-              break;
-            default:
-              break;
+        final isDropTable =
+            sortedOperations.any((op) => op.type == MigrationType.dropTable);
+
+        if (!isDropTable) {
+          // Deep validation of operations against current schema
+          for (final op in sortedOperations) {
+            switch (op.type) {
+              case MigrationType.addField:
+                final field = op.field;
+                if (field != null &&
+                    oldSchema.fields.any((f) => f.name == field.name)) {
+                  throw BusinessError(
+                    'Cannot add field [${field.name}] to table [$tableName]: field already exists.',
+                    type: BusinessErrorType.migrationError,
+                  );
+                }
+                break;
+              case MigrationType.removeField:
+              case MigrationType.renameField:
+              case MigrationType.modifyField:
+                final fieldName = op.fieldName ?? op.fieldUpdate?.name;
+                if (fieldName != null &&
+                    !oldSchema.fields.any((f) => f.name == fieldName)) {
+                  throw BusinessError(
+                    'Cannot ${op.type.name} field [$fieldName] in table [$tableName]: field does not exist.',
+                    type: BusinessErrorType.migrationError,
+                  );
+                }
+                break;
+              default:
+                break;
+            }
           }
-        }
 
-        // 2. Predict target schema and validate its overall structure
-        // This catches invalid field names, reserved words, etc. before the task is even saved.
-        targetSchema ??= _predictTargetSchema(
-          oldSchema,
-          sortedOperations,
-          isAutoGenerated: isAutoGenerated,
-        );
-        final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-        if (!targetSchema.validateTableSchema(
-          reservedTableNames: reservedSystemTableNames,
-          allowReservedTableNames:
-              SystemTable.isKnownSystemTable(targetSchema.name),
-          allowInternalTableNamePrefix:
-              SystemTable.isKnownSystemTable(targetSchema.name),
-          allowOtherInternalFields:
-              SystemTable.isKnownSystemTable(targetSchema.name),
-        )) {
-          throw const BusinessError(
-            'Invalid table structure after migration operations',
-            type: BusinessErrorType.schemaError,
+          // 2. Predict target schema and validate its overall structure
+          // This catches invalid field names, reserved words, etc. before the task is even saved.
+          targetSchema ??= _predictTargetSchema(
+            oldSchema,
+            sortedOperations,
+            isAutoGenerated: isAutoGenerated,
           );
-        }
+          final reservedSystemTableNames = SystemTable.knownSystemTableNames;
+          if (!targetSchema.validateTableSchema(
+            reservedTableNames: reservedSystemTableNames,
+            allowReservedTableNames:
+                SystemTable.isKnownSystemTable(targetSchema.name),
+            allowInternalTableNamePrefix:
+                SystemTable.isKnownSystemTable(targetSchema.name),
+            allowOtherInternalFields:
+                SystemTable.isKnownSystemTable(targetSchema.name),
+          )) {
+            throw const BusinessError(
+              'Invalid table structure after migration operations',
+              type: BusinessErrorType.schemaError,
+            );
+          }
 
-        // Only check for existing tables
-        final requiresMigration =
-            await _requiresDataMigration(sortedOperations, oldSchema);
-
-        if (requiresMigration) {
+          // Only check for existing tables
           bool isAllowed = false;
           if (allowAfterDataMigration) {
-            // From SchemaBuilder
             isAllowed = true;
           } else if (isAutoGenerated) {
-            // From migrate()
             final allowedTables = _dataStore
                     .config.migrationConfig?.allowedAfterDataMigrationTables ??
                 [];
@@ -1259,19 +1305,28 @@ class MigrationManager {
             }
           }
 
-          if (!isAllowed) {
-            final recordCount = await _dataStore.tableDataManager
-                .getTableRecordCount(tableName);
-            if (recordCount != 0) {
-              throw Exception(
-                  'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
-                  'This is to prevent accidental data loss or long-running migrations. \n'
-                  'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
-                  'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.');
+          final requiresMigration = await _requiresDataMigration(
+              sortedOperations, oldSchema,
+              targetSchema: targetSchema, isAllowed: isAllowed);
+
+          if (requiresMigration) {
+            if (!isAllowed) {
+              final recordCount = await _dataStore.tableDataManager
+                  .getTableRecordCount(tableName);
+              if (recordCount != 0) {
+                throw Exception(
+                    'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
+                    'This is to prevent accidental data loss or long-running migrations. \n'
+                    'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
+                    'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.');
+              }
             }
           }
         }
       }
+      // Calculate table write requirement once
+      final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
+
       // create new migration task
       final taskId = DateTime.now().microsecondsSinceEpoch.toString();
       final dirIndex = await _getNextDirIndex();
@@ -1294,19 +1349,9 @@ class MigrationManager {
         oldFieldLayoutSnapshot: oldFieldLayout,
         currentTableName: targetTableName,
         schemaCutoverWalPointer: cutoverPointer,
+        writeMode: writeMode,
+        specificIndexes: specificIndexes,
       );
-
-      // persist migration task
-      await _saveMigrationTask(task);
-      _pendingTasks.add(task);
-
-      // update global config
-      final globalConfig = await _dataStore.getGlobalConfig();
-      if (globalConfig != null && !globalConfig.hasMigrationTask) {
-        // only update when hasMigrationTask is false, avoid unnecessary write
-        await _dataStore
-            .saveGlobalConfig(globalConfig.copyWith(hasMigrationTask: true));
-      }
 
       // Schema metadata update is performed synchronously to ensure that subsequent operations
       // can immediately use the new schema. Data migration remains asynchronous.
@@ -1323,14 +1368,82 @@ class MigrationManager {
           isSchemaUpdated: true,
           currentTableName: currentTableName,
         );
-        await _saveMigrationTask(task);
-        _updatePendingTaskInMemory(task);
       }
 
-      var needDataMigration = task.forceDataMigration ||
-          _needDataMigration(sortedOperations, oldSchema);
-
       task = await _maybeEnableDeletedSlotCompaction(task, sortedOperations);
+
+      // Pre-calculate BackgroundWriteMode and specificIndexes upfront if not provided
+      if (task.writeMode == null || task.specificIndexes == null) {
+        final calcOldSchema = task.oldSchemaSnapshot ?? oldSchema;
+        final calcTargetSchema = task.targetSchemaSnapshot ?? targetSchema;
+        final currentNeedsTableWrite =
+            task.forceDataMigration || needsTableWrite;
+        final indexesToBuild = _calculateBuildingIndexes(
+          oldSchema: calcOldSchema,
+          targetSchema: calcTargetSchema,
+          sortedOperations: sortedOperations,
+          currentTableName: task.currentTableName ?? targetTableName,
+        );
+
+        final derivedWriteMode = task.writeMode ??
+            (currentNeedsTableWrite
+                ? (indexesToBuild.isNotEmpty
+                    ? BackgroundWriteMode.tableAndIndex
+                    : BackgroundWriteMode.tableOnly)
+                : (indexesToBuild.isNotEmpty
+                    ? BackgroundWriteMode.indexOnly
+                    : BackgroundWriteMode.tableAndIndex));
+        final derivedSpecificIndexes = task.specificIndexes ?? indexesToBuild;
+
+        task = task.copyWith(
+          writeMode: derivedWriteMode,
+          specificIndexes: derivedSpecificIndexes,
+        );
+      }
+
+      // For the active space, immediately set `isBuilding = true` for target indexes
+      if (task.specificIndexes != null && task.specificIndexes!.isNotEmpty) {
+        final currentSchema = task.targetSchemaSnapshot ?? targetSchema;
+        if (currentSchema != null) {
+          final allIndexes = <IndexSchema>[
+            ...currentSchema.getAllIndexes(),
+            ...?_dataStore.indexManager?.getEngineManagedBtreeIndexes(
+                task.currentTableName ?? targetTableName, currentSchema),
+          ];
+          for (final indexName in task.specificIndexes!) {
+            final idxSchema = allIndexes.firstWhere(
+              (i) => i.actualIndexName == indexName,
+              orElse: () => IndexSchema(indexName: indexName, fields: const []),
+            );
+            await _dataStore.indexManager?.deletePhysicalIndexArtifacts(
+              task.currentTableName ?? targetTableName,
+              indexName,
+            );
+            final indexMeta = IndexMeta.createEmpty(
+              name: indexName,
+              tableName: task.currentTableName ?? targetTableName,
+              fields: idxSchema.fields,
+              isUnique: idxSchema.unique,
+              isBuilding: true,
+            );
+            await _dataStore.indexManager?.updateIndexMeta(
+              tableName: task.currentTableName ?? targetTableName,
+              indexName: indexName,
+              updatedMeta: indexMeta,
+            );
+          }
+        }
+      }
+
+      // persist migration task
+      await _saveMigrationTask(task);
+      _updatePendingTaskInMemory(task);
+      _pendingTasks.add(task);
+
+      await syncHasMigrationTask();
+
+      final needDataMigration = task.forceDataMigration || needsTableWrite;
+
       await _invalidatePrimaryInstanceCachesForMigration(
         originalTableName: tableName,
         currentTableName: task.currentTableName ?? targetTableName,
@@ -1896,34 +2009,143 @@ class MigrationManager {
     return false;
   }
 
+  List<String> _calculateBuildingIndexes({
+    required TableSchema? oldSchema,
+    required TableSchema? targetSchema,
+    required List<MigrationOperation> sortedOperations,
+    required String currentTableName,
+  }) {
+    final indexesToBuild = <String>[];
+
+    if (oldSchema != null && targetSchema != null) {
+      final oldAllIndexes = <IndexSchema>[
+        ...oldSchema.getAllIndexes(),
+        ...?_dataStore.indexManager
+            ?.getEngineManagedBtreeIndexes(currentTableName, oldSchema),
+      ];
+
+      final targetAllIndexes = <IndexSchema>[
+        ...targetSchema.getAllIndexes(),
+        ...?_dataStore.indexManager
+            ?.getEngineManagedBtreeIndexes(currentTableName, targetSchema),
+      ];
+
+      // 1. Identify newly added or modified index definitions (including unique constraints, TTL, foreign keys)
+      for (final newIdx in targetAllIndexes) {
+        final newIdxName = newIdx.actualIndexName;
+        IndexSchema? oldIdx;
+        try {
+          oldIdx =
+              oldAllIndexes.firstWhere((i) => i.actualIndexName == newIdxName);
+        } catch (_) {}
+
+        if (oldIdx == null) {
+          // Brand new index, must be physically built
+          indexesToBuild.add(newIdxName);
+        } else {
+          // Existing index, check if its definition changed
+          bool definitionChanged = false;
+          if (oldIdx.fields.length != newIdx.fields.length) {
+            definitionChanged = true;
+          } else {
+            for (int i = 0; i < oldIdx.fields.length; i++) {
+              if (oldIdx.fields[i] != newIdx.fields[i]) {
+                definitionChanged = true;
+                break;
+              }
+            }
+          }
+          if (oldIdx.unique != newIdx.unique ||
+              oldIdx.type != newIdx.type ||
+              oldIdx.vectorConfig != newIdx.vectorConfig) {
+            definitionChanged = true;
+          }
+
+          if (definitionChanged) {
+            indexesToBuild.add(newIdxName);
+          }
+        }
+      }
+
+      // 2. Identify indexes impacted by field type modifications
+      for (final op in sortedOperations) {
+        if (op.type == MigrationType.modifyField) {
+          final fieldUpdate = op.fieldUpdate!;
+          FieldSchema? oldField;
+          for (final f in oldSchema.fields) {
+            if (f.name == fieldUpdate.name) {
+              oldField = f;
+              break;
+            }
+          }
+          if (oldField != null &&
+              fieldUpdate.type != null &&
+              oldField.type != fieldUpdate.type) {
+            // Rebuild all indexes referencing the modified field name
+            for (final idx in targetAllIndexes) {
+              if (idx.fields.contains(fieldUpdate.name)) {
+                indexesToBuild.add(idx.actualIndexName);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return indexesToBuild.toSet().toList();
+  }
+
   bool _needDataMigration(
       List<MigrationOperation> operations, TableSchema? oldSchema) {
+    if (oldSchema == null) return false;
     for (final operation in operations) {
-      if (operation.type == MigrationType.addField) {
-        final field = operation.field;
-        if (field != null &&
-            !field.nullable &&
-            field.defaultValue == null &&
-            field.defaultValueType == DefaultValueType.none) {
-          return true;
-        }
-      } else if (operation.type == MigrationType.modifyField) {
-        // Only migrate data if field definition changes affect storage
+      if (operation.type == MigrationType.modifyField) {
+        // Only migrate data if field definition changes affect storage or constraints
         final update = operation.fieldUpdate!;
-        final oldField = oldSchema?.fields.cast<FieldSchema?>().firstWhere(
+        final oldField = oldSchema.fields.cast<FieldSchema?>().firstWhere(
               (f) => f?.name == update.name,
               orElse: () => null,
             );
 
         if (oldField != null) {
-          // Type change requires migration
+          // 1. Type change requires migration
           if (update.type != null && oldField.type != update.type) {
             return true;
           }
-          // Nullable -> Non-nullable requires migration (to fill defaults)
-          else if (oldField.nullable && update.nullable == false) {
+          // 2. Nullable -> Non-nullable requires migration (to fill defaults)
+          if (oldField.nullable && update.nullable == false) {
             return true;
           }
+          // 3. Length constraints requires migration
+          if (update.maxLength != null &&
+              (oldField.maxLength == null ||
+                  update.maxLength! < oldField.maxLength!)) {
+            return true;
+          }
+          if (update.minLength != null &&
+              (oldField.minLength == null ||
+                  update.minLength! > oldField.minLength!)) {
+            return true;
+          }
+          // 4. Value range constraints requires migration
+          if (update.minValue != null &&
+              (oldField.minValue == null ||
+                  update.minValue! > oldField.minValue!)) {
+            return true;
+          }
+          if (update.maxValue != null &&
+              (oldField.maxValue == null ||
+                  update.maxValue! < oldField.maxValue!)) {
+            return true;
+          }
+        }
+      } else if (operation.type == MigrationType.setPrimaryKeyConfig) {
+        final newConfig = operation.primaryKeyConfig;
+        final oldConfig = oldSchema.primaryKeyConfig;
+        if (newConfig != null &&
+            (newConfig.name != oldConfig.name ||
+                newConfig.type != oldConfig.type)) {
+          return true;
         }
       }
     }
@@ -3043,16 +3265,7 @@ class MigrationManager {
         }
       }
 
-      // update global config after all tasks are completed
-      final globalConfig = await _dataStore.getGlobalConfig();
-      if (globalConfig != null) {
-        final hasTasks = _pendingTasks.isNotEmpty;
-        if (globalConfig.hasMigrationTask != hasTasks) {
-          await _dataStore.saveGlobalConfig(
-            globalConfig.copyWith(hasMigrationTask: hasTasks),
-          );
-        }
-      }
+      await syncHasMigrationTask();
     } catch (e, stack) {
       Logger.error(
         'Process migration tasks failed: $e\n$stack',
@@ -3176,12 +3389,13 @@ class MigrationManager {
         currentTableName,
       );
 
-      currentTask = await _maybeEnableDeletedSlotCompaction(
-          currentTask, sortedOperations);
       oldFieldLayout = currentTask.oldFieldLayoutSnapshot ?? oldFieldLayout;
 
+      final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
+      final specificIndexes = currentTask.specificIndexes ?? const <String>[];
       final needDataMigration = currentTask.forceDataMigration ||
-          _needDataMigration(sortedOperations, oldSchema);
+          needsTableWrite ||
+          specificIndexes.isNotEmpty;
 
       if (renameOp == null && needDataMigration && oldSchema == null) {
         throw StateError(
@@ -3310,8 +3524,6 @@ class MigrationManager {
 
               final int writeBatchSize =
                   max(1, migrationInstance.config.writeBatchSize);
-              final int queueSoftCap = writeBatchSize * 2 -
-                  _dataStore.writeBufferManager.queueLength;
 
               final sourceSchema = oldSchema ??
                   await _dataStore.schemaManager
@@ -3331,45 +3543,96 @@ class MigrationManager {
                     currentTask.taskId, tableMeta.totalRecords);
               }
 
-              final encodedCheckpoint =
-                  currentTask.checkpointKeyForSpace(space);
-              Uint8List? checkpointKey;
-              if (encodedCheckpoint != null && encodedCheckpoint.isNotEmpty) {
-                try {
-                  checkpointKey =
-                      Uint8List.fromList(base64Decode(encodedCheckpoint));
-                } catch (_) {}
-              }
+              final startCursor = currentTask.checkpointKeyForSpace(space);
 
-              String? startCursor;
-              if (checkpointKey != null && checkpointKey.isNotEmpty) {
-                try {
-                  final tuple = MemComparableKey.decodeTuple(checkpointKey);
-                  if (tuple.isNotEmpty) {
-                    final startPkStr = tuple.first?.toString();
-                    if (startPkStr != null) {
-                      startCursor = QueryExecutor.buildPrimaryKeyCursor(
-                          currentTableName, startPkStr);
+              final writeMode =
+                  currentTask.writeMode ?? BackgroundWriteMode.tableAndIndex;
+              final specificIndexes = currentTask.specificIndexes != null &&
+                      currentTask.specificIndexes!.isNotEmpty
+                  ? currentTask.specificIndexes
+                  : null;
+
+              // Initialize index locks (isBuilding = true) and clean physical files in this space ONLY IF this is the first execution (no checkpoint cursor)
+              if (migrationInstance.indexManager != null &&
+                  currentTask.specificIndexes != null &&
+                  currentTask.specificIndexes!.isNotEmpty) {
+                final isResume = startCursor != null && startCursor.isNotEmpty;
+                final targetSchema = await migrationInstance.schemaManager
+                    ?.getTableSchema(currentTableName);
+                if (targetSchema != null) {
+                  final allIndexes = <IndexSchema>[
+                    ...targetSchema.getAllIndexes(),
+                    ...?migrationInstance.indexManager
+                        ?.getEngineManagedBtreeIndexes(
+                            currentTableName, targetSchema),
+                  ];
+                  for (final indexName in currentTask.specificIndexes!) {
+                    final idxSchema = allIndexes.firstWhere(
+                      (i) => i.actualIndexName == indexName,
+                      orElse: () =>
+                          IndexSchema(indexName: indexName, fields: const []),
+                    );
+                    if (!isResume) {
+                      // Only delete physical files if starting fresh
+                      await migrationInstance.indexManager!
+                          .deletePhysicalIndexArtifacts(
+                        currentTableName,
+                        indexName,
+                      );
+                    }
+
+                    // Always ensure/repair metadata as isBuilding = true during ongoing migration
+                    final existingMeta =
+                        await migrationInstance.indexManager!.getIndexMeta(
+                      currentTableName,
+                      indexName,
+                    );
+                    if (existingMeta == null || !existingMeta.isBuilding) {
+                      final indexMeta = (existingMeta != null)
+                          ? existingMeta.copyWith(isBuilding: true)
+                          : IndexMeta.createEmpty(
+                              name: indexName,
+                              tableName: currentTableName,
+                              fields: idxSchema.fields,
+                              isUnique: idxSchema.unique,
+                              isBuilding: true,
+                            );
+                      await migrationInstance.indexManager!.updateIndexMeta(
+                        tableName: currentTableName,
+                        indexName: indexName,
+                        updatedMeta: indexMeta,
+                      );
                     }
                   }
-                } catch (_) {}
+                }
               }
 
               await migrationInstance.queryExecutor.queryEachBatch(
                 currentTableName,
-                batchSize: writeBatchSize,
+                batchSize: 1000,
                 checkpointCursor: startCursor,
                 cancellationToken: migrationController,
                 decodeSchema: oldSchema,
                 decodeFieldStructureOverride: decodeFieldStructureOverride,
-                onBatch: (records, nextCursor) async {
+                onBatch: (records, currentCursor, nextCursor) async {
+                  if (nextCursor != null) {
+                    _activeReadCursors[currentTableName] = nextCursor;
+                  }
+
                   if (migrationController.isCancelled) {
                     return false;
                   }
 
-                  while (_totalPreparedRecords >= queueSoftCap &&
-                      !migrationController.isCancelled) {
-                    await Future.delayed(const Duration(milliseconds: 100));
+                  // Memory threshold backpressure control with cancellation detection
+                  await migrationInstance.backgroundWriteScheduler
+                      .waitIfCongested(
+                    writeBatchSize,
+                    migrationInstance.writeBufferManager.queueLength,
+                    cancellationToken: migrationController,
+                  );
+
+                  if (migrationController.isCancelled) {
+                    return false;
                   }
 
                   if (records.isEmpty) return true;
@@ -3382,46 +3645,30 @@ class MigrationManager {
 
                   if (migratedRecords.isNotEmpty) {
                     final yieldController = YieldController(
-                        'MigrationManager.subBatching',
+                        'MigrationManager.toBackgroundScheduler',
                         checkInterval: 64);
-                    // Sub-batching: Split large results into 1000-record chunks.
-                    // This ensures PJM can poll precise amounts without overfilling or splitting.
-                    const int subBatchSize = 1000;
-                    for (int i = 0;
-                        i < migratedRecords.length;
-                        i += subBatchSize) {
+
+                    for (int i = 0; i < migratedRecords.length; i++) {
                       await yieldController.maybeYield();
-                      final int end =
-                          (i + subBatchSize < migratedRecords.length)
-                              ? i + subBatchSize
-                              : migratedRecords.length;
-                      final entries = migratedRecords.sublist(i, end);
+                      final be = migratedRecords[i];
+                      final pk = be.data[sourcePkName]?.toString() ?? '';
 
-                      final lastRecord = entries.last.data;
-                      final sourcePk = lastRecord[sourcePkName]?.toString();
-                      Uint8List? sourcePkBytes;
-                      if (sourcePk != null) {
-                        try {
-                          sourcePkBytes =
-                              sourceSchema.encodePrimaryKeyComponent(sourcePk);
-                        } catch (_) {}
-                      }
-
-                      final preparedBatch = MigrationPreparedBatch(
+                      final bgEntry = BackgroundWriteEntry(
                         taskId: currentTask.taskId,
                         tableName: currentTableName,
-                        spaceName: space,
-                        entries: entries,
-                        partitionNo: 0,
-                        checkpointKey: sourcePkBytes,
+                        primaryKey: pk,
+                        type: BackgroundWriteType.schemaMigration,
+                        mode: writeMode,
+                        entry: be,
+                        specificIndexes: specificIndexes,
+                        currentCursor: currentCursor,
+                        nextCursor: nextCursor,
                       );
 
-                      _preparedBatches
-                          .putIfAbsent(space, () => Queue())
-                          .add(preparedBatch);
+                      migrationInstance.backgroundWriteScheduler
+                          .addEntry(bgEntry, pk);
                     }
 
-                    _totalPreparedRecords += migratedRecords.length;
                     migrationInstance.parallelJournalManager
                         .scheduleFlushIfNeeded();
                   }
@@ -3430,12 +3677,29 @@ class MigrationManager {
                 },
               );
 
+              if (migrationController.isCancelled) {
+                throw _MigrationStoppedException(space);
+              }
+
               // Ensure all migration data is physically persisted before marking complete.
               // flushCompletely() waits until the PJM queue is fully drained to disk.
               await migrationInstance.parallelJournalManager.flushCompletely();
 
-              if (migrationController.isCancelled) {
-                throw _MigrationStoppedException(space);
+              // Unlock isBuilding = false
+              if (migrationInstance.indexManager != null &&
+                  currentTask.specificIndexes != null &&
+                  currentTask.specificIndexes!.isNotEmpty) {
+                for (final indexName in currentTask.specificIndexes!) {
+                  final existingMeta = await migrationInstance.indexManager!
+                      .getIndexMeta(currentTableName, indexName);
+                  if (existingMeta != null && existingMeta.isBuilding) {
+                    await migrationInstance.indexManager!.updateIndexMeta(
+                      tableName: currentTableName,
+                      indexName: indexName,
+                      updatedMeta: existingMeta.copyWith(isBuilding: false),
+                    );
+                  }
+                }
               }
 
               // After persistence, perform a spot check validation of the actual physical data.
@@ -3463,15 +3727,6 @@ class MigrationManager {
               }
             }
 
-            await _ensureTargetIndexesBuilt(
-              migrationInstance,
-              currentTableName,
-              targetSchema: currentTask.targetSchemaSnapshot ??
-                  await _dataStore.schemaManager
-                      ?.getTableSchema(currentTableName),
-              controller: migrationController,
-            );
-
             // update task status
             currentTask = currentTask.removePendingSpace(space);
             await _saveMigrationTask(currentTask);
@@ -3494,6 +3749,7 @@ class MigrationManager {
           }
           _activeControllers.remove(space);
           _activeSpaceMigrationTasks.remove(space);
+          _activeReadCursors.remove(currentTableName);
         }
 
         spaceStopwatch.stop();
@@ -3604,8 +3860,34 @@ class MigrationManager {
         }
 
         handledOldActualNames.add(oldIndex.actualIndexName);
+        bool typeChanged = false;
+        for (final oldFieldName in oldIndex.fields) {
+          FieldSchema? oldField;
+          for (final f in oldSchema.fields) {
+            if (f.name == oldFieldName) {
+              oldField = f;
+              break;
+            }
+          }
+          final newFieldName = fieldRenames[oldFieldName] ?? oldFieldName;
+          FieldSchema? targetField;
+          for (final f in targetSchema.fields) {
+            if (f.name == newFieldName) {
+              targetField = f;
+              break;
+            }
+          }
+          if (oldField != null &&
+              targetField != null &&
+              oldField.type != targetField.type) {
+            typeChanged = true;
+            break;
+          }
+        }
+
         if (_sameIndexBuildDefinition(oldIndex, targetIndex,
-            ignoreFields: true)) {
+                ignoreFields: true) &&
+            !typeChanged) {
           await migrationInstance.indexManager?.renameIndex(
             tableName,
             oldIndexName: oldIndex.actualIndexName,
@@ -3642,7 +3924,31 @@ class MigrationManager {
         continue;
       }
 
-      if (!_sameIndexBuildDefinition(oldIndex, targetIndex)) {
+      bool typeChanged = false;
+      for (final fieldName in oldIndex.fields) {
+        FieldSchema? oldField;
+        for (final f in oldSchema.fields) {
+          if (f.name == fieldName) {
+            oldField = f;
+            break;
+          }
+        }
+        FieldSchema? targetField;
+        for (final f in targetSchema.fields) {
+          if (f.name == fieldName) {
+            targetField = f;
+            break;
+          }
+        }
+        if (oldField != null &&
+            targetField != null &&
+            oldField.type != targetField.type) {
+          typeChanged = true;
+          break;
+        }
+      }
+
+      if (!_sameIndexBuildDefinition(oldIndex, targetIndex) || typeChanged) {
         await migrationInstance.indexManager?.deleteIndexArtifactsForMigration(
           tableName,
           indexName: oldActual,
@@ -3896,45 +4202,6 @@ class MigrationManager {
   }
 
   /// Sort operations to ensure they are executed in correct order
-  Future<void> _ensureTargetIndexesBuilt(
-    DataStoreImpl migrationInstance,
-    String tableName, {
-    required TableSchema? targetSchema,
-    required CancellationToken controller,
-  }) async {
-    final schema = targetSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      return;
-    }
-
-    final indexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-        const <IndexSchema>[];
-    for (final index in indexes) {
-      if (controller.isCancelled) {
-        throw _MigrationStoppedException(migrationInstance.currentSpaceName);
-      }
-      try {
-        await migrationInstance.indexManager?.createIndex(
-          tableName,
-          index,
-          tableSchemaOverride: schema,
-          controller: controller,
-        );
-      } catch (e) {
-        if (e is IndexBuildCancelledException) {
-          throw _MigrationStoppedException(migrationInstance.currentSpaceName);
-        }
-        Logger.warn(
-          'Failed to ensure index ${index.actualIndexName} for table $tableName: $e',
-          label: 'MigrationManager._ensureTargetIndexesBuilt',
-        );
-        rethrow;
-      }
-    }
-  }
-
-  /// Sort operations to ensure they are executed in correct order
   List<MigrationOperation> _sortOperations(
       List<MigrationOperation> operations) {
     // Define operation type priority
@@ -4054,96 +4321,136 @@ class MigrationManager {
   Future<void> initialize() async {
     try {
       _runtimeMigrations.clear();
-      // check if global config has unfinished migration
-      final globalConfig = await _dataStore.getGlobalConfig();
-      if (globalConfig != null && globalConfig.hasMigrationTask) {
-        // load migration meta data
-        final meta = await _getOrLoadMigrationMeta();
-        if (meta.directoryMapping.idToDir.isNotEmpty) {
-          // Track tasks to remove from mapping (file doesn't exist)
-          final tasksToRemove = <String>[];
-
-          // load unfinished tasks one by one
-          for (final entry in meta.directoryMapping.idToDir.entries) {
-            final taskId = entry.key;
-            final dirIndex = entry.value;
-
-            try {
-              // Check if task file exists
-              final taskPath =
-                  _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
-              final fileExists = await _dataStore.storage.existsFile(taskPath);
-
-              if (!fileExists) {
-                // File doesn't exist but mapping has it - mark for cleanup
-                Logger.warn(
-                  'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-                  label: 'MigrationManager.initialize',
-                );
-                tasksToRemove.add(taskId);
-                continue;
-              }
-
-              // read task file
-              final taskContent =
-                  await _dataStore.storage.readAsString(taskPath);
-
-              if (taskContent != null && taskContent.isNotEmpty) {
-                // parse task
-                final task = MigrationTask.fromJson(jsonDecode(taskContent));
-
-                // check if there are remaining spaces to be processed
-                if (task.pendingMigrationSpaces.isNotEmpty) {
-                  Logger.info(
-                    'Found unfinished migration task: taskId[${task.taskId}], table[${task.tableName}], remaining spaces[${task.pendingMigrationSpaces.length}]',
-                    label: 'MigrationManager.initialize',
-                  );
-
-                  // add to pending tasks queue
-                  _pendingTasks.add(task);
-                } else {
-                  // Task is completed but still in mapping - mark for cleanup
-                  Logger.info(
-                    'Task completed but still in mapping: taskId[$taskId], cleaning up mapping',
-                    label: 'MigrationManager.initialize',
-                  );
-                  tasksToRemove.add(taskId);
-                }
-              } else {
-                // File exists but is empty - mark for cleanup
-                Logger.warn(
-                  'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-                  label: 'MigrationManager.initialize',
-                );
-                tasksToRemove.add(taskId);
-              }
-            } catch (e) {
-              Logger.warn(
-                'Failed to load task: taskId[$taskId], error[$e], cleaning up mapping',
-                label: 'MigrationManager.initialize',
-              );
-              tasksToRemove.add(taskId);
-            }
-          }
-
-          // Clean up orphaned mappings (tasks that don't exist or are completed)
-          if (tasksToRemove.isNotEmpty) {
-            await _cleanupOrphanedMappings(tasksToRemove);
-          }
-
-          // start processing recovered tasks
-          if (_pendingTasks.isNotEmpty) {
-            _rebuildRuntimeMigrations();
-            unawaited(processMigrationTasks());
-          }
-        }
-      }
+      await _recoverPendingSchemaTasksFromDisk();
+      await syncHasMigrationTask();
     } catch (e, stack) {
       Logger.error(
         'Failed to initialize migration manager: $e\n$stack',
         label: 'MigrationManager.initialize',
       );
     }
+  }
+
+  /// Load unfinished schema migration tasks from disk into [_pendingTasks].
+  Future<void> _recoverPendingSchemaTasksFromDisk() async {
+    final meta = await _getOrLoadMigrationMeta();
+    if (meta.directoryMapping.idToDir.isEmpty) return;
+
+    final tasksToRemove = <String>[];
+
+    for (final entry in meta.directoryMapping.idToDir.entries) {
+      final taskId = entry.key;
+      final dirIndex = entry.value;
+
+      try {
+        final taskPath =
+            _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
+        final fileExists = await _dataStore.storage.existsFile(taskPath);
+
+        if (!fileExists) {
+          Logger.warn(
+            'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+            label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
+          );
+          tasksToRemove.add(taskId);
+          continue;
+        }
+
+        final taskContent = await _dataStore.storage.readAsString(taskPath);
+
+        if (taskContent != null && taskContent.isNotEmpty) {
+          final task = MigrationTask.fromJson(jsonDecode(taskContent));
+
+          if (task.pendingMigrationSpaces.isNotEmpty) {
+            if (_pendingTasks.any((t) => t.taskId == task.taskId)) continue;
+            Logger.info(
+              'Found unfinished migration task: taskId[${task.taskId}], table[${task.tableName}], remaining spaces[${task.pendingMigrationSpaces.length}]',
+              label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
+            );
+            _pendingTasks.add(task);
+          } else {
+            Logger.info(
+              'Task completed but still in mapping: taskId[$taskId], cleaning up mapping',
+              label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
+            );
+            tasksToRemove.add(taskId);
+          }
+        } else {
+          Logger.warn(
+            'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
+            label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
+          );
+          tasksToRemove.add(taskId);
+        }
+      } catch (e) {
+        Logger.warn(
+          'Failed to load task: taskId[$taskId], error[$e], cleaning up mapping',
+          label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
+        );
+        tasksToRemove.add(taskId);
+      }
+    }
+
+    if (tasksToRemove.isNotEmpty) {
+      await _cleanupOrphanedMappings(tasksToRemove);
+    }
+
+    if (_pendingTasks.isNotEmpty) {
+      _rebuildRuntimeMigrations();
+      unawaited(processMigrationTasks());
+    }
+  }
+
+  /// Find unfinished schema task ids; when [tableName] is null, match any table.
+  Future<List<String>> _findUnfinishedSchemaTaskIdsForTable(
+    String? tableName,
+  ) async {
+    final found = <String>[];
+
+    for (final task in _pendingTasks) {
+      if (task.pendingMigrationSpaces.isEmpty) continue;
+      if (tableName != null && task.tableName != tableName) continue;
+      found.add(task.taskId);
+    }
+    if (tableName != null && found.isNotEmpty) return found;
+
+    final meta = await _getOrLoadMigrationMeta();
+    if (meta.directoryMapping.idToDir.isEmpty) return found;
+
+    final tasksToRemove = <String>[];
+    for (final entry in meta.directoryMapping.idToDir.entries) {
+      final taskId = entry.key;
+      if (found.contains(taskId)) continue;
+
+      try {
+        final dirIndex = entry.value;
+        final taskPath =
+            _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
+        final fileExists = await _dataStore.storage.existsFile(taskPath);
+        if (!fileExists) {
+          tasksToRemove.add(taskId);
+          continue;
+        }
+
+        final content = await _dataStore.storage.readAsString(taskPath);
+        if (content != null && content.isNotEmpty) {
+          final task = MigrationTask.fromJson(jsonDecode(content));
+          if (task.pendingMigrationSpaces.isEmpty) continue;
+          if (tableName != null && task.tableName != tableName) continue;
+          found.add(taskId);
+        } else {
+          tasksToRemove.add(taskId);
+        }
+      } catch (e) {
+        tasksToRemove.add(taskId);
+      }
+    }
+
+    if (tasksToRemove.isNotEmpty) {
+      await _cleanupOrphanedMappings(tasksToRemove);
+    }
+
+    return found;
   }
 
   /// Clean up orphaned task mappings (tasks that no longer exist)
@@ -4465,7 +4772,45 @@ class MigrationManager {
 
   /// check if the migration operations require data migration.
   Future<bool> _requiresDataMigration(
-      List<MigrationOperation> operations, TableSchema oldSchema) async {
+      List<MigrationOperation> operations, TableSchema oldSchema,
+      {TableSchema? targetSchema, bool isAllowed = false}) async {
+    final recordCount =
+        await _dataStore.tableDataManager.getTableRecordCount(oldSchema.name);
+
+    // Check for unique index tightening (both explicit and implicit unique properties)
+    if (targetSchema != null) {
+      final oldIndexes = oldSchema.getAllIndexes();
+      final targetIndexes = targetSchema.getAllIndexes();
+
+      for (final newIdx in targetIndexes) {
+        if (newIdx.unique) {
+          final hasEquivalentOldUnique = oldIndexes.any((oldIdx) =>
+              oldIdx.unique && _sameFieldList(oldIdx.fields, newIdx.fields));
+
+          if (!hasEquivalentOldUnique) {
+            if (recordCount > 0 && !isAllowed) {
+              throw BusinessError(
+                'Adding or modifying unique index "${newIdx.actualIndexName}" is not allowed on non-empty table "${oldSchema.name}" '
+                'without explicit data migration allowance, as it may cause duplicate key errors.',
+                type: BusinessErrorType.migrationError,
+              );
+            }
+            Logger.warn(
+              'Data migration required: adding or modifying unique index "${newIdx.actualIndexName}" on table "${oldSchema.name}".',
+              label: 'MigrationManager._requiresDataMigration',
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    bool isNumericType(DataType type) {
+      return type == DataType.integer ||
+          type == DataType.bigInt ||
+          type == DataType.double;
+    }
+
     for (final op in operations) {
       switch (op.type) {
         case MigrationType.addField:
@@ -4473,6 +4818,13 @@ class MigrationManager {
           if (!field.nullable &&
               field.defaultValue == null &&
               field.defaultValueType == DefaultValueType.none) {
+            if (recordCount > 0) {
+              throw BusinessError(
+                'Cannot add non-nullable field "${field.name}" without a default value to non-empty table "${oldSchema.name}". '
+                'This operation is physically impossible and would fail during data write.',
+                type: BusinessErrorType.migrationError,
+              );
+            }
             Logger.warn(
               'Data migration required: adding non-nullable field "${field.name}" without a default value.',
               label: 'MigrationManager._requiresDataMigration',
@@ -4491,8 +4843,28 @@ class MigrationManager {
           }
 
           if (oldField != null) {
+            // Check text to numeric high risk conversion
+            if (oldField.type == DataType.text &&
+                fieldUpdate.type != null &&
+                isNumericType(fieldUpdate.type!)) {
+              if (recordCount > 0 && !isAllowed) {
+                throw BusinessError(
+                  'Changing field "${fieldUpdate.name}" type from text to numeric is not allowed on non-empty table "${oldSchema.name}" '
+                  'without explicit data migration allowance, as it may cause parsing errors for non-numeric data.',
+                  type: BusinessErrorType.migrationError,
+                );
+              }
+            }
+
             // from nullable to non-nullable
             if (oldField.nullable && (fieldUpdate.nullable == false)) {
+              if (recordCount > 0 && !isAllowed) {
+                throw BusinessError(
+                  'Changing field "${fieldUpdate.name}" from nullable to non-nullable is not allowed on non-empty table "${oldSchema.name}" '
+                  'without explicit data migration allowance.',
+                  type: BusinessErrorType.migrationError,
+                );
+              }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from nullable to non-nullable.',
                 label: 'MigrationManager._requiresDataMigration',
@@ -4501,6 +4873,13 @@ class MigrationManager {
             }
             // Type change requires migration
             if (fieldUpdate.type != null && oldField.type != fieldUpdate.type) {
+              if (recordCount > 0 && !isAllowed) {
+                throw BusinessError(
+                  'Changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type} '
+                  'is not allowed on non-empty table "${oldSchema.name}" without explicit data migration allowance.',
+                  type: BusinessErrorType.migrationError,
+                );
+              }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type}.',
                 label: 'MigrationManager._requiresDataMigration',
@@ -4509,6 +4888,13 @@ class MigrationManager {
             }
             // from non-unique to unique
             if (!oldField.unique && (fieldUpdate.unique == true)) {
+              if (recordCount > 0 && !isAllowed) {
+                throw BusinessError(
+                  'Changing field "${fieldUpdate.name}" from non-unique to unique is not allowed on non-empty table "${oldSchema.name}" '
+                  'without explicit data migration allowance.',
+                  type: BusinessErrorType.migrationError,
+                );
+              }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from non-unique to unique.',
                 label: 'MigrationManager._requiresDataMigration',
@@ -4523,6 +4909,13 @@ class MigrationManager {
           if (newConfig != null &&
               (newConfig.name != oldConfig.name ||
                   newConfig.type != oldConfig.type)) {
+            if (recordCount > 0 && !isAllowed) {
+              throw BusinessError(
+                'Changing primary key config is not allowed on non-empty table "${oldSchema.name}" '
+                'without explicit data migration allowance.',
+                type: BusinessErrorType.migrationError,
+              );
+            }
             Logger.warn(
               'Data migration required: changing primary key name or type.',
               label: 'MigrationManager._requiresDataMigration',
@@ -4966,21 +5359,9 @@ class _MigrationStoppedException implements Exception {
   String toString() => 'Migration stopped for space [$spaceName]';
 }
 
-/// Encapsulates a batch of data prepared for migration to be flushed via ParallelJournalManager.
-class MigrationPreparedBatch {
-  final String taskId;
-  final String tableName;
-  final String spaceName;
-  final List<BufferEntry> entries;
-  final int partitionNo;
-  final Uint8List? checkpointKey;
+class BgTaskProgress {
+  final String? checkpointKey;
+  final int count;
 
-  MigrationPreparedBatch({
-    required this.taskId,
-    required this.tableName,
-    required this.spaceName,
-    required this.entries,
-    required this.partitionNo,
-    this.checkpointKey,
-  });
+  BgTaskProgress({this.checkpointKey, required this.count});
 }

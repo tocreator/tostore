@@ -10,6 +10,9 @@ import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
+import '../model/background_write_entry.dart';
+import '../model/background_write_mode.dart';
+import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
@@ -286,10 +289,9 @@ class ParallelJournalManager {
     if (_flushInProgress) return;
 
     final hasNormalData = !_bufferManager.isEmpty;
-    final hasMigrationData =
-        _dataStore.migrationManager?.hasPreparedData ?? false;
+    final hasBackgroundWriteData = !_dataStore.backgroundWriteScheduler.isEmpty;
 
-    if (!hasNormalData && !hasMigrationData) return;
+    if (!hasNormalData && !hasBackgroundWriteData) return;
 
     _flushInProgress = true;
     final fut = _pumpFlush();
@@ -376,13 +378,9 @@ class ParallelJournalManager {
     bool firstIteration = true;
     final int delayMs = _dataStore.config.maxFlushLatencyMs;
 
-    final migrationManager = _dataStore.migrationManager;
-
     while (_running &&
         (!_bufferManager.isEmpty ||
-            (migrationManager
-                    ?.hasPreparedDataFor(_dataStore.currentSpaceName) ??
-                false))) {
+            !_dataStore.backgroundWriteScheduler.isEmpty)) {
       List<WriteQueueEntry> batch = const <WriteQueueEntry>[];
       try {
         // This is the first iteration, we need to ensure at least one batch is flushed.
@@ -408,40 +406,59 @@ class ParallelJournalManager {
 
         final batchSw = Stopwatch()..start();
 
-        final int migrationRecordsCount;
-        List<MigrationPreparedBatch> migrationBatches = const [];
+        final int backgroundRecordsCount;
+        List<BackgroundWriteEntry> bgEntries = const [];
 
-        if (migrationManager != null) {
-          migrationBatches = migrationManager.pollMigrationBatches(
-              _dataStore.currentSpaceName, batchSize);
+        final hasBackground = !_dataStore.backgroundWriteScheduler.isEmpty;
+        int normalBatchSize = batchSize;
+        int backgroundLimit = 0;
+
+        // Allocate quota: reserve 10% for background task if it has work
+        if (hasBackground) {
+          final int minBgLimit = (batchSize * 0.1).ceil();
+          normalBatchSize = batchSize - minBgLimit;
+          backgroundLimit = minBgLimit;
         }
-
-        // Count actual migration records polled
-        int count = 0;
-        for (final mb in migrationBatches) {
-          count += mb.entries.length;
-        }
-        migrationRecordsCount = count;
-
-        // Calculate remaining capacity for normal writes
-        final int normalBatchSize = max(0, batchSize - migrationRecordsCount);
 
         // Pop normal batch from buffer manager
         if (normalBatchSize > 0) {
           batch = _bufferManager.popBatch(normalBatchSize);
         }
 
-        if (batch.isEmpty && migrationBatches.isEmpty) {
-          // Both queues are empty, but we might have arrived here due to notifyMigrationDataReady
-          // Just break the loop and wait for next schedule.
+        // Poll background write entries using the remaining budget
+        if (hasBackground) {
+          final remainingCapacity = batchSize - batch.length;
+          if (remainingCapacity > backgroundLimit) {
+            backgroundLimit = remainingCapacity;
+          }
+          bgEntries = _dataStore.backgroundWriteScheduler
+              .pollBackgroundWriteEntries(backgroundLimit);
+
+          // If background entries are less than limit, give excess capacity back to normal writes
+          if (bgEntries.length < backgroundLimit &&
+              batch.length < normalBatchSize) {
+            final extraNormalLimit = backgroundLimit - bgEntries.length;
+            final extraNormal = _bufferManager.popBatch(extraNormalLimit);
+            batch = [...batch, ...extraNormal];
+          }
+        }
+
+        backgroundRecordsCount = bgEntries.length;
+
+        if (batch.isEmpty && bgEntries.isEmpty) {
+          // In drain mode, keep looping while background scheduler still has work.
+          if (drainCompletely && !_dataStore.backgroundWriteScheduler.isEmpty) {
+            continue;
+          }
+          // Both queues are empty; wait for next schedule in normal mode.
           break;
         }
 
-        final migrationSuffix = migrationRecordsCount > 0
-            ? " and $migrationRecordsCount migration items"
+        final bgSuffix = backgroundRecordsCount > 0
+            ? " and $backgroundRecordsCount background write items"
             : "";
         Logger.debug(
-            "Executing batch with ${batch.length} normal items$migrationSuffix",
+            "Executing batch with ${batch.length} normal items$bgSuffix",
             label: "ParallelJournalManager._pumpFlush");
 
         firstIteration = false;
@@ -460,38 +477,31 @@ class ParallelJournalManager {
         final Map<String, Map<String, BufferEntry>> tablePkMap = {};
         final Map<String, int> tableEpochs = {};
         final Map<String, List<WriteQueueEntry>> entriesByTable = {};
+        final Map<String, List<BackgroundWriteEntry>> bgEntriesByTable = {};
 
         final yieldController =
             YieldController('ParallelJournalManager._pumpFlush');
 
         // Calculate the target checkpoint for each table in this batch
-        final Map<String, Uint8List?> targetCheckpoints = {};
-        for (final mb in migrationBatches) {
-          if (mb.checkpointKey != null) {
-            // migrationBatches are polled in order, so the latest one for a table wins
-            targetCheckpoints[mb.tableName] = mb.checkpointKey;
+        final Map<String, String> targetCheckpoints = {};
+        final flushCheckpointMap = <String, BgTaskProgress>{};
+        for (final entry in bgEntries) {
+          bgEntriesByTable.putIfAbsent(entry.tableName, () => []).add(entry);
+          if (entry.type == BackgroundWriteType.schemaMigration &&
+              entry.nextCursor != null) {
+            targetCheckpoints[entry.tableName] = entry.nextCursor!;
           }
+          final currentProgress = flushCheckpointMap[entry.taskId];
+          final count = (currentProgress?.count ?? 0) + 1;
+          final String? latestCheckpointKey =
+              entry.currentCursor ?? currentProgress?.checkpointKey;
+          flushCheckpointMap[entry.taskId] = BgTaskProgress(
+            checkpointKey: latestCheckpointKey,
+            count: count,
+          );
         }
 
-        // 1. Process migration records (as the "oldest" data in this batch)
-        for (final mb in migrationBatches) {
-          final pkMap = tablePkMap.putIfAbsent(mb.tableName, () => {});
-          final schema =
-              await _dataStore.schemaManager?.getTableSchema(mb.tableName);
-          if (schema == null) continue;
-
-          for (final entry in mb.entries) {
-            final pk = entry.data[schema.primaryKey]?.toString();
-            if (pk == null) continue;
-
-            // Migration is the "base" data, added first.
-            // These entries were pre-constructed in MigrationManager to save CPU here.
-            pkMap[pk] = entry;
-            await yieldController.maybeYield();
-          }
-        }
-
-        // 2. Process business writes (as the "newer" data, overwriting migration)
+        // Process business writes (as the "newer" data, overwriting migration)
         for (final e in batch) {
           await yieldController.maybeYield();
           tableEpochs.putIfAbsent(
@@ -590,7 +600,9 @@ class ParallelJournalManager {
         // Build lightweight table plan with index names to indicate index meta involvement
         final Map<String, dynamic> tablePlan = {};
         int estimatedTotalWorkOps = 0;
-        for (final table in grouped.keys) {
+        final allTables = <String>{...grouped.keys, ...bgEntriesByTable.keys};
+
+        for (final table in allTables) {
           try {
             final schema =
                 await _dataStore.schemaManager?.getTableSchema(table);
@@ -624,6 +636,10 @@ class ParallelJournalManager {
             // Calculate ops for timeout: records * (1 + indexCount)
             int tableRecordCount = 0;
             grouped[table]?.forEach((_, map) => tableRecordCount += map.length);
+
+            final bgRecords = bgEntriesByTable[table] ?? [];
+            tableRecordCount += bgRecords.length;
+
             estimatedTotalWorkOps += tableRecordCount * (1 + indexNames.length);
 
             tablePlan[table] = {
@@ -679,20 +695,24 @@ class ParallelJournalManager {
         final tasks = <Future<void> Function()>[];
         late final int plannedTableConcurrency;
         late final int perTableTokenBudget;
-        grouped.forEach((table, byOp) {
-          // Use the epoch captured before/during grouping
-          final capturedEpoch = tableEpochs[table] ?? 0;
-          final tableQueueItems = entriesByTable[table] ?? [];
 
-          final inserts = byOp[BufferOperationType.insert]
+        for (final table in allTables) {
+          // Use the epoch captured before/during grouping
+          final capturedEpoch =
+              tableEpochs[table] ?? _bufferManager.getClearEpoch(table);
+          final tableQueueItems = entriesByTable[table] ?? [];
+          final tableBgEntries = bgEntriesByTable[table] ?? [];
+
+          final byOp = grouped[table];
+          final inserts = byOp?[BufferOperationType.insert]
                   ?.values
                   .toList(growable: false) ??
               const <BufferEntry>[];
-          final updates = byOp[BufferOperationType.update]
+          final updates = byOp?[BufferOperationType.update]
                   ?.values
                   .toList(growable: false) ??
               const <BufferEntry>[];
-          final deletes = byOp[BufferOperationType.delete]
+          final deletes = byOp?[BufferOperationType.delete]
                   ?.values
                   .toList(growable: false) ??
               const <BufferEntry>[];
@@ -702,7 +722,7 @@ class ParallelJournalManager {
             ...updates,
             ...deletes,
           ];
-          if (allEntries.isEmpty) return;
+          if (allEntries.isEmpty && tableBgEntries.isEmpty) return;
 
           tasks.add(() async {
             try {
@@ -739,10 +759,6 @@ class ParallelJournalManager {
                       await _dataStore.schemaManager?.getTableSchema(table);
                   if (schema == null) return;
                   final pkName = schema.primaryKey;
-                  final logicalInsertRecords =
-                      inserts.map((e) => e.data).toList(growable: false);
-                  final logicalDeleteRecords =
-                      deletes.map((e) => e.data).toList(growable: false);
                   final migrationManager = _dataStore.migrationManager;
                   final legacyFieldStruct =
                       migrationManager?.getLegacyFieldStructureForWrite(table);
@@ -753,6 +769,37 @@ class ParallelJournalManager {
                       legacyFieldStruct.isNotEmpty &&
                       migrationManager.hasRuntimeMigrationForTable(table);
 
+                  // Extract and separate valid background write data
+                  final activeBgEntries =
+                      tableBgEntries.where((e) => e.isValid).toList();
+
+                  // 1) Unified pk-map coalescing (overwrite background with business writes)
+                  final Map<String, BufferEntry> unifiedPkMap = {};
+
+                  // First load background writes (if mode includes table write)
+                  for (final bgEntry in activeBgEntries) {
+                    if (bgEntry.mode == BackgroundWriteMode.tableOnly ||
+                        bgEntry.mode == BackgroundWriteMode.tableAndIndex) {
+                      unifiedPkMap[bgEntry.primaryKey] = bgEntry.entry;
+                    }
+                  }
+
+                  // Then overwrite with normal business writes (newer)
+                  final businessPkMap = tablePkMap[table];
+                  if (businessPkMap != null) {
+                    unifiedPkMap.addAll(businessPkMap);
+                  }
+
+                  // 2) Parse the checkpoint key once outside the loops (intention vs persisted)
+                  dynamic decodedCheckpointKey;
+                  final cpCursor = targetCheckpoints[table] ??
+                      migrationManager?.getPersistedCheckpointKey(
+                          table, _dataStore.currentSpaceName);
+                  if (cpCursor != null) {
+                    decodedCheckpointKey =
+                        _decodePrimaryKeyFromCursor(cpCursor);
+                  }
+
                   final insertRecords = <Map<String, dynamic>>[];
                   final updateRecords = <Map<String, dynamic>>[];
                   final deleteRecords = <Map<String, dynamic>>[];
@@ -760,91 +807,67 @@ class ParallelJournalManager {
                   final legacyUpdateRecords = <Map<String, dynamic>>[];
                   final legacyDeleteRecords = <Map<String, dynamic>>[];
 
-                  void classifyForPhysicalWrite(
-                    BufferEntry entry,
-                    List<Map<String, dynamic>> latestBucket,
-                    List<Map<String, dynamic>> legacyBucket,
-                  ) {
-                    final data = entry.data;
+                  // 3) Classify records into latest/legacy based on checkpoint cursor comparison
+                  for (final be in unifiedPkMap.values) {
+                    await yieldController.maybeYield();
+                    final data = be.data;
+                    bool useLegacy = true;
 
-                    // 1. Migration records are ALWAYS written in latest format
-                    // These carry a pseudo-WAL pointer with partitionIndex -1.
-                    if (entry.walPointer?.partitionIndex == -1) {
-                      latestBucket.add(data);
-                      return;
+                    if (decodedCheckpointKey != null) {
+                      final pkValue = data[pkName];
+                      if (pkValue != null &&
+                          decodedCheckpointKey is Comparable &&
+                          pkValue is Comparable) {
+                        try {
+                          if (pkValue.compareTo(decodedCheckpointKey) <= 0) {
+                            useLegacy = false;
+                          }
+                        } catch (_) {}
+                      }
                     }
 
                     if (!hasLegacyPhysicalSplit) {
-                      latestBucket.add(data);
-                      return;
+                      useLegacy = false;
                     }
 
-                    // 2. Business writes are classified based on the batch checkpoint
-                    // to ensure they stay in the new format if the migration has already
-                    // moved past their PK in this flush cycle.
-                    final useLegacy = migrationManager
-                        .shouldStoreLegacyPhysicalFormatForRecord(
-                      table,
-                      data,
-                      batchCheckpoint: targetCheckpoints[table],
-                    );
-                    if (!useLegacy) {
-                      latestBucket.add(data);
-                      return;
-                    }
-                    legacyBucket.add(
-                      migrationManager.convertCurrentRecordToLegacyForWriteSync(
+                    if (useLegacy) {
+                      final legacyData = migrationManager!
+                          .convertCurrentRecordToLegacyForWriteSync(
                         table,
                         data,
-                      ),
-                    );
-                  }
-
-                  // 1) Classification and Old Value Preparation
-                  if (!hasLegacyPhysicalSplit) {
-                    // Fast Path: No active migration for this table.
-                    insertRecords.addAll(logicalInsertRecords);
-                    deleteRecords.addAll(logicalDeleteRecords);
-                  } else {
-                    // Slow Path: PK-aware classification for online migration.
-                    for (final entry in inserts) {
-                      await yieldController.maybeYield();
-                      classifyForPhysicalWrite(
-                        entry,
-                        insertRecords,
-                        legacyInsertRecords,
                       );
-                    }
-                    for (final entry in deletes) {
-                      await yieldController.maybeYield();
-                      classifyForPhysicalWrite(
-                        entry,
-                        deleteRecords,
-                        legacyDeleteRecords,
-                      );
-                    }
-                  }
-
-                  // Unified Updates Loop: Handles classification AND old value collection in one pass.
-                  final missingOld = <String>[];
-                  for (final u in updates) {
-                    await yieldController.maybeYield();
-                    // Classification
-                    if (!hasLegacyPhysicalSplit) {
-                      updateRecords.add(u.data);
+                      if (be.operation == BufferOperationType.insert ||
+                          be.operation == BufferOperationType.rewrite) {
+                        legacyInsertRecords.add(legacyData);
+                      } else if (be.operation == BufferOperationType.update) {
+                        legacyUpdateRecords.add(legacyData);
+                      } else if (be.operation == BufferOperationType.delete) {
+                        legacyDeleteRecords.add(legacyData);
+                      }
                     } else {
-                      classifyForPhysicalWrite(
-                        u,
-                        updateRecords,
-                        legacyUpdateRecords,
-                      );
-                    }
-                    // Old values collection for index maintenance
-                    if (u.oldValues == null) {
-                      final pk = u.data[pkName]?.toString();
-                      if (pk != null && pk.isNotEmpty) missingOld.add(pk);
+                      if (be.operation == BufferOperationType.insert ||
+                          be.operation == BufferOperationType.rewrite) {
+                        insertRecords.add(data);
+                      } else if (be.operation == BufferOperationType.update) {
+                        updateRecords.add(data);
+                      } else if (be.operation == BufferOperationType.delete) {
+                        deleteRecords.add(data);
+                      }
                     }
                   }
+
+                  // 4) Identify missing old values for index updates
+                  final missingOld = <String>[];
+                  for (final be in unifiedPkMap.values) {
+                    if (be.operation == BufferOperationType.update &&
+                        be.oldValues == null) {
+                      final pk = be.data[pkName]?.toString();
+                      if (pk != null && pk.isNotEmpty) {
+                        missingOld.add(pk);
+                      }
+                    }
+                  }
+
                   final oldByPk = <String, Map<String, dynamic>>{};
                   if (missingOld.isNotEmpty) {
                     try {
@@ -859,15 +882,15 @@ class ParallelJournalManager {
                         if (pk == null || pk.isEmpty) continue;
 
                         var normalizedRecord = r;
-                        // IMPORTANT: If we are in migration, the queried record might be in LEGACY format.
-                        // We must normalize it to the NEW schema so IndexManager can correctly
-                        // calculate which index entries to remove (especially if fields were renamed).
                         if (migrationManager != null &&
                             migrationManager
                                 .hasRuntimeMigrationForTable(table)) {
+                          final cpBytes = cpCursor != null
+                              ? Uint8List.fromList(base64Decode(cpCursor))
+                              : null;
                           if (migrationManager
                               .shouldPreferLegacyDecodeForRecord(table, r,
-                                  batchCheckpoint: targetCheckpoints[table])) {
+                                  batchCheckpoint: cpBytes)) {
                             normalizedRecord = migrationManager
                                 .normalizeRecordForReadSync(table, r);
                           }
@@ -877,35 +900,68 @@ class ParallelJournalManager {
                     } catch (_) {}
                   }
 
-                  // Prepare Index Updates (CPU bound mostly, but writes are IO)
+                  // 5) Build coalesced index update buckets (global vs specific)
                   final idxInserts = <Map<String, dynamic>>[];
-                  idxInserts.addAll(logicalInsertRecords);
                   final idxUpdates = <IndexRecordUpdate>[];
-                  for (final u in updates) {
-                    await yieldController.maybeYield();
-                    final pk = u.data[pkName]?.toString();
+                  final idxDeletes = <Map<String, dynamic>>[];
+                  final Map<String, List<BackgroundWriteEntry>> bgIndexTasks =
+                      {};
+
+                  // Normal business writes
+                  for (final be in inserts) {
+                    idxInserts.add(be.data);
+                  }
+                  for (final be in deletes) {
+                    idxDeletes.add(be.data);
+                  }
+                  for (final be in updates) {
+                    final pk = be.data[pkName]?.toString();
                     if (pk == null || pk.isEmpty) continue;
-                    final oldVals = u.oldValues ?? oldByPk[pk];
+                    final oldVals = be.oldValues ?? oldByPk[pk];
                     if (oldVals == null) {
-                      // Cannot safely remove old index entries; treat as insert-only.
-                      idxInserts.add(u.data);
-                      continue;
+                      idxInserts.add(be.data);
+                    } else {
+                      idxUpdates.add(IndexRecordUpdate(
+                        primaryKey: pk,
+                        newValues: Map<String, dynamic>.from(be.data),
+                        oldValues: Map<String, dynamic>.from(oldVals),
+                      ));
                     }
-                    idxUpdates.add(IndexRecordUpdate(
-                      primaryKey: pk,
-                      newValues: Map<String, dynamic>.from(u.data),
-                      oldValues: Map<String, dynamic>.from(oldVals),
-                    ));
                   }
 
-                  // Execute Table Write and Index Write in Parallel
-                  // Compute per-table token budgets (data vs indexes) from planned batch plan.
-                  // IMPORTANT: budgets are request caps; actual concurrency is still bounded by scheduler grants.
-                  //
-                  // allIndexes includes vector indexes — used to decide whether to call writeChanges.
-                  // btreeIndexes excludes vector indexes — used for B+Tree budget calculation.
-                  // IndexManager.writeChanges internally intercepts vector-type and dispatches
-                  // to VectorIndexManager, so a single entry point handles both.
+                  // Background writes (merged into global if specIdxs is empty)
+                  for (final bgEntry in activeBgEntries) {
+                    final mode = bgEntry.mode;
+                    if (mode == BackgroundWriteMode.indexOnly ||
+                        mode == BackgroundWriteMode.tableAndIndex) {
+                      final specIdxs = bgEntry.specificIndexes;
+                      if (specIdxs == null || specIdxs.isEmpty) {
+                        final be = bgEntry.entry;
+                        if (be.operation == BufferOperationType.insert ||
+                            be.operation == BufferOperationType.rewrite) {
+                          idxInserts.add(be.data);
+                        } else if (be.operation == BufferOperationType.update) {
+                          final pk = bgEntry.primaryKey;
+                          final oldVals = be.oldValues ?? oldByPk[pk];
+                          if (oldVals == null) {
+                            idxInserts.add(be.data);
+                          } else {
+                            idxUpdates.add(IndexRecordUpdate(
+                              primaryKey: pk,
+                              newValues: Map<String, dynamic>.from(be.data),
+                              oldValues: Map<String, dynamic>.from(oldVals),
+                            ));
+                          }
+                        } else if (be.operation == BufferOperationType.delete) {
+                          idxDeletes.add(be.data);
+                        }
+                      } else {
+                        final key = specIdxs.join(',');
+                        bgIndexTasks.putIfAbsent(key, () => []).add(bgEntry);
+                      }
+                    }
+                  }
+
                   final allIndexes = <IndexSchema>[
                     ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
                     ...?_dataStore.indexManager
@@ -919,7 +975,7 @@ class ParallelJournalManager {
                     indexCount: btreeIndexCount,
                   );
 
-                  // 1) Table Data
+                  // 6) Execution actions
                   Future<void> writeTableData() async {
                     if (legacyInsertRecords.isNotEmpty ||
                         legacyUpdateRecords.isNotEmpty ||
@@ -951,28 +1007,83 @@ class ParallelJournalManager {
                     }
                   }
 
-                  final tableWriteFuture = writeTableData();
-
-                  // 2) All indexes (B+Tree + Vector) via single IndexManager entry point.
                   Future<void> indexWrite() async {
-                    if (allIndexes.isEmpty) return;
-                    await (_dataStore.indexManager?.writeChanges(
-                          tableName: table,
-                          inserts: idxInserts,
-                          updates: idxUpdates,
-                          deletes: logicalDeleteRecords,
-                          batchContext: currentBatchContext,
-                          concurrency: split.indexTokens,
-                        ) ??
-                        Future.value());
+                    if (allIndexes.isNotEmpty &&
+                        (idxInserts.isNotEmpty ||
+                            idxUpdates.isNotEmpty ||
+                            idxDeletes.isNotEmpty)) {
+                      await (_dataStore.indexManager?.writeChanges(
+                            tableName: table,
+                            inserts: idxInserts,
+                            updates: idxUpdates,
+                            deletes: idxDeletes,
+                            batchContext: currentBatchContext,
+                            concurrency: split.indexTokens,
+                          ) ??
+                          Future.value());
+                    }
+
+                    if (bgIndexTasks.isNotEmpty) {
+                      for (final specKey in bgIndexTasks.keys) {
+                        final entries = bgIndexTasks[specKey]!;
+                        final specificIdxs = entries.first.specificIndexes;
+
+                        final specIns = <Map<String, dynamic>>[];
+                        final specUps = <IndexRecordUpdate>[];
+                        final specDels = <Map<String, dynamic>>[];
+
+                        for (final entry in entries) {
+                          final be = entry.entry;
+                          final pk = entry.primaryKey;
+                          if (be.operation == BufferOperationType.insert ||
+                              be.operation == BufferOperationType.rewrite) {
+                            specIns.add(be.data);
+                          } else if (be.operation ==
+                              BufferOperationType.update) {
+                            final oldVals = be.oldValues ?? oldByPk[pk];
+                            if (oldVals == null) {
+                              specIns.add(be.data);
+                            } else {
+                              specUps.add(IndexRecordUpdate(
+                                primaryKey: pk,
+                                newValues: Map<String, dynamic>.from(be.data),
+                                oldValues: Map<String, dynamic>.from(oldVals),
+                              ));
+                            }
+                          } else if (be.operation ==
+                              BufferOperationType.delete) {
+                            specDels.add(be.data);
+                          }
+                        }
+
+                        List<IndexSchema>? targetOverride;
+                        if (specificIdxs != null) {
+                          targetOverride = allIndexes
+                              .where((i) =>
+                                  specificIdxs.contains(i.actualIndexName))
+                              .toList();
+                        }
+
+                        await (_dataStore.indexManager?.writeChanges(
+                              tableName: table,
+                              inserts: specIns,
+                              updates: specUps,
+                              deletes: specDels,
+                              batchContext: currentBatchContext,
+                              concurrency: split.indexTokens,
+                              targetIndexesOverride: targetOverride,
+                            ) ??
+                            Future.value());
+                      }
+                    }
                   }
 
                   if (allIndexes.isEmpty) {
-                    await tableWriteFuture;
+                    await writeTableData();
                   } else if (split.runInParallel) {
-                    await Future.wait([tableWriteFuture, indexWrite()]);
+                    await Future.wait([writeTableData(), indexWrite()]);
                   } else {
-                    await tableWriteFuture;
+                    await writeTableData();
                     await indexWrite();
                   }
 
@@ -985,8 +1096,10 @@ class ParallelJournalManager {
               );
 
               if (journaling && currentBatchContext != null) {
-                final totalCount =
-                    inserts.length + updates.length + deletes.length;
+                final totalCount = inserts.length +
+                    updates.length +
+                    deletes.length +
+                    tableBgEntries.length;
                 if (totalCount > 0) {
                   await appendJournalEntry(TaskDoneEntry(
                     at: DateTime.now().toIso8601String(),
@@ -1005,7 +1118,7 @@ class ParallelJournalManager {
               rethrow;
             }
           });
-        });
+        }
 
         // Execute with controlled parallelism; allocate flush budget and split outer/inner
         if (tasks.isNotEmpty) {
@@ -1041,11 +1154,6 @@ class ParallelJournalManager {
             timeout: timeout,
             continueOnError: false,
           );
-
-          // 13) Handle migration completion callback after all tables in the batch are persisted
-          if (migrationBatches.isNotEmpty && migrationManager != null) {
-            await migrationManager.onMigrationBatchPersisted(migrationBatches);
-          }
 
           // ── Backpressure: measure per-record flush cost ──
           final batchElapsedUs = batchSw.elapsedMicroseconds;
@@ -1098,6 +1206,13 @@ class ParallelJournalManager {
           try {
             await _flushRecoveryArtifactsIfNeeded();
           } catch (_) {}
+
+          // Handle migration completion callback after all tables in the batch are persisted
+          if (bgEntries.isNotEmpty && _dataStore.migrationManager != null) {
+            await _dataStore.migrationManager
+                ?.onBackgroundWritePersisted(flushCheckpointMap);
+          }
+
           _activeBatchContext = null;
 
           // If this was a recovery flush, check if we can clear the recovering flag
@@ -1118,6 +1233,11 @@ class ParallelJournalManager {
           }
         } else {
           await _dataStore.storage.flushAll();
+          // Handle migration completion callback after all tables in the batch are persisted
+          if (bgEntries.isNotEmpty && _dataStore.migrationManager != null) {
+            await _dataStore.migrationManager
+                ?.onBackgroundWritePersisted(flushCheckpointMap);
+          }
         }
         await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
       } catch (e, s) {
@@ -2788,6 +2908,19 @@ class ParallelJournalManager {
     } catch (_) {
       // ignore
     }
+  }
+
+  static dynamic _decodePrimaryKeyFromCursor(String? cursor) {
+    if (cursor == null || cursor.isEmpty) return null;
+    try {
+      final decoded =
+          utf8.decode(base64Url.decode(base64Url.normalize(cursor)));
+      final obj = jsonDecode(decoded);
+      if (obj is Map) {
+        return obj['pk'];
+      }
+    } catch (_) {}
+    return null;
   }
 }
 

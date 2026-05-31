@@ -26,12 +26,10 @@ import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
-import '../model/index_entry.dart';
 import '../model/log_config.dart';
 import '../model/memory_info.dart';
 import '../model/migration_task.dart';
 import '../model/ngh_index_meta.dart';
-import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/result_type.dart';
 import '../model/space_config.dart';
@@ -48,6 +46,7 @@ import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
 import '../upgrades/old_structure_migration_handler.dart';
 import '../upgrades/version_upgrade_manager.dart';
+import 'background_write_scheduler.dart';
 import 'backup_manager.dart';
 import 'cache_manager.dart';
 import 'compaction_manager.dart';
@@ -67,6 +66,7 @@ import 'index_manager.dart';
 import 'index_tree_partition_manager.dart';
 import 'integrity_checker.dart';
 import 'key_manager.dart';
+import 'large_operation_runner.dart';
 import 'lock_manager.dart';
 import 'migration_manager.dart';
 import 'notification_manager.dart';
@@ -92,14 +92,6 @@ import 'yield_controller.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
-  // Concurrency control for heavy delete operations
-  static int _heavyDeleteOperationsInProgress = 0;
-  static final _heavyDeleteQueue = Queue<Completer<void>>();
-
-  // Concurrency control for heavy update operations
-  static int _heavyUpdateOperationsInProgress = 0;
-  static final _heavyUpdateQueue = Queue<Completer<void>>();
-
   static final Map<String, DataStoreImpl> _instances = {};
 
   static const String _kvKeyField = SystemTable.keyValueKeyField;
@@ -192,9 +184,6 @@ class DataStoreImpl {
     return _pathManager!;
   }
 
-  int get _maxConcurrentPartitionMaintenances =>
-      config.maxConcurrentPartitionMaintenances;
-
   /// Engine-managed directory sharding parameter (persisted in `global_config.json`).
   ///
   /// Used for deterministic sharding: `dirIndex = pIndex ~/ maxEntriesPerDir`.
@@ -219,6 +208,7 @@ class DataStoreImpl {
   late WalManager walManager;
   late WriteBufferManager writeBufferManager;
   late ParallelJournalManager parallelJournalManager;
+  late BackgroundWriteScheduler backgroundWriteScheduler;
   TableTreePartitionManager? tableTreePartitionManager;
   IndexTreePartitionManager? indexTreePartitionManager;
 
@@ -838,6 +828,7 @@ class DataStoreImpl {
       // Initialize WAL and parallel journal pipeline
       walManager = WalManager(this);
       writeBufferManager = WriteBufferManager(this);
+      backgroundWriteScheduler = BackgroundWriteScheduler();
       parallelJournalManager =
           ParallelJournalManager(this, walManager, writeBufferManager);
       migrationManager = MigrationManager(this);
@@ -887,8 +878,7 @@ class DataStoreImpl {
             await walManager.initializeAndRecover();
             await parallelJournalManager.start();
 
-            await _resumePendingLargeDeletes();
-            await _resumePendingLargeUpdates();
+            await LargeOperationRunner.runPendingOperations(this);
 
             // Recover unfinished transactions (commit plans or rollbacks)
             await transactionManager!.recoverUnfinishedTransactionsOnStartup();
@@ -900,6 +890,9 @@ class DataStoreImpl {
 
             // Initialize migration manager, restore unfinished migration tasks
             await migrationManager?.initialize();
+
+            // Key migration runs after schema tasks are recovered (schema before key).
+            await _keyManager!.startDeferredKeyMigrationWork();
 
             await _startSetupAndUpgrade();
           }
@@ -966,9 +959,12 @@ class DataStoreImpl {
     try {
       await _onConfigure?.call(this);
 
-      // Check if global configuration has migration tasks
-      final globalConfig = await getGlobalConfig();
-      if (globalConfig?.hasMigrationTask == true) {
+      // Skip automatic schema diff/migrate while schema or key migration is pending.
+      // Recovery runs earlier: schema via MigrationManager.initialize(),
+      // key via KeyManager.startDeferredKeyMigrationWork().
+      final migrationMgr = migrationManager;
+      if (migrationMgr != null &&
+          await migrationMgr.hasAnyPendingMigrationWork()) {
         return;
       }
 
@@ -1038,26 +1034,17 @@ class DataStoreImpl {
       }
       // Need upgrade - perform table structure migration
       else if (systemSchemaChanged || userSchemaChanged) {
-        // When only system schema changed, use systemOnly: true so migrate() only manages
-        // on-disk tables that are known system tables (SystemTable.isKnownSystemTable).
-        // User tables are never touched even when userSchemas is empty (e.g. server-side
-        // open() without schemas and runtime createTables()).
-        final systemOnly = systemSchemaChanged && !userSchemaChanged;
-
-        // Perform automatic table structure migration
-        final migrationSchemas = getInitialSchemas(systemOnly: systemOnly);
-
         await migrationManager?.migrate(
-          migrationSchemas,
+          userSchemas: userSchemas,
+          systemSchemas: systemSchemas,
           batchSize: config.migrationConfig?.batchSize ?? 1000,
-          systemOnly: systemOnly,
         );
 
         if (systemSchemaChanged) {
           await schemaManager?.updateSystemSchemaHash(systemSchemas);
         }
 
-        if (userSchemaChanged && userSchemas.isNotEmpty) {
+        if (userSchemaChanged) {
           await schemaManager?.updateUserSchemaHash(userSchemas);
         }
       }
@@ -1127,9 +1114,13 @@ class DataStoreImpl {
           } catch (_) {}
         }
 
-        if (migrationManager != null) {
-          await migrationManager!.stopAllMigrations();
-        }
+        await _keyManager?.pauseKeyMigration();
+        await migrationManager?.stopAllMigrations();
+
+        await LargeOperationRunner.pauseForShutdown(this);
+
+        // Clear all background write scheduler entries to prevent flush blocking
+        backgroundWriteScheduler.clearAll();
 
         // Flush and stop write pipelines
         try {
@@ -1578,6 +1569,15 @@ class DataStoreImpl {
       final planIns = planUniqueForInsert(tableName, schema, validData);
 
       final recordId = validData[schema.primaryKey].toString();
+
+      // Check and record conflicts for running large background operations
+      if (!tableName.startsWith('_system_temp_op_conflict_')) {
+        await _checkAndRecordConflictsForBatch(
+          tableName,
+          [validData],
+          action: 'insert',
+        );
+      }
 
       // 3. Reservation based: try reserve unique keys first to lock the buffer
       try {
@@ -2104,7 +2104,7 @@ class DataStoreImpl {
     return records;
   }
 
-  Future<List<UniformUpdatePreparedRecord>> _prepareUniformUpdateRecords(
+  Future<List<UniformUpdatePreparedRecord>> prepareUniformUpdateRecords(
     TableSchema schema,
     String tableName,
     Map<String, dynamic> validData,
@@ -2344,6 +2344,7 @@ class DataStoreImpl {
     String? checkpointCursor,
   }) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
+    List<String>? partialUniqueFailedKeys;
     await ensureInitialized();
 
     // Emergency Resource Check
@@ -2390,6 +2391,74 @@ class DataStoreImpl {
         ));
       }
 
+      // Unique Key and Primary Key Detection
+      final String? txIdCheck = Zone.current[_txnZoneKey] as String?;
+      if (txIdCheck == null || TransactionContext.isApplyingCommit()) {
+        final uniqueIndexes =
+            schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+        final uniqueFields = <String>{schema.primaryKey};
+        for (final idx in uniqueIndexes) {
+          uniqueFields.addAll(idx.fields);
+        }
+
+        final modifiesUniqueField =
+            data.keys.any((k) => uniqueFields.contains(k));
+        if (modifiesUniqueField) {
+          bool isUniqueEquality = false;
+          final conditionMap = condition.build();
+
+          // Check if it's a primary key equality query (e.g., id = 1)
+          if (conditionMap.length == 1 &&
+              conditionMap.containsKey(schema.primaryKey)) {
+            final pkVal = conditionMap[schema.primaryKey];
+            if (pkVal is! Map || pkVal.containsKey('=')) {
+              isUniqueEquality = true;
+            }
+          }
+
+          // Or a unique index field equality query
+          if (!isUniqueEquality) {
+            for (final idx in uniqueIndexes) {
+              if (idx.fields.length == conditionMap.length &&
+                  idx.fields.every((f) => conditionMap.containsKey(f))) {
+                bool allEquals = true;
+                for (final f in idx.fields) {
+                  final val = conditionMap[f];
+                  if (val is Map && !val.containsKey('=')) {
+                    allEquals = false;
+                    break;
+                  }
+                }
+                if (allEquals) {
+                  isUniqueEquality = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (!isUniqueEquality) {
+            final evalResult = await queryExecutor.execute(
+              tableName,
+              condition: condition,
+              limit: 2,
+            );
+            if (evalResult.records.length > 1) {
+              if (!continueOnPartialErrors) {
+                throw BusinessError(
+                  'Batch update would modify multiple records but unique key or primary key would be duplicated.',
+                  type: BusinessErrorType.uniqueError,
+                );
+              } else {
+                limit = 1;
+                final secondPk =
+                    evalResult.records[1][schema.primaryKey]?.toString() ?? '';
+                partialUniqueFailedKeys = [secondPk];
+              }
+            }
+          }
+        }
+      }
       // Get table file metadata to make an informed decision on the update strategy
       final tableMeta = await tableDataManager.getTableMeta(tableName);
 
@@ -2492,422 +2561,41 @@ class DataStoreImpl {
             message: 'Deferred heavy update recorded in transaction',
           ));
         }
+
         // Heavy update execution path (not in transaction or during commit).
-        // Page-batch streaming keeps large partition files bounded in memory.
-        // Concurrency check for heavy operations (global throttling of partition maintenance).
-        if (_heavyUpdateOperationsInProgress >=
-            _maxConcurrentPartitionMaintenances) {
-          final completer = Completer<void>();
-          _heavyUpdateQueue.add(completer);
-          Logger.info(
-              'Heavy update operation for table $tableName queued due to concurrency limit.',
-              label: 'DataStore-update');
-          await completer.future;
-        }
-        _heavyUpdateOperationsInProgress++;
-        String largeUpdateOpId = '';
-        bool createdNewOp = false;
-        try {
-          Logger.info(
-              'Table $tableName has a large number of records and a complex update condition. A multi-batch update process will be used. Please wait.',
-              label: 'DataStore-update');
+        // Instead of running queryEachBatch synchronously, we register it as a WAL large update operation
+        // and delegate actual processing to the background LargeOperationRunner.
+        final largeUpdateOpId =
+            checkpointOpId ?? GlobalIdGenerator.generate('large_update_');
 
-          // create counters
-          int totalProcessed = 0;
-          int totalUpdated = checkpointUpdatedSoFar ?? 0;
-          // Collect updated record keys
-          final List<String> updatedKeys = [];
-          const maxUpdatedKeysToReturn = 100000;
-
-          // Determine opId and start partition via checkpoint or create new
-          final bool hasCheckpointOp =
-              (checkpointOpId != null && checkpointOpId.isNotEmpty);
-          largeUpdateOpId = hasCheckpointOp
-              ? checkpointOpId
-              : GlobalIdGenerator.generate('large_update_');
-
-          try {
-            // Only create a new WAL large update entry when not resuming an existing op
-            if (!hasCheckpointOp) {
-              await walManager.beginLargeUpdate(
-                opId: largeUpdateOpId,
-                table: tableName,
-                condition: conditionMap,
-                updateData: validData,
-                orderBy: orderBy,
-                limit: limit,
-                offset: offset,
-              );
-              createdNewOp = true;
-            }
-          } catch (_) {}
-
-          final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
-          final insertedPrimaryKeysThisUpdate = <String>{};
-          final Set<String> indexedFieldNames = <String>{primaryKey}..addAll(
-              <IndexSchema>[
-                ...?schemaManager?.getAllIndexesFor(schema),
-                ...?indexManager?.getEngineManagedBtreeIndexes(
-                  tableName,
-                  schema,
-                ),
-              ].expand((i) => i.fields),
-            );
-
-          Future<void> flushIndexUpdateBatch(
-            List<Map<String, dynamic>> originalRecords,
-            List<Map<String, dynamic>> updates,
-            List<Map<String, dynamic>> deletes,
-            List<Map<String, dynamic>> inserts,
-            BatchContext? batchContext,
-          ) async {
-            if (_indexManager == null ||
-                (updates.isEmpty && deletes.isEmpty && inserts.isEmpty)) {
-              return;
-            }
-            final indexUpdates = <IndexRecordUpdate>[];
-            final oldByPk = <String, Map<String, dynamic>>{};
-            for (final oldRec in originalRecords) {
-              final oldPk = oldRec[primaryKey]?.toString();
-              if (oldPk == null || oldPk.isEmpty) continue;
-              oldByPk[oldPk] = oldRec;
-            }
-
-            final yieldController =
-                YieldController('DataStoreImpl._updateInternal.flushIndex');
-            for (final newRec in updates) {
-              await yieldController.maybeYield();
-              final pk = newRec[primaryKey]?.toString();
-              if (pk == null || pk.isEmpty) continue;
-              final oldRec = oldByPk[pk];
-              if (oldRec == null) continue;
-
-              final changed = <String>{};
-              final oldVals = <String, dynamic>{};
-              for (final field in indexedFieldNames) {
-                final oldVal = oldRec[field];
-                final newVal = newRec[field];
-                if (oldVal != newVal) {
-                  changed.add(field);
-                  oldVals[field] = oldVal;
-                }
-              }
-
-              if (changed.isEmpty) continue;
-
-              indexUpdates.add(IndexRecordUpdate(
-                primaryKey: pk,
-                newValues: Map<String, dynamic>.from(newRec),
-                oldValues:
-                    oldVals.isEmpty ? null : Map<String, dynamic>.from(oldVals),
-                changedFields: changed,
-              ));
-            }
-
-            if (inserts.isEmpty && indexUpdates.isEmpty && deletes.isEmpty) {
-              return;
-            }
-            await _indexManager?.writeChanges(
-              tableName: tableName,
-              inserts: inserts,
-              updates: indexUpdates,
-              deletes: deletes,
-              batchContext: batchContext,
-            );
-          }
-
-          // Identify unique fields that need validation during heavy update
-          final Set<String> uniqueFieldsToCheck = <String>{};
-          if (_indexManager != null) {
-            final allIndexes =
-                schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-            for (final index in allIndexes) {
-              if (index.fields.any((f) => validData.containsKey(f))) {
-                uniqueFieldsToCheck.addAll(index.fields);
-              }
-            }
-          }
-
-          await queryExecutor.queryEachBatch(
-            tableName,
-            batchSize: 1000,
-            checkpointCursor: checkpointCursor,
+        if (checkpointOpId == null) {
+          await walManager.beginLargeUpdate(
+            opId: largeUpdateOpId,
+            table: tableName,
+            spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
+            condition: conditionMap,
+            updateData: validData,
             orderBy: orderBy,
-            condition: condition,
-            onBatch: (records, nextCursor) async {
-              await tableDataManager.withTableWriteLock(
-                tableName,
-                (tableLock) async {
-                  final originalCount = records.length;
-                  final remainingMatchBudget =
-                      limit == null ? null : max(0, limit - totalUpdated);
-                  if (limit != null && remainingMatchBudget == 0) {
-                    return;
-                  }
-
-                  final matchResult =
-                      await ConditionBatchMatcher.matchRecordIndices(
-                    schema: schema,
-                    tableName: tableName,
-                    condition: conditionMap,
-                    records: records,
-                    estimateRecordBytes:
-                        tableDataManager.estimateRecordSizeBytes,
-                    maxMatchCount: remainingMatchBudget,
-                  );
-
-                  final matchedRecords = <Map<String, dynamic>>[];
-                  final matchedYieldController =
-                      YieldController('DataStoreImpl._updateInternal.matched');
-                  for (final matchedIndex in matchResult.matchedIndices) {
-                    await matchedYieldController.maybeYield();
-                    final candidate = records[matchedIndex];
-                    final candidatePk = candidate[primaryKey]?.toString();
-                    if (candidatePk != null &&
-                        insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
-                      continue;
-                    }
-                    if (limit != null && totalUpdated >= limit) {
-                      continue;
-                    }
-
-                    totalUpdated++;
-                    matchedRecords.add(candidate);
-                  }
-
-                  final inserts = <Map<String, dynamic>>[];
-                  final updates = <Map<String, dynamic>>[];
-                  final deletes = <Map<String, dynamic>>[];
-                  final cacheKeysToRemove = <String>{};
-
-                  if (matchedRecords.isNotEmpty) {
-                    final preparedMatchedRecords =
-                        await _prepareUniformUpdateRecords(
-                      schema,
-                      tableName,
-                      validData,
-                      matchedRecords,
-                    );
-                    final applyYieldController = YieldController(
-                        'DataStoreImpl._updateInternal.process');
-
-                    for (int matchedIndex = 0;
-                        matchedIndex < matchedRecords.length;
-                        matchedIndex++) {
-                      final record = matchedRecords[matchedIndex];
-                      final updatedRecord =
-                          preparedMatchedRecords[matchedIndex].updatedRecord;
-
-                      // Verify unique constraints for heavy update (bypass buffer/reservation)
-                      if (uniqueFieldsToCheck.isNotEmpty &&
-                          _indexManager != null) {
-                        try {
-                          final uniqueCheckData = <String, dynamic>{
-                            primaryKey: updatedRecord[primaryKey],
-                          };
-                          for (final f in uniqueFieldsToCheck) {
-                            uniqueCheckData[f] = updatedRecord[f];
-                          }
-
-                          final violation =
-                              await _indexManager!.checkUniqueConstraints(
-                            tableName,
-                            uniqueCheckData,
-                            isUpdate: true,
-                          );
-
-                          if (violation != null) {
-                            Logger.warn(
-                                '[Unique Constraint Violation] Skipping record during heavy update - ${violation.message}',
-                                label: 'DataStore.updateInternal');
-                            continue;
-                          }
-                        } catch (e) {
-                          Logger.error(
-                              'Unique constraint check failed during heavy update: $e',
-                              label: 'DataStore.updateInternal');
-                          continue;
-                        }
-                      }
-
-                      // Validate foreign key constraints if needed
-                      if (_foreignKeyManager != null) {
-                        try {
-                          await _foreignKeyManager!
-                              .validateForeignKeyConstraints(
-                            tableName: tableName,
-                            data: updatedRecord,
-                            operation: ForeignKeyOperation.update,
-                          );
-                        } catch (e) {
-                          Logger.error(
-                              'Foreign key constraint validation failed during heavy update: $e',
-                              label: 'DataStore.updateInternal');
-                          continue;
-                        }
-
-                        if (isPrimaryKeyUpdate) {
-                          final oldPkValue = record[primaryKey];
-                          final newPkValue = updatedRecord[primaryKey];
-                          if (oldPkValue != null &&
-                              newPkValue != null &&
-                              oldPkValue != newPkValue) {
-                            try {
-                              await _foreignKeyManager!
-                                  .checkRestrictConstraintsForUpdate(
-                                tableName: tableName,
-                                oldPkValues: oldPkValue,
-                              );
-                            } catch (e) {
-                              Logger.error(
-                                  'RESTRICT constraint check failed during heavy update: $e',
-                                  label: 'DataStore.updateInternal');
-                              continue;
-                            }
-
-                            try {
-                              await _foreignKeyManager!.handleCascadeUpdate(
-                                tableName: tableName,
-                                oldPkValues: oldPkValue,
-                                newPkValues: newPkValue,
-                                visitedTables: null,
-                                skipRestrictCheck: true,
-                              );
-                            } catch (e) {
-                              Logger.error(
-                                  'Cascade update failed during heavy update: $e',
-                                  label: 'DataStore.updateInternal');
-                              continue;
-                            }
-                          }
-                        }
-                      }
-
-                      final pkValue = record[primaryKey];
-                      if (pkValue != null) {
-                        final pkValueStr = pkValue.toString();
-                        if (updatedKeys.length < maxUpdatedKeysToReturn) {
-                          updatedKeys.add(pkValueStr);
-                        }
-
-                        tableDataManager.removeRecordFromBuffer(
-                            tableName, pkValueStr);
-                        cacheKeysToRemove.add(pkValueStr);
-                      }
-                      final newPkValue = updatedRecord[primaryKey];
-                      if (newPkValue != null && newPkValue != pkValue) {
-                        final newPkValueStr = newPkValue.toString();
-                        insertedPrimaryKeysThisUpdate.add(newPkValueStr);
-                        tableDataManager.removeRecordFromBuffer(
-                          tableName,
-                          newPkValueStr,
-                        );
-                        cacheKeysToRemove.add(newPkValueStr);
-                        deletes.add(record);
-                        inserts.add(updatedRecord);
-                      } else {
-                        updates.add(updatedRecord);
-                      }
-
-                      if (notificationManager.hasListeners(tableName)) {
-                        notificationManager.notify(ChangeEvent(
-                          type: ChangeType.update,
-                          tableName: tableName,
-                          record: updatedRecord,
-                          oldRecord: record,
-                        ));
-                      }
-
-                      await applyYieldController.maybeYield();
-                    }
-                  }
-
-                  totalProcessed += originalCount;
-
-                  if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) {
-                    return;
-                  }
-
-                  BatchContext? batchContext;
-                  if (config.enableJournal) {
-                    batchContext = await parallelJournalManager
-                        .beginMaintenanceBatch(table: tableName);
-                  }
-
-                  await tableDataManager.writeChanges(
-                    tableName: tableName,
-                    inserts: inserts,
-                    updates: updates,
-                    deletes: deletes,
-                    batchContext: batchContext,
-                    tableLock: tableLock,
-                    recordCountInsertDelta: inserts.length,
-                    recordCountDeleteDelta: deletes.length,
-                  );
-
-                  await tableDataManager.removeTableRecords(
-                    tableName,
-                    cacheKeysToRemove.toList(growable: false),
-                  );
-                  await flushIndexUpdateBatch(
-                    records,
-                    updates,
-                    deletes,
-                    inserts,
-                    batchContext,
-                  );
-
-                  if (config.enableJournal && batchContext != null) {
-                    await parallelJournalManager.completeMaintenanceBatch(
-                      batchContext: batchContext,
-                    );
-                    await tableDataManager.persistRuntimeMetaIfNeeded();
-                  }
-                },
-                operationPrefix: 'direct_page_batches_',
-              );
-
-              try {
-                await walManager.updateLargeUpdateCheckpoint(
-                  opId: largeUpdateOpId,
-                  updatedSoFar: totalUpdated,
-                  checkpointCursor: nextCursor,
-                );
-              } catch (_) {}
-
-              if (limit != null && totalUpdated >= limit) {
-                return false;
-              }
-              return true;
-            },
+            limit: limit,
+            offset: offset,
           );
-
-          // Complete large update tracking in WAL meta
-          try {
-            await walManager.completeLargeUpdate(largeUpdateOpId);
-          } catch (_) {}
-
-          return finish(DbResult.success(
-            successKeys: updatedKeys,
-            message:
-                'Successfully updated $totalUpdated records (processed $totalProcessed)',
-          ));
-        } catch (updateError) {
-          // If heavy update fails and we created a new op, cancel it to avoid orphaned checkpoints
-          if (createdNewOp) {
-            try {
-              await walManager.cancelLargeUpdate(largeUpdateOpId);
-            } catch (_) {
-              // Best effort cleanup, ignore errors
-            }
-          }
-          rethrow;
-        } finally {
-          _heavyUpdateOperationsInProgress--;
-          if (_heavyUpdateQueue.isNotEmpty) {
-            _heavyUpdateQueue.removeFirst().complete();
-          }
         }
+
+        // Ensure system temporary table exists for conflict tracking
+        final tempConflictTableName =
+            '_system_temp_op_conflict_$largeUpdateOpId';
+        if (!await tableExists(tempConflictTableName)) {
+          await _createSystemTempOpConflictTable(
+              largeUpdateOpId, schema.isGlobal);
+        }
+
+        // Trigger background runner asynchronously
+        unawaited(LargeOperationRunner.runPendingOperations(this));
+
+        return finish(DbResult.success(
+          message:
+              'Large update operation started asynchronously in the background (opId: $largeUpdateOpId).',
+        ));
       } else {
         // Optimizable query path: use regular method
         // find matching records (for optimizable queries)
@@ -3008,12 +2696,24 @@ class DataStoreImpl {
           }
         }
 
-        final preparedRecords = await _prepareUniformUpdateRecords(
+        final preparedRecords = await prepareUniformUpdateRecords(
           schema,
           tableName,
           validData,
           records,
         );
+
+        // Check and record conflicts for running large background operations
+        if (!tableName.startsWith('_system_temp_op_conflict_')) {
+          final newRecords =
+              preparedRecords.map((x) => x.updatedRecord).toList();
+          await _checkAndRecordConflictsForBatch(
+            tableName,
+            newRecords,
+            action: 'update',
+            oldRecords: records,
+          );
+        }
 
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
           await yieldController.maybeYield();
@@ -3245,6 +2945,14 @@ class DataStoreImpl {
                 'Update partially successful, ${successKeys.length} records updated, ${failedKeys.length} records failed',
           ));
         } else {
+          if (partialUniqueFailedKeys != null) {
+            return finish(DbResult.batch(
+              successKeys: successKeys,
+              failedKeys: partialUniqueFailedKeys,
+              message:
+                  'Update partially successful, unique constraint skipped remaining records',
+            ));
+          }
           return finish(DbResult.success(
             successKeys: successKeys,
             message:
@@ -3555,6 +3263,15 @@ class DataStoreImpl {
           ));
         }
 
+        // Check and record conflicts for running large background operations
+        if (!tableName.startsWith('_system_temp_op_conflict_')) {
+          await _checkAndRecordConflictsForBatch(
+            tableName,
+            recordsToDelete,
+            action: 'delete',
+          );
+        }
+
         // Handle foreign key constraints: RESTRICT must be checked immediately, CASCADE can be deferred
         // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately when delete is attempted,
         // not at commit time. Only CASCADE/SET NULL/SET DEFAULT operations can be deferred to commit.
@@ -3690,224 +3407,37 @@ class DataStoreImpl {
             message: 'Deferred heavy delete recorded in transaction',
           ));
         }
-        // Concurrency check for heavy operations (global throttling of partition maintenance).
-        if (_heavyDeleteOperationsInProgress >=
-            _maxConcurrentPartitionMaintenances) {
-          final completer = Completer<void>();
-          _heavyDeleteQueue.add(completer);
-          Logger.info(
-              'Heavy delete operation for table $tableName queued due to concurrency limit.',
-              label: 'DataStore-delete');
-          await completer.future;
-        }
-        _heavyDeleteOperationsInProgress++;
-        try {
-          Logger.info(
-              'Table $tableName has a large number of records and a complex deletion condition. A multi-batch deletion process will be used. Please wait.',
-              label: 'DataStore-delete');
 
-          // create counters
-          int totalProcessed = 0;
-          int deletedCount = checkpointDeletedSoFar ?? 0;
-          // Collect deleted record keys
-          final List<String> deletedKeys = [];
-          const maxDeletedKeysToReturn = 100000;
+        final largeDeleteOpId =
+            checkpointOpId ?? GlobalIdGenerator.generate('large_delete_');
 
-          // Determine opId and start partition via checkpoint or create new
-          final bool hasCheckpointOp =
-              (checkpointOpId != null && checkpointOpId.isNotEmpty);
-          final String largeDeleteOpId = hasCheckpointOp
-              ? checkpointOpId
-              : GlobalIdGenerator.generate('large_delete_');
-
-          try {
-            // Only create a new WAL large delete entry when not resuming an existing op
-            if (!hasCheckpointOp) {
-              await walManager.beginLargeDelete(
-                opId: largeDeleteOpId,
-                table: tableName,
-                condition: conditionMap,
-                orderBy: orderBy,
-                limit: limit,
-                offset: offset,
-              );
-            }
-          } catch (_) {}
-
-          Future<void> flushIndexDeleteBatch(
-            List<Map<String, dynamic>> records,
-            BatchContext? batchContext,
-          ) async {
-            if (_indexManager == null || records.isEmpty) return;
-            await _indexManager!.writeChanges(
-              tableName: tableName,
-              deletes: records,
-              batchContext: batchContext,
-            );
-          }
-
-          await queryExecutor.queryEachBatch(
-            tableName,
-            batchSize: 1000,
-            checkpointCursor: checkpointCursor,
+        if (checkpointOpId == null) {
+          await walManager.beginLargeDelete(
+            opId: largeDeleteOpId,
+            table: tableName,
+            spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
+            condition: conditionMap,
             orderBy: orderBy,
-            condition: condition,
-            onBatch: (records, nextCursor) async {
-              await tableDataManager.withTableWriteLock(
-                tableName,
-                (tableLock) async {
-                  final originalCount = records.length;
-                  final remainingMatchBudget =
-                      limit == null ? null : max(0, limit - deletedCount);
-                  if (limit != null && remainingMatchBudget == 0) {
-                    return;
-                  }
-
-                  final matchResult =
-                      await ConditionBatchMatcher.matchRecordIndices(
-                    schema: schema,
-                    tableName: tableName,
-                    condition: conditionMap,
-                    records: records,
-                    estimateRecordBytes:
-                        tableDataManager.estimateRecordSizeBytes,
-                    maxMatchCount: remainingMatchBudget,
-                  );
-
-                  final deletes = <Map<String, dynamic>>[];
-                  final cacheKeysToRemove = <String>[];
-                  final yieldController =
-                      YieldController('DataStoreImpl._deleteInternal.process');
-                  for (final matchedIndex in matchResult.matchedIndices) {
-                    await yieldController.maybeYield();
-                    final record = records[matchedIndex];
-                    if (limit != null && deletedCount >= limit) {
-                      continue;
-                    }
-
-                    final pkValue = record[primaryKey];
-                    if (pkValue == null) {
-                      continue;
-                    }
-
-                    // Phase 1: Check RESTRICT/NO ACTION constraints immediately
-                    if (_foreignKeyManager != null) {
-                      try {
-                        await _foreignKeyManager!
-                            .checkRestrictConstraintsForDelete(
-                          tableName: tableName,
-                          deletedPkValues: pkValue,
-                        );
-                      } catch (e) {
-                        Logger.error(
-                            'RESTRICT constraint check failed in heavy delete: $e',
-                            label: 'DataStore.deleteInternal');
-                        rethrow;
-                      }
-
-                      // Phase 2: Execute CASCADE operations immediately for this record
-                      try {
-                        await _foreignKeyManager!.handleCascadeDelete(
-                          tableName: tableName,
-                          deletedPkValues: pkValue,
-                          skipRestrictCheck: true,
-                        );
-                      } catch (e) {
-                        Logger.error(
-                            'Cascade delete failed in heavy delete for record: $e',
-                            label: 'DataStore.deleteInternal');
-                        rethrow;
-                      }
-                    }
-
-                    deletedCount++;
-                    deletes.add(record);
-
-                    if (notificationManager.hasListeners(tableName)) {
-                      notificationManager.notify(ChangeEvent(
-                        type: ChangeType.delete,
-                        tableName: tableName,
-                        oldRecord: record,
-                      ));
-                    }
-
-                    final pkValueStr = pkValue.toString();
-                    if (deletedKeys.length < maxDeletedKeysToReturn) {
-                      deletedKeys.add(pkValueStr);
-                    }
-
-                    tableDataManager.removeRecordFromBuffer(
-                        tableName, pkValueStr);
-                    cacheKeysToRemove.add(pkValueStr);
-                  }
-
-                  totalProcessed += originalCount;
-
-                  if (deletes.isEmpty) {
-                    return;
-                  }
-
-                  BatchContext? batchContext;
-                  if (config.enableJournal) {
-                    batchContext = await parallelJournalManager
-                        .beginMaintenanceBatch(table: tableName);
-                  }
-
-                  await tableDataManager.writeChanges(
-                    tableName: tableName,
-                    deletes: deletes,
-                    batchContext: batchContext,
-                    tableLock: tableLock,
-                    recordCountDeleteDelta: deletes.length,
-                  );
-
-                  await tableDataManager.removeTableRecords(
-                    tableName,
-                    cacheKeysToRemove,
-                  );
-                  await flushIndexDeleteBatch(deletes, batchContext);
-
-                  if (config.enableJournal && batchContext != null) {
-                    await parallelJournalManager.completeMaintenanceBatch(
-                      batchContext: batchContext,
-                    );
-                    await tableDataManager.persistRuntimeMetaIfNeeded();
-                  }
-                },
-                operationPrefix: 'direct_page_batches_',
-              );
-
-              try {
-                await walManager.updateLargeDeleteCheckpoint(
-                  opId: largeDeleteOpId,
-                  deletedSoFar: deletedCount,
-                  checkpointCursor: nextCursor,
-                );
-              } catch (_) {}
-
-              if (limit != null && deletedCount >= limit) {
-                return false;
-              }
-              return true;
-            },
+            limit: limit,
+            offset: offset,
           );
-
-          // Complete large delete tracking in WAL meta
-          try {
-            await walManager.completeLargeDelete(largeDeleteOpId);
-          } catch (_) {}
-
-          return finish(DbResult.success(
-            successKeys: deletedKeys,
-            message:
-                'Successfully deleted $deletedCount records (processed $totalProcessed)',
-          ));
-        } finally {
-          _heavyDeleteOperationsInProgress--;
-          if (_heavyDeleteQueue.isNotEmpty) {
-            _heavyDeleteQueue.removeFirst().complete();
-          }
         }
+
+        // Ensure system temporary table exists for conflict tracking
+        final tempConflictTableName =
+            '_system_temp_op_conflict_$largeDeleteOpId';
+        if (!await tableExists(tempConflictTableName)) {
+          await _createSystemTempOpConflictTable(
+              largeDeleteOpId, schema.isGlobal);
+        }
+
+        // Trigger background runner asynchronously
+        unawaited(LargeOperationRunner.runPendingOperations(this));
+
+        return finish(DbResult.success(
+          message:
+              'Large delete operation started asynchronously in the background (opId: $largeDeleteOpId).',
+        ));
       }
     } catch (e) {
       Logger.error('Delete failed: $e', label: 'DataStore-delete');
@@ -3918,65 +3448,6 @@ class DataStoreImpl {
         type: ResultType.dbError,
         message: 'Delete failed: $e',
       );
-    }
-  }
-
-  /// Resume pending large delete operations recorded in WAL by delegating to deleteInternal with checkpoints.
-  Future<void> _resumePendingLargeDeletes() async {
-    try {
-      final pendingLargeDeletes = walManager.meta.largeDeletes.values.toList();
-      for (final m in pendingLargeDeletes) {
-        if (m.status == 'completed') continue;
-        try {
-          await deleteInternal(
-            m.table,
-            QueryCondition.fromMap(m.condition),
-            orderBy: m.orderBy,
-            limit: m.limit,
-            offset: m.offset,
-            allowAll: false,
-            checkpointDeletedSoFar: m.deletedSoFar,
-            checkpointOpId: m.opId,
-            checkpointCursor: m.checkpointCursor,
-          );
-        } catch (e) {
-          Logger.warn('Resume large delete failed for ${m.opId}: $e',
-              label: 'DataStore.resumeLargeDeletes');
-        }
-      }
-    } catch (e) {
-      Logger.error('Resume pending large deletes failed: $e',
-          label: 'DataStore.resumeLargeDeletes');
-    }
-  }
-
-  /// Resume pending large update operations recorded in WAL by delegating to updateInternal with checkpoints.
-  Future<void> _resumePendingLargeUpdates() async {
-    try {
-      final pendingLargeUpdates = walManager.meta.largeUpdates.values.toList();
-      for (final m in pendingLargeUpdates) {
-        if (m.status == 'completed') continue;
-        try {
-          await updateInternal(
-            m.table,
-            m.updateData,
-            QueryCondition.fromMap(m.condition),
-            orderBy: m.orderBy,
-            limit: m.limit,
-            offset: m.offset,
-            allowAll: false,
-            checkpointUpdatedSoFar: m.updatedSoFar,
-            checkpointOpId: m.opId,
-            checkpointCursor: m.checkpointCursor,
-          );
-        } catch (e) {
-          Logger.warn('Resume large update failed for ${m.opId}: $e',
-              label: 'DataStore.resumeLargeUpdates');
-        }
-      }
-    } catch (e) {
-      Logger.error('Resume pending large updates failed: $e',
-          label: 'DataStore.resumeLargeUpdates');
     }
   }
 
@@ -7853,6 +7324,212 @@ class DataStoreImpl {
       }
     }
     return result;
+  }
+
+  /// Creates a system temporary table for operational conflict tracking.
+  Future<void> _createSystemTempOpConflictTable(
+      String opId, bool isGlobal) async {
+    final tempTableName = '_system_temp_op_conflict_$opId';
+    final tempSchema = TableSchema(
+      name: tempTableName,
+      primaryKeyConfig: const PrimaryKeyConfig(
+        name: 'primaryKey',
+        type: PrimaryKeyType.none,
+      ),
+      fields: const [
+        FieldSchema(
+          name: 'skipFlag',
+          type: DataType.integer,
+          nullable: false,
+        ),
+        FieldSchema(
+          name: 'conflictFields',
+          type: DataType.text,
+          nullable: true,
+        ),
+      ],
+      isGlobal: isGlobal,
+    );
+    final createResult = await createTable(tempSchema, isSystemTable: true);
+    if (!createResult.isSuccess) {
+      throw BusinessError(
+        'Failed to create conflict temporary table for operation $opId: ${createResult.message}',
+        type: BusinessErrorType.schemaError,
+      );
+    }
+  }
+
+  /// Performs conflict checks and writes flags to corresponding system conflict tables for multiple records.
+  Future<void> _checkAndRecordConflictsForBatch(
+    String tableName,
+    List<Map<String, dynamic>> records, {
+    required String action, // 'insert', 'update', 'delete'
+    List<Map<String, dynamic>>? oldRecords, // required for 'update'
+  }) async {
+    if (tableName.startsWith('_system_temp_op_conflict_')) return;
+    if (records.isEmpty) return;
+    if (walManager.meta.largeDeletes.isEmpty &&
+        walManager.meta.largeUpdates.isEmpty) {
+      return;
+    }
+
+    final schema = await schemaManager?.getTableSchema(tableName);
+    if (schema == null) return;
+    final primaryKey = schema.primaryKey;
+
+    // Scan running largeDeletes
+    for (final op in walManager.meta.largeDeletes.values) {
+      if (op.status == 'completed') continue;
+      final isSpaceMatch = schema.isGlobal
+          ? op.spaceName == '__global__'
+          : op.spaceName == currentSpaceName;
+      if (!isSpaceMatch) continue;
+      if (op.table != tableName) continue;
+
+      final conflictTable = '_system_temp_op_conflict_${op.opId}';
+
+      if (action == 'insert') {
+        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: records,
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+        for (final idx in matchResult.matchedIndices) {
+          final rec = records[idx];
+          final pk = rec[primaryKey]?.toString();
+          if (pk != null) {
+            await _writeConflictFlag(conflictTable, pk, 1, null);
+          }
+        }
+      } else if (action == 'update') {
+        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: records, // new values
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+        for (final idx in matchResult.matchedIndices) {
+          final rec = records[idx];
+          final pk = rec[primaryKey]?.toString();
+          if (pk != null) {
+            await _writeConflictFlag(conflictTable, pk, 1, null);
+          }
+        }
+      }
+    }
+
+    // Scan running largeUpdates
+    for (final op in walManager.meta.largeUpdates.values) {
+      if (op.status == 'completed') continue;
+      final isSpaceMatch = schema.isGlobal
+          ? op.spaceName == '__global__'
+          : op.spaceName == currentSpaceName;
+      if (!isSpaceMatch) continue;
+      if (op.table != tableName) continue;
+
+      final conflictTable = '_system_temp_op_conflict_${op.opId}';
+
+      if (action == 'insert') {
+        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: records,
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+        for (final idx in matchResult.matchedIndices) {
+          final rec = records[idx];
+          final pk = rec[primaryKey]?.toString();
+          if (pk != null) {
+            await _writeConflictFlag(conflictTable, pk, 1, null);
+          }
+        }
+      } else if (action == 'delete') {
+        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: records,
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+        for (final idx in matchResult.matchedIndices) {
+          final rec = records[idx];
+          final pk = rec[primaryKey]?.toString();
+          if (pk != null) {
+            await _writeConflictFlag(conflictTable, pk, 1, null);
+          }
+        }
+      } else if (action == 'update') {
+        if (oldRecords == null || oldRecords.length != records.length) continue;
+
+        final matchOldResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: oldRecords,
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+
+        final matchedOldIndicesSet = matchOldResult.matchedIndices.toSet();
+
+        for (final idx in matchOldResult.matchedIndices) {
+          final oldRec = oldRecords[idx];
+          final newRec = records[idx];
+          final pk = oldRec[primaryKey]?.toString();
+          if (pk != null) {
+            final overlap = <String>[];
+            for (final key in newRec.keys) {
+              if (newRec[key] != oldRec[key] &&
+                  op.updateData.containsKey(key)) {
+                overlap.add(key);
+              }
+            }
+            // Always record conflict skipFlag = 2 even if overlap is empty, to enable incremental catch-up processing
+            await _writeConflictFlag(conflictTable, pk, 2, overlap.join(','));
+          }
+        }
+
+        final matchNewResult = await ConditionBatchMatcher.matchRecordIndices(
+          schema: schema,
+          tableName: tableName,
+          condition: op.condition,
+          records: records, // new values
+          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+        );
+
+        for (final idx in matchNewResult.matchedIndices) {
+          if (matchedOldIndicesSet.contains(idx)) continue;
+          final rec = records[idx];
+          final pk = rec[primaryKey]?.toString();
+          if (pk != null) {
+            await _writeConflictFlag(conflictTable, pk, 1, null);
+          }
+        }
+      }
+    }
+  }
+
+  /// Writes conflict flag to the conflict system temporary table.
+  Future<void> _writeConflictFlag(
+    String conflictTable,
+    String recordId,
+    int skipFlag,
+    String? conflictFields,
+  ) async {
+    try {
+      final data = {
+        'primaryKey': recordId,
+        'skipFlag': skipFlag,
+        if (conflictFields != null) 'conflictFields': conflictFields,
+      };
+      await upsert(conflictTable, data);
+    } catch (e) {
+      Logger.error('Failed to write conflict flag to $conflictTable: $e',
+          label: 'DataStore.conflictDefense');
+    }
   }
 }
 

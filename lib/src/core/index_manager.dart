@@ -8,6 +8,7 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
+import '../model/background_write_mode.dart';
 import '../model/business_error.dart';
 import '../model/cancellation_token.dart';
 import '../model/data_block_entry.dart';
@@ -16,6 +17,7 @@ import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/index_search.dart';
 import '../model/meta_info.dart';
+import '../model/migration_task.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -26,6 +28,7 @@ import 'compute/index_delta_prepare_compute.dart';
 import 'compute/unique_index_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'data_store_impl.dart';
+import 'key_migration_runner.dart';
 import 'io_concurrency_planner.dart';
 import 'table_data_manager.dart';
 import 'transaction_context.dart';
@@ -978,6 +981,22 @@ class IndexManager {
     );
   }
 
+  /// Checks if a newly created index should start with isBuilding = true.
+  bool _shouldCreateIndexAsBuilding(String tableName, String indexName) {
+    final migrationMgr = _dataStore.migrationManager;
+    if (migrationMgr != null &&
+        migrationMgr.hasPendingIndexBuild(tableName, indexName)) {
+      return true;
+    }
+    if (KeyMigrationRunner.isTableMigrating(tableName)) {
+      return true;
+    }
+    if (migrationMgr != null && migrationMgr.hasRunningKeyMigration()) {
+      return true;
+    }
+    return false;
+  }
+
   /// Get index metadata
   /// First tries to get from cache, if not found, loads from file and caches it
   Future<IndexMeta?> getIndexMeta(String tableName, String indexName) async {
@@ -1036,11 +1055,14 @@ class IndexManager {
                 orElse: () => IndexSchema(indexName: '', fields: const []),
               );
               if (idx.fields.isNotEmpty) {
+                final isBuilding =
+                    _shouldCreateIndexAsBuilding(tableName, indexName);
                 final meta = IndexMeta.createEmpty(
                   name: indexName,
                   tableName: tableName,
                   fields: idx.fields,
                   isUnique: idx.unique,
+                  isBuilding: isBuilding,
                 );
                 _indexMetaCache.put([tableName, indexName], meta);
                 return meta;
@@ -1193,7 +1215,7 @@ class IndexManager {
             'Detected incomplete index build for $tableName.$indexName, deleting stale artifacts before rebuild',
             label: 'IndexManager.createIndex',
           );
-          await _deletePhysicalIndexArtifacts(tableName, indexName);
+          await deletePhysicalIndexArtifacts(tableName, indexName);
         } else {
           Logger.debug('Index already exists: $indexName',
               label: 'IndexManager.createIndex');
@@ -1251,7 +1273,7 @@ class IndexManager {
             label: 'IndexManager.createIndex');
       }
     } catch (e, stack) {
-      await _deletePhysicalIndexArtifacts(tableName, indexName);
+      await deletePhysicalIndexArtifacts(tableName, indexName);
       if (e is IndexBuildCancelledException) {
         Logger.info('$e; partial artifacts removed',
             label: 'IndexManager.createIndex');
@@ -1421,17 +1443,14 @@ class IndexManager {
     _emptyIndexRepairFutures[repairKey] = completer.future;
 
     unawaited(() async {
-      final lockMgr = _dataStore.lockManager;
-      final indexLockKey = 'index:$tableName:$indexName';
-      final indexLockOpId = GlobalIdGenerator.generate('empty_index_index_');
-      bool indexLocked = false;
       try {
-        if (lockMgr != null) {
-          indexLocked =
-              lockMgr.tryAcquireExclusiveLock(indexLockKey, indexLockOpId);
-          if (!indexLocked) {
+        final migrationMgr = _dataStore.migrationManager;
+        if (migrationMgr != null) {
+          final hasActiveTask = migrationMgr.pendingTasks.any((t) =>
+              t.tableName == tableName && t.pendingMigrationSpaces.isNotEmpty);
+          if (hasActiveTask) {
             Logger.debug(
-              'Defer empty-index rebuild for $tableName.$indexName because index is busy',
+              'Skip empty-index repair for $tableName.$indexName because there is an active migration task',
               label: 'IndexManager._scheduleEmptyIndexRepair',
             );
             return;
@@ -1439,20 +1458,52 @@ class IndexManager {
         }
 
         Logger.warn(
-          'Detected empty index $tableName.$indexName while table has $persistedTableRecords persisted records, rebuilding',
+          'Detected empty index $tableName.$indexName while table has $persistedTableRecords persisted records, scheduling async repair',
           label: 'IndexManager._scheduleEmptyIndexRepair',
         );
-        await _deletePhysicalIndexArtifacts(tableName, indexName);
-        await _rebuildTableIndexes(tableName, schema, [index]);
+
+        // Clean physical index files before repair starts
+        await deletePhysicalIndexArtifacts(tableName, indexName);
+
+        // Lock the index building state
+        final existingMeta = await getIndexMeta(tableName, indexName);
+        final indexMeta = (existingMeta != null)
+            ? existingMeta.copyWith(isBuilding: true)
+            : IndexMeta.createEmpty(
+                name: indexName,
+                tableName: tableName,
+                fields: index.fields,
+                isUnique: index.unique,
+                isBuilding: true,
+              );
+        await updateIndexMeta(
+          tableName: tableName,
+          indexName: indexName,
+          updatedMeta: indexMeta,
+        );
+
+        if (migrationMgr != null) {
+          final op = MigrationOperation(
+            type: MigrationType.modifyIndex,
+            index: index,
+            indexName: indexName,
+          );
+          await migrationMgr.addMigrationTask(
+            tableName,
+            [op],
+            isAutoGenerated: true,
+            startProcessing: true,
+            targetSchemaSnapshot: schema,
+            writeMode: BackgroundWriteMode.indexOnly,
+            specificIndexes: [indexName],
+          );
+        }
       } catch (e, stack) {
         Logger.error(
-          'Empty-index rebuild failed for $tableName.$indexName: $e\n$stack',
+          'Empty-index rebuild scheduling failed for $tableName.$indexName: $e\n$stack',
           label: 'IndexManager._scheduleEmptyIndexRepair',
         );
       } finally {
-        if (indexLocked) {
-          lockMgr?.releaseExclusiveLock(indexLockKey, indexLockOpId);
-        }
         _emptyIndexRepairFutures.remove(repairKey);
         if (!completer.isCompleted) {
           completer.complete();
@@ -2330,7 +2381,7 @@ class IndexManager {
           'Detected orphaned index metadata for ${index.actualIndexName} in table $tableName, cleaning it up before rebuild',
           label: 'IndexManager.addIndex',
         );
-        await _deletePhysicalIndexArtifacts(tableName, index.actualIndexName);
+        await deletePhysicalIndexArtifacts(tableName, index.actualIndexName);
       }
 
       // If the schema already contains the index and the physical index metadata
@@ -2561,7 +2612,7 @@ class IndexManager {
         }
       }
 
-      await _deletePhysicalIndexArtifacts(tableName, indexName);
+      await deletePhysicalIndexArtifacts(tableName, indexName);
     } catch (e) {
       Logger.error(
         'Failed to delete index artifacts for migration: $e',
@@ -2779,6 +2830,8 @@ class IndexManager {
       for (final indexSchema in indexesToBuild) {
         if (indexSchema.type == IndexType.vector) continue;
         final indexName = indexSchema.actualIndexName;
+        // Clean physical index files before rebuild starts
+        await deletePhysicalIndexArtifacts(tableName, indexName);
         final indexMeta = IndexMeta.createEmpty(
           name: indexName,
           tableName: tableName,
@@ -2794,7 +2847,7 @@ class IndexManager {
         tableName,
         batchSize: 1000,
         cancellationToken: controller,
-        onBatch: (records, nextCursor) async {
+        onBatch: (records, currentCursor, nextCursor) async {
           if (controller?.isCancelled ?? false) {
             throw IndexBuildCancelledException(
               tableName,
@@ -2952,7 +3005,8 @@ class IndexManager {
     }
   }
 
-  Future<void> _deletePhysicalIndexArtifacts(
+  /// Public wrapper to delete physical index files and clear cache.
+  Future<void> deletePhysicalIndexArtifacts(
     String tableName,
     String indexName,
   ) async {
@@ -3096,11 +3150,13 @@ class IndexManager {
         var meta = await getIndexMeta(tableName, indexName);
         // If index metadata doesn't exist, create it in memory only (avoid extra IO)
         if (meta == null) {
+          final isBuilding = _shouldCreateIndexAsBuilding(tableName, indexName);
           meta = IndexMeta.createEmpty(
             name: indexName,
             tableName: tableName,
             fields: idx.fields,
             isUnique: idx.unique,
+            isBuilding: isBuilding,
           );
           // Only cache in memory, don't write to file yet to avoid extra IO
           _indexMetaCache.put([tableName, indexName], meta);
