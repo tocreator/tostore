@@ -7,6 +7,15 @@ import 'package:tostore/tostore.dart';
 
 import 'testing/log_service.dart';
 
+String _statusErrorMessage(
+  Iterable<ResultStatus> statuses, {
+  String fallback = 'Operation failed',
+}) {
+  final errors =
+      statuses.where((s) => s.type != ResultType.success).map((s) => s.message);
+  return errors.isEmpty ? fallback : errors.join('; ');
+}
+
 /// This example demonstrates the core features of ToStore using a user management system
 /// with global settings. It shows how to:
 /// - Create tables (both regular and global)
@@ -803,9 +812,9 @@ class ToStoreExample {
       final result = await db.batchInsert(tableName, records);
       dbStopwatch.stop();
 
-      if (!result.isSuccess) {
+      if (result.hasFailed) {
         logService.add(
-            'Batch insert failed at offset $processedCount: ${result.message}',
+            'Batch insert failed at offset $processedCount: ${_statusErrorMessage(result.statuses)}',
             LogType.error);
         return -1;
       }
@@ -876,7 +885,7 @@ class ToStoreExample {
         records[i],
       );
 
-      if (!result.isSuccess) {
+      if (result.hasFailed) {
         return -1;
       }
       if (i % 200 == 0) {
@@ -1025,7 +1034,7 @@ class ToStoreExample {
       });
     });
 
-    if (txResult1.isSuccess) {
+    if (!txResult1.hasFailed) {
       logService.add('Transaction committed: 2 users inserted', LogType.info);
     }
 
@@ -1040,9 +1049,10 @@ class ToStoreExample {
       throw Exception('Simulated business error');
     }, rollbackOnError: true);
 
-    if (txResult2.isFailed) {
+    if (txResult2.hasFailed) {
       logService.add(
-          'Transaction rolled back: ${txResult2.error?.message}', LogType.info);
+          'Transaction rolled back: ${_statusErrorMessage(txResult2.statuses, fallback: 'Transaction failed')}',
+          LogType.info);
     }
 
     logService.add('Transaction examples completed', LogType.info);
