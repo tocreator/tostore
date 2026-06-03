@@ -251,7 +251,7 @@ class DatabaseTester {
       ]);
       final deleteResult = await db.delete('users').where('id', '>', 0);
       isTestPassed &= _expect(
-          'Delete result should be successful', deleteResult.isSuccess, true);
+          'Delete result should be successful', !deleteResult.hasFailed, true);
       final dataAfterDelete = await db.query('users');
       final countAfterDelete = dataAfterDelete.length;
       isTestPassed &= _expect(
@@ -617,7 +617,9 @@ class DatabaseTester {
 
       isTestPassed &= _expect(
         'Old schema insert users into renamed table should succeed',
-        insertUser1.isSuccess && insertUser2.isSuccess && insertUser3.isSuccess,
+        !insertUser1.hasFailed &&
+            !insertUser2.hasFailed &&
+            !insertUser3.hasFailed,
         true,
       );
       if (!isTestPassed || insertUser1.successKeys.isEmpty) {
@@ -632,7 +634,7 @@ class DatabaseTester {
       });
       isTestPassed &= _expect(
         'Old schema insert into child table should succeed',
-        insertPost.isSuccess,
+        !insertPost.hasFailed,
         true,
       );
       if (!isTestPassed) {
@@ -811,7 +813,7 @@ class DatabaseTester {
       });
       isTestPassed &= _expect(
         'Insert into newly created table after migration should succeed',
-        insertAudit.isSuccess,
+        !insertAudit.hasFailed,
         true,
       );
       if (!isTestPassed) {
@@ -912,7 +914,7 @@ class DatabaseTester {
           LogType.info);
 
       isTestPassed &= _expect(
-          'Batch Insert should be successful', insertResult.isSuccess, true);
+          'Batch Insert should be successful', !insertResult.hasFailed, true);
       isTestPassed &= _expect('Batch Insert should affect $count rows',
           insertResult.successCount, count);
 
@@ -936,7 +938,7 @@ class DatabaseTester {
           LogType.info);
 
       isTestPassed &= _expect(
-          'Batch Update should be successful', updateResult.isSuccess, true);
+          'Batch Update should be successful', !updateResult.hasFailed, true);
       isTestPassed &= _expect('Batch Update should affect $count rows',
           updateResult.successCount, count);
 
@@ -999,7 +1001,7 @@ class DatabaseTester {
         'age': 25,
       });
       isTestPassed &=
-          _expect('First insert should succeed', firstInsert.isSuccess, true);
+          _expect('First insert should succeed', !firstInsert.hasFailed, true);
 
       // Immediate second insert with same username (unique)
       final secondInsert = await db.insert('users', {
@@ -1007,9 +1009,9 @@ class DatabaseTester {
         'email': 'another@test.com',
       });
       isTestPassed &= _expect('Immediate duplicate insert should be blocked',
-          secondInsert.isSuccess, false);
+          !secondInsert.hasFailed, false);
       isTestPassed &= _expect('Duplicate error should be unique violation',
-          secondInsert.type, ResultType.uniqueViolation);
+          secondInsert.firstType, ResultType.uniqueViolation);
 
       // 2. Insert then Partial Update (Merging test)
       const String partialUser = 'partial_test_user';
@@ -1026,7 +1028,7 @@ class DatabaseTester {
       final partialUpdate = await db
           .update('users', {'age': 31}).where('username', '=', partialUser);
       isTestPassed &= _expect('Immediate partial update should succeed',
-          partialUpdate.isSuccess, true);
+          !partialUpdate.hasFailed, true);
 
       // Query immediately (should see merged data from buffer)
       final mergedRecord =
@@ -1046,7 +1048,7 @@ class DatabaseTester {
       final immediateDelete =
           await db.delete('users').where('username', '=', deleteUser);
       isTestPassed &= _expect(
-          'Immediate delete should succeed', immediateDelete.isSuccess, true);
+          'Immediate delete should succeed', !immediateDelete.hasFailed, true);
 
       final deletedRecord =
           await db.query('users').where('username', '=', deleteUser).first();
@@ -1097,7 +1099,7 @@ class DatabaseTester {
         final insertResult = await db.insert('users',
             {'username': 'crud_user', 'email': 'crud@test.com', 'age': 30});
         isTestPassed &= _expect(
-            'Insert should be successful', insertResult.isSuccess, true);
+            'Insert should be successful', !insertResult.hasFailed, true);
         isTestPassed &=
             _expect('Insert should affect 1 row', insertResult.successCount, 1);
 
@@ -1117,7 +1119,7 @@ class DatabaseTester {
         final deleteResult =
             await db.delete('users').where('username', '=', 'crud_user');
         isTestPassed &= _expect(
-            'Delete should be successful', deleteResult.isSuccess, true);
+            'Delete should be successful', !deleteResult.hasFailed, true);
         isTestPassed &=
             _expect('Delete should affect 1 row', deleteResult.successCount, 1);
         final dataAfterDeleteQuery = await db.query('users');
@@ -1162,7 +1164,7 @@ class DatabaseTester {
         'age': insertedAge,
       });
       isTestPassed &=
-          _expect('Insert should be successful', insertResult.isSuccess, true);
+          _expect('Insert should be successful', !insertResult.hasFailed, true);
       isTestPassed &=
           _expect('Insert should affect 1 row', insertResult.successCount, 1);
       if (!isTestPassed || insertResult.successKeys.isEmpty) return false;
@@ -1193,7 +1195,7 @@ class DatabaseTester {
       final updateResult = await db
           .update('users', {'age': updatedAge}).where('id', '=', userId);
       isTestPassed &=
-          _expect('Update should be successful', updateResult.isSuccess, true);
+          _expect('Update should be successful', !updateResult.hasFailed, true);
       isTestPassed &=
           _expect('Update should affect 1 row', updateResult.successCount, 1);
       isTestPassed &= await _expectCachedUserQueryTwice(
@@ -1223,7 +1225,7 @@ class DatabaseTester {
       // Delete: verify repeated cached lookups do not resurrect stale data.
       final deleteResult = await db.delete('users').where('id', '=', userId);
       isTestPassed &=
-          _expect('Delete should be successful', deleteResult.isSuccess, true);
+          _expect('Delete should be successful', !deleteResult.hasFailed, true);
       isTestPassed &=
           _expect('Delete should affect 1 row', deleteResult.successCount, 1);
       isTestPassed &= await _expectCachedUserQueryTwice(
@@ -1459,7 +1461,7 @@ class DatabaseTester {
       // Insert user first to get valid ID for foreign key
       final userResult = await db
           .insert('users', {'username': 'join_user', 'email': 'join@test.com'});
-      if (!userResult.isSuccess) {
+      if (!!userResult.hasFailed) {
         isTestPassed = false;
         _failTest('Failed to insert user for join test');
         return false;
@@ -1664,12 +1666,12 @@ class DatabaseTester {
 
       isTestPassed &= _expect(
           'Insert with null for non-nullable field should fail',
-          result.isSuccess,
+          !result.hasFailed,
           false);
       isTestPassed &= _expect(
           'Error type should be validationFailed or notNullViolation',
-          result.type == ResultType.validationFailed ||
-              result.type == ResultType.notNullViolation,
+          result.firstType == ResultType.validationFailed ||
+              result.firstType == ResultType.notNullViolation,
           true);
 
       final count = (await db.query('users')).length;
@@ -1752,10 +1754,10 @@ class DatabaseTester {
       final u2 = await db.insert('users',
           {'username': 'bk_user_2', 'email': 'bk2@test.com', 'age': 22});
       ok &= _expect(
-          'Insert base users success', u1.isSuccess && u2.isSuccess, true);
+          'Insert base users success', !u1.hasFailed && !u2.hasFailed, true);
       final p1 = await db.insert(
           'posts', {'title': 'bk_post_1', 'user_id': u1.successKeys.first});
-      ok &= _expect('Insert base post success', p1.isSuccess, true);
+      ok &= _expect('Insert base post success', !p1.hasFailed, true);
 
       // Snapshot counts before backup
       final usersBefore = (await db.query('users')).length;
@@ -1908,7 +1910,7 @@ class DatabaseTester {
 
             final result = await db.batchInsert(tableName, batchData);
 
-            if (result.isSuccess) {
+            if (!result.hasFailed) {
               for (int j = 0; j < result.successKeys.length; j++) {
                 final Map<String, dynamic> newItem = {
                   idField: result.successKeys[j]
@@ -2238,7 +2240,7 @@ class DatabaseTester {
         'email': 'fk@test.com',
       });
       isTestPassed &=
-          _expect('Insert user should succeed', userResult.isSuccess, true);
+          _expect('Insert user should succeed', !userResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final userId = userResult.successKeys.first;
@@ -2249,7 +2251,7 @@ class DatabaseTester {
         'user_id': userId,
       });
       isTestPassed &= _expect('Insert post with valid user_id should succeed',
-          postResult.isSuccess, true);
+          !postResult.hasFailed, true);
 
       // Test 1.2: Insert post with invalid foreign key (non-existent user_id)
       final invalidPostResult = await db.insert('posts', {
@@ -2257,11 +2259,13 @@ class DatabaseTester {
         'user_id': '99999', // Non-existent user ID
       });
       isTestPassed &= _expect('Insert post with invalid user_id should fail',
-          invalidPostResult.isSuccess, false);
+          !invalidPostResult.hasFailed, false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          invalidPostResult.type == ResultType.foreignKeyViolation ||
-              invalidPostResult.type == ResultType.validationFailed,
+          invalidPostResult.firstType == ResultType.foreignKeyViolation ||
+              invalidPostResult.firstType ==
+                  ResultType.foreignKeyParentNotExist ||
+              invalidPostResult.firstType == ResultType.validationFailed,
           true);
 
       // Test 1.3: Insert comment with valid foreign keys
@@ -2273,7 +2277,7 @@ class DatabaseTester {
       });
       isTestPassed &= _expect(
           'Insert comment with valid foreign keys should succeed',
-          commentResult.isSuccess,
+          !commentResult.hasFailed,
           true);
 
       // Test 1.4: Insert comment with invalid post_id
@@ -2283,7 +2287,7 @@ class DatabaseTester {
         'content': 'Invalid comment',
       });
       isTestPassed &= _expect('Insert comment with invalid post_id should fail',
-          invalidCommentResult1.isSuccess, false);
+          !invalidCommentResult1.hasFailed, false);
 
       // Test 1.5: Insert comment with invalid user_id
       final invalidCommentResult2 = await db.insert('comments', {
@@ -2292,7 +2296,7 @@ class DatabaseTester {
         'content': 'Invalid comment',
       });
       isTestPassed &= _expect('Insert comment with invalid user_id should fail',
-          invalidCommentResult2.isSuccess, false);
+          !invalidCommentResult2.hasFailed, false);
 
       // ========== Test 2: Cascade Delete (CASCADE) ==========
       log.add('--- Sub-test: Cascade Delete ---', LogType.debug);
@@ -2307,7 +2311,7 @@ class DatabaseTester {
         'email': 'cascade@test.com',
       });
       isTestPassed &= _expect(
-          'Insert user should succeed', cascadeUserResult.isSuccess, true);
+          'Insert user should succeed', !cascadeUserResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final cascadeUserId = cascadeUserResult.successKeys.first;
@@ -2318,7 +2322,7 @@ class DatabaseTester {
         'email': 'cascade_comment@test.com',
       });
       isTestPassed &= _expect('Insert comment user should succeed',
-          cascadeCommentUserResult.isSuccess, true);
+          !cascadeCommentUserResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final cascadeCommentUserId = cascadeCommentUserResult.successKeys.first;
@@ -2333,7 +2337,7 @@ class DatabaseTester {
         'user_id': cascadeUserId,
       });
       isTestPassed &= _expect('Insert posts should succeed',
-          cascadePost1Result.isSuccess && cascadePost2Result.isSuccess, true);
+          !cascadePost1Result.hasFailed && !cascadePost2Result.hasFailed, true);
       if (!isTestPassed) return false;
 
       final cascadePost1Id = cascadePost1Result.successKeys.first;
@@ -2378,7 +2382,7 @@ class DatabaseTester {
       final deleteResult =
           await db.delete('users').where('id', '=', cascadeUserId);
       isTestPassed &=
-          _expect('Delete user should succeed', deleteResult.isSuccess, true);
+          _expect('Delete user should succeed', !deleteResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       // Verify cascade delete: posts should be deleted
@@ -2406,7 +2410,7 @@ class DatabaseTester {
         'email': 'update@test.com',
       });
       isTestPassed &= _expect(
-          'Insert user should succeed', updateUserResult.isSuccess, true);
+          'Insert user should succeed', !updateUserResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final updateUserId = updateUserResult.successKeys.first;
@@ -2417,7 +2421,7 @@ class DatabaseTester {
         'user_id': updateUserId,
       });
       isTestPassed &= _expect(
-          'Insert post should succeed', updatePostResult.isSuccess, true);
+          'Insert post should succeed', !updatePostResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final updatePostId = updatePostResult.successKeys.first;
@@ -2460,7 +2464,7 @@ class DatabaseTester {
         'email': 'restrict@test.com',
       });
       isTestPassed &= _expect(
-          'Insert user should succeed', restrictUserResult.isSuccess, true);
+          'Insert user should succeed', !restrictUserResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final restrictUserId = restrictUserResult.successKeys.first;
@@ -2471,7 +2475,7 @@ class DatabaseTester {
         'user_id': restrictUserId,
       });
       isTestPassed &= _expect(
-          'Insert post should succeed', restrictPostResult.isSuccess, true);
+          'Insert post should succeed', !restrictPostResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       final restrictPostId = restrictPostResult.successKeys.first;
@@ -2483,7 +2487,7 @@ class DatabaseTester {
         'content': 'Restrict Comment',
       });
       isTestPassed &= _expect('Insert comment should succeed',
-          restrictCommentResult.isSuccess, true);
+          !restrictCommentResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       // Try to delete user - should fail because comments.user_id has RESTRICT
@@ -2491,12 +2495,14 @@ class DatabaseTester {
           await db.delete('users').where('id', '=', restrictUserId);
       isTestPassed &= _expect(
           'Delete user with RESTRICT foreign key should fail',
-          restrictDeleteResult.isSuccess,
+          !restrictDeleteResult.hasFailed,
           false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          restrictDeleteResult.type == ResultType.foreignKeyViolation ||
-              restrictDeleteResult.type == ResultType.validationFailed,
+          restrictDeleteResult.firstType == ResultType.foreignKeyViolation ||
+              restrictDeleteResult.firstType ==
+                  ResultType.foreignKeyChildRestrict ||
+              restrictDeleteResult.firstType == ResultType.validationFailed,
           true);
 
       // Verify user still exists
@@ -2513,7 +2519,7 @@ class DatabaseTester {
           await db.delete('users').where('id', '=', restrictUserId);
       isTestPassed &= _expect(
           'Delete user after removing comment should succeed',
-          restrictDeleteResult2.isSuccess,
+          !restrictDeleteResult2.hasFailed,
           true);
 
       // ========== Test 5: Clear and Drop Operations ==========
@@ -2531,7 +2537,7 @@ class DatabaseTester {
         'email': 'clear2@test.com',
       });
       isTestPassed &= _expect('Insert users should succeed',
-          clearUser1Result.isSuccess && clearUser2Result.isSuccess, true);
+          !clearUser1Result.hasFailed && !clearUser2Result.hasFailed, true);
       if (!isTestPassed) return false;
 
       final clearUser1Id = clearUser1Result.successKeys.first;
@@ -2547,7 +2553,7 @@ class DatabaseTester {
         'user_id': clearUser2Id,
       });
       isTestPassed &= _expect('Insert posts should succeed',
-          clearPost1Result.isSuccess && clearPost2Result.isSuccess, true);
+          !clearPost1Result.hasFailed && !clearPost2Result.hasFailed, true);
       if (!isTestPassed) return false;
 
       final clearPost1Id = clearPost1Result.successKeys.first;
@@ -2588,7 +2594,7 @@ class DatabaseTester {
       await db.clear('posts');
       // Now clear users should succeed since no comments reference users
       final clearUsersBeforeTest = await db.clear('users');
-      if (!clearUsersBeforeTest.isSuccess) {
+      if (!!clearUsersBeforeTest.hasFailed) {
         // If clear failed, manually delete all users
         await db.delete('users').allowDeleteAll();
       }
@@ -2599,7 +2605,7 @@ class DatabaseTester {
         'email': 'clear3@test.com',
       });
       isTestPassed &= _expect('Insert user for RESTRICT test should succeed',
-          clearUser3Result.isSuccess, true);
+          !clearUser3Result.hasFailed, true);
       if (!isTestPassed) return false;
 
       final clearUser3Id = clearUser3Result.successKeys.first;
@@ -2608,7 +2614,7 @@ class DatabaseTester {
         'user_id': clearUser3Id,
       });
       isTestPassed &= _expect('Insert post for RESTRICT test should succeed',
-          clearPost3Result.isSuccess, true);
+          !clearPost3Result.hasFailed, true);
       if (!isTestPassed) return false;
 
       final clearPost3Id = clearPost3Result.successKeys.first;
@@ -2618,7 +2624,7 @@ class DatabaseTester {
         'content': 'Comment 3',
       });
       isTestPassed &= _expect('Insert comment for RESTRICT test should succeed',
-          clearCommentResult.isSuccess, true);
+          !clearCommentResult.hasFailed, true);
       if (!isTestPassed) return false;
 
       // Verify initial state: should have exactly 1 user
@@ -2631,12 +2637,13 @@ class DatabaseTester {
       final clearResult = await db.clear('users');
       isTestPassed &= _expect(
           'Clear users with RESTRICT foreign key should fail',
-          clearResult.isSuccess,
+          !clearResult.hasFailed,
           false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          clearResult.type == ResultType.foreignKeyViolation ||
-              clearResult.type == ResultType.validationFailed,
+          clearResult.firstType == ResultType.foreignKeyViolation ||
+              clearResult.firstType == ResultType.foreignKeyChildRestrict ||
+              clearResult.firstType == ResultType.validationFailed,
           true);
 
       // Verify users still exist (should still be 1, the same as before)
@@ -2838,7 +2845,7 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect(
-          'Transaction should commit successfully', txResult1.isSuccess, true);
+          'Transaction should commit successfully', !txResult1.hasFailed, true);
 
       final countAfterTx = await db.query('users').count();
       isTestPassed &=
@@ -2855,7 +2862,7 @@ class DatabaseTester {
       }, rollbackOnError: true);
 
       isTestPassed &= _expect(
-          'Transaction should rollback on error', txResult2.isFailed, true);
+          'Transaction should rollback on error', txResult2.hasFailed, true);
 
       final countAfterRollback = await db.query('users').count();
       isTestPassed &= _expect(
@@ -2883,7 +2890,7 @@ class DatabaseTester {
 
       isTestPassed &= _expect(
           'Transaction should fail on unique constraint violation',
-          txResult3.isFailed,
+          txResult3.hasFailed,
           true);
 
       final txUser4 =
@@ -2909,7 +2916,7 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect('Transaction with expressions should commit',
-          txResult4.isSuccess, true);
+          !txResult4.hasFailed, true);
 
       final txUser5 =
           await db.query('users').where('username', '=', 'tx_user5').first();
@@ -2939,7 +2946,7 @@ class DatabaseTester {
       }, rollbackOnError: true);
 
       isTestPassed &= _expect('Transaction should rollback expression updates',
-          txResult6.isFailed, true);
+          txResult6.hasFailed, true);
 
       final txUser7 =
           await db.query('users').where('username', '=', 'tx_user7').first();
@@ -2966,7 +2973,7 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect('Multi-operation transaction should commit',
-          txResult7.isSuccess, true);
+          !txResult7.hasFailed, true);
 
       final txUser8 =
           await db.query('users').where('username', '=', 'tx_user8').first();
