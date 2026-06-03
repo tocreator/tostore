@@ -9,10 +9,14 @@ All notable changes to this project will be documented in this file.
 - Added instant database shutdown and space switching by gracefully pausing background operations and resuming from checkpoints on next launch, eliminating potential delays.
 - Added dynamic field storage layout and optimized index building to support schema modifications (such as adding or dropping fields) without requiring full table data rewrites.
 - Added `next()` and `prev()` methods to `QueryResult` for seamless and stateful cursor-based pagination.
+- Added `ResultStatus` (along with `SuccessStatus` and `GeneralStatus`) to represent granular item-level diagnostic outcomes, optimized for AI agents and automated scripts to precisely inspect operation results.
 
 ### Changed
+- Standardized response models (`DbResult`, `QueryResult`, `TransactionResult`) and exception model `DbException` under a unified diagnostic architecture.
+- Refactored `ResultType` to support granular error classifications with unique numeric codes and semantic string keys (`codeKey`).
 - Renamed `nextCursor` and `prevCursor` to `nextCursorToken` and `prevCursorToken` to clarify their role as stateless pagination tokens.
 - Optimized cursor pagination resilience to fully support complex queries and multi-table joins.
+- Deprecated `DbResult.isSuccess`, `DbResult.type`, and `TransactionResult.isSuccess` in favor of `hasFailed` and `firstType` to eliminate semantic ambiguities in batch operations.
 
 ### Fixed
 - Fixed missing `.watch()` notifications for table clearing, drop table, restoration, and batch insert operations.
