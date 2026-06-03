@@ -6,6 +6,13 @@ import 'testing/database_tester.dart';
 import 'testing/log_service.dart';
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
 
+String _dbResultErrorMessage(DbResult result) {
+  final errors = result.statuses
+      .where((s) => s.type != ResultType.success)
+      .map((s) => s.message);
+  return errors.isEmpty ? 'Operation failed' : errors.join('; ');
+}
+
 /// Simple UI to run examples
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -22,8 +29,7 @@ void main() async {
       }
 
       // 2. Suppress expected Unique Constraint Violations (New Format)
-      // Format: [Unique Constraint Violation] Table '...' Field(s) [...] already contain value '...' (source: ...).
-      if (message.contains('[Unique Constraint Violation]')) {
+      if (message.contains('CONSTRAINT_VIOLATION_UNIQUE')) {
         // Only suppress if it contains specific test data values
         if (message.contains("value 'tx_user1'") || // Transaction test
             message.contains("value 'tx_user4'") || // Transaction test
@@ -40,16 +46,16 @@ void main() async {
       }
 
       // 3. Suppress expected Foreign Key and Transaction warnings
-      if (message.contains('Values: {id: 99999}') ||
+      if (message.contains('Conflicting values: [99999]') ||
           message.contains(
-              'Cannot clear table users: Referenced by foreign keys with RESTRICT/NO ACTION in tables: comments') ||
+              'Referenced by records in child table "comments" via foreign key') ||
           message.contains(
-              'Cannot delete record from users: Referenced by records in comments (foreign key: fk_comments_user)') ||
+              '"users": Referenced by records in child tables (comments) with RESTRICT/NO ACTION policy.') ||
           message.contains('Division by zero in expression. Returning 0.') ||
           message.contains(
               'Table users has primary key conflict, update auto increment start:') ||
           message.contains(
-              'Insert failed: Transaction operation failed: insert on users -> Unique constraint violation')) {
+              '(uniq_username) with value: tx_user1 (Existing PK: 1) (Key: 5)')) {
         return; // Suppress expected foreign key constraint test errors
       }
 
@@ -1952,11 +1958,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         logService.add(
             'Deleted ${result.successCount} of ${_selectedRows.length} records.',
-            result.isSuccess ? LogType.info : LogType.warn);
+            !result.hasFailed ? LogType.info : LogType.warn);
 
         if (result.failedCount > 0) {
           logService.add(
-              'Failed to delete ${result.failedCount} records. Error: ${result.message}',
+              'Failed to delete ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}',
               LogType.error);
         }
       } catch (e, s) {
@@ -2000,7 +2006,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             .update(_selectedTable, updatedData)
             .where(schema.primaryKeyConfig.name, '=', pkValue);
 
-        if (result.isSuccess) {
+        if (!result.hasFailed) {
           logService.add('Row successfully updated.', LogType.info);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -2011,12 +2017,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             );
           }
         } else {
-          logService.add(
-              'Failed to update row: ${result.message}', LogType.error);
+          final errorMsg = _dbResultErrorMessage(result);
+          logService.add('Failed to update row: $errorMsg', LogType.error);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Error: ${result.message}'),
+                content: Text('Error: $errorMsg'),
                 backgroundColor: Colors.red,
               ),
             );
@@ -2076,7 +2082,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         if (result.failedCount > 0) {
           final errorMsg =
-              'Failed to update ${result.failedCount} records. Error: ${result.message}';
+              'Failed to update ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}';
           logService.add(errorMsg, LogType.error);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -2157,7 +2163,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
           logService.add(
               'Custom delete affected ${result.successCount} record(s).',
-              result.isSuccess ? LogType.info : LogType.warn);
+              !result.hasFailed ? LogType.info : LogType.warn);
 
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
