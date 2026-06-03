@@ -11,6 +11,15 @@ class DirectoryManager {
 
   DirectoryManager(this._dataStore);
 
+  /// Helper to resolve actual space name, fallback to active space if '__global__' is passed.
+  String _resolveSpaceName(String? spaceName) {
+    if (spaceName == null || spaceName == '__global__') {
+      final activeSpace = _dataStore.currentSpaceName;
+      return activeSpace == '__global__' ? 'default' : activeSpace;
+    }
+    return spaceName;
+  }
+
   /// Get directory identifier key (for directoryUsageMap)
   String _getDirectoryKey(String spacePrefix, int dirIndex) {
     return '$spacePrefix:$dirIndex';
@@ -25,11 +34,12 @@ class DirectoryManager {
   /// Returns null if table directory mapping is not found in space configuration
   Future<String?> getTableDirectoryPath(String tableName,
       {String? spaceName}) async {
-    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final currentSpaceName = _resolveSpaceName(spaceName);
 
     try {
       // Check if table is global table
-      final isGlobal = await isTableGlobal(tableName);
+      final isGlobal =
+          await isTableGlobal(tableName, spaceName: currentSpaceName);
       if (isGlobal == null) {
         // Table does not exist
         return null;
@@ -52,15 +62,17 @@ class DirectoryManager {
             _dataStore.pathManager.getGlobalPath(), 'tables_$dirIndex');
         return pathJoin(subDir, tableName);
       } else {
-        final spaceConfig = await _dataStore.getSpaceConfig();
+        final spaceConfig =
+            await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
         if (spaceConfig == null) return null;
 
         final dirInfo = spaceConfig.tableDirectoryMap[tableKey];
         if (dirInfo == null) return null;
 
         final dirIndex = dirInfo.dirIndex;
-        final subDir =
-            pathJoin(_dataStore.pathManager.getSpacePath(), 'tables_$dirIndex');
+        final subDir = pathJoin(
+            _dataStore.pathManager.getSpacePath(spaceName: currentSpaceName),
+            'tables_$dirIndex');
         return pathJoin(subDir, tableName);
       }
     } catch (e) {
@@ -82,7 +94,7 @@ class DirectoryManager {
     required bool isGlobal,
     String? spaceName,
   }) async {
-    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final currentSpaceName = _resolveSpaceName(spaceName);
     final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final tableKey = _getTableKey(spacePrefix, tableName);
 
@@ -102,7 +114,8 @@ class DirectoryManager {
         );
       }
 
-      final spaceConfig = await _dataStore.getSpaceConfig();
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
       if (spaceConfig == null) return null;
 
       final dirInfo = spaceConfig.tableDirectoryMap[tableKey];
@@ -125,8 +138,10 @@ class DirectoryManager {
 
   /// Allocate storage directory index for table
   /// Returns allocated directory index for table
-  Future<int> allocateTableDirectory(String tableName, bool isGlobal) async {
-    final spacePrefix = isGlobal ? 'global' : _dataStore.config.spaceName;
+  Future<int> allocateTableDirectory(String tableName, bool isGlobal,
+      {String? spaceName}) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final tableKey = _getTableKey(spacePrefix, tableName);
 
     if (isGlobal) {
@@ -168,9 +183,11 @@ class DirectoryManager {
 
       return selectedDirIndex;
     } else {
-      final spaceConfig = await _dataStore.getSpaceConfig() ??
-          SpaceConfig(
-              current: const EncryptionKeyInfo(key: '', keyId: 0), version: 0);
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName) ??
+              SpaceConfig(
+                  current: const EncryptionKeyInfo(key: '', keyId: 0),
+                  version: 0);
       if (spaceConfig.tableDirectoryMap.containsKey(tableKey)) {
         final dirInfo = spaceConfig.tableDirectoryMap[tableKey]!;
         return dirInfo.dirIndex;
@@ -200,10 +217,12 @@ class DirectoryManager {
       );
 
       // save updated configuration
-      await _dataStore.saveSpaceConfigToFile(updatedConfig);
+      await _dataStore.saveSpaceConfigToFile(updatedConfig,
+          spaceName: currentSpaceName);
 
       // ensure directory exists
-      final dirPath = _getTableSubDirectoryPath(isGlobal, selectedDirIndex);
+      final dirPath = _getTableSubDirectoryPath(isGlobal, selectedDirIndex,
+          spaceName: currentSpaceName);
       await _dataStore.storage.ensureDirectoryExists(dirPath);
 
       return selectedDirIndex;
@@ -261,10 +280,13 @@ class DirectoryManager {
   }
 
   /// Release table directory, called when table is deleted
-  Future<void> releaseTableDirectory(String tableName) async {
-    final isGlobal = await isTableGlobal(tableName);
+  Future<void> releaseTableDirectory(String tableName,
+      {String? spaceName}) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
+    final isGlobal =
+        await isTableGlobal(tableName, spaceName: currentSpaceName);
     if (isGlobal == null) return;
-    final spacePrefix = isGlobal ? 'global' : _dataStore.config.spaceName;
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final tableKey = _getTableKey(spacePrefix, tableName);
 
     if (isGlobal) {
@@ -298,9 +320,11 @@ class DirectoryManager {
       // Save updated configuration
       await _dataStore.saveGlobalConfig(updatedConfig);
     } else {
-      final spaceConfig = await _dataStore.getSpaceConfig() ??
-          SpaceConfig(
-              current: const EncryptionKeyInfo(key: '', keyId: 0), version: 0);
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName) ??
+              SpaceConfig(
+                  current: const EncryptionKeyInfo(key: '', keyId: 0),
+                  version: 0);
       if (!spaceConfig.tableDirectoryMap.containsKey(tableKey)) {
         return;
       }
@@ -328,7 +352,8 @@ class DirectoryManager {
       );
 
       // Save updated configuration
-      await _dataStore.saveSpaceConfigToFile(updatedConfig);
+      await _dataStore.saveSpaceConfigToFile(updatedConfig,
+          spaceName: currentSpaceName);
     }
   }
 
@@ -336,7 +361,7 @@ class DirectoryManager {
   Future<TableDirectoryInfo?> getTableDirectoryInfo(
       String tableName, bool isGlobal,
       {String? spaceName}) async {
-    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final currentSpaceName = _resolveSpaceName(spaceName);
     final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final tableKey = _getTableKey(spacePrefix, tableName);
 
@@ -344,16 +369,20 @@ class DirectoryManager {
       final globalConfig = await _dataStore.getGlobalConfig() ?? GlobalConfig();
       return globalConfig.tableDirectoryMap[tableKey];
     } else {
-      final spaceConfig = await _dataStore.getSpaceConfig() ??
-          SpaceConfig(
-              current: const EncryptionKeyInfo(key: '', keyId: 0), version: 0);
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName) ??
+              SpaceConfig(
+                  current: const EncryptionKeyInfo(key: '', keyId: 0),
+                  version: 0);
       return spaceConfig.tableDirectoryMap[tableKey];
     }
   }
 
   /// Get table directory index
-  Future<int?> getTableDirectoryIndex(String tableName, bool isGlobal) async {
-    final dirInfo = await getTableDirectoryInfo(tableName, isGlobal);
+  Future<int?> getTableDirectoryIndex(String tableName, bool isGlobal,
+      {String? spaceName}) async {
+    final dirInfo =
+        await getTableDirectoryInfo(tableName, isGlobal, spaceName: spaceName);
     if (dirInfo != null) {
       return dirInfo.dirIndex;
     }
@@ -361,7 +390,8 @@ class DirectoryManager {
   }
 
   /// Get whether the table is a global table
-  Future<bool?> isTableGlobal(String tableName) async {
+  Future<bool?> isTableGlobal(String tableName, {String? spaceName}) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
     try {
       // First try to get from table structure
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -379,10 +409,10 @@ class DirectoryManager {
       }
 
       // Try to find in current space configuration
-      final spaceConfig = await _dataStore.getSpaceConfig();
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
       if (spaceConfig != null) {
-        final spaceTableKey =
-            _getTableKey(_dataStore.currentSpaceName, tableName);
+        final spaceTableKey = _getTableKey(currentSpaceName, tableName);
         if (spaceConfig.tableDirectoryMap.containsKey(spaceTableKey)) {
           return false; // Found in space configuration, indicating it is a space table
         }
@@ -400,12 +430,17 @@ class DirectoryManager {
   }
 
   /// Get table subdirectory path
-  String _getTableSubDirectoryPath(bool isGlobal, int dirIndex) {
+  String _getTableSubDirectoryPath(bool isGlobal, int dirIndex,
+      {String? spaceName}) {
     if (isGlobal) {
       return pathJoin(
           _dataStore.pathManager.getGlobalPath(), 'tables_$dirIndex');
     }
-    return pathJoin(_dataStore.pathManager.getSpacePath(), 'tables_$dirIndex');
+    return pathJoin(
+        _dataStore.pathManager.getSpacePath(
+          spaceName: _resolveSpaceName(spaceName),
+        ),
+        'tables_$dirIndex');
   }
 
   /// Get table actual path
@@ -413,13 +448,16 @@ class DirectoryManager {
   Future<String?> getTablePathIfExists(
     String tableName, {
     bool createIfMappingMissing = true,
+    String? spaceName,
   }) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return null;
     }
     final isGlobal = schema.isGlobal;
-    final dirInfo = await getTableDirectoryInfo(tableName, isGlobal);
+    final dirInfo = await getTableDirectoryInfo(tableName, isGlobal,
+        spaceName: currentSpaceName);
     if (dirInfo == null) {
       if (!createIfMappingMissing) {
         Logger.warn(
@@ -428,19 +466,23 @@ class DirectoryManager {
         );
         return null;
       }
-      return await createTablePathIfNotExists(tableName, isGlobal);
+      return await createTablePathIfNotExists(tableName, isGlobal,
+          spaceName: currentSpaceName);
     }
 
-    final tablePath =
-        _getTablePath(tableName, dirInfo.isGlobal, dirInfo.dirIndex);
+    final tablePath = _getTablePath(
+        tableName, dirInfo.isGlobal, dirInfo.dirIndex,
+        spaceName: currentSpaceName);
     await _dataStore.storage.ensureDirectoryExists(tablePath);
 
     return tablePath;
   }
 
   /// Get table path (internal method)
-  String _getTablePath(String tableName, bool isGlobal, int dirIndex) {
-    final subDir = _getTableSubDirectoryPath(isGlobal, dirIndex);
+  String _getTablePath(String tableName, bool isGlobal, int dirIndex,
+      {String? spaceName}) {
+    final subDir =
+        _getTableSubDirectoryPath(isGlobal, dirIndex, spaceName: spaceName);
     return pathJoin(subDir, tableName);
   }
 
@@ -455,7 +497,7 @@ class DirectoryManager {
         ? pathJoin(_dataStore.pathManager.getGlobalPath(), 'tables_$dirIndex')
         : pathJoin(
             _dataStore.pathManager.getSpacePath(
-              spaceName: spaceName ?? _dataStore.currentSpaceName,
+              spaceName: _resolveSpaceName(spaceName),
             ),
             'tables_$dirIndex',
           );
@@ -463,15 +505,19 @@ class DirectoryManager {
   }
 
   /// Get table path, if table does not exist, allocate directory and create path
-  Future<String> createTablePathIfNotExists(
-      String tableName, bool isGlobal) async {
+  Future<String> createTablePathIfNotExists(String tableName, bool isGlobal,
+      {String? spaceName}) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
     // Allocate directory and create path directly
-    final dirIndex = await allocateTableDirectory(tableName, isGlobal);
-    final dirInfo = await getTableDirectoryInfo(tableName, isGlobal);
+    final dirIndex = await allocateTableDirectory(tableName, isGlobal,
+        spaceName: currentSpaceName);
+    final dirInfo = await getTableDirectoryInfo(tableName, isGlobal,
+        spaceName: currentSpaceName);
     if (dirInfo == null) {
       throw StateError('Failed to allocate directory for table $tableName');
     }
-    final tablePath = _getTablePath(tableName, isGlobal, dirIndex);
+    final tablePath = _getTablePath(tableName, isGlobal, dirIndex,
+        spaceName: currentSpaceName);
 
     // Ensure directory exists
     await _dataStore.storage.ensureDirectoryExists(tablePath);
@@ -483,11 +529,12 @@ class DirectoryManager {
   /// Returns whether removal was successful
   Future<bool> removeTableDirectoryMapping(String tableName,
       {String? spaceName}) async {
-    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final currentSpaceName = _resolveSpaceName(spaceName);
 
     try {
       // Check if table is global table
-      final isGlobal = await isTableGlobal(tableName);
+      final isGlobal =
+          await isTableGlobal(tableName, spaceName: currentSpaceName);
       if (isGlobal == null) {
         // Table does not exist
         return false;
@@ -519,7 +566,8 @@ class DirectoryManager {
 
         return true;
       } else {
-        final spaceConfig = await _dataStore.getSpaceConfig();
+        final spaceConfig =
+            await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
         if (spaceConfig == null) return false;
 
         if (!spaceConfig.tableDirectoryMap.containsKey(tableKey)) {
@@ -535,7 +583,8 @@ class DirectoryManager {
         final updatedConfig = spaceConfig.copyWith(
           tableDirectoryMap: updatedTableDirMap,
         );
-        await _dataStore.saveSpaceConfigToFile(updatedConfig);
+        await _dataStore.saveSpaceConfigToFile(updatedConfig,
+            spaceName: currentSpaceName);
 
         return true;
       }
@@ -548,6 +597,68 @@ class DirectoryManager {
     }
   }
 
+  /// Ensure a directory mapping exists for a table with known physical storage.
+  ///
+  /// Used during migration crash recovery when the mapping entry was lost but
+  /// the table directory is already present on disk under [dirIndex].
+  Future<bool> ensureTableDirectoryMapping(
+    String tableName, {
+    required bool isGlobal,
+    required int dirIndex,
+    String? spaceName,
+  }) async {
+    final currentSpaceName = _resolveSpaceName(spaceName);
+    final spacePrefix = isGlobal ? 'global' : currentSpaceName;
+    final tableKey = _getTableKey(spacePrefix, tableName);
+
+    try {
+      final dirInfo = TableDirectoryInfo(
+        isGlobal: isGlobal,
+        dirIndex: dirIndex,
+      );
+
+      if (isGlobal) {
+        final globalConfig = await _dataStore.getGlobalConfig();
+        if (globalConfig == null) return false;
+
+        if (globalConfig.tableDirectoryMap.containsKey(tableKey)) {
+          return true;
+        }
+
+        final updatedTableDirMap =
+            Map<String, TableDirectoryInfo>.from(globalConfig.tableDirectoryMap)
+              ..[tableKey] = dirInfo;
+        await _dataStore.saveGlobalConfig(
+          globalConfig.copyWith(tableDirectoryMap: updatedTableDirMap),
+        );
+        return true;
+      }
+
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
+      if (spaceConfig == null) return false;
+
+      if (spaceConfig.tableDirectoryMap.containsKey(tableKey)) {
+        return true;
+      }
+
+      final updatedTableDirMap =
+          Map<String, TableDirectoryInfo>.from(spaceConfig.tableDirectoryMap)
+            ..[tableKey] = dirInfo;
+      await _dataStore.saveSpaceConfigToFile(
+        spaceConfig.copyWith(tableDirectoryMap: updatedTableDirMap),
+        spaceName: currentSpaceName,
+      );
+      return true;
+    } catch (e) {
+      Logger.error(
+        'Failed to ensure table directory mapping: $e',
+        label: 'DirectoryManager.ensureTableDirectoryMapping',
+      );
+      return false;
+    }
+  }
+
   /// Rename a table directory mapping while preserving the existing dirIndex.
   Future<bool> renameTableDirectoryMapping(
     String oldTableName,
@@ -555,7 +666,7 @@ class DirectoryManager {
     required bool isGlobal,
     String? spaceName,
   }) async {
-    final currentSpaceName = spaceName ?? _dataStore.currentSpaceName;
+    final currentSpaceName = _resolveSpaceName(spaceName);
     final spacePrefix = isGlobal ? 'global' : currentSpaceName;
     final oldTableKey = _getTableKey(spacePrefix, oldTableName);
     final newTableKey = _getTableKey(spacePrefix, newTableName);
@@ -590,7 +701,8 @@ class DirectoryManager {
         return true;
       }
 
-      final spaceConfig = await _dataStore.getSpaceConfig();
+      final spaceConfig =
+          await _dataStore.getSpaceConfig(spaceName: currentSpaceName);
       if (spaceConfig == null) return false;
 
       final existingNew = spaceConfig.tableDirectoryMap[newTableKey];
@@ -614,6 +726,7 @@ class DirectoryManager {
 
       await _dataStore.saveSpaceConfigToFile(
         spaceConfig.copyWith(tableDirectoryMap: updatedTableDirMap),
+        spaceName: currentSpaceName,
       );
       return true;
     } catch (e) {

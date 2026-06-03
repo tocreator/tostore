@@ -478,6 +478,8 @@ class ParallelJournalManager {
         final Map<String, int> tableEpochs = {};
         final Map<String, List<WriteQueueEntry>> entriesByTable = {};
         final Map<String, List<BackgroundWriteEntry>> bgEntriesByTable = {};
+        final Map<String, List<BackgroundWriteEntry>> bgLargeUpdatesByTable =
+            {};
 
         final yieldController =
             YieldController('ParallelJournalManager._pumpFlush');
@@ -487,6 +489,11 @@ class ParallelJournalManager {
         final flushCheckpointMap = <String, BgTaskProgress>{};
         for (final entry in bgEntries) {
           bgEntriesByTable.putIfAbsent(entry.tableName, () => []).add(entry);
+          if (entry.type == BackgroundWriteType.largeUpdate) {
+            bgLargeUpdatesByTable
+                .putIfAbsent(entry.tableName, () => [])
+                .add(entry);
+          }
           if (entry.type == BackgroundWriteType.schemaMigration &&
               entry.nextCursor != null) {
             targetCheckpoints[entry.tableName] = entry.nextCursor!;
@@ -1091,6 +1098,21 @@ class ParallelJournalManager {
                   if (tableQueueItems.isNotEmpty) {
                     await _bufferManager.cleanupAfterBatch(tableQueueItems);
                   }
+
+                  // Release unique key reservations for large update operations to prevent memory leaks and blocking
+                  final largeUpdates = bgLargeUpdatesByTable[table];
+                  if (largeUpdates != null && largeUpdates.isNotEmpty) {
+                    for (final bgEntry in largeUpdates) {
+                      if (bgEntry.isValid) {
+                        try {
+                          _bufferManager.releaseReservedUniqueKeys(
+                            tableName: table,
+                            recordId: bgEntry.primaryKey,
+                          );
+                        } catch (_) {}
+                      }
+                    }
+                  }
                 },
                 operationPrefix: 'flush_batch_unified_',
               );
@@ -1154,6 +1176,9 @@ class ParallelJournalManager {
             timeout: timeout,
             continueOnError: false,
           );
+
+          // Clear map reference to release memory immediately for GC optimization
+          bgLargeUpdatesByTable.clear();
 
           // ── Backpressure: measure per-record flush cost ──
           final batchElapsedUs = batchSw.elapsedMicroseconds;

@@ -1,6 +1,7 @@
+import 'dart:convert';
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
-import 'dart:convert';
+
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
@@ -231,122 +232,104 @@ class TableSchema {
 
     // validate name format
     if (name.isEmpty || !tableNameRegex.hasMatch(name)) {
-      Logger.warn(
-        'Invalid table name format',
-        label: 'TableSchema.validateTable',
+      throw BusinessError(
+        'Invalid table name format for "$name". Table names must only contain alphanumeric characters and underscores, and must start with a letter.',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // Reserve exact table names for system tables (published names must remain stable).
     if (!allowReservedTableNames && reservedTableNames.contains(name)) {
-      Logger.error(
-        'Table name $name is reserved for system tables',
-        label: 'TableSchema.validateTableSchema',
+      throw BusinessError(
+        'Table name "$name" is reserved for system tables and cannot be used.',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // Reserve internal prefix for engine/system tables.
     if (!allowInternalTableNamePrefix &&
         name.startsWith(internalSystemPrefix)) {
-      Logger.error(
-        'Table name $name is reserved for internal tables (prefix: $internalSystemPrefix)',
-        label: 'TableSchema.validateTableSchema',
+      throw BusinessError(
+        'Table name "$name" is reserved for internal tables (prefix: "$internalSystemPrefix").',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // validate primary key name format
     if (primaryKey.isEmpty || !fieldNameRegex.hasMatch(primaryKey)) {
-      Logger.warn(
-        'Invalid primary key name format',
-        label: 'TableSchema.validateTable',
+      throw BusinessError(
+        'Invalid primary key name format "$primaryKey" in table "$name".',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // validate field name format
     for (final field in fields) {
       if (!fieldNameRegex.hasMatch(field.name)) {
-        Logger.warn(
-          'Invalid field name format',
-          label: 'TableSchema.validateTable',
+        throw BusinessError(
+          'Invalid field name format "${field.name}" in table "$name".',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
 
       // Reserve internal prefix for engine fields.
-      // Business systems may use `system_` prefix, so we only reserve `_system_`.
-      // `_system_ingest_ts_ms` is a virtual/internal TTL field and MUST NOT
-      // appear in persisted table schema (it is never user-defined).
       if (field.name.startsWith(internalSystemPrefix)) {
         if (field.name == internalTtlIngestTsMsField) {
-          Logger.error(
-            'Field ${field.name} is reserved for internal TTL management and cannot be user-defined',
-            label: 'TableSchema.validateTableSchema',
+          throw BusinessError(
+            'Field "${field.name}" in table "$name" is reserved for internal TTL management and cannot be user-defined.',
+            type: BusinessErrorType.schemaError,
           );
-          return false;
         }
         if (!allowOtherInternalFields) {
-          Logger.error(
-            'Field ${field.name} is reserved for internal system fields (prefix: $internalSystemPrefix)',
-            label: 'TableSchema.validateTableSchema',
+          throw BusinessError(
+            'Field "${field.name}" in table "$name" is reserved for internal system fields (prefix: "$internalSystemPrefix").',
+            type: BusinessErrorType.schemaError,
           );
-          return false;
         }
       }
 
       // Field should not have the same name as the primary key
       if (field.name == primaryKey) {
-        Logger.error(
-          'Field $field has the same name as the primary key, primary key should not be defined in the field list',
-          label: 'TableSchema.validateTableSchema',
+        throw BusinessError(
+          'Field "${field.name}" in table "$name" has the same name as the primary key. Primary key should not be defined in the field list.',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
     }
 
     if (fields.isEmpty) {
-      Logger.warn(
-        'Table $name has no fields',
-        label: 'TableSchema.validateTableSchema',
+      throw BusinessError(
+        'Table "$name" has no fields. User tables must define at least one field.',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // Validate field name uniqueness
     final fieldNames = fields.map((f) => f.name).toSet();
     if (fieldNames.length != fields.length) {
-      Logger.warn(
-        'Field names must be unique',
-        label: 'TableSchema.validateTableSchema',
+      throw BusinessError(
+        'Field names in table "$name" must be unique.',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // Validate index configuration
     for (final index in indexes) {
-      if (!validateIndexFields(index)) {
-        return false;
-      }
+      validateIndexFields(index);
     }
 
     // Validate foreign key configuration
     for (final fk in foreignKeys) {
-      if (!validateForeignKey(fk)) {
-        return false;
-      }
+      validateForeignKey(fk);
     }
 
     // Validate table TTL configuration
     final ttl = ttlConfig;
     if (ttl != null && !ttl.validateFor(this)) {
-      Logger.error(
-        'Invalid TTL configuration for table $name',
-        label: 'TableSchema.validateTableSchema',
+      throw BusinessError(
+        'Invalid TTL configuration for table "$name".',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     return true;
@@ -359,11 +342,10 @@ class TableSchema {
   bool validateForeignKey(ForeignKeySchema fk) {
     // Validate foreign key schema itself
     if (!fk.validate()) {
-      Logger.error(
-        'Invalid foreign key schema: ${fk.actualName}',
-        label: 'TableSchema.validateForeignKey',
+      throw BusinessError(
+        'Invalid foreign key schema definition for "${fk.actualName}" in table "$name".',
+        type: BusinessErrorType.schemaError,
       );
-      return false;
     }
 
     // Validate that foreign key fields exist in this table
@@ -371,11 +353,10 @@ class TableSchema {
       final fieldExists = fields.any((field) => field.name == fieldName) ||
           fieldName == primaryKey;
       if (!fieldExists) {
-        Logger.error(
-          'Foreign key ${fk.actualName} references non-existent field: $fieldName',
-          label: 'TableSchema.validateForeignKey',
+        throw BusinessError(
+          'Foreign key "${fk.actualName}" in table "$name" references non-existent local field: "$fieldName".',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
     }
 
@@ -405,9 +386,7 @@ class TableSchema {
     TableSchema referencedSchema,
   ) {
     // First validate within current table context
-    if (!validateForeignKey(fk)) {
-      return false;
-    }
+    validateForeignKey(fk);
 
     // Validate that referenced fields exist in the referenced table
     for (final refFieldName in fk.referencedFields) {
@@ -416,11 +395,10 @@ class TableSchema {
           ) ||
           refFieldName == referencedSchema.primaryKey;
       if (!refFieldExists) {
-        Logger.error(
-          'Foreign key ${fk.actualName} references non-existent field: $refFieldName in table ${fk.referencedTable}',
-          label: 'TableSchema.validateForeignKeyWithReferencedTable',
+        throw BusinessError(
+          'Foreign key "${fk.actualName}" in table "$name" references non-existent field "$refFieldName" in referenced table "${fk.referencedTable}".',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
     }
 
@@ -465,13 +443,10 @@ class TableSchema {
       // Validate type compatibility
       // Note: fkField and refField are guaranteed to be non-null here due to the logic above
       if (!_areTypesCompatible(fkField.type, refFieldType)) {
-        Logger.error(
-          'Foreign key ${fk.actualName}: Field type mismatch - $fkFieldName (${fkField.type}) vs $refFieldName ($refFieldType). '
-          'Foreign key fields must have compatible types with referenced fields. '
-          'Note: Primary keys are stored as text, so numeric types (integer, bigInt, double) can reference them.',
-          label: 'TableSchema.validateForeignKeyWithReferencedTable',
+        throw BusinessError(
+          'Foreign key "${fk.actualName}" type mismatch: field "$fkFieldName" (${fkField.type.name}) in table "$name" is not compatible with referenced field "$refFieldName" (${refFieldType.name}) in table "${fk.referencedTable}".',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
     }
 
@@ -550,11 +525,10 @@ class TableSchema {
       // Check if the field exists in the field list
       final fieldExists = fields.any((field) => field.name == fieldName);
       if (!fieldExists) {
-        Logger.error(
-          'Table $name index ${index.actualIndexName} references non-existent field $fieldName',
-          label: 'TableSchema.validateIndexFields',
+        throw BusinessError(
+          'Index "${index.actualIndexName}" in table "$name" references non-existent field "$fieldName".',
+          type: BusinessErrorType.schemaError,
         );
-        return false;
       }
     }
 
@@ -2488,6 +2462,16 @@ class VectorFieldConfig {
       precision: precision ?? this.precision,
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! VectorFieldConfig) return false;
+    return other.dimensions == dimensions && other.precision == precision;
+  }
+
+  @override
+  int get hashCode => Object.hash(dimensions, precision);
 }
 
 /// Vector precision options
@@ -2664,6 +2648,30 @@ class VectorIndexConfig {
           (json['pqSubspaces'] as num?)?.toInt(),
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! VectorIndexConfig) return false;
+    return other.indexType == indexType &&
+        other.distanceMetric == distanceMetric &&
+        other.maxDegree == maxDegree &&
+        other.efSearch == efSearch &&
+        other.constructionEf == constructionEf &&
+        other.pruneAlpha == pruneAlpha &&
+        other.pqSubspaces == pqSubspaces;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        indexType,
+        distanceMetric,
+        maxDegree,
+        efSearch,
+        constructionEf,
+        pruneAlpha,
+        pqSubspaces,
+      );
 }
 
 /// Vector utility methods extension

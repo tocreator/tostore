@@ -12,11 +12,9 @@ import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/business_error.dart';
 import '../model/cancellation_token.dart';
-import '../model/meta_info.dart';
 import '../model/key_migration_info.dart';
+import '../model/meta_info.dart';
 import '../model/migration_meta.dart';
-import 'key_migration_progress.dart';
-import 'key_migration_runner.dart';
 import '../model/migration_task.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
@@ -26,6 +24,8 @@ import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
+import 'key_migration_progress.dart';
+import 'key_migration_runner.dart';
 import 'transaction_context.dart';
 import 'yield_controller.dart';
 
@@ -671,6 +671,13 @@ class MigrationManager {
         renamedTableTargets[entry.key] = entry.value.name;
       }
 
+      // Perform global database schema consistency validation before executing migration
+      await _validateGlobalSchemaConsistency(
+        targetSchemas: targetSchemas,
+        renamedTableTargets: renamedTableTargets,
+        existingTables: existingTables,
+      );
+
       // Handle renamed tables
       for (final entry in renamedTables.entries) {
         final oldTableName = entry.key;
@@ -722,12 +729,7 @@ class MigrationManager {
             'Failed to handle table renaming [$oldTableName -> ${newSchema.name}]: $e\n$stack',
             label: 'MigrationManager.migrate',
           );
-          // Rethrow critical errors to alert developer in IDE
-          if (e is BusinessError &&
-              (e.type == BusinessErrorType.schemaError ||
-                  e.type == BusinessErrorType.migrationError)) {
-            rethrow;
-          }
+          rethrow;
         }
       }
 
@@ -771,12 +773,7 @@ class MigrationManager {
             'Failed to handle table [${schema.name}]: $e\n$stack',
             label: 'MigrationManager.migrate',
           );
-          // Rethrow critical errors to alert developer in IDE
-          if (e is BusinessError &&
-              (e.type == BusinessErrorType.schemaError ||
-                  e.type == BusinessErrorType.migrationError)) {
-            rethrow;
-          }
+          rethrow;
         }
       }
 
@@ -812,12 +809,7 @@ class MigrationManager {
             'Failed to handle table deletion [$tableName]: $e\n$stack',
             label: 'MigrationManager.migrate',
           );
-          // Rethrow critical errors to alert developer in IDE
-          if (e is BusinessError &&
-              (e.type == BusinessErrorType.schemaError ||
-                  e.type == BusinessErrorType.migrationError)) {
-            rethrow;
-          }
+          rethrow;
         }
       }
 
@@ -868,6 +860,87 @@ class MigrationManager {
         label: 'MigrationManager.migrate',
       );
       rethrow;
+    }
+  }
+
+  /// Perform global database schema consistency validation before executing migration
+  Future<void> _validateGlobalSchemaConsistency({
+    required List<TableSchema> targetSchemas,
+    required Map<String, String> renamedTableTargets,
+    required List<String> existingTables,
+  }) async {
+    // 1. Check duplicate table names in target schemas
+    final seenTableNames = <String>{};
+    for (final schema in targetSchemas) {
+      if (seenTableNames.contains(schema.name)) {
+        throw BusinessError(
+          'Duplicate table name "${schema.name}" found in target schema list.',
+          type: BusinessErrorType.schemaError,
+        );
+      }
+      seenTableNames.add(schema.name);
+    }
+
+    final targetSchemaMap = {for (final s in targetSchemas) s.name: s};
+
+    // 2. Validate cross-table foreign key constraints and other inconsistencies
+    for (final schema in targetSchemas) {
+      // Validate duplicate foreign key names within the same table
+      final seenFkNames = <String>{};
+      for (final fk in schema.foreignKeys) {
+        final fkName = fk.actualName;
+        if (seenFkNames.contains(fkName)) {
+          throw BusinessError(
+            'Duplicate foreign key name "$fkName" in table "${schema.name}".',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+        seenFkNames.add(fkName);
+
+        if (!fk.enabled) continue;
+
+        final refTableName = fk.referencedTable;
+
+        // Check if referenced table exists in target schemas
+        if (!targetSchemaMap.containsKey(refTableName)) {
+          // Check if it was renamed but not updated in foreign key config
+          if (renamedTableTargets.containsKey(refTableName)) {
+            final newName = renamedTableTargets[refTableName];
+            throw BusinessError(
+              'Foreign key "${fk.actualName}" in table "${schema.name}" references table "$refTableName", '
+              'which has been renamed to "$newName". Please update the foreign key definition in the schema code to reference the new table name.',
+              type: BusinessErrorType.schemaError,
+            );
+          } else {
+            throw BusinessError(
+              'Foreign key "${fk.actualName}" in table "${schema.name}" references non-existent table "$refTableName".',
+              type: BusinessErrorType.schemaError,
+            );
+          }
+        }
+
+        // Validate foreign key with referenced table
+        final referencedSchema = targetSchemaMap[refTableName]!;
+        if (!schema.validateForeignKeyWithReferencedTable(
+            fk, referencedSchema)) {
+          throw BusinessError(
+            'Invalid foreign key "${fk.actualName}" in table "${schema.name}": '
+            'referenced fields in table "$refTableName" are not compatible or do not exist.',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+
+        // Validate space consistency: Space tables cannot reference Global tables and vice versa
+        if (schema.isGlobal != referencedSchema.isGlobal) {
+          throw BusinessError(
+            'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
+            '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
+            'referenced table $refTableName is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+            'Foreign key relationships across global and space boundaries are not allowed.',
+            type: BusinessErrorType.schemaError,
+          );
+        }
+      }
     }
   }
 
@@ -1292,6 +1365,41 @@ class MigrationManager {
             );
           }
 
+          // 3. For runtime manual migrations, validate new foreign key constraints
+          if (!isAutoGenerated) {
+            for (final fk in targetSchema.foreignKeys) {
+              if (!fk.enabled) continue;
+
+              final referencedSchema = await _dataStore.schemaManager
+                  ?.getTableSchema(fk.referencedTable);
+              if (referencedSchema == null) {
+                throw BusinessError(
+                  'Cannot upgrade table $tableName: Referenced table "${fk.referencedTable}" does not exist for foreign key "${fk.actualName}".',
+                  type: BusinessErrorType.schemaError,
+                );
+              }
+
+              if (targetSchema.isGlobal != referencedSchema.isGlobal) {
+                throw BusinessError(
+                  'Space mismatch in foreign key "${fk.actualName}" of table "${targetSchema.name}": '
+                  '${targetSchema.name} is ${targetSchema.isGlobal ? "global" : "space-specific"} but '
+                  'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+                  'Foreign key relationships across global and space boundaries are not allowed.',
+                  type: BusinessErrorType.schemaError,
+                );
+              }
+
+              if (!targetSchema.validateForeignKeyWithReferencedTable(
+                  fk, referencedSchema)) {
+                throw BusinessError(
+                  'Invalid foreign key "${fk.actualName}" in table "${targetSchema.name}": '
+                  'referenced fields in table "${fk.referencedTable}" are not compatible or do not exist.',
+                  type: BusinessErrorType.schemaError,
+                );
+              }
+            }
+          }
+
           // Only check for existing tables
           bool isAllowed = false;
           if (allowAfterDataMigration) {
@@ -1314,11 +1422,12 @@ class MigrationManager {
               final recordCount = await _dataStore.tableDataManager
                   .getTableRecordCount(tableName);
               if (recordCount != 0) {
-                throw Exception(
+                throw BusinessError(
                     'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
                     'This is to prevent accidental data loss or long-running migrations. \n'
                     'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
-                    'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.');
+                    'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.',
+                    type: BusinessErrorType.migrationError);
               }
             }
           }
@@ -2018,6 +2127,16 @@ class MigrationManager {
     final indexesToBuild = <String>[];
 
     if (oldSchema != null && targetSchema != null) {
+      // Build field rename mapping: old field name -> new field name
+      final fieldRenames = <String, String>{};
+      for (final op in sortedOperations) {
+        if (op.type == MigrationType.renameField &&
+            op.fieldName != null &&
+            op.newName != null) {
+          fieldRenames[op.fieldName!] = op.newName!;
+        }
+      }
+
       final oldAllIndexes = <IndexSchema>[
         ...oldSchema.getAllIndexes(),
         ...?_dataStore.indexManager
@@ -2034,10 +2153,29 @@ class MigrationManager {
       for (final newIdx in targetAllIndexes) {
         final newIdxName = newIdx.actualIndexName;
         IndexSchema? oldIdx;
-        try {
-          oldIdx =
-              oldAllIndexes.firstWhere((i) => i.actualIndexName == newIdxName);
-        } catch (_) {}
+
+        if (fieldRenames.isNotEmpty) {
+          for (final oldIndex in oldAllIndexes) {
+            final mappedOldFields =
+                oldIndex.fields.map((f) => fieldRenames[f] ?? f).toList();
+            final sameName = oldIndex.indexName != null &&
+                newIdx.indexName != null &&
+                oldIndex.indexName == newIdx.indexName;
+            final sameFields =
+                _areIndexFieldsEqual(mappedOldFields, newIdx.fields);
+            if (sameName || sameFields) {
+              oldIdx = oldIndex;
+              break;
+            }
+          }
+        } else {
+          for (final oldIndex in oldAllIndexes) {
+            if (oldIndex.actualIndexName == newIdxName) {
+              oldIdx = oldIndex;
+              break;
+            }
+          }
+        }
 
         if (oldIdx == null) {
           // Brand new index, must be physically built
@@ -2045,19 +2183,50 @@ class MigrationManager {
         } else {
           // Existing index, check if its definition changed
           bool definitionChanged = false;
-          if (oldIdx.fields.length != newIdx.fields.length) {
+          final mappedOldFields =
+              oldIdx.fields.map((f) => fieldRenames[f] ?? f).toList();
+
+          if (mappedOldFields.length != newIdx.fields.length) {
             definitionChanged = true;
           } else {
-            for (int i = 0; i < oldIdx.fields.length; i++) {
-              if (oldIdx.fields[i] != newIdx.fields[i]) {
+            for (int i = 0; i < mappedOldFields.length; i++) {
+              if (mappedOldFields[i] != newIdx.fields[i]) {
                 definitionChanged = true;
                 break;
               }
             }
           }
+
+          // Check if any field in the index changed its data type
+          bool typeChanged = false;
+          for (final oldFieldName in oldIdx.fields) {
+            final newFieldName = fieldRenames[oldFieldName] ?? oldFieldName;
+            FieldSchema? oldField;
+            for (final f in oldSchema.fields) {
+              if (f.name == oldFieldName) {
+                oldField = f;
+                break;
+              }
+            }
+            FieldSchema? targetField;
+            for (final f in targetSchema.fields) {
+              if (f.name == newFieldName) {
+                targetField = f;
+                break;
+              }
+            }
+            if (oldField != null &&
+                targetField != null &&
+                oldField.type != targetField.type) {
+              typeChanged = true;
+              break;
+            }
+          }
+
           if (oldIdx.unique != newIdx.unique ||
               oldIdx.type != newIdx.type ||
-              oldIdx.vectorConfig != newIdx.vectorConfig) {
+              oldIdx.vectorConfig != newIdx.vectorConfig ||
+              typeChanged) {
             definitionChanged = true;
           }
 
@@ -2081,9 +2250,12 @@ class MigrationManager {
           if (oldField != null &&
               fieldUpdate.type != null &&
               oldField.type != fieldUpdate.type) {
+            final newFieldName =
+                fieldRenames[fieldUpdate.name] ?? fieldUpdate.name;
             // Rebuild all indexes referencing the modified field name
             for (final idx in targetAllIndexes) {
-              if (idx.fields.contains(fieldUpdate.name)) {
+              if (idx.fields.contains(fieldUpdate.name) ||
+                  idx.fields.contains(newFieldName)) {
                 indexesToBuild.add(idx.actualIndexName);
               }
             }
@@ -2198,9 +2370,10 @@ class MigrationManager {
           'This requires complex data migration between spaces and the global scope and is therefore rejected.',
           label: 'MigrationManager._compareSchemasAndGenerateOperations',
         );
-        throw Exception(
+        throw BusinessError(
             'Changing the "isGlobal" property (from ${oldSchema.isGlobal} to ${newSchema.isGlobal}) for an existing table ($tableName) with existing data is not supported. '
-            'Please perform the data migration manually, or clear the table before changing "isGlobal".');
+            'Please perform the data migration manually, or clear the table before changing "isGlobal".',
+            type: BusinessErrorType.migrationError);
       }
 
       Logger.info(
@@ -2620,7 +2793,7 @@ class MigrationManager {
         if (coreDefinitionChanged) {
           // Core definition changed - this is a breaking change that requires manual handling
           // Throwing exception to warn developer that this requires data migration
-          throw Exception(
+          throw BusinessError(
             'Foreign key core definition change detected for ${matchedOldFk.actualName} in table ${oldSchema.name}. '
             'Core definitions (fields, referencedTable, referencedFields) cannot be automatically modified. '
             'This is a breaking change that may cause data inconsistency.\n'
@@ -2630,6 +2803,7 @@ class MigrationManager {
             '1. Remove the old foreign key: db.schema("${oldSchema.name}").removeForeignKey("${matchedOldFk.actualName}")\n'
             '2. Ensure data integrity (check for orphaned records, update data if needed)\n'
             '3. Add the new foreign key: db.schema("${oldSchema.name}").addForeignKey(...)',
+            type: BusinessErrorType.migrationError,
           );
         } else {
           // Only non-core properties changed - can modify
@@ -2970,8 +3144,9 @@ class MigrationManager {
     }
 
     if (isDangerous) {
-      throw Exception(
-          'Unsupported data type change for field "${newField.name}" from ${oldType.name} to ${newType.name}. This conversion is unsafe because existing data $reason This could lead to data loss or migration failure. Please handle this migration manually by creating a new field and migrating the data yourself.');
+      throw BusinessError(
+          'Unsupported data type change for field "${newField.name}" from ${oldType.name} to ${newType.name}. This conversion is unsafe because existing data $reason This could lead to data loss or migration failure. Please handle this migration manually by creating a new field and migrating the data yourself.',
+          type: BusinessErrorType.migrationError);
     }
   }
 
@@ -3259,9 +3434,10 @@ class MigrationManager {
           // task execution failed
           success = false;
 
-          // remove failed task, avoid infinite loop
-          _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
+          // Keep the task on disk and in memory so startup / the next scheduler
+          // pass can retry idempotent cutover steps after a crash or transient error.
           _unregisterRuntimeMigrationForTask(task);
+          break;
         }
       }
 
@@ -3495,6 +3671,7 @@ class MigrationManager {
                 oldSchemaSnapshot: oldSchema,
                 updateSchema: false,
                 refreshForeignKeySystemTables: true,
+                spaceName: space,
               );
             }
 
@@ -3888,12 +4065,35 @@ class MigrationManager {
         if (_sameIndexBuildDefinition(oldIndex, targetIndex,
                 ignoreFields: true) &&
             !typeChanged) {
-          await migrationInstance.indexManager?.renameIndex(
-            tableName,
-            oldIndexName: oldIndex.actualIndexName,
-            newIndexName: targetIndex.actualIndexName,
-            newFields: targetIndex.fields,
-          );
+          final indexMgr = migrationInstance.indexManager;
+          var indexAlreadyRenamed = false;
+          if (indexMgr != null &&
+              oldIndex.actualIndexName != targetIndex.actualIndexName) {
+            final oldIndexPath =
+                await migrationInstance.pathManager.getIndexPath(
+              tableName,
+              oldIndex.actualIndexName,
+            );
+            final newIndexPath =
+                await migrationInstance.pathManager.getIndexPath(
+              tableName,
+              targetIndex.actualIndexName,
+            );
+            final oldIndexExists =
+                await migrationInstance.storage.existsDirectory(oldIndexPath);
+            final newIndexExists =
+                await migrationInstance.storage.existsDirectory(newIndexPath);
+            indexAlreadyRenamed = !oldIndexExists && newIndexExists;
+          }
+
+          if (!indexAlreadyRenamed) {
+            await indexMgr?.renameIndex(
+              tableName,
+              oldIndexName: oldIndex.actualIndexName,
+              newIndexName: targetIndex.actualIndexName,
+              newFields: targetIndex.fields,
+            );
+          }
           updatedActualNames.add(targetIndex.actualIndexName);
         } else {
           await migrationInstance.indexManager

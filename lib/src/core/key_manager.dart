@@ -284,6 +284,9 @@ class KeyManager {
       return;
     }
 
+    // Clear any stale migration progress records from previous runs before starting a new one
+    await KeyMigrationProgressStore.clearAll(_dataStore);
+
     await migrationManager.persistKeyMigrationInfo(
       KeyMigrationInfo(
         targetKeyId: info.newKeyId,

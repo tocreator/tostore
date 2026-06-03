@@ -1,24 +1,24 @@
-import 'dart:convert';
-import 'dart:collection';
 import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
 import 'dart:typed_data';
 
+import '../handler/encoder.dart';
 import '../handler/logger.dart';
+import '../handler/platform_handler.dart';
 import '../handler/wal_encoder.dart';
 import '../model/data_store_config.dart';
-import 'data_store_impl.dart';
-import 'storage_adapter.dart';
-import '../model/table_op_meta.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/table_op_meta.dart';
 import '../model/wal_pointer.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/wal_decode_batch_runner.dart';
-import 'yield_controller.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
-import '../handler/encoder.dart';
-import '../handler/platform_handler.dart';
+import 'data_store_impl.dart';
+import 'storage_adapter.dart';
+import 'yield_controller.dart';
 
 /// Pending parallel batch metadata recorded in WAL meta for recovery
 class PendingParallelBatch {
@@ -133,6 +133,34 @@ class LargeDeleteMeta {
           (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
     );
   }
+
+  LargeDeleteMeta copyWith({
+    String? opId,
+    String? table,
+    String? spaceName,
+    Map<String, dynamic>? condition,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? checkpointCursor,
+    int? deletedSoFar,
+    String? status,
+    String? createdAt,
+  }) {
+    return LargeDeleteMeta(
+      opId: opId ?? this.opId,
+      table: table ?? this.table,
+      spaceName: spaceName ?? this.spaceName,
+      condition: condition ?? this.condition,
+      orderBy: orderBy ?? this.orderBy,
+      limit: limit ?? this.limit,
+      offset: offset ?? this.offset,
+      checkpointCursor: checkpointCursor ?? this.checkpointCursor,
+      deletedSoFar: deletedSoFar ?? this.deletedSoFar,
+      status: status ?? this.status,
+      createdAt: createdAt ?? this.createdAt,
+    );
+  }
 }
 
 /// Large update operation metadata for WAL meta (single-table update with checkpoint)
@@ -149,6 +177,7 @@ class LargeUpdateMeta {
   int updatedSoFar; // cumulative updated rows (for limit semantics across crashes)
   String status; // 'running' | 'completed'
   final String createdAt; // ISO8601
+  final bool continueOnPartialErrors;
 
   LargeUpdateMeta({
     required this.opId,
@@ -163,6 +192,7 @@ class LargeUpdateMeta {
     required this.updatedSoFar,
     required this.status,
     required this.createdAt,
+    this.continueOnPartialErrors = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -178,6 +208,7 @@ class LargeUpdateMeta {
         'updatedSoFar': updatedSoFar,
         'status': status,
         'createdAt': createdAt,
+        'continueOnPartialErrors': continueOnPartialErrors,
       };
 
   static LargeUpdateMeta fromJson(Map<String, dynamic> json) {
@@ -197,6 +228,41 @@ class LargeUpdateMeta {
       status: (json['status'] as String?) ?? 'running',
       createdAt:
           (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
+      continueOnPartialErrors:
+          (json['continueOnPartialErrors'] as bool?) ?? false,
+    );
+  }
+
+  LargeUpdateMeta copyWith({
+    String? opId,
+    String? table,
+    String? spaceName,
+    Map<String, dynamic>? condition,
+    Map<String, dynamic>? updateData,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? checkpointCursor,
+    int? updatedSoFar,
+    String? status,
+    String? createdAt,
+    bool? continueOnPartialErrors,
+  }) {
+    return LargeUpdateMeta(
+      opId: opId ?? this.opId,
+      table: table ?? this.table,
+      spaceName: spaceName ?? this.spaceName,
+      condition: condition ?? this.condition,
+      updateData: updateData ?? this.updateData,
+      orderBy: orderBy ?? this.orderBy,
+      limit: limit ?? this.limit,
+      offset: offset ?? this.offset,
+      checkpointCursor: checkpointCursor ?? this.checkpointCursor,
+      updatedSoFar: updatedSoFar ?? this.updatedSoFar,
+      status: status ?? this.status,
+      createdAt: createdAt ?? this.createdAt,
+      continueOnPartialErrors:
+          continueOnPartialErrors ?? this.continueOnPartialErrors,
     );
   }
 }
@@ -936,49 +1002,51 @@ class WalManager {
       }
       final start = _meta.existingStartPartitionIndex;
       final end = _meta.existingEndPartitionIndex;
-      final cap = _config.logPartitionCycle;
       final checkpoint = _meta.checkpoint.partitionIndex;
 
-      int idx = start;
-      final toDelete = <int>[];
-      final yieldController = YieldController(
-          'WalManager.cleanupObsoletePartitions',
-          checkInterval: 1);
-      while (true) {
-        await yieldController.maybeYield();
-        if (idx == checkpoint) {
-          // Do not delete checkpoint partition or newer
-          break;
-        }
-        toDelete.add(idx);
-        if (idx == end) break;
-        idx = (idx + 1) % cap;
-        if (idx == start) break; // safety
+      if (start == checkpoint) {
+        return;
       }
 
-      // First, collect dirIndex for each partition to delete (before updating mapping)
+      // Only partitions on [start, checkpoint) within [start..end] are obsolete.
+      // Scan directoryMapping keys instead of walking every index in the ring —
+      // when start=0 and checkpoint≈899999 that would iterate ~900k slots even
+      // though almost none have files or mapping entries.
+      bool isInExistingRange(int p) {
+        if (start <= end) return p >= start && p <= end;
+        return p >= start || p <= end;
+      }
+
+      bool isOnForwardArc(int p, int from, int toExclusive) {
+        if (from <= toExclusive) return p >= from && p < toExclusive;
+        return p >= from || p < toExclusive;
+      }
+
+      bool isObsoletePartition(int p) {
+        if (p == checkpoint) return false;
+        return isInExistingRange(p) && isOnForwardArc(p, start, checkpoint);
+      }
+
       final partitionToDirIndex = <int, int>{};
-      if (_directoryMapping != null && toDelete.isNotEmpty) {
-        for (final p in toDelete) {
-          final dirIndex = _directoryMapping!.getDirIndex(p);
-          if (dirIndex != null) {
-            partitionToDirIndex[p] = dirIndex;
+      final mapping = _directoryMapping;
+      if (mapping != null && mapping.partitionToDir.isNotEmpty) {
+        for (final entry in mapping.partitionToDir.entries) {
+          final p = entry.key;
+          if (isObsoletePartition(p)) {
+            partitionToDirIndex[p] = entry.value;
           }
         }
       }
 
-      // Delete partition files
-      for (final p in toDelete) {
+      final yieldController = YieldController(
+          'WalManager.cleanupObsoletePartitions',
+          checkInterval: 1);
+
+      // Delete partition files that still have mapping entries
+      for (final entry in partitionToDirIndex.entries) {
         await yieldController.maybeYield();
-        final dirIndex = partitionToDirIndex[p];
-        if (dirIndex == null) {
-          // Skip partitions without directory mapping (should not happen in normal operation)
-          Logger.warn(
-            'Cannot find dirIndex for WAL partition $p, skipping deletion',
-            label: 'WalManager.cleanupObsoletePartitions',
-          );
-          continue;
-        }
+        final p = entry.key;
+        final dirIndex = entry.value;
         final path = _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
             spaceName: _dataStore.currentSpaceName);
         try {
@@ -1015,15 +1083,12 @@ class WalManager {
         );
       }
 
-      // Move start forward
-      if (toDelete.isNotEmpty) {
-        final newStart = (toDelete.last + 1) % cap;
-        _meta = _meta.copyWith(
-          existingStartPartitionIndex: newStart,
-          directoryMapping: _directoryMapping,
-        );
-        await persistMeta();
-      }
+      // Advance start to checkpoint: unmapped indices never had files.
+      _meta = _meta.copyWith(
+        existingStartPartitionIndex: checkpoint,
+        directoryMapping: _directoryMapping,
+      );
+      await persistMeta();
     } catch (e) {
       Logger.error('cleanupObsoletePartitions failed: $e', label: 'WalManager');
     }
@@ -1624,6 +1689,7 @@ class WalManager {
     int? limit,
     int? offset,
     String? checkpointCursor,
+    bool continueOnPartialErrors = false,
   }) async {
     if (!_config.enableJournal) return;
     if (!_initialized) {
@@ -1642,6 +1708,7 @@ class WalManager {
       updatedSoFar: 0,
       status: 'running',
       createdAt: DateTime.now().toIso8601String(),
+      continueOnPartialErrors: continueOnPartialErrors,
     );
     await persistMeta(flush: false);
   }

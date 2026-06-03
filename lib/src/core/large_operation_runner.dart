@@ -7,14 +7,16 @@ import '../model/background_write_mode.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
-import '../query/query_condition.dart';
-import '../model/table_schema.dart';
 import '../model/change_event.dart';
+import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
-import 'data_store_impl.dart';
-import 'yield_controller.dart';
+import '../model/table_schema.dart';
+import '../query/query_condition.dart';
 import 'compute/batch_match_runner.dart';
+import 'data_store_impl.dart';
 import 'wal_manager.dart';
+import 'yield_controller.dart';
+import 'write_buffer_manager.dart';
 
 /// Runner that processes large delete and update operations asynchronously in the background.
 ///
@@ -143,6 +145,8 @@ class LargeOperationRunner {
     if (token.isCancelled) return;
     _runningOpIds.add(op.opId);
 
+    final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
+
     Logger.info(
         'Starting/resuming background delete for table [${op.table}] (opId: ${op.opId}).',
         label: 'LargeOperationRunner');
@@ -152,15 +156,12 @@ class LargeOperationRunner {
       final schema = await dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         // Table not found, clean metadata and complete
-        await dataStore.dropTable('_system_temp_op_conflict_${op.opId}',
-            registerWalOp: false);
+        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeDelete(op.opId);
         return;
       }
 
       final primaryKey = schema.primaryKey;
-      final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
-
       int deletedCount = op.deletedSoFar;
       final conditionMap = op.condition;
       final writeBatchSize = dataStore.config.writeBatchSize;
@@ -330,6 +331,10 @@ class LargeOperationRunner {
     } catch (e, s) {
       Logger.error('Large delete failed for ${op.opId}: $e\n$s',
           label: 'LargeOperationRunner');
+      try {
+        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
+        await dataStore.walManager.cancelLargeDelete(op.opId);
+      } catch (_) {}
       rethrow;
     } finally {
       _runningOpIds.remove(op.opId);
@@ -344,6 +349,8 @@ class LargeOperationRunner {
     if (token.isCancelled) return;
     _runningOpIds.add(op.opId);
 
+    final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
+
     Logger.info(
         'Starting/resuming background update for table [${op.table}] (opId: ${op.opId}).',
         label: 'LargeOperationRunner');
@@ -352,15 +359,12 @@ class LargeOperationRunner {
       final tableName = op.table;
       final schema = await dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        await dataStore.dropTable('_system_temp_op_conflict_${op.opId}',
-            registerWalOp: false);
+        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeUpdate(op.opId);
         return;
       }
 
       final primaryKey = schema.primaryKey;
-      final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
-
       int updatedCount = op.updatedSoFar;
       final conditionMap = op.condition;
       final validData = op.updateData;
@@ -369,23 +373,14 @@ class LargeOperationRunner {
       final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
       final insertedPrimaryKeysThisUpdate = <String>{};
 
-      final Set<String> indexedFieldNames = <String>{primaryKey}..addAll(
-          <IndexSchema>[
-            ...?dataStore.schemaManager?.getAllIndexesFor(schema),
-            ...?dataStore.indexManager?.getEngineManagedBtreeIndexes(
-              tableName,
-              schema,
-            ),
-          ].expand((i) => i.fields),
-        );
-
       final Set<String> uniqueFieldsToCheck = <String>{};
       if (dataStore.indexManager != null) {
         final allIndexes =
             dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
                 <IndexSchema>[];
         for (final index in allIndexes) {
-          if (index.fields.any((f) => validData.containsKey(f))) {
+          if (index.fields.any(
+              (f) => validData.containsKey(f) && validData[f] is ExprNode)) {
             uniqueFieldsToCheck.addAll(index.fields);
           }
         }
@@ -451,6 +446,9 @@ class LargeOperationRunner {
           );
 
           final matchedRecords = <Map<String, dynamic>>[];
+          final matchedIndexSet = matchResult.matchedIndices.toSet();
+
+          // First add records matched by ConditionBatchMatcher
           for (final matchedIndex in matchResult.matchedIndices) {
             final candidate = records[matchedIndex];
             final candidatePk = candidate[primaryKey]?.toString();
@@ -463,6 +461,24 @@ class LargeOperationRunner {
             }
             updatedCount++;
             matchedRecords.add(candidate);
+          }
+
+          // Safely catch up on records that were modified online (skipFlag == 2)
+          // but no longer match the condition filter, preventing them from being leaked.
+          for (var idx = 0; idx < records.length; idx++) {
+            if (matchedIndexSet.contains(idx)) continue;
+            final candidate = records[idx];
+            final candidatePk = candidate[primaryKey]?.toString();
+            if (candidatePk != null && skipMap[candidatePk] == 2) {
+              if (insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
+                continue;
+              }
+              if (op.limit != null && updatedCount >= op.limit!) {
+                continue;
+              }
+              updatedCount++;
+              matchedRecords.add(candidate);
+            }
           }
 
           if (matchedRecords.isEmpty) return true;
@@ -511,47 +527,133 @@ class LargeOperationRunner {
                 updatedRecord = mergedRecord;
               }
             }
-
+            List<UniqueKeyRef>? reservedKeys;
             // Verify unique constraints
             if (uniqueFieldsToCheck.isNotEmpty &&
                 dataStore.indexManager != null &&
                 !isPrimaryKeyUpdate) {
+              final planUpd = dataStore.planUniqueForUpdate(
+                tableName,
+                schema,
+                updatedRecord,
+                validData.keys.toSet(),
+              );
+
+              try {
+                reservedKeys =
+                    dataStore.writeBufferManager.tryReserveUniqueKeys(
+                  tableName: tableName,
+                  recordId: pkValueStr,
+                  uniqueKeys: planUpd.refs,
+                  isUpdate: true,
+                );
+              } catch (e) {
+                Logger.error(
+                    'Unique constraint check failed in heavy update reserve: $e',
+                    label: 'LargeOperationRunner');
+                if (op.continueOnPartialErrors) {
+                  Logger.warn(
+                      'Skip updating record with PK $pkValueStr due to unique constraint conflict: $e',
+                      label: 'LargeOperationRunner');
+                  continue;
+                }
+                rethrow;
+              }
+
               try {
                 final violation =
                     await dataStore.indexManager!.checkUniqueConstraints(
                   tableName,
                   updatedRecord,
                   isUpdate: true,
+                  skipBufferCheck: true,
                 );
                 if (violation != null) {
                   throw violation;
                 }
               } catch (e) {
+                if (reservedKeys != null) {
+                  try {
+                    dataStore.writeBufferManager.releaseReservedUniqueKeys(
+                      tableName: tableName,
+                      recordId: pkValueStr,
+                    );
+                  } catch (_) {}
+                }
                 Logger.error(
                     'Unique constraint check failed in heavy update: $e',
                     label: 'LargeOperationRunner');
+                if (op.continueOnPartialErrors) {
+                  Logger.warn(
+                      'Skip updating record with PK $pkValueStr due to unique constraint conflict: $e',
+                      label: 'LargeOperationRunner');
+                  continue;
+                }
                 rethrow;
               }
             }
 
-            // Primary Key update logic (rewrite)
+            // Verify and check primary key update unique constraints with reservation
             if (isPrimaryKeyUpdate) {
               final newPkVal = updatedRecord[primaryKey]?.toString();
               if (newPkVal != null && newPkVal != pkValueStr) {
+                final planIns = dataStore.planUniqueForInsert(
+                  tableName,
+                  schema,
+                  updatedRecord,
+                );
+
+                List<UniqueKeyRef>? pkReservedKeys;
+                try {
+                  pkReservedKeys =
+                      dataStore.writeBufferManager.tryReserveUniqueKeys(
+                    tableName: tableName,
+                    recordId: newPkVal,
+                    uniqueKeys: planIns.refs,
+                    isUpdate: false,
+                  );
+                } catch (e) {
+                  Logger.error(
+                      'Unique constraint check failed in primary key update reserve: $e',
+                      label: 'LargeOperationRunner');
+                  if (op.continueOnPartialErrors) {
+                    Logger.warn(
+                        'Skip primary key update for record with PK $pkValueStr due to unique conflict: $e',
+                        label: 'LargeOperationRunner');
+                    continue;
+                  }
+                  rethrow;
+                }
+
                 try {
                   final violation =
                       await dataStore.indexManager!.checkUniqueConstraints(
                     tableName,
                     updatedRecord,
                     isUpdate: true,
+                    skipBufferCheck: true,
                   );
                   if (violation != null) {
                     throw violation;
                   }
                 } catch (e) {
+                  if (pkReservedKeys != null) {
+                    try {
+                      dataStore.writeBufferManager.releaseReservedUniqueKeys(
+                        tableName: tableName,
+                        recordId: newPkVal,
+                      );
+                    } catch (_) {}
+                  }
                   Logger.error(
                       'Unique constraint check failed in primary key update: $e',
                       label: 'LargeOperationRunner');
+                  if (op.continueOnPartialErrors) {
+                    Logger.warn(
+                        'Skip primary key update for record with PK $pkValueStr due to unique conflict: $e',
+                        label: 'LargeOperationRunner');
+                    continue;
+                  }
                   rethrow;
                 }
 
@@ -673,20 +775,12 @@ class LargeOperationRunner {
             final oldRecord =
                 records.firstWhere((r) => r[primaryKey].toString() == pk);
 
-            final oldVals = <String, dynamic>{};
-            for (final field in indexedFieldNames) {
-              final oldVal = oldRecord[field];
-              final newVal = record[field];
-              if (oldVal != newVal) {
-                oldVals[field] = oldVal;
-              }
-            }
-
             final entry = BufferEntry(
               operation: BufferOperationType.update,
               data: record,
               timestamp: DateTime.now(),
-              oldValues: oldVals.isEmpty ? null : oldVals,
+              // Pass the complete old record directly to avoid partial index oldValues missing
+              oldValues: oldRecord,
             );
 
             dataStore.backgroundWriteScheduler.addEntry(
@@ -725,6 +819,10 @@ class LargeOperationRunner {
     } catch (e, s) {
       Logger.error('Large update failed for ${op.opId}: $e\n$s',
           label: 'LargeOperationRunner');
+      try {
+        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
+        await dataStore.walManager.cancelLargeUpdate(op.opId);
+      } catch (_) {}
       rethrow;
     } finally {
       _runningOpIds.remove(op.opId);

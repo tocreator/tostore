@@ -678,6 +678,73 @@ class WeightManager {
     return entries.map((e) => e.key).toList();
   }
 
+  /// Rename table and its btree indexes weight keys in the weight cache
+  Future<void> renameTableWeights(
+    String oldTableName,
+    String newTableName, {
+    required List<String> oldIndexNames,
+    required List<String> newIndexNames,
+    String? spaceName,
+  }) async {
+    await _ensureWeightsLoaded(spaceName: spaceName);
+
+    var dirty = false;
+
+    // 1. Rename tableRecord weight key
+    final tableRecordCache = _weightCache[WeightType.tableRecord]!;
+    final oldTableKey = _getTableRecordKey(oldTableName);
+    final newTableKey = _getTableRecordKey(newTableName);
+    if (tableRecordCache.containsKey(oldTableKey)) {
+      final weightData = tableRecordCache.remove(oldTableKey)!;
+      tableRecordCache[newTableKey] = weightData;
+      dirty = true;
+    }
+
+    // 2. Rename indexData weight keys
+    final indexDataCache = _weightCache[WeightType.indexData]!;
+    for (int i = 0; i < oldIndexNames.length; i++) {
+      final oldIndexName = oldIndexNames[i];
+      final newIndexName =
+          i < newIndexNames.length ? newIndexNames[i] : oldIndexName;
+      final oldIndexKey = _getIndexDataKey(oldTableName, oldIndexName);
+      final newIndexKey = _getIndexDataKey(newTableName, newIndexName);
+      if (indexDataCache.containsKey(oldIndexKey)) {
+        final weightData = indexDataCache.remove(oldIndexKey)!;
+        indexDataCache[newIndexKey] = weightData;
+        dirty = true;
+      }
+    }
+
+    if (dirty) {
+      _rebuildHighWeightCache();
+      _onMutation();
+      await saveWeights(spaceName: spaceName, force: true);
+    }
+  }
+
+  /// Rename a single index weight key in the weight cache
+  Future<void> renameIndexWeights(
+    String tableName, {
+    required String oldIndexName,
+    required String newIndexName,
+    String? spaceName,
+  }) async {
+    if (oldIndexName == newIndexName) return;
+    await _ensureWeightsLoaded(spaceName: spaceName);
+
+    final indexDataCache = _weightCache[WeightType.indexData]!;
+    final oldIndexKey = _getIndexDataKey(tableName, oldIndexName);
+    final newIndexKey = _getIndexDataKey(tableName, newIndexName);
+
+    if (indexDataCache.containsKey(oldIndexKey)) {
+      final weightData = indexDataCache.remove(oldIndexKey)!;
+      indexDataCache[newIndexKey] = weightData;
+      _rebuildHighWeightCache();
+      _onMutation();
+      await saveWeights(spaceName: spaceName, force: true);
+    }
+  }
+
   /// Clear weight data (for testing or reset)
   Future<void> clear({String? spaceName}) async {
     clearMemory();

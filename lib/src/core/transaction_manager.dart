@@ -312,22 +312,17 @@ class TransactionManager {
             journalPaths.add(p);
           }
         }
-        // Fallback to current WAL partition if nothing was captured
-        if (walPaths.isEmpty) {
+        // Fallback to current WAL partition if nothing was captured.
+        // WAL append goes through WalManager's queue and may not register paths
+        // in TransactionContext (common for schema-only / migration commits).
+        if (walPaths.isEmpty && _dataStore.config.enableJournal) {
           final walIdx = _dataStore.walManager.currentPointer.partitionIndex;
           final walDirIndex =
-              _dataStore.walManager.getPartitionDirIndex(walIdx);
-          if (walDirIndex != null) {
-            final fallbackWal = _dataStore.pathManager.getWalPartitionLogPath(
-                walDirIndex, walIdx,
-                spaceName: _dataStore.currentSpaceName);
-            walPaths.add(fallbackWal);
-          } else {
-            Logger.warn(
-              'Cannot find dirIndex for WAL partition $walIdx, skipping WAL flush',
-              label: 'TxnManager.commit',
-            );
-          }
+              _dataStore.walManager.getPartitionDirIndex(walIdx) ??
+                  walIdx ~/ _dataStore.maxEntriesPerDir;
+          walPaths.add(_dataStore.pathManager.getWalPartitionLogPath(
+              walDirIndex, walIdx,
+              spaceName: _dataStore.currentSpaceName));
         }
 
         // Flush wal/journal; keep handles open to avoid frequent reopen.

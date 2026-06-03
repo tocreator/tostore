@@ -874,10 +874,10 @@ class DataStoreImpl {
           // Prepare temp directory for crash-safe writes (native only)
           await _resetTempDir();
 
-          if (!isMigrationInstance) {
-            await walManager.initializeAndRecover();
-            await parallelJournalManager.start();
+          await walManager.initializeAndRecover();
+          await parallelJournalManager.start();
 
+          if (!isMigrationInstance) {
             await LargeOperationRunner.runPendingOperations(this);
 
             // Recover unfinished transactions (commit plans or rollbacks)
@@ -1292,6 +1292,16 @@ class DataStoreImpl {
           if (referencedSchema == null) {
             throw BusinessError(
               'Cannot create table ${schema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
+              type: BusinessErrorType.schemaError,
+            );
+          }
+
+          if (schemaValid.isGlobal != referencedSchema.isGlobal) {
+            throw BusinessError(
+              'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
+              '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
+              'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+              'Foreign key relationships across global and space boundaries are not allowed.',
               type: BusinessErrorType.schemaError,
             );
           }
@@ -2578,6 +2588,7 @@ class DataStoreImpl {
             orderBy: orderBy,
             limit: limit,
             offset: offset,
+            continueOnPartialErrors: continueOnPartialErrors,
           );
         }
 
@@ -6606,6 +6617,7 @@ class DataStoreImpl {
     TableSchema? oldSchemaSnapshot,
     bool updateSchema = true,
     bool refreshForeignKeySystemTables = true,
+    String? spaceName,
   }) async {
     if (oldTableName == newTableName) {
       return;
@@ -6636,6 +6648,7 @@ class DataStoreImpl {
     }
 
     final isGlobal = schemaForLayout.isGlobal;
+    final currentSpace = spaceName ?? currentSpaceName;
     final renamedSchema = _schemaWithRenamedReferencedTable(
       schemaForLayout.copyWith(name: newTableName),
       oldTableName,
@@ -6647,17 +6660,19 @@ class DataStoreImpl {
     await cacheManager.invalidateCache(oldTableName, invalidateSchema: false);
     await cacheManager.invalidateCache(newTableName, invalidateSchema: false);
 
-    final oldDirInfo =
-        await dirMgr.getTableDirectoryInfo(oldTableName, isGlobal);
-    final newDirInfo =
-        await dirMgr.getTableDirectoryInfo(newTableName, isGlobal);
+    final oldDirInfo = await dirMgr
+        .getTableDirectoryInfo(oldTableName, isGlobal, spaceName: currentSpace);
+    final newDirInfo = await dirMgr
+        .getTableDirectoryInfo(newTableName, isGlobal, spaceName: currentSpace);
     final oldPath = await dirMgr.getTableDirectoryPathByScope(
       oldTableName,
       isGlobal: isGlobal,
+      spaceName: currentSpace,
     );
     String? newPath = await dirMgr.getTableDirectoryPathByScope(
       newTableName,
       isGlobal: isGlobal,
+      spaceName: currentSpace,
     );
     final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
     if (newPath == null && resolvedDirIndex != null) {
@@ -6665,30 +6680,84 @@ class DataStoreImpl {
         newTableName,
         isGlobal: isGlobal,
         dirIndex: resolvedDirIndex,
+        spaceName: currentSpace,
       );
     }
 
-    final sourceExists =
-        oldPath != null && await storage.existsDirectory(oldPath);
-    final targetExists =
+    // After mapping cutover the directory may still live under the old folder
+    // name inside the same shard. Resolve that legacy path for idempotent retry.
+    String? effectiveSourcePath = oldPath;
+    if (resolvedDirIndex != null) {
+      final legacySourcePath = dirMgr.buildTableDirectoryPath(
+        oldTableName,
+        isGlobal: isGlobal,
+        dirIndex: resolvedDirIndex,
+        spaceName: currentSpace,
+      );
+      if (legacySourcePath != newPath &&
+          await storage.existsDirectory(legacySourcePath)) {
+        final mappedSourceExists = effectiveSourcePath != null &&
+            effectiveSourcePath != newPath &&
+            await storage.existsDirectory(effectiveSourcePath);
+        if (!mappedSourceExists) {
+          effectiveSourcePath = legacySourcePath;
+        }
+      }
+    }
+
+    var sourceExists = effectiveSourcePath != null &&
+        effectiveSourcePath != newPath &&
+        await storage.existsDirectory(effectiveSourcePath);
+    var targetExists =
         newPath != null && await storage.existsDirectory(newPath);
     final updatedReferencingTables = <String>{};
 
     try {
-      if (sourceExists && newPath != null && oldPath != newPath) {
+      if (sourceExists && newPath != null && effectiveSourcePath != newPath) {
         if (targetExists) {
-          throw StateError(
-            'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
-          );
+          // Idempotent recovery: mapping may already point to the new name while
+          // a stale source folder still exists, or a partial target was created.
+          if (newDirInfo != null && oldDirInfo == null) {
+            await storage.deleteDirectory(effectiveSourcePath);
+            sourceExists = false;
+          } else if (oldDirInfo != null && newDirInfo == null) {
+            await storage.deleteDirectory(newPath);
+            await storage.moveDirectory(effectiveSourcePath, newPath);
+            sourceExists = false;
+            targetExists = true;
+          } else {
+            throw StateError(
+              'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
+            );
+          }
+        } else {
+          await storage.moveDirectory(effectiveSourcePath, newPath);
+          sourceExists = false;
+          targetExists = true;
         }
-        await storage.moveDirectory(oldPath, newPath);
       }
 
-      final mappingRenamed = await dirMgr.renameTableDirectoryMapping(
+      var mappingRenamed = await dirMgr.renameTableDirectoryMapping(
         oldTableName,
         newTableName,
         isGlobal: isGlobal,
+        spaceName: currentSpace,
       );
+      if (!mappingRenamed) {
+        if (targetExists && resolvedDirIndex != null) {
+          mappingRenamed = await dirMgr.ensureTableDirectoryMapping(
+            newTableName,
+            isGlobal: isGlobal,
+            dirIndex: resolvedDirIndex,
+            spaceName: currentSpace,
+          );
+        } else {
+          final recoveredNewDirInfo = await dirMgr.getTableDirectoryInfo(
+              newTableName, isGlobal,
+              spaceName: currentSpace);
+          mappingRenamed = recoveredNewDirInfo != null && targetExists;
+        }
+      }
       if (!mappingRenamed) {
         throw StateError(
           'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
@@ -6719,6 +6788,21 @@ class DataStoreImpl {
           throwOnError: true,
         );
       }
+
+      if (_weightManager != null) {
+        final btreeIndexes =
+            schemaManager?.getBtreeIndexesFor(schemaForLayout) ??
+                <IndexSchema>[];
+        final indexNames = btreeIndexes.map((i) => i.actualIndexName).toList();
+        await _weightManager!.renameTableWeights(
+          oldTableName,
+          newTableName,
+          oldIndexNames: indexNames,
+          newIndexNames: indexNames,
+          spaceName: isGlobal ? '__global__' : currentSpace,
+        );
+      }
+      await _renameTableInLargeOperations(oldTableName, newTableName);
     } catch (error, stackTrace) {
       try {
         await _rollbackRenameTableForMigration(
@@ -6730,8 +6814,9 @@ class DataStoreImpl {
           updateSchema: updateSchema,
           refreshForeignKeySystemTables: refreshForeignKeySystemTables,
           updatedReferencingTables: updatedReferencingTables,
-          oldPath: oldPath,
+          oldPath: effectiveSourcePath ?? oldPath,
           newPath: newPath,
+          spaceName: currentSpace,
         );
       } catch (rollbackError, rollbackStackTrace) {
         Logger.error(
@@ -6759,6 +6844,7 @@ class DataStoreImpl {
     required Set<String> updatedReferencingTables,
     String? oldPath,
     String? newPath,
+    String? spaceName,
   }) async {
     final schemaMgr = schemaManager;
     final dirMgr = directoryManager;
@@ -6772,6 +6858,8 @@ class DataStoreImpl {
           newTableName,
           oldTableName,
         );
+
+    final currentSpace = spaceName ?? currentSpaceName;
 
     if (updateSchema && updatedReferencingTables.isNotEmpty) {
       await _updateSchemasReferencingRenamedTable(
@@ -6789,15 +6877,16 @@ class DataStoreImpl {
       }
     }
 
-    final currentOldDirInfo =
-        await dirMgr.getTableDirectoryInfo(oldTableName, isGlobal);
-    final currentNewDirInfo =
-        await dirMgr.getTableDirectoryInfo(newTableName, isGlobal);
+    final currentOldDirInfo = await dirMgr
+        .getTableDirectoryInfo(oldTableName, isGlobal, spaceName: currentSpace);
+    final currentNewDirInfo = await dirMgr
+        .getTableDirectoryInfo(newTableName, isGlobal, spaceName: currentSpace);
     if (currentOldDirInfo == null && currentNewDirInfo != null) {
       final restored = await dirMgr.renameTableDirectoryMapping(
         newTableName,
         oldTableName,
         isGlobal: isGlobal,
+        spaceName: currentSpace,
       );
       if (!restored) {
         throw StateError(
@@ -6835,6 +6924,20 @@ class DataStoreImpl {
         throwOnError: true,
       );
     }
+
+    if (_weightManager != null) {
+      final btreeIndexes =
+          schemaManager?.getBtreeIndexesFor(schemaForLayout) ?? <IndexSchema>[];
+      final indexNames = btreeIndexes.map((i) => i.actualIndexName).toList();
+      await _weightManager!.renameTableWeights(
+        newTableName,
+        oldTableName,
+        oldIndexNames: indexNames,
+        newIndexNames: indexNames,
+        spaceName: isGlobal ? '__global__' : currentSpace,
+      );
+    }
+    await _renameTableInLargeOperations(newTableName, oldTableName);
   }
 
   TableSchema _schemaWithRenamedReferencedTable(
@@ -6965,6 +7068,34 @@ class DataStoreImpl {
           updatedMeta: updatedMeta.pkToNodeIdMeta,
         );
       }
+    }
+  }
+
+  Future<void> _renameTableInLargeOperations(
+      String oldTableName, String newTableName) async {
+    if (!config.enableJournal) return;
+    var metaDirty = false;
+
+    // 1. Rename table in largeDeletes
+    for (final entry in walManager.meta.largeDeletes.entries) {
+      if (entry.value.table == oldTableName) {
+        walManager.meta.largeDeletes[entry.key] =
+            entry.value.copyWith(table: newTableName);
+        metaDirty = true;
+      }
+    }
+
+    // 2. Rename table in largeUpdates
+    for (final entry in walManager.meta.largeUpdates.entries) {
+      if (entry.value.table == oldTableName) {
+        walManager.meta.largeUpdates[entry.key] =
+            entry.value.copyWith(table: newTableName);
+        metaDirty = true;
+      }
+    }
+
+    if (metaDirty) {
+      await walManager.persistMeta(flush: false);
     }
   }
 

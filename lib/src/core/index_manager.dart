@@ -28,8 +28,8 @@ import 'compute/index_delta_prepare_compute.dart';
 import 'compute/unique_index_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'data_store_impl.dart';
-import 'key_migration_runner.dart';
 import 'io_concurrency_planner.dart';
+import 'key_migration_runner.dart';
 import 'table_data_manager.dart';
 import 'transaction_context.dart';
 import 'tree_cache.dart';
@@ -2727,7 +2727,9 @@ class IndexManager {
             await _dataStore.storage.deleteDirectory(newIndexPath);
           }
           await _dataStore.storage.moveDirectory(oldIndexPath, newIndexPath);
-        } else if (!newExists) {
+        } else if (newExists) {
+          // Idempotent retry: physical rename already completed.
+        } else {
           // Neither exist, maybe index wasn't physically created yet.
           return;
         }
@@ -2740,8 +2742,8 @@ class IndexManager {
         final metaStr = await _dataStore.storage.readAsString(metaPath);
         if (metaStr != null && metaStr.isNotEmpty) {
           final meta = IndexMeta.fromJson(jsonDecode(metaStr));
-          final updatedMeta =
-              meta.copyWith(name: newIndexName, fields: newFields);
+          final updatedMeta = meta.copyWith(
+              name: newIndexName, fields: newFields, tableName: tableName);
           await _dataStore.storage
               .writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
         }
@@ -2788,6 +2790,15 @@ class IndexManager {
             );
           }
         }
+      }
+
+      if (_dataStore.weightManager != null) {
+        await _dataStore.weightManager!.renameIndexWeights(
+          tableName,
+          oldIndexName: oldIndexName,
+          newIndexName: newIndexName,
+          spaceName: _dataStore.currentSpaceName,
+        );
       }
     } catch (e) {
       Logger.error('Failed to rename index: $e',
