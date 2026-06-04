@@ -9,6 +9,8 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   bool _allowAll = false;
   // add flag to indicate whether to continue on partial errors
   bool _continueOnPartialErrors = false;
+  // add flag to indicate whether to skip result details
+  bool _skipResultDetails = false;
 
   UpdateBuilder(super.db, super.tableName,
       [Map<String, dynamic> data = const {}])
@@ -228,6 +230,21 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
     return this;
   }
 
+  /// Skips collecting success/failure primary key lists and status details in the returned result.
+  /// Use this when performing large-scale range-based updates (e.g. `.where('id', '>', 5)`)
+  /// to improve performance and avoid memory overhead.
+  /// When skipped, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  ///
+  /// 跳过收集成功/失败的主键列表和状态详情。
+  /// 适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
+  /// 能够显著提升性能并避免内存开销。
+  /// 跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
+  UpdateBuilder skipResultDetails() {
+    _skipResultDetails = true;
+    _onChanged();
+    return this;
+  }
+
   @override
   Future<DbResult> get future async {
     _future ??= _db.updateInternal(
@@ -239,6 +256,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
       offset: _offset,
       allowAll: _allowAll,
       continueOnPartialErrors: _continueOnPartialErrors,
+      returnResultDetails: !_skipResultDetails,
     );
     return _future!;
   }
