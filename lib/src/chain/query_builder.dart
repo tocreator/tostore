@@ -413,7 +413,23 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<QueryResult<Map<String, dynamic>>> get future async {
     final bool isFirstRun = _future == null;
     _future ??= _executeQuery();
-    final result = await _future!;
+    final ExecuteResult result;
+    try {
+      result = await _future!;
+    } catch (e) {
+      if (e is DbException) {
+        return QueryResult.error(
+          type: e.statuses.isNotEmpty
+              ? e.statuses.first.type
+              : ResultType.unknown,
+          message: e.message,
+        );
+      }
+      return QueryResult.error(
+        type: ResultType.unknown,
+        message: e.toString(),
+      );
+    }
 
     Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
       final cloned = clone();
