@@ -1,5 +1,7 @@
 import '../../handler/logger.dart';
-import '../../model/business_error.dart';
+import '../../model/db_exception.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
 import '../../model/expr.dart';
 import '../../model/table_schema.dart';
 
@@ -18,9 +20,27 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   Map<String, FieldSchema>? fieldMap,
   bool hasResolvedPrimaryKey = false,
   Object? resolvedPrimaryKey,
+  bool ignoreUnknownFields = true,
 }) {
   try {
     final primaryKey = schema.primaryKey;
+    final fieldMapLocal =
+        fieldMap ?? {for (final f in schema.fields) f.name: f};
+
+    if (!ignoreUnknownFields) {
+      for (final key in data.keys) {
+        if (key != primaryKey && !fieldMapLocal.containsKey(key)) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message: 'Unknown field $key in table $tableName',
+              parameterName: key,
+              passedValue: data[key],
+            )
+          ]);
+        }
+      }
+    }
     final result = <String, dynamic>{};
 
     // 1. Primary key handling.
@@ -28,10 +48,14 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       if (hasResolvedPrimaryKey) {
         result[primaryKey] = resolvedPrimaryKey;
       } else {
-        throw const BusinessError(
-          'Primary key value cannot be null',
-          type: BusinessErrorType.invalidData,
-        );
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.notNullViolation,
+            message: 'Primary key value cannot be null (table $tableName)',
+            tableName: tableName,
+            fields: [primaryKey],
+          )
+        ]);
       }
     } else {
       final providedId = data[primaryKey];
@@ -39,10 +63,15 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       if (providedId != null &&
           !skipPrimaryKeyFormatCheck &&
           !schema.validatePrimaryKeyFormat(providedId)) {
-        throw BusinessError(
-          'The provided primary key value $providedId does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
-          type: BusinessErrorType.invalidData,
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentFormat,
+            message:
+                'The provided primary key value $providedId for table $tableName does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
+            parameterName: primaryKey,
+            passedValue: providedId,
+          )
+        ]);
       }
 
       result[primaryKey] =
@@ -86,6 +115,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       errors: validationErrors,
       trustedConvertedValues: true,
       fieldMap: fieldMap,
+      ignoreUnknownFields: ignoreUnknownFields,
     );
     if (validatedResult == null) {
       Logger.warn(
@@ -96,19 +126,15 @@ Map<String, dynamic>? validateAndProcessRecordPure({
     }
 
     return validatedResult;
+  } on DbException {
+    rethrow;
   } catch (e) {
     Logger.error(
       'Data validation failed: $e',
       label: 'RecordCompute.validateAndProcessRecordPure',
     );
     if (validationErrors != null) {
-      if (e is BusinessError &&
-          e.type == BusinessErrorType.invalidData &&
-          e.message.isNotEmpty) {
-        validationErrors.add(e.message);
-      } else {
-        validationErrors.add(e.toString());
-      }
+      validationErrors.add(e.toString());
     }
     return null;
   }
@@ -164,10 +190,28 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   required TableSchema schema,
   required Map<String, dynamic> data,
   required String tableName,
+  bool ignoreUnknownFields = true,
 }) {
   try {
-    final result = <String, dynamic>{};
     final primaryKey = schema.primaryKey;
+    final fieldMap = {for (final f in schema.fields) f.name: f};
+
+    if (!ignoreUnknownFields) {
+      for (final key in data.keys) {
+        if (key != primaryKey && !fieldMap.containsKey(key)) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message: 'Unknown field $key in table $tableName',
+              parameterName: key,
+              passedValue: data[key],
+            )
+          ]);
+        }
+      }
+    }
+
+    final result = <String, dynamic>{};
 
     for (final field in schema.fields) {
       if (field.name == primaryKey) {
@@ -184,13 +228,11 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         continue;
       }
 
-      if (!field.validateUpdateValue(value)) {
-        Logger.warn(
-          'Field ${field.name} value does not meet constraints: $value',
-          label: 'RecordCompute.validateAndProcessUpdateDataPure',
-        );
-        return null;
-      }
+      field.checkConstraints(
+        value,
+        tableName: tableName,
+        skipMaxLengthCheck: true,
+      );
 
       result[field.name] = field.convertValue(value);
       if (result[field.name] != null &&
@@ -207,6 +249,8 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
     }
 
     return result;
+  } on DbException {
+    rethrow;
   } catch (e) {
     Logger.error(
       'Update data validation failed: $e',
