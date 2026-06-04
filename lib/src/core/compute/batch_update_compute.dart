@@ -1,5 +1,6 @@
 import '../../model/expr.dart';
 import '../../model/table_schema.dart';
+import '../../model/db_exception.dart';
 import '../../handler/logger.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
@@ -12,6 +13,7 @@ class BatchUpdatePrepareRequest {
   final List<Map<String, dynamic>> records;
   final List<Map<String, dynamic>?> existingRecords;
   final List<IndexSchema> uniqueIndexes;
+  final bool ignoreUnknownFields;
 
   BatchUpdatePrepareRequest({
     required this.schema,
@@ -19,6 +21,7 @@ class BatchUpdatePrepareRequest {
     required this.records,
     required this.existingRecords,
     required this.uniqueIndexes,
+    this.ignoreUnknownFields = true,
   });
 }
 
@@ -31,6 +34,7 @@ class BatchUpdatePreparedRecord {
   final List<PlannedUniqueKeyRef> reservationUniqueRefs;
   final List<PlannedUniqueKeyRef> currentUniqueRefs;
   final List<String> fieldConstraintErrors;
+  final List<Map<String, dynamic>>? validationStatusesJson;
 
   BatchUpdatePreparedRecord({
     required this.missingExistingRecord,
@@ -40,6 +44,7 @@ class BatchUpdatePreparedRecord {
     required this.reservationUniqueRefs,
     required this.currentUniqueRefs,
     required this.fieldConstraintErrors,
+    this.validationStatusesJson,
   });
 }
 
@@ -119,12 +124,30 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
       continue;
     }
 
-    final validData = validateAndProcessUpdateDataPure(
-      schema: request.schema,
-      data: record,
-      tableName: request.tableName,
-    );
-    if (validData == null || validData.isEmpty) {
+    Map<String, dynamic>? validData;
+    final fieldConstraintErrors = <String>[];
+    List<Map<String, dynamic>>? validationStatusesJson;
+    bool validationFailed = false;
+    try {
+      validData = validateAndProcessUpdateDataPure(
+        schema: request.schema,
+        data: record,
+        tableName: request.tableName,
+        ignoreUnknownFields: request.ignoreUnknownFields,
+      );
+      if (validData == null || validData.isEmpty) {
+        validationFailed = true;
+      }
+    } on DbException catch (e) {
+      validationFailed = true;
+      fieldConstraintErrors.addAll(e.statuses.map((s) => s.message));
+      validationStatusesJson = e.statuses.map((s) => s.toJson()).toList();
+    } catch (e) {
+      validationFailed = true;
+      fieldConstraintErrors.add(e.toString());
+    }
+
+    if (validationFailed) {
       results.add(
         BatchUpdatePreparedRecord(
           missingExistingRecord: false,
@@ -133,7 +156,8 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
           changedFields: const <String>[],
           reservationUniqueRefs: const <PlannedUniqueKeyRef>[],
           currentUniqueRefs: const <PlannedUniqueKeyRef>[],
-          fieldConstraintErrors: const <String>[],
+          fieldConstraintErrors: fieldConstraintErrors,
+          validationStatusesJson: validationStatusesJson,
         ),
       );
       continue;
@@ -141,9 +165,13 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
 
     final updatedRecord = <String, dynamic>{...existingRecord};
     final changedFields = <String>[];
-    final fieldConstraintErrors = <String>[];
 
-    for (final entry in validData.entries) {
+    final actualValidData = validData;
+    if (actualValidData == null) {
+      continue;
+    }
+
+    for (final entry in actualValidData.entries) {
       final fieldName = entry.key;
       final proposed = entry.value;
 
@@ -161,7 +189,15 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
           }
 
           final converted = field.convertValue(result);
-          if (!field.validateUpdateValue(converted)) {
+          try {
+            field.checkConstraints(
+              converted,
+              tableName: request.schema.name,
+              skipMaxLengthCheck: true,
+            );
+          } on DbException catch (e) {
+            validationStatusesJson ??= [];
+            validationStatusesJson.addAll(e.statuses.map((s) => s.toJson()));
             fieldConstraintErrors.add(
               'Result of expression for $fieldName exceeds constraints: $converted',
             );
@@ -225,6 +261,7 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
         reservationUniqueRefs: reservationUniqueRefs,
         currentUniqueRefs: currentUniqueRefs,
         fieldConstraintErrors: fieldConstraintErrors,
+        validationStatusesJson: validationStatusesJson,
       ),
     );
   }
