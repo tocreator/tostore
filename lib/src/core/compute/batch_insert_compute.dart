@@ -1,4 +1,5 @@
 import '../../model/table_schema.dart';
+import '../../model/db_exception.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
 import 'unique_ref_compute.dart';
@@ -10,6 +11,7 @@ class BatchInsertPrepareRequest {
   final List<Map<String, dynamic>> records;
   final List<IndexSchema> uniqueIndexes;
   final List<bool> skipPrimaryKeyFormatChecks;
+  final bool ignoreUnknownFields;
 
   BatchInsertPrepareRequest({
     required this.schema,
@@ -17,6 +19,7 @@ class BatchInsertPrepareRequest {
     required this.records,
     required this.uniqueIndexes,
     required this.skipPrimaryKeyFormatChecks,
+    this.ignoreUnknownFields = true,
   });
 }
 
@@ -26,12 +29,14 @@ class BatchInsertPreparedRecord {
   final Object? preparedPrimaryKeyValue;
   final List<PlannedUniqueKeyRef> plannedUniqueRefs;
   final List<String> validationErrors;
+  final List<Map<String, dynamic>>? validationStatusesJson;
 
   BatchInsertPreparedRecord({
     required this.validData,
     required this.preparedPrimaryKeyValue,
     required this.plannedUniqueRefs,
     required this.validationErrors,
+    this.validationStatusesJson,
   });
 }
 
@@ -63,14 +68,24 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
   for (int i = 0; i < request.records.length; i++) {
     await yieldController.maybeYield();
     final errors = <String>[];
-    final validData = validateAndProcessRecordPure(
-      schema: request.schema,
-      data: request.records[i],
-      tableName: request.tableName,
-      skipPrimaryKeyFormatCheck: request.skipPrimaryKeyFormatChecks[i],
-      validationErrors: errors,
-      fieldMap: fieldMap,
-    );
+    Map<String, dynamic>? validData;
+    List<Map<String, dynamic>>? validationStatusesJson;
+    try {
+      validData = validateAndProcessRecordPure(
+        schema: request.schema,
+        data: request.records[i],
+        tableName: request.tableName,
+        skipPrimaryKeyFormatCheck: request.skipPrimaryKeyFormatChecks[i],
+        validationErrors: errors,
+        fieldMap: fieldMap,
+        ignoreUnknownFields: request.ignoreUnknownFields,
+      );
+    } on DbException catch (e) {
+      errors.addAll(e.statuses.map((s) => s.message));
+      validationStatusesJson = e.statuses.map((s) => s.toJson()).toList();
+    } catch (e) {
+      errors.add(e.toString());
+    }
     final plannedUniqueRefs = validData == null
         ? const <PlannedUniqueKeyRef>[]
         : planInsertUniqueRefsPure(
@@ -85,6 +100,7 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
             validData == null ? null : validData[request.schema.primaryKey],
         plannedUniqueRefs: plannedUniqueRefs,
         validationErrors: errors,
+        validationStatusesJson: validationStatusesJson,
       ),
     );
   }
