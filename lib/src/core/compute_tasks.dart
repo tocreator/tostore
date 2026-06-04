@@ -688,6 +688,7 @@ Map<String, dynamic> applyMigrationOperationsSync(
             record,
             update,
             oldFieldSchema: oldField,
+            tableName: oldSchema?.name ?? '',
           );
         }
         break;
@@ -759,7 +760,8 @@ Map<String, dynamic> applyMigrationReverseOperationsSync(
         if (update != null && record.containsKey(update.name)) {
           final oldField = oldFieldByName[update.name];
           if (oldField != null) {
-            _revertFieldModificationSync(record, update.name, oldField);
+            _revertFieldModificationSync(
+                record, update.name, oldField, oldSchema.name);
           }
         }
         break;
@@ -786,6 +788,7 @@ void _revertFieldModificationSync(
   Map<String, dynamic> record,
   String fieldName,
   FieldSchema oldField,
+  String tableName,
 ) {
   if (!record.containsKey(fieldName)) return;
 
@@ -813,7 +816,7 @@ void _revertFieldModificationSync(
     }
   }
 
-  if (!oldField.validateValue(value)) {
+  if (!oldField.validateValue(value, tableName: tableName)) {
     value = oldField.getDefaultValue();
   }
 
@@ -875,7 +878,7 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
 /// Apply field modification to a single record
 Map<String, dynamic> applyFieldModification(
     Map<String, dynamic> record, FieldSchemaUpdate fieldUpdate,
-    {FieldSchema? oldFieldSchema}) {
+    {FieldSchema? oldFieldSchema, String tableName = ''}) {
   // Create field schema for validation and get default value
   final fieldSchema = FieldSchema(
     name: fieldUpdate.name,
@@ -1002,7 +1005,8 @@ Map<String, dynamic> applyFieldModification(
   }
 
   // 7. Final validation
-  if (!fieldSchema.validateValue(record[fieldUpdate.name])) {
+  if (!fieldSchema.validateValue(record[fieldUpdate.name],
+      tableName: tableName)) {
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
     Logger.warn(
       'Field ${fieldUpdate.name} value does not meet constraints after updates, using default value',
