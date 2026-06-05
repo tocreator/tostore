@@ -9,8 +9,10 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
-import '../model/business_error.dart';
 import '../model/data_store_config.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
@@ -995,10 +997,16 @@ class TableDataManager {
       if (existingOp != null) {
         if (existingOp.type == BufferOperationType.delete &&
             operationType == BufferOperationType.update) {
-          throw BusinessError(
-            'Cannot update record $recordId in table $tableName because it has already been deleted in the current transaction',
-            type: BusinessErrorType.notFound,
-          );
+          throw DbException([
+            ConstraintStatus(
+              type: ResultType.notFound,
+              tableName: tableName,
+              fields: [primaryKey],
+              conflictingKeys: [recordId],
+              message:
+                  'Cannot update record $recordId in table $tableName because it has already been deleted in the current transaction',
+            ),
+          ]);
         }
         if (existingOp.type == BufferOperationType.insert &&
             operationType == BufferOperationType.update) {
@@ -1053,10 +1061,16 @@ class TableDataManager {
           _dataStore.writeBufferManager.getBufferedRecord(tableName, recordId);
       if (priorBuffered != null &&
           priorBuffered.operation == BufferOperationType.delete) {
-        throw BusinessError(
-          'Cannot update record $recordId in table $tableName because it has already been deleted',
-          type: BusinessErrorType.notFound,
-        );
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.notFound,
+            tableName: tableName,
+            fields: [primaryKey],
+            conflictingKeys: [recordId],
+            message:
+                'Cannot update record $recordId in table $tableName because it has already been deleted',
+          ),
+        ]);
       }
     }
 
