@@ -9,7 +9,9 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
 import '../model/background_write_mode.dart';
-import '../model/business_error.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/cancellation_token.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
@@ -2976,10 +2978,17 @@ class IndexManager {
         final encodedKey = base64Encode(key);
         final existingOwner = seenInBatch[encodedKey];
         if (existingOwner != null && existingOwner != pk) {
-          throw BusinessError(
-            'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=$pk',
-            type: BusinessErrorType.uniqueError,
-          );
+          throw DbException([
+            ConstraintStatus(
+              type: ResultType.uniqueViolation,
+              message:
+                  'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=$pk',
+              tableName: tableName,
+              constraintName: index.actualIndexName,
+              fields: index.fields,
+              conflictingKeys: [pk],
+            )
+          ]);
         }
 
         if (existingOwner == null) {
@@ -3008,10 +3017,17 @@ class IndexManager {
         if (existingOwner == null || existingOwner == owners[i]) {
           continue;
         }
-        throw BusinessError(
-          'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=${owners[i]}',
-          type: BusinessErrorType.uniqueError,
-        );
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.uniqueViolation,
+            message:
+                'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=${owners[i]}',
+            tableName: tableName,
+            constraintName: index.actualIndexName,
+            fields: index.fields,
+            conflictingKeys: [owners[i]],
+          )
+        ]);
       }
     }
   }
