@@ -16,7 +16,8 @@ import '../handler/platform_handler.dart';
 import '../handler/value_matcher.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
-import '../model/business_error.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
 import '../model/cancellation_token.dart';
 import '../model/change_event.dart';
 import '../model/config_info.dart';
@@ -226,7 +227,7 @@ class DataStoreImpl {
   /// Out-of-line large value store (TOAST-like).
   late OverflowManager overflowManager;
 
-  /// If inside a transaction and rollbackOnError=true, throw BusinessError on non-success DbResult
+  /// If inside a transaction and rollbackOnError=true, throw DbException on non-success DbResult
   DbResult _returnOrThrowIfTxn(
       DbResult result, String operation, String tableName) {
     final String? txId = Zone.current[_txnZoneKey] as String?;
@@ -234,99 +235,48 @@ class DataStoreImpl {
     final bool rollbackOnError =
         Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
     if (!rollbackOnError) return result;
-    if (!result.isSuccess && result.type != ResultType.notFound) {
-      throw BusinessError(
-        'Transaction operation failed: $operation on $tableName -> ${result.message}',
-        type: BusinessErrorType.transactionError,
-        data: result.toJson(),
-      );
+    if (result.hasFailed) {
+      final List<ResultStatus> statuses = result.statuses.isNotEmpty
+          ? result.statuses
+          : [
+              TransactionOperationStatus(
+                type: ResultType.transactionErrorAborted,
+                message:
+                    'Transaction operation failed: $operation on $tableName',
+                txId: txId,
+              ),
+            ];
+      throw DbException(statuses);
     }
     return result;
   }
 
   /// Normalize cascade operation errors to appropriate ResultType
   ///
-  /// This function maps different error types from cascade operations (update/delete)
-  /// to appropriate ResultType values, providing better error classification:
-  ///
-  /// - BusinessError with invalidData/notFound -> foreignKeyViolation/notFound
-  /// - BusinessError with dbError -> dbError
-  /// - System errors -> dbError or ioError
-  ///
-  /// This helps users distinguish between constraint violations and system errors
-  /// without being too granular.
   DbResult _normalizeCascadeError(
     dynamic error,
     String operation, // 'update', 'delete', or 'clear'
   ) {
-    // Handle BusinessError
-    if (error is BusinessError) {
-      switch (error.type) {
-        case BusinessErrorType.invalidData:
-          // Foreign key constraint violation or data validation error
-          // Check if it's a foreign key related error
-          if (error.message.toLowerCase().contains('foreign key') ||
-              error.message.toLowerCase().contains('referenced') ||
-              error.message.toLowerCase().contains('cannot update') ||
-              error.message.toLowerCase().contains('cannot delete') ||
-              error.message.toLowerCase().contains('cannot clear')) {
-            return DbResult.error(
-              type: ResultType.foreignKeyViolation,
-              message: error.message,
-            );
-          }
-          // Other data validation errors
-          return DbResult.error(
-            type: ResultType.validationFailed,
-            message: error.message,
-          );
-
-        case BusinessErrorType.notFound:
-          return DbResult.error(
-            type: ResultType.notFound,
-            message: error.message,
-          );
-
-        case BusinessErrorType.dbError:
-        case BusinessErrorType.primaryKeyError:
-          return DbResult.error(
-            type: ResultType.dbError,
-            message: error.message,
-          );
-
-        case BusinessErrorType.transactionError:
-          return DbResult.error(
-            type: ResultType.dbError,
-            message:
-                'Transaction error during cascade $operation: ${error.message}',
-          );
-
-        default:
-          // For other BusinessError types, use dbError as fallback
-          return DbResult.error(
-            type: ResultType.dbError,
-            message: 'Cascade $operation failed: ${error.message}',
-          );
-      }
+    if (error is DbException) {
+      return DbResult.batch(
+        statuses: error.statuses,
+        failedCount: error.statuses.length,
+      );
     }
 
-    // Handle other exceptions (system errors, IO errors, etc.)
     final errorMessage = error.toString();
-
-    // Check for IO-related errors
+    final ResultType type;
     if (errorMessage.toLowerCase().contains('io') ||
         errorMessage.toLowerCase().contains('file') ||
         errorMessage.toLowerCase().contains('permission') ||
         errorMessage.toLowerCase().contains('access')) {
-      return DbResult.error(
-        type: ResultType.ioError,
-        message: 'IO error during cascade $operation: $errorMessage',
-      );
+      type = ResultType.ioError;
+    } else {
+      type = ResultType.dbError;
     }
 
-    // Default to dbError for unknown errors
     return DbResult.error(
-      type: ResultType.dbError,
+      type: type,
       message: 'Cascade $operation failed: $errorMessage',
     );
   }
@@ -632,10 +582,15 @@ class DataStoreImpl {
       // On mobile platforms, a persistent dbPath must be explicitly provided by the app.
       // This avoids silently falling back to temporary or undefined locations.
       if (PlatformHandler.isMobile) {
-        throw const BusinessError(
-          'On mobile platforms (Android/iOS ...), dbPath is required. Please inject a persistent app directory path via ToStore(dbPath: ...) or DataStoreConfig(dbPath: ...). See example/mobile_quickstart.dart',
-          type: BusinessErrorType.invalidData,
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentFormat,
+            message:
+                'On mobile platforms (Android/iOS ...), dbPath is required. Please inject a persistent app directory path via ToStore(dbPath: ...) or DataStoreConfig(dbPath: ...). See example/mobile_quickstart.dart',
+            parameterName: 'dbPath',
+            passedValue: null,
+          ),
+        ]);
       }
       rootPath = await getPathApp();
     }
@@ -997,7 +952,7 @@ class DataStoreImpl {
           systemSchemas,
           isSystemTable: true,
         );
-        if (!systemTablesResult.isSuccess) {
+        if (systemTablesResult.hasFailed) {
           Logger.warn(
             'Failed to create system tables: ${systemTablesResult.message}',
             label: 'DataStoreImpl._startSetupAndUpgrade',
@@ -1011,7 +966,7 @@ class DataStoreImpl {
         // This ensures parent tables are created before child tables, regardless of definition order
         if (userSchemas.isNotEmpty) {
           final userTablesResult = await createTables(userSchemas);
-          if (!userTablesResult.isSuccess &&
+          if (userTablesResult.hasFailed &&
               userTablesResult.failedKeys.isNotEmpty) {
             // If all tables failed, throw error; if partial success, log warning but continue
             if (userTablesResult.successKeys.isEmpty) {
@@ -1270,17 +1225,12 @@ class DataStoreImpl {
         final bool isKnownSystemTable =
             SystemTable.isKnownSystemTable(schema.name);
         final bool allowSystemSchema = isKnownSystemTable || isSystemTable;
-        if (!schemaValid.validateTableSchema(
+        schemaValid.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
           allowReservedTableNames: allowSystemSchema,
           allowInternalTableNamePrefix: allowSystemSchema,
           allowOtherInternalFields: allowSystemSchema,
-        )) {
-          throw BusinessError(
-            'The structure of table ${schema.name} is invalid, please check primary key configuration and index fields',
-            type: BusinessErrorType.schemaError,
-          );
-        }
+        );
 
         // Validate foreign key constraints with referenced tables
         // This ensures field type compatibility and referenced table existence
@@ -1290,28 +1240,48 @@ class DataStoreImpl {
           final referencedSchema =
               await schemaManager?.getTableSchema(fk.referencedTable);
           if (referencedSchema == null) {
-            throw BusinessError(
-              'Cannot create table ${schema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
-              type: BusinessErrorType.schemaError,
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.notFoundTable,
+                message:
+                    'Cannot create table ${schema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
+                tableName: schema.name,
+                field: fk.fields.join(','),
+                wrongValue: fk.referencedTable,
+              ),
+            ]);
           }
 
           if (schemaValid.isGlobal != referencedSchema.isGlobal) {
-            throw BusinessError(
-              'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
-              '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
-              'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
-              'Foreign key relationships across global and space boundaries are not allowed.',
-              type: BusinessErrorType.schemaError,
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.invalidSchemaSpaceMismatch,
+                message:
+                    'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
+                    '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
+                    'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+                    'Foreign key relationships across global and space boundaries are not allowed.',
+                tableName: schema.name,
+                field: fk.fields.join(','),
+                wrongValue: {
+                  'tableIsGlobal': schema.isGlobal,
+                  'referencedTableIsGlobal': referencedSchema.isGlobal,
+                },
+              ),
+            ]);
           }
 
           if (!schemaValid.validateForeignKeyWithReferencedTable(
               fk, referencedSchema)) {
-            throw BusinessError(
-              'Invalid foreign key ${fk.actualName} in table ${schema.name}: Field type mismatch or invalid configuration',
-              type: BusinessErrorType.schemaError,
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.invalidSchemaForeignKey,
+                message:
+                    'Invalid foreign key ${fk.actualName} in table ${schema.name}: Field type mismatch or invalid configuration',
+                tableName: schema.name,
+                field: fk.fields.join(','),
+              ),
+            ]);
           }
         }
 
@@ -1350,6 +1320,7 @@ class DataStoreImpl {
         }
 
         return finish(DbResult.success(
+          successKey: schema.name,
           message: 'Table ${schema.name} created successfully',
         ));
       } catch (e) {
@@ -1362,16 +1333,10 @@ class DataStoreImpl {
 
         Logger.error('Create table failed: $e', label: 'DataStore.createTable');
         // Convert exception to DbResult for graceful error handling
-        if (e is BusinessError) {
-          if (e.type == BusinessErrorType.schemaError) {
-            return finish(DbResult.error(
-              type: ResultType.validationFailed,
-              message: e.message,
-            ));
-          }
-          return finish(DbResult.error(
-            type: ResultType.dbError,
-            message: e.message,
+        if (e is DbException) {
+          return finish(DbResult.batch(
+            statuses: e.statuses,
+            failedCount: e.statuses.length,
           ));
         }
         return finish(DbResult.error(
@@ -1485,13 +1450,15 @@ class DataStoreImpl {
     // Create tables in sorted order
     final List<String> successKeys = [];
     final List<String> failedKeys = [];
+    final List<ResultStatus> statuses = [];
 
     for (var schema in sortedSchemas) {
       final result = await createTable(
         schema,
         isSystemTable: isSystemTable,
       );
-      if (result.isSuccess) {
+      statuses.addAll(result.statuses);
+      if (!result.hasFailed) {
         successKeys.add(schema.name);
       } else {
         failedKeys.add(schema.name);
@@ -1500,18 +1467,22 @@ class DataStoreImpl {
     }
 
     if (failedKeys.isEmpty) {
-      return DbResult.success(
-        message: 'All ${successKeys.length} tables created successfully',
+      return DbResult(
+        statuses: statuses,
         successKeys: successKeys,
+        successCount: successKeys.length,
+        failedCount: 0,
       );
     } else if (successKeys.isEmpty) {
       return DbResult.error(
         type: ResultType.dbError,
         message: 'Failed to create all tables',
         failedKeys: failedKeys,
+        statuses: statuses,
       );
     } else {
       return DbResult.batch(
+        statuses: statuses,
         message:
             'Partially successful: ${successKeys.length} tables created, ${failedKeys.length} failed',
         successKeys: successKeys,
@@ -1559,12 +1530,25 @@ class DataStoreImpl {
       }
 
       final validationErrors = <String>[];
-      validData = await _validateAndProcessData(
-        schema,
-        data,
-        tableName,
-        validationErrors: validationErrors,
-      );
+      try {
+        validData = await _validateAndProcessData(
+          schema,
+          data,
+          tableName,
+          validationErrors: validationErrors,
+        );
+      } on DbException catch (e) {
+        final detailMsg = e.statuses.isNotEmpty
+            ? 'Data validation failed for table $tableName: ${e.statuses.map((s) => s.message).join("; ")}'
+            : 'Data validation failed for table $tableName';
+        return finish(DbResult.error(
+          type: e.statuses.isNotEmpty
+              ? e.statuses.first.type
+              : ResultType.validationFailed,
+          message: detailMsg,
+          statuses: e.statuses,
+        ));
+      }
       if (validData == null) {
         final detailMsg = validationErrors.isNotEmpty
             ? 'Data validation failed for table $tableName: ${validationErrors.join("; ")}'
@@ -1830,6 +1814,7 @@ class DataStoreImpl {
       fieldMap: fieldMap,
       hasResolvedPrimaryKey: resolvedPrimaryKey != null,
       resolvedPrimaryKey: resolvedPrimaryKey,
+      ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
     );
   }
 
@@ -1873,6 +1858,7 @@ class DataStoreImpl {
             uniqueIndexes: uniqueIndexes,
             skipPrimaryKeyFormatChecks:
                 skipPrimaryKeyFormatChecks.sublist(range.start, range.end),
+            ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
           ),
         ),
       );
@@ -2005,6 +1991,7 @@ class DataStoreImpl {
             records: records.sublist(range.start, range.end),
             existingRecords: existingRecords.sublist(range.start, range.end),
             uniqueIndexes: uniqueIndexes,
+            ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
           ),
         ),
       );
@@ -2352,6 +2339,7 @@ class DataStoreImpl {
     int? checkpointUpdatedSoFar,
     String? checkpointOpId,
     String? checkpointCursor,
+    bool returnResultDetails = true,
   }) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
     List<String>? partialUniqueFailedKeys;
@@ -2392,8 +2380,21 @@ class DataStoreImpl {
           message: 'Table $tableName does not exist',
         ));
       }
-      final validData =
-          await _validateAndProcessUpdateData(schema, data, tableName);
+      Map<String, dynamic>? validData;
+      try {
+        validData =
+            await _validateAndProcessUpdateData(schema, data, tableName);
+      } on DbException catch (e) {
+        return finish(DbResult.error(
+          type: e.statuses.isNotEmpty
+              ? e.statuses.first.type
+              : ResultType.validationFailed,
+          message: e.statuses.isNotEmpty
+              ? e.statuses.first.message
+              : 'Data validation failed',
+          statuses: e.statuses,
+        ));
+      }
       if (validData == null || validData.isEmpty) {
         return finish(DbResult.error(
           type: ResultType.validationFailed,
@@ -2455,10 +2456,24 @@ class DataStoreImpl {
             );
             if (evalResult.records.length > 1) {
               if (!continueOnPartialErrors) {
-                throw BusinessError(
-                  'Batch update would modify multiple records but unique key or primary key would be duplicated.',
-                  type: BusinessErrorType.uniqueError,
-                );
+                final conflictFields =
+                    data.keys.where((k) => uniqueFields.contains(k)).toList();
+                final conflictValues =
+                    conflictFields.map((f) => data[f]).toList();
+
+                throw DbException([
+                  ConstraintStatus(
+                    type: ResultType.uniqueViolation,
+                    message:
+                        'Batch update would modify multiple records but unique key or primary key would be duplicated. '
+                        'Conflicting fields: ${conflictFields.join(", ")}, Update values: ${conflictValues.map((v) => v.toString()).join(", ")}',
+                    tableName: tableName,
+                    fields: conflictFields.isNotEmpty
+                        ? conflictFields
+                        : [schema.primaryKey],
+                    conflictingKeys: conflictValues,
+                  ),
+                ]);
               } else {
                 limit = 1;
                 final secondPk =
@@ -2555,6 +2570,13 @@ class DataStoreImpl {
 
       // If inside a transaction and this is a heavy update path, we should defer execution
       if (!isOptimizableQuery) {
+        if (returnResultDetails) {
+          return finish(DbResult.error(
+            type: ResultType.validationFailed,
+            message:
+                'This is a large-scale update operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
+          ));
+        }
         // Heavy update branch
         if (txId != null && !TransactionContext.isApplyingCommit()) {
           // Defer heavy update within transaction: record plan only and return success
@@ -2685,6 +2707,8 @@ class DataStoreImpl {
         }
         final List<String> successKeys = [];
         final List<String> failedKeys = [];
+        int successCount = 0;
+        int failedCount = 0;
 
         // Row-level locks for target records
         final lockMgr = lockManager;
@@ -2758,13 +2782,16 @@ class DataStoreImpl {
             } catch (e) {
               if (e is UniqueViolation) {
                 if (continueOnPartialErrors) {
-                  failedKeys.add(recordKey);
+                  if (returnResultDetails) {
+                    failedKeys.add(recordKey);
+                  }
+                  failedCount++;
                   continue;
                 }
                 return finish(DbResult.error(
                   type: ResultType.uniqueViolation,
                   message: e.message,
-                  failedKeys: [recordKey],
+                  failedKeys: returnResultDetails ? [recordKey] : const [],
                 ));
               }
               rethrow;
@@ -2792,13 +2819,16 @@ class DataStoreImpl {
                 Logger.error('Foreign key constraint validation failed: $e',
                     label: 'DataStore.updateInternal');
                 if (continueOnPartialErrors) {
-                  failedKeys.add(recordKey);
+                  if (returnResultDetails) {
+                    failedKeys.add(recordKey);
+                  }
+                  failedCount++;
                   continue;
                 }
                 return finish(DbResult.error(
                   type: ResultType.foreignKeyViolation,
                   message: e.toString(),
-                  failedKeys: [recordKey],
+                  failedKeys: returnResultDetails ? [recordKey] : const [],
                 ));
               }
             }
@@ -2834,7 +2864,10 @@ class DataStoreImpl {
           }
 
           if (!ok) {
-            failedKeys.add(recordKey);
+            if (returnResultDetails) {
+              failedKeys.add(recordKey);
+            }
+            failedCount++;
             if (continueOnPartialErrors) {
               continue;
             }
@@ -2842,7 +2875,7 @@ class DataStoreImpl {
               type: ResultType.uniqueViolation,
               message:
                   uniqueViolation?.message ?? 'Unique constraint violation',
-              failedKeys: [recordKey],
+              failedKeys: returnResultDetails ? [recordKey] : const [],
             ));
           }
 
@@ -2861,7 +2894,10 @@ class DataStoreImpl {
                 );
                 if (continueOnPartialErrors) {
                   // release unique locks before continuing
-                  failedKeys.add(recordKey);
+                  if (returnResultDetails) {
+                    failedKeys.add(recordKey);
+                  }
+                  failedCount++;
                   continue;
                 }
                 // release unique locks before returning
@@ -2933,7 +2969,10 @@ class DataStoreImpl {
           }
 
           // Add to success keys list
-          successKeys.add(recordKey);
+          if (returnResultDetails) {
+            successKeys.add(recordKey);
+          }
+          successCount++;
         }
 
         // Non-transaction: release locks immediately; transaction: release by commit/rollback
@@ -2948,7 +2987,17 @@ class DataStoreImpl {
         } catch (_) {}
 
         // If there are both successful and failed records
-        if (successKeys.isNotEmpty && failedKeys.isNotEmpty) {
+        if (successCount > 0 && failedCount > 0) {
+          if (!returnResultDetails) {
+            return finish(DbResult(
+              statuses: const [],
+              successKeys: const [],
+              failedKeys: const [],
+              successCount: successCount,
+              failedCount: failedCount,
+              data: null,
+            ));
+          }
           return finish(DbResult.batch(
             successKeys: successKeys,
             failedKeys: failedKeys,
@@ -2957,11 +3006,32 @@ class DataStoreImpl {
           ));
         } else {
           if (partialUniqueFailedKeys != null) {
+            final int partialFailedCount = partialUniqueFailedKeys.length;
+            if (!returnResultDetails) {
+              return finish(DbResult(
+                statuses: const [],
+                successKeys: const [],
+                failedKeys: const [],
+                successCount: successCount,
+                failedCount: partialFailedCount,
+                data: null,
+              ));
+            }
             return finish(DbResult.batch(
               successKeys: successKeys,
               failedKeys: partialUniqueFailedKeys,
               message:
                   'Update partially successful, unique constraint skipped remaining records',
+            ));
+          }
+          if (!returnResultDetails) {
+            return finish(DbResult(
+              statuses: const [],
+              successKeys: const [],
+              failedKeys: const [],
+              successCount: successCount,
+              failedCount: 0,
+              data: null,
             ));
           }
           return finish(DbResult.success(
@@ -2976,19 +3046,12 @@ class DataStoreImpl {
       if (isInTransactionWithRollback()) {
         rethrow;
       }
-      if (e is BusinessError) {
-        if (e.type == BusinessErrorType.notFound) {
-          return finish(DbResult.error(
-            type: ResultType.notFound,
-            message: e.message,
-          ));
-        }
-        if (e.type == BusinessErrorType.invalidData) {
-          return finish(DbResult.error(
-            type: ResultType.validationFailed,
-            message: e.message,
-          ));
-        }
+      if (e is DbException) {
+        return finish(DbResult.batch(
+          statuses: returnResultDetails ? e.statuses : const [],
+          successCount: 0,
+          failedCount: e.statuses.length,
+        ));
       }
       // Best-effort release locks
       try {
@@ -3115,6 +3178,7 @@ class DataStoreImpl {
     int? checkpointDeletedSoFar,
     String? checkpointOpId,
     String? checkpointCursor,
+    bool returnResultDetails = true,
   }) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
     await ensureInitialized();
@@ -3148,7 +3212,7 @@ class DataStoreImpl {
         // Use clear() for better performance when deleting all records
         // clear() now returns DbResult for graceful error handling
         final clearResult = await clear(tableName);
-        if (clearResult.isSuccess) {
+        if (!clearResult.hasFailed) {
           return finish(DbResult.success(
             message: 'All records in table $tableName have been deleted',
           ));
@@ -3331,6 +3395,7 @@ class DataStoreImpl {
 
         // Collect successful primary keys
         final List<String> successKeys = [];
+        int successCount = 0;
 
         // Row-level locks for delete
         final lockMgr = lockManager;
@@ -3359,7 +3424,10 @@ class DataStoreImpl {
             } catch (_) {}
           }
           // Add to success keys
-          successKeys.add(pkValue);
+          if (txId == null || returnResultDetails) {
+            successKeys.add(pkValue);
+          }
+          successCount++;
 
           // Register write-set for SSI conflict detection
           if (txId != null) {
@@ -3398,11 +3466,28 @@ class DataStoreImpl {
           }
         }
 
+        if (!returnResultDetails) {
+          return finish(DbResult(
+            statuses: const [],
+            successKeys: const [],
+            failedKeys: const [],
+            successCount: successCount,
+            failedCount: 0,
+          ));
+        }
+
         return finish(DbResult.success(
           successKeys: successKeys,
           message: 'Successfully deleted ${successKeys.length} records',
         ));
       } else {
+        if (returnResultDetails) {
+          return finish(DbResult.error(
+            type: ResultType.validationFailed,
+            message:
+                'This is a large-scale delete operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
+          ));
+        }
         // Heavy delete branch
         if (txId != null && !TransactionContext.isApplyingCommit()) {
           // Defer heavy delete within transaction: record plan only and return success
@@ -3479,7 +3564,7 @@ class DataStoreImpl {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
           if (op.type == 'clear') {
             final clearResult = await clear(op.table, registerWalOp: false);
-            if (!clearResult.isSuccess) {
+            if (clearResult.hasFailed) {
               Logger.error(
                 'Failed to resume clear operation for table ${op.table}: ${clearResult.message}',
                 label: 'DataStore._resumePendingTableOps',
@@ -3493,7 +3578,7 @@ class DataStoreImpl {
               isMigration: false,
               registerWalOp: false,
             );
-            if (!dropResult.isSuccess) {
+            if (dropResult.hasFailed) {
               Logger.error(
                 'Failed to resume drop operation for table ${op.table}: ${dropResult.message}',
                 label: 'DataStore._resumePendingTableOps',
@@ -3617,7 +3702,7 @@ class DataStoreImpl {
         TransactionContext.readKeysKey: <String, Set<String>>{},
       });
       return result;
-    } catch (e, stack) {
+    } catch (e) {
       // Rollback on any error
       try {
         await tableDataManager.applyTransactionRollback(txId);
@@ -3639,42 +3724,46 @@ class DataStoreImpl {
 
       final finished = DateTime.now();
       // If SSI is enabled, we could signal retry advice here (future work)
+      final List<ResultStatus> statuses;
+      if (e is DbException) {
+        statuses = e.statuses;
+      } else {
+        final resultType = _classifyErrorToResultType(e);
+        statuses = [
+          TransactionOperationStatus(
+            type: resultType,
+            message: e.toString(),
+            txId: txId,
+          ),
+        ];
+      }
       return TransactionResult.failed(
         txId: txId,
         startedAt: started,
         finishedAt: finished,
-        error: TransactionError(
-          type: _classifyTransactionErrorOrUnknown(e),
-          message: e.toString(),
-          cause: e,
-          stackTrace: stack.toString(),
-        ),
+        statuses: statuses,
       );
     }
   }
 
-  TransactionErrorType _classifyTransactionErrorOrUnknown(Object e) {
-    if (e is TimeoutException) return TransactionErrorType.timeout;
-
-    final businessClassification = _classifyBusinessTransactionError(e);
-    if (businessClassification != null) {
-      return businessClassification;
-    }
-
+  ResultType _classifyErrorToResultType(Object e) {
+    if (e is TimeoutException) return ResultType.timeout;
     final msg = e.toString().toLowerCase();
-    if (msg.contains('timeout')) return TransactionErrorType.timeout;
+    if (msg.contains('timeout')) return ResultType.timeout;
     if (_looksLikeIoFailure(e, msg)) {
-      return TransactionErrorType.io;
+      if (msg.contains('read')) return ResultType.ioErrorFileRead;
+      if (msg.contains('write')) return ResultType.ioErrorFileWrite;
+      return ResultType.ioError;
     }
     if (msg.contains('unique') ||
         msg.contains('constraint') ||
         msg.contains('integrity')) {
-      return TransactionErrorType.integrityViolation;
+      if (msg.contains('primary key')) return ResultType.primaryKeyViolation;
+      if (msg.contains('unique')) return ResultType.uniqueViolation;
+      if (msg.contains('foreign key')) return ResultType.foreignKeyViolation;
+      return ResultType.transactionErrorConflict;
     }
-    if (msg.contains('lock') || msg.contains('conflict')) {
-      return TransactionErrorType.conflict;
-    }
-    return TransactionErrorType.unknown;
+    return ResultType.transactionErrorAborted;
   }
 
   bool _looksLikeIoFailure(Object e, String msg) {
@@ -3687,60 +3776,6 @@ class DataStoreImpl {
         msg.contains('io error') ||
         msg.contains('i/o') ||
         msg.contains('disk');
-  }
-
-  TransactionErrorType? _classifyBusinessTransactionError(Object e) {
-    if (e is! BusinessError) return null;
-
-    final resultType = _extractResultTypeFromBusinessError(e);
-    if (resultType != null) {
-      return _mapResultTypeToTransactionError(resultType);
-    }
-
-    switch (e.type) {
-      case BusinessErrorType.duplicateKey:
-      case BusinessErrorType.duplicateValue:
-      case BusinessErrorType.uniqueError:
-      case BusinessErrorType.primaryKeyError:
-        return TransactionErrorType.integrityViolation;
-      default:
-        return TransactionErrorType.operationError;
-    }
-  }
-
-  ResultType? _extractResultTypeFromBusinessError(BusinessError error) {
-    final data = error.data;
-    if (data is! Map) return null;
-
-    final code = data['code'];
-    if (code is! int) return null;
-
-    return ResultType.fromCode(code);
-  }
-
-  TransactionErrorType _mapResultTypeToTransactionError(ResultType type) {
-    switch (type) {
-      case ResultType.uniqueViolation:
-      case ResultType.primaryKeyViolation:
-      case ResultType.foreignKeyViolation:
-      case ResultType.notNullViolation:
-        return TransactionErrorType.integrityViolation;
-      case ResultType.timeout:
-        return TransactionErrorType.timeout;
-      case ResultType.ioError:
-        return TransactionErrorType.io;
-      case ResultType.success:
-      case ResultType.partialSuccess:
-      case ResultType.unknown:
-      case ResultType.validationFailed:
-      case ResultType.notFound:
-      case ResultType.tableExists:
-      case ResultType.fieldExists:
-      case ResultType.indexExists:
-      case ResultType.resourceExhausted:
-      case ResultType.dbError:
-        return TransactionErrorType.operationError;
-    }
   }
 
   /// drop table
@@ -3967,7 +4002,7 @@ class DataStoreImpl {
   /// [allowPartialErrors] if true, continue processing remaining records even if some fail
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchInsert', tableName);
     await ensureInitialized();
@@ -4035,9 +4070,12 @@ class DataStoreImpl {
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
+      int successCount = 0;
+      int failedCount = 0;
       // Collect a limited number of detailed validation error messages for result reporting.
       // This is per-batch only and does not grow with table size, so it is safe for large-scale data.
       final List<String> validationErrorsForResult = [];
+      final List<ResultStatus> batchStatuses = [];
       // Track records whose primary key was auto-generated in this batch
       final Set<Map<String, dynamic>> autoPkRecords = <Map<String, dynamic>>{};
       // Track whether any record in this batch has a user-provided primary key.
@@ -4072,13 +4110,13 @@ class DataStoreImpl {
                 type: ResultType.dbError,
                 message:
                     'Failed to generate enough primary keys for batch insert',
-                failedKeys: allKeys,
+                failedKeys: returnResultDetails ? allKeys : const [],
               ));
             } else {
               // Mark records that needed a key as invalid and remove them from processing.
               for (final record in recordsNeedingPk) {
                 invalidRecords.add(record);
-                // These records don't have a PK, so nothing to add to failedKeys yet.
+                failedCount++;
               }
               recordsToProcess.removeWhere((r) => r[primaryKey] == null);
             }
@@ -4273,7 +4311,23 @@ class DataStoreImpl {
                               .add('pk=$rid: [Disk Conflict] ${vio.message}');
                         }
                       }
-                      failedKeys.add(rid);
+                      final originalIndex = recordsToProcess
+                          .indexWhere((r) => r[primaryKey]?.toString() == rid);
+                      final effectiveIndex =
+                          originalIndex != -1 ? originalIndex + start : 0;
+                      if (returnResultDetails) {
+                        batchStatuses.add(ConstraintStatus(
+                          type: ResultType.uniqueViolation,
+                          message: 'pk=$rid: [Disk Conflict] ${vio.message}',
+                          tableName: tableName,
+                          fields: vio.fields,
+                          conflictingKeys: [vio.value],
+                          index: effectiveIndex,
+                          primaryKey: rid,
+                        ));
+                        failedKeys.add(rid);
+                      }
+                      failedCount++;
                     }
                   }
 
@@ -4309,7 +4363,10 @@ class DataStoreImpl {
                   } catch (_) {}
                   final orig = batchOriginalById[rid];
                   if (orig != null) invalidRecords.add(orig);
-                  failedKeys.add(rid);
+                  if (returnResultDetails) {
+                    failedKeys.add(rid);
+                  }
+                  failedCount++;
                 }
                 batchRecordsForBuffer.clear();
                 batchUniqueRefsForBuffer.clear();
@@ -4331,7 +4388,10 @@ class DataStoreImpl {
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
-              successKeys.addAll(bufferResult.successRecordIds);
+              if (returnResultDetails) {
+                successKeys.addAll(bufferResult.successRecordIds);
+              }
+              successCount += bufferResult.successRecordIds.length;
 
               if (notificationManager.hasListeners(tableName)) {
                 final successSet = bufferResult.successRecordIds.toSet();
@@ -4361,7 +4421,12 @@ class DataStoreImpl {
                 } catch (_) {}
                 final orig = batchOriginalById[failedId];
                 if (orig != null) invalidRecords.add(orig);
-                if (failedId.isNotEmpty) failedKeys.add(failedId);
+                if (failedId.isNotEmpty) {
+                  if (returnResultDetails) {
+                    failedKeys.add(failedId);
+                  }
+                  failedCount++;
+                }
               }
             }
 
@@ -4391,14 +4456,24 @@ class DataStoreImpl {
                 recordErrors.clear();
                 if (triedPkConflictRetry) {
                   // Conflict retries are rare; keep them on the mature local path.
-                  validData = await _validateAndProcessData(
-                    tableSchema,
-                    record,
-                    tableName,
-                    skipPrimaryKeyFormatCheck: isAutoPk,
-                    validationErrors: recordErrors,
-                    fieldMap: fieldMapForValidation,
-                  );
+                  try {
+                    validData = await _validateAndProcessData(
+                      tableSchema,
+                      record,
+                      tableName,
+                      skipPrimaryKeyFormatCheck: isAutoPk,
+                      validationErrors: recordErrors,
+                      fieldMap: fieldMapForValidation,
+                    );
+                  } on DbException catch (e) {
+                    recordErrors.addAll(e.statuses.map((s) => s.message));
+                    if (returnResultDetails) {
+                      for (final s in e.statuses) {
+                        batchStatuses.add(ResultStatus.fromJson(s.toJson(),
+                            indexOverride: j));
+                      }
+                    }
+                  }
                 } else {
                   validData = preparedRecord.validData;
                   recordErrors.addAll(preparedRecord.validationErrors);
@@ -4416,15 +4491,35 @@ class DataStoreImpl {
                 if (validData == null) {
                   invalidRecords.add(record);
                   final failedKey = record[primaryKey]?.toString() ?? '';
-                  if (failedKey.isNotEmpty) {
+                  if (returnResultDetails && failedKey.isNotEmpty) {
                     failedKeys.add(failedKey);
                   }
+                  failedCount++;
                   if (recordErrors.isNotEmpty &&
                       validationErrorsForResult.length < 20) {
                     final prefix =
                         failedKey.isNotEmpty ? 'pk=$failedKey' : 'index=$j';
                     validationErrorsForResult
                         .add('$prefix: ${recordErrors.join("; ")}');
+                  }
+                  if (!triedPkConflictRetry) {
+                    if (returnResultDetails) {
+                      if (preparedRecord.validationStatusesJson != null) {
+                        for (final sJson
+                            in preparedRecord.validationStatusesJson!) {
+                          batchStatuses.add(
+                              ResultStatus.fromJson(sJson, indexOverride: j));
+                        }
+                      } else {
+                        batchStatuses.add(GeneralStatus(
+                          type: ResultType.validationFailed,
+                          message: recordErrors.isNotEmpty
+                              ? recordErrors.join("; ")
+                              : 'Data validation failed',
+                          index: j,
+                        ));
+                      }
+                    }
                   }
                   finishedRecord = true;
                   break;
@@ -4445,8 +4540,23 @@ class DataStoreImpl {
                     );
                     invalidRecords.add(record);
                     final failedKey = validData[primaryKey]?.toString() ?? '';
-                    if (failedKey.isNotEmpty) {
+                    if (returnResultDetails && failedKey.isNotEmpty) {
                       failedKeys.add(failedKey);
+                    }
+                    failedCount++;
+                    if (returnResultDetails) {
+                      if (e is DbException) {
+                        for (final s in e.statuses) {
+                          batchStatuses.add(ResultStatus.fromJson(s.toJson(),
+                              indexOverride: j));
+                        }
+                      } else {
+                        batchStatuses.add(GeneralStatus(
+                          type: ResultType.foreignKeyViolation,
+                          message: e.toString(),
+                          index: j,
+                        ));
+                      }
                     }
                     finishedRecord = true;
                     break;
@@ -4551,16 +4661,17 @@ class DataStoreImpl {
 
                     invalidRecords.add(record);
                     final failedKey = validData[primaryKey]?.toString() ?? '';
-                    if (failedKey.isNotEmpty) {
+                    if (returnResultDetails && failedKey.isNotEmpty) {
                       failedKeys.add(failedKey);
                     }
+                    failedCount++;
                     if (!allowPartialErrors) {
                       // Flush pending successful records to avoid leaving reservations behind.
                       await flushBatch();
                       return finish(DbResult.error(
                         type: ResultType.uniqueViolation,
                         message: e.message,
-                        failedKeys: failedKeys,
+                        failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
                     }
                     finishedRecord = true;
@@ -4580,7 +4691,7 @@ class DataStoreImpl {
                       return finish(DbResult.error(
                         type: ResultType.dbError,
                         message: 'Error processing record: WAL append failed',
-                        failedKeys: failedKeys,
+                        failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
                     }
                   }
@@ -4605,9 +4716,10 @@ class DataStoreImpl {
               );
               invalidRecords.add(record);
               final failedKey = record[primaryKey]?.toString() ?? '';
-              if (failedKey.isNotEmpty) {
+              if (returnResultDetails && failedKey.isNotEmpty) {
                 failedKeys.add(failedKey);
               }
+              failedCount++;
 
               if (!allowPartialErrors) {
                 // Flush pending successful records to avoid leaving reservations behind.
@@ -4615,7 +4727,7 @@ class DataStoreImpl {
                 return finish(DbResult.error(
                   type: ResultType.dbError,
                   message: 'Error processing record: $e',
-                  failedKeys: failedKeys,
+                  failedKeys: returnResultDetails ? failedKeys : const [],
                 ));
               }
             }
@@ -4626,15 +4738,30 @@ class DataStoreImpl {
             return finish(DbResult.error(
               type: ResultType.dbError,
               message: 'Error processing record: WAL append failed',
-              failedKeys: failedKeys,
+              failedKeys: returnResultDetails ? failedKeys : const [],
             ));
           }
 
           start = end;
         }
 
+        if (returnResultDetails) {
+          // Fill success statuses
+          final successSet = successKeys.toSet();
+          for (int i = 0; i < records.length; i++) {
+            final pkVal = records[i][primaryKey]?.toString() ?? '';
+            if (pkVal.isNotEmpty && successSet.contains(pkVal)) {
+              batchStatuses.add(SuccessStatus(
+                message: 'Record inserted successfully',
+                index: i,
+                primaryKey: pkVal,
+              ));
+            }
+          }
+        }
+
         // If no valid records and not allowing partial errors, return error
-        if (successKeys.isEmpty) {
+        if (successCount == 0) {
           String message = 'All data validation failed';
           if (validationErrorsForResult.isNotEmpty) {
             final preview = validationErrorsForResult.length > 5
@@ -4649,7 +4776,8 @@ class DataStoreImpl {
           return finish(DbResult.error(
             type: ResultType.validationFailed,
             message: message,
-            failedKeys: failedKeys,
+            failedKeys: returnResultDetails ? failedKeys : const [],
+            statuses: returnResultDetails ? batchStatuses : const [],
           ));
         }
 
@@ -4670,19 +4798,23 @@ class DataStoreImpl {
           return finish(DbResult.error(
             type: ResultType.validationFailed,
             message: message,
-            failedKeys: failedKeys,
+            failedKeys: returnResultDetails ? failedKeys : const [],
+            statuses: returnResultDetails ? batchStatuses : const [],
           ));
         }
 
         // Return result
         if (invalidRecords.isEmpty) {
-          return finish(DbResult.success(
-            successKeys: successKeys,
-            message: 'All records inserted successfully',
+          return finish(DbResult(
+            statuses: returnResultDetails ? batchStatuses : const [],
+            successKeys: returnResultDetails ? successKeys : const [],
+            failedKeys: const [],
+            successCount: successCount,
+            failedCount: 0,
           ));
         } else {
           String message =
-              'Partial records inserted successfully, ${successKeys.length} successful, ${failedKeys.length} failed';
+              'Partial records inserted successfully, $successCount successful, $failedCount failed';
           if (validationErrorsForResult.isNotEmpty) {
             final preview = validationErrorsForResult.length > 5
                 ? validationErrorsForResult.sublist(0, 5)
@@ -4693,10 +4825,12 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finish(DbResult.batch(
-            successKeys: successKeys,
-            failedKeys: failedKeys,
-            message: message,
+          return finish(DbResult(
+            statuses: returnResultDetails ? batchStatuses : const [],
+            successKeys: returnResultDetails ? successKeys : const [],
+            failedKeys: returnResultDetails ? failedKeys : const [],
+            successCount: successCount,
+            failedCount: failedCount,
           ));
         }
       } catch (e) {
@@ -4728,7 +4862,7 @@ class DataStoreImpl {
       return finish(DbResult.error(
         type: ResultType.dbError,
         message: 'Batch insertion failed: $e',
-        failedKeys: failedKeys,
+        failedKeys: returnResultDetails ? failedKeys : const [],
       ));
     }
   }
@@ -4738,7 +4872,7 @@ class DataStoreImpl {
   /// Optimized to use batch index probing for high throughput.
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
     await ensureInitialized();
@@ -4771,6 +4905,8 @@ class DataStoreImpl {
     final pk = schema.primaryKey;
     final successKeys = <String>[];
     final failedKeys = <String>[];
+    int successCount = 0;
+    int failedCount = 0;
 
     final validationErrorsForResult = <String>[];
 
@@ -4793,7 +4929,10 @@ class DataStoreImpl {
         final err = identifierResults[i].error;
         if (err != null) {
           final failedKey = record[pk]?.toString() ?? 'index=$i';
-          failedKeys.add(record[pk]?.toString() ?? '');
+          if (returnResultDetails) {
+            failedKeys.add(record[pk]?.toString() ?? '');
+          }
+          failedCount++;
 
           if (validationErrorsForResult.length < 10) {
             validationErrorsForResult.add('pk=$failedKey: $err');
@@ -4805,7 +4944,7 @@ class DataStoreImpl {
             return finish(DbResult.error(
               type: ResultType.validationFailed,
               message: err,
-              failedKeys: failedKeys,
+              failedKeys: returnResultDetails ? failedKeys : const [],
             ));
           }
         } else {
@@ -4818,10 +4957,17 @@ class DataStoreImpl {
         if (validationErrorsForResult.isNotEmpty) {
           message += '. Examples: ${validationErrorsForResult.join(" | ")}';
         }
-        return finish(DbResult.batch(
-          successKeys: successKeys,
-          failedKeys: failedKeys,
-          message: message,
+        return finish(DbResult(
+          statuses: returnResultDetails
+              ? [
+                  GeneralStatus(
+                      type: ResultType.validationFailed, message: message)
+                ]
+              : const [],
+          successKeys: const [],
+          failedKeys: returnResultDetails ? failedKeys : const [],
+          successCount: 0,
+          failedCount: failedCount,
         ));
       }
 
@@ -4853,10 +4999,15 @@ class DataStoreImpl {
           tableName,
           toUpdate,
           allowPartialErrors: allowPartialErrors,
+          returnResultDetails: returnResultDetails,
         );
-        if (upResult.isSuccess || allowPartialErrors) {
-          successKeys.addAll(upResult.successKeys);
-          failedKeys.addAll(upResult.failedKeys);
+        if (!upResult.hasFailed || allowPartialErrors) {
+          if (returnResultDetails) {
+            successKeys.addAll(upResult.successKeys);
+            failedKeys.addAll(upResult.failedKeys);
+          }
+          successCount += upResult.successCount;
+          failedCount += upResult.failedCount;
         } else {
           return finish(upResult);
         }
@@ -4868,27 +5019,44 @@ class DataStoreImpl {
           tableName,
           toInsert,
           allowPartialErrors: allowPartialErrors,
+          returnResultDetails: returnResultDetails,
         );
-        successKeys.addAll(insResult.successKeys);
-        failedKeys.addAll(insResult.failedKeys);
-        if (!allowPartialErrors && !insResult.isSuccess) {
+        if (returnResultDetails) {
+          successKeys.addAll(insResult.successKeys);
+          failedKeys.addAll(insResult.failedKeys);
+        }
+        successCount += insResult.successCount;
+        failedCount += insResult.failedCount;
+        if (!allowPartialErrors && insResult.hasFailed) {
           return finish(insResult);
         }
       }
 
       String message = 'Batch upsert completed';
-      if (failedKeys.isNotEmpty) {
+      if (failedCount > 0) {
         message =
-            'Batch upsert partially successful: ${successKeys.length} success, ${failedKeys.length} failed';
+            'Batch upsert partially successful: $successCount success, $failedCount failed';
         if (validationErrorsForResult.isNotEmpty) {
           message +=
               '. Validation errors: ${validationErrorsForResult.join(" | ")}';
         }
       }
 
+      if (!returnResultDetails) {
+        return finish(DbResult(
+          statuses: const [],
+          successKeys: const [],
+          failedKeys: const [],
+          successCount: successCount,
+          failedCount: failedCount,
+        ));
+      }
+
       return finish(DbResult.batch(
         successKeys: successKeys,
         failedKeys: failedKeys,
+        successCount: successCount,
+        failedCount: failedCount,
         message: message,
       ));
     } catch (e) {
@@ -4906,7 +5074,7 @@ class DataStoreImpl {
   /// batch update data based on primary keys or unique identifiers.
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpdate', tableName);
     await ensureInitialized();
@@ -4942,6 +5110,9 @@ class DataStoreImpl {
 
     final successKeys = <String>[];
     final failedKeys = <String>[];
+    int successCount = 0;
+    int failedCount = 0;
+    final batchStatuses = <ResultStatus>[];
 
     // 1. Identification & Resolution Phase
     // Pre-process records to ensure every record has a primary key.
@@ -4988,12 +5159,15 @@ class DataStoreImpl {
           final originalIndex = recordsNeedingIdentifierValidationIndices[i];
           final failedKey =
               record[primaryKey]?.toString() ?? 'missing_identifier';
-          failedKeys.add(failedKey);
+          if (returnResultDetails) {
+            failedKeys.add(failedKey);
+          }
+          failedCount++;
           if (!allowPartialErrors) {
             return finish(DbResult.error(
               type: ResultType.validationFailed,
               message: 'Validation failed for record $originalIndex: $err',
-              failedKeys: failedKeys,
+              failedKeys: returnResultDetails ? failedKeys : const [],
             ));
           }
           continue;
@@ -5018,13 +5192,16 @@ class DataStoreImpl {
       // Handle records that failed resolution (not found in DB/Buffer)
       for (final r in needsResolution) {
         if (r[primaryKey] == null) {
-          failedKeys.add('not_found');
+          if (returnResultDetails) {
+            failedKeys.add('not_found');
+          }
+          failedCount++;
           if (!allowPartialErrors) {
             final idInfo = r.keys.take(3).map((k) => '$k=${r[k]}').join(', ');
             return finish(DbResult.error(
               type: ResultType.notFound,
               message: 'Record not found for unique identifier: {$idInfo}',
-              failedKeys: failedKeys,
+              failedKeys: returnResultDetails ? failedKeys : const [],
             ));
           }
         }
@@ -5038,10 +5215,18 @@ class DataStoreImpl {
     ];
 
     if (finalRecords.isEmpty) {
-      return finish(DbResult.batch(
-        successKeys: successKeys,
-        failedKeys: failedKeys,
-        message: 'No valid records found to update',
+      return finish(DbResult(
+        statuses: returnResultDetails
+            ? [
+                GeneralStatus(
+                    type: ResultType.validationFailed,
+                    message: 'No valid records found to update')
+              ]
+            : const [],
+        successKeys: returnResultDetails ? successKeys : const [],
+        failedKeys: returnResultDetails ? failedKeys : const [],
+        successCount: 0,
+        failedCount: failedCount,
       ));
     }
 
@@ -5095,13 +5280,16 @@ class DataStoreImpl {
         if (!allowPartialErrors && resultsMap.length < pkList.length) {
           for (final pkVal in pkList) {
             if (!resultsMap.containsKey(pkVal)) {
-              failedKeys.add(pkVal);
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+              }
+              failedCount++;
             }
           }
           return finish(DbResult.error(
             type: ResultType.notFound,
             message: 'Some records not found during batchUpdate',
-            failedKeys: failedKeys,
+            failedKeys: returnResultDetails ? failedKeys : const [],
           ));
         }
 
@@ -5135,8 +5323,11 @@ class DataStoreImpl {
 
           if (existingRecord == null) {
             if (allowPartialErrors) {
-              failedKeys.add(pkVal);
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+              }
             }
+            failedCount++;
             continue;
           }
 
@@ -5144,39 +5335,80 @@ class DataStoreImpl {
           final preparedRecord = preparedRecords[recordIndex];
           if (preparedRecord.missingExistingRecord) {
             if (allowPartialErrors) {
-              failedKeys.add(pkVal);
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+              }
             }
+            failedCount++;
             continue;
           }
 
           if (preparedRecord.validationFailed) {
-            failedKeys.add(pkVal);
+            if (returnResultDetails) {
+              failedKeys.add(pkVal);
+              if (preparedRecord.validationStatusesJson != null) {
+                for (final sJson in preparedRecord.validationStatusesJson!) {
+                  batchStatuses
+                      .add(ResultStatus.fromJson(sJson, indexOverride: i));
+                }
+              } else {
+                batchStatuses.add(GeneralStatus(
+                  type: ResultType.validationFailed,
+                  message: 'Data validation failed for record $pkVal',
+                  index: i,
+                ));
+              }
+            }
+            failedCount++;
             if (!allowPartialErrors) {
               return finish(DbResult.error(
                 type: ResultType.validationFailed,
                 message: 'Data validation failed for record $pkVal',
-                failedKeys: failedKeys,
+                failedKeys: returnResultDetails ? failedKeys : const [],
+                statuses: returnResultDetails ? batchStatuses : const [],
               ));
             }
             continue;
           }
 
-          for (final error in preparedRecord.fieldConstraintErrors) {
-            failedKeys.add(pkVal);
+          if (preparedRecord.fieldConstraintErrors.isNotEmpty) {
+            if (returnResultDetails) {
+              failedKeys.add(pkVal);
+              if (preparedRecord.validationStatusesJson != null) {
+                for (final sJson in preparedRecord.validationStatusesJson!) {
+                  batchStatuses
+                      .add(ResultStatus.fromJson(sJson, indexOverride: i));
+                }
+              } else {
+                for (final error in preparedRecord.fieldConstraintErrors) {
+                  batchStatuses.add(GeneralStatus(
+                    type: ResultType.validationFailed,
+                    message: error,
+                    index: i,
+                  ));
+                }
+              }
+            }
+            failedCount++;
             if (!allowPartialErrors) {
               return finish(DbResult.error(
                 type: ResultType.validationFailed,
-                message: error,
-                failedKeys: failedKeys,
+                message: preparedRecord.fieldConstraintErrors.join("; "),
+                failedKeys: returnResultDetails ? failedKeys : const [],
+                statuses: returnResultDetails ? batchStatuses : const [],
               ));
             }
+            continue;
           }
 
           final updatedRecord = preparedRecord.updatedRecord;
           final changedFields = preparedRecord.changedFields;
           if (updatedRecord == null) continue;
           if (changedFields.isEmpty) {
-            successKeys.add(pkVal);
+            if (returnResultDetails) {
+              successKeys.add(pkVal);
+            }
+            successCount++;
             continue;
           }
 
@@ -5214,7 +5446,22 @@ class DataStoreImpl {
               batchContext.tryReserve(pkVal, refsToReserve);
               reservedRefsMap[pkVal] = refsToReserve;
             } catch (e) {
-              failedKeys.add(pkVal);
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+              }
+              failedCount++;
+              final originalIndex =
+                  records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
+              final globalIndex = originalIndex != -1 ? originalIndex : 0;
+              if (returnResultDetails) {
+                batchStatuses.add(ConstraintStatus(
+                  type: ResultType.uniqueViolation,
+                  message: 'Unique reservation failed for $pkVal: $e',
+                  tableName: tableName,
+                  index: globalIndex,
+                  primaryKey: pkVal,
+                ));
+              }
               if (!allowPartialErrors) {
                 // Rollback all reservations in this sub-batch before returning
                 for (final rPk in reservedRefsMap.keys) {
@@ -5229,7 +5476,8 @@ class DataStoreImpl {
                 return finish(DbResult.error(
                   type: ResultType.uniqueViolation,
                   message: 'Unique reservation failed for $pkVal: $e',
-                  failedKeys: failedKeys,
+                  failedKeys: returnResultDetails ? failedKeys : const [],
+                  statuses: returnResultDetails ? batchStatuses : const [],
                 ));
               }
               continue;
@@ -5268,7 +5516,25 @@ class DataStoreImpl {
           final violation = violations[j];
 
           if (violation != null) {
-            failedKeys.add(pkVal);
+            if (returnResultDetails) {
+              failedKeys.add(pkVal);
+            }
+            failedCount++;
+            final originalIndex =
+                records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
+            final globalIndex = originalIndex != -1 ? originalIndex : 0;
+            if (returnResultDetails) {
+              batchStatuses.add(ConstraintStatus(
+                type: ResultType.uniqueViolation,
+                message:
+                    'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
+                tableName: tableName,
+                fields: violation.fields,
+                conflictingKeys: [violation.value],
+                index: globalIndex,
+                primaryKey: pkVal,
+              ));
+            }
             // Rollback reservation for this specific record on disk conflict
             if (reservedRefsMap.containsKey(pkVal)) {
               try {
@@ -5295,7 +5561,8 @@ class DataStoreImpl {
                 type: ResultType.uniqueViolation,
                 message:
                     'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
-                failedKeys: failedKeys,
+                failedKeys: returnResultDetails ? failedKeys : const [],
+                statuses: returnResultDetails ? batchStatuses : const [],
               ));
             }
             continue;
@@ -5314,7 +5581,27 @@ class DataStoreImpl {
                 operation: ForeignKeyOperation.update,
               );
             } catch (e) {
-              failedKeys.add(pkVal);
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+              }
+              failedCount++;
+              final originalIndex =
+                  records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
+              final globalIndex = originalIndex != -1 ? originalIndex : 0;
+              if (returnResultDetails) {
+                if (e is DbException) {
+                  for (final s in e.statuses) {
+                    batchStatuses.add(ResultStatus.fromJson(s.toJson(),
+                        indexOverride: globalIndex));
+                  }
+                } else {
+                  batchStatuses.add(GeneralStatus(
+                    type: ResultType.foreignKeyViolation,
+                    message: e.toString(),
+                    index: globalIndex,
+                  ));
+                }
+              }
               if (reservedRefsMap.containsKey(pkVal)) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
@@ -5338,7 +5625,8 @@ class DataStoreImpl {
                 return finish(DbResult.error(
                   type: ResultType.foreignKeyViolation,
                   message: e.toString(),
-                  failedKeys: [pkVal],
+                  failedKeys: returnResultDetails ? failedKeys : const [],
+                  statuses: returnResultDetails ? batchStatuses : const [],
                 ));
               }
               continue;
@@ -5372,11 +5660,17 @@ class DataStoreImpl {
             transactionId: txId,
           );
 
-          successKeys.addAll(commitResult.successRecordIds);
+          if (returnResultDetails) {
+            successKeys.addAll(commitResult.successRecordIds);
+          }
+          successCount += commitResult.successRecordIds.length;
 
           if (commitResult.failedRecordIds.isNotEmpty) {
             for (final fId in commitResult.failedRecordIds) {
-              failedKeys.add(fId);
+              if (returnResultDetails) {
+                failedKeys.add(fId);
+              }
+              failedCount++;
               if (reservedRefsMap.containsKey(fId)) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
@@ -5406,23 +5700,43 @@ class DataStoreImpl {
         }
       }
 
-      if (successKeys.isNotEmpty && failedKeys.isNotEmpty) {
-        return finish(DbResult.batch(
-          successKeys: successKeys,
-          failedKeys: failedKeys,
-          message:
-              'Batch update partially successful: ${successKeys.length} updated, ${failedKeys.length} failed',
+      // Fill success statuses
+      if (returnResultDetails) {
+        final successSet = successKeys.toSet();
+        for (int i = 0; i < records.length; i++) {
+          final pkVal = records[i][primaryKey]?.toString() ?? '';
+          if (pkVal.isNotEmpty && successSet.contains(pkVal)) {
+            batchStatuses.add(SuccessStatus(
+              message: 'Record updated successfully',
+              index: i,
+              primaryKey: pkVal,
+            ));
+          }
+        }
+      }
+
+      if (successCount > 0 && failedCount > 0) {
+        return finish(DbResult(
+          statuses: returnResultDetails ? batchStatuses : const [],
+          successKeys: returnResultDetails ? successKeys : const [],
+          failedKeys: returnResultDetails ? failedKeys : const [],
+          successCount: successCount,
+          failedCount: failedCount,
         ));
-      } else if (successKeys.isNotEmpty) {
-        return finish(DbResult.success(
-          successKeys: successKeys,
-          message: 'Batch update successful: ${successKeys.length} updated',
+      } else if (successCount > 0) {
+        return finish(DbResult(
+          statuses: returnResultDetails ? batchStatuses : const [],
+          successKeys: returnResultDetails ? successKeys : const [],
+          failedKeys: const [],
+          successCount: successCount,
+          failedCount: 0,
         ));
       } else {
         return finish(DbResult.error(
           type: ResultType.notFound,
           message: 'No records were updated',
-          failedKeys: failedKeys,
+          failedKeys: returnResultDetails ? failedKeys : const [],
+          statuses: returnResultDetails ? batchStatuses : const [],
         ));
       }
     } catch (e) {
@@ -5433,6 +5747,7 @@ class DataStoreImpl {
       return finish(DbResult.error(
         type: ResultType.dbError,
         message: 'Batch update failed: $e',
+        statuses: returnResultDetails ? batchStatuses : const [],
       ));
     }
   }
@@ -7482,11 +7797,14 @@ class DataStoreImpl {
       isGlobal: isGlobal,
     );
     final createResult = await createTable(tempSchema, isSystemTable: true);
-    if (!createResult.isSuccess) {
-      throw BusinessError(
-        'Failed to create conflict temporary table for operation $opId: ${createResult.message}',
-        type: BusinessErrorType.schemaError,
-      );
+    if (createResult.hasFailed) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.dbError,
+          message:
+              'Failed to create conflict temporary table for operation $opId: ${createResult.statuses.isNotEmpty ? createResult.statuses.first.message : "unknown error"}',
+        ),
+      ]);
     }
   }
 
