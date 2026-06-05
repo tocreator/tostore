@@ -470,7 +470,8 @@ class IntegrityChecker {
           isValid = false;
         } else {
           // Check other constraints if type is valid
-          final fieldError = field.getValidationError(entry.value);
+          final fieldError =
+              field.getValidationError(entry.value, tableName: schema.name);
           if (fieldError != null) {
             if (errors != null) {
               errors.add(fieldError);
