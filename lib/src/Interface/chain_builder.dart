@@ -2,6 +2,8 @@ import 'dart:async';
 
 import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
+import '../model/db_exception.dart';
+import '../model/result_type.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
