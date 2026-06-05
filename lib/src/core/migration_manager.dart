@@ -9,8 +9,10 @@ import '../handler/memcomparable.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_mode.dart';
 import '../model/background_write_type.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
-import '../model/business_error.dart';
 import '../model/cancellation_token.dart';
 import '../model/key_migration_info.dart';
 import '../model/meta_info.dart';
@@ -590,34 +592,24 @@ class MigrationManager {
       // Validate system schemas (allow reserved names and system prefix)
       for (final schema in systemSchemas) {
         final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-        if (!schema.validateTableSchema(
+        schema.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
           allowReservedTableNames: true,
           allowInternalTableNamePrefix: true,
           allowOtherInternalFields: true,
-        )) {
-          throw BusinessError(
-            'Invalid system schema definition for table ${schema.name}.',
-            type: BusinessErrorType.schemaError,
-          );
-        }
+        );
         targetSchemas.add(schema);
       }
 
       // Validate user-defined schemas (strict validation: no system prefix/reserved names)
       for (final schema in userSchemas) {
         final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-        if (!schema.validateTableSchema(
+        schema.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
           allowReservedTableNames: false,
           allowInternalTableNamePrefix: false,
           allowOtherInternalFields: false,
-        )) {
-          throw BusinessError(
-            'Invalid user schema definition for table ${schema.name}. User tables cannot use system prefixes or reserved names.',
-            type: BusinessErrorType.schemaError,
-          );
-        }
+        );
         targetSchemas.add(schema);
       }
 
@@ -820,17 +812,32 @@ class MigrationManager {
             'Database migration generated ${allTasks.length} migration tasks, starting execution...',
             label: 'MigrationManager.migrate',
           );
-          final migrateSuccess = await processMigrationTasks();
+          final migrateResult = await processMigrationTasks();
 
-          if (!migrateSuccess) {
+          if (!migrateResult.success) {
             Logger.error(
               'Some migration tasks failed, please check the log for details',
               label: 'MigrationManager.migrate',
             );
-            throw const BusinessError(
-              'Some migration tasks failed',
-              type: BusinessErrorType.migrationError,
-            );
+            if (migrateResult.errors.isNotEmpty) {
+              final firstError = migrateResult.errors.first;
+              if (firstError is DbException) {
+                throw firstError;
+              } else {
+                throw DbException([
+                  GeneralStatus(
+                    type: ResultType.dbError,
+                    message: 'Migration task failed: $firstError',
+                  ),
+                ]);
+              }
+            }
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.dbError,
+                message: 'Some migration tasks failed',
+              ),
+            ]);
           } else {
             Logger.info(
               'All migration tasks have been successfully completed',
@@ -873,10 +880,14 @@ class MigrationManager {
     final seenTableNames = <String>{};
     for (final schema in targetSchemas) {
       if (seenTableNames.contains(schema.name)) {
-        throw BusinessError(
-          'Duplicate table name "${schema.name}" found in target schema list.',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.tableExists,
+            message:
+                'Duplicate table name "${schema.name}" found in target schema list.',
+            tableName: schema.name,
+          ),
+        ]);
       }
       seenTableNames.add(schema.name);
     }
@@ -890,10 +901,16 @@ class MigrationManager {
       for (final fk in schema.foreignKeys) {
         final fkName = fk.actualName;
         if (seenFkNames.contains(fkName)) {
-          throw BusinessError(
-            'Duplicate foreign key name "$fkName" in table "${schema.name}".',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaForeignKey,
+              message:
+                  'Duplicate foreign key name "$fkName" in table "${schema.name}".',
+              tableName: schema.name,
+              field: fk.fields.join(','),
+              wrongValue: fkName,
+            )
+          ]);
         }
         seenFkNames.add(fkName);
 
@@ -906,16 +923,31 @@ class MigrationManager {
           // Check if it was renamed but not updated in foreign key config
           if (renamedTableTargets.containsKey(refTableName)) {
             final newName = renamedTableTargets[refTableName];
-            throw BusinessError(
-              'Foreign key "${fk.actualName}" in table "${schema.name}" references table "$refTableName", '
-              'which has been renamed to "$newName". Please update the foreign key definition in the schema code to reference the new table name.',
-              type: BusinessErrorType.schemaError,
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.notFoundTable,
+                message:
+                    'Foreign key "${fk.actualName}" in table "${schema.name}" references table "$refTableName", '
+                    'which has been renamed to "$newName". Please update the foreign key definition in the schema code to reference the new table name.',
+                tableName: schema.name,
+                field: fk.fields.join(','),
+                wrongValue: {
+                  'referencedTable': refTableName,
+                  'renamedTo': newName,
+                },
+              )
+            ]);
           } else {
-            throw BusinessError(
-              'Foreign key "${fk.actualName}" in table "${schema.name}" references non-existent table "$refTableName".',
-              type: BusinessErrorType.schemaError,
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.notFoundTable,
+                message:
+                    'Foreign key "${fk.actualName}" in table "${schema.name}" references non-existent table "$refTableName".',
+                tableName: schema.name,
+                field: fk.fields.join(','),
+                wrongValue: refTableName,
+              )
+            ]);
           }
         }
 
@@ -923,22 +955,41 @@ class MigrationManager {
         final referencedSchema = targetSchemaMap[refTableName]!;
         if (!schema.validateForeignKeyWithReferencedTable(
             fk, referencedSchema)) {
-          throw BusinessError(
-            'Invalid foreign key "${fk.actualName}" in table "${schema.name}": '
-            'referenced fields in table "$refTableName" are not compatible or do not exist.',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaForeignKey,
+              message:
+                  'Invalid foreign key "${fk.actualName}" in table "${schema.name}": '
+                  'referenced fields in table "$refTableName" are not compatible or do not exist.',
+              tableName: schema.name,
+              field: fk.fields.join(','),
+              wrongValue: {
+                'referencedFields': fk.referencedFields.join(','),
+                'referencedTable': refTableName,
+              },
+            )
+          ]);
         }
 
         // Validate space consistency: Space tables cannot reference Global tables and vice versa
         if (schema.isGlobal != referencedSchema.isGlobal) {
-          throw BusinessError(
-            'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
-            '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
-            'referenced table $refTableName is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
-            'Foreign key relationships across global and space boundaries are not allowed.',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaSpaceMismatch,
+              message:
+                  'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
+                  '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
+                  'referenced table $refTableName is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+                  'Foreign key relationships across global and space boundaries are not allowed.',
+              tableName: schema.name,
+              field: fk.fields.join(','),
+              wrongValue: {
+                'tableIsGlobal': schema.isGlobal,
+                'referencedTable': refTableName,
+                'referencedTableIsGlobal': referencedSchema.isGlobal,
+              },
+            )
+          ]);
         }
       }
     }
@@ -1285,11 +1336,13 @@ class MigrationManager {
         targetTableName: targetTableName,
       );
       if (pendingTask != null) {
-        throw BusinessError(
-          'Table [$tableName] already has a pending migration task '
-          '[${pendingTask.taskId}]. Wait until it completes before calling updateSchema again.',
-          type: BusinessErrorType.migrationError,
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.dbError,
+            message: 'Table [$tableName] already has a pending migration task '
+                '[${pendingTask.taskId}]. Wait until it completes before calling updateSchema again.',
+          )
+        ]);
       }
 
       final oldSchema =
@@ -1302,10 +1355,14 @@ class MigrationManager {
       if (oldSchema == null) {
         // If it's not a system auto-migration and the table doesn't exist, it's an error for updateSchema
         if (!isAutoGenerated) {
-          throw BusinessError(
-            'Table [$tableName] does not exist. updateSchema can only be used to modify existing tables.',
-            type: BusinessErrorType.migrationError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.notFoundTable,
+              message:
+                  'Table [$tableName] does not exist. updateSchema can only be used to modify existing tables.',
+              tableName: tableName,
+            )
+          ]);
         }
       } else {
         final isDropTable =
@@ -1319,10 +1376,15 @@ class MigrationManager {
                 final field = op.field;
                 if (field != null &&
                     oldSchema.fields.any((f) => f.name == field.name)) {
-                  throw BusinessError(
-                    'Cannot add field [${field.name}] to table [$tableName]: field already exists.',
-                    type: BusinessErrorType.migrationError,
-                  );
+                  throw DbException([
+                    SchemaValidationStatus(
+                      type: ResultType.fieldExists,
+                      message:
+                          'Cannot add field [${field.name}] to table [$tableName]: field already exists.',
+                      tableName: tableName,
+                      field: field.name,
+                    )
+                  ]);
                 }
                 break;
               case MigrationType.removeField:
@@ -1331,10 +1393,15 @@ class MigrationManager {
                 final fieldName = op.fieldName ?? op.fieldUpdate?.name;
                 if (fieldName != null &&
                     !oldSchema.fields.any((f) => f.name == fieldName)) {
-                  throw BusinessError(
-                    'Cannot ${op.type.name} field [$fieldName] in table [$tableName]: field does not exist.',
-                    type: BusinessErrorType.migrationError,
-                  );
+                  throw DbException([
+                    SchemaValidationStatus(
+                      type: ResultType.invalidSchemaFieldName,
+                      message:
+                          'Cannot ${op.type.name} field [$fieldName] in table [$tableName]: field does not exist.',
+                      tableName: tableName,
+                      field: fieldName,
+                    )
+                  ]);
                 }
                 break;
               default:
@@ -1350,7 +1417,7 @@ class MigrationManager {
             isAutoGenerated: isAutoGenerated,
           );
           final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-          if (!targetSchema.validateTableSchema(
+          targetSchema.validateTableSchema(
             reservedTableNames: reservedSystemTableNames,
             allowReservedTableNames:
                 SystemTable.isKnownSystemTable(targetSchema.name),
@@ -1358,12 +1425,7 @@ class MigrationManager {
                 SystemTable.isKnownSystemTable(targetSchema.name),
             allowOtherInternalFields:
                 SystemTable.isKnownSystemTable(targetSchema.name),
-          )) {
-            throw const BusinessError(
-              'Invalid table structure after migration operations',
-              type: BusinessErrorType.schemaError,
-            );
-          }
+          );
 
           // 3. For runtime manual migrations, validate new foreign key constraints
           if (!isAutoGenerated) {
@@ -1373,29 +1435,54 @@ class MigrationManager {
               final referencedSchema = await _dataStore.schemaManager
                   ?.getTableSchema(fk.referencedTable);
               if (referencedSchema == null) {
-                throw BusinessError(
-                  'Cannot upgrade table $tableName: Referenced table "${fk.referencedTable}" does not exist for foreign key "${fk.actualName}".',
-                  type: BusinessErrorType.schemaError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.notFoundTable,
+                    message:
+                        'Cannot upgrade table $tableName: Referenced table "${fk.referencedTable}" does not exist for foreign key "${fk.actualName}".',
+                    tableName: tableName,
+                    field: fk.fields.join(','),
+                    wrongValue: fk.referencedTable,
+                  )
+                ]);
               }
 
               if (targetSchema.isGlobal != referencedSchema.isGlobal) {
-                throw BusinessError(
-                  'Space mismatch in foreign key "${fk.actualName}" of table "${targetSchema.name}": '
-                  '${targetSchema.name} is ${targetSchema.isGlobal ? "global" : "space-specific"} but '
-                  'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
-                  'Foreign key relationships across global and space boundaries are not allowed.',
-                  type: BusinessErrorType.schemaError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.invalidSchemaSpaceMismatch,
+                    message:
+                        'Space mismatch in foreign key "${fk.actualName}" of table "${targetSchema.name}": '
+                        '${targetSchema.name} is ${targetSchema.isGlobal ? "global" : "space-specific"} but '
+                        'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
+                        'Foreign key relationships across global and space boundaries are not allowed.',
+                    tableName: targetSchema.name,
+                    field: fk.fields.join(','),
+                    wrongValue: {
+                      'tableIsGlobal': targetSchema.isGlobal,
+                      'referencedTable': fk.referencedTable,
+                      'referencedTableIsGlobal': referencedSchema.isGlobal,
+                    },
+                  )
+                ]);
               }
 
               if (!targetSchema.validateForeignKeyWithReferencedTable(
                   fk, referencedSchema)) {
-                throw BusinessError(
-                  'Invalid foreign key "${fk.actualName}" in table "${targetSchema.name}": '
-                  'referenced fields in table "${fk.referencedTable}" are not compatible or do not exist.',
-                  type: BusinessErrorType.schemaError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.invalidSchemaForeignKey,
+                    message:
+                        'Invalid foreign key "${fk.actualName}" in table "${targetSchema.name}": '
+                        'referenced fields in table "${fk.referencedTable}" are not compatible or do not exist.',
+                    tableName: targetSchema.name,
+                    field: fk.fields.join(','),
+                    wrongValue: {
+                      'referencedFields': fk.referencedFields.join(','),
+                      'referencedTable': fk.referencedTable,
+                    },
+                  )
+                ]);
               }
             }
           }
@@ -1422,12 +1509,17 @@ class MigrationManager {
               final recordCount = await _dataStore.tableDataManager
                   .getTableRecordCount(tableName);
               if (recordCount != 0) {
-                throw BusinessError(
-                    'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
-                    'This is to prevent accidental data loss or long-running migrations. \n'
-                    'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
-                    'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.',
-                    type: BusinessErrorType.migrationError);
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.migrationNotAllowedWithData,
+                    message:
+                        'Migration for table "$tableName" requires data modification and was not explicitly allowed. '
+                        'This is to prevent accidental data loss or long-running migrations. \n'
+                        'For changes during app startup, add the table name to `MigrationConfig.allowedAfterDataMigrationTables`. \n'
+                        'For changes via SchemaBuilder, use the `.allowAfterDataMigration()` method before calling `.future`.',
+                    tableName: tableName,
+                  )
+                ]);
               }
             }
           }
@@ -2370,10 +2462,20 @@ class MigrationManager {
           'This requires complex data migration between spaces and the global scope and is therefore rejected.',
           label: 'MigrationManager._compareSchemasAndGenerateOperations',
         );
-        throw BusinessError(
-            'Changing the "isGlobal" property (from ${oldSchema.isGlobal} to ${newSchema.isGlobal}) for an existing table ($tableName) with existing data is not supported. '
-            'Please perform the data migration manually, or clear the table before changing "isGlobal".',
-            type: BusinessErrorType.migrationError);
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaSpaceMismatch,
+            message:
+                'Changing the "isGlobal" property (from ${oldSchema.isGlobal} to ${newSchema.isGlobal}) for an existing table ($tableName) with existing data is not supported. '
+                'Please perform the data migration manually, or clear the table before changing "isGlobal".',
+            tableName: tableName,
+            wrongValue: {
+              'oldIsGlobal': oldSchema.isGlobal,
+              'newIsGlobal': newSchema.isGlobal,
+              'recordCount': recordCount,
+            },
+          )
+        ]);
       }
 
       Logger.info(
@@ -2793,18 +2895,35 @@ class MigrationManager {
         if (coreDefinitionChanged) {
           // Core definition changed - this is a breaking change that requires manual handling
           // Throwing exception to warn developer that this requires data migration
-          throw BusinessError(
-            'Foreign key core definition change detected for ${matchedOldFk.actualName} in table ${oldSchema.name}. '
-            'Core definitions (fields, referencedTable, referencedFields) cannot be automatically modified. '
-            'This is a breaking change that may cause data inconsistency.\n'
-            'Old definition: fields=${matchedOldFk.fields}, referencedTable=${matchedOldFk.referencedTable}, referencedFields=${matchedOldFk.referencedFields}\n'
-            'New definition: fields=${newFk.fields}, referencedTable=${newFk.referencedTable}, referencedFields=${newFk.referencedFields}\n'
-            'Please handle this manually:\n'
-            '1. Remove the old foreign key: db.schema("${oldSchema.name}").removeForeignKey("${matchedOldFk.actualName}")\n'
-            '2. Ensure data integrity (check for orphaned records, update data if needed)\n'
-            '3. Add the new foreign key: db.schema("${oldSchema.name}").addForeignKey(...)',
-            type: BusinessErrorType.migrationError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaForeignKey,
+              message:
+                  'Foreign key core definition change detected for ${matchedOldFk.actualName} in table ${oldSchema.name}. '
+                  'Core definitions (fields, referencedTable, referencedFields) cannot be automatically modified. '
+                  'This is a breaking change that may cause data inconsistency.\n'
+                  'Old definition: fields=${matchedOldFk.fields}, referencedTable=${matchedOldFk.referencedTable}, referencedFields=${matchedOldFk.referencedFields}\n'
+                  'New definition: fields=${newFk.fields}, referencedTable=${newFk.referencedTable}, referencedFields=${newFk.referencedFields}\n'
+                  'Please handle this manually:\n'
+                  '1. Remove the old foreign key: db.schema("${oldSchema.name}").removeForeignKey("${matchedOldFk.actualName}")\n'
+                  '2. Ensure data integrity (check for orphaned records, update data if needed)\n'
+                  '3. Add the new foreign key: db.schema("${oldSchema.name}").addForeignKey(...)',
+              tableName: oldSchema.name,
+              field: matchedOldFk.fields.join(','),
+              wrongValue: {
+                'oldFk': {
+                  'fields': matchedOldFk.fields,
+                  'referencedTable': matchedOldFk.referencedTable,
+                  'referencedFields': matchedOldFk.referencedFields,
+                },
+                'newFk': {
+                  'fields': newFk.fields,
+                  'referencedTable': newFk.referencedTable,
+                  'referencedFields': newFk.referencedFields,
+                }
+              },
+            )
+          ]);
         } else {
           // Only non-core properties changed - can modify
           final needsModification = matchedOldFk.onDelete != newFk.onDelete ||
@@ -3144,9 +3263,19 @@ class MigrationManager {
     }
 
     if (isDangerous) {
-      throw BusinessError(
-          'Unsupported data type change for field "${newField.name}" from ${oldType.name} to ${newType.name}. This conversion is unsafe because existing data $reason This could lead to data loss or migration failure. Please handle this migration manually by creating a new field and migrating the data yourself.',
-          type: BusinessErrorType.migrationError);
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.migrationUnsafeTypeConversion,
+          message:
+              'Unsupported data type change for field "${newField.name}" from ${oldType.name} to ${newType.name}. This conversion is unsafe because existing data $reason This could lead to data loss or migration failure. Please handle this migration manually by creating a new field and migrating the data yourself.',
+          tableName: '',
+          field: newField.name,
+          wrongValue: {
+            'oldType': oldType.name,
+            'newType': newType.name,
+          },
+        )
+      ]);
     }
   }
 
@@ -3378,14 +3507,16 @@ class MigrationManager {
   }
 
   /// Process pending migration tasks
-  /// [return] boolean value indicating if all tasks are successfully processed
-  Future<bool> processMigrationTasks() async {
+  /// [return] MigrationTasksResult indicating if all tasks are successfully processed
+  Future<MigrationTasksResult> processMigrationTasks() async {
     if (_isProcessingTasks || _pendingTasks.isEmpty) {
-      return true; // no task to process, consider as success
+      return MigrationTasksResult(
+          success: true); // no task to process, consider as success
     }
 
     _isProcessingTasks = true;
     bool success = true; // track if all tasks are successful
+    final errors = <dynamic>[];
     try {
       // 1. Wait for primary instance recovery to complete before starting migration tasks.
       // This prevents migration writes from conflicting with WAL replay or missing
@@ -3409,6 +3540,8 @@ class MigrationManager {
 
             // timeout consider as failed
             success = false;
+            errors.add(TimeoutException(
+                'Migration task execution timed out for ${task.tableName}'));
             // timeout not remove task, continue to execute next time
             return false;
           });
@@ -3433,6 +3566,7 @@ class MigrationManager {
 
           // task execution failed
           success = false;
+          errors.add(e);
 
           // Keep the task on disk and in memory so startup / the next scheduler
           // pass can retry idempotent cutover steps after a crash or transient error.
@@ -3448,11 +3582,12 @@ class MigrationManager {
         label: 'MigrationManager.processMigrationTasks',
       );
       success = false;
+      errors.add(e);
     } finally {
       _isProcessingTasks = false;
     }
 
-    return success;
+    return MigrationTasksResult(success: success, errors: errors);
   }
 
   /// Execute single migration task across spaces
@@ -4253,10 +4388,19 @@ class MigrationManager {
           fk,
           targetSchema,
         )) {
-          throw BusinessError(
-            'Foreign key ${fk.actualName} in table $childTableName is no longer compatible with the migrated table $parentTableName.',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaForeignKey,
+              message:
+                  'Foreign key ${fk.actualName} in table $childTableName is no longer compatible with the migrated table $parentTableName.',
+              tableName: childTableName,
+              field: fk.fields.join(','),
+              wrongValue: {
+                'fkName': fk.actualName,
+                'referencedTable': parentTableName,
+              },
+            )
+          ]);
         }
       }
 
@@ -4477,10 +4621,12 @@ class MigrationManager {
         allProcessedEntries.addAll(batchResult.migratedEntries);
       } else {
         // Critical error: fail the entire migration task to prevent data loss
-        throw BusinessError(
-          'Batch migration failed: ${batchResult.errorMessage}',
-          type: BusinessErrorType.migrationError,
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.migrationBatchExecutionFailed,
+            message: 'Batch migration failed: ${batchResult.errorMessage}',
+          )
+        ]);
       }
     }
 
@@ -4989,11 +5135,17 @@ class MigrationManager {
 
           if (!hasEquivalentOldUnique) {
             if (recordCount > 0 && !isAllowed) {
-              throw BusinessError(
-                'Adding or modifying unique index "${newIdx.actualIndexName}" is not allowed on non-empty table "${oldSchema.name}" '
-                'without explicit data migration allowance, as it may cause duplicate key errors.',
-                type: BusinessErrorType.migrationError,
-              );
+              throw DbException([
+                SchemaValidationStatus(
+                  type: ResultType.migrationUniqueTighteningNotAllowed,
+                  message:
+                      'Adding or modifying unique index "${newIdx.actualIndexName}" is not allowed on non-empty table "${oldSchema.name}" '
+                      'without explicit data migration allowance, as it may cause duplicate key errors.',
+                  tableName: oldSchema.name,
+                  field: newIdx.fields.join(','),
+                  wrongValue: newIdx.actualIndexName,
+                )
+              ]);
             }
             Logger.warn(
               'Data migration required: adding or modifying unique index "${newIdx.actualIndexName}" on table "${oldSchema.name}".',
@@ -5019,11 +5171,20 @@ class MigrationManager {
               field.defaultValue == null &&
               field.defaultValueType == DefaultValueType.none) {
             if (recordCount > 0) {
-              throw BusinessError(
-                'Cannot add non-nullable field "${field.name}" without a default value to non-empty table "${oldSchema.name}". '
-                'This operation is physically impossible and would fail during data write.',
-                type: BusinessErrorType.migrationError,
-              );
+              throw DbException([
+                SchemaValidationStatus(
+                  type: ResultType.migrationCannotAddNonNullField,
+                  message:
+                      'Cannot add non-nullable field "${field.name}" without a default value to non-empty table "${oldSchema.name}". '
+                      'This operation is physically impossible and would fail during data write.',
+                  tableName: oldSchema.name,
+                  field: field.name,
+                  wrongValue: {
+                    'nullable': field.nullable,
+                    'defaultValue': field.defaultValue,
+                  },
+                )
+              ]);
             }
             Logger.warn(
               'Data migration required: adding non-nullable field "${field.name}" without a default value.',
@@ -5048,22 +5209,40 @@ class MigrationManager {
                 fieldUpdate.type != null &&
                 isNumericType(fieldUpdate.type!)) {
               if (recordCount > 0 && !isAllowed) {
-                throw BusinessError(
-                  'Changing field "${fieldUpdate.name}" type from text to numeric is not allowed on non-empty table "${oldSchema.name}" '
-                  'without explicit data migration allowance, as it may cause parsing errors for non-numeric data.',
-                  type: BusinessErrorType.migrationError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.migrationUnsafeTypeConversion,
+                    message:
+                        'Changing field "${fieldUpdate.name}" type from text to numeric is not allowed on non-empty table "${oldSchema.name}" '
+                        'without explicit data migration allowance, as it may cause parsing errors for non-numeric data.',
+                    tableName: oldSchema.name,
+                    field: fieldUpdate.name,
+                    wrongValue: {
+                      'oldType': 'text',
+                      'newType': fieldUpdate.type?.name,
+                    },
+                  )
+                ]);
               }
             }
 
             // from nullable to non-nullable
             if (oldField.nullable && (fieldUpdate.nullable == false)) {
               if (recordCount > 0 && !isAllowed) {
-                throw BusinessError(
-                  'Changing field "${fieldUpdate.name}" from nullable to non-nullable is not allowed on non-empty table "${oldSchema.name}" '
-                  'without explicit data migration allowance.',
-                  type: BusinessErrorType.migrationError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.migrationNullableToNonNullNotAllowed,
+                    message:
+                        'Changing field "${fieldUpdate.name}" from nullable to non-nullable is not allowed on non-empty table "${oldSchema.name}" '
+                        'without explicit data migration allowance.',
+                    tableName: oldSchema.name,
+                    field: fieldUpdate.name,
+                    wrongValue: {
+                      'oldNullable': true,
+                      'newNullable': false,
+                    },
+                  )
+                ]);
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from nullable to non-nullable.',
@@ -5074,11 +5253,20 @@ class MigrationManager {
             // Type change requires migration
             if (fieldUpdate.type != null && oldField.type != fieldUpdate.type) {
               if (recordCount > 0 && !isAllowed) {
-                throw BusinessError(
-                  'Changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type} '
-                  'is not allowed on non-empty table "${oldSchema.name}" without explicit data migration allowance.',
-                  type: BusinessErrorType.migrationError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.migrationUnsafeTypeConversion,
+                    message:
+                        'Changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type} '
+                        'is not allowed on non-empty table "${oldSchema.name}" without explicit data migration allowance.',
+                    tableName: oldSchema.name,
+                    field: fieldUpdate.name,
+                    wrongValue: {
+                      'oldType': oldField.type.name,
+                      'newType': fieldUpdate.type?.name,
+                    },
+                  )
+                ]);
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type}.',
@@ -5089,11 +5277,20 @@ class MigrationManager {
             // from non-unique to unique
             if (!oldField.unique && (fieldUpdate.unique == true)) {
               if (recordCount > 0 && !isAllowed) {
-                throw BusinessError(
-                  'Changing field "${fieldUpdate.name}" from non-unique to unique is not allowed on non-empty table "${oldSchema.name}" '
-                  'without explicit data migration allowance.',
-                  type: BusinessErrorType.migrationError,
-                );
+                throw DbException([
+                  SchemaValidationStatus(
+                    type: ResultType.migrationUniqueTighteningNotAllowed,
+                    message:
+                        'Changing field "${fieldUpdate.name}" from non-unique to unique is not allowed on non-empty table "${oldSchema.name}" '
+                        'without explicit data migration allowance.',
+                    tableName: oldSchema.name,
+                    field: fieldUpdate.name,
+                    wrongValue: {
+                      'oldUnique': false,
+                      'newUnique': true,
+                    },
+                  )
+                ]);
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from non-unique to unique.',
@@ -5110,11 +5307,20 @@ class MigrationManager {
               (newConfig.name != oldConfig.name ||
                   newConfig.type != oldConfig.type)) {
             if (recordCount > 0 && !isAllowed) {
-              throw BusinessError(
-                'Changing primary key config is not allowed on non-empty table "${oldSchema.name}" '
-                'without explicit data migration allowance.',
-                type: BusinessErrorType.migrationError,
-              );
+              throw DbException([
+                SchemaValidationStatus(
+                  type: ResultType.invalidSchemaPrimaryKey,
+                  message:
+                      'Changing primary key config is not allowed on non-empty table "${oldSchema.name}" '
+                      'without explicit data migration allowance.',
+                  tableName: oldSchema.name,
+                  field: oldSchema.primaryKey,
+                  wrongValue: {
+                    'oldPrimaryKey': oldSchema.primaryKey,
+                    'newPrimaryKey': newConfig.name,
+                  },
+                )
+              ]);
             }
             Logger.warn(
               'Data migration required: changing primary key name or type.',
@@ -5564,4 +5770,11 @@ class BgTaskProgress {
   final int count;
 
   BgTaskProgress({this.checkpointKey, required this.count});
+}
+
+class MigrationTasksResult {
+  final bool success;
+  final List<dynamic> errors;
+
+  MigrationTasksResult({required this.success, this.errors = const []});
 }
