@@ -2,7 +2,12 @@ import 'result_type.dart';
 
 /// query result class
 class QueryResult<T> {
+  /// Whether the operation has any failures
+  bool get hasFailed => type != ResultType.success;
+
   /// Whether the operation is successful
+  /// Deprecated: Use type == ResultType.success or check failures.
+  @Deprecated('Use type == ResultType.success instead')
   bool get isSuccess => type == ResultType.success;
 
   /// query result data
@@ -66,9 +71,6 @@ class QueryResult<T> {
     Future<QueryResult<T>> Function()? prevPageExecutor,
   })  : _nextPageExecutor = nextPageExecutor,
         _prevPageExecutor = prevPageExecutor;
-
-  /// Get the status code value
-  int get code => type.code;
 
   /// Seamlessly fetch the next page.
   /// Automatically handles both cursor-based and offset-based pagination.
@@ -164,13 +166,14 @@ class QueryResult<T> {
   /// Override toString for easy debugging
   @override
   String toString() {
-    return 'QueryResult{code: $code, message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, tableTotalCount: $tableTotalCount}';
+    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, tableTotalCount: $tableTotalCount}';
   }
 
   /// for serialization
   Map<String, dynamic> toJson() {
     return {
       'code': type.code,
+      'codeKey': type.codeKey,
       'message': message,
       'data': data is List<Map<String, dynamic>>
           ? data
@@ -186,8 +189,11 @@ class QueryResult<T> {
 
   /// create an instance from json
   static QueryResult<Map<String, dynamic>> fromJson(Map<String, dynamic> json) {
+    final codeKey = json['codeKey'] as String?;
     return QueryResult<Map<String, dynamic>>(
-      type: ResultType.fromCode(json['code'] as int),
+      type: codeKey != null
+          ? ResultType.fromCodeKey(codeKey)
+          : ResultType.fromCode(json['code'] as int? ?? 99001),
       message: json['message'] as String? ?? '',
       data: (json['data'] as List?)
               ?.map((e) => Map<String, dynamic>.from(e as Map))
