@@ -12,6 +12,11 @@ class DataStoreConfig {
   /// database path
   final String? dbPath;
 
+  /// Whether to ignore fields not defined in the table schema when inserting/updating data.
+  /// If true (default), unknown fields in DML input maps will be silently ignored.
+  /// If false, a DbException containing InvalidArgumentStatus will be thrown.
+  final bool ignoreUnknownFields;
+
   /// database name, used for quickly creating different database instances
   final String dbName;
 
@@ -156,6 +161,7 @@ class DataStoreConfig {
     this.dbName = 'default',
     this.spaceName = 'default',
     this.compressionLevel = 6,
+    this.ignoreUnknownFields = true,
     this.enableMonitoring = true,
     this.enableCompression = true,
     this.enableAutoRepair = true,
@@ -543,6 +549,7 @@ class DataStoreConfig {
       dbName: json['dbName'] as String? ?? 'default',
       spaceName: json['spaceName'] as String? ?? 'default',
       compressionLevel: json['compressionLevel'] as int? ?? 6,
+      ignoreUnknownFields: json['ignoreUnknownFields'] as bool? ?? true,
       transactionTimeout:
           Duration(milliseconds: json['transactionTimeout'] as int? ?? 300000),
       enableMonitoring: json['enableMonitoring'] as bool? ?? true,
@@ -603,6 +610,7 @@ class DataStoreConfig {
       'dbName': dbName,
       'spaceName': spaceName,
       'compressionLevel': compressionLevel,
+      'ignoreUnknownFields': ignoreUnknownFields,
       'transactionTimeout': transactionTimeout.inMilliseconds,
       'enableMonitoring': enableMonitoring,
       'enableCompression': enableCompression,
@@ -648,6 +656,7 @@ class DataStoreConfig {
     String? dbName,
     String? spaceName,
     int? compressionLevel,
+    bool? ignoreUnknownFields,
     Duration? transactionTimeout,
     bool? enableMonitoring,
     bool? enableCompression,
@@ -688,6 +697,7 @@ class DataStoreConfig {
       dbName: dbName ?? this.dbName,
       spaceName: spaceName ?? this.spaceName,
       compressionLevel: compressionLevel ?? this.compressionLevel,
+      ignoreUnknownFields: ignoreUnknownFields ?? this.ignoreUnknownFields,
       transactionTimeout: transactionTimeout ?? this.transactionTimeout,
       enableMonitoring: enableMonitoring ?? this.enableMonitoring,
       enableCompression: enableCompression ?? this.enableCompression,
