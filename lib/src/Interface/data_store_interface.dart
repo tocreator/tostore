@@ -43,17 +43,17 @@ abstract class DataStoreInterface {
   /// batch insert data, returns the operation result with successful and failed keys
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true});
+      {bool allowPartialErrors = true, bool returnResultDetails = true});
 
   /// batch upsert data based on unique constraints.
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true});
+      {bool allowPartialErrors = true, bool returnResultDetails = true});
 
   /// batch update data based on primary keys or unique identifiers.
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true});
+      {bool allowPartialErrors = true, bool returnResultDetails = true});
 
   /// update data
   UpdateBuilder update(String tableName,
