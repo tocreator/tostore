@@ -37,7 +37,8 @@ export 'src/Interface/status_provider.dart';
 export 'src/handler/logger.dart' show LogType;
 export 'src/handler/to_crypto.dart';
 export 'src/model/backup_scope.dart';
-export 'src/model/business_error.dart';
+export 'src/model/db_exception.dart';
+export 'src/model/result_status.dart';
 export 'src/model/config_info.dart';
 export 'src/model/data_store_config.dart';
 export 'src/model/db_result.dart';
@@ -433,7 +434,7 @@ class ToStore implements DataStoreInterface {
 
   /// Upsert a record: updates if it exists, otherwise inserts.
   ///
-  /// Existing rows are located via primary key or unique indexes.
+  /// Existing records are located via primary key or unique indexes.
   ///
   /// [tableName] The name of the table.
   /// [data] The data map to insert or update.
@@ -537,6 +538,15 @@ class ToStore implements DataStoreInterface {
   /// [data] Initial fields and values to update.
   /// Returns an [UpdateBuilder] to specify conditions and execute the update.
   ///
+  /// chain methods on [UpdateBuilder]:
+  /// - `.where(field, op, value)` — filter condition
+  /// - `.skipResultDetails()` — skip collecting success/failure primary key lists
+  ///     and status details. Use for large-scale range updates (e.g. `.where('id', '>', 5)`)
+  ///     to improve performance and avoid memory overhead.
+  ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  /// - `.allowUpdateAll()` — allow updating all records without a condition
+  /// - `.allowPartialErrors()` — continue on partial record failures
+  ///
   /// Example:
   /// ```dart
   /// // Update with condition
@@ -551,6 +561,11 @@ class ToStore implements DataStoreInterface {
   /// await db.update('users', {'email': 'unique@example.com'})
   ///         .where('status', '=', 'inactive')
   ///         .allowPartialErrors();
+  ///
+  /// // Skip result details for large-scale range updates to save memory
+  /// await db.update('users', {'status': 'inactive'})
+  ///         .skipResultDetails()
+  ///         .where('last_login', '<', expiredDate);
   /// ```
   ///
   /// 获取更新构建器，用于修改记录。
@@ -558,6 +573,15 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名。
   /// [data] 初始更新字段和值。
   /// 返回 [UpdateBuilder] 用于指定条件并执行更新。
+  ///
+  /// [UpdateBuilder] 链式方法：
+  /// - `.where(field, op, value)` — 筛选条件
+  /// - `.skipResultDetails()` — 跳过收集成功/失败的主键列表和状态详情。
+  ///     适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
+  ///     能够显著提升性能并避免内存开销。
+  ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
+  /// - `.allowUpdateAll()` — 允许无条件更新全部记录
+  /// - `.allowPartialErrors()` — 部分记录失败时继续执行
   @override
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]) {
@@ -572,20 +596,23 @@ class ToStore implements DataStoreInterface {
   /// [tableName] Table name.
   /// [dataList] List of records to insert.
   /// [allowPartialErrors] Whether to continue when some records fail to insert (defaults to true).
+  /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
+  ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
   ///
   /// Returns the operation result with successful and failed keys.
   ///
   /// 批量插入多条记录。
-  ///
   /// [tableName] 表名。
   /// [dataList] 要插入的数据列表。
   /// [allowPartialErrors] 当部分记录插入失败时是否继续处理其他记录（默认为 true）。
+  /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
+  ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
   ///
   /// 返回包含成功和失败主键信息的操作结果。
   @override
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchInserted manually', 'ToStore.batchInsert');
 
@@ -593,6 +620,7 @@ class ToStore implements DataStoreInterface {
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
+      returnResultDetails: returnResultDetails,
     );
   }
 
@@ -606,6 +634,8 @@ class ToStore implements DataStoreInterface {
   /// [tableName] Table name.
   /// [dataList] List of records to upsert.
   /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
+  /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
+  ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
   ///
   ///  ///
   /// Example:
@@ -633,10 +663,12 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名。
   /// [dataList] 记录列表。
   /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
+  /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
+  ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
   @override
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpserted manually', 'ToStore.batchUpsert');
 
@@ -644,6 +676,7 @@ class ToStore implements DataStoreInterface {
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
+      returnResultDetails: returnResultDetails,
     );
   }
 
@@ -654,6 +687,8 @@ class ToStore implements DataStoreInterface {
   /// [tableName] Table name.
   /// [dataList] List of records to update.
   /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
+  /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
+  ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
   ///
   /// Example:
   /// ```dart
@@ -671,10 +706,12 @@ class ToStore implements DataStoreInterface {
   /// [tableName] 表名。
   /// [dataList] 记录列表。
   /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
+  /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
+  ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
   @override
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true}) async {
+      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpdated manually', 'ToStore.batchUpdate');
 
@@ -682,6 +719,7 @@ class ToStore implements DataStoreInterface {
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
+      returnResultDetails: returnResultDetails,
     );
   }
 
@@ -872,6 +910,15 @@ class ToStore implements DataStoreInterface {
   /// [tableName] The name of the table.
   /// Returns a [DeleteBuilder] to specify conditions and execute deletion.
   ///
+  /// chain methods on [DeleteBuilder]:
+  /// - `.where(field, op, value)` — filter condition
+  /// - `.skipResultDetails()` — skip collecting success/failure primary key lists
+  ///     and status details. Use for large-scale range deletes (e.g. `.where('id', '>', 5)`)
+  ///     to improve performance and avoid memory overhead.
+  ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  /// - `.allowDeleteAll()` — allow deleting all records without a condition
+  /// - `.allowPartialErrors()` — continue on partial record failures
+  ///
   /// Example:
   /// ```dart
   /// await db.delete('users')
@@ -881,12 +928,26 @@ class ToStore implements DataStoreInterface {
   /// await db.delete('users')
   ///         .where('id', '>', 100)
   ///         .allowPartialErrors();
+  ///
+  /// // Skip result details for large-scale range deletes to save memory
+  /// await db.delete('users')
+  ///         .skipResultDetails()
+  ///         .where('created_at', '<', expiredDate);
   /// ```
   ///
   /// 获取删除构建器，用于删除记录。
   ///
   /// [tableName] 表名。
   /// 返回 [DeleteBuilder] 用于指定条件并执行删除。
+  ///
+  /// [DeleteBuilder] 链式方法：
+  /// - `.where(field, op, value)` — 筛选条件
+  /// - `.skipResultDetails()` — 跳过收集成功/失败的主键列表和状态详情。
+  ///     适用于大范围范围查询的批量删除场景（如 `.where('id', '>', 5)`），
+  ///     能够显著提升性能并避免内存开销。
+  ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
+  /// - `.allowDeleteAll()` — 允许无条件删除全部记录
+  /// - `.allowPartialErrors()` — 部分记录失败时继续执行
   @override
   DeleteBuilder delete(String tableName) {
     _checkSystemTableAccess(
