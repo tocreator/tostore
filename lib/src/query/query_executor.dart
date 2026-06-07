@@ -16,8 +16,10 @@ import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
 import '../handler/binary_schema_codec.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
-import '../model/business_error.dart';
 import '../model/index_search.dart';
 import '../model/join_clause.dart';
 import '../model/query_aggregation.dart';
@@ -294,11 +296,15 @@ class QueryExecutor {
       bool useCursor = isCursorIntent;
 
       if (useCursor && offset != null && offset > 0) {
-        throw BusinessError(
-          'Cursor pagination and offset are mutually exclusive. Use cursor() or offset(), not both.',
-          type: BusinessErrorType.invalidData,
-          data: {'cursor': cursor, 'offset': offset},
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorPagination,
+            message:
+                'Cursor pagination and offset are mutually exclusive. Use cursor() or offset(), not both.',
+            parameterName: 'offset',
+            passedValue: {'cursor': cursor, 'offset': offset},
+          ),
+        ]);
       }
 
       if (useCursor) {
@@ -322,12 +328,13 @@ class QueryExecutor {
 
         if (!supported) {
           if (hasToken) {
-            throw BusinessError(
-              reason ??
-                  'Cursor pagination is not supported for this query type.',
-              type: BusinessErrorType.dbError,
-              data: {'table': tableName},
-            );
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.invalidCursorPagination,
+                message: reason ??
+                    'Cursor pagination is not supported for this query type.',
+              ),
+            ]);
           } else {
             useCursor = false;
           }
@@ -341,12 +348,15 @@ class QueryExecutor {
       if (effectiveOffset < 0) effectiveOffset = 0;
       final int maxOffset = _dataStore.config.maxQueryOffset;
       if (maxOffset > 0 && effectiveOffset > maxOffset && !hasCursor) {
-        throw BusinessError(
-          'Query offset ($effectiveOffset) exceeds maxQueryOffset ($maxOffset). '
-          'Use keyset pagination (primaryKey/index range) instead of deep offset pagination.',
-          type: BusinessErrorType.dbError,
-          data: {'offset': effectiveOffset, 'maxQueryOffset': maxOffset},
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentFormat,
+            message:
+                'Query offset ($effectiveOffset) exceeds maxQueryOffset ($maxOffset). Use keyset pagination instead.',
+            parameterName: 'offset',
+            passedValue: effectiveOffset,
+          ),
+        ]);
       }
 
       bool isDefaultLimitApplied = false;
@@ -370,14 +380,13 @@ class QueryExecutor {
               effectiveLimit = null;
             } else {
               // Safety: never allow unbounded reads in ultra-large datasets.
-              throw BusinessError(
-                'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
-                type: BusinessErrorType.dbError,
-                data: {
-                  'table': tableName,
-                  'defaultQueryLimit': _dataStore.config.defaultQueryLimit,
-                },
-              );
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.invalidArgumentFormat,
+                  message:
+                      'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
+                ),
+              ]);
             }
           } else {
             effectiveLimit = defaultLimit;
@@ -418,14 +427,14 @@ class QueryExecutor {
           hasCursor ? _QueryCursorToken.tryDecode(cursor) : null;
       if (cursorToken != null) {
         if (cursorToken.tableName != tableName) {
-          throw BusinessError(
-            'Cursor does not match target table.',
-            type: BusinessErrorType.dbError,
-            data: {
-              'table': tableName,
-              'cursorTable': cursorToken.tableName,
-            },
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorTable,
+              message: 'Cursor does not match target table.',
+              parameterName: 'cursor',
+              passedValue: cursor,
+            ),
+          ]);
         }
 
         // Validate query signature hash to prevent mismatched query cursors
@@ -436,15 +445,15 @@ class QueryExecutor {
             orderBy: orderBy,
           );
           if (cursorToken.querySigHash != currentSigHash) {
-            throw BusinessError(
-              'Mismatched cursor: The query conditions or sorting used for this cursor do not match the current query parameters.',
-              type: BusinessErrorType.dbError,
-              data: {
-                'table': tableName,
-                'query': _deterministicJsonStringify(where),
-                'orderBy': orderBy,
-              },
-            );
+            throw DbException([
+              InvalidArgumentStatus(
+                type: ResultType.invalidCursorSignature,
+                message:
+                    'Mismatched cursor: The query conditions or sorting used for this cursor do not match the current query parameters.',
+                parameterName: 'cursor',
+                passedValue: cursor,
+              ),
+            ]);
           }
         }
       }
@@ -755,7 +764,7 @@ class QueryExecutor {
         executionTimeMs: stopwatch.elapsedMilliseconds,
         tableTotalCount: tableTotalCount,
       );
-    } on BusinessError catch (e) {
+    } on DbException catch (e) {
       // Business/Validation errors should not clutter logs with stack traces.
       Logger.error(e.message, label: 'QueryExecutor.execute');
       rethrow;
@@ -1958,15 +1967,12 @@ class QueryExecutor {
       final IndexCondition indexCondition = builtCondition ??
           (indexSchema != null
               ? IndexCondition.fromMap({'SCAN': true})
-              : (throw BusinessError(
-                  'Index condition is not available for index scan.',
-                  type: BusinessErrorType.dbError,
-                  data: {
-                    'table': tableName,
-                    'index': actualIndexName,
-                    'conditions': conditions,
-                  },
-                )));
+              : (throw DbException([
+                  GeneralStatus(
+                    type: ResultType.notFoundIndex,
+                    message: 'Index condition is not available for index scan.',
+                  ),
+                ])));
 
       // use searchIndex to get pointers
       // IMPORTANT: offset is applied by the final pagination step in QueryExecutor.
@@ -2752,11 +2758,12 @@ class QueryExecutor {
       if (indexName.startsWith('uniq_') && indexName.length > 5) {
         return (fields: <String>[indexName.substring(5)], isUnique: true);
       }
-      throw BusinessError(
-        'Index schema not found for cursor pagination.',
-        type: BusinessErrorType.dbError,
-        data: {'index': indexName},
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.notFoundIndex,
+          message: 'Index schema not found for cursor pagination: $indexName.',
+        ),
+      ]);
     }
   }
 
@@ -2769,11 +2776,13 @@ class QueryExecutor {
   }) {
     final idxName = plan.operation.indexName;
     if (idxName == null) {
-      throw BusinessError(
-        'Index scan plan is missing indexName for cursor pagination.',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.notFoundIndex,
+          message:
+              'Index scan plan is missing indexName for cursor pagination.',
+        ),
+      ]);
     }
     final spec = _resolveIndexSpecForCursor(schema, idxName);
 
@@ -2782,40 +2791,39 @@ class QueryExecutor {
     // on a composite index of ['age', 'score'] where 'id' is the primary key),
     // we strip the trailing PK before index prefix checking since PK is already physically
     // appended to all non-unique index keys for total stable sorting.
-    final cleanOrderBy = List<String>.from(orderBy);
+    if (orderBy.isEmpty) return;
+
+    // orderBy fields mapping
+    final cleanOrderBy = orderBy.toList();
     if (cleanOrderBy.isNotEmpty) {
-      final lastParsed = _parseSortField(cleanOrderBy.last);
-      final lastField = lastParsed.field.contains('.')
-          ? lastParsed.field.split('.').last
-          : lastParsed.field;
+      final lastField = _parseSortField(cleanOrderBy.last).field;
       if (lastField == schema.primaryKey) {
         cleanOrderBy.removeLast();
       }
     }
 
     if (cleanOrderBy.isEmpty && orderBy.isNotEmpty) {
-      throw BusinessError(
-        'Index-key cursor pagination requires orderBy to include index fields.',
-        type: BusinessErrorType.dbError,
-        data: {
-          'table': tableName,
-          'index': idxName,
-          'orderBy': orderBy,
-        },
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorOrderBy,
+          message:
+              'Index-key cursor pagination requires orderBy to include index fields.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
     }
 
     if (cleanOrderBy.length > spec.fields.length) {
-      throw BusinessError(
-        'Index-key cursor pagination requires orderBy to match index fields prefix.',
-        type: BusinessErrorType.dbError,
-        data: {
-          'table': tableName,
-          'index': idxName,
-          'orderBy': orderBy,
-          'indexFields': spec.fields,
-        },
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorOrderBy,
+          message:
+              'Index-key cursor pagination requires orderBy to match index fields prefix.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
     }
     bool firstIsDesc = false;
     for (int i = 0; i < cleanOrderBy.length; i++) {
@@ -2825,31 +2833,29 @@ class QueryExecutor {
       final isDesc = parsed.descending;
 
       if (f != spec.fields[i]) {
-        throw BusinessError(
-          'Index-key cursor pagination requires orderBy to match index fields in the same order.',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'index': idxName,
-            'orderBy': orderBy,
-            'indexFields': spec.fields,
-            'mismatchAt': i,
-          },
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorOrderBy,
+            message:
+                'Index-key cursor pagination requires orderBy to match index fields in the same order.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
       }
 
       if (i == 0) {
         firstIsDesc = isDesc;
       } else if (isDesc != firstIsDesc) {
-        throw BusinessError(
-          'Cursor pagination for multi-field indexes requires a uniform sort direction (all ASC or all DESC).',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'index': idxName,
-            'orderBy': orderBy,
-          },
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorOrderBy,
+            message:
+                'Cursor pagination for multi-field indexes requires a uniform sort direction (all ASC or all DESC).',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
       }
     }
   }
@@ -2871,11 +2877,14 @@ class QueryExecutor {
     required _QueryCursorToken cursorToken,
   }) {
     if (cursorToken.mode != _CursorMode.sortKey) {
-      throw BusinessError(
-        'Cursor token mode mismatch (expected sortKey).',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorMode,
+          message: 'Cursor token mode mismatch (expected sortKey).',
+          parameterName: 'cursor',
+          passedValue: cursorToken.mode.toString(),
+        ),
+      ]);
     }
     final tokenFields = cursorToken.sortFields;
     final keyBytes = cursorToken.sortKey;
@@ -2883,18 +2892,24 @@ class QueryExecutor {
         tokenFields.isEmpty ||
         keyBytes == null ||
         keyBytes.isEmpty) {
-      throw BusinessError(
-        'Invalid sort-key cursor token.',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorPayload,
+          message: 'Invalid sort-key cursor token.',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
     }
     if (orderBy.isEmpty) {
-      throw BusinessError(
-        'Sort-key cursor requires explicit orderBy.',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorOrderBy,
+          message: 'Sort-key cursor requires explicit orderBy.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
     }
 
     final orderFieldsRaw = <String>[];
@@ -2908,53 +2923,52 @@ class QueryExecutor {
     }
 
     if (!_sameStringList(normalizedFields, tokenFields)) {
-      throw BusinessError(
-        'Cursor orderBy fields do not match current query orderBy.',
-        type: BusinessErrorType.dbError,
-        data: {
-          'table': tableName,
-          'cursorFields': tokenFields,
-          'orderByFields': normalizedFields,
-        },
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorOrderBy,
+          message: 'Cursor orderBy fields do not match current query orderBy.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
     }
 
     final tokenDesc = cursorToken.sortDesc;
     if (tokenDesc == null || tokenDesc.length != tokenFields.length) {
-      throw BusinessError(
-        'Invalid sort-key cursor token (missing direction).',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorPayload,
+          message: 'Invalid sort-key cursor token (missing direction).',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
     }
     for (int i = 0; i < orderDesc.length; i++) {
       final expected = tokenDesc[i] ^ cursorToken.isBackward;
       if (orderDesc[i] != expected) {
-        throw BusinessError(
-          'Cursor orderBy direction does not match current orderBy.',
-          type: BusinessErrorType.dbError,
-          data: {
-            'table': tableName,
-            'cursorDesc': tokenDesc,
-            'orderByDesc': orderDesc,
-            'isBackward': cursorToken.isBackward,
-          },
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorOrderBy,
+            message: 'Cursor orderBy direction does not match current orderBy.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
       }
     }
 
     final pivotValues = MemComparableKey.decodeTuple(keyBytes);
     final expectedLen = tokenFields.length + 1; // + primary key tie-breaker
     if (pivotValues.length != expectedLen) {
-      throw BusinessError(
-        'Invalid sort-key cursor payload.',
-        type: BusinessErrorType.dbError,
-        data: {
-          'table': tableName,
-          'expected': expectedLen,
-          'actual': pivotValues.length,
-        },
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorPayload,
+          message: 'Invalid sort-key cursor payload.',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
     }
 
     final matchers = <MatcherFunction>[];
@@ -3023,11 +3037,13 @@ class QueryExecutor {
     if (op.type == QueryOperationType.indexScan) {
       final idxName = op.indexName ?? '';
       if (idxName.isEmpty) {
-        throw BusinessError(
-          'Index scan plan is missing indexName for cursor pagination.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName},
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.notFoundIndex,
+            message:
+                'Index scan plan is missing indexName for cursor pagination.',
+          ),
+        ]);
       }
 
       // Check if orderBy aligns with index fields (or empty).
@@ -3078,19 +3094,25 @@ class QueryExecutor {
       final pkVal =
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null || pkVal.isEmpty) {
-        throw BusinessError(
-          'Cannot build next cursor: primary key is missing from the last record.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'primaryKey': pkName},
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.validationFailed,
+            message:
+                'Cannot build next cursor: primary key is missing from the last record.',
+          ),
+        ]);
       }
       final pkOrder = _parsePrimaryKeyOrder(orderBy, pkName);
       if (!pkOrder.isPkOrder) {
-        throw BusinessError(
-          'Cannot build primary-key cursor when orderBy is not primary key.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'orderBy': orderBy},
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentFormat,
+            message:
+                'Cannot build primary-key cursor when orderBy is not primary key.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
       }
       return _QueryCursorToken.primaryKey(
         tableName: tableName,
@@ -3104,11 +3126,14 @@ class QueryExecutor {
     if (mode == _CursorMode.sortKey) {
       final ob = orderBy ?? const <String>[];
       if (ob.isEmpty) {
-        throw BusinessError(
-          'Cannot build sort-key cursor without orderBy.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName},
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentFormat,
+            message: 'Cannot build sort-key cursor without orderBy.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
       }
 
       final sortFields = <String>[];
@@ -3137,11 +3162,13 @@ class QueryExecutor {
       final pkVal =
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null || pkVal.isEmpty) {
-        throw BusinessError(
-          'Cannot build sort-key cursor: primary key is missing from the last record.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'primaryKey': pkName},
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.validationFailed,
+            message:
+                'Cannot build sort-key cursor: primary key is missing from the last record.',
+          ),
+        ]);
       }
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
 
@@ -3158,19 +3185,22 @@ class QueryExecutor {
     // indexKey cursor
     final idxName = plan.operation.indexName;
     if (idxName == null || idxName.isEmpty) {
-      throw BusinessError(
-        'Cannot build next cursor: missing indexName from query plan.',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName},
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.notFoundIndex,
+          message:
+              'Cannot build next cursor: missing indexName from query plan.',
+        ),
+      ]);
     }
     final spec = _resolveIndexSpecForCursor(schema, idxName);
     if (spec.fields.isEmpty) {
-      throw BusinessError(
-        'Cannot build next cursor: index has no fields.',
-        type: BusinessErrorType.dbError,
-        data: {'table': tableName, 'index': idxName},
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.notFoundIndex,
+          message: 'Cannot build next cursor: index has no fields.',
+        ),
+      ]);
     }
 
     final bool truncateText = !spec.isUnique;
@@ -3183,11 +3213,13 @@ class QueryExecutor {
         truncateText: truncateText,
       );
       if (c == null) {
-        throw BusinessError(
-          'Cannot build next cursor: missing or unsupported index field value in the last record.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'index': idxName, 'field': f},
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.validationFailed,
+            message:
+                'Cannot build next cursor: missing or unsupported index field value in the last record.',
+          ),
+        ]);
       }
       comps.add(c);
     }
@@ -3196,11 +3228,13 @@ class QueryExecutor {
       final pkVal =
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null) {
-        throw BusinessError(
-          'Cannot build next cursor: primary key is missing for non-unique index cursor.',
-          type: BusinessErrorType.dbError,
-          data: {'table': tableName, 'index': idxName},
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.validationFailed,
+            message:
+                'Cannot build next cursor: primary key is missing for non-unique index cursor.',
+          ),
+        ]);
       }
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
     }
@@ -3709,33 +3743,40 @@ final class _QueryCursorToken {
     return base64Url.encode(utf8.encode(jsonStr));
   }
 
-  static _QueryCursorToken? tryDecode(String? token) {
-    final raw = (token ?? '').trim();
-    if (raw.isEmpty) return null;
+  static _QueryCursorToken? tryDecode(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
     try {
       final decoded = utf8.decode(base64Url.decode(base64Url.normalize(raw)));
       final obj = jsonDecode(decoded);
       if (obj is! Map) {
-        throw BusinessError(
-          'Invalid cursor token payload.',
-          type: BusinessErrorType.dbError,
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorPayload,
+            message: 'Invalid cursor token payload.',
+            parameterName: 'cursor',
+          ),
+        ]);
       }
       final int v = (obj['v'] is int) ? (obj['v'] as int) : -1;
       if (v != _currentVersion) {
-        throw BusinessError(
-          'Unsupported cursor token version.',
-          type: BusinessErrorType.dbError,
-          data: {'version': v},
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorPayload,
+            message: 'Unsupported cursor token version: $v',
+            parameterName: 'cursor',
+          ),
+        ]);
       }
       final String t = (obj['t'] ?? '').toString();
       final String m = (obj['m'] ?? '').toString();
       if (t.isEmpty || m.isEmpty) {
-        throw BusinessError(
-          'Invalid cursor token.',
-          type: BusinessErrorType.dbError,
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidCursorPayload,
+            message: 'Invalid cursor token.',
+            parameterName: 'cursor',
+          ),
+        ]);
       }
 
       final querySigHash = obj['s'] as int?;
@@ -3743,10 +3784,13 @@ final class _QueryCursorToken {
       if (m == 'pk') {
         final pk = (obj['pk'] ?? '').toString();
         if (pk.isEmpty) {
-          throw BusinessError(
-            'Invalid primary-key cursor token.',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid primary-key cursor token.',
+              parameterName: 'cursor',
+            ),
+          ]);
         }
         final bool reverse = obj['r'] == true;
         final bool isBackward = obj['b'] == true;
@@ -3763,18 +3807,24 @@ final class _QueryCursorToken {
         final idx = (obj['i'] ?? '').toString();
         final k = (obj['k'] ?? '').toString();
         if (idx.isEmpty || k.isEmpty) {
-          throw BusinessError(
-            'Invalid index-key cursor token.',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid index-key cursor token.',
+              parameterName: 'cursor',
+            ),
+          ]);
         }
         final keyBytes =
             Uint8List.fromList(base64Url.decode(base64Url.normalize(k)));
         if (keyBytes.isEmpty) {
-          throw BusinessError(
-            'Invalid index-key cursor token (empty key).',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid index-key cursor token (empty key).',
+              parameterName: 'cursor',
+            ),
+          ]);
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.indexKey(
@@ -3791,34 +3841,50 @@ final class _QueryCursorToken {
         final d = obj['d'];
         final k = (obj['k'] ?? '').toString();
         if (f is! List || d is! List || k.isEmpty) {
-          throw BusinessError(
-            'Invalid sort-key cursor token.',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid sort-key cursor token.',
+              parameterName: 'cursor',
+              passedValue: null,
+            ),
+          ]);
         }
         final fields =
             f.map((e) => e.toString()).where((e) => e.isNotEmpty).toList();
         if (fields.isEmpty) {
-          throw BusinessError(
-            'Invalid sort-key cursor token (empty fields).',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid sort-key cursor token (empty fields).',
+              parameterName: 'cursor',
+              passedValue: null,
+            ),
+          ]);
         }
         final desc = d.map((e) => e == true).toList(growable: false);
         if (desc.length != fields.length) {
-          throw BusinessError(
-            'Invalid sort-key cursor token (direction length mismatch).',
-            type: BusinessErrorType.dbError,
-            data: {'fields': fields.length, 'desc': desc.length},
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message:
+                  'Invalid sort-key cursor token (direction length mismatch).',
+              parameterName: 'cursor',
+              passedValue: null,
+            ),
+          ]);
         }
         final keyBytes =
             Uint8List.fromList(base64Url.decode(base64Url.normalize(k)));
         if (keyBytes.isEmpty) {
-          throw BusinessError(
-            'Invalid sort-key cursor token (empty key).',
-            type: BusinessErrorType.dbError,
-          );
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidCursorPayload,
+              message: 'Invalid sort-key cursor token (empty key).',
+              parameterName: 'cursor',
+              passedValue: null,
+            ),
+          ]);
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.sortKey(
@@ -3831,18 +3897,24 @@ final class _QueryCursorToken {
         );
       }
 
-      throw BusinessError(
-        'Unknown cursor token mode.',
-        type: BusinessErrorType.dbError,
-        data: {'mode': m},
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorMode,
+          message: 'Unknown cursor token mode.',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
     } catch (e) {
-      if (e is BusinessError) rethrow;
-      throw BusinessError(
-        'Failed to decode cursor token.',
-        type: BusinessErrorType.dbError,
-        data: {'error': e.toString()},
-      );
+      if (e is DbException) rethrow;
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.invalidCursorPayload,
+          message: 'Failed to decode cursor token: $e',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
     }
   }
 }
