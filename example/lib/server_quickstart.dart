@@ -392,14 +392,14 @@ class ServerCRUDExamples {
       'email': 'john@example.com',
       'status': 'active',
     });
-    log('✅ Created user: ${user1.successKeys}');
+    log('✅ Created user: ${user1.firstPrimaryKey}');
 
     final user2 = await _db.insert('users', {
       'username': 'jane_smith',
       'email': 'jane@example.com',
       'status': 'active',
     });
-    log('✅ Created user: ${user2.successKeys}');
+    log('✅ Created user: ${user2.firstPrimaryKey}');
 
     // Query users
     final activeUsers = await _db
@@ -449,7 +449,7 @@ class ServerCRUDExamples {
 
     for (final product in products) {
       final result = await _db.insert('products', product);
-      log('✅ Created product: ${result.successKeys}');
+      log('✅ Created product: ${result.firstPrimaryKey}');
     }
 
     // Query products by category
