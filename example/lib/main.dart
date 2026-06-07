@@ -1958,7 +1958,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         logService.add(
             'Deleted ${result.successCount} of ${_selectedRows.length} records.',
-            !result.hasFailed ? LogType.info : LogType.warn);
+            !result.hasErrors ? LogType.info : LogType.warn);
 
         if (result.failedCount > 0) {
           logService.add(
@@ -2006,7 +2006,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             .update(_selectedTable, updatedData)
             .where(schema.primaryKeyConfig.name, '=', pkValue);
 
-        if (!result.hasFailed) {
+        if (!result.hasErrors) {
           logService.add('Row successfully updated.', LogType.info);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -2163,7 +2163,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
           logService.add(
               'Custom delete affected ${result.successCount} record(s).',
-              !result.hasFailed ? LogType.info : LogType.warn);
+              !result.hasErrors ? LogType.info : LogType.warn);
 
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
