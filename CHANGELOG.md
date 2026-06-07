@@ -16,7 +16,7 @@ All notable changes to this project will be documented in this file.
 - Refactored `ResultType` to support granular error classifications with unique numeric codes and semantic string keys (`codeKey`).
 - Renamed `nextCursor` and `prevCursor` to `nextCursorToken` and `prevCursorToken` to clarify their role as stateless pagination tokens.
 - Optimized cursor pagination resilience to fully support complex queries and multi-table joins.
-- Deprecated `DbResult.isSuccess`, `DbResult.type`, and `TransactionResult.isSuccess` in favor of `hasFailed` and `firstType` to eliminate semantic ambiguities in batch operations.
+- Deprecated `DbResult.isSuccess`, `DbResult.type`, `successKeys`, `failedKeys`, and `TransactionResult.isSuccess` in favor of `hasErrors`, `firstType`, and `firstPrimaryKey` to eliminate semantic ambiguities in batch operations.
 
 ### Fixed
 - Fixed missing `.watch()` notifications for table clearing, drop table, restoration, and batch insert operations.
