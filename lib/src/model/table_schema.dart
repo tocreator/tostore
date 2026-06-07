@@ -6,7 +6,9 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
 import '../handler/value_matcher.dart';
-import 'business_error.dart';
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 /// table schema
 class TableSchema {
@@ -232,85 +234,137 @@ class TableSchema {
 
     // validate name format
     if (name.isEmpty || !tableNameRegex.hasMatch(name)) {
-      throw BusinessError(
-        'Invalid table name format for "$name". Table names must only contain alphanumeric characters and underscores, and must start with a letter.',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTableName,
+          message:
+              'Invalid table name format for "$name". Table names must only contain alphanumeric characters and underscores, and must start with a letter.',
+          tableName: name,
+        )
+      ]);
     }
 
     // Reserve exact table names for system tables (published names must remain stable).
     if (!allowReservedTableNames && reservedTableNames.contains(name)) {
-      throw BusinessError(
-        'Table name "$name" is reserved for system tables and cannot be used.',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTableName,
+          message:
+              'Table name "$name" is reserved for system tables and cannot be used.',
+          tableName: name,
+        )
+      ]);
     }
 
     // Reserve internal prefix for engine/system tables.
     if (!allowInternalTableNamePrefix &&
         name.startsWith(internalSystemPrefix)) {
-      throw BusinessError(
-        'Table name "$name" is reserved for internal tables (prefix: "$internalSystemPrefix").',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTableName,
+          message:
+              'Table name "$name" is reserved for internal tables (prefix: "$internalSystemPrefix").',
+          tableName: name,
+        )
+      ]);
     }
 
     // validate primary key name format
     if (primaryKey.isEmpty || !fieldNameRegex.hasMatch(primaryKey)) {
-      throw BusinessError(
-        'Invalid primary key name format "$primaryKey" in table "$name".',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaPrimaryKey,
+          message:
+              'Invalid primary key name format "$primaryKey" in table "$name".',
+          tableName: name,
+          field: primaryKey,
+        )
+      ]);
     }
 
     // validate field name format
     for (final field in fields) {
       if (!fieldNameRegex.hasMatch(field.name)) {
-        throw BusinessError(
-          'Invalid field name format "${field.name}" in table "$name".',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaFieldName,
+            message:
+                'Invalid field name format "${field.name}" in table "$name".',
+            tableName: name,
+            field: field.name,
+          )
+        ]);
       }
 
       // Reserve internal prefix for engine fields.
       if (field.name.startsWith(internalSystemPrefix)) {
         if (field.name == internalTtlIngestTsMsField) {
-          throw BusinessError(
-            'Field "${field.name}" in table "$name" is reserved for internal TTL management and cannot be user-defined.',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaFieldName,
+              message:
+                  'Field "${field.name}" in table "$name" is reserved for internal TTL management and cannot be user-defined.',
+              tableName: name,
+              field: field.name,
+            )
+          ]);
         }
         if (!allowOtherInternalFields) {
-          throw BusinessError(
-            'Field "${field.name}" in table "$name" is reserved for internal system fields (prefix: "$internalSystemPrefix").',
-            type: BusinessErrorType.schemaError,
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.invalidSchemaFieldName,
+              message:
+                  'Field "${field.name}" in table "$name" is reserved for internal system fields (prefix: "$internalSystemPrefix").',
+              tableName: name,
+              field: field.name,
+            )
+          ]);
         }
       }
 
       // Field should not have the same name as the primary key
       if (field.name == primaryKey) {
-        throw BusinessError(
-          'Field "${field.name}" in table "$name" has the same name as the primary key. Primary key should not be defined in the field list.',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaPrimaryKey,
+            message:
+                'Field "${field.name}" in table "$name" has the same name as the primary key. Primary key should not be defined in the field list.',
+            tableName: name,
+            field: field.name,
+          )
+        ]);
       }
     }
 
     if (fields.isEmpty) {
-      throw BusinessError(
-        'Table "$name" has no fields. User tables must define at least one field.',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchema,
+          message:
+              'Table "$name" has no fields. User tables must define at least one field.',
+          tableName: name,
+        )
+      ]);
     }
 
     // Validate field name uniqueness
-    final fieldNames = fields.map((f) => f.name).toSet();
-    if (fieldNames.length != fields.length) {
-      throw BusinessError(
-        'Field names in table "$name" must be unique.',
-        type: BusinessErrorType.schemaError,
-      );
+    final seenFields = <String>{};
+    final duplicateFields = <String>{};
+    for (final field in fields) {
+      if (!seenFields.add(field.name)) {
+        duplicateFields.add(field.name);
+      }
+    }
+    if (duplicateFields.isNotEmpty) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaDuplicateFieldName,
+          message:
+              'Field names in table "$name" must be unique. Duplicate fields found: ${duplicateFields.join(', ')}',
+          tableName: name,
+          field: duplicateFields.join(','),
+        )
+      ]);
     }
 
     // Validate index configuration
@@ -325,11 +379,8 @@ class TableSchema {
 
     // Validate table TTL configuration
     final ttl = ttlConfig;
-    if (ttl != null && !ttl.validateFor(this)) {
-      throw BusinessError(
-        'Invalid TTL configuration for table "$name".',
-        type: BusinessErrorType.schemaError,
-      );
+    if (ttl != null) {
+      ttl.checkTtlConfig(this);
     }
 
     return true;
@@ -342,10 +393,16 @@ class TableSchema {
   bool validateForeignKey(ForeignKeySchema fk) {
     // Validate foreign key schema itself
     if (!fk.validate()) {
-      throw BusinessError(
-        'Invalid foreign key schema definition for "${fk.actualName}" in table "$name".',
-        type: BusinessErrorType.schemaError,
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaForeignKey,
+          message:
+              'Invalid foreign key schema definition for "${fk.actualName}" in table "$name".',
+          tableName: name,
+          field: fk.fields.join(','),
+          wrongValue: fk.referencedTable,
+        )
+      ]);
     }
 
     // Validate that foreign key fields exist in this table
@@ -353,10 +410,16 @@ class TableSchema {
       final fieldExists = fields.any((field) => field.name == fieldName) ||
           fieldName == primaryKey;
       if (!fieldExists) {
-        throw BusinessError(
-          'Foreign key "${fk.actualName}" in table "$name" references non-existent local field: "$fieldName".',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaForeignKey,
+            message:
+                'Foreign key "${fk.actualName}" in table "$name" references non-existent local field: "$fieldName".',
+            tableName: name,
+            field: fieldName,
+            wrongValue: fieldName,
+          )
+        ]);
       }
     }
 
@@ -395,10 +458,19 @@ class TableSchema {
           ) ||
           refFieldName == referencedSchema.primaryKey;
       if (!refFieldExists) {
-        throw BusinessError(
-          'Foreign key "${fk.actualName}" in table "$name" references non-existent field "$refFieldName" in referenced table "${fk.referencedTable}".',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaForeignKey,
+            message:
+                'Foreign key "${fk.actualName}" in table "$name" references non-existent field "$refFieldName" in referenced table "${fk.referencedTable}".',
+            tableName: name,
+            field: refFieldName,
+            wrongValue: {
+              'referencedTable': fk.referencedTable,
+              'referencedField': refFieldName,
+            },
+          )
+        ]);
       }
     }
 
@@ -443,10 +515,21 @@ class TableSchema {
       // Validate type compatibility
       // Note: fkField and refField are guaranteed to be non-null here due to the logic above
       if (!_areTypesCompatible(fkField.type, refFieldType)) {
-        throw BusinessError(
-          'Foreign key "${fk.actualName}" type mismatch: field "$fkFieldName" (${fkField.type.name}) in table "$name" is not compatible with referenced field "$refFieldName" (${refFieldType.name}) in table "${fk.referencedTable}".',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaForeignKey,
+            message:
+                'Foreign key "${fk.actualName}" type mismatch: field "$fkFieldName" (${fkField.type.name}) in table "$name" is not compatible with referenced field "$refFieldName" (${refFieldType.name}) in table "${fk.referencedTable}".',
+            tableName: name,
+            field: fkFieldName,
+            wrongValue: {
+              'localFieldType': fkField.type.name,
+              'referencedTable': fk.referencedTable,
+              'referencedField': refFieldName,
+              'referencedFieldType': refFieldType.name,
+            },
+          )
+        ]);
       }
     }
 
@@ -525,10 +608,16 @@ class TableSchema {
       // Check if the field exists in the field list
       final fieldExists = fields.any((field) => field.name == fieldName);
       if (!fieldExists) {
-        throw BusinessError(
-          'Index "${index.actualIndexName}" in table "$name" references non-existent field "$fieldName".',
-          type: BusinessErrorType.schemaError,
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.invalidSchemaIndexField,
+            message:
+                'Index "${index.actualIndexName}" in table "$name" references non-existent field "$fieldName".',
+            tableName: name,
+            field: fieldName,
+            wrongValue: fieldName,
+          )
+        ]);
       }
     }
 
@@ -632,102 +721,154 @@ class TableSchema {
     List<String>? errors,
     bool trustedConvertedValues = false,
     Map<String, FieldSchema>? fieldMap,
+    bool ignoreUnknownFields = true,
   }) {
-    // In batch scenarios, callers can build and pass a shared fieldMap to avoid
-    // reconstructing it for every record; for non-batch calls we build a local map here.
-    final fieldMapLocal = fieldMap ?? {for (final f in fields) f.name: f};
+    try {
+      // In batch scenarios, callers can build and pass a shared fieldMap to avoid
+      // reconstructing it for every record; for non-batch calls we build a local map here.
+      final fieldMapLocal = fieldMap ?? {for (final f in fields) f.name: f};
 
-    // Create a new result Map
-    var result = Map<String, dynamic>.from(data);
+      // Create a new result Map
+      var result = Map<String, dynamic>.from(data);
 
-    // First handle primary key field
-    final primaryKeyName = primaryKeyConfig.name;
-    var primaryKeyValue = data[primaryKeyName];
+      // First handle primary key field
+      final primaryKeyName = primaryKeyConfig.name;
+      var primaryKeyValue = data[primaryKeyName];
 
-    // Handle primary key value
-    if (primaryKeyValue != null) {
-      // Convert to string and handle leading/trailing spaces
-      if (primaryKeyValue is int || primaryKeyValue is BigInt) {
-        // Directly convert number types to string
-        result[primaryKeyName] = primaryKeyValue.toString();
-      } else if (primaryKeyValue is String) {
-        // String type, remove leading/trailing spaces
-        result[primaryKeyName] = primaryKeyValue.trim();
-      } else {
-        // Unsupported type
-        final msg =
-            'Invalid primary key $primaryKeyName value type: $primaryKeyValue (should be number or string type)';
-        Logger.warn(
-          msg,
-          label: 'TableSchema.validateData',
-        );
-        errors?.add(msg);
-        return null;
-      }
-    }
-
-    // Check required (non-nullable) fields
-    for (var field in fields) {
-      if (!field.nullable &&
-          !data.containsKey(field.name) &&
-          field.name != primaryKeyName) {
-        final msg =
-            'Field ${field.name} is required but not provided for table $name';
-        Logger.warn(
-          msg,
-          label: 'TableSchema.validateData',
-        );
-        errors?.add(msg);
-        return null;
-      }
-    }
-
-    // Validate field type and constraints
-    for (var entry in data.entries) {
-      // If it's the primary key field, it's already validated, skip
-      if (entry.key == primaryKeyName) continue;
-
-      // Find field definition
-      final fieldSchema = fieldMapLocal[entry.key];
-      if (fieldSchema == null) {
-        throw ArgumentError('Unknown field ${entry.key}');
+      // Handle primary key value
+      if (primaryKeyValue != null) {
+        // Convert to string and handle leading/trailing spaces
+        if (primaryKeyValue is int || primaryKeyValue is BigInt) {
+          // Directly convert number types to string
+          result[primaryKeyName] = primaryKeyValue.toString();
+        } else if (primaryKeyValue is String) {
+          // String type, remove leading/trailing spaces
+          result[primaryKeyName] = primaryKeyValue.trim();
+        } else {
+          // Unsupported type
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message:
+                  'Invalid primary key $primaryKeyName value type: $primaryKeyValue (should be number or string type) (table $name)',
+              parameterName: primaryKeyName,
+              passedValue: primaryKeyValue,
+            )
+          ]);
+        }
       }
 
-      // Use FieldSchema's detailed validation helper to get error message
-      final fieldError = fieldSchema.getValidationError(
-        entry.value,
-        skipMaxLengthCheck: applyConstraints,
-        trustedConvertedValue: trustedConvertedValues,
-      );
-      if (fieldError != null) {
-        final msg =
-            'Field ${fieldSchema.name} validation failed: $fieldError (table $name)';
-        Logger.warn(
-          msg,
-          label: 'TableSchema.validateData',
-        );
-        errors?.add(msg);
-        return null;
+      // Check required (non-nullable) fields
+      for (var field in fields) {
+        if (!field.nullable &&
+            !data.containsKey(field.name) &&
+            field.name != primaryKeyName) {
+          throw DbException([
+            ConstraintStatus(
+              type: ResultType.notNullViolation,
+              message:
+                  'Field ${field.name} is required but not provided for table $name',
+              tableName: name,
+              fields: [field.name],
+              conflictingKeys:
+                  primaryKeyValue != null ? [primaryKeyValue] : const [],
+            )
+          ]);
+        }
       }
 
-      // Apply constraint conditions
-      if (applyConstraints && entry.value != null) {
-        if (entry.value is String) {
-          String stringValue = entry.value;
-          if (fieldSchema.maxLength != null &&
-              stringValue.length > fieldSchema.maxLength!) {
-            Logger.warn(
-              'Field ${fieldSchema.name} exceeds maximum length ${fieldSchema.maxLength}, will truncate',
-              label: 'TableSchema.validateData',
-            );
-            result[entry.key] =
-                stringValue.substring(0, fieldSchema.maxLength!);
+      // Validate field type and constraints
+      for (var entry in data.entries) {
+        // If it's the primary key field, it's already validated, skip
+        if (entry.key == primaryKeyName) continue;
+
+        // Find field definition
+        final fieldSchema = fieldMapLocal[entry.key];
+        if (fieldSchema == null) {
+          if (ignoreUnknownFields) {
+            result.remove(entry.key);
+            continue;
+          }
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message: 'Unknown field ${entry.key} in table $name',
+              parameterName: entry.key,
+              passedValue: entry.value,
+            )
+          ]);
+        }
+
+        try {
+          // Use FieldSchema's detailed validation helper to throw DbException
+          fieldSchema.checkConstraints(
+            entry.value,
+            tableName: name,
+            skipMaxLengthCheck: applyConstraints,
+            trustedConvertedValue: trustedConvertedValues,
+          );
+        } on DbException catch (e) {
+          if (primaryKeyValue != null) {
+            final updatedStatuses = e.statuses.map((s) {
+              if (s is ConstraintStatus) {
+                return ConstraintStatus(
+                  type: s.type,
+                  message: s.message,
+                  index: s.index,
+                  tableName: s.tableName,
+                  constraintName: s.constraintName,
+                  fields: s.fields,
+                  conflictingKeys: [primaryKeyValue],
+                );
+              } else if (s is InvalidArgumentStatus) {
+                return InvalidArgumentStatus(
+                  type: s.type,
+                  message: s.message,
+                  index: s.index,
+                  parameterName: s.parameterName,
+                  passedValue: s.passedValue,
+                  primaryKey: primaryKeyValue.toString(),
+                );
+              }
+              return s;
+            }).toList();
+            throw DbException(updatedStatuses);
+          }
+          rethrow;
+        }
+
+        // Apply constraint conditions
+        if (applyConstraints && entry.value != null) {
+          if (entry.value is String) {
+            String stringValue = entry.value;
+            if (fieldSchema.maxLength != null &&
+                stringValue.length > fieldSchema.maxLength!) {
+              Logger.warn(
+                'Field ${fieldSchema.name} exceeds maximum length ${fieldSchema.maxLength}, will truncate',
+                label: 'TableSchema.validateData',
+              );
+              result[entry.key] =
+                  stringValue.substring(0, fieldSchema.maxLength!);
+            }
           }
         }
       }
-    }
 
-    return result;
+      return result;
+    } on DbException catch (e) {
+      if (errors != null) {
+        errors.addAll(e.statuses.map((s) => s.message));
+        return null;
+      }
+      rethrow;
+    } catch (e) {
+      Logger.warn(
+        'Unexpected data validation error for table $name: $e',
+        label: 'TableSchema.validateData',
+      );
+      errors?.add(e.toString());
+      return null;
+    }
   }
 
   /// Validate primary key format against corresponding type requirements
@@ -1558,6 +1699,95 @@ class FieldSchema {
 
   /// Get detailed validation error message for a value.
   ///
+  /// Validate field constraints and throw [DbException] on failure.
+  void checkConstraints(
+    dynamic value, {
+    required String tableName,
+    bool skipMaxLengthCheck = false,
+    bool trustedConvertedValue = false,
+  }) {
+    if (value == null && !nullable) {
+      throw DbException([
+        ConstraintStatus(
+          type: ResultType.notNullViolation,
+          message:
+              'Field $name is required and cannot be null (table $tableName)',
+          tableName: tableName,
+          fields: [name],
+        )
+      ]);
+    }
+
+    if (value != null) {
+      // Check data type.
+      if (!trustedConvertedValue && !isValidDataType(value, type)) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidArgumentType,
+            message:
+                'Field $name expects type $type but got ${value.runtimeType} (table $tableName)',
+            parameterName: name,
+            passedValue: value,
+          )
+        ]);
+      }
+
+      // Check string length constraints
+      if (value is String) {
+        if (!skipMaxLengthCheck &&
+            maxLength != null &&
+            value.length > maxLength!) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message:
+                  'Field $name length ${value.length} exceeds maxLength $maxLength (table $tableName)',
+              parameterName: name,
+              passedValue: value,
+            )
+          ]);
+        }
+        if (minLength != null && value.length < minLength!) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message:
+                  'Field $name length ${value.length} is less than minLength $minLength (table $tableName)',
+              parameterName: name,
+              passedValue: value,
+            )
+          ]);
+        }
+      }
+
+      // Check numeric value constraints
+      if (value is num) {
+        if (minValue != null && value < minValue!) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message:
+                  'Field $name value $value is less than minValue $minValue (table $tableName)',
+              parameterName: name,
+              passedValue: value,
+            )
+          ]);
+        }
+        if (maxValue != null && value > maxValue!) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidArgumentFormat,
+              message:
+                  'Field $name value $value exceeds maxValue $maxValue (table $tableName)',
+              parameterName: name,
+              passedValue: value,
+            )
+          ]);
+        }
+      }
+    }
+  }
+
   /// Returns `null` when the value is valid, otherwise returns a human-readable
   /// description of which constraint failed. This is designed for single-record
   /// validation and does not perform any table-wide scan.
@@ -1565,76 +1795,44 @@ class FieldSchema {
     dynamic value, {
     bool skipMaxLengthCheck = false,
     bool trustedConvertedValue = false,
+    required String tableName,
   }) {
-    if (value == null && !nullable) {
-      return 'Field $name is required and cannot be null';
+    try {
+      checkConstraints(
+        value,
+        tableName: tableName,
+        skipMaxLengthCheck: skipMaxLengthCheck,
+        trustedConvertedValue: trustedConvertedValue,
+      );
+      return null;
+    } on DbException catch (e) {
+      return e.statuses.first.message;
     }
-
-    // Check data type. For values that have already gone through FieldSchema.convertValue
-    // (e.g. bulk insert paths), callers can set [trustedConvertedValue] to true to skip
-    // expensive deep checks such as DateTime.parse, relying on the converter instead.
-    if (!trustedConvertedValue && !isValidDataType(value, type)) {
-      return 'Field $name expects type $type but got ${value.runtimeType}';
-    }
-
-    // Check string length constraints
-    if (value is String) {
-      if (!skipMaxLengthCheck &&
-          maxLength != null &&
-          value.length > maxLength!) {
-        return 'Field $name length ${value.length} exceeds maxLength $maxLength';
-      }
-      if (minLength != null && value.length < minLength!) {
-        return 'Field $name length ${value.length} is less than minLength $minLength';
-      }
-    }
-
-    // Check numeric value constraints
-    if (value is num) {
-      if (minValue != null && value < minValue!) {
-        return 'Field $name value $value is less than minValue $minValue';
-      }
-      if (maxValue != null && value > maxValue!) {
-        return 'Field $name value $value exceeds maxValue $maxValue';
-      }
-    }
-
-    return null;
   }
 
   /// Validate value against field constraints
-  bool validateValue(dynamic value, {bool skipMaxLengthCheck = false}) {
+  bool validateValue(dynamic value,
+      {bool skipMaxLengthCheck = false, required String tableName}) {
     return getValidationError(
           value,
           skipMaxLengthCheck: skipMaxLengthCheck,
+          tableName: tableName,
         ) ==
         null;
   }
 
   /// Validate value for update operation against field constraints
-  bool validateUpdateValue(dynamic value) {
-    if (value == null && !nullable) {
+  bool validateUpdateValue(dynamic value, {required String tableName}) {
+    try {
+      checkConstraints(
+        value,
+        tableName: tableName,
+        skipMaxLengthCheck: true,
+      );
+      return true;
+    } catch (_) {
       return false;
     }
-
-    // Check string length constraints
-    if (value is String) {
-      if (minLength != null && value.length < minLength!) {
-        return false;
-      }
-    }
-
-    // Check numeric value constraints
-    if (value is num) {
-      if (minValue != null && value < minValue!) {
-        return false;
-      }
-      if (maxValue != null && value > maxValue!) {
-        return false;
-      }
-    }
-
-    return true;
   }
 
   /// Check if value matches data type
@@ -1835,52 +2033,75 @@ class TableTtlConfig {
     );
   }
 
-  bool validateFor(TableSchema schema) {
+  void checkTtlConfig(TableSchema schema) {
     if (ttlMs <= 0) {
-      Logger.error('ttlMs must be greater than 0', label: 'TableTtlConfig');
-      return false;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTtlConfig,
+          message:
+              'TTL duration for table "${schema.name}" must be greater than 0.',
+          tableName: schema.name,
+        )
+      ]);
     }
 
     final field = sourceField;
     if (field == null || field.isEmpty) {
-      return true;
+      return;
     }
 
     final matched = schema.fields.where((f) => f.name == field);
     if (matched.isEmpty) {
-      Logger.error(
-        'sourceField $field does not exist in table ${schema.name}',
-        label: 'TableTtlConfig',
-      );
-      return false;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTtlConfig,
+          message:
+              'TTL source field "$field" does not exist in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+        )
+      ]);
     }
 
     final fieldSchema = matched.first;
     if (fieldSchema.type != DataType.datetime) {
-      Logger.error(
-        'sourceField $field must be DataType.datetime, got ${fieldSchema.type}',
-        label: 'TableTtlConfig',
-      );
-      return false;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTtlConfig,
+          message:
+              'TTL source field "$field" must be DataType.datetime, but got ${fieldSchema.type.name} in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: fieldSchema.type.name,
+        )
+      ]);
     }
 
     if (fieldSchema.nullable) {
-      Logger.error(
-        'sourceField $field must be non-nullable for TTL',
-        label: 'TableTtlConfig',
-      );
-      return false;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTtlConfig,
+          message:
+              'TTL source field "$field" must be non-nullable in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: {'nullable': true},
+        )
+      ]);
     }
 
     if (fieldSchema.defaultValueType != DefaultValueType.currentTimestamp) {
-      Logger.error(
-        'sourceField $field must use DefaultValueType.currentTimestamp for TTL',
-        label: 'TableTtlConfig',
-      );
-      return false;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.invalidSchemaTtlConfig,
+          message:
+              'TTL source field "$field" must use DefaultValueType.currentTimestamp to ensure automatic ingestion timestamp filling in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: fieldSchema.defaultValueType.name,
+        )
+      ]);
     }
-
-    return true;
   }
 }
 
@@ -2044,10 +2265,14 @@ class PrimaryKeyConfig {
     try {
       return value.toString();
     } catch (e) {
-      throw BusinessError(
-        'Failed to convert value to primary key type: $value',
-        type: BusinessErrorType.invalidData,
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.validationFailedTypeCast,
+          message: 'Failed to convert value to primary key type: $value',
+          parameterName: name,
+          passedValue: value,
+        )
+      ]);
     }
   }
 
