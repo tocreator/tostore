@@ -1,7 +1,9 @@
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
-import '../model/business_error.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'v2_upgrade.dart';
 import 'v3_upgrade.dart';
 
@@ -30,13 +32,16 @@ class VersionUpgradeManager {
         // The database was created or upgraded by a newer version of ToStore.
         // Opening it with an older engine may lead to data corruption or crashes
         // because the older engine doesn't understand the newer file formats or metadata.
-        throw BusinessError(
-          'Database engine version mismatch: The database was created with a newer version of the engine (v$currentVersion), '
-          'but the current engine version is v$engineVersion. '
-          'Downgrading is not supported as newer engine features may be incompatible with older versions. '
-          'Please use the previous database version or the latest version.',
-          type: BusinessErrorType.versionError,
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.dbErrorEngineIncompatible,
+            message:
+                'Database engine version mismatch: The database was created with a newer version of the engine (v$currentVersion), '
+                'but the current engine version is v$engineVersion. '
+                'Downgrading is not supported as newer engine features may be incompatible with older versions. '
+                'Please use the previous database version or the latest version.',
+          )
+        ]);
       }
 
       // 2. Handle Up-to-date: Version matches exactly.
@@ -61,7 +66,7 @@ class VersionUpgradeManager {
         await v3Upgrade.execute(globalConfig);
       }
     } catch (e, stack) {
-      if (e is BusinessError) rethrow;
+      if (e is DbException) rethrow;
 
       Logger.error(
         'Database version upgrade failed: $e\n$stack',
