@@ -99,8 +99,15 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       } else if (field is QueryAggregation) {
         _extraAggregations.add(field);
       } else {
-        throw ArgumentError(
-            'Select field must be a String or QueryAggregation (Agg)');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidQuerySelectField,
+            message: 'select() field must be String or QueryAggregation (Agg), '
+                'got ${field.runtimeType}',
+            parameterName: 'select',
+            passedValue: field.runtimeType.toString(),
+          ),
+        ]);
       }
     }
     _onChanged();
@@ -117,8 +124,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       } else if (item is QueryAggregation) {
         _aggregations!.add(item);
       } else {
-        throw ArgumentError(
-            'Items in selectAgg must be String or QueryAggregation');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.invalidQuerySelectField,
+            message:
+                'selectAgg() item must be String or QueryAggregation (Agg), '
+                'got ${item.runtimeType}',
+            parameterName: 'selectAgg',
+            passedValue: item.runtimeType.toString(),
+          ),
+        ]);
       }
     }
     _onChanged();
@@ -206,7 +221,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   ///   .future;
   /// ```
   ///
-  /// Throws [StateError] if no foreign key relationship is found
+  /// Throws [DbException] if no foreign key relationship is found
   QueryBuilder joinWithForeignKey(String tableName,
       {JoinType type = JoinType.inner}) {
     // Store the join request - will be resolved during query execution
@@ -849,7 +864,14 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         final alias = parts[1].trim();
         // Validate alias format, only allow letters, numbers, and underscores
         if (!RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(alias)) {
-          throw ArgumentError('Invalid alias format: $alias');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidQueryFieldAlias,
+              message: 'Invalid alias format: $alias',
+              parameterName: 'alias',
+              passedValue: alias,
+            ),
+          ]);
         }
         return alias;
       }
@@ -872,7 +894,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     // Get current table schema
     final currentSchema = await _db.schemaManager?.getTableSchema(_tableName);
     if (currentSchema == null) {
-      throw StateError('Current table $_tableName does not exist');
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.notFoundTable,
+          message: 'Current table $_tableName does not exist',
+          tableName: _tableName,
+        ),
+      ]);
     }
 
     for (final pendingJoin in _pendingForeignKeyJoins!) {
@@ -882,7 +910,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       // Get target table schema
       final targetSchema = await _db.schemaManager?.getTableSchema(tableName);
       if (targetSchema == null) {
-        throw StateError('Target table $tableName does not exist');
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.notFoundTable,
+            message: 'Target table $tableName does not exist',
+            tableName: tableName,
+          ),
+        ]);
       }
 
       // Try to find foreign key from current table to target table
@@ -917,9 +951,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
         // If still not found, throw error
         if (fk == null) {
-          throw StateError(
-              'No foreign key relationship found between $_tableName and $tableName. '
-              'Please use manual join() method instead.');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.invalidQueryForeignKeyJoin,
+              message:
+                  'No foreign key relationship found between $_tableName and $tableName. '
+                  'Please use manual join() method instead.',
+              parameterName: 'joinWithForeignKey',
+              passedValue: tableName,
+            ),
+          ]);
         }
       }
 
