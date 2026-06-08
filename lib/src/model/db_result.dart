@@ -8,26 +8,10 @@ class DbResult {
   final List<ResultStatus> statuses;
 
   /// Whether the operation has any failures
-  final bool hasFailed;
+  final bool hasErrors;
 
   /// Optional arbitrary data payload (e.g. for returning modified rows or records)
   final dynamic data;
-
-  /// List of successfully processed items
-  ///
-  /// The content depends on the operation type:
-  /// - For insert/update/delete operations: contains primary key values of successfully processed records
-  /// - For createTables/dropTable operations: contains table names that were successfully processed
-  /// - For other operations: contains operation-specific identifiers
-  final List<String> successKeys;
-
-  /// List of failed items
-  ///
-  /// The content depends on the operation type:
-  /// - For insert/update/delete operations: contains primary key values of failed records
-  /// - For createTables/dropTable operations: contains table names that failed to process
-  /// - For other operations: contains operation-specific identifiers
-  final List<String> failedKeys;
 
   /// Total number of successful items
   final int successCount;
@@ -38,17 +22,56 @@ class DbResult {
   /// Constructor
   DbResult({
     required this.statuses,
-    this.successKeys = const [],
-    this.failedKeys = const [],
     int? successCount,
     int? failedCount,
-    bool? hasFailed,
+    bool? hasErrors,
     this.data,
-  })  : successCount = successCount ?? successKeys.length,
-        failedCount = failedCount ?? failedKeys.length,
-        hasFailed = hasFailed ??
-            ((failedCount ?? failedKeys.length) > 0 ||
+    List<String>? successKeys,
+    List<String>? failedKeys,
+  })  : successCount =
+            successCount ?? successKeys?.length ?? _countSuccess(statuses),
+        failedCount =
+            failedCount ?? failedKeys?.length ?? _countFailed(statuses),
+        hasErrors = hasErrors ??
+            ((failedCount ?? failedKeys?.length ?? 0) > 0 ||
                 statuses.any((s) => s.type != ResultType.success));
+
+  static int _countSuccess(List<ResultStatus> list) =>
+      list.isEmpty ? 0 : list.where((s) => s.type == ResultType.success).length;
+
+  static int _countFailed(List<ResultStatus> list) =>
+      list.isEmpty ? 0 : list.where((s) => s.type != ResultType.success).length;
+
+  /// List of successfully processed item primary keys.
+  ///
+  /// Deprecated: Use [statuses] instead for comprehensive diagnostics and exact order-matching,
+  /// or use [primaryKey] / [id] for single-item operations.
+  @Deprecated('Use statuses or primaryKey/id instead')
+  List<String> get successKeys {
+    if (statuses.isEmpty) return const [];
+    return statuses
+        .where((s) => s.type == ResultType.success && s.primaryKey != null)
+        .map((s) => s.primaryKey!)
+        .toList();
+  }
+
+  /// List of failed item primary keys.
+  ///
+  /// Deprecated: Use [statuses] instead for comprehensive diagnostics and exact order-matching,
+  /// or use [primaryKey] / [id] for single-item operations.
+  @Deprecated('Use statuses or primaryKey/id instead')
+  List<String> get failedKeys {
+    if (statuses.isEmpty) return const [];
+    return statuses
+        .where((s) => s.type != ResultType.success && s.primaryKey != null)
+        .map((s) => s.primaryKey!)
+        .toList();
+  }
+
+  /// The primary key of the first status in [statuses], or null if empty.
+  /// Extremely convenient for single-item operations (e.g. insert, update, delete) to avoid parsing the list.
+  String? get firstPrimaryKey =>
+      statuses.isNotEmpty ? statuses.first.primaryKey : null;
 
   /// Get total number of items processed
   int get totalCount => successCount + failedCount;
@@ -76,15 +99,15 @@ class DbResult {
   /// The primary or first diagnostic type of the operation.
   ///
   /// - For single-item operations, it returns the exact operation result type in O(1).
-  /// - For batch operations, if any items fail ([hasFailed] is true), it returns the first
+  /// - For batch operations, if any items fail ([hasErrors] is true), it returns the first
   ///   encountered error type (or [ResultType.dbError] if details are missing) instead of success.
   ResultType get firstType {
     if (statuses.isEmpty) {
-      return hasFailed ? ResultType.dbError : ResultType.success;
+      return hasErrors ? ResultType.dbError : ResultType.success;
     }
     if (statuses.length == 1) return statuses.first.type;
 
-    if (hasFailed) {
+    if (hasErrors) {
       for (final s in statuses) {
         if (s.type != ResultType.success) {
           return s.type;
@@ -98,8 +121,8 @@ class DbResult {
   /// Grand status type of the operation.
   ///
   /// Deprecated: Use [firstType] to clarify that it only represents the first status type
-  /// in batch operations, or use `!hasFailed` to check for general success.
-  @Deprecated('Use firstType or !hasFailed instead')
+  /// in batch operations, or use `!hasErrors` to check for general success.
+  @Deprecated('Use firstType or !hasErrors instead')
   ResultType get type => firstType;
 
   /// The first status in [statuses], or null if empty.
@@ -108,10 +131,10 @@ class DbResult {
 
   /// Whether the operation is successful.
   ///
-  /// Migration: use `!hasFailed` instead to properly handle partial success scenarios.
+  /// Migration: use `!hasErrors` instead to properly handle partial success scenarios.
   @Deprecated(
-      'Use !hasFailed instead to properly handle partial success scenarios')
-  bool get isSuccess => !hasFailed;
+      'Use !hasErrors instead to properly handle partial success scenarios')
+  bool get isSuccess => !hasErrors;
 
   /// Create a success result
   static DbResult success({
@@ -133,7 +156,7 @@ class DbResult {
       successKeys: keys,
       successCount: keys.length,
       failedCount: 0,
-      hasFailed: false,
+      hasErrors: false,
       data: data,
     );
   }
@@ -164,7 +187,7 @@ class DbResult {
       successCount: 0,
       failedCount:
           failedKeys.isNotEmpty ? failedKeys.length : effectiveStatuses.length,
-      hasFailed: true,
+      hasErrors: true,
     );
   }
 
@@ -175,7 +198,7 @@ class DbResult {
     List<String> failedKeys = const [],
     int? successCount,
     int? failedCount,
-    bool? hasFailed,
+    bool? hasErrors,
     String? message,
     dynamic data,
   }) {
@@ -201,7 +224,7 @@ class DbResult {
       failedKeys: failedKeys,
       successCount: successCount ?? successKeys.length,
       failedCount: failedCount ?? failedKeys.length,
-      hasFailed: hasFailed,
+      hasErrors: hasErrors,
       data: data,
     );
   }
@@ -209,7 +232,7 @@ class DbResult {
   /// Convert DbResult to a Map (for serialization)
   Map<String, dynamic> toJson() {
     return {
-      'hasFailed': hasFailed,
+      'hasErrors': hasErrors,
       'successCount': successCount,
       'failedCount': failedCount,
       if (data != null) 'data': data,
@@ -224,32 +247,15 @@ class DbResult {
         .toList();
 
     final data = json['data'];
-
-    final successKeys = <String>[];
-    final failedKeys = <String>[];
-
-    for (final status in statusList) {
-      final key = status.primaryKey;
-      if (key != null) {
-        if (status.type == ResultType.success) {
-          successKeys.add(key);
-        } else {
-          failedKeys.add(key);
-        }
-      }
-    }
-
-    final successCount = json['successCount'] as int? ?? successKeys.length;
-    final failedCount = json['failedCount'] as int? ?? failedKeys.length;
-    final hasFailed = json['hasFailed'] as bool?;
+    final successCount = json['successCount'] as int? ?? 0;
+    final failedCount = json['failedCount'] as int? ?? 0;
+    final hasErrors = json['hasErrors'] as bool?;
 
     return DbResult(
       statuses: statusList,
-      successKeys: successKeys,
-      failedKeys: failedKeys,
       successCount: successCount,
       failedCount: failedCount,
-      hasFailed: hasFailed,
+      hasErrors: hasErrors,
       data: data,
     );
   }
@@ -259,8 +265,8 @@ class DbResult {
   String toString() {
     final buffer = StringBuffer();
     buffer.write(
-        'DbResult{hasFailed: $hasFailed, successCount: $successCount, failedCount: $failedCount');
-    if (hasFailed && statuses.isNotEmpty) {
+        'DbResult{hasErrors: $hasErrors, successCount: $successCount, failedCount: $failedCount');
+    if (hasErrors && statuses.isNotEmpty) {
       final errorStatuses =
           statuses.where((s) => s.type != ResultType.success).toList();
       if (errorStatuses.isNotEmpty) {
