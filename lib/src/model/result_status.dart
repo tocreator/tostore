@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'result_type.dart';
 
 /// Base class for all database operation status results.
@@ -198,7 +200,7 @@ class SchemaValidationStatus extends ResultStatus {
       map['field'] = field;
     }
     if (wrongValue != null) {
-      map['wrongValue'] = wrongValue;
+      map['wrongValue'] = jsonSafeDiagnosticValue(wrongValue);
     }
     return map;
   }
@@ -230,7 +232,7 @@ class InvalidArgumentStatus extends ResultStatus {
     final map = super.toJson();
     map['parameterName'] = parameterName;
     if (passedValue != null) {
-      map['passedValue'] = passedValue;
+      map['passedValue'] = jsonSafeDiagnosticValue(passedValue);
     }
     if (primaryKey != null) {
       map['primaryKey'] = primaryKey;
@@ -279,5 +281,28 @@ class GeneralStatus extends ResultStatus {
       map['primaryKey'] = primaryKey;
     }
     return map;
+  }
+}
+
+/// Convert a diagnostic field value into a JSON-serializable representation.
+///
+/// Construction of [InvalidArgumentStatus] / [DbException] never calls this;
+/// it is used when serializing or logging so exotic [passedValue] types cannot
+/// cause secondary failures after the original error was thrown.
+dynamic jsonSafeDiagnosticValue(dynamic value) {
+  if (value == null) return null;
+  if (value is String || value is num || value is bool) return value;
+  if (value is List || value is Map) {
+    try {
+      jsonEncode(value);
+      return value;
+    } catch (_) {
+      return value.toString();
+    }
+  }
+  try {
+    return value.toString();
+  } catch (_) {
+    return value.runtimeType.toString();
   }
 }
