@@ -10,23 +10,23 @@ class TransactionResult {
   final DateTime startedAt; // transaction started at
   final DateTime finishedAt; // transaction finished at
   final bool logFlushed; // whether the log is flushed
-  final bool hasFailed;
+  final bool hasErrors;
 
   TransactionResult({
     required this.txId,
     required this.statuses,
     required this.startedAt,
     required this.finishedAt,
-    bool? hasFailed,
+    bool? hasErrors,
     this.logFlushed = false,
-  }) : hasFailed =
-            hasFailed ?? statuses.any((s) => s.type != ResultType.success);
+  }) : hasErrors =
+            hasErrors ?? statuses.any((s) => s.type != ResultType.success);
 
-  @Deprecated('Use hasFailed instead to properly check transaction outcome')
-  bool get isSuccess => !hasFailed;
+  @Deprecated('Use hasErrors instead to properly check transaction outcome')
+  bool get isSuccess => !hasErrors;
 
-  @Deprecated('Use hasFailed instead to properly check transaction outcome')
-  bool get isFailed => hasFailed;
+  @Deprecated('Use hasErrors instead to properly check transaction outcome')
+  bool get isFailed => hasErrors;
 
   factory TransactionResult.success({
     required String txId,
@@ -39,7 +39,7 @@ class TransactionResult {
       statuses: const [],
       startedAt: startedAt,
       finishedAt: finishedAt,
-      hasFailed: false,
+      hasErrors: false,
       logFlushed: logFlushed,
     );
   }
@@ -55,18 +55,18 @@ class TransactionResult {
       statuses: statuses,
       startedAt: startedAt,
       finishedAt: finishedAt,
-      hasFailed: true,
+      hasErrors: true,
       logFlushed: false,
     );
   }
 
   @Deprecated('Use statuses instead to inspect results')
   TransactionStatus get status =>
-      !hasFailed ? TransactionStatus.success : TransactionStatus.failed;
+      !hasErrors ? TransactionStatus.success : TransactionStatus.failed;
 
   @Deprecated('Use statuses instead for detailed diagnostics')
   TransactionError? get error {
-    if (!hasFailed) return null;
+    if (!hasErrors) return null;
     if (statuses.isEmpty) return null;
     final firstErr = statuses.firstWhere((s) => s.type != ResultType.success,
         orElse: () => statuses.first);
@@ -104,7 +104,7 @@ class TransactionResult {
       'finishedAt': finishedAt.toIso8601String(),
       'logFlushed': logFlushed,
       'statuses': statuses.map((e) => e.toJson()).toList(),
-      'hasFailed': hasFailed,
+      'hasErrors': hasErrors,
     };
   }
 
@@ -121,7 +121,7 @@ class TransactionResult {
           json['startedAt'] as String? ?? DateTime.now().toIso8601String()),
       finishedAt: DateTime.parse(
           json['finishedAt'] as String? ?? DateTime.now().toIso8601String()),
-      hasFailed: json['hasFailed'] as bool?,
+      hasErrors: json['hasErrors'] as bool?,
       logFlushed: json['logFlushed'] == true,
     );
   }
