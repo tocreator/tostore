@@ -812,7 +812,7 @@ class ToStoreExample {
       final result = await db.batchInsert(tableName, records);
       dbStopwatch.stop();
 
-      if (result.hasFailed) {
+      if (result.hasErrors) {
         logService.add(
             'Batch insert failed at offset $processedCount: ${_statusErrorMessage(result.statuses)}',
             LogType.error);
@@ -885,7 +885,7 @@ class ToStoreExample {
         records[i],
       );
 
-      if (result.hasFailed) {
+      if (result.hasErrors) {
         return -1;
       }
       if (i % 200 == 0) {
@@ -1034,7 +1034,7 @@ class ToStoreExample {
       });
     });
 
-    if (!txResult1.hasFailed) {
+    if (!txResult1.hasErrors) {
       logService.add('Transaction committed: 2 users inserted', LogType.info);
     }
 
@@ -1049,7 +1049,7 @@ class ToStoreExample {
       throw Exception('Simulated business error');
     }, rollbackOnError: true);
 
-    if (txResult2.hasFailed) {
+    if (txResult2.hasErrors) {
       logService.add(
           'Transaction rolled back: ${_statusErrorMessage(txResult2.statuses, fallback: 'Transaction failed')}',
           LogType.info);
