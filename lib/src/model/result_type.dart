@@ -5,9 +5,6 @@ enum ResultType {
   /// Operation successful
   success(0, 'SUCCESS', 'Operation successful'),
 
-  /// Partially successful operation
-  partialSuccess(10000, 'PARTIAL_SUCCESS', 'Partially successful'),
-
   /// Invalid argument - format error
   invalidArgumentFormat(
       40001, 'INVALID_ARGUMENT_FORMAT', 'Argument format error'),
@@ -37,6 +34,18 @@ enum ResultType {
   /// Invalid cursor payload
   invalidCursorPayload(
       40206, 'INVALID_CURSOR_PAYLOAD', 'Invalid cursor payload'),
+
+  /// Query select/selectAgg field type invalid
+  invalidQuerySelectField(40301, 'INVALID_QUERY_SELECT_FIELD',
+      'Query select field must be String or QueryAggregation'),
+
+  /// Auto foreign key join cannot resolve relationship
+  invalidQueryForeignKeyJoin(40302, 'INVALID_QUERY_FOREIGN_KEY_JOIN',
+      'No foreign key relationship for auto join'),
+
+  /// Query field alias format invalid
+  invalidQueryFieldAlias(
+      40303, 'INVALID_QUERY_FIELD_ALIAS', 'Query field alias format invalid'),
 
   /// Read permission denied
   permissionDeniedRead(
@@ -200,6 +209,12 @@ enum ResultType {
   /// Memory resource exhausted
   resourceExhaustedMemory(
       52001, 'RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted'),
+
+  /// Large-scale operation requires details bypass to prevent OOM
+  largeScaleOperationRequiredBypass(
+      52002,
+      'LARGE_SCALE_OPERATION_REQUIRED_BYPASS',
+      'Large-scale operation requires skipping result details to prevent OOM'),
 
   /// Disk space exhausted / System resources exhausted (Generic)
   resourceExhausted(52000, 'RESOURCE_EXHAUSTED', 'System resources exhausted'),
