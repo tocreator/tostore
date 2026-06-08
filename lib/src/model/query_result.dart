@@ -3,7 +3,7 @@ import 'result_type.dart';
 /// query result class
 class QueryResult<T> {
   /// Whether the operation has any failures
-  bool get hasFailed => type != ResultType.success;
+  bool get hasErrors => type != ResultType.success;
 
   /// Whether the operation is successful
   /// Deprecated: Use type == ResultType.success or check failures.
