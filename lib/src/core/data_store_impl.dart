@@ -235,7 +235,7 @@ class DataStoreImpl {
     final bool rollbackOnError =
         Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
     if (!rollbackOnError) return result;
-    if (result.hasFailed) {
+    if (result.hasErrors) {
       final List<ResultStatus> statuses = result.statuses.isNotEmpty
           ? result.statuses
           : [
@@ -952,7 +952,7 @@ class DataStoreImpl {
           systemSchemas,
           isSystemTable: true,
         );
-        if (systemTablesResult.hasFailed) {
+        if (systemTablesResult.hasErrors) {
           Logger.warn(
             'Failed to create system tables: ${systemTablesResult.message}',
             label: 'DataStoreImpl._startSetupAndUpgrade',
@@ -966,7 +966,7 @@ class DataStoreImpl {
         // This ensures parent tables are created before child tables, regardless of definition order
         if (userSchemas.isNotEmpty) {
           final userTablesResult = await createTables(userSchemas);
-          if (userTablesResult.hasFailed &&
+          if (userTablesResult.hasErrors &&
               userTablesResult.failedKeys.isNotEmpty) {
             // If all tables failed, throw error; if partial success, log warning but continue
             if (userTablesResult.successKeys.isEmpty) {
@@ -1458,7 +1458,7 @@ class DataStoreImpl {
         isSystemTable: isSystemTable,
       );
       statuses.addAll(result.statuses);
-      if (!result.hasFailed) {
+      if (!result.hasErrors) {
         successKeys.add(schema.name);
       } else {
         failedKeys.add(schema.name);
@@ -2572,7 +2572,7 @@ class DataStoreImpl {
       if (!isOptimizableQuery) {
         if (returnResultDetails) {
           return finish(DbResult.error(
-            type: ResultType.validationFailed,
+            type: ResultType.largeScaleOperationRequiredBypass,
             message:
                 'This is a large-scale update operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
           ));
@@ -3212,7 +3212,7 @@ class DataStoreImpl {
         // Use clear() for better performance when deleting all records
         // clear() now returns DbResult for graceful error handling
         final clearResult = await clear(tableName);
-        if (!clearResult.hasFailed) {
+        if (!clearResult.hasErrors) {
           return finish(DbResult.success(
             message: 'All records in table $tableName have been deleted',
           ));
@@ -3483,7 +3483,7 @@ class DataStoreImpl {
       } else {
         if (returnResultDetails) {
           return finish(DbResult.error(
-            type: ResultType.validationFailed,
+            type: ResultType.largeScaleOperationRequiredBypass,
             message:
                 'This is a large-scale delete operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
           ));
@@ -3564,7 +3564,7 @@ class DataStoreImpl {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
           if (op.type == 'clear') {
             final clearResult = await clear(op.table, registerWalOp: false);
-            if (clearResult.hasFailed) {
+            if (clearResult.hasErrors) {
               Logger.error(
                 'Failed to resume clear operation for table ${op.table}: ${clearResult.message}',
                 label: 'DataStore._resumePendingTableOps',
@@ -3578,7 +3578,7 @@ class DataStoreImpl {
               isMigration: false,
               registerWalOp: false,
             );
-            if (dropResult.hasFailed) {
+            if (dropResult.hasErrors) {
               Logger.error(
                 'Failed to resume drop operation for table ${op.table}: ${dropResult.message}',
                 label: 'DataStore._resumePendingTableOps',
@@ -5001,7 +5001,7 @@ class DataStoreImpl {
           allowPartialErrors: allowPartialErrors,
           returnResultDetails: returnResultDetails,
         );
-        if (!upResult.hasFailed || allowPartialErrors) {
+        if (!upResult.hasErrors || allowPartialErrors) {
           if (returnResultDetails) {
             successKeys.addAll(upResult.successKeys);
             failedKeys.addAll(upResult.failedKeys);
@@ -5027,7 +5027,7 @@ class DataStoreImpl {
         }
         successCount += insResult.successCount;
         failedCount += insResult.failedCount;
-        if (!allowPartialErrors && insResult.hasFailed) {
+        if (!allowPartialErrors && insResult.hasErrors) {
           return finish(insResult);
         }
       }
@@ -7797,7 +7797,7 @@ class DataStoreImpl {
       isGlobal: isGlobal,
     );
     final createResult = await createTable(tempSchema, isSystemTable: true);
-    if (createResult.hasFailed) {
+    if (createResult.hasErrors) {
       throw DbException([
         GeneralStatus(
           type: ResultType.dbError,
