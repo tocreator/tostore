@@ -5,241 +5,81 @@ enum ResultType {
   /// Operation successful
   success(0, 'SUCCESS', 'Operation successful'),
 
-  /// Invalid argument - format error
-  invalidArgumentFormat(
-      40001, 'INVALID_ARGUMENT_FORMAT', 'Argument format error'),
+  // "BIZ_" - Business Error (10-19)
+  bizValidationFailed(10000, 'BIZ_VALIDATION_FAILED', 'Data validation failed'),
+  bizNotNullViolation(10001, 'BIZ_NOT_NULL_VIOLATION', 'Not null constraint violation'),
+  bizTypeCastFailed(10002, 'BIZ_VALIDATION_TYPE_CAST', 'Type cast failed'),
+  bizPrimaryKeyViolation(11001, 'BIZ_CONSTRAINT_PRIMARY_KEY', 'Primary key conflict'),
+  bizUniqueViolation(11002, 'BIZ_CONSTRAINT_UNIQUE', 'Unique constraint violation'),
+  bizForeignKeyViolation(11003, 'BIZ_CONSTRAINT_FOREIGN_KEY', 'Foreign key constraint violation'),
+  bizCheckViolation(11004, 'BIZ_CONSTRAINT_CHECK', 'Check constraint violation'),
+  bizForeignKeyParentNotExist(11005, 'BIZ_CONSTRAINT_FOREIGN_KEY_PARENT_NOT_EXIST', 'Referenced parent key does not exist'),
+  bizForeignKeyChildRestrict(11006, 'BIZ_CONSTRAINT_FOREIGN_KEY_CHILD_RESTRICT', 'Delete or update restricted by child records'),
+  bizForeignKeyCompositeMismatch(11007, 'BIZ_CONSTRAINT_FOREIGN_KEY_COMPOSITE_MISMATCH', 'Incomplete composite foreign key values'),
+  bizForeignKeyTypeMismatch(11008, 'BIZ_CONSTRAINT_FOREIGN_KEY_TYPE_MISMATCH', 'Foreign key type mismatch'),
+  bizValueExceedsMaxLength(11009, 'BIZ_CONSTRAINT_MAX_LENGTH', 'Value exceeds max length'),
+  bizValueLessThanMinLength(11010, 'BIZ_CONSTRAINT_MIN_LENGTH', 'Value is less than min length'),
+  bizValueLessThanMinValue(11011, 'BIZ_CONSTRAINT_MIN_VALUE', 'Value is less than min value'),
+  bizValueExceedsMaxValue(11012, 'BIZ_CONSTRAINT_MAX_VALUE', 'Value exceeds max value'),
+  bizRecordNotFound(12002, 'BIZ_NOT_FOUND_RECORD', 'Resource does not exist'),
 
-  /// Invalid argument - type mismatch
-  invalidArgumentType(40002, 'INVALID_ARGUMENT_TYPE', 'Argument type mismatch'),
+  // "DEV_" - Developer Error (20-49)
+  devInvalidArgumentFormat(20001, 'DEV_INVALID_ARGUMENT_FORMAT', 'Argument format error'),
+  devInvalidArgumentType(20002, 'DEV_INVALID_ARGUMENT_TYPE', 'Argument type mismatch'),
+  devInvalidArgumentMissing(20003, 'DEV_INVALID_ARGUMENT_MISSING', 'Required argument is missing'),
+  devInvalidPrimaryKeyFormat(20005, 'DEV_INVALID_PRIMARY_KEY_FORMAT', 'Invalid primary key format'),
+  devInvalidCursorPagination(20201, 'DEV_INVALID_CURSOR_PAGINATION', 'Cursor pagination and offset are mutually exclusive'),
+  devInvalidCursorTable(20202, 'DEV_INVALID_CURSOR_TABLE', 'Cursor does not match target table'),
+  devInvalidCursorSignature(20203, 'DEV_INVALID_CURSOR_SIGNATURE', 'Mismatched cursor signature'),
+  devInvalidCursorOrderBy(20204, 'DEV_INVALID_CURSOR_ORDERBY', 'Cursor orderBy configuration invalid or mismatched'),
+  devInvalidCursorMode(20205, 'DEV_INVALID_CURSOR_MODE', 'Cursor token mode mismatch'),
+  devInvalidCursorPayload(20206, 'DEV_INVALID_CURSOR_PAYLOAD', 'Invalid cursor payload'),
+  devInvalidQuerySelectField(20301, 'DEV_INVALID_QUERY_SELECT_FIELD', 'Query select field must be String or QueryAggregation'),
+  devInvalidQueryForeignKeyJoin(20302, 'DEV_INVALID_QUERY_FOREIGN_KEY_JOIN', 'No foreign key relationship for auto join'),
+  devInvalidQueryFieldAlias(20303, 'DEV_INVALID_QUERY_FIELD_ALIAS', 'Query field alias format invalid'),
+  devPermissionDeniedRead(21001, 'DEV_PERMISSION_DENIED_READ', 'Read permission denied'),
+  devPermissionDeniedWrite(21002, 'DEV_PERMISSION_DENIED_WRITE', 'Write permission denied'),
+  devTableNotFound(22001, 'DEV_NOT_FOUND_TABLE', 'Table not found'),
+  devIndexNotFound(22003, 'DEV_NOT_FOUND_INDEX', 'Index not found'),
+  devSpaceNotFound(22004, 'DEV_NOT_FOUND_SPACE', 'Space not found'),
+  devFieldNotFound(22005, 'DEV_NOT_FOUND_FIELD', 'Field not found'),
+  devLargeScaleOperationBypassRequired(23001, 'DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS', 'Large-scale operation requires skipping result details to prevent OOM'),
+  devEngineIncompatible(24001, 'DEV_ENGINE_INCOMPATIBLE', 'Engine version incompatible'),
+  devInvalidSchema(30000, 'DEV_INVALID_SCHEMA', 'Invalid table schema definition'),
+  devInvalidSchemaTableName(30001, 'DEV_INVALID_SCHEMA_TABLE_NAME', 'Table name validation failed'),
+  devInvalidSchemaFieldName(30002, 'DEV_INVALID_SCHEMA_FIELD_NAME', 'Field name validation failed'),
+  devInvalidSchemaPrimaryKey(30003, 'DEV_INVALID_SCHEMA_PRIMARY_KEY', 'Primary key validation failed'),
+  devInvalidSchemaIndexLimit(30004, 'DEV_INVALID_SCHEMA_INDEX_LIMIT', 'Index count validation failed'),
+  devSchemaTableExists(30005, 'DEV_SCHEMA_TABLE_EXISTS', 'Table already exists'),
+  devSchemaFieldExists(30006, 'DEV_SCHEMA_FIELD_EXISTS', 'Field already exists'),
+  devSchemaIndexExists(30007, 'DEV_SCHEMA_INDEX_EXISTS', 'Index already exists'),
+  devInvalidSchemaForeignKey(30008, 'DEV_INVALID_SCHEMA_FOREIGN_KEY', 'Foreign key definition invalid'),
+  devInvalidSchemaSpaceMismatch(30009, 'DEV_INVALID_SCHEMA_SPACE_MISMATCH', 'Global/Space-specific boundary mismatch'),
+  devMigrationNotAllowedWithData(30010, 'DEV_MIGRATION_NOT_ALLOWED_WITH_DATA', 'Migration requires data modification and was not explicitly allowed'),
+  devMigrationUnsafeTypeConversion(30011, 'DEV_MIGRATION_UNSAFE_TYPE_CONVERSION', 'Unsupported data type change for field'),
+  devMigrationBatchExecutionFailed(30012, 'DEV_MIGRATION_BATCH_EXECUTION_FAILED', 'Batch migration execution failed'),
+  devMigrationCannotAddNonNullField(30013, 'DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD', 'Cannot add non-nullable field without a default value'),
+  devMigrationNullableToNonNullNotAllowed(30014, 'DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED', 'Changing field from nullable to non-nullable is not allowed'),
+  devMigrationUniqueTighteningNotAllowed(30015, 'DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED', 'Changing field from non-unique to unique is not allowed'),
+  devInvalidSchemaTtlConfig(30016, 'DEV_INVALID_SCHEMA_TTL_CONFIG', 'TTL configuration validation failed'),
+  devInvalidSchemaDuplicateFieldName(30017, 'DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME', 'Duplicate field name in table schema'),
+  devInvalidSchemaIndexField(30018, 'DEV_INVALID_SCHEMA_INDEX_FIELD', 'Index references non-existent field'),
 
-  /// Cursor pagination conflict / unsupported
-  invalidCursorPagination(40201, 'INVALID_CURSOR_PAGINATION',
-      'Cursor pagination and offset are mutually exclusive'),
+  // "SYS_" - System Error (50-69)
+  sysTransactionAborted(50001, 'SYS_TRANSACTION_ABORTED', 'Transaction aborted'),
+  sysTransactionConflict(50002, 'SYS_TRANSACTION_CONFLICT', 'Transaction conflict'),
+  sysTimeoutLockAcquisition(51001, 'SYS_TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
+  sysTimeout(51002, 'SYS_TIMEOUT', 'Operation timeout'),
+  sysResourceExhaustedMemory(52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted'),
+  sysResourceExhausted(52002, 'SYS_RESOURCE_EXHAUSTED', 'System resources exhausted'),
+  sysIoFileRead(53001, 'SYS_IO_ERROR_FILE_READ', 'File read error'),
+  sysIoFileWrite(53002, 'SYS_IO_ERROR_FILE_WRITE', 'File write error'),
+  sysIoGeneric(53003, 'SYS_IO_ERROR', 'System IO error'),
 
-  /// Cursor does not match target table
-  invalidCursorTable(
-      40202, 'INVALID_CURSOR_TABLE', 'Cursor does not match target table'),
-
-  /// Mismatched cursor query signature hash
-  invalidCursorSignature(
-      40203, 'INVALID_CURSOR_SIGNATURE', 'Mismatched cursor signature'),
-
-  /// Cursor orderBy fields or direction mismatch
-  invalidCursorOrderBy(40204, 'INVALID_CURSOR_ORDERBY',
-      'Cursor orderBy configuration invalid or mismatched'),
-
-  /// Cursor token mode mismatch
-  invalidCursorMode(40205, 'INVALID_CURSOR_MODE', 'Cursor token mode mismatch'),
-
-  /// Invalid cursor payload
-  invalidCursorPayload(
-      40206, 'INVALID_CURSOR_PAYLOAD', 'Invalid cursor payload'),
-
-  /// Query select/selectAgg field type invalid
-  invalidQuerySelectField(40301, 'INVALID_QUERY_SELECT_FIELD',
-      'Query select field must be String or QueryAggregation'),
-
-  /// Auto foreign key join cannot resolve relationship
-  invalidQueryForeignKeyJoin(40302, 'INVALID_QUERY_FOREIGN_KEY_JOIN',
-      'No foreign key relationship for auto join'),
-
-  /// Query field alias format invalid
-  invalidQueryFieldAlias(
-      40303, 'INVALID_QUERY_FIELD_ALIAS', 'Query field alias format invalid'),
-
-  /// Read permission denied
-  permissionDeniedRead(
-      41001, 'PERMISSION_DENIED_READ', 'Read permission denied'),
-
-  /// Write permission denied
-  permissionDeniedWrite(
-      41002, 'PERMISSION_DENIED_WRITE', 'Write permission denied'),
-
-  /// Not null constraint violation
-  notNullViolation(
-      42001, 'VALIDATION_FAILED_NOT_NULL', 'Not null constraint violation'),
-
-  /// Type cast failed
-  validationFailedTypeCast(
-      42002, 'VALIDATION_FAILED_TYPE_CAST', 'Type cast failed'),
-
-  /// Data validation failed (generic)
-  validationFailed(42000, 'VALIDATION_FAILED', 'Data validation failed'),
-
-  /// Invalid table schema definition
-  invalidSchema(43000, 'INVALID_SCHEMA', 'Invalid table schema definition'),
-
-  /// Table name validation failed
-  invalidSchemaTableName(
-      43001, 'INVALID_SCHEMA_TABLE_NAME', 'Table name validation failed'),
-
-  /// Field name validation failed
-  invalidSchemaFieldName(
-      43002, 'INVALID_SCHEMA_FIELD_NAME', 'Field name validation failed'),
-
-  /// Primary key validation failed
-  invalidSchemaPrimaryKey(
-      43003, 'INVALID_SCHEMA_PRIMARY_KEY', 'Primary key validation failed'),
-
-  /// Index count validation failed
-  invalidSchemaIndexLimit(
-      43004, 'INVALID_SCHEMA_INDEX_LIMIT', 'Index count validation failed'),
-
-  /// Table already exists
-  tableExists(43005, 'INVALID_SCHEMA_TABLE_EXISTS', 'Table already exists'),
-
-  /// Field already exists
-  fieldExists(43006, 'INVALID_SCHEMA_FIELD_EXISTS', 'Field already exists'),
-
-  /// Index already exists
-  indexExists(43007, 'INVALID_SCHEMA_INDEX_EXISTS', 'Index already exists'),
-
-  /// Foreign key definition invalid
-  invalidSchemaForeignKey(
-      43008, 'INVALID_SCHEMA_FOREIGN_KEY', 'Foreign key definition invalid'),
-
-  /// Global/Space-specific boundary mismatch
-  invalidSchemaSpaceMismatch(43009, 'INVALID_SCHEMA_SPACE_MISMATCH',
-      'Global/Space-specific boundary mismatch'),
-
-  /// Migration for table requires data modification and was not explicitly allowed
-  migrationNotAllowedWithData(43010, 'MIGRATION_NOT_ALLOWED_WITH_DATA',
-      'Migration requires data modification and was not explicitly allowed'),
-
-  /// Unsupported or high-risk data type change for field
-  migrationUnsafeTypeConversion(43011, 'MIGRATION_UNSAFE_TYPE_CONVERSION',
-      'Unsupported data type change for field'),
-
-  /// Batch migration execution failed
-  migrationBatchExecutionFailed(43012, 'MIGRATION_BATCH_EXECUTION_FAILED',
-      'Batch migration execution failed'),
-
-  /// Cannot add non-nullable field without a default value to non-empty table
-  migrationCannotAddNonNullField(43013, 'MIGRATION_CANNOT_ADD_NON_NULL_FIELD',
-      'Cannot add non-nullable field without a default value'),
-
-  /// Changing field from nullable to non-nullable is not allowed on non-empty table
-  migrationNullableToNonNullNotAllowed(
-      43014,
-      'MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED',
-      'Changing field from nullable to non-nullable is not allowed'),
-
-  /// Changing field from non-unique to unique is not allowed on non-empty table
-  migrationUniqueTighteningNotAllowed(
-      43015,
-      'MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED',
-      'Changing field from non-unique to unique is not allowed'),
-
-  /// TTL configuration validation failed
-  invalidSchemaTtlConfig(43016, 'INVALID_SCHEMA_TTL_CONFIG',
-      'TTL configuration validation failed'),
-
-  /// Duplicate field name in table schema
-  invalidSchemaDuplicateFieldName(43017, 'INVALID_SCHEMA_DUPLICATE_FIELD_NAME',
-      'Duplicate field name in table schema'),
-
-  /// Index references non-existent field
-  invalidSchemaIndexField(43018, 'INVALID_SCHEMA_INDEX_FIELD',
-      'Index references non-existent field'),
-
-  /// Table not found
-  notFoundTable(44001, 'NOT_FOUND_TABLE', 'Table not found'),
-
-  /// Resource does not exist / Record not found
-  notFound(44002, 'NOT_FOUND_RECORD', 'Resource does not exist'),
-
-  /// Index not found
-  notFoundIndex(44003, 'NOT_FOUND_INDEX', 'Index not found'),
-
-  /// Primary key conflict
-  primaryKeyViolation(
-      45001, 'CONSTRAINT_VIOLATION_PRIMARY_KEY', 'Primary key conflict'),
-
-  /// Unique constraint violation
-  uniqueViolation(
-      45002, 'CONSTRAINT_VIOLATION_UNIQUE', 'Unique constraint violation'),
-
-  /// Foreign key constraint violation
-  foreignKeyViolation(45003, 'CONSTRAINT_VIOLATION_FOREIGN_KEY',
-      'Foreign key constraint violation'),
-
-  /// Check constraint violation
-  constraintViolationCheck(
-      45004, 'CONSTRAINT_VIOLATION_CHECK', 'Check constraint violation'),
-
-  /// Referenced parent key does not exist
-  foreignKeyParentNotExist(
-      45005,
-      'CONSTRAINT_VIOLATION_FOREIGN_KEY_PARENT_NOT_EXIST',
-      'Referenced parent key does not exist'),
-
-  /// Delete or update restricted by child records
-  foreignKeyChildRestrict(
-      45006,
-      'CONSTRAINT_VIOLATION_FOREIGN_KEY_CHILD_RESTRICT',
-      'Delete or update restricted by child records'),
-
-  /// Incomplete composite foreign key values
-  foreignKeyCompositeMismatch(
-      45007,
-      'CONSTRAINT_VIOLATION_FOREIGN_KEY_COMPOSITE_MISMATCH',
-      'Incomplete composite foreign key values'),
-
-  /// Foreign key type mismatch
-  foreignKeyTypeMismatch(
-      45008,
-      'CONSTRAINT_VIOLATION_FOREIGN_KEY_TYPE_MISMATCH',
-      'Foreign key type mismatch'),
-
-  /// Transaction aborted
-  transactionErrorAborted(
-      50001, 'TRANSACTION_ERROR_ABORTED', 'Transaction aborted'),
-
-  /// Transaction conflict
-  transactionErrorConflict(
-      50002, 'TRANSACTION_ERROR_CONFLICT', 'Transaction conflict'),
-
-  /// Lock acquisition timeout
-  timeoutLockAcquisition(
-      51001, 'TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
-
-  /// Query execution timeout / Operation timeout
-  timeout(51000, 'TIMEOUT', 'Operation timeout'),
-
-  /// Memory resource exhausted
-  resourceExhaustedMemory(
-      52001, 'RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted'),
-
-  /// Large-scale operation requires details bypass to prevent OOM
-  largeScaleOperationRequiredBypass(
-      52002,
-      'LARGE_SCALE_OPERATION_REQUIRED_BYPASS',
-      'Large-scale operation requires skipping result details to prevent OOM'),
-
-  /// Disk space exhausted / System resources exhausted (Generic)
-  resourceExhausted(52000, 'RESOURCE_EXHAUSTED', 'System resources exhausted'),
-
-  /// File read error
-  ioErrorFileRead(53001, 'IO_ERROR_FILE_READ', 'File read error'),
-
-  /// File write error
-  ioErrorFileWrite(53002, 'IO_ERROR_FILE_WRITE', 'File write error'),
-
-  /// System IO error (Generic)
-  ioError(53000, 'IO_ERROR', 'System IO error'),
-
-  /// Engine version incompatible
-  dbErrorEngineIncompatible(
-      54001, 'DB_ERROR_ENGINE_INCOMPATIBLE', 'Engine version incompatible'),
-
-  /// Database corruption
-  dbErrorCorruption(54002, 'DB_ERROR_CORRUPTION', 'Database corruption'),
-
-  /// Database error (Generic)
-  dbError(54000, 'DB_ERROR', 'Database error'),
-
-  /// Unknown system error
-  unknown(99001, 'UNKNOWN_ERROR', 'Unknown error');
+  // "ENG_" - Engine Error (90-99)
+  engDatabaseCorruption(90002, 'ENG_DATABASE_CORRUPTION', 'Database corruption'),
+  engDatabaseGeneric(90001, 'ENG_DATABASE_ERROR', 'Database error'),
+  engUnknown(99001, 'ENG_UNKNOWN_ERROR', 'Unknown error');
 
   /// Status code value
   final int code;
@@ -260,7 +100,7 @@ enum ResultType {
         return val;
       }
     }
-    return ResultType.unknown;
+    return ResultType.engUnknown;
   }
 
   /// Get the corresponding enum from the code key
@@ -270,10 +110,27 @@ enum ResultType {
         return val;
       }
     }
-    return ResultType.unknown;
+    return ResultType.engUnknown;
   }
 
   /// Determine if it is a constraint error
   bool get isConstraintError =>
-      (code >= 45000 && code < 46000) || this == ResultType.notNullViolation;
+      code == 10001 || (code >= 11000 && code < 12000);
+
+  /// Whether the error belongs to Business Error (10-19)
+  bool get isBusinessError => code >= 10000 && code < 20000;
+
+  /// Whether the error belongs to Developer Error (20-49)
+  bool get isDeveloperError => code >= 20000 && code < 50000;
+
+  /// Whether the error belongs to System Error (50-69)
+  bool get isSystemError => code >= 50000 && code < 70000;
+
+  /// Whether the error belongs to Engine Error (90-99)
+  bool get isEngineError => code >= 90000 && code < 100000;
+
+  /// Whether the error is a fatal error that must throw exception in any environment
+  bool get isFatalError =>
+      this == ResultType.devEngineIncompatible ||
+      name.startsWith('devMigration');
 }
