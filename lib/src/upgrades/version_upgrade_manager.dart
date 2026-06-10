@@ -34,7 +34,7 @@ class VersionUpgradeManager {
         // because the older engine doesn't understand the newer file formats or metadata.
         throw DbException([
           GeneralStatus(
-            type: ResultType.dbErrorEngineIncompatible,
+            type: ResultType.devEngineIncompatible,
             message:
                 'Database engine version mismatch: The database was created with a newer version of the engine (v$currentVersion), '
                 'but the current engine version is v$engineVersion. '
