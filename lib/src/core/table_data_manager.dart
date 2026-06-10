@@ -999,7 +999,7 @@ class TableDataManager {
             operationType == BufferOperationType.update) {
           throw DbException([
             ConstraintStatus(
-              type: ResultType.notFound,
+              type: ResultType.bizRecordNotFound,
               tableName: tableName,
               fields: [primaryKey],
               conflictingKeys: [recordId],
@@ -1063,7 +1063,7 @@ class TableDataManager {
           priorBuffered.operation == BufferOperationType.delete) {
         throw DbException([
           ConstraintStatus(
-            type: ResultType.notFound,
+            type: ResultType.bizRecordNotFound,
             tableName: tableName,
             fields: [primaryKey],
             conflictingKeys: [recordId],
