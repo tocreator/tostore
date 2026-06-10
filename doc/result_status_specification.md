@@ -33,7 +33,6 @@
 | 大类名称 (Class Name) | 大类代码 (前2位) | 大类数值区间 | 状态描述说明 |
 | :--- | :--- | :--- | :--- |
 | **success** | `0` (特殊) | `0` | 操作完全成功 |
-| **partialSuccess** | `10` | `[10000, 10999]` | 批量操作部分成功 |
 | **invalidArgument** | `40` | `[40000, 40999]` | 参数格式错误或参数值无效 |
 | **permissionDenied** | `41` | `[41000, 41999]` | 访问与操作权限拒绝 |
 | **validationFailed** | `42` | `[42000, 42999]` | 数据格式或非空约束校验失败 |
@@ -214,7 +213,6 @@
 | Code (数字) | CodeKey (语义) | 大类 Class (前2位) | 状态默认含义描述 |
 | :--- | :--- | :--- | :--- |
 | `0` | `SUCCESS` | `success: 0` | 操作完全成功 |
-| `10000` | `PARTIAL_SUCCESS` | `partialSuccess: 10` | 批量操作部分成功 |
 | `40001` | `INVALID_ARGUMENT_FORMAT` | `invalidArgument: 40` | 参数格式校验错误 |
 | `40002` | `INVALID_ARGUMENT_TYPE` | `invalidArgument: 40` | 参数数据类型不匹配 |
 | `40201` | `INVALID_CURSOR_PAGINATION` | `invalidArgument: 40` | 游标分页与 Offset 互斥冲突 |

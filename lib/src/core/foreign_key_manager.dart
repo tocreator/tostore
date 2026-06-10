@@ -109,11 +109,6 @@ class ForeignKeyManager {
         _referencingTablesCache =
             <String, Map<String, List<ForeignKeySchema>>>{};
         _cacheNeedsRebuild = false;
-
-        Logger.debug(
-          'System table not found or empty, initialized empty cache. Foreign keys will be added incrementally when tables are created/modified.',
-          label: 'ForeignKeyManager._loadCache',
-        );
       }
     } catch (e) {
       Logger.error(
