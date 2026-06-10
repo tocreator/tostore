@@ -101,7 +101,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       } else {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidQuerySelectField,
+            type: ResultType.devInvalidQuerySelectField,
             message: 'select() field must be String or QueryAggregation (Agg), '
                 'got ${field.runtimeType}',
             parameterName: 'select',
@@ -126,7 +126,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       } else {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidQuerySelectField,
+            type: ResultType.devInvalidQuerySelectField,
             message:
                 'selectAgg() item must be String or QueryAggregation (Agg), '
                 'got ${item.runtimeType}',
@@ -436,12 +436,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         return QueryResult.error(
           type: e.statuses.isNotEmpty
               ? e.statuses.first.type
-              : ResultType.unknown,
+              : ResultType.engUnknown,
           message: e.message,
         );
       }
       return QueryResult.error(
-        type: ResultType.unknown,
+        type: ResultType.engUnknown,
         message: e.toString(),
       );
     }
@@ -866,7 +866,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         if (!RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(alias)) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidQueryFieldAlias,
+              type: ResultType.devInvalidQueryFieldAlias,
               message: 'Invalid alias format: $alias',
               parameterName: 'alias',
               passedValue: alias,
@@ -896,7 +896,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (currentSchema == null) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.notFoundTable,
+          type: ResultType.devTableNotFound,
           message: 'Current table $_tableName does not exist',
           tableName: _tableName,
         ),
@@ -912,7 +912,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       if (targetSchema == null) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.notFoundTable,
+            type: ResultType.devTableNotFound,
             message: 'Target table $tableName does not exist',
             tableName: tableName,
           ),
@@ -953,7 +953,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         if (fk == null) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidQueryForeignKeyJoin,
+              type: ResultType.devInvalidQueryForeignKeyJoin,
               message:
                   'No foreign key relationship found between $_tableName and $tableName. '
                   'Please use manual join() method instead.',
