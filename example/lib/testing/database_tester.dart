@@ -1011,7 +1011,7 @@ class DatabaseTester {
       isTestPassed &= _expect('Immediate duplicate insert should be blocked',
           !secondInsert.hasErrors, false);
       isTestPassed &= _expect('Duplicate error should be unique violation',
-          secondInsert.firstType, ResultType.uniqueViolation);
+          secondInsert.firstType, ResultType.bizUniqueViolation);
 
       // 2. Insert then Partial Update (Merging test)
       const String partialUser = 'partial_test_user';
@@ -1670,8 +1670,8 @@ class DatabaseTester {
           false);
       isTestPassed &= _expect(
           'Error type should be validationFailed or notNullViolation',
-          result.firstType == ResultType.validationFailed ||
-              result.firstType == ResultType.notNullViolation,
+          result.firstType == ResultType.bizValidationFailed ||
+              result.firstType == ResultType.bizNotNullViolation,
           true);
 
       final count = (await db.query('users')).length;
@@ -2262,10 +2262,10 @@ class DatabaseTester {
           !invalidPostResult.hasErrors, false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          invalidPostResult.firstType == ResultType.foreignKeyViolation ||
+          invalidPostResult.firstType == ResultType.bizForeignKeyViolation ||
               invalidPostResult.firstType ==
-                  ResultType.foreignKeyParentNotExist ||
-              invalidPostResult.firstType == ResultType.validationFailed,
+                  ResultType.bizForeignKeyParentNotExist ||
+              invalidPostResult.firstType == ResultType.bizValidationFailed,
           true);
 
       // Test 1.3: Insert comment with valid foreign keys
@@ -2499,10 +2499,10 @@ class DatabaseTester {
           false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          restrictDeleteResult.firstType == ResultType.foreignKeyViolation ||
+          restrictDeleteResult.firstType == ResultType.bizForeignKeyViolation ||
               restrictDeleteResult.firstType ==
-                  ResultType.foreignKeyChildRestrict ||
-              restrictDeleteResult.firstType == ResultType.validationFailed,
+                  ResultType.bizForeignKeyChildRestrict ||
+              restrictDeleteResult.firstType == ResultType.bizValidationFailed,
           true);
 
       // Verify user still exists
@@ -2641,9 +2641,9 @@ class DatabaseTester {
           false);
       isTestPassed &= _expect(
           'Error type should be foreignKeyViolation or validationFailed',
-          clearResult.firstType == ResultType.foreignKeyViolation ||
-              clearResult.firstType == ResultType.foreignKeyChildRestrict ||
-              clearResult.firstType == ResultType.validationFailed,
+          clearResult.firstType == ResultType.bizForeignKeyViolation ||
+              clearResult.firstType == ResultType.bizForeignKeyChildRestrict ||
+              clearResult.firstType == ResultType.bizValidationFailed,
           true);
 
       // Verify users still exist (should still be 1, the same as before)
