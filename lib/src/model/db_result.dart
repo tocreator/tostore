@@ -103,7 +103,7 @@ class DbResult {
   ///   encountered error type (or [ResultType.dbError] if details are missing) instead of success.
   ResultType get firstType {
     if (statuses.isEmpty) {
-      return hasErrors ? ResultType.dbError : ResultType.success;
+      return hasErrors ? ResultType.engDatabaseGeneric : ResultType.success;
     }
     if (statuses.length == 1) return statuses.first.type;
 
@@ -113,7 +113,7 @@ class DbResult {
           return s.type;
         }
       }
-      return ResultType.dbError;
+      return ResultType.engDatabaseGeneric;
     }
     return ResultType.success;
   }
@@ -212,7 +212,7 @@ class DbResult {
             ),
           for (int i = 0; i < failedKeys.length; i++)
             GeneralStatus(
-              type: ResultType.dbError,
+              type: ResultType.engDatabaseGeneric,
               message: message ?? 'Item failed',
               index: successKeys.length + i,
               primaryKey: failedKeys[i],
