@@ -213,6 +213,12 @@
   | **Code**: `20002`<br>`ResultType.devInvalidArgumentType` | 参数的数据类型不匹配（期待数字传入字符串等） | <ul><li>`parameterName`: 参数名</li><li>`passedValue`: 传入的非法类型对象，如 `{"foo": "bar"}`（被期望为 String 时）</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20003`<br>`ResultType.devInvalidArgumentMissing` | 必填的接口入参未传入 | <ul><li>`parameterName`: 缺失的必填参数名 (如 `"dbPath"`)</li><li>`passedValue`: `null` (代表该值未传)</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20005`<br>`ResultType.devInvalidPrimaryKeyFormat` | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） | <ul><li>`parameterName`: `"primaryKey"` 或 主键字段名</li><li>`passedValue`: 传入的非法主键值，例如 `"invalid_id_value"`</li><li>`primaryKey`: 传入的非法主键值</li></ul> |
+  | **Code**: `20006`<br>`ResultType.devInvalidEngineState` | 引擎状态或未初始化错误（尝试在未准备好时操作引擎组件） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20007`<br>`ResultType.devIndexOutOfBounds` | 索引或范围超限错误（如越界读写缓冲区） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20008`<br>`ResultType.devUnsupportedOperation` | 当前上下文不支持的操作（不支持该平台、未实现等） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20009`<br>`ResultType.devInvalidDataFormat` | 数据流格式或编解码失败（数据反序列化非法） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20010`<br>`ResultType.devVectorDimensionMismatch` | 向量计算或比较时维度不匹配（如点积、距离计算等） | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 传入向量的非法维度值</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20011`<br>`ResultType.devIndexFieldMissing` | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 缺失的字段名</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20201`<br>`ResultType.devInvalidCursorPagination` | 分页冲突（游标分页和 Offset 分页不能同时配置） | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 冲突的分页配置对象</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20202`<br>`ResultType.devInvalidCursorTable` | 游标包含的表与当前查询表不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标字符串 (指出游标和当前表不相符)</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20203`<br>`ResultType.devInvalidCursorSignature` | 游标签名哈希校验失败（游标已被篡改） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标值 (指出签名校验已被损坏或篡改)</li><li>`primaryKey`: `null`</li></ul> |
@@ -450,6 +456,12 @@ try {
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 开发者错误 | 参数的数据类型不匹配（期待数字传入字符串等） |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 开发者错误 | 必填的接口入参未传入 |
 | **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 开发者错误 | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） |
+| **20006** | `DEV_INVALID_ENGINE_STATE` | `ResultType.devInvalidEngineState` | 开发者错误 | 引擎状态或未初始化错误（尝试在未准备好时操作引擎组件） |
+| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 开发者错误 | 索引或范围超限错误（如越界读写缓冲区） |
+| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 开发者错误 | 当前上下文不支持的操作（不支持该平台、未实现等） |
+| **20009** | `DEV_INVALID_DATA_FORMAT` | `ResultType.devInvalidDataFormat` | 开发者错误 | 数据流格式或编解码失败（数据反序列化非法） |
+| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 开发者错误 | 向量计算或比较时维度不匹配（如点积、距离计算等） |
+| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 开发者错误 | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） |
 | **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 开发者错误 | 分页冲突（游标分页和 Offset 分页不能同时配置） |
 | **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 开发者错误 | 游标包含的表与当前查询表不一致 |
 | **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 开发者错误 | 游标签名哈希校验失败（游标已被篡改） |
