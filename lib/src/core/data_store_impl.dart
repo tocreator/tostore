@@ -16,12 +16,11 @@ import '../handler/platform_handler.dart';
 import '../handler/value_matcher.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
 import '../model/cancellation_token.dart';
 import '../model/change_event.dart';
 import '../model/config_info.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
@@ -32,6 +31,7 @@ import '../model/memory_info.dart';
 import '../model/migration_task.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/query_result.dart';
+import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/space_config.dart';
 import '../model/space_info.dart';
@@ -171,7 +171,12 @@ class DataStoreImpl {
 
   KeyManager get keyManager {
     if (_keyManager == null) {
-      throw StateError('KeyManager not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'KeyManager not initialized',
+        )
+      ]);
     }
     return _keyManager!;
   }
@@ -180,7 +185,12 @@ class DataStoreImpl {
 
   PathManager get pathManager {
     if (_pathManager == null) {
-      throw StateError('PathManager not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'PathManager not initialized',
+        )
+      ]);
     }
     return _pathManager!;
   }
@@ -195,7 +205,12 @@ class DataStoreImpl {
   TableDataManager get tableDataManager {
     if (_tableDataManager == null) {
       if (_isInitialized) {
-        throw StateError('TableDataManager not initialized');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.devInvalidEngineState,
+            message: 'TableDataManager not initialized',
+          )
+        ]);
       }
     }
     return _tableDataManager!;
@@ -309,7 +324,12 @@ class DataStoreImpl {
   QueryExecutor get queryExecutor {
     final qe = _queryExecutor;
     if (qe == null) {
-      throw StateError('QueryExecutor not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'QueryExecutor not initialized',
+        )
+      ]);
     }
     return qe;
   }
@@ -378,7 +398,12 @@ class DataStoreImpl {
   /// Get current configuration
   DataStoreConfig get config {
     if (_config == null) {
-      throw StateError('DataStore not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'DataStore not initialized',
+        )
+      ]);
     }
     return _config!;
   }
@@ -3656,8 +3681,14 @@ class DataStoreImpl {
                   .checkSerializableConflictsTransactional(
                       readKeys, started, txId);
               if (conflicts.isNotEmpty) {
-                throw StateError(
-                    'Serializable conflict on: ${conflicts.take(5).join(', ')}');
+                throw DbException([
+                  TransactionOperationStatus(
+                    type: ResultType.sysTransactionConflict,
+                    message:
+                        'Serializable conflict on: ${conflicts.take(5).join(', ')}',
+                    txId: txId,
+                  )
+                ]);
               }
             }
             // Build and persist commit plan (inserts/updates/deletes), then apply
@@ -3693,8 +3724,14 @@ class DataStoreImpl {
           await doWork().timeout(
             timeout,
             onTimeout: () {
-              throw TimeoutException(
-                  'Transaction timed out after ${timeout.inMilliseconds} ms');
+              throw DbException([
+                TransactionOperationStatus(
+                  type: ResultType.sysTimeout,
+                  message:
+                      'Transaction timed out after ${timeout.inMilliseconds} ms',
+                  txId: txId,
+                )
+              ]);
             },
           );
         } else {
@@ -3765,6 +3802,11 @@ class DataStoreImpl {
   }
 
   ResultType _classifyErrorToResultType(Object e) {
+    if (e is DbException) {
+      return e.statuses.isNotEmpty
+          ? e.statuses.first.type
+          : ResultType.engDatabaseGeneric;
+    }
     if (e is TimeoutException) return ResultType.sysTimeout;
     final msg = e.toString().toLowerCase();
     if (msg.contains('timeout')) return ResultType.sysTimeout;
@@ -3985,7 +4027,12 @@ class DataStoreImpl {
   Future<bool> tableExists(String tableName) async {
     try {
       if (schemaManager == null) {
-        throw StateError('SchemaPartitionManager not initialized');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.devInvalidEngineState,
+            message: 'SchemaPartitionManager not initialized',
+          )
+        ]);
       }
 
       final schema = await schemaManager?.getTableSchema(tableName);
@@ -4003,7 +4050,12 @@ class DataStoreImpl {
   Future<List<String>> getTableNames() async {
     try {
       if (schemaManager == null) {
-        throw StateError('SchemaPartitionManager not initialized');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.devInvalidEngineState,
+            message: 'SchemaPartitionManager not initialized',
+          )
+        ]);
       }
 
       return await schemaManager!.listAllTables();
@@ -6991,7 +7043,12 @@ class DataStoreImpl {
     final schemaMgr = schemaManager;
     final dirMgr = directoryManager;
     if (schemaMgr == null || dirMgr == null) {
-      throw StateError('Database managers are not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Database managers are not initialized',
+        )
+      ]);
     }
 
     final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
@@ -7001,15 +7058,26 @@ class DataStoreImpl {
         actualOldSchema != null &&
         existingNewSchema != null &&
         oldTableName != newTableName) {
-      throw StateError(
-        'Cannot rename table $oldTableName -> $newTableName: target table already exists',
-      );
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devSchemaTableExists,
+          message:
+              'Cannot rename table $oldTableName -> $newTableName: target table already exists',
+          tableName: newTableName,
+        )
+      ]);
     }
     final schemaForLayout = existingOldSchema ?? existingNewSchema;
     if (schemaForLayout == null) {
-      throw StateError(
-        'Cannot rename table $oldTableName -> $newTableName: schema not found',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devTableNotFound,
+          message:
+              'Cannot rename table $oldTableName -> $newTableName: schema not found',
+          parameterName: 'oldTableName',
+          passedValue: oldTableName,
+        )
+      ]);
     }
 
     final isGlobal = schemaForLayout.isGlobal;
@@ -7091,9 +7159,14 @@ class DataStoreImpl {
             sourceExists = false;
             targetExists = true;
           } else {
-            throw StateError(
-              'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
-            );
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.devSchemaTableExists,
+                message:
+                    'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
+                tableName: newTableName,
+              )
+            ]);
           }
         } else {
           await storage.moveDirectory(effectiveSourcePath, newPath);
@@ -7124,9 +7197,13 @@ class DataStoreImpl {
         }
       }
       if (!mappingRenamed) {
-        throw StateError(
-          'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engDatabaseGeneric,
+            message:
+                'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
+          )
+        ]);
       }
 
       if (updateSchema && actualOldSchema != null) {
@@ -7214,7 +7291,12 @@ class DataStoreImpl {
     final schemaMgr = schemaManager;
     final dirMgr = directoryManager;
     if (schemaMgr == null || dirMgr == null) {
-      throw StateError('Database managers are not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Database managers are not initialized',
+        )
+      ]);
     }
 
     final rollbackSchema = existingOldSchema ??
@@ -7254,9 +7336,13 @@ class DataStoreImpl {
         spaceName: currentSpace,
       );
       if (!restored) {
-        throw StateError(
-          'Failed to restore directory mapping for table $oldTableName during rollback',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engDatabaseGeneric,
+            message:
+                'Failed to restore directory mapping for table $oldTableName during rollback',
+          )
+        ]);
       }
     }
 
