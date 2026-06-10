@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'result_type.dart';
 
@@ -89,7 +90,12 @@ abstract class ResultStatus {
         field: json['field'] as String?,
         wrongValue: json['wrongValue'],
       );
-    } else if ((type.code >= 20000 && type.code < 21000) ||
+    } else if ((type.code >= 20000 &&
+            type.code < 21000 &&
+            type.code != 20006 &&
+            type.code != 20007 &&
+            type.code != 20008 &&
+            type.code != 20009) ||
         type.code == 22005) {
       return InvalidArgumentStatus(
         type: type,
@@ -312,17 +318,49 @@ class GeneralStatus extends ResultStatus {
 /// cause secondary failures after the original error was thrown.
 dynamic jsonSafeDiagnosticValue(dynamic value) {
   if (value == null) return null;
-  if (value is String || value is num || value is bool) return value;
-  if (value is List || value is Map) {
+  if (value is String) {
+    if (value.length > 1000) {
+      return '${value.substring(0, 1000)}... (truncated, total length: ${value.length})';
+    }
+    return value;
+  }
+  if (value is num || value is bool) return value;
+  if (value is TypedData) {
+    return '${value.runtimeType}(${value.lengthInBytes} bytes)';
+  }
+  if (value is List) {
+    if (value.length > 100) {
+      final sub = value.take(100).toList();
+      return [...sub, '... (truncated, total length: ${value.length})'];
+    }
     try {
       jsonEncode(value);
       return value;
     } catch (_) {
-      return value.toString();
+      return value.map((e) => jsonSafeDiagnosticValue(e)).toList();
+    }
+  }
+  if (value is Map) {
+    if (value.length > 100) {
+      final sub = Map.fromEntries(value.entries.take(100));
+      sub['...'] = '(truncated, total size: ${value.length})';
+      return sub
+          .map((k, v) => MapEntry(k.toString(), jsonSafeDiagnosticValue(v)));
+    }
+    try {
+      jsonEncode(value);
+      return value;
+    } catch (_) {
+      return value
+          .map((k, v) => MapEntry(k.toString(), jsonSafeDiagnosticValue(v)));
     }
   }
   try {
-    return value.toString();
+    final str = value.toString();
+    if (str.length > 1000) {
+      return '${str.substring(0, 1000)}... (truncated, total length: ${str.length})';
+    }
+    return str;
   } catch (_) {
     return value.runtimeType.toString();
   }
