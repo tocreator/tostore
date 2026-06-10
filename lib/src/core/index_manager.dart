@@ -2980,7 +2980,7 @@ class IndexManager {
         if (existingOwner != null && existingOwner != pk) {
           throw DbException([
             ConstraintStatus(
-              type: ResultType.uniqueViolation,
+              type: ResultType.bizUniqueViolation,
               message:
                   'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=$pk',
               tableName: tableName,
@@ -3019,7 +3019,7 @@ class IndexManager {
         }
         throw DbException([
           ConstraintStatus(
-            type: ResultType.uniqueViolation,
+            type: ResultType.bizUniqueViolation,
             message:
                 'Unique index rebuild failed for $tableName.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=${owners[i]}',
             tableName: tableName,
