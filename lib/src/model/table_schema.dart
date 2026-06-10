@@ -236,7 +236,7 @@ class TableSchema {
     if (name.isEmpty || !tableNameRegex.hasMatch(name)) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTableName,
+          type: ResultType.devInvalidSchemaTableName,
           message:
               'Invalid table name format for "$name". Table names must only contain alphanumeric characters and underscores, and must start with a letter.',
           tableName: name,
@@ -248,7 +248,7 @@ class TableSchema {
     if (!allowReservedTableNames && reservedTableNames.contains(name)) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTableName,
+          type: ResultType.devInvalidSchemaTableName,
           message:
               'Table name "$name" is reserved for system tables and cannot be used.',
           tableName: name,
@@ -261,7 +261,7 @@ class TableSchema {
         name.startsWith(internalSystemPrefix)) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTableName,
+          type: ResultType.devInvalidSchemaTableName,
           message:
               'Table name "$name" is reserved for internal tables (prefix: "$internalSystemPrefix").',
           tableName: name,
@@ -273,7 +273,7 @@ class TableSchema {
     if (primaryKey.isEmpty || !fieldNameRegex.hasMatch(primaryKey)) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaPrimaryKey,
+          type: ResultType.devInvalidSchemaPrimaryKey,
           message:
               'Invalid primary key name format "$primaryKey" in table "$name".',
           tableName: name,
@@ -287,7 +287,7 @@ class TableSchema {
       if (!fieldNameRegex.hasMatch(field.name)) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaFieldName,
+            type: ResultType.devInvalidSchemaFieldName,
             message:
                 'Invalid field name format "${field.name}" in table "$name".',
             tableName: name,
@@ -301,7 +301,7 @@ class TableSchema {
         if (field.name == internalTtlIngestTsMsField) {
           throw DbException([
             SchemaValidationStatus(
-              type: ResultType.invalidSchemaFieldName,
+              type: ResultType.devInvalidSchemaFieldName,
               message:
                   'Field "${field.name}" in table "$name" is reserved for internal TTL management and cannot be user-defined.',
               tableName: name,
@@ -312,7 +312,7 @@ class TableSchema {
         if (!allowOtherInternalFields) {
           throw DbException([
             SchemaValidationStatus(
-              type: ResultType.invalidSchemaFieldName,
+              type: ResultType.devInvalidSchemaFieldName,
               message:
                   'Field "${field.name}" in table "$name" is reserved for internal system fields (prefix: "$internalSystemPrefix").',
               tableName: name,
@@ -326,7 +326,7 @@ class TableSchema {
       if (field.name == primaryKey) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaPrimaryKey,
+            type: ResultType.devInvalidSchemaPrimaryKey,
             message:
                 'Field "${field.name}" in table "$name" has the same name as the primary key. Primary key should not be defined in the field list.',
             tableName: name,
@@ -339,7 +339,7 @@ class TableSchema {
     if (fields.isEmpty) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchema,
+          type: ResultType.devInvalidSchema,
           message:
               'Table "$name" has no fields. User tables must define at least one field.',
           tableName: name,
@@ -358,7 +358,7 @@ class TableSchema {
     if (duplicateFields.isNotEmpty) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaDuplicateFieldName,
+          type: ResultType.devInvalidSchemaDuplicateFieldName,
           message:
               'Field names in table "$name" must be unique. Duplicate fields found: ${duplicateFields.join(', ')}',
           tableName: name,
@@ -395,7 +395,7 @@ class TableSchema {
     if (!fk.validate()) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaForeignKey,
+          type: ResultType.devInvalidSchemaForeignKey,
           message:
               'Invalid foreign key schema definition for "${fk.actualName}" in table "$name".',
           tableName: name,
@@ -412,7 +412,7 @@ class TableSchema {
       if (!fieldExists) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaForeignKey,
+            type: ResultType.devInvalidSchemaForeignKey,
             message:
                 'Foreign key "${fk.actualName}" in table "$name" references non-existent local field: "$fieldName".',
             tableName: name,
@@ -460,7 +460,7 @@ class TableSchema {
       if (!refFieldExists) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaForeignKey,
+            type: ResultType.devInvalidSchemaForeignKey,
             message:
                 'Foreign key "${fk.actualName}" in table "$name" references non-existent field "$refFieldName" in referenced table "${fk.referencedTable}".',
             tableName: name,
@@ -517,7 +517,7 @@ class TableSchema {
       if (!_areTypesCompatible(fkField.type, refFieldType)) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaForeignKey,
+            type: ResultType.devInvalidSchemaForeignKey,
             message:
                 'Foreign key "${fk.actualName}" type mismatch: field "$fkFieldName" (${fkField.type.name}) in table "$name" is not compatible with referenced field "$refFieldName" (${refFieldType.name}) in table "${fk.referencedTable}".',
             tableName: name,
@@ -610,7 +610,7 @@ class TableSchema {
       if (!fieldExists) {
         throw DbException([
           SchemaValidationStatus(
-            type: ResultType.invalidSchemaIndexField,
+            type: ResultType.devInvalidSchemaIndexField,
             message:
                 'Index "${index.actualIndexName}" in table "$name" references non-existent field "$fieldName".',
             tableName: name,
@@ -748,7 +748,7 @@ class TableSchema {
           // Unsupported type
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+              type: ResultType.devInvalidPrimaryKeyFormat,
               message:
                   'Invalid primary key $primaryKeyName value type: $primaryKeyValue (should be number or string type) (table $name)',
               parameterName: primaryKeyName,
@@ -765,7 +765,7 @@ class TableSchema {
             field.name != primaryKeyName) {
           throw DbException([
             ConstraintStatus(
-              type: ResultType.notNullViolation,
+              type: ResultType.bizNotNullViolation,
               message:
                   'Field ${field.name} is required but not provided for table $name',
               tableName: name,
@@ -791,7 +791,7 @@ class TableSchema {
           }
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+              type: ResultType.devFieldNotFound,
               message: 'Unknown field ${entry.key} in table $name',
               parameterName: entry.key,
               passedValue: entry.value,
@@ -1709,7 +1709,7 @@ class FieldSchema {
     if (value == null && !nullable) {
       throw DbException([
         ConstraintStatus(
-          type: ResultType.notNullViolation,
+          type: ResultType.bizNotNullViolation,
           message:
               'Field $name is required and cannot be null (table $tableName)',
           tableName: tableName,
@@ -1723,7 +1723,7 @@ class FieldSchema {
       if (!trustedConvertedValue && !isValidDataType(value, type)) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentType,
+            type: ResultType.devInvalidArgumentType,
             message:
                 'Field $name expects type $type but got ${value.runtimeType} (table $tableName)',
             parameterName: name,
@@ -1738,23 +1738,25 @@ class FieldSchema {
             maxLength != null &&
             value.length > maxLength!) {
           throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+            ConstraintStatus(
+              type: ResultType.bizValueExceedsMaxLength,
               message:
                   'Field $name length ${value.length} exceeds maxLength $maxLength (table $tableName)',
-              parameterName: name,
-              passedValue: value,
+              tableName: tableName,
+              fields: [name],
+              conflictingKeys: [value],
             )
           ]);
         }
         if (minLength != null && value.length < minLength!) {
           throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+            ConstraintStatus(
+              type: ResultType.bizValueLessThanMinLength,
               message:
                   'Field $name length ${value.length} is less than minLength $minLength (table $tableName)',
-              parameterName: name,
-              passedValue: value,
+              tableName: tableName,
+              fields: [name],
+              conflictingKeys: [value],
             )
           ]);
         }
@@ -1764,23 +1766,25 @@ class FieldSchema {
       if (value is num) {
         if (minValue != null && value < minValue!) {
           throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+            ConstraintStatus(
+              type: ResultType.bizValueLessThanMinValue,
               message:
                   'Field $name value $value is less than minValue $minValue (table $tableName)',
-              parameterName: name,
-              passedValue: value,
+              tableName: tableName,
+              fields: [name],
+              conflictingKeys: [value],
             )
           ]);
         }
         if (maxValue != null && value > maxValue!) {
           throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+            ConstraintStatus(
+              type: ResultType.bizValueExceedsMaxValue,
               message:
                   'Field $name value $value exceeds maxValue $maxValue (table $tableName)',
-              parameterName: name,
-              passedValue: value,
+              tableName: tableName,
+              fields: [name],
+              conflictingKeys: [value],
             )
           ]);
         }
@@ -2037,7 +2041,7 @@ class TableTtlConfig {
     if (ttlMs <= 0) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTtlConfig,
+          type: ResultType.devInvalidSchemaTtlConfig,
           message:
               'TTL duration for table "${schema.name}" must be greater than 0.',
           tableName: schema.name,
@@ -2054,7 +2058,7 @@ class TableTtlConfig {
     if (matched.isEmpty) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTtlConfig,
+          type: ResultType.devInvalidSchemaTtlConfig,
           message:
               'TTL source field "$field" does not exist in table "${schema.name}".',
           tableName: schema.name,
@@ -2067,7 +2071,7 @@ class TableTtlConfig {
     if (fieldSchema.type != DataType.datetime) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTtlConfig,
+          type: ResultType.devInvalidSchemaTtlConfig,
           message:
               'TTL source field "$field" must be DataType.datetime, but got ${fieldSchema.type.name} in table "${schema.name}".',
           tableName: schema.name,
@@ -2080,7 +2084,7 @@ class TableTtlConfig {
     if (fieldSchema.nullable) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTtlConfig,
+          type: ResultType.devInvalidSchemaTtlConfig,
           message:
               'TTL source field "$field" must be non-nullable in table "${schema.name}".',
           tableName: schema.name,
@@ -2093,7 +2097,7 @@ class TableTtlConfig {
     if (fieldSchema.defaultValueType != DefaultValueType.currentTimestamp) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.invalidSchemaTtlConfig,
+          type: ResultType.devInvalidSchemaTtlConfig,
           message:
               'TTL source field "$field" must use DefaultValueType.currentTimestamp to ensure automatic ingestion timestamp filling in table "${schema.name}".',
           tableName: schema.name,
@@ -2267,7 +2271,7 @@ class PrimaryKeyConfig {
     } catch (e) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.validationFailedTypeCast,
+          type: ResultType.bizTypeCastFailed,
           message: 'Failed to convert value to primary key type: $value',
           parameterName: name,
           passedValue: value,
