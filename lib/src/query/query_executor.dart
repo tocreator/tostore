@@ -298,7 +298,7 @@ class QueryExecutor {
       if (useCursor && offset != null && offset > 0) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorPagination,
+            type: ResultType.devInvalidCursorPagination,
             message:
                 'Cursor pagination and offset are mutually exclusive. Use cursor() or offset(), not both.',
             parameterName: 'offset',
@@ -330,7 +330,7 @@ class QueryExecutor {
           if (hasToken) {
             throw DbException([
               GeneralStatus(
-                type: ResultType.invalidCursorPagination,
+                type: ResultType.devInvalidCursorPagination,
                 message: reason ??
                     'Cursor pagination is not supported for this query type.',
               ),
@@ -350,7 +350,7 @@ class QueryExecutor {
       if (maxOffset > 0 && effectiveOffset > maxOffset && !hasCursor) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentFormat,
+            type: ResultType.devInvalidArgumentFormat,
             message:
                 'Query offset ($effectiveOffset) exceeds maxQueryOffset ($maxOffset). Use keyset pagination instead.',
             parameterName: 'offset',
@@ -382,7 +382,7 @@ class QueryExecutor {
               // Safety: never allow unbounded reads in ultra-large datasets.
               throw DbException([
                 GeneralStatus(
-                  type: ResultType.invalidArgumentFormat,
+                  type: ResultType.devInvalidArgumentFormat,
                   message:
                       'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
                 ),
@@ -429,7 +429,7 @@ class QueryExecutor {
         if (cursorToken.tableName != tableName) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorTable,
+              type: ResultType.devInvalidCursorTable,
               message: 'Cursor does not match target table.',
               parameterName: 'cursor',
               passedValue: cursor,
@@ -447,7 +447,7 @@ class QueryExecutor {
           if (cursorToken.querySigHash != currentSigHash) {
             throw DbException([
               InvalidArgumentStatus(
-                type: ResultType.invalidCursorSignature,
+                type: ResultType.devInvalidCursorSignature,
                 message:
                     'Mismatched cursor: The query conditions or sorting used for this cursor do not match the current query parameters.',
                 parameterName: 'cursor',
@@ -1969,7 +1969,7 @@ class QueryExecutor {
               ? IndexCondition.fromMap({'SCAN': true})
               : (throw DbException([
                   GeneralStatus(
-                    type: ResultType.notFoundIndex,
+                    type: ResultType.devIndexNotFound,
                     message: 'Index condition is not available for index scan.',
                   ),
                 ])));
@@ -2760,7 +2760,7 @@ class QueryExecutor {
       }
       throw DbException([
         GeneralStatus(
-          type: ResultType.notFoundIndex,
+          type: ResultType.devIndexNotFound,
           message: 'Index schema not found for cursor pagination: $indexName.',
         ),
       ]);
@@ -2778,7 +2778,7 @@ class QueryExecutor {
     if (idxName == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.notFoundIndex,
+          type: ResultType.devIndexNotFound,
           message:
               'Index scan plan is missing indexName for cursor pagination.',
         ),
@@ -2805,7 +2805,7 @@ class QueryExecutor {
     if (cleanOrderBy.isEmpty && orderBy.isNotEmpty) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorOrderBy,
+          type: ResultType.devInvalidCursorOrderBy,
           message:
               'Index-key cursor pagination requires orderBy to include index fields.',
           parameterName: 'orderBy',
@@ -2817,7 +2817,7 @@ class QueryExecutor {
     if (cleanOrderBy.length > spec.fields.length) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorOrderBy,
+          type: ResultType.devInvalidCursorOrderBy,
           message:
               'Index-key cursor pagination requires orderBy to match index fields prefix.',
           parameterName: 'orderBy',
@@ -2835,7 +2835,7 @@ class QueryExecutor {
       if (f != spec.fields[i]) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorOrderBy,
+            type: ResultType.devInvalidCursorOrderBy,
             message:
                 'Index-key cursor pagination requires orderBy to match index fields in the same order.',
             parameterName: 'orderBy',
@@ -2849,7 +2849,7 @@ class QueryExecutor {
       } else if (isDesc != firstIsDesc) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorOrderBy,
+            type: ResultType.devInvalidCursorOrderBy,
             message:
                 'Cursor pagination for multi-field indexes requires a uniform sort direction (all ASC or all DESC).',
             parameterName: 'orderBy',
@@ -2879,7 +2879,7 @@ class QueryExecutor {
     if (cursorToken.mode != _CursorMode.sortKey) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorMode,
+          type: ResultType.devInvalidCursorMode,
           message: 'Cursor token mode mismatch (expected sortKey).',
           parameterName: 'cursor',
           passedValue: cursorToken.mode.toString(),
@@ -2894,7 +2894,7 @@ class QueryExecutor {
         keyBytes.isEmpty) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorPayload,
+          type: ResultType.devInvalidCursorPayload,
           message: 'Invalid sort-key cursor token.',
           parameterName: 'cursor',
           passedValue: null,
@@ -2904,7 +2904,7 @@ class QueryExecutor {
     if (orderBy.isEmpty) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorOrderBy,
+          type: ResultType.devInvalidCursorOrderBy,
           message: 'Sort-key cursor requires explicit orderBy.',
           parameterName: 'orderBy',
           passedValue: orderBy,
@@ -2925,7 +2925,7 @@ class QueryExecutor {
     if (!_sameStringList(normalizedFields, tokenFields)) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorOrderBy,
+          type: ResultType.devInvalidCursorOrderBy,
           message: 'Cursor orderBy fields do not match current query orderBy.',
           parameterName: 'orderBy',
           passedValue: orderBy,
@@ -2937,7 +2937,7 @@ class QueryExecutor {
     if (tokenDesc == null || tokenDesc.length != tokenFields.length) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorPayload,
+          type: ResultType.devInvalidCursorPayload,
           message: 'Invalid sort-key cursor token (missing direction).',
           parameterName: 'cursor',
           passedValue: null,
@@ -2949,7 +2949,7 @@ class QueryExecutor {
       if (orderDesc[i] != expected) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorOrderBy,
+            type: ResultType.devInvalidCursorOrderBy,
             message: 'Cursor orderBy direction does not match current orderBy.',
             parameterName: 'orderBy',
             passedValue: orderBy,
@@ -2963,7 +2963,7 @@ class QueryExecutor {
     if (pivotValues.length != expectedLen) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorPayload,
+          type: ResultType.devInvalidCursorPayload,
           message: 'Invalid sort-key cursor payload.',
           parameterName: 'cursor',
           passedValue: null,
@@ -3039,7 +3039,7 @@ class QueryExecutor {
       if (idxName.isEmpty) {
         throw DbException([
           GeneralStatus(
-            type: ResultType.notFoundIndex,
+            type: ResultType.devIndexNotFound,
             message:
                 'Index scan plan is missing indexName for cursor pagination.',
           ),
@@ -3095,10 +3095,11 @@ class QueryExecutor {
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null || pkVal.isEmpty) {
         throw DbException([
-          GeneralStatus(
-            type: ResultType.validationFailed,
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
             message:
                 'Cannot build next cursor: primary key is missing from the last record.',
+            parameterName: 'cursor',
           ),
         ]);
       }
@@ -3106,7 +3107,7 @@ class QueryExecutor {
       if (!pkOrder.isPkOrder) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentFormat,
+            type: ResultType.devInvalidCursorOrderBy,
             message:
                 'Cannot build primary-key cursor when orderBy is not primary key.',
             parameterName: 'orderBy',
@@ -3128,7 +3129,7 @@ class QueryExecutor {
       if (ob.isEmpty) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentFormat,
+            type: ResultType.devInvalidCursorOrderBy,
             message: 'Cannot build sort-key cursor without orderBy.',
             parameterName: 'orderBy',
             passedValue: orderBy,
@@ -3163,10 +3164,11 @@ class QueryExecutor {
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null || pkVal.isEmpty) {
         throw DbException([
-          GeneralStatus(
-            type: ResultType.validationFailed,
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
             message:
                 'Cannot build sort-key cursor: primary key is missing from the last record.',
+            parameterName: 'cursor',
           ),
         ]);
       }
@@ -3187,7 +3189,7 @@ class QueryExecutor {
     if (idxName == null || idxName.isEmpty) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.notFoundIndex,
+          type: ResultType.devIndexNotFound,
           message:
               'Cannot build next cursor: missing indexName from query plan.',
         ),
@@ -3197,7 +3199,7 @@ class QueryExecutor {
     if (spec.fields.isEmpty) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.notFoundIndex,
+          type: ResultType.devIndexNotFound,
           message: 'Cannot build next cursor: index has no fields.',
         ),
       ]);
@@ -3214,10 +3216,11 @@ class QueryExecutor {
       );
       if (c == null) {
         throw DbException([
-          GeneralStatus(
-            type: ResultType.validationFailed,
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
             message:
                 'Cannot build next cursor: missing or unsupported index field value in the last record.',
+            parameterName: 'cursor',
           ),
         ]);
       }
@@ -3229,10 +3232,11 @@ class QueryExecutor {
           (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
       if (pkVal == null) {
         throw DbException([
-          GeneralStatus(
-            type: ResultType.validationFailed,
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
             message:
                 'Cannot build next cursor: primary key is missing for non-unique index cursor.',
+            parameterName: 'cursor',
           ),
         ]);
       }
@@ -3751,7 +3755,7 @@ final class _QueryCursorToken {
       if (obj is! Map) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorPayload,
+            type: ResultType.devInvalidCursorPayload,
             message: 'Invalid cursor token payload.',
             parameterName: 'cursor',
           ),
@@ -3761,7 +3765,7 @@ final class _QueryCursorToken {
       if (v != _currentVersion) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorPayload,
+            type: ResultType.devInvalidCursorPayload,
             message: 'Unsupported cursor token version: $v',
             parameterName: 'cursor',
           ),
@@ -3772,7 +3776,7 @@ final class _QueryCursorToken {
       if (t.isEmpty || m.isEmpty) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidCursorPayload,
+            type: ResultType.devInvalidCursorPayload,
             message: 'Invalid cursor token.',
             parameterName: 'cursor',
           ),
@@ -3786,7 +3790,7 @@ final class _QueryCursorToken {
         if (pk.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid primary-key cursor token.',
               parameterName: 'cursor',
             ),
@@ -3809,7 +3813,7 @@ final class _QueryCursorToken {
         if (idx.isEmpty || k.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid index-key cursor token.',
               parameterName: 'cursor',
             ),
@@ -3820,7 +3824,7 @@ final class _QueryCursorToken {
         if (keyBytes.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid index-key cursor token (empty key).',
               parameterName: 'cursor',
             ),
@@ -3843,7 +3847,7 @@ final class _QueryCursorToken {
         if (f is! List || d is! List || k.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid sort-key cursor token.',
               parameterName: 'cursor',
               passedValue: null,
@@ -3855,7 +3859,7 @@ final class _QueryCursorToken {
         if (fields.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid sort-key cursor token (empty fields).',
               parameterName: 'cursor',
               passedValue: null,
@@ -3866,7 +3870,7 @@ final class _QueryCursorToken {
         if (desc.length != fields.length) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message:
                   'Invalid sort-key cursor token (direction length mismatch).',
               parameterName: 'cursor',
@@ -3879,7 +3883,7 @@ final class _QueryCursorToken {
         if (keyBytes.isEmpty) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidCursorPayload,
+              type: ResultType.devInvalidCursorPayload,
               message: 'Invalid sort-key cursor token (empty key).',
               parameterName: 'cursor',
               passedValue: null,
@@ -3899,7 +3903,7 @@ final class _QueryCursorToken {
 
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorMode,
+          type: ResultType.devInvalidCursorMode,
           message: 'Unknown cursor token mode.',
           parameterName: 'cursor',
           passedValue: null,
@@ -3909,7 +3913,7 @@ final class _QueryCursorToken {
       if (e is DbException) rethrow;
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.invalidCursorPayload,
+          type: ResultType.devInvalidCursorPayload,
           message: 'Failed to decode cursor token: $e',
           parameterName: 'cursor',
           passedValue: null,
