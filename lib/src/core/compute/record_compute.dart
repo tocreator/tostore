@@ -32,7 +32,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         if (key != primaryKey && !fieldMapLocal.containsKey(key)) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+              type: ResultType.devFieldNotFound,
               message: 'Unknown field $key in table $tableName',
               parameterName: key,
               passedValue: data[key],
@@ -50,7 +50,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       } else {
         throw DbException([
           ConstraintStatus(
-            type: ResultType.notNullViolation,
+            type: ResultType.bizNotNullViolation,
             message: 'Primary key value cannot be null (table $tableName)',
             tableName: tableName,
             fields: [primaryKey],
@@ -65,7 +65,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
           !schema.validatePrimaryKeyFormat(providedId)) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentFormat,
+            type: ResultType.devInvalidPrimaryKeyFormat,
             message:
                 'The provided primary key value $providedId for table $tableName does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
             parameterName: primaryKey,
@@ -201,7 +201,7 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         if (key != primaryKey && !fieldMap.containsKey(key)) {
           throw DbException([
             InvalidArgumentStatus(
-              type: ResultType.invalidArgumentFormat,
+              type: ResultType.devFieldNotFound,
               message: 'Unknown field $key in table $tableName',
               parameterName: key,
               passedValue: data[key],
