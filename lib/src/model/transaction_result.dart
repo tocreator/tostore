@@ -75,16 +75,16 @@ class TransactionResult {
     final type = firstErr.type;
     if (type.isConstraintError) {
       errType = TransactionErrorType.integrityViolation;
-    } else if (type == ResultType.timeout ||
-        type == ResultType.timeoutLockAcquisition) {
+    } else if (type == ResultType.sysTimeout ||
+        type == ResultType.sysTimeoutLockAcquisition) {
       errType = TransactionErrorType.timeout;
-    } else if (type == ResultType.ioError ||
-        type == ResultType.ioErrorFileRead ||
-        type == ResultType.ioErrorFileWrite) {
+    } else if (type == ResultType.sysIoGeneric ||
+        type == ResultType.sysIoFileRead ||
+        type == ResultType.sysIoFileWrite) {
       errType = TransactionErrorType.io;
-    } else if (type == ResultType.transactionErrorConflict) {
+    } else if (type == ResultType.sysTransactionConflict) {
       errType = TransactionErrorType.conflict;
-    } else if (type == ResultType.transactionErrorAborted) {
+    } else if (type == ResultType.sysTransactionAborted) {
       errType = TransactionErrorType.userAbort;
     } else {
       errType = TransactionErrorType.operationError;
