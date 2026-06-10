@@ -23,6 +23,18 @@ abstract class ResultStatus {
   /// Optional primary key of the record associated with this status
   String? get primaryKey => null;
 
+  /// Whether this status is a Business Error
+  bool get isBusinessError => type.isBusinessError;
+
+  /// Whether this status is a Developer Error
+  bool get isDeveloperError => type.isDeveloperError;
+
+  /// Whether this status is a System Error
+  bool get isSystemError => type.isSystemError;
+
+  /// Whether this status is an Engine Error
+  bool get isEngineError => type.isEngineError;
+
   ResultStatus({
     required this.type,
     required this.message,
@@ -53,9 +65,9 @@ abstract class ResultStatus {
         index: index,
         primaryKey: json['primaryKey']?.toString(),
       );
-    } else if ((type.code >= 45000 && type.code < 46000) ||
-        type == ResultType.notNullViolation ||
-        type == ResultType.notFound) {
+    } else if (type.code == 10001 ||
+        type.code == 12002 ||
+        (type.code >= 11000 && type.code < 12000)) {
       return ConstraintStatus(
         type: type,
         message: message,
@@ -66,8 +78,9 @@ abstract class ResultStatus {
         conflictingKeys:
             List<dynamic>.from(json['conflictingKeys'] as List? ?? []),
         primaryKey: json['primaryKey']?.toString(),
+        referencedTable: json['referencedTable']?.toString(),
       );
-    } else if (type.code >= 43000 && type.code < 44000) {
+    } else if (type.code >= 30000 && type.code < 31000) {
       return SchemaValidationStatus(
         type: type,
         message: message,
@@ -76,7 +89,8 @@ abstract class ResultStatus {
         field: json['field'] as String?,
         wrongValue: json['wrongValue'],
       );
-    } else if (type.code >= 40000 && type.code < 41000) {
+    } else if ((type.code >= 20000 && type.code < 21000) ||
+        type.code == 22005) {
       return InvalidArgumentStatus(
         type: type,
         message: message,
@@ -145,6 +159,9 @@ class ConstraintStatus extends ResultStatus {
   @override
   final String? primaryKey;
 
+  /// Optional referenced table name (specifically for foreign key constraints)
+  final String? referencedTable;
+
   ConstraintStatus({
     required super.type,
     required super.message,
@@ -154,6 +171,7 @@ class ConstraintStatus extends ResultStatus {
     this.fields = const [],
     this.conflictingKeys = const [],
     this.primaryKey,
+    this.referencedTable,
   });
 
   @override
@@ -167,6 +185,9 @@ class ConstraintStatus extends ResultStatus {
     map['conflictingKeys'] = conflictingKeys;
     if (primaryKey != null) {
       map['primaryKey'] = primaryKey;
+    }
+    if (referencedTable != null) {
+      map['referencedTable'] = referencedTable;
     }
     return map;
   }
