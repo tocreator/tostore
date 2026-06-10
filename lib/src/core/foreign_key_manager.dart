@@ -294,7 +294,7 @@ class ForeignKeyManager {
           if (!field.nullable) {
             throw DbException([
               ConstraintStatus(
-                type: ResultType.notNullViolation,
+                type: ResultType.bizNotNullViolation,
                 message:
                     'Foreign key field "$fieldName" in table "$tableName" cannot be null',
                 tableName: tableName,
@@ -327,7 +327,7 @@ class ForeignKeyManager {
     if (referencedSchema == null) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.notFoundTable,
+          type: ResultType.devTableNotFound,
           message:
               'Cannot validate foreign key "${fk.actualName}" on table "$tableName": Referenced table "${fk.referencedTable}" does not exist.',
           tableName: fk.referencedTable,
@@ -360,13 +360,14 @@ class ForeignKeyManager {
           if (!allFieldsNull) {
             throw DbException([
               ConstraintStatus(
-                type: ResultType.foreignKeyCompositeMismatch,
+                type: ResultType.bizForeignKeyCompositeMismatch,
                 message:
                     'Composite foreign key violation in table "$tableName" (Constraint: "${fk.actualName}"): All fields (${fk.fields.join(', ')}) must be non-null, or all must be null.',
                 tableName: tableName,
                 constraintName: fk.actualName,
                 fields: fk.fields,
                 conflictingKeys: fk.fields.map((f) => fkValues[f]).toList(),
+                referencedTable: fk.referencedTable,
               )
             ]);
           }
@@ -404,13 +405,14 @@ class ForeignKeyManager {
           // Type conversion failed - this indicates a type mismatch
           throw DbException([
             ConstraintStatus(
-              type: ResultType.foreignKeyTypeMismatch,
+              type: ResultType.bizForeignKeyTypeMismatch,
               message:
                   'Foreign key value type mismatch in table "$tableName" (Constraint: "${fk.actualName}"): Cannot convert value "$fkValue" of type ${fkValue.runtimeType} to referenced field "${fk.referencedTable}.$refField" type (${refFieldSchema.type}).',
               tableName: tableName,
               constraintName: fk.actualName,
               fields: [fkField],
               conflictingKeys: [fkValue],
+              referencedTable: fk.referencedTable,
             )
           ]);
         }
@@ -428,13 +430,14 @@ class ForeignKeyManager {
     if (fk.fields.length > 1 && condition.length != fk.fields.length) {
       throw DbException([
         ConstraintStatus(
-          type: ResultType.foreignKeyCompositeMismatch,
+          type: ResultType.bizForeignKeyCompositeMismatch,
           message:
               'Composite foreign key violation in table "$tableName" (Constraint: "${fk.actualName}"): Incomplete values provided for fields (${fk.fields.join(', ')}).',
           tableName: tableName,
           constraintName: fk.actualName,
           fields: fk.fields,
           conflictingKeys: fk.fields.map((f) => fkValues[f]).toList(),
+          referencedTable: fk.referencedTable,
         )
       ]);
     }
@@ -458,7 +461,7 @@ class ForeignKeyManager {
     if (results.data.isEmpty) {
       throw DbException([
         ConstraintStatus(
-          type: ResultType.foreignKeyParentNotExist,
+          type: ResultType.bizForeignKeyParentNotExist,
           message:
               'Foreign key constraint violation on table "$tableName" (Constraint: "${fk.actualName}"): '
               'Referenced record does not exist in table "${fk.referencedTable}" for fields (${fk.fields.join(', ')}) referencing (${fk.referencedFields.join(', ')}). '
@@ -467,6 +470,7 @@ class ForeignKeyManager {
           constraintName: fk.actualName,
           fields: fk.fields,
           conflictingKeys: condition.values.toList(),
+          referencedTable: fk.referencedTable,
         )
       ]);
     }
@@ -515,7 +519,7 @@ class ForeignKeyManager {
           if (hasReferences) {
             throw DbException([
               ConstraintStatus(
-                type: ResultType.foreignKeyChildRestrict,
+                type: ResultType.bizForeignKeyChildRestrict,
                 message:
                     'Cannot delete record from table "$tableName" with values $deletedPkValues: '
                     'Referenced by records in child table "$childTableName" via foreign key "${fk.actualName}" (fields: ${fk.fields.join(', ')} referencing ${fk.referencedFields.join(', ')}). '
@@ -524,6 +528,7 @@ class ForeignKeyManager {
                 constraintName: fk.actualName,
                 fields: fk.referencedFields,
                 conflictingKeys: [deletedPkValues],
+                referencedTable: tableName,
               )
             ]);
           }
@@ -571,7 +576,7 @@ class ForeignKeyManager {
           if (hasReferences) {
             throw DbException([
               ConstraintStatus(
-                type: ResultType.foreignKeyChildRestrict,
+                type: ResultType.bizForeignKeyChildRestrict,
                 message:
                     'Cannot update primary key in table "$tableName" from $oldPkValues: '
                     'Referenced by records in child table "$childTableName" via foreign key "${fk.actualName}" (fields: ${fk.fields.join(', ')} referencing ${fk.referencedFields.join(', ')}). '
@@ -580,6 +585,7 @@ class ForeignKeyManager {
                 constraintName: fk.actualName,
                 fields: fk.referencedFields,
                 conflictingKeys: [oldPkValues],
+                referencedTable: tableName,
               )
             ]);
           }
@@ -657,7 +663,7 @@ class ForeignKeyManager {
             if (hasReferences) {
               throw DbException([
                 ConstraintStatus(
-                  type: ResultType.foreignKeyChildRestrict,
+                  type: ResultType.bizForeignKeyChildRestrict,
                   message:
                       'Cannot delete record from table "$tableName" with values $deletedPkValues: '
                       'Referenced by records in child table "$childTableName" via foreign key "${fk.actualName}" (fields: ${fk.fields.join(', ')} referencing ${fk.referencedFields.join(', ')}). '
@@ -666,6 +672,7 @@ class ForeignKeyManager {
                   constraintName: fk.actualName,
                   fields: fk.referencedFields,
                   conflictingKeys: [deletedPkValues],
+                  referencedTable: tableName,
                 )
               ]);
             }
@@ -802,7 +809,7 @@ class ForeignKeyManager {
           if (hasReferences) {
             throw DbException([
               ConstraintStatus(
-                type: ResultType.foreignKeyChildRestrict,
+                type: ResultType.bizForeignKeyChildRestrict,
                 message:
                     'Cannot update primary key in table "$tableName" from $oldPkValues: '
                     'Referenced by records in child table "$childTableName" via foreign key "${fk.actualName}" (fields: ${fk.fields.join(', ')} referencing ${fk.referencedFields.join(', ')}). '
@@ -811,6 +818,7 @@ class ForeignKeyManager {
                 constraintName: fk.actualName,
                 fields: fk.referencedFields,
                 conflictingKeys: [oldPkValues],
+                referencedTable: tableName,
               )
             ]);
           }
@@ -998,11 +1006,12 @@ class ForeignKeyManager {
       final restrictTableNames = restrictTables.join(', ');
       throw DbException([
         ConstraintStatus(
-          type: ResultType.foreignKeyChildRestrict,
+          type: ResultType.bizForeignKeyChildRestrict,
           message:
               'Cannot clear table "$tableName": Referenced by records in child tables ($restrictTableNames) with RESTRICT/NO ACTION policy. Please delete the referencing child records first, or modify the foreign key constraints.',
           tableName: tableName,
           fields: const [],
+          referencedTable: tableName,
         )
       ]);
     }
@@ -1394,7 +1403,7 @@ class ForeignKeyManager {
     if (referencedSchema == null) {
       throw DbException([
         SchemaValidationStatus(
-          type: ResultType.notFoundTable,
+          type: ResultType.devTableNotFound,
           message:
               'Cannot execute cascade update for table "$childTableName": Referenced table "${fk.referencedTable}" does not exist (Constraint: "${fk.actualName}").',
           tableName: fk.referencedTable,
@@ -1460,13 +1469,14 @@ class ForeignKeyManager {
       if (verifyResult.data.isEmpty) {
         throw DbException([
           ConstraintStatus(
-            type: ResultType.foreignKeyParentNotExist,
+            type: ResultType.bizForeignKeyParentNotExist,
             message:
                 'Cannot execute cascade update on table "$childTableName" (Constraint: "${fk.actualName}"): New referenced value ${newPkCondition.values.toList()} does not exist in table "${fk.referencedTable}".',
             tableName: childTableName,
             constraintName: fk.actualName,
             fields: fk.fields,
             conflictingKeys: newPkCondition.values.toList(),
+            referencedTable: fk.referencedTable,
           )
         ]);
       }
@@ -1544,7 +1554,7 @@ class ForeignKeyManager {
       if (!field.nullable) {
         throw DbException([
           ConstraintStatus(
-            type: ResultType.notNullViolation,
+            type: ResultType.bizNotNullViolation,
             message:
                 'Cannot set foreign key field $fieldName to NULL: field does not allow NULL values',
             tableName: childTableName,
@@ -1611,7 +1621,7 @@ class ForeignKeyManager {
       if (defaultValue == null && !field.nullable) {
         throw DbException([
           ConstraintStatus(
-            type: ResultType.notNullViolation,
+            type: ResultType.bizNotNullViolation,
             message:
                 'Cannot set foreign key field $fieldName to default: field has no default value and does not allow NULL',
             tableName: childTableName,
