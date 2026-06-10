@@ -240,7 +240,7 @@ class DataStoreImpl {
           ? result.statuses
           : [
               TransactionOperationStatus(
-                type: ResultType.transactionErrorAborted,
+                type: ResultType.sysTransactionAborted,
                 message:
                     'Transaction operation failed: $operation on $tableName',
                 txId: txId,
@@ -270,9 +270,9 @@ class DataStoreImpl {
         errorMessage.toLowerCase().contains('file') ||
         errorMessage.toLowerCase().contains('permission') ||
         errorMessage.toLowerCase().contains('access')) {
-      type = ResultType.ioError;
+      type = ResultType.sysIoGeneric;
     } else {
-      type = ResultType.dbError;
+      type = ResultType.engDatabaseGeneric;
     }
 
     return DbResult.error(
@@ -584,7 +584,7 @@ class DataStoreImpl {
       if (PlatformHandler.isMobile) {
         throw DbException([
           InvalidArgumentStatus(
-            type: ResultType.invalidArgumentFormat,
+            type: ResultType.devInvalidArgumentMissing,
             message:
                 'On mobile platforms (Android/iOS ...), dbPath is required. Please inject a persistent app directory path via ToStore(dbPath: ...) or DataStoreConfig(dbPath: ...). See example/mobile_quickstart.dart',
             parameterName: 'dbPath',
@@ -1214,7 +1214,7 @@ class DataStoreImpl {
         Logger.warn('Table ${schema.name} already exists',
             label: 'DataStore.createTable');
         return finish(DbResult.error(
-          type: ResultType.tableExists,
+          type: ResultType.devSchemaTableExists,
           message: 'Table ${schema.name} already exists',
         ));
       }
@@ -1242,7 +1242,7 @@ class DataStoreImpl {
           if (referencedSchema == null) {
             throw DbException([
               SchemaValidationStatus(
-                type: ResultType.notFoundTable,
+                type: ResultType.devTableNotFound,
                 message:
                     'Cannot create table ${schema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
                 tableName: schema.name,
@@ -1255,7 +1255,7 @@ class DataStoreImpl {
           if (schemaValid.isGlobal != referencedSchema.isGlobal) {
             throw DbException([
               SchemaValidationStatus(
-                type: ResultType.invalidSchemaSpaceMismatch,
+                type: ResultType.devInvalidSchemaSpaceMismatch,
                 message:
                     'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
                     '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
@@ -1275,7 +1275,7 @@ class DataStoreImpl {
               fk, referencedSchema)) {
             throw DbException([
               SchemaValidationStatus(
-                type: ResultType.invalidSchemaForeignKey,
+                type: ResultType.devInvalidSchemaForeignKey,
                 message:
                     'Invalid foreign key ${fk.actualName} in table ${schema.name}: Field type mismatch or invalid configuration',
                 tableName: schema.name,
@@ -1340,7 +1340,7 @@ class DataStoreImpl {
           ));
         }
         return finish(DbResult.error(
-          type: ResultType.dbError,
+          type: ResultType.engDatabaseGeneric,
           message: 'Failed to create table ${schema.name}: $e',
         ));
       }
@@ -1348,7 +1348,7 @@ class DataStoreImpl {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       // Convert any unexpected exceptions to DbResult
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Failed to create table ${schema.name}: $e',
       ));
     }
@@ -1475,7 +1475,7 @@ class DataStoreImpl {
       );
     } else if (successKeys.isEmpty) {
       return DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Failed to create all tables',
         failedKeys: failedKeys,
         statuses: statuses,
@@ -1506,7 +1506,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'Insert operation blocked: System resources are critically low.',
       ));
@@ -1524,7 +1524,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.insert');
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
       }
@@ -1544,7 +1544,7 @@ class DataStoreImpl {
         return finish(DbResult.error(
           type: e.statuses.isNotEmpty
               ? e.statuses.first.type
-              : ResultType.validationFailed,
+              : ResultType.bizValidationFailed,
           message: detailMsg,
           statuses: e.statuses,
         ));
@@ -1554,7 +1554,7 @@ class DataStoreImpl {
             ? 'Data validation failed for table $tableName: ${validationErrors.join("; ")}'
             : 'Data validation failed for table $tableName';
         return finish(DbResult.error(
-          type: ResultType.validationFailed,
+          type: ResultType.bizValidationFailed,
           message: detailMsg,
         ));
       }
@@ -1604,7 +1604,7 @@ class DataStoreImpl {
           }
 
           return finish(DbResult.error(
-            type: ResultType.uniqueViolation,
+            type: ResultType.bizUniqueViolation,
             message: e.message,
             failedKeys: [recordId],
           ));
@@ -1634,7 +1634,7 @@ class DataStoreImpl {
           Logger.error('Foreign key constraint validation failed: $e',
               label: 'DataStore.insert');
           return finish(DbResult.error(
-            type: ResultType.foreignKeyViolation,
+            type: ResultType.bizForeignKeyViolation,
             message: e.toString(),
           ));
         }
@@ -1684,7 +1684,7 @@ class DataStoreImpl {
         } catch (_) {}
 
         return finish(DbResult.error(
-          type: ResultType.uniqueViolation,
+          type: ResultType.bizUniqueViolation,
           message: uniqueViolation.message,
           failedKeys: [recordId],
         ));
@@ -1770,7 +1770,7 @@ class DataStoreImpl {
       }
 
       return DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Insert failed: $e',
         failedKeys: failedKeys,
       );
@@ -2220,7 +2220,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'Upsert operation blocked: System resources are critically low.',
       ));
@@ -2229,7 +2229,7 @@ class DataStoreImpl {
     final schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
       ));
     }
@@ -2348,7 +2348,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'update operation blocked: System resources are critically low.',
       ));
@@ -2362,10 +2362,19 @@ class DataStoreImpl {
       Logger.warn(
           'Update operation without condition, this may cause accidental update of all records, please use allowUpdateAll() method to explicitly confirm.',
           label: 'DataStore.updateInternal');
+      const message =
+          'Update operation must specify a filter condition. If you really need to update all records, please use allowUpdateAll() method to explicitly confirm.';
       return finish(DbResult.error(
-        type: ResultType.validationFailed,
-        message:
-            'Update operation must specify a filter condition. If you really need to update all records, please use allowUpdateAll() method to explicitly confirm.',
+        type: ResultType.devInvalidArgumentMissing,
+        message: message,
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentMissing,
+            message: message,
+            parameterName: 'condition',
+            passedValue: null,
+          )
+        ],
       ));
     }
 
@@ -2376,7 +2385,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.updateInternal');
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
       }
@@ -2388,7 +2397,7 @@ class DataStoreImpl {
         return finish(DbResult.error(
           type: e.statuses.isNotEmpty
               ? e.statuses.first.type
-              : ResultType.validationFailed,
+              : ResultType.bizValidationFailed,
           message: e.statuses.isNotEmpty
               ? e.statuses.first.message
               : 'Data validation failed',
@@ -2397,7 +2406,7 @@ class DataStoreImpl {
       }
       if (validData == null || validData.isEmpty) {
         return finish(DbResult.error(
-          type: ResultType.validationFailed,
+          type: ResultType.bizValidationFailed,
           message: 'Data validation failed',
         ));
       }
@@ -2463,7 +2472,7 @@ class DataStoreImpl {
 
                 throw DbException([
                   ConstraintStatus(
-                    type: ResultType.uniqueViolation,
+                    type: ResultType.bizUniqueViolation,
                     message:
                         'Batch update would modify multiple records but unique key or primary key would be duplicated. '
                         'Conflicting fields: ${conflictFields.join(", ")}, Update values: ${conflictValues.map((v) => v.toString()).join(", ")}',
@@ -2572,7 +2581,7 @@ class DataStoreImpl {
       if (!isOptimizableQuery) {
         if (returnResultDetails) {
           return finish(DbResult.error(
-            type: ResultType.largeScaleOperationRequiredBypass,
+            type: ResultType.devLargeScaleOperationBypassRequired,
             message:
                 'This is a large-scale update operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
           ));
@@ -2638,7 +2647,7 @@ class DataStoreImpl {
             orderBy: orderBy, limit: effectiveLimit, offset: offset);
         if (records.isEmpty) {
           return finish(DbResult.error(
-            type: ResultType.notFound,
+            type: ResultType.bizRecordNotFound,
             message: 'No matching records found',
           ));
         }
@@ -2789,7 +2798,7 @@ class DataStoreImpl {
                   continue;
                 }
                 return finish(DbResult.error(
-                  type: ResultType.uniqueViolation,
+                  type: ResultType.bizUniqueViolation,
                   message: e.message,
                   failedKeys: returnResultDetails ? [recordKey] : const [],
                 ));
@@ -2826,7 +2835,7 @@ class DataStoreImpl {
                   continue;
                 }
                 return finish(DbResult.error(
-                  type: ResultType.foreignKeyViolation,
+                  type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
                   failedKeys: returnResultDetails ? [recordKey] : const [],
                 ));
@@ -2872,7 +2881,7 @@ class DataStoreImpl {
               continue;
             }
             return finish(DbResult.error(
-              type: ResultType.uniqueViolation,
+              type: ResultType.bizUniqueViolation,
               message:
                   uniqueViolation?.message ?? 'Unique constraint violation',
               failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -2902,7 +2911,7 @@ class DataStoreImpl {
                 }
                 // release unique locks before returning
                 return finish(DbResult.error(
-                  type: ResultType.dbError,
+                  type: ResultType.engDatabaseGeneric,
                   message: 'Lock conflict on primary key $recordKey',
                 ));
               }
@@ -3061,7 +3070,7 @@ class DataStoreImpl {
         }
       } catch (_) {}
       return DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Update failed: $e',
       );
     }
@@ -3083,7 +3092,7 @@ class DataStoreImpl {
     if (schema == null) {
       Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
       ));
     }
@@ -3160,7 +3169,7 @@ class DataStoreImpl {
       Logger.info('Clear table failed: $e', label: 'DataStore-clear');
       // Convert any unexpected exceptions to DbResult for graceful error handling
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Failed to clear table $tableName: $e',
       ));
     }
@@ -3186,7 +3195,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'Delete operation blocked: System resources are critically low.',
       ));
@@ -3198,10 +3207,19 @@ class DataStoreImpl {
         Logger.warn(
             'Delete operation without condition, this may cause accidental deletion of all records, please use allowDeleteAll() method to explicitly confirm.',
             label: 'DataStore.deleteInternal');
+        const message =
+            'Delete operation must specify a filter condition. If you really need to delete all records, please use allowDeleteAll() method to explicitly confirm.';
         return finish(DbResult.error(
-          type: ResultType.validationFailed,
-          message:
-              'Delete operation must specify a filter condition. If you really need to delete all records, please use allowDeleteAll() method to explicitly confirm.',
+          type: ResultType.devInvalidArgumentMissing,
+          message: message,
+          statuses: [
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentMissing,
+              message: message,
+              parameterName: 'condition',
+              passedValue: null,
+            )
+          ],
         ));
       } else {
         // If allowAll=true and no condition, use clear() for better performance
@@ -3240,7 +3258,7 @@ class DataStoreImpl {
         Logger.warn('Table $tableName does not exist',
             label: 'DataStore.deleteInternal');
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
       }
@@ -3483,7 +3501,7 @@ class DataStoreImpl {
       } else {
         if (returnResultDetails) {
           return finish(DbResult.error(
-            type: ResultType.largeScaleOperationRequiredBypass,
+            type: ResultType.devLargeScaleOperationBypassRequired,
             message:
                 'This is a large-scale delete operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
           ));
@@ -3541,7 +3559,7 @@ class DataStoreImpl {
         rethrow;
       }
       return DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Delete failed: $e',
       );
     }
@@ -3747,23 +3765,23 @@ class DataStoreImpl {
   }
 
   ResultType _classifyErrorToResultType(Object e) {
-    if (e is TimeoutException) return ResultType.timeout;
+    if (e is TimeoutException) return ResultType.sysTimeout;
     final msg = e.toString().toLowerCase();
-    if (msg.contains('timeout')) return ResultType.timeout;
+    if (msg.contains('timeout')) return ResultType.sysTimeout;
     if (_looksLikeIoFailure(e, msg)) {
-      if (msg.contains('read')) return ResultType.ioErrorFileRead;
-      if (msg.contains('write')) return ResultType.ioErrorFileWrite;
-      return ResultType.ioError;
+      if (msg.contains('read')) return ResultType.sysIoFileRead;
+      if (msg.contains('write')) return ResultType.sysIoFileWrite;
+      return ResultType.sysIoGeneric;
     }
     if (msg.contains('unique') ||
         msg.contains('constraint') ||
         msg.contains('integrity')) {
-      if (msg.contains('primary key')) return ResultType.primaryKeyViolation;
-      if (msg.contains('unique')) return ResultType.uniqueViolation;
-      if (msg.contains('foreign key')) return ResultType.foreignKeyViolation;
-      return ResultType.transactionErrorConflict;
+      if (msg.contains('primary key')) return ResultType.bizPrimaryKeyViolation;
+      if (msg.contains('unique')) return ResultType.bizUniqueViolation;
+      if (msg.contains('foreign key')) return ResultType.bizForeignKeyViolation;
+      return ResultType.sysTransactionConflict;
     }
-    return ResultType.transactionErrorAborted;
+    return ResultType.sysTransactionAborted;
   }
 
   bool _looksLikeIoFailure(Object e, String msg) {
@@ -3798,7 +3816,7 @@ class DataStoreImpl {
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
       }
@@ -3936,7 +3954,7 @@ class DataStoreImpl {
       Logger.error('Failed to delete table: $e', label: 'DataStore-dropTable');
       // Convert any unexpected exceptions to DbResult
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Failed to drop table $tableName: $e',
       ));
     }
@@ -4010,7 +4028,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'Insert operation blocked: System resources are critically low.',
       ));
@@ -4034,7 +4052,7 @@ class DataStoreImpl {
         Logger.error('Table $tableName does not exist',
             label: 'DataStore.batchInsert');
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
       }
@@ -4107,7 +4125,7 @@ class DataStoreImpl {
                   .map((k) => k!)
                   .toList();
               return finish(DbResult.error(
-                type: ResultType.dbError,
+                type: ResultType.engDatabaseGeneric,
                 message:
                     'Failed to generate enough primary keys for batch insert',
                 failedKeys: returnResultDetails ? allKeys : const [],
@@ -4146,7 +4164,7 @@ class DataStoreImpl {
       // we can end early without starting a transaction.
       if (recordsToProcess.isEmpty) {
         return finish(DbResult.error(
-          type: ResultType.dbError,
+          type: ResultType.engDatabaseGeneric,
           message:
               'All ${invalidRecords.length} records failed during primary key generation.',
           // failedKeys is empty because these records never received a key.
@@ -4317,7 +4335,7 @@ class DataStoreImpl {
                           originalIndex != -1 ? originalIndex + start : 0;
                       if (returnResultDetails) {
                         batchStatuses.add(ConstraintStatus(
-                          type: ResultType.uniqueViolation,
+                          type: ResultType.bizUniqueViolation,
                           message: 'pk=$rid: [Disk Conflict] ${vio.message}',
                           tableName: tableName,
                           fields: vio.fields,
@@ -4512,7 +4530,7 @@ class DataStoreImpl {
                         }
                       } else {
                         batchStatuses.add(GeneralStatus(
-                          type: ResultType.validationFailed,
+                          type: ResultType.bizValidationFailed,
                           message: recordErrors.isNotEmpty
                               ? recordErrors.join("; ")
                               : 'Data validation failed',
@@ -4552,7 +4570,7 @@ class DataStoreImpl {
                         }
                       } else {
                         batchStatuses.add(GeneralStatus(
-                          type: ResultType.foreignKeyViolation,
+                          type: ResultType.bizForeignKeyViolation,
                           message: e.toString(),
                           index: j,
                         ));
@@ -4669,7 +4687,7 @@ class DataStoreImpl {
                       // Flush pending successful records to avoid leaving reservations behind.
                       await flushBatch();
                       return finish(DbResult.error(
-                        type: ResultType.uniqueViolation,
+                        type: ResultType.bizUniqueViolation,
                         message: e.message,
                         failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
@@ -4689,7 +4707,7 @@ class DataStoreImpl {
                     final bool hadFlushFailures = await flushBatch();
                     if (hadFlushFailures && !allowPartialErrors) {
                       return finish(DbResult.error(
-                        type: ResultType.dbError,
+                        type: ResultType.engDatabaseGeneric,
                         message: 'Error processing record: WAL append failed',
                         failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
@@ -4725,7 +4743,7 @@ class DataStoreImpl {
                 // Flush pending successful records to avoid leaving reservations behind.
                 await flushBatch();
                 return finish(DbResult.error(
-                  type: ResultType.dbError,
+                  type: ResultType.engDatabaseGeneric,
                   message: 'Error processing record: $e',
                   failedKeys: returnResultDetails ? failedKeys : const [],
                 ));
@@ -4736,7 +4754,7 @@ class DataStoreImpl {
           final bool hadFlushFailures = await flushBatch();
           if (hadFlushFailures && !allowPartialErrors) {
             return finish(DbResult.error(
-              type: ResultType.dbError,
+              type: ResultType.engDatabaseGeneric,
               message: 'Error processing record: WAL append failed',
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
@@ -4774,7 +4792,7 @@ class DataStoreImpl {
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
           return finish(DbResult.error(
-            type: ResultType.validationFailed,
+            type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
             statuses: returnResultDetails ? batchStatuses : const [],
@@ -4796,7 +4814,7 @@ class DataStoreImpl {
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
           return finish(DbResult.error(
-            type: ResultType.validationFailed,
+            type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
             statuses: returnResultDetails ? batchStatuses : const [],
@@ -4860,7 +4878,7 @@ class DataStoreImpl {
       }
 
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Batch insertion failed: $e',
         failedKeys: returnResultDetails ? failedKeys : const [],
       ));
@@ -4879,7 +4897,7 @@ class DataStoreImpl {
 
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'upsert operation blocked: System resources are critically low.',
       ));
@@ -4895,7 +4913,7 @@ class DataStoreImpl {
     final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
       ));
     }
@@ -4942,7 +4960,7 @@ class DataStoreImpl {
 
           if (!allowPartialErrors) {
             return finish(DbResult.error(
-              type: ResultType.validationFailed,
+              type: ResultType.bizValidationFailed,
               message: err,
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
@@ -4961,7 +4979,7 @@ class DataStoreImpl {
           statuses: returnResultDetails
               ? [
                   GeneralStatus(
-                      type: ResultType.validationFailed, message: message)
+                      type: ResultType.bizValidationFailed, message: message)
                 ]
               : const [],
           successKeys: const [],
@@ -5065,7 +5083,7 @@ class DataStoreImpl {
         rethrow;
       }
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Batch upsert failed: $e',
       ));
     }
@@ -5082,7 +5100,7 @@ class DataStoreImpl {
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
-        type: ResultType.resourceExhausted,
+        type: ResultType.sysResourceExhausted,
         message:
             'batch update operation blocked: System resources are critically low.',
       ));
@@ -5098,7 +5116,7 @@ class DataStoreImpl {
     final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
       ));
     }
@@ -5165,7 +5183,7 @@ class DataStoreImpl {
           failedCount++;
           if (!allowPartialErrors) {
             return finish(DbResult.error(
-              type: ResultType.validationFailed,
+              type: ResultType.bizValidationFailed,
               message: 'Validation failed for record $originalIndex: $err',
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
@@ -5199,7 +5217,7 @@ class DataStoreImpl {
           if (!allowPartialErrors) {
             final idInfo = r.keys.take(3).map((k) => '$k=${r[k]}').join(', ');
             return finish(DbResult.error(
-              type: ResultType.notFound,
+              type: ResultType.bizRecordNotFound,
               message: 'Record not found for unique identifier: {$idInfo}',
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
@@ -5219,7 +5237,7 @@ class DataStoreImpl {
         statuses: returnResultDetails
             ? [
                 GeneralStatus(
-                    type: ResultType.validationFailed,
+                    type: ResultType.bizValidationFailed,
                     message: 'No valid records found to update')
               ]
             : const [],
@@ -5287,7 +5305,7 @@ class DataStoreImpl {
             }
           }
           return finish(DbResult.error(
-            type: ResultType.notFound,
+            type: ResultType.bizRecordNotFound,
             message: 'Some records not found during batchUpdate',
             failedKeys: returnResultDetails ? failedKeys : const [],
           ));
@@ -5353,7 +5371,7 @@ class DataStoreImpl {
                 }
               } else {
                 batchStatuses.add(GeneralStatus(
-                  type: ResultType.validationFailed,
+                  type: ResultType.bizValidationFailed,
                   message: 'Data validation failed for record $pkVal',
                   index: i,
                 ));
@@ -5362,7 +5380,7 @@ class DataStoreImpl {
             failedCount++;
             if (!allowPartialErrors) {
               return finish(DbResult.error(
-                type: ResultType.validationFailed,
+                type: ResultType.bizValidationFailed,
                 message: 'Data validation failed for record $pkVal',
                 failedKeys: returnResultDetails ? failedKeys : const [],
                 statuses: returnResultDetails ? batchStatuses : const [],
@@ -5382,7 +5400,7 @@ class DataStoreImpl {
               } else {
                 for (final error in preparedRecord.fieldConstraintErrors) {
                   batchStatuses.add(GeneralStatus(
-                    type: ResultType.validationFailed,
+                    type: ResultType.bizValidationFailed,
                     message: error,
                     index: i,
                   ));
@@ -5392,7 +5410,7 @@ class DataStoreImpl {
             failedCount++;
             if (!allowPartialErrors) {
               return finish(DbResult.error(
-                type: ResultType.validationFailed,
+                type: ResultType.bizValidationFailed,
                 message: preparedRecord.fieldConstraintErrors.join("; "),
                 failedKeys: returnResultDetails ? failedKeys : const [],
                 statuses: returnResultDetails ? batchStatuses : const [],
@@ -5455,7 +5473,7 @@ class DataStoreImpl {
               final globalIndex = originalIndex != -1 ? originalIndex : 0;
               if (returnResultDetails) {
                 batchStatuses.add(ConstraintStatus(
-                  type: ResultType.uniqueViolation,
+                  type: ResultType.bizUniqueViolation,
                   message: 'Unique reservation failed for $pkVal: $e',
                   tableName: tableName,
                   index: globalIndex,
@@ -5474,7 +5492,7 @@ class DataStoreImpl {
                   } catch (_) {}
                 }
                 return finish(DbResult.error(
-                  type: ResultType.uniqueViolation,
+                  type: ResultType.bizUniqueViolation,
                   message: 'Unique reservation failed for $pkVal: $e',
                   failedKeys: returnResultDetails ? failedKeys : const [],
                   statuses: returnResultDetails ? batchStatuses : const [],
@@ -5525,7 +5543,7 @@ class DataStoreImpl {
             final globalIndex = originalIndex != -1 ? originalIndex : 0;
             if (returnResultDetails) {
               batchStatuses.add(ConstraintStatus(
-                type: ResultType.uniqueViolation,
+                type: ResultType.bizUniqueViolation,
                 message:
                     'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
                 tableName: tableName,
@@ -5558,7 +5576,7 @@ class DataStoreImpl {
                 } catch (_) {}
               }
               return finish(DbResult.error(
-                type: ResultType.uniqueViolation,
+                type: ResultType.bizUniqueViolation,
                 message:
                     'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
                 failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5596,7 +5614,7 @@ class DataStoreImpl {
                   }
                 } else {
                   batchStatuses.add(GeneralStatus(
-                    type: ResultType.foreignKeyViolation,
+                    type: ResultType.bizForeignKeyViolation,
                     message: e.toString(),
                     index: globalIndex,
                   ));
@@ -5623,7 +5641,7 @@ class DataStoreImpl {
                   } catch (_) {}
                 }
                 return finish(DbResult.error(
-                  type: ResultType.foreignKeyViolation,
+                  type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
                   failedKeys: returnResultDetails ? failedKeys : const [],
                   statuses: returnResultDetails ? batchStatuses : const [],
@@ -5733,7 +5751,7 @@ class DataStoreImpl {
         ));
       } else {
         return finish(DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.bizRecordNotFound,
           message: 'No records were updated',
           failedKeys: returnResultDetails ? failedKeys : const [],
           statuses: returnResultDetails ? batchStatuses : const [],
@@ -5745,7 +5763,7 @@ class DataStoreImpl {
         rethrow;
       }
       return finish(DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Batch update failed: $e',
         statuses: returnResultDetails ? batchStatuses : const [],
       ));
@@ -6312,17 +6330,33 @@ class DataStoreImpl {
 
     if (ttl != null && expiresAt != null) {
       return finish(DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message: 'ttl and expiresAt are mutually exclusive',
         failedKeys: [key],
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'ttl and expiresAt are mutually exclusive',
+            parameterName: 'ttl',
+            passedValue: ttl,
+          )
+        ],
       ));
     }
 
     if (ttl != null && ttl <= Duration.zero) {
       return finish(DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message: 'ttl must be greater than zero',
         failedKeys: [key],
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'ttl must be greater than zero',
+            parameterName: 'ttl',
+            passedValue: ttl,
+          )
+        ],
       ));
     }
 
@@ -6341,7 +6375,7 @@ class DataStoreImpl {
     final schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'KV table not found',
         failedKeys: [key],
       ));
@@ -6367,22 +6401,38 @@ class DataStoreImpl {
 
     if (ttl != null && expiresAt != null) {
       return finish(DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message: 'ttl and expiresAt are mutually exclusive',
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'ttl and expiresAt are mutually exclusive',
+            parameterName: 'ttl',
+            passedValue: ttl,
+          )
+        ],
       ));
     }
 
     if (ttl != null && ttl <= Duration.zero) {
       return finish(DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message: 'ttl must be greater than zero',
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'ttl must be greater than zero',
+            parameterName: 'ttl',
+            passedValue: ttl,
+          )
+        ],
       ));
     }
 
     final schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null) {
       return finish(DbResult.error(
-        type: ResultType.notFound,
+        type: ResultType.devTableNotFound,
         message: 'KV table not found',
       ));
     }
@@ -7627,8 +7677,16 @@ class DataStoreImpl {
         label: 'DataStore.deleteSpace',
       );
       return DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message: 'Cannot delete the default space',
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'Cannot delete the default space',
+            parameterName: 'spaceName',
+            passedValue: spaceName,
+          )
+        ],
       );
     }
 
@@ -7638,9 +7696,18 @@ class DataStoreImpl {
         label: 'DataStore.deleteSpace',
       );
       return DbResult.error(
-        type: ResultType.validationFailed,
+        type: ResultType.devInvalidArgumentFormat,
         message:
             'Cannot delete the currently active space. Please switch to another space before deleting.',
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message:
+                'Cannot delete the currently active space. Please switch to another space before deleting.',
+            parameterName: 'spaceName',
+            passedValue: spaceName,
+          )
+        ],
       );
     }
 
@@ -7651,7 +7718,7 @@ class DataStoreImpl {
         Logger.warn('Space $spaceName does not exist, no need to delete.',
             label: 'DataStore.deleteSpace');
         return DbResult.error(
-          type: ResultType.notFound,
+          type: ResultType.devSpaceNotFound,
           message: 'Space $spaceName does not exist',
         );
       }
@@ -7680,7 +7747,7 @@ class DataStoreImpl {
           label: 'DataStore.deleteSpace');
       // Convert any unexpected exceptions to DbResult
       return DbResult.error(
-        type: ResultType.dbError,
+        type: ResultType.engDatabaseGeneric,
         message: 'Failed to delete space $spaceName: $e',
       );
     }
@@ -7800,7 +7867,7 @@ class DataStoreImpl {
     if (createResult.hasErrors) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.dbError,
+          type: ResultType.engDatabaseGeneric,
           message:
               'Failed to create conflict temporary table for operation $opId: ${createResult.statuses.isNotEmpty ? createResult.statuses.first.message : "unknown error"}',
         ),
