@@ -12,10 +12,13 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/encoder_config.dart';
 import '../model/index_search.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute_tasks.dart';
@@ -199,7 +202,12 @@ final class IndexTreePartitionManager {
       IndexMeta meta, int partitionNo) async {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
-      throw StateError('Invalid partitionNo: $partitionNo (count=$count)');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Invalid partitionNo: $partitionNo (count=$count)',
+        ),
+      ]);
     }
     return _dataStore.pathManager
         .getIndexPartitionPathByNo(tableName, indexName, partitionNo);
@@ -278,8 +286,13 @@ final class IndexTreePartitionManager {
       }
       return leaf;
     } catch (e) {
-      throw StateError(
-          'Corrupted B+Tree leaf page: index=$tableName.$indexName ptr=$ptr path=$path err=$e');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Corrupted B+Tree leaf page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+        ),
+      ]);
     }
   }
 
@@ -349,8 +362,13 @@ final class IndexTreePartitionManager {
       }
       return page;
     } catch (e) {
-      throw StateError(
-          'Corrupted B+Tree internal page: index=$tableName.$indexName ptr=$ptr path=$path err=$e');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Corrupted B+Tree internal page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+        ),
+      ]);
     }
   }
 
@@ -617,12 +635,21 @@ final class IndexTreePartitionManager {
       try {
         final parsed = BTreePageIO.parsePageBytes(raw);
         if (parsed.type != BTreePageType.free) {
-          throw StateError(
-              'Freelist head page is not free: type=${parsed.type}');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Freelist head page is not free: type=${parsed.type}',
+            ),
+          ]);
         }
         final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
         if (fp == null) {
-          throw StateError('Failed to decode FreePage payload');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Failed to decode FreePage payload',
+            ),
+          ]);
         }
         // Cycle safety: if corrupted and points to itself, drop the freelist.
         if (fp.nextFreePageNo == head) {
@@ -1123,12 +1150,16 @@ final class IndexTreePartitionManager {
             final rightPayload = rightLeaf.encodePayload();
             if (!payloadFitsInPage(leftPayload.length) ||
                 !payloadFitsInPage(rightPayload.length)) {
-              throw StateError(
-                'Index $tableName.$indexName: page overflow after split '
-                '(single entry may exceed page capacity). '
-                'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
-                'pageSize=${meta.btreePageSize}',
-              );
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.engError,
+                  message:
+                      'Index $tableName.$indexName: page overflow after split '
+                      '(single entry may exceed page capacity). '
+                      'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
+                      'pageSize=${meta.btreePageSize}',
+                ),
+              ]);
             }
             pendingPtrs.add(ptr);
             pending.add(BTreePageEncodeItem(
@@ -1180,9 +1211,13 @@ final class IndexTreePartitionManager {
               }
             }
             if (selfFrameIndex < 0) {
-              throw StateError(
-                'Index $tableName.$indexName: internal ptr not found in descent frames',
-              );
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.engError,
+                  message:
+                      'Index $tableName.$indexName: internal ptr not found in descent frames',
+                ),
+              ]);
             }
             if (selfFrameIndex > 0) {
               frames.removeRange(selfFrameIndex, frames.length);
@@ -1204,10 +1239,14 @@ final class IndexTreePartitionManager {
             final rightPayload = rightNode.encodePayload();
             if (!payloadFitsInPage(leftPayload.length) ||
                 !payloadFitsInPage(rightPayload.length)) {
-              throw StateError(
-                'Index $tableName.$indexName: internal page overflow after split. '
-                'pageSize=${meta.btreePageSize}',
-              );
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.engError,
+                  message:
+                      'Index $tableName.$indexName: internal page overflow after split. '
+                      'pageSize=${meta.btreePageSize}',
+                ),
+              ]);
             }
             pendingPtrs.add(ptr);
             pending.add(BTreePageEncodeItem(
