@@ -32,6 +32,9 @@ import 'src/model/system_table.dart';
 import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
+import 'src/model/db_exception.dart';
+import 'src/model/result_status.dart';
+import 'src/model/result_type.dart';
 
 export 'src/Interface/status_provider.dart';
 export 'src/handler/logger.dart' show LogType;
@@ -1251,7 +1254,14 @@ class ToStore implements DataStoreInterface {
     if (SystemTable.isKnownSystemTable(tableName)) {
       final msg = 'Table $tableName is a system table and $action.';
       Logger.error(msg, label: label);
-      throw ArgumentError(msg);
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devPermissionDeniedWrite,
+          message: msg,
+          parameterName: 'tableName',
+          passedValue: tableName,
+        )
+      ]);
     }
   }
 }
