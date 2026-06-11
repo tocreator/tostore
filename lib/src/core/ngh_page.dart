@@ -1,6 +1,9 @@
 import 'dart:typed_data';
 
 import '../handler/platform_byte_data.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'btree_page.dart';
 
 // ============================================================================
@@ -266,8 +269,12 @@ final class NghPqCodePage {
   /// Set PQ code for the vector at [index] within this page.
   void setCode(int index, Uint8List code) {
     if (code.length != pqSubspaces) {
-      throw StateError(
-          'PQ code length mismatch: expected $pqSubspaces, got ${code.length}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'PQ code length mismatch: expected $pqSubspaces, got ${code.length}',
+        ),
+      ]);
     }
     final off = index * pqSubspaces;
     codes.setRange(off, off + pqSubspaces, code);
