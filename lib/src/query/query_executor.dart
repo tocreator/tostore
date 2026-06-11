@@ -79,7 +79,12 @@ class QueryExecutor {
     final schemaMgr = _dataStore.schemaManager;
     if (schemaMgr == null) {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
-      throw StateError('Schema manager not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Schema manager not initialized',
+        )
+      ]);
     }
 
     final schema = await schemaMgr.getTableSchema(tableName);
@@ -105,7 +110,12 @@ class QueryExecutor {
     final optimizer = _dataStore.getQueryOptimizer();
     if (optimizer == null) {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
-      throw StateError('Query optimizer not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Query optimizer not initialized',
+        )
+      ]);
     }
 
     Map<String, dynamic>? where = condition?.build();
@@ -2335,7 +2345,16 @@ class QueryExecutor {
                   v,
                   truncateText: truncateText,
                 );
-                if (c == null) throw StateError('Missing index field $f');
+                if (c == null) {
+                  throw DbException([
+                    InvalidArgumentStatus(
+                      type: ResultType.devIndexFieldMissing,
+                      message: 'Missing index field $f',
+                      parameterName: 'cursor',
+                      passedValue: f,
+                    )
+                  ]);
+                }
                 comps.add(c);
               }
               if (!spec.isUnique) {
@@ -2645,7 +2664,12 @@ class QueryExecutor {
       return data;
     } catch (e) {
       Logger.error('Sort failed: $e', label: "QueryExecutor-_applySort");
-      throw StateError('Error applying sort: ${e.toString()}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          message: 'Error applying sort: ${e.toString()}',
+        )
+      ]);
     }
   }
 
@@ -3447,11 +3471,23 @@ class QueryExecutor {
     // 2. Resolve Table Schema
     final schemaMgr = _dataStore.schemaManager;
     if (schemaMgr == null) {
-      throw StateError('Schema manager not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Schema manager not initialized',
+        )
+      ]);
     }
     final schema = decodeSchema ?? await schemaMgr.getTableSchema(tableName);
     if (schema == null) {
-      throw StateError('Table schema not found for $tableName');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table schema not found for $tableName',
+          parameterName: 'tableName',
+          passedValue: tableName,
+        )
+      ]);
     }
 
     final schemas = <String, TableSchema>{tableName: schema};
@@ -3462,7 +3498,12 @@ class QueryExecutor {
     // 3. Optimize query plan
     final optimizer = _dataStore.getQueryOptimizer();
     if (optimizer == null) {
-      throw StateError('Query optimizer not initialized');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devInvalidEngineState,
+          message: 'Query optimizer not initialized',
+        )
+      ]);
     }
 
     final Map<String, dynamic>? where = condition?.build();
