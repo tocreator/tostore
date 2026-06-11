@@ -1,6 +1,10 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+
 /// SHA256 standard implementation
 class SHA256 {
   // 64 constant words for the SHA-256 algorithm, taken from the standard.
@@ -198,7 +202,14 @@ class SHA256 {
   /// Convert a hexadecimal string to a Uint8List.
   static Uint8List hexToBytes(String hex) {
     if (hex.length % 2 != 0) {
-      throw ArgumentError("Hex string must have an even length");
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Hex string must have an even length',
+          parameterName: 'hex',
+          passedValue: hex,
+        )
+      ]);
     }
     final result = Uint8List(hex.length ~/ 2);
     for (int i = 0; i < hex.length; i += 2) {
