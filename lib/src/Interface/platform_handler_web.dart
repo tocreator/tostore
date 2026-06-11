@@ -6,6 +6,9 @@ import '../handler/logger.dart';
 import '../core/storage_adapter.dart';
 import '../core/lock_manager.dart';
 import '../core/shared_engine_registry.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 
 /// Web platform implementation
 class PlatformHandlerImpl implements PlatformInterface {
@@ -185,13 +188,27 @@ class PlatformHandlerImpl implements PlatformInterface {
 
       // check if ZIP file exists
       if (!await storage.existsFile(zipPath)) {
-        throw Exception('ZIP file not found: $zipPath');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoNotFound,
+            message: 'ZIP file not found: $zipPath',
+            target: zipPath,
+            operation: 'extractZip',
+          )
+        ]);
       }
 
       // read ZIP file content
       final bytes = await storage.readAsBytes(zipPath);
       if (bytes.isEmpty) {
-        throw Exception('Failed to read ZIP file');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoGeneric,
+            message: 'Failed to read ZIP file: $zipPath',
+            target: zipPath,
+            operation: 'extractZip',
+          )
+        ]);
       }
 
       // decode ZIP file
