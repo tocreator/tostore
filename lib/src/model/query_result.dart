@@ -144,7 +144,7 @@ class QueryResult<T> {
 
   /// create an error result
   factory QueryResult.error({
-    ResultType type = ResultType.engUnknown,
+    ResultType type = ResultType.engError,
     String message = '',
   }) {
     return QueryResult(
