@@ -38,10 +38,10 @@
 | 数值区间 (Code Range) | Class Code (前两位) | 语义化前缀 (Prefix) | 错误范畴 (Category)               | 异常抛出策略 (Exception Strategy)                                                                      |
 | ----------------- | ---------------- | -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------ |
 | `0`               | `00`             | `SUCCESS`      | **操作成功**                      | 不抛出异常，正常返回                                                                                       |
-| `10000 - 19999`   | `10 - 19`        | `BIZ_`         | **业务错误** (终端用户输入错误，如约束违反等)    | 不抛出异常，均通过 `DbResult` 或 `QueryResult` 正常传出                                                        |
+| `10000 - 19999`   | `10 - 19`        | `BIZ_`         | **业务错误** (终端用户输入错误，如约束违反等)    | 不抛出异常，均通过 `DbResult` 或 `QueryResult` 正常响应                                                        |
 | `20000 - 49999`   | `20 - 49`        | `DEV_`         | **开发者错误** (接口传参非法、表结构配置无效等)   | **调试环境下直接抛出** `DbException` 打断运行以警告开发者修改；**生产环境下则保持作为结果正常返回**。*(注：版本不兼容及数据迁移重大冲突为致命错误，生产下也强制抛出)* |
-| `50000 - 69999`   | `50 - 69`        | `SYS_`         | **系统错误** (磁盘空间不足、IO 异常、超时等)   | 不抛出异常，正常返回结果                                                                                     |
-| `90000 - 99999`   | `90 - 99`        | `ENG_`         | **引擎错误** (引擎逻辑出错、数据文件损坏、未知错误) | 不抛出异常，正常返回结果以方便系统监控和告警                                                                           |
+| `50000 - 79999`   | `50 - 79`        | `SYS_`         | **系统错误** (磁盘空间不足、IO 异常、锁超时等) | 影响正常运行时抛出异常；其它（如事务冲突）作为结果响应 |
+| `99000 - 99999`   | `99`             | `ENG_`         | **引擎错误** (引擎逻辑出错、数据文件损坏、未知错误) | 一般错误不抛出异常，严重时抛出异常                                                                           |
 
 
 ---
@@ -279,9 +279,11 @@
 - **大类范围**：除以上情况外，未归属于上述四个子类的所有其他状态码，均作为通用异常输出（主要为底层物理限制、系统故障、无权限访问或未知硬件错误）。
 - **专属字段定义**：
 
-  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                     |
+  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details) |
   | ------------ | --------- | ------------------------------------------------------- |
   | `primaryKey` | `String?` | **可选**。只有当异常能明确归属到某一特定的主键时才会填充，绝大多数底层系统或引擎级异常时为 `null`。 |
+  | `target`     | `String?` | **可选**。操作的物理目标标识符。例如：I/O 错误时的**物理路径**；并发锁超时时的**锁资源名**；网络请求时的 **URL**。 |
+  | `operation`  | `String?` | **可选**。具体的底层系统操作动作名称。例如：I/O 错误时的 `'readAsString'`、`'delete'`；锁超时时的 `'acquire'`。 |
 
 - **叶子状态码的具体字段填充规范对照表**：
 
@@ -291,19 +293,25 @@
   | **Code**: `21002`<br>`ResultType.devPermissionDeniedWrite` | **级别**：开发者错误<br>细粒度安全规则拦截，试图修改不具写权限的行。 | <ul><li>`primaryKey`: 试图修改的行主键（如有）</li></ul> |
   | **Code**: `22001`<br>`ResultType.devTableNotFound` | **级别**：开发者错误<br>执行 Query 或写入时，传入了尚未创建的非物理表名。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `22003`<br>`ResultType.devIndexNotFound` | **级别**：开发者错误<br>执行 ForceIndex 查询时，指定了根本没有在 Schema 中建立的索引。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在的 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | **级别**：开发者错误<br>传入了表中未定义的未知字段。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `23001`<br>`ResultType.devLargeScaleOperationBypassRequired` | **级别**：开发者错误<br>超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `24001`<br>`ResultType.devEngineIncompatible` | **级别**：**致命错误**<br>库配置或数据文件与当前引擎版本不兼容，强制拦截抛出。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `51001`<br>`ResultType.sysTimeoutLockAcquisition` | **级别**：系统错误<br>并发控制：在高负载下等待行锁或表锁，锁获取超时（默认 10s）。 | <ul><li>`primaryKey`: 等待获取锁的主键值（如有）</li></ul> |
+  | **Code**: `51001`<br>`ResultType.sysTimeoutLockAcquisition` | **级别**：系统错误<br>并发控制：在高负载下等待行锁或表锁，锁获取超时（默认 10s）。 | <ul><li>`primaryKey`: 等待获取锁的主键值（如有）</li><li>`target`: 锁定的资源名称</li><li>`operation`: `"acquire"`</li></ul> |
   | **Code**: `51002`<br>`ResultType.sysTimeout` | **级别**：系统错误<br>系统超时：整个异步运算执行时间超时未归还。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `52001`<br>`ResultType.sysResourceExhaustedMemory` | **级别**：系统错误<br>内存报警：JVM / Dart 虚拟机所分配的堆内存空间面临 OOM。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `51003`<br>`ResultType.sysCancellation` | **级别**：系统错误<br>操作取消：异步操作或计算任务被 CancellationToken 中途取消。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `52001`<br>`ResultType.sysResourceExhaustedMemory` | **级别**：系统错误<br>内存报警：JVM / Dart 虚拟机所分配的堆内存空间面临 OOM. | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `52002`<br>`ResultType.sysResourceExhausted` | **级别**：系统错误<br>磁盘空间耗尽，无法执行落盘写入。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `53001`<br>`ResultType.sysIoFileRead` | **级别**：系统错误<br>操作系统物理文件读取错误。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `53002`<br>`ResultType.sysIoFileWrite` | **级别**：系统错误<br>操作系统物理文件写入错误或物理扇区故障。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `53003`<br>`ResultType.sysIoGeneric` | **级别**：系统错误<br>物理文件系统底层遭遇其他硬件或物理 I/O 错误（如未挂载、磁盘物理损坏）。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `90001`<br>`ResultType.engDatabaseGeneric` | **级别**：引擎错误<br>存储引擎核心缺陷或运行时未知崩溃。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `90002`<br>`ResultType.engDatabaseCorruption` | **级别**：引擎错误<br>检测到数据库底层物理文件被篡改或损坏。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `99001`<br>`ResultType.engUnknown` | **级别**：引擎错误<br>未知内部错误。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `53001`<br>`ResultType.sysIoNotFound` | **级别**：系统错误<br>物理文件或目录路径不存在。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53002`<br>`ResultType.sysIoPermissionDenied` | **级别**：系统错误<br>物理文件读写权限不足/拒绝访问。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53003`<br>`ResultType.sysIoDiskFull` | **级别**：系统错误<br>磁盘空间不足或写数据超过配额限额。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53004`<br>`ResultType.sysIoFileLocked` | **级别**：系统错误<br>物理文件已被其它进程占用/共享冲突/锁定。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53005`<br>`ResultType.sysIoDeviceFault` | **级别**：系统错误<br>存储设备或介质硬件故障。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53006`<br>`ResultType.sysIoWebStorageUnavailable` | **级别**：系统错误<br>Web 端 IndexedDB 满额、被禁用或初始化失败。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53007`<br>`ResultType.sysBackupCorrupted` | **级别**：系统错误<br>备份包已损坏或缺少清单文件。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理清单文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53008`<br>`ResultType.sysIoDataCorrupted` | **级别**：系统错误<br>数据库数据文件损坏或 CRC 校验失败。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理数据文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `53099`<br>`ResultType.sysIoGeneric` | **级别**：系统错误<br>物理文件系统底层遭遇其他硬件或物理 I/O 错误。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
+  | **Code**: `99001`<br>`ResultType.engError` | **级别**：引擎错误<br>数据库底层引擎发生代码崩溃、未知内部异常或运行时逻辑缺陷。 | <ul><li>`primaryKey`: `null`</li></ul> |
 
 - **JSON 反序列化样例**（表不存在错误）：
   ```json
@@ -502,11 +510,16 @@ try {
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 系统错误 | 并发事务修改了同一实体导致版本冲突 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 系统错误 | 事务内获取排他锁超时 |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 系统错误 | 查询、写入等底层操作执行超时 |
+| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | 系统错误 | 异步操作或计算任务被 CancellationToken 中途取消 |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | 系统错误 | 物理内存耗尽，可能面临 OOM 风险 |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | 系统错误 | 磁盘空间耗尽，无法执行落盘写入 |
-| **53001** | `SYS_IO_ERROR_FILE_READ` | `ResultType.sysIoFileRead` | 系统错误 | 数据库读取物理文件异常 |
-| **53002** | `SYS_IO_ERROR_FILE_WRITE` | `ResultType.sysIoFileWrite` | 系统错误 | 数据库写入物理文件、FLUSH 操作异常 |
-| **53003** | `SYS_IO_ERROR` | `ResultType.sysIoGeneric` | 系统错误 | 底层文件系统遭遇其他硬件或物理 I/O 错误 |
-| **90001** | `ENG_DATABASE_ERROR` | `ResultType.engDatabaseGeneric` | 引擎错误 | 数据库底层引擎发生代码崩溃或内部致命逻辑缺陷 |
-| **90002** | `ENG_DATABASE_CORRUPTION` | `ResultType.engDatabaseCorruption` | 引擎错误 | 检测到数据库底层物理文件被篡改或损坏 |
-| **99001** | `ENG_UNKNOWN_ERROR` | `ResultType.engUnknown` | 引擎错误 | 未知异常（缺少诊断信息） |
+| **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | 系统错误 | 物理文件或目录路径不存在 |
+| **53002** | `SYS_IO_PERMISSION_DENIED` | `ResultType.sysIoPermissionDenied` | 系统错误 | 物理文件读写权限不足/拒绝访问 |
+| **53003** | `SYS_IO_DISK_FULL` | `ResultType.sysIoDiskFull` | 系统错误 | 磁盘空间不足或写数据超过配额限额 |
+| **53004** | `SYS_IO_FILE_LOCKED` | `ResultType.sysIoFileLocked` | 系统错误 | 物理文件已被其它进程占用/共享冲突/锁定 |
+| **53005** | `SYS_IO_DEVICE_FAULT` | `ResultType.sysIoDeviceFault` | 系统错误 | 存储设备或介质硬件故障 |
+| **53006** | `SYS_IO_WEB_STORAGE_UNAVAILABLE` | `ResultType.sysIoWebStorageUnavailable` | 系统错误 | Web 端 IndexedDB 满额、被禁用或初始化失败 |
+| **53007** | `SYS_BACKUP_CORRUPTED` | `ResultType.sysBackupCorrupted` | 系统错误 | 备份包已损坏或缺少清单文件 |
+| **53008** | `SYS_IO_DATA_CORRUPTED` | `ResultType.sysIoDataCorrupted` | 系统错误 | 数据库数据文件损坏或 CRC 校验失败 |
+| **53099** | `SYS_IO_GENERIC` | `ResultType.sysIoGeneric` | 系统错误 | 物理文件系统底层遭遇其他硬件或物理 I/O 错误 |
+| **99001** | `ENG_ERROR` | `ResultType.engError` | 引擎错误 | 数据库底层引擎发生代码崩溃、未知内部异常或运行时逻辑缺陷 |
