@@ -3,8 +3,11 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../handler/logger.dart';
 import '../Interface/storage_interface.dart';
+import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/value_ref.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
@@ -99,7 +102,14 @@ final class OverflowManager {
     OverflowBatchAllocator? allocator,
   }) async {
     if (valueBytes.isEmpty) {
-      throw ArgumentError.value(valueBytes.length, 'valueBytes', 'must be > 0');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'put large value: valueBytes must not be empty',
+          parameterName: 'valueBytes',
+          passedValue: valueBytes.length,
+        ),
+      ]);
     }
 
     final path = await _overflowPath(tableName, _defaultPartitionNo);
@@ -284,7 +294,13 @@ final class OverflowManager {
     final path = await _overflowPath(tableName, ref.overflowPartitionNo);
     // Fast path: if file missing, treat as corruption.
     if (!await _dataStore.storage.existsFile(path)) {
-      throw StateError('Overflow file missing: $path');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'get overflow: overflow file missing: $path',
+          target: path,
+        ),
+      ]);
     }
 
     final out = BytesBuilder(copy: false);
@@ -293,13 +309,23 @@ final class OverflowManager {
     int guard = 0;
     while (pageNo > 0 && remaining > 0) {
       if (guard++ > 1 << 20) {
-        throw StateError('Overflow chain too long (cycle?)');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'get overflow: overflow chain too long (cycle?)',
+          ),
+        ]);
       }
       final pageBytes = await _dataStore.storage
           .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
       final parsed = BTreePageIO.parsePageBytes(pageBytes);
       if (parsed.type != BTreePageType.overflow) {
-        throw StateError('Expected overflow page, got ${parsed.type}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Expected overflow page, got ${parsed.type}',
+          ),
+        ]);
       }
       final decodedPayload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
@@ -310,7 +336,12 @@ final class OverflowManager {
       );
       final page = OverflowPage.tryDecodePayload(decodedPayload);
       if (page == null) {
-        throw StateError('Invalid overflow payload');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Invalid overflow payload',
+          ),
+        ]);
       }
       final take = page.data.length < remaining ? page.data.length : remaining;
       if (take > 0) out.add(page.data.sublist(0, take));
@@ -320,13 +351,22 @@ final class OverflowManager {
 
     final bytes = out.toBytes();
     if (bytes.length != ref.totalLen) {
-      throw StateError(
-          'Overflow length mismatch: expected=${ref.totalLen} actual=${bytes.length}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Overflow length mismatch: expected=${ref.totalLen} actual=${bytes.length}',
+        ),
+      ]);
     }
     final crc = Crc32.of(bytes);
     if (crc != ref.crc32) {
-      throw StateError(
-          'Overflow CRC mismatch: expected=${ref.crc32} actual=$crc');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Overflow CRC mismatch: expected=${ref.crc32} actual=$crc',
+        ),
+      ]);
     }
     return bytes;
   }
@@ -348,7 +388,12 @@ final class OverflowManager {
   List<Uint8List> _splitIntoChunks(Uint8List bytes, int chunkSize) {
     if (bytes.isEmpty) return const <Uint8List>[];
     if (chunkSize <= 0) {
-      throw StateError('Invalid overflow chunkSize=$chunkSize');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Invalid overflow chunkSize=$chunkSize',
+        ),
+      ]);
     }
     final out = <Uint8List>[];
     int off = 0;
@@ -383,7 +428,12 @@ final class OverflowManager {
       }
     }
     if (lo <= 0) {
-      throw StateError('Overflow pageSize too small: pageSize=$pageSize');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Overflow pageSize too small: pageSize=$pageSize',
+        ),
+      ]);
     }
     return lo;
   }
@@ -437,7 +487,12 @@ final class OverflowManager {
         await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
     final parsed = BTreePageIO.parsePageBytes(page0);
     if (parsed.type != BTreePageType.meta) {
-      throw StateError('Overflow meta page type mismatch: ${parsed.type}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Overflow meta page type mismatch: ${parsed.type}',
+        ),
+      ]);
     }
     final decodedPayload = BTreePageCodec.decodePayload(
       parsed.encodedPayload,
@@ -448,7 +503,12 @@ final class OverflowManager {
     );
     final meta = PartitionMetaPage.tryDecodePayload(decodedPayload);
     if (meta == null) {
-      throw StateError('Overflow meta payload invalid');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Overflow meta payload invalid',
+        ),
+      ]);
     }
     return meta;
   }
@@ -574,8 +634,13 @@ class OverflowBatchAllocator {
 
   List<int> next(int count) {
     if (_consumed + count > _pages.length) {
-      throw StateError(
-          'Batch allocator exhausted: needed $count, available ${_pages.length - _consumed}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Batch allocator exhausted: needed $count, available ${_pages.length - _consumed}',
+        ),
+      ]);
     }
     final range = _pages.sublist(_consumed, _consumed + count);
     _consumed += count;
