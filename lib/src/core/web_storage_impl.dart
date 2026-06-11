@@ -1,14 +1,18 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:typed_data';
+
 import 'package:web/web.dart';
-import '../handler/logger.dart';
-import 'dart:convert';
-import '../handler/common.dart';
-import 'yield_controller.dart';
 
 import '../Interface/storage_interface.dart';
+import '../handler/common.dart';
+import '../handler/logger.dart';
+import '../model/db_exception.dart';
 import '../model/meta_info.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+import 'yield_controller.dart';
 
 /// Web platform storage adapter implementation
 class WebStorageImpl implements StorageInterface {
@@ -176,7 +180,7 @@ class WebStorageImpl implements StorageInterface {
       await _wrapRequest(store.delete(normalizedPath.toJS));
     } catch (e) {
       Logger.error('Delete file failed: $e', label: 'WebStorageImpl');
-      rethrow;
+      throw _wrapWebIoError(e, 'deleteFile', path);
     }
   }
 
@@ -223,7 +227,7 @@ class WebStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Delete directory failed: $e', label: 'WebStorageImpl');
-      rethrow;
+      throw _wrapWebIoError(e, 'deleteDirectory', path);
     }
   }
 
@@ -346,7 +350,7 @@ class WebStorageImpl implements StorageInterface {
       _instances.remove(_db!.name);
     } catch (e) {
       Logger.error('Close database failed: $e', label: 'WebStorageAdapter');
-      rethrow;
+      throw _wrapWebIoError(e, 'close', 'IndexedDB');
     }
   }
 
@@ -362,7 +366,7 @@ class WebStorageImpl implements StorageInterface {
       await _wrapDeleteRequest(request);
     } catch (e) {
       Logger.error('Delete database failed: $e', label: 'WebStorageAdapter');
-      rethrow;
+      throw _wrapWebIoError(e, 'deleteDatabase', dbName);
     }
   }
 
@@ -391,7 +395,7 @@ class WebStorageImpl implements StorageInterface {
       await _wrapRequest(store.put(fileInfo.toJson().jsify()));
     } catch (e) {
       Logger.error('Write file failed: $e');
-      rethrow;
+      throw _wrapWebIoError(e, 'storeFileInfo', fileInfo.path);
     }
   }
 
@@ -405,8 +409,13 @@ class WebStorageImpl implements StorageInterface {
     if (json == null) return null;
     final converted = _deepConvert(json);
     if (converted is! Map) {
-      throw StateError(
-          'Unexpected file info payload: ${converted.runtimeType}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Unexpected file info payload: expected Map, got ${converted.runtimeType}',
+        ),
+      ]);
     }
     return FileInfo.fromJson(converted.cast<String, dynamic>());
   }
@@ -455,7 +464,7 @@ class WebStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Write failed: $e', label: 'WebStorageImpl.writeAsString');
-      rethrow;
+      throw _wrapWebIoError(e, 'writeAsString', path);
     }
   }
 
@@ -476,7 +485,7 @@ class WebStorageImpl implements StorageInterface {
     } catch (e) {
       Logger.error('Write bytes failed: $e',
           label: 'WebStorageImpl.writeAsBytes');
-      rethrow;
+      throw _wrapWebIoError(e, 'writeAsBytes', path);
     }
   }
 
@@ -567,7 +576,7 @@ class WebStorageImpl implements StorageInterface {
     } catch (e) {
       Logger.error('Write bytes at offsets failed: $e',
           label: 'WebStorageImpl.writeManyAsBytesAt');
-      rethrow;
+      throw _wrapWebIoError(e, 'writeManyAsBytesAt', path);
     }
   }
 
@@ -579,7 +588,7 @@ class WebStorageImpl implements StorageInterface {
       await _flushPath(normalizedPath);
     } catch (e) {
       Logger.error('Flush file failed: $e', label: 'WebStorageImpl.flushFile');
-      rethrow;
+      throw _wrapWebIoError(e, 'flushFile', path);
     }
   }
 
@@ -640,24 +649,35 @@ class WebStorageImpl implements StorageInterface {
   @override
   Future<void> moveDirectory(String sourcePath, String targetPath) async {
     await _initCompleter.future;
-    final normalizedSourcePath = _normalizePath(sourcePath);
-    final normalizedTargetPath = _normalizePath(targetPath);
-    if (normalizedSourcePath == normalizedTargetPath) {
-      return;
-    }
+    try {
+      final normalizedSourcePath = _normalizePath(sourcePath);
+      final normalizedTargetPath = _normalizePath(targetPath);
+      if (normalizedSourcePath == normalizedTargetPath) {
+        return;
+      }
 
-    final sourceExists = await existsDirectory(normalizedSourcePath);
-    if (!sourceExists) {
-      return;
-    }
+      final sourceExists = await existsDirectory(normalizedSourcePath);
+      if (!sourceExists) {
+        return;
+      }
 
-    final targetExists = await existsDirectory(normalizedTargetPath);
-    if (targetExists) {
-      throw StateError('Destination directory already exists: $targetPath');
-    }
+      final targetExists = await existsDirectory(normalizedTargetPath);
+      if (targetExists) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoGeneric,
+            message: 'Destination directory already exists: $targetPath',
+            operation: 'moveDirectory',
+            target: targetPath,
+          ),
+        ]);
+      }
 
-    await copyDirectory(normalizedSourcePath, normalizedTargetPath);
-    await deleteDirectory(normalizedSourcePath);
+      await copyDirectory(normalizedSourcePath, normalizedTargetPath);
+      await deleteDirectory(normalizedSourcePath);
+    } catch (e) {
+      throw _wrapWebIoError(e, 'moveDirectory', '$sourcePath -> $targetPath');
+    }
   }
 
   /// Update getFileMeta to use FileInfo structure
@@ -721,7 +741,12 @@ class WebStorageImpl implements StorageInterface {
     } else if (data is List) {
       return Uint8List.fromList(_normalizeByteList(data));
     } else {
-      throw Exception('Unexpected data type: ${data.runtimeType}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message: 'Unexpected data type: ${data.runtimeType}',
+        ),
+      ]);
     }
   }
 
@@ -732,7 +757,12 @@ class WebStorageImpl implements StorageInterface {
     } else if (data is List) {
       return _normalizeByteList(data);
     } else {
-      throw Exception('Unexpected data type: ${data.runtimeType}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message: 'Unexpected data type: ${data.runtimeType}',
+        ),
+      ]);
     }
   }
 
@@ -740,12 +770,20 @@ class WebStorageImpl implements StorageInterface {
     return List<int>.generate(data.length, (index) {
       final value = _normalizeNumericValue(data[index]);
       if (value is! int) {
-        throw FormatException(
-            'Invalid byte value at index $index: ${data[index]}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoDataCorrupted,
+            message: 'Invalid byte value at index $index: ${data[index]}',
+          ),
+        ]);
       }
       if (value < 0 || value > 255) {
-        throw FormatException(
-            'Byte value out of range at index $index: $value');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoDataCorrupted,
+            message: 'Byte value out of range at index $index: $value',
+          ),
+        ]);
       }
       return value;
     }, growable: false);
@@ -976,6 +1014,63 @@ class WebStorageImpl implements StorageInterface {
     // After flush, release buffered memory to avoid growth; base can be reloaded lazily on next append
     _writeBuffer.remove(normalizedPath);
   }
+
+  static DbException _wrapWebIoError(Object e, String operation, String path) {
+    ResultType type = ResultType.sysIoGeneric;
+    String message = e.toString();
+
+    String? domErrorName;
+    try {
+      // Cast to JSAny to check JS interop type safely.
+      // If it is a native Dart error, the cast throws and is caught, falling back to string checks.
+      final jsObj = e as JSAny;
+      if (jsObj.isA<DOMException>()) {
+        domErrorName = (jsObj as DOMException).name;
+      }
+    } catch (_) {}
+
+    final lowerName = domErrorName?.toLowerCase() ?? '';
+    final lowerMsg = message.toLowerCase();
+
+    if (lowerName == 'quotaexceedederror' ||
+        lowerMsg.contains('quota') ||
+        lowerMsg.contains('full') ||
+        lowerMsg.contains('exceeded')) {
+      type = ResultType.sysIoDiskFull;
+    } else if (lowerName == 'securityerror' ||
+        lowerName == 'notallowederror' ||
+        lowerMsg.contains('security') ||
+        lowerMsg.contains('permission') ||
+        lowerMsg.contains('allow')) {
+      type = ResultType.sysIoPermissionDenied;
+    } else if (lowerName == 'notfounderror' ||
+        lowerMsg.contains('not found') ||
+        lowerMsg.contains('exist')) {
+      type = ResultType.sysIoNotFound;
+    } else if (lowerName == 'aborterror' ||
+        lowerName == 'transactioninactiveerror' ||
+        lowerName == 'invalidstateerror' ||
+        lowerMsg.contains('abort') ||
+        lowerMsg.contains('closed') ||
+        lowerMsg.contains('inactive') ||
+        lowerMsg.contains('not initialized')) {
+      type = ResultType.sysIoWebStorageUnavailable;
+    } else if (lowerName == 'unknownerror' ||
+        lowerMsg.contains('hardware') ||
+        lowerMsg.contains('device') ||
+        lowerMsg.contains('unknown error')) {
+      type = ResultType.sysIoDeviceFault;
+    }
+
+    final status = GeneralStatus(
+      type: type,
+      message:
+          'Web IO error during $operation on $path: $message${domErrorName != null ? ' (DOMException: $domErrorName)' : ''}',
+      target: path,
+      operation: operation,
+    );
+    return DbException([status]);
+  }
 }
 
 class _BufferedEntry {
@@ -1042,7 +1137,13 @@ class _BufferedEntry {
   void writeAt(int offset, Uint8List data) {
     if (data.isEmpty) return;
     if (offset < 0) {
-      throw ArgumentError.value(offset, 'offset', 'must be >= 0');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Offset must be >= 0, got $offset',
+          parameterName: 'offset',
+        ),
+      ]);
     }
     _ensureMaterialized();
     final buf = _materialized!;
@@ -1078,11 +1179,22 @@ class _BufferedEntry {
     for (final s in items) {
       if (s.bytes.isEmpty) continue;
       if (s.offset < 0) {
-        throw ArgumentError.value(s.offset, 'offset', 'must be >= 0');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.engError,
+            message: 'Offset must be >= 0, got ${s.offset}',
+            parameterName: 'offset',
+          ),
+        ]);
       }
       if (lastEnd >= 0 && s.offset < lastEnd) {
-        throw StateError(
-            'Overlapping write spans: offset=${s.offset} < lastEnd=$lastEnd');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Overlapping write spans: offset=${s.offset} < lastEnd=$lastEnd',
+          ),
+        ]);
       }
       lastEnd = s.offset + s.bytes.length;
     }
