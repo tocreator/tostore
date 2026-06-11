@@ -272,7 +272,8 @@ final class NghPqCodePage {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'PQ code length mismatch: expected $pqSubspaces, got ${code.length}',
+          message:
+              'PQ code length mismatch: expected $pqSubspaces, got ${code.length}',
         ),
       ]);
     }
