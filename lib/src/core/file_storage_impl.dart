@@ -956,7 +956,14 @@ class FileStorageImpl implements StorageInterface {
     try {
       final tmpFile = File(tempPath);
       if (!await tmpFile.exists()) {
-        throw FileSystemException('Temporary file does not exist', tempPath);
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoNotFound,
+            message: 'Temporary file does not exist: $tempPath',
+            target: tempPath,
+            operation: 'replaceFileAtomic',
+          )
+        ]);
       }
       await flushAll(path: finalPath, closeHandles: true);
       await flushAll(path: tempPath, closeHandles: true);
