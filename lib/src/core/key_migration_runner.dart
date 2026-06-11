@@ -3,6 +3,9 @@ import 'dart:typed_data';
 
 import '../handler/encoder.dart';
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_mode.dart';
 import '../model/background_write_type.dart';
@@ -18,8 +21,14 @@ import 'key_migration_progress.dart';
 import 'yield_controller.dart';
 
 /// Thrown when key migration is paused (e.g. close / switchSpace) for later resume.
-class KeyMigrationPausedException implements Exception {
-  const KeyMigrationPausedException();
+class KeyMigrationPausedException extends DbException {
+  KeyMigrationPausedException()
+      : super([
+          GeneralStatus(
+            type: ResultType.sysCancellation,
+            message: 'Key migration paused',
+          ),
+        ]);
 
   @override
   String toString() => 'Key migration paused';
@@ -71,7 +80,7 @@ class KeyMigrationRunner {
 
   static void _throwIfPaused() {
     if (isPauseRequested) {
-      throw const KeyMigrationPausedException();
+      throw KeyMigrationPausedException();
     }
   }
 
@@ -288,7 +297,7 @@ class KeyMigrationRunner {
 
         if (isPauseRequested) {
           await _drainBackgroundWrites(dataStore);
-          throw const KeyMigrationPausedException();
+          throw KeyMigrationPausedException();
         }
 
         await _drainBackgroundWrites(dataStore);
