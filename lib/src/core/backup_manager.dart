@@ -8,6 +8,9 @@ import 'data_store_impl.dart';
 import '../model/backup_scope.dart';
 import '../model/backup_metadata.dart';
 import '../handler/platform_handler.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 
 /// backup manager
 class BackupManager {
@@ -48,7 +51,14 @@ class BackupManager {
       // Check if directory was created successfully
       if (!await _dataStore.storage.existsDirectory(backupDir)) {
         if (!PlatformHandler.isWeb) {
-          throw StateError('Failed to create backup directory: $backupDir');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysIoGeneric,
+              message: 'Failed to create backup directory: $backupDir',
+              target: backupDir,
+              operation: 'createBackupDirectory',
+            )
+          ]);
         }
       }
 
@@ -162,12 +172,27 @@ class BackupManager {
   Future<Map<String, dynamic>> readBackupMetadata(String backupPath) async {
     final metaPath = pathJoin(backupPath, 'meta.json');
     if (!await _dataStore.storage.existsFile(metaPath)) {
-      throw StateError('Backup metadata file not found');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoNotFound,
+          message: 'Backup metadata file not found at path: $metaPath',
+          target: metaPath,
+          operation: 'readBackupMetadata',
+        )
+      ]);
     }
 
     final metaJson = await _dataStore.storage.readAsString(metaPath);
     if (metaJson == null) {
-      throw const FormatException('Failed to read backup metadata');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysBackupCorrupted,
+          message:
+              'Failed to read backup metadata: file is empty or corrupted.',
+          target: metaPath,
+          operation: 'readBackupMetadata',
+        )
+      ]);
     }
 
     return jsonDecode(metaJson) as Map<String, dynamic>;
@@ -336,14 +361,28 @@ class BackupManager {
         // Already a directory root
         normalizedRoot = originalInput;
       } else {
-        throw FormatException('Invalid backup path: $originalInput');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message:
+                'Invalid backup path: $originalInput. Path is neither a zip file nor a directory containing meta.json.',
+            parameterName: 'backupPath',
+            passedValue: originalInput,
+          )
+        ]);
       }
 
       // Ensure meta.json exists under normalizedRoot
       final metaPath = pathJoin(normalizedRoot, 'meta.json');
       if (!await _dataStore.storage.existsFile(metaPath)) {
-        throw StateError(
-            'Backup metadata file not found under: $normalizedRoot');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysBackupCorrupted,
+            message: 'Backup metadata file not found under: $normalizedRoot',
+            target: metaPath,
+            operation: 'restore',
+          )
+        ]);
       }
 
       // Read metadata to choose restore scope
