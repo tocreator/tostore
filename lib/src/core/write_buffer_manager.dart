@@ -3,6 +3,9 @@ import 'dart:collection';
 
 import '../handler/logger.dart';
 import '../model/buffer_entry.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/unique_violation.dart';
 import '../model/wal_pointer.dart';
 import 'crontab_manager.dart';
@@ -591,8 +594,19 @@ class WriteBufferManager {
     if (recordIds.isEmpty) return;
     if (recordIds.length != entries.length ||
         recordIds.length != uniqueKeysList.length) {
-      throw ArgumentError(
-          'addInsertBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}, uniqueKeysList=${uniqueKeysList.length}');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message:
+              'addInsertBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}, uniqueKeysList=${uniqueKeysList.length}',
+          parameterName: 'recordIds/entries/uniqueKeysList',
+          passedValue: {
+            'recordIdsLength': recordIds.length,
+            'entriesLength': entries.length,
+            'uniqueKeysListLength': uniqueKeysList.length,
+          },
+        )
+      ]);
     }
 
     // Update record count once (batch optimized).
@@ -1614,8 +1628,19 @@ class WriteBufferManager {
     if (recordIds.isEmpty) return;
     if (recordIds.length != entries.length ||
         recordIds.length != uniqueKeysList.length) {
-      throw ArgumentError(
-          'addUpdateBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}, uniqueKeysList=${uniqueKeysList.length}');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message:
+              'addUpdateBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}, uniqueKeysList=${uniqueKeysList.length}',
+          parameterName: 'recordIds/entries/uniqueKeysList',
+          passedValue: {
+            'recordIdsLength': recordIds.length,
+            'entriesLength': entries.length,
+            'uniqueKeysListLength': uniqueKeysList.length,
+          },
+        )
+      ]);
     }
 
     final buf = _ensureTable(tableName);
@@ -1748,8 +1773,18 @@ class WriteBufferManager {
   }) async {
     if (recordIds.isEmpty) return;
     if (recordIds.length != entries.length) {
-      throw ArgumentError(
-          'addDeleteBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message:
+              'addDeleteBatch length mismatch: recordIds=${recordIds.length}, entries=${entries.length}',
+          parameterName: 'recordIds/entries',
+          passedValue: {
+            'recordIdsLength': recordIds.length,
+            'entriesLength': entries.length,
+          },
+        )
+      ]);
     }
 
     // Update record count once (batch optimized).
