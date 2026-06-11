@@ -38,11 +38,17 @@ import 'tree_cache.dart';
 import 'weight_manager.dart';
 import 'yield_controller.dart';
 
-class IndexBuildCancelledException implements Exception {
+class IndexBuildCancelledException extends DbException {
   final String tableName;
   final String indexName;
 
-  const IndexBuildCancelledException(this.tableName, this.indexName);
+  IndexBuildCancelledException(this.tableName, this.indexName)
+      : super([
+          GeneralStatus(
+            type: ResultType.sysCancellation,
+            message: 'Index build cancelled for $tableName.$indexName',
+          ),
+        ]);
 
   @override
   String toString() => 'Index build cancelled for $tableName.$indexName';
@@ -1204,8 +1210,13 @@ class IndexManager {
           indexLockOpId,
         );
         if (!indexLocked) {
-          throw StateError(
-              'Failed to acquire lock for creating index $tableName.$indexName');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysTimeoutLockAcquisition,
+              message:
+                  'Failed to acquire lock for creating index $tableName.$indexName',
+            ),
+          ]);
         }
       }
 
@@ -1354,9 +1365,13 @@ class IndexManager {
               lockOpId,
             );
             if (!locked) {
-              throw StateError(
-                'Failed to acquire lock for resetting index $tableName.$indexName',
-              );
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.sysTimeoutLockAcquisition,
+                  message:
+                      'Failed to acquire lock for resetting index $tableName.$indexName',
+                ),
+              ]);
             }
             acquiredLocks[lockKey] = lockOpId;
           }
@@ -2398,7 +2413,15 @@ class IndexManager {
 
       // validate index fields
       if (!schema.validateIndexFields(index)) {
-        throw Exception('Index fields do not exist in table $tableName');
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexField,
+            message:
+                'Index fields do not exist in table $tableName: ${index.fields}',
+            tableName: tableName,
+            field: index.fields.join(','),
+          ),
+        ]);
       }
 
       // create index file and build index
@@ -2482,7 +2505,14 @@ class IndexManager {
   }) async {
     try {
       if (indexName == null && (fields == null || fields.isEmpty)) {
-        throw ArgumentError('index name or field list is required');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentMissing,
+            message: 'index name or field list is required for removeIndex',
+            parameterName: 'indexName/fields',
+            passedValue: 'indexName=$indexName, fields=$fields',
+          ),
+        ]);
       }
 
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -2557,9 +2587,13 @@ class IndexManager {
             indexLockOpId,
           );
           if (!indexLocked) {
-            throw StateError(
-              'Failed to acquire lock for removing index $tableName.$actualName',
-            );
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.sysTimeoutLockAcquisition,
+                message:
+                    'Failed to acquire lock for removing index $tableName.$actualName',
+              ),
+            ]);
           }
         }
 
@@ -2608,9 +2642,13 @@ class IndexManager {
           indexLockOpId,
         );
         if (!indexLocked) {
-          throw StateError(
-            'Failed to acquire lock for deleting index artifacts $tableName.$indexName',
-          );
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysTimeoutLockAcquisition,
+              message:
+                  'Failed to acquire lock for deleting index artifacts $tableName.$indexName',
+            ),
+          ]);
         }
       }
 
@@ -2692,8 +2730,13 @@ class IndexManager {
           final opId = '${indexLockOpId}_$key';
           final locked = await lockMgr.acquireExclusiveLock(key, opId);
           if (!locked) {
-            throw StateError(
-                'Failed to acquire lock for renaming index $tableName: $key');
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.sysTimeoutLockAcquisition,
+                message:
+                    'Failed to acquire lock for renaming index $tableName: $key',
+              ),
+            ]);
           }
           acquiredLocks.add(key);
         }
