@@ -173,7 +173,7 @@ class DataStoreImpl {
     if (_keyManager == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'KeyManager not initialized',
         )
       ]);
@@ -187,7 +187,7 @@ class DataStoreImpl {
     if (_pathManager == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'PathManager not initialized',
         )
       ]);
@@ -207,7 +207,7 @@ class DataStoreImpl {
       if (_isInitialized) {
         throw DbException([
           GeneralStatus(
-            type: ResultType.devInvalidEngineState,
+            type: ResultType.engError,
             message: 'TableDataManager not initialized',
           )
         ]);
@@ -287,7 +287,7 @@ class DataStoreImpl {
         errorMessage.toLowerCase().contains('access')) {
       type = ResultType.sysIoGeneric;
     } else {
-      type = ResultType.engDatabaseGeneric;
+      type = ResultType.engError;
     }
 
     return DbResult.error(
@@ -326,7 +326,7 @@ class DataStoreImpl {
     if (qe == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'QueryExecutor not initialized',
         )
       ]);
@@ -400,7 +400,7 @@ class DataStoreImpl {
     if (_config == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'DataStore not initialized',
         )
       ]);
@@ -1365,7 +1365,7 @@ class DataStoreImpl {
           ));
         }
         return finish(DbResult.error(
-          type: ResultType.engDatabaseGeneric,
+          type: ResultType.engError,
           message: 'Failed to create table ${schema.name}: $e',
         ));
       }
@@ -1373,7 +1373,7 @@ class DataStoreImpl {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       // Convert any unexpected exceptions to DbResult
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Failed to create table ${schema.name}: $e',
       ));
     }
@@ -1500,7 +1500,7 @@ class DataStoreImpl {
       );
     } else if (successKeys.isEmpty) {
       return DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Failed to create all tables',
         failedKeys: failedKeys,
         statuses: statuses,
@@ -1795,7 +1795,7 @@ class DataStoreImpl {
       }
 
       return DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Insert failed: $e',
         failedKeys: failedKeys,
       );
@@ -1988,11 +1988,13 @@ class DataStoreImpl {
       return const <BatchUpdatePreparedRecord>[];
     }
     if (records.length != existingRecords.length) {
-      throw ArgumentError(
-        '_prepareBatchUpdateRecords length mismatch: '
-        'records=${records.length}, '
-        'existingRecords=${existingRecords.length}',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              '_prepareBatchUpdateRecords length mismatch. Records length (${records.length}) does not match existing records list length (${existingRecords.length}).',
+        )
+      ]);
     }
 
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
@@ -2936,7 +2938,7 @@ class DataStoreImpl {
                 }
                 // release unique locks before returning
                 return finish(DbResult.error(
-                  type: ResultType.engDatabaseGeneric,
+                  type: ResultType.engError,
                   message: 'Lock conflict on primary key $recordKey',
                 ));
               }
@@ -3095,7 +3097,7 @@ class DataStoreImpl {
         }
       } catch (_) {}
       return DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Update failed: $e',
       );
     }
@@ -3194,7 +3196,7 @@ class DataStoreImpl {
       Logger.info('Clear table failed: $e', label: 'DataStore-clear');
       // Convert any unexpected exceptions to DbResult for graceful error handling
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Failed to clear table $tableName: $e',
       ));
     }
@@ -3584,7 +3586,7 @@ class DataStoreImpl {
         rethrow;
       }
       return DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Delete failed: $e',
       );
     }
@@ -3805,14 +3807,16 @@ class DataStoreImpl {
     if (e is DbException) {
       return e.statuses.isNotEmpty
           ? e.statuses.first.type
-          : ResultType.engDatabaseGeneric;
+          : ResultType.engError;
     }
     if (e is TimeoutException) return ResultType.sysTimeout;
     final msg = e.toString().toLowerCase();
     if (msg.contains('timeout')) return ResultType.sysTimeout;
     if (_looksLikeIoFailure(e, msg)) {
-      if (msg.contains('read')) return ResultType.sysIoFileRead;
-      if (msg.contains('write')) return ResultType.sysIoFileWrite;
+      if (msg.contains('not found') || msg.contains('no such file')) return ResultType.sysIoNotFound;
+      if (msg.contains('permission') || msg.contains('access denied')) return ResultType.sysIoPermissionDenied;
+      if (msg.contains('disk full') || msg.contains('quota')) return ResultType.sysIoDiskFull;
+      if (msg.contains('locked') || msg.contains('sharing violation')) return ResultType.sysIoFileLocked;
       return ResultType.sysIoGeneric;
     }
     if (msg.contains('unique') ||
@@ -3996,7 +4000,7 @@ class DataStoreImpl {
       Logger.error('Failed to delete table: $e', label: 'DataStore-dropTable');
       // Convert any unexpected exceptions to DbResult
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Failed to drop table $tableName: $e',
       ));
     }
@@ -4025,17 +4029,9 @@ class DataStoreImpl {
 
   /// check table exists
   Future<bool> tableExists(String tableName) async {
+    if (!_isInitialized || schemaManager == null) return false;
     try {
-      if (schemaManager == null) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.devInvalidEngineState,
-            message: 'SchemaPartitionManager not initialized',
-          )
-        ]);
-      }
-
-      final schema = await schemaManager?.getTableSchema(tableName);
+      final schema = await schemaManager!.getTableSchema(tableName);
       return schema != null;
     } catch (e) {
       Logger.error(
@@ -4048,16 +4044,8 @@ class DataStoreImpl {
 
   /// get all table names
   Future<List<String>> getTableNames() async {
+    if (!_isInitialized || schemaManager == null) return <String>[];
     try {
-      if (schemaManager == null) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.devInvalidEngineState,
-            message: 'SchemaPartitionManager not initialized',
-          )
-        ]);
-      }
-
       return await schemaManager!.listAllTables();
     } catch (e) {
       Logger.error(
@@ -4177,7 +4165,7 @@ class DataStoreImpl {
                   .map((k) => k!)
                   .toList();
               return finish(DbResult.error(
-                type: ResultType.engDatabaseGeneric,
+                type: ResultType.engError,
                 message:
                     'Failed to generate enough primary keys for batch insert',
                 failedKeys: returnResultDetails ? allKeys : const [],
@@ -4216,7 +4204,7 @@ class DataStoreImpl {
       // we can end early without starting a transaction.
       if (recordsToProcess.isEmpty) {
         return finish(DbResult.error(
-          type: ResultType.engDatabaseGeneric,
+          type: ResultType.engError,
           message:
               'All ${invalidRecords.length} records failed during primary key generation.',
           // failedKeys is empty because these records never received a key.
@@ -4759,7 +4747,7 @@ class DataStoreImpl {
                     final bool hadFlushFailures = await flushBatch();
                     if (hadFlushFailures && !allowPartialErrors) {
                       return finish(DbResult.error(
-                        type: ResultType.engDatabaseGeneric,
+                        type: ResultType.engError,
                         message: 'Error processing record: WAL append failed',
                         failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
@@ -4795,7 +4783,7 @@ class DataStoreImpl {
                 // Flush pending successful records to avoid leaving reservations behind.
                 await flushBatch();
                 return finish(DbResult.error(
-                  type: ResultType.engDatabaseGeneric,
+                  type: ResultType.engError,
                   message: 'Error processing record: $e',
                   failedKeys: returnResultDetails ? failedKeys : const [],
                 ));
@@ -4806,7 +4794,7 @@ class DataStoreImpl {
           final bool hadFlushFailures = await flushBatch();
           if (hadFlushFailures && !allowPartialErrors) {
             return finish(DbResult.error(
-              type: ResultType.engDatabaseGeneric,
+              type: ResultType.engError,
               message: 'Error processing record: WAL append failed',
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
@@ -4930,7 +4918,7 @@ class DataStoreImpl {
       }
 
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Batch insertion failed: $e',
         failedKeys: returnResultDetails ? failedKeys : const [],
       ));
@@ -5135,7 +5123,7 @@ class DataStoreImpl {
         rethrow;
       }
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Batch upsert failed: $e',
       ));
     }
@@ -5815,7 +5803,7 @@ class DataStoreImpl {
         rethrow;
       }
       return finish(DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Batch update failed: $e',
         statuses: returnResultDetails ? batchStatuses : const [],
       ));
@@ -7045,7 +7033,7 @@ class DataStoreImpl {
     if (schemaMgr == null || dirMgr == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Database managers are not initialized',
         )
       ]);
@@ -7199,7 +7187,7 @@ class DataStoreImpl {
       if (!mappingRenamed) {
         throw DbException([
           GeneralStatus(
-            type: ResultType.engDatabaseGeneric,
+            type: ResultType.engError,
             message:
                 'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
           )
@@ -7293,7 +7281,7 @@ class DataStoreImpl {
     if (schemaMgr == null || dirMgr == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Database managers are not initialized',
         )
       ]);
@@ -7338,7 +7326,7 @@ class DataStoreImpl {
       if (!restored) {
         throw DbException([
           GeneralStatus(
-            type: ResultType.engDatabaseGeneric,
+            type: ResultType.engError,
             message:
                 'Failed to restore directory mapping for table $oldTableName during rollback',
           )
@@ -7833,7 +7821,7 @@ class DataStoreImpl {
           label: 'DataStore.deleteSpace');
       // Convert any unexpected exceptions to DbResult
       return DbResult.error(
-        type: ResultType.engDatabaseGeneric,
+        type: ResultType.engError,
         message: 'Failed to delete space $spaceName: $e',
       );
     }
@@ -7953,7 +7941,7 @@ class DataStoreImpl {
     if (createResult.hasErrors) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.engDatabaseGeneric,
+          type: ResultType.engError,
           message:
               'Failed to create conflict temporary table for operation $opId: ${createResult.statuses.isNotEmpty ? createResult.statuses.first.message : "unknown error"}',
         ),
