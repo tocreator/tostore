@@ -11,9 +11,12 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/encoder_config.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/stored_value.dart';
 import '../model/table_schema.dart';
 import 'btree_page.dart';
@@ -209,10 +212,13 @@ final class TableTreePartitionManager {
     }
 
     if (merged.length != records.length) {
-      throw StateError(
-        'Encoded record count mismatch: expected=${records.length}, '
-        'actual=${merged.length}',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Encoded record count mismatch: expected=${records.length}, actual=${merged.length}',
+        ),
+      ]);
     }
     return merged;
   }
@@ -333,7 +339,12 @@ final class TableTreePartitionManager {
       String tableName, TableMeta meta, int partitionNo) async {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
-      throw StateError('Invalid partitionNo: $partitionNo (count=$count)');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Invalid partitionNo: $partitionNo (count=$count)',
+        ),
+      ]);
     }
     return _dataStore.pathManager
         .getPartitionFilePathByNo(tableName, partitionNo);
@@ -414,9 +425,13 @@ final class TableTreePartitionManager {
       }
       return leaf;
     } catch (e) {
-      // Do NOT silently treat corrupted pages as empty; that would create "missing data" illusions.
-      throw StateError(
-          'Corrupted B+Tree leaf page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Corrupted B+Tree leaf page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+        ),
+      ]);
     }
   }
 
@@ -493,8 +508,13 @@ final class TableTreePartitionManager {
       }
       return page;
     } catch (e) {
-      throw StateError(
-          'Corrupted B+Tree internal page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Corrupted B+Tree internal page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+        ),
+      ]);
     }
   }
 
@@ -612,7 +632,13 @@ final class TableTreePartitionManager {
     final schema = schemaOverride ??
         await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      throw StateError('Table schema not found: $tableName');
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.engError,
+          message: 'Table schema not found: $tableName',
+          tableName: tableName,
+        ),
+      ]);
     }
 
     // Values-only encoding structure.
@@ -755,12 +781,21 @@ final class TableTreePartitionManager {
       try {
         final parsed = BTreePageIO.parsePageBytes(raw);
         if (parsed.type != BTreePageType.free) {
-          throw StateError(
-              'Freelist head page is not free: type=${parsed.type}');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Freelist head page is not free: type=${parsed.type}',
+            ),
+          ]);
         }
         final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
         if (fp == null) {
-          throw StateError('Failed to decode FreePage payload');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Failed to decode FreePage payload',
+            ),
+          ]);
         }
         // Cycle safety: if corrupted and points to itself, drop the freelist.
         if (fp.nextFreePageNo == head) {
@@ -1393,12 +1428,13 @@ final class TableTreePartitionManager {
           final rightPayload = right.encodePayload();
           if (!payloadFitsInPage(leftPayload.length) ||
               !payloadFitsInPage(rightPayload.length)) {
-            throw StateError(
-              'Table $tableName: page overflow after split '
-              '(single entry may exceed page capacity). '
-              'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
-              'pageSize=${meta.btreePageSize}',
-            );
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message:
+                    'Table $tableName: page overflow after split (single entry may exceed page capacity). leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} pageSize=${meta.btreePageSize}',
+              ),
+            ]);
           }
           pendingPtrs.add(ptr);
           pending.add(BTreePageEncodeItem(
@@ -1445,9 +1481,13 @@ final class TableTreePartitionManager {
             }
           }
           if (selfFrameIndex < 0) {
-            throw StateError(
-              'Table $tableName: internal ptr not found in descent frames',
-            );
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message:
+                    'Table $tableName: internal ptr not found in descent frames',
+              ),
+            ]);
           }
           if (selfFrameIndex > 0) {
             frames.removeRange(selfFrameIndex, frames.length);
@@ -1469,10 +1509,13 @@ final class TableTreePartitionManager {
           final rightPayload = rightNode.encodePayload();
           if (!payloadFitsInPage(leftPayload.length) ||
               !payloadFitsInPage(rightPayload.length)) {
-            throw StateError(
-              'Table $tableName: internal page overflow after split. '
-              'pageSize=${meta.btreePageSize}',
-            );
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message:
+                    'Table $tableName: internal page overflow after split. pageSize=${meta.btreePageSize}',
+              ),
+            ]);
           }
           pendingPtrs.add(ptr);
           pending.add(BTreePageEncodeItem(
@@ -2286,8 +2329,13 @@ final class TableTreePartitionManager {
         leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
       } catch (e) {
         final offset = pageNo * pageSize;
-        throw StateError('Corrupted B+Tree page while streaming partition: '
-            'table=$tableName ptr=$ptr path=$path offset=$offset err=$e');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Corrupted B+Tree page while streaming partition: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+          ),
+        ]);
       }
 
       if (leaf.keys.isEmpty) continue;
