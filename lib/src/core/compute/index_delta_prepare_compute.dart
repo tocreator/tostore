@@ -6,6 +6,9 @@ import '../../model/data_block_entry.dart';
 import '../../model/index_entry.dart';
 import '../../model/system_table.dart';
 import '../../model/table_schema.dart';
+import '../../model/db_exception.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
 import '../yield_controller.dart';
 
 /// Operation kind for batched B+Tree index delta preparation.
@@ -113,10 +116,13 @@ Future<IndexDeltaPrepareResult> prepareIndexDeltaChunk(
 
         final oldValues = update.oldValues;
         if (oldValues == null) {
-          throw StateError(
-            'Index update requires oldValues for '
-            '${request.tableName}.${request.indexName} (pk=$pk)',
-          );
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Index update requires oldValues for '
+                  '${request.tableName}.${request.indexName} (pk=$pk)',
+            ),
+          ]);
         }
 
         final oldRecord = Map<String, dynamic>.from(update.newValues);
