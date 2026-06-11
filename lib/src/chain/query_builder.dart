@@ -436,12 +436,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         return QueryResult.error(
           type: e.statuses.isNotEmpty
               ? e.statuses.first.type
-              : ResultType.engUnknown,
+              : ResultType.engError,
           message: e.message,
         );
       }
       return QueryResult.error(
-        type: ResultType.engUnknown,
+        type: ResultType.engError,
         message: e.toString(),
       );
     }
