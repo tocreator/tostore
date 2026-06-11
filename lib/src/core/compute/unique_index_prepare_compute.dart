@@ -1,6 +1,9 @@
 import 'dart:typed_data';
 
 import '../../handler/memcomparable.dart';
+import '../../model/db_exception.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
 import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 
@@ -43,11 +46,13 @@ Future<UniqueIndexPrepareResult> prepareUniqueIndexChunk(
 ) async {
   if (request.changedFieldsByRecord != null &&
       request.changedFieldsByRecord!.length != request.records.length) {
-    throw ArgumentError(
-      'prepareUniqueIndexChunk length mismatch: '
-      'records=${request.records.length}, '
-      'changedFieldsByRecord=${request.changedFieldsByRecord!.length}',
-    );
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'prepareUniqueIndexChunk length mismatch. Records length (${request.records.length}) does not match changed fields list length (${request.changedFieldsByRecord!.length}).',
+      )
+    ]);
   }
 
   final entries = <PreparedUniqueIndexEntry>[];
