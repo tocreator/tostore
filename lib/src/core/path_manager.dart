@@ -2,6 +2,9 @@ import '../model/data_store_config.dart';
 import '../handler/common.dart';
 import 'data_store_impl.dart';
 import '../model/meta_info.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 
 /// path manager
 /// responsible for all file path related operations, including table paths, index paths, data paths, etc.
@@ -144,8 +147,13 @@ class PathManager {
       createIfMappingMissing: createIfMissing,
     );
     if (tablePath == null) {
-      throw StateError(
-          'Table $tableName does not exist or path cannot be determined');
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist or path cannot be determined',
+          tableName: tableName,
+        ),
+      ]);
     }
 
     // update cache
@@ -161,7 +169,12 @@ class PathManager {
         ?.createTablePathIfNotExists(tableName, isGlobal);
 
     if (tablePath == null) {
-      throw StateError('Failed to create path for table $tableName');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Failed to create path for table $tableName',
+        ),
+      ]);
     }
 
     // update cache
