@@ -1714,7 +1714,8 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
+          message:
+              'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
               '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
               'plainPayload=${plainPayload.length}, typeIndex=${p.typeIndex}, '
               'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
