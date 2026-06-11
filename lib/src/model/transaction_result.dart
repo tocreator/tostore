@@ -78,9 +78,7 @@ class TransactionResult {
     } else if (type == ResultType.sysTimeout ||
         type == ResultType.sysTimeoutLockAcquisition) {
       errType = TransactionErrorType.timeout;
-    } else if (type == ResultType.sysIoGeneric ||
-        type == ResultType.sysIoFileRead ||
-        type == ResultType.sysIoFileWrite) {
+    } else if (type.code >= 53000 && type.code < 54000) {
       errType = TransactionErrorType.io;
     } else if (type == ResultType.sysTransactionConflict) {
       errType = TransactionErrorType.conflict;
