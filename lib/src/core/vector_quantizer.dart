@@ -1,6 +1,10 @@
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+
 // ============================================================================
 // Product Quantization (PQ) for NGH Vector Index
 //
@@ -86,11 +90,25 @@ class VectorQuantizer {
     int iterations = 10, // Reduced from 20
   }) async {
     if (samples.isEmpty) {
-      throw ArgumentError('Training requires at least one sample vector');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Training requires at least one sample vector',
+          parameterName: 'samples',
+          passedValue: 0,
+        )
+      ]);
     }
     if (dimensions % subspaces != 0) {
-      throw ArgumentError(
-          'Dimensions ($dimensions) must be divisible by subspaces ($subspaces)');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message:
+              'Dimensions ($dimensions) must be divisible by subspaces ($subspaces)',
+          parameterName: 'subspaces',
+          passedValue: subspaces,
+        )
+      ]);
     }
     final subDim = dimensions ~/ subspaces;
     final k = min(numCentroids, samples.length);
