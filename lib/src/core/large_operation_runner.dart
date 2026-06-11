@@ -6,7 +6,7 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
-import '../model/background_write_mode.dart';
+import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
@@ -301,7 +301,7 @@ class LargeOperationRunner {
                 tableName: tableName,
                 primaryKey: pkValueStr,
                 type: BackgroundWriteType.largeDelete,
-                mode: BackgroundWriteMode.tableAndIndex,
+                mode: MigrationWriteMode.tableAndIndex,
                 entry: entry,
                 // Assign nextCursor to currentCursor to forward checkpoint correctly
                 currentCursor: nextCursor,
@@ -762,7 +762,7 @@ class LargeOperationRunner {
                 tableName: tableName,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
-                mode: BackgroundWriteMode.tableAndIndex,
+                mode: MigrationWriteMode.tableAndIndex,
                 entry: entry,
                 currentCursor: nextCursor,
                 nextCursor: nextCursor,
@@ -784,7 +784,7 @@ class LargeOperationRunner {
                 tableName: tableName,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
-                mode: BackgroundWriteMode.tableAndIndex,
+                mode: MigrationWriteMode.tableAndIndex,
                 entry: entry,
                 currentCursor: nextCursor,
                 nextCursor: nextCursor,
@@ -812,7 +812,7 @@ class LargeOperationRunner {
                 tableName: tableName,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
-                mode: BackgroundWriteMode.tableAndIndex,
+                mode: MigrationWriteMode.tableAndIndex,
                 entry: entry,
                 currentCursor: nextCursor,
                 nextCursor: nextCursor,
