@@ -144,7 +144,7 @@ enum ResultType {
   devInvalidSchemaIndexField(30018, 'DEV_INVALID_SCHEMA_INDEX_FIELD',
       'Index references non-existent field'),
 
-  // "SYS_" - System Error (50-69)
+  // "SYS_" - System Error (50-79)
   sysTransactionAborted(
       50001, 'SYS_TRANSACTION_ABORTED', 'Transaction aborted'),
   sysTransactionConflict(
@@ -152,19 +152,30 @@ enum ResultType {
   sysTimeoutLockAcquisition(
       51001, 'SYS_TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
   sysTimeout(51002, 'SYS_TIMEOUT', 'Operation timeout'),
+  sysCancellation(51003, 'SYS_CANCELLATION', 'Operation was cancelled'),
   sysResourceExhaustedMemory(
       52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted'),
   sysResourceExhausted(
       52002, 'SYS_RESOURCE_EXHAUSTED', 'System resources exhausted'),
-  sysIoFileRead(53001, 'SYS_IO_ERROR_FILE_READ', 'File read error'),
-  sysIoFileWrite(53002, 'SYS_IO_ERROR_FILE_WRITE', 'File write error'),
-  sysIoGeneric(53003, 'SYS_IO_ERROR', 'System IO error'),
+  sysIoNotFound(53001, 'SYS_IO_NOT_FOUND', 'Physical file or path does not exist'),
+  sysIoPermissionDenied(
+      53002, 'SYS_IO_PERMISSION_DENIED', 'Permission denied for file access'),
+  sysIoDiskFull(
+      53003, 'SYS_IO_DISK_FULL', 'Disk full or storage quota exceeded'),
+  sysIoFileLocked(53004, 'SYS_IO_FILE_LOCKED',
+      'File is locked or in use by another process'),
+  sysIoDeviceFault(
+      53005, 'SYS_IO_DEVICE_FAULT', 'Storage device or media fault'),
+  sysIoWebStorageUnavailable(53006, 'SYS_IO_WEB_STORAGE_UNAVAILABLE',
+      'Web IndexedDB or storage is unavailable'),
+  sysBackupCorrupted(53007, 'SYS_BACKUP_CORRUPTED',
+      'Backup package is corrupted or missing metadata'),
+  sysIoDataCorrupted(53008, 'SYS_IO_DATA_CORRUPTED',
+      'Database data file is corrupted or checksum failed'),
+  sysIoGeneric(53099, 'SYS_IO_GENERIC', 'Generic system IO error'),
 
-  // "ENG_" - Engine Error (90-99)
-  engDatabaseCorruption(
-      90002, 'ENG_DATABASE_CORRUPTION', 'Database corruption'),
-  engDatabaseGeneric(90001, 'ENG_DATABASE_ERROR', 'Database error'),
-  engUnknown(99001, 'ENG_UNKNOWN_ERROR', 'Unknown error');
+  // "ENG_" - Engine Error (99)
+  engError(99001, 'ENG_ERROR', 'Engine error');
 
   /// Status code value
   final int code;
@@ -185,7 +196,7 @@ enum ResultType {
         return val;
       }
     }
-    return ResultType.engUnknown;
+    return ResultType.engError;
   }
 
   /// Get the corresponding enum from the code key
@@ -195,7 +206,7 @@ enum ResultType {
         return val;
       }
     }
-    return ResultType.engUnknown;
+    return ResultType.engError;
   }
 
   /// Determine if it is a constraint error
@@ -208,11 +219,11 @@ enum ResultType {
   /// Whether the error belongs to Developer Error (20-49)
   bool get isDeveloperError => code >= 20000 && code < 50000;
 
-  /// Whether the error belongs to System Error (50-69)
-  bool get isSystemError => code >= 50000 && code < 70000;
+  /// Whether the error belongs to System Error (50-79)
+  bool get isSystemError => code >= 50000 && code < 80000;
 
-  /// Whether the error belongs to Engine Error (90-99)
-  bool get isEngineError => code >= 90000 && code < 100000;
+  /// Whether the error belongs to Engine Error (99)
+  bool get isEngineError => code >= 99000 && code < 100000;
 
   /// Whether the error is a fatal error that must throw exception in any environment
   bool get isFatalError =>
