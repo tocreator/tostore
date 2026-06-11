@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_schema.dart' show VectorData;
 import 'platform_byte_data.dart';
 
@@ -246,15 +249,25 @@ class BinarySchemaCodec {
       case 0xC9: // ext32
         return _readExt(r, r.u32be());
       default:
-        throw FormatException(
-            'Unsupported MessagePack type: 0x${byte.toRadixString(16)}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary schema codec: Unsupported MessagePack type: 0x${byte.toRadixString(16)}',
+          )
+        ]);
     }
   }
 
   static String _readString(_Reader r, int len) {
     if (len > maxStringLength) {
-      throw FormatException(
-          'String length $len exceeds maximum $maxStringLength');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: String length $len exceeds maximum limit of $maxStringLength.',
+        )
+      ]);
     }
     final bytes = r.bytes(len);
     return utf8.decode(bytes, allowMalformed: true);
@@ -262,8 +275,13 @@ class BinarySchemaCodec {
 
   static Uint8List _readBinary(_Reader r, int len) {
     if (len > maxBinaryLength) {
-      throw FormatException(
-          'Binary length $len exceeds maximum $maxBinaryLength');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Binary length $len exceeds maximum limit of $maxBinaryLength.',
+        )
+      ]);
     }
     return r.bytes(len);
   }
@@ -271,7 +289,13 @@ class BinarySchemaCodec {
   static List<dynamic> _readArray32(_Reader r) {
     final count = r.u32be();
     if (count > maxArraySize) {
-      throw FormatException('Array size $count exceeds maximum $maxArraySize');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Array size $count exceeds maximum limit of $maxArraySize.',
+        )
+      ]);
     }
     final out = <dynamic>[];
     out.length = count;
@@ -284,13 +308,25 @@ class BinarySchemaCodec {
   static Map<String, dynamic> _readMap32(_Reader r) {
     final count = r.u32be();
     if (count > maxArraySize) {
-      throw FormatException('Map size $count exceeds maximum $maxArraySize');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Map size $count exceeds maximum limit of $maxArraySize.',
+        )
+      ]);
     }
     final out = <String, dynamic>{};
     for (int i = 0; i < count; i++) {
       final k = _readValue(r);
       if (k is! String) {
-        throw FormatException('Map key must be string, got ${k.runtimeType}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary schema codec: Map key must be string, got: ${k.runtimeType}.',
+          )
+        ]);
       }
       out[k] = _readValue(r);
     }
@@ -398,33 +434,73 @@ final class _Reader {
   _Reader(this.b);
 
   int u8() {
-    if (off + 1 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 1 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     return b[off++];
   }
 
   int u16be() {
-    if (off + 2 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 2 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final v = ByteData.sublistView(b, off, off + 2).getUint16(0, Endian.big);
     off += 2;
     return v;
   }
 
   int u32be() {
-    if (off + 4 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 4 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final v = ByteData.sublistView(b, off, off + 4).getUint32(0, Endian.big);
     off += 4;
     return v;
   }
 
   int i32be() {
-    if (off + 4 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 4 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final v = ByteData.sublistView(b, off, off + 4).getInt32(0, Endian.big);
     off += 4;
     return v;
   }
 
   int i64be() {
-    if (off + 8 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 8 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final v = PlatformByteData.getInt64(
         ByteData.sublistView(b, off, off + 8), 0, Endian.big);
     off += 8;
@@ -432,7 +508,15 @@ final class _Reader {
   }
 
   double f64be() {
-    if (off + 8 > b.length) throw RangeError('Read beyond buffer');
+    if (off + 8 > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final v = ByteData.sublistView(b, off, off + 8).getFloat64(0, Endian.big);
     off += 8;
     return v;
@@ -440,7 +524,15 @@ final class _Reader {
 
   Uint8List bytes(int len) {
     if (len <= 0) return Uint8List(0);
-    if (off + len > b.length) throw RangeError('Read beyond buffer');
+    if (off + len > b.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+        )
+      ]);
+    }
     final out = b.sublist(off, off + len);
     off += len;
     return out;
