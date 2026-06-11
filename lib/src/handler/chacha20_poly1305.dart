@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'sha256.dart';
 
 /// Optimized Manual ChaCha20-Poly1305 Implementation
@@ -59,7 +62,16 @@ class ChaCha20Poly1305 {
     Uint8List? aad,
   }) {
     key ??= defaultKey;
-    if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
+    if (key.length != 32) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Key must be 32 bytes',
+          parameterName: 'key',
+          passedValue: key.length.toString(),
+        )
+      ]);
+    }
     aad ??= Uint8List(0);
 
     final input = plaintext;
@@ -109,9 +121,25 @@ class ChaCha20Poly1305 {
     Uint8List? aad,
   }) {
     key ??= defaultKey;
-    if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
+    if (key.length != 32) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Key must be 32 bytes',
+          parameterName: 'key',
+          passedValue: key.length.toString(),
+        )
+      ]);
+    }
     if (encryptedData.length < 12 + 16) {
-      throw ArgumentError('Invalid input length');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Invalid input length',
+          parameterName: 'encryptedData',
+          passedValue: encryptedData.length.toString(),
+        )
+      ]);
     }
     aad ??= Uint8List(0);
 
@@ -129,7 +157,12 @@ class ChaCha20Poly1305 {
     // 2. Verify MAC
     final computedTag = _poly1305Mac(ciphertext, aad, polyKey);
     if (!_constantTimeEqual(tag, computedTag)) {
-      throw ArgumentError('Authentication failed');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Authentication failed',
+        )
+      ]);
     }
 
     // 3. Decrypt
