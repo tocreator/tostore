@@ -1,6 +1,9 @@
 import 'dart:typed_data';
 
 import 'value_ref.dart';
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 /// Canonical on-disk value encoding stored in B+Tree leaf `values[]`.
 ///
@@ -39,20 +42,40 @@ final class StoredValue {
         return out;
       case tagOverflowRef:
         final r = ref;
-        if (r == null) throw StateError('Missing overflow ref');
+        if (r == null) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Missing overflow ref: StoredValue tag is tagOverflowRef ($tagOverflowRef), but the ValueRef reference is null.',
+            )
+          ]);
+        }
         final rb = r.encode();
         final out = Uint8List(1 + rb.length);
         out[0] = tagOverflowRef;
         out.setRange(1, out.length, rb);
         return out;
       default:
-        throw StateError('Unknown StoredValue tag=$tag');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Unknown StoredValue tag: Received tag = $tag. Valid tags are tagInline ($tagInline) and tagOverflowRef ($tagOverflowRef).',
+          )
+        ]);
     }
   }
 
   static StoredValue decode(Uint8List bytes) {
     if (bytes.isEmpty) {
-      throw StateError('Empty StoredValue');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Empty StoredValue: Attempted to decode StoredValue from an empty Uint8List (bytes.length = 0).',
+        )
+      ]);
     }
     final tag = bytes[0];
     switch (tag) {
@@ -63,11 +86,23 @@ final class StoredValue {
         final rb = bytes.length <= 1 ? Uint8List(0) : bytes.sublist(1);
         final r = ValueRef.tryDecode(rb);
         if (r == null) {
-          throw StateError('Invalid overflow ref');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Invalid overflow ref: Failed to decode ValueRef from bytes (length = ${rb.length}).',
+            )
+          ]);
         }
         return StoredValue.overflow(r);
       default:
-        throw StateError('Unknown StoredValue tag=$tag');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Unknown StoredValue tag: Received tag = $tag. Valid tags are tagInline ($tagInline) and tagOverflowRef ($tagOverflowRef).',
+          )
+        ]);
     }
   }
 }
