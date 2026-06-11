@@ -5,6 +5,9 @@ import '../handler/encoder.dart';
 import '../handler/platform_byte_data.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 
 // ============================================================================
 // B+Tree Page Types and Constants
@@ -196,13 +199,16 @@ final class BTreePageIO {
     final headerBytes = hdr.encode();
     final total = BTreePageHeader.size + encodedPayload.length;
     if (total > pageSize) {
-      throw StateError(
-        'Page overflow ($type): total=$total > pageSize=$pageSize '
-        '(header=${BTreePageHeader.size}, payload=${encodedPayload.length}, '
-        'overflow=${total - pageSize} bytes). '
-        'This indicates the page size estimation was inaccurate. '
-        'Consider checking BTreePageSizer.fitsInPage before encoding.',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Page overflow ($type): total=$total > pageSize=$pageSize '
+              '(header=${BTreePageHeader.size}, payload=${encodedPayload.length}, '
+              'overflow=${total - pageSize} bytes). '
+              'This indicates the page size estimation was inaccurate. '
+              'Consider checking BTreePageSizer.fitsInPage before encoding.',
+        )
+      ]);
     }
     final out = Uint8List(pageSize);
     out.setRange(0, BTreePageHeader.size, headerBytes);
@@ -216,18 +222,37 @@ final class BTreePageIO {
       Uint8List pageBytes) {
     final hdr = BTreePageHeader.tryDecode(pageBytes);
     if (hdr == null) {
-      throw StateError('Invalid page header/magic');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message: 'Invalid page header/magic, data file block is corrupted.',
+          operation: 'parsePageBytes',
+        )
+      ]);
     }
     final int off = BTreePageHeader.size;
     final int end = off + hdr.payloadLen;
     if (hdr.payloadLen < 0 || end > pageBytes.length) {
-      throw StateError('Invalid payload length: ${hdr.payloadLen}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Invalid payload length: ${hdr.payloadLen}. Page data is corrupted.',
+          operation: 'parsePageBytes',
+        )
+      ]);
     }
     final payload = pageBytes.sublist(off, end);
     final crc = Crc32.of(payload);
     if (crc != hdr.payloadCrc32) {
-      throw StateError(
-          'Page CRC mismatch: expected=${hdr.payloadCrc32} actual=$crc');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Page CRC mismatch: expected=${hdr.payloadCrc32} actual=$crc. Torn write or storage fault detected.',
+          operation: 'parsePageBytes',
+        )
+      ]);
     }
     return (type: hdr.pageType, encodedPayload: payload);
   }
