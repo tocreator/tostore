@@ -3,6 +3,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'aes_gcm.dart';
 import 'chacha20_poly1305.dart';
 import 'sha256.dart';
@@ -39,20 +42,40 @@ class ToCrypto {
   static Uint8List _normalizeKey(Object key) {
     if (key is String) {
       if (key.isEmpty) {
-        throw ArgumentError('ToCrypto: key must not be empty');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.engError,
+            message: 'ToCrypto: key must not be empty',
+            parameterName: 'key',
+            passedValue: '',
+          )
+        ]);
       }
       final keyBytes = Uint8List.fromList(utf8.encode(key));
       return keyBytes.length == 32 ? keyBytes : SHA256.hash(keyBytes);
     }
     if (key is Uint8List) {
       if (key.isEmpty) {
-        throw ArgumentError('ToCrypto: key must not be empty');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.engError,
+            message: 'ToCrypto: key must not be empty',
+            parameterName: 'key',
+            passedValue: 0,
+          )
+        ]);
       }
       return key.length == 32 ? key : SHA256.hash(key);
     }
-    throw ArgumentError(
-      'ToCrypto: key must be String or Uint8List, got ${key.runtimeType}',
-    );
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.engError,
+        message:
+            'ToCrypto: key must be String or Uint8List, got ${key.runtimeType}',
+        parameterName: 'key',
+        passedValue: key.runtimeType.toString(),
+      )
+    ]);
   }
 
   static Uint8List _aadOrEmpty(Uint8List? aad) => aad ?? Uint8List(0);
@@ -84,20 +107,33 @@ class ToCrypto {
   /// [cipherBase64] Base64 string returned by [encode].
   /// [key] Secret key; must match the key used at encode.
   /// [aad] Must match encode if AAD was used at encode.
-  /// Throws [ArgumentError] if key is wrong or data is corrupted.
   static String decode(
     String cipherBase64, {
     required Object key,
     Uint8List? aad,
   }) {
     if (cipherBase64.isEmpty) {
-      throw ArgumentError('ToCrypto: cipherBase64 must not be empty');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: cipherBase64 must not be empty',
+          parameterName: 'cipherBase64',
+          passedValue: '',
+        )
+      ]);
     }
     List<int> decoded;
     try {
       decoded = base64Decode(cipherBase64);
     } catch (e) {
-      throw ArgumentError('ToCrypto: invalid base64: $e');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: invalid base64: $e',
+          parameterName: 'cipherBase64',
+          passedValue: cipherBase64,
+        )
+      ]);
     }
     final raw = Uint8List.fromList(decoded);
     final plain = _decodeBytes(raw, key: key, aad: aad);
@@ -122,13 +158,27 @@ class ToCrypto {
     Uint8List? aad,
   }) {
     if (cipherBase64.isEmpty) {
-      throw ArgumentError('ToCrypto: cipherBase64 must not be empty');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: cipherBase64 must not be empty',
+          parameterName: 'cipherBase64',
+          passedValue: '',
+        )
+      ]);
     }
     List<int> decoded;
     try {
       decoded = base64Decode(cipherBase64);
     } catch (e) {
-      throw ArgumentError('ToCrypto: invalid base64: $e');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: invalid base64: $e',
+          parameterName: 'cipherBase64',
+          passedValue: cipherBase64,
+        )
+      ]);
     }
     final raw = Uint8List.fromList(decoded);
     return _decodeBytes(raw, key: key, aad: aad);
@@ -205,20 +255,33 @@ class ToCrypto {
     Uint8List? aad,
   }) {
     if (cipherBytes.length < _minCipherLen) {
-      throw ArgumentError(
-        'ToCrypto: cipher too short (expected header + nonce + tag)',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: cipher too short (expected header + nonce + tag)',
+          parameterName: 'cipherBytes',
+          passedValue: cipherBytes.length,
+        )
+      ]);
     }
     if (cipherBytes[0] != _magic[0] ||
         cipherBytes[1] != _magic[1] ||
         cipherBytes[2] != _magic[2]) {
-      throw ArgumentError('ToCrypto: invalid cipher (bad magic)');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: invalid cipher (bad magic)',
+        )
+      ]);
     }
     final version = cipherBytes[3];
     if (version != _formatVersion) {
-      throw ArgumentError(
-        'ToCrypto: unsupported format version $version',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'ToCrypto: unsupported format version $version',
+        )
+      ]);
     }
     final typeByte = cipherBytes[4];
     // Copy payload so buffer offset is 0; AES/ChaCha20 require 4-byte-aligned views internally.
@@ -243,13 +306,19 @@ class ToCrypto {
             aad: aadBytes,
           );
         default:
-          throw ArgumentError(
-            'ToCrypto: unknown type byte $typeByte',
-          );
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'ToCrypto: unknown type byte $typeByte',
+            )
+          ]);
       }
     } catch (e) {
-      throw ArgumentError(
-        'ToCrypto: decryption failed (wrong key, wrong AAD, or corrupted data): $e',
+      throw DbException.wrap(
+        e,
+        fallbackType: ResultType.engError,
+        fallbackMessage:
+            'ToCrypto: decryption failed (wrong key, wrong AAD, or corrupted data)',
       );
     }
   }
