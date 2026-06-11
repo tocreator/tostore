@@ -1,5 +1,7 @@
-import '../../model/table_schema.dart';
 import '../../model/db_exception.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
+import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
 import 'unique_ref_compute.dart';
@@ -52,11 +54,13 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
   BatchInsertPrepareRequest request,
 ) async {
   if (request.records.length != request.skipPrimaryKeyFormatChecks.length) {
-    throw ArgumentError(
-      'prepareBatchInsertChunk length mismatch: '
-      'records=${request.records.length}, '
-      'skipPrimaryKeyFormatChecks=${request.skipPrimaryKeyFormatChecks.length}',
-    );
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'prepareBatchInsertChunk length mismatch. Records length (${request.records.length}) does not match check list length (${request.skipPrimaryKeyFormatChecks.length}).',
+      )
+    ]);
   }
 
   final fieldMap = {
