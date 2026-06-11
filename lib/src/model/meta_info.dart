@@ -1,4 +1,7 @@
 import '../handler/common.dart';
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 // ============================================================================
 // B+Tree Paged Storage Metadata
@@ -79,7 +82,13 @@ class FileInfo {
 
   factory FileInfo.fromJson(Map<String, dynamic> json) {
     if (json['path'] == null || json['meta'] == null) {
-      throw ArgumentError('Missing required fields for FileInfo');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Missing required fields for FileInfo. Details: path is ${json['path'] == null ? 'NULL' : 'present'}, meta is ${json['meta'] == null ? 'NULL' : 'present'}. ',
+        )
+      ]);
     }
     return FileInfo(
       path: json['path'] as String,
@@ -140,7 +149,17 @@ class FileMeta {
         json['name'] == null ||
         json['fileSizeInBytes'] == null ||
         json['timestamps'] == null) {
-      throw ArgumentError('Missing required fields for FileMeta');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Missing required fields for FileMeta. Missing fields: ${[
+            if (json['type'] == null) 'type',
+            if (json['name'] == null) 'name',
+            if (json['fileSizeInBytes'] == null) 'fileSizeInBytes',
+            if (json['timestamps'] == null) 'timestamps'
+          ].join(', ')}.',
+        )
+      ]);
     }
     return FileMeta(
       version: resolveVersionValue(
@@ -309,7 +328,25 @@ class TableMeta {
         json['btreeFirstLeaf'] == null ||
         json['btreeLastLeaf'] == null ||
         json['btreeHeight'] == null) {
-      throw ArgumentError('Missing required fields for TableMeta (v2+)');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Missing required fields for TableMeta (v2+). Missing fields: ${[
+            if (json['name'] == null) 'name',
+            if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
+            if (json['totalRecords'] == null) 'totalRecords',
+            if (json['timestamps'] == null) 'timestamps',
+            if (json['btreePageSize'] == null) 'btreePageSize',
+            if (json['btreeNextPageNo'] == null) 'btreeNextPageNo',
+            if (json['btreePartitionCount'] == null) 'btreePartitionCount',
+            if (json['btreeRoot'] == null) 'btreeRoot',
+            if (json['btreeFirstLeaf'] == null) 'btreeFirstLeaf',
+            if (json['btreeLastLeaf'] == null) 'btreeLastLeaf',
+            if (json['btreeHeight'] == null) 'btreeHeight'
+          ].join(', ')}.',
+        )
+      ]);
     }
 
     return TableMeta(
@@ -384,13 +421,31 @@ class Timestamps {
 
   factory Timestamps.fromJson(Map<String, dynamic> json) {
     if (json['created'] == null || json['modified'] == null) {
-      throw ArgumentError('Missing required fields for Timestamps');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Missing required fields for Timestamps. Details: created is ${json['created'] == null ? 'NULL' : 'present'}, modified is ${json['modified'] == null ? 'NULL' : 'present'}.',
+        )
+      ]);
     }
     return Timestamps(
       created: DateTime.tryParse(json['created'] as String) ??
-          (throw ArgumentError('Invalid created timestamp')),
+          (throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Invalid created timestamp: Cannot parse value of type ${json['created'].runtimeType} into DateTime.',
+            )
+          ])),
       modified: DateTime.tryParse(json['modified'] as String) ??
-          (throw ArgumentError('Invalid modified timestamp')),
+          (throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Invalid modified timestamp: Cannot parse value of type ${json['modified'].runtimeType} into DateTime.',
+            )
+          ])),
     );
   }
 
@@ -1012,7 +1067,26 @@ class IndexMeta {
         json['btreeFirstLeaf'] == null ||
         json['btreeLastLeaf'] == null ||
         json['btreeHeight'] == null) {
-      throw ArgumentError('Missing required fields for IndexMeta (v2+)');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Missing required fields for IndexMeta (v2+). Missing fields: ${[
+            if (json['name'] == null) 'name',
+            if (json['tableName'] == null) 'tableName',
+            if (json['fields'] == null) 'fields',
+            if (json['isUnique'] == null) 'isUnique',
+            if (json['timestamps'] == null) 'timestamps',
+            if (json['btreePageSize'] == null) 'btreePageSize',
+            if (json['btreeNextPageNo'] == null) 'btreeNextPageNo',
+            if (json['btreePartitionCount'] == null) 'btreePartitionCount',
+            if (json['btreeRoot'] == null) 'btreeRoot',
+            if (json['btreeFirstLeaf'] == null) 'btreeFirstLeaf',
+            if (json['btreeLastLeaf'] == null) 'btreeLastLeaf',
+            if (json['btreeHeight'] == null) 'btreeHeight'
+          ].join(', ')}.',
+        )
+      ]);
     }
 
     return IndexMeta(
