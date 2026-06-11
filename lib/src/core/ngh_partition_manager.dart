@@ -857,7 +857,8 @@ final class NghPartitionManager {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'Codebook sub-space size (${codebook.centroidsPerSubspace} × ${codebook.subspaceDimensions} × 4 bytes) exceeds page capacity',
+          message:
+              'Codebook sub-space size (${codebook.centroidsPerSubspace} × ${codebook.subspaceDimensions} × 4 bytes) exceeds page capacity',
         ),
       ]);
     }
@@ -912,7 +913,8 @@ final class NghPartitionManager {
         throw DbException([
           GeneralStatus(
             type: ResultType.engError,
-            message: 'Codebook sub-space size ($centroidsPerSubspace × $subspaceDimensions × 4 bytes) exceeds page capacity',
+            message:
+                'Codebook sub-space size ($centroidsPerSubspace × $subspaceDimensions × 4 bytes) exceeds page capacity',
           ),
         ]);
       }
