@@ -8,6 +8,9 @@ import 'package:path/path.dart' as p;
 
 import '../Interface/storage_interface.dart';
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'yield_controller.dart';
 
 /// File system storage implementation for native platforms
@@ -112,7 +115,14 @@ class FileStorageImpl implements StorageInterface {
   }
 
   Future<RandomAccessFile> _getHandle(String path, FileMode mode) async {
-    if (_closed) throw StateError('Storage is closed');
+    if (_closed) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Storage is closed',
+        ),
+      ]);
+    }
     final key = _poolKey(path, mode);
     final file = File(path);
     await file.parent.create(recursive: true);
@@ -182,7 +192,7 @@ class FileStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Delete file failed: $e', label: 'FileStorageImpl');
-      rethrow;
+      throw _wrapIoError(e, 'deleteFile', path);
     }
   }
 
@@ -214,7 +224,7 @@ class FileStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Delete directory failed: $e', label: 'FileStorageImpl');
-      rethrow;
+      throw _wrapIoError(e, 'deleteDirectory', path);
     }
   }
 
@@ -331,7 +341,7 @@ class FileStorageImpl implements StorageInterface {
       });
     } catch (e) {
       Logger.error('Write string failed: $e', label: 'FileStorageImpl');
-      rethrow;
+      throw _wrapIoError(e, 'writeAsString', path);
     }
   }
 
@@ -363,17 +373,22 @@ class FileStorageImpl implements StorageInterface {
       });
     } catch (e) {
       Logger.error('Write bytes failed: $e', label: 'FileStorageImpl');
-      rethrow;
+      throw _wrapIoError(e, 'writeAsBytes', path);
     }
   }
 
   @override
   Future<Uint8List> readAsBytes(String path) async {
-    final file = File(path);
-    if (!await file.exists()) {
-      return Uint8List(0);
+    try {
+      final file = File(path);
+      if (!await file.exists()) {
+        return Uint8List(0);
+      }
+      return await file.readAsBytes();
+    } catch (e) {
+      Logger.error('Read bytes failed: $e', label: 'FileStorageImpl');
+      throw _wrapIoError(e, 'readAsBytes', path);
     }
-    return await file.readAsBytes();
   }
 
   static bool _isFileNotFound(Object e) {
@@ -446,7 +461,13 @@ class FileStorageImpl implements StorageInterface {
     ];
     for (final s in items) {
       if (s.offset < 0) {
-        throw ArgumentError.value(s.offset, 'offset', 'must be >= 0');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.engError,
+            message: 'Offset must be >= 0, got ${s.offset}',
+            parameterName: 'offset',
+          ),
+        ]);
       }
     }
     items.sort((a, b) {
@@ -459,7 +480,12 @@ class FileStorageImpl implements StorageInterface {
         continue;
       }
       if (lastEnd >= 0 && s.offset < lastEnd) {
-        throw StateError('Overlapping write spans for $path');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Overlapping write spans for $path',
+          ),
+        ]);
       }
       lastEnd = s.offset + s.bytes.length;
     }
@@ -612,8 +638,14 @@ class FileStorageImpl implements StorageInterface {
 
       final destDir = Directory(destinationPath);
       if (await destDir.exists()) {
-        throw StateError(
-            'Destination directory already exists: $destinationPath');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoGeneric,
+            message: 'Destination directory already exists: $destinationPath',
+            operation: 'moveDirectory',
+            target: destinationPath,
+          ),
+        ]);
       }
 
       await _flushAndCloseHandlesUnderDirectory(sourcePath);
@@ -630,7 +662,7 @@ class FileStorageImpl implements StorageInterface {
     } catch (e) {
       Logger.error('Move directory failed: $e',
           label: 'FileStorageImpl.moveDirectory');
-      rethrow;
+      throw _wrapIoError(e, 'moveDirectory', '$sourcePath -> $destinationPath');
     }
   }
 
@@ -645,7 +677,7 @@ class FileStorageImpl implements StorageInterface {
       await srcFile.copy(destinationPath);
     } catch (e) {
       Logger.error('Copy file failed: $e', label: 'FileStorageImpl.copyFile');
-      rethrow;
+      throw _wrapIoError(e, 'copyFile', '$sourcePath -> $destinationPath');
     }
   }
 
@@ -724,7 +756,7 @@ class FileStorageImpl implements StorageInterface {
       } catch (e) {
         Logger.error('Write lines stream failed: $path, error: $e',
             label: 'FileStorageImpl');
-        rethrow;
+        throw _wrapIoError(e, 'writeLinesStream', path);
       }
     });
   }
@@ -737,59 +769,67 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<int> appendBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
-    final key = _poolKey(path, FileMode.append);
-    return await _withHandleLock<int>(key, () async {
-      final raf = await _getHandle(path, FileMode.append);
-      int? cached = _handleLengths[key];
-      if (cached == null) {
-        cached = await raf.length();
-        _handleLengths[key] = cached;
-      }
-      final offset = cached;
-      await raf.setPosition(offset);
-      await raf.writeFrom(bytes);
-      if (flush) {
-        await raf.flush();
-      }
-      _handleLengths[key] = offset + bytes.length;
-      if (flush && closeHandleAfterFlush) {
-        await raf.close();
-        _handlePool.remove(key);
-        _lru.remove(key);
-        _handleLengths.remove(key);
-      }
-      return offset;
-    });
+    try {
+      final key = _poolKey(path, FileMode.append);
+      return await _withHandleLock<int>(key, () async {
+        final raf = await _getHandle(path, FileMode.append);
+        int? cached = _handleLengths[key];
+        if (cached == null) {
+          cached = await raf.length();
+          _handleLengths[key] = cached;
+        }
+        final offset = cached;
+        await raf.setPosition(offset);
+        await raf.writeFrom(bytes);
+        if (flush) {
+          await raf.flush();
+        }
+        _handleLengths[key] = offset + bytes.length;
+        if (flush && closeHandleAfterFlush) {
+          await raf.close();
+          _handlePool.remove(key);
+          _lru.remove(key);
+          _handleLengths.remove(key);
+        }
+        return offset;
+      });
+    } catch (e) {
+      throw _wrapIoError(e, 'appendBytes', path);
+    }
   }
 
   @override
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
-    final key = _poolKey(path, FileMode.append);
-    return await _withHandleLock<int>(key, () async {
-      final raf = await _getHandle(path, FileMode.append);
-      int? cached = _handleLengths[key];
-      if (cached == null) {
-        cached = await raf.length();
-        _handleLengths[key] = cached;
-      }
-      final offset = cached;
-      await raf.setPosition(offset);
-      await raf.writeString(content);
-      if (flush) {
-        await raf.flush();
-      }
-      try {
-        _handleLengths[key] = await raf.position();
-      } catch (_) {}
-      if (flush && closeHandleAfterFlush) {
-        await raf.close();
-        _handlePool.remove(key);
-        _lru.remove(key);
-        _handleLengths.remove(key);
-      }
-      return offset;
-    });
+    try {
+      final key = _poolKey(path, FileMode.append);
+      return await _withHandleLock<int>(key, () async {
+        final raf = await _getHandle(path, FileMode.append);
+        int? cached = _handleLengths[key];
+        if (cached == null) {
+          cached = await raf.length();
+          _handleLengths[key] = cached;
+        }
+        final offset = cached;
+        await raf.setPosition(offset);
+        await raf.writeString(content);
+        if (flush) {
+          await raf.flush();
+        }
+        try {
+          _handleLengths[key] = await raf.position();
+        } catch (_) {}
+        if (flush && closeHandleAfterFlush) {
+          await raf.close();
+          _handlePool.remove(key);
+          _lru.remove(key);
+          _handleLengths.remove(key);
+        }
+        return offset;
+      });
+    } catch (e) {
+      throw _wrapIoError(e, 'appendString', path);
+    }
   }
 
   @override
@@ -981,8 +1021,86 @@ class FileStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Atomic replace failed: $e', label: 'FileStorageImpl');
-      rethrow;
+      throw _wrapIoError(e, 'replaceFileAtomic', '$tempPath -> $finalPath');
     }
+  }
+
+  DbException _wrapIoError(Object e, String operation, String path) {
+    ResultType type = ResultType.sysIoGeneric;
+    String message = e.toString();
+
+    if (e is FileSystemException) {
+      final osCode = e.osError?.errorCode;
+      final osMsg = e.osError?.message ?? '';
+      final lowerMsg = '${osMsg.toLowerCase()} ${e.message.toLowerCase()}';
+
+      bool isNotFound = false;
+      bool isPermission = false;
+      bool isDiskFull = false;
+      bool isLocked = false;
+      bool isDeviceFault = false;
+
+      if (osCode != null) {
+        if (Platform.isWindows) {
+          isNotFound = (osCode == 2 || osCode == 3);
+          isPermission = (osCode == 5 || osCode == 19);
+          isDiskFull = (osCode == 112 || osCode == 39);
+          isLocked = (osCode == 32 || osCode == 33);
+          isDeviceFault = (osCode == 29 || osCode == 30 || osCode == 31);
+        } else {
+          // POSIX errno (macOS, Linux, iOS, Android)
+          isNotFound = (osCode == 2 || osCode == 20); // ENOENT, ENOTDIR
+          isPermission = (osCode == 13 || osCode == 1); // EACCES, EPERM
+          isDiskFull = (osCode == 28); // ENOSPC
+          isLocked = (osCode == 11 ||
+              osCode == 35 ||
+              osCode == 37 ||
+              osCode == 16); // EAGAIN/EWOULDBLOCK, EDEADLK, ENOLCK, EBUSY
+          isDeviceFault = (osCode == 5 ||
+              osCode == 6 ||
+              osCode == 19); // EIO, ENXIO, ENODEV
+        }
+      }
+
+      if (isNotFound ||
+          lowerMsg.contains('no such file') ||
+          lowerMsg.contains('pathnotfoundexception') ||
+          lowerMsg.contains('does not exist') ||
+          lowerMsg.contains('not exist')) {
+        type = ResultType.sysIoNotFound;
+      } else if (isPermission ||
+          lowerMsg.contains('permission denied') ||
+          lowerMsg.contains('access is denied') ||
+          lowerMsg.contains('operation not permitted')) {
+        type = ResultType.sysIoPermissionDenied;
+      } else if (isDiskFull ||
+          lowerMsg.contains('no space left') ||
+          lowerMsg.contains('disk full') ||
+          lowerMsg.contains('quota exceeded')) {
+        type = ResultType.sysIoDiskFull;
+      } else if (isLocked ||
+          lowerMsg.contains('sharing violation') ||
+          lowerMsg.contains('lock') ||
+          lowerMsg.contains('resource temporarily unavailable') ||
+          lowerMsg.contains('file is locked')) {
+        type = ResultType.sysIoFileLocked;
+      } else if (isDeviceFault ||
+          lowerMsg.contains('hardware') ||
+          lowerMsg.contains('io error') ||
+          lowerMsg.contains('i/o error') ||
+          lowerMsg.contains('device fault')) {
+        type = ResultType.sysIoDeviceFault;
+      }
+      message = '${e.message} (OS Error: $osMsg, errno = $osCode)';
+    }
+
+    final status = GeneralStatus(
+      type: type,
+      message: 'IO error during $operation on $path: $message',
+      target: path,
+      operation: operation,
+    );
+    return DbException([status]);
   }
 }
 
