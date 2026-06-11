@@ -7,6 +7,9 @@ import '../handler/logger.dart';
 import '../core/lock_manager.dart';
 import '../core/compute_manager.dart';
 import '../core/compute_tasks.dart';
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 /// ID generator interface
 abstract class IdGenerator {
@@ -193,9 +196,14 @@ class SequentialIdGenerator implements IdGenerator {
     }
 
     if (result.isEmpty) {
-      throw Exception(
-          'SequentialIdGenerator: Pool empty and fill timeout. Request=$count, '
-          'RefillInProgress=$_idGenerationInProgress, PoolSize=${_idPool.length}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysTimeout,
+          message:
+              'SequentialIdGenerator: Pool empty and fill timeout. Request=$count, '
+              'RefillInProgress=$_idGenerationInProgress, PoolSize=${_idPool.length}.',
+        )
+      ]);
     }
     return result;
   }
@@ -260,7 +268,13 @@ class Base62Encoder {
   /// Encode BigInt to Base62 string
   static String encode(BigInt value) {
     if (value < BigInt.zero) {
-      throw ArgumentError('Base62 encoding does not support negative numbers');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Base62 encoding does not support negative numbers. Passed value: $value.',
+        )
+      ]);
     }
     if (value == BigInt.zero) {
       return '0';
@@ -298,7 +312,12 @@ class Base62Encoder {
     for (int i = value.length - 1; i >= 0; i--) {
       int digit = _charset.indexOf(value[i]);
       if (digit == -1) {
-        throw FormatException('Illegal Base62 character: ${value[i]}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Illegal Base62 character: ${value[i]} at index $i.',
+          )
+        ]);
       }
       result += BigInt.from(digit) * power;
       power *= base;
@@ -407,8 +426,13 @@ class TimeBasedIdGenerator implements IdGenerator {
     if (keyType != PrimaryKeyType.timestampBased &&
         keyType != PrimaryKeyType.datePrefixed &&
         keyType != PrimaryKeyType.shortCode) {
-      throw ArgumentError(
-          'keyType must be timestampBased, datePrefixed, or shortCode');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'keyType must be timestampBased, datePrefixed, or shortCode. Passed: $keyType.',
+        )
+      ]);
     }
 
     // Calculate and cache the number of digits for node ID
@@ -713,9 +737,13 @@ class TimeBasedIdGenerator implements IdGenerator {
       );
 
       if (!result.success || result.ids.isEmpty) {
-        throw StateError(
-          result.errorMessage ?? 'Single isolate ID generation returned empty.',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Single isolate ID generation returned empty. Error: ${result.errorMessage != null ? (result.errorMessage!.length > 200 ? "${result.errorMessage!.substring(0, 200)}..." : result.errorMessage) : "none"}.',
+          )
+        ]);
       }
 
       _sequenceMap[tableName] = result.lastSequence;
@@ -814,10 +842,15 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     // If no ID is retrieved, throw exception
     if (result.isEmpty) {
-      throw Exception(
-          'Unable to generate ID: Pool is empty and fill timeout. Table=$tableName, Request=$count, '
-          'Fill in=${_idGenerationInProgress[tableName] ?? false}, '
-          'Current pool size=${_idPools[tableName]?.length ?? 0}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysTimeout,
+          message:
+              'Unable to generate ID: Pool is empty and fill timeout. Table=$tableName, Request=$count, '
+              'FillInProgress=${_idGenerationInProgress[tableName] ?? false}, '
+              'Current pool size=${_idPools[tableName]?.length ?? 0}.',
+        )
+      ]);
     }
 
     return result;
@@ -891,7 +924,12 @@ class TimeBasedIdGenerator implements IdGenerator {
     } else if (keyType == PrimaryKeyType.datePrefixed) {
       return await _generateDatePrefixedIds(count, recentTotal);
     } else {
-      throw UnsupportedError('Unsupported ID type: $keyType');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Unsupported ID type: $keyType.',
+        )
+      ]);
     }
   }
 
@@ -1347,8 +1385,13 @@ class IdGeneratorFactory {
 
       case PrimaryKeyType.none:
         // Return an empty implementation, user needs to provide ID
-        throw UnsupportedError(
-            'Unsupported primary key generation type: ${pkConfig.type}');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Unsupported primary key generation type: ${pkConfig.type}.',
+          )
+        ]);
     }
   }
 }
