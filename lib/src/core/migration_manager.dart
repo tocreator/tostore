@@ -826,7 +826,7 @@ class MigrationManager {
               } else {
                 throw DbException([
                   GeneralStatus(
-                    type: ResultType.engDatabaseGeneric,
+                    type: ResultType.engError,
                     message: 'Migration task failed: $firstError',
                   ),
                 ]);
@@ -834,7 +834,7 @@ class MigrationManager {
             }
             throw DbException([
               GeneralStatus(
-                type: ResultType.engDatabaseGeneric,
+                type: ResultType.engError,
                 message: 'Some migration tasks failed',
               ),
             ]);
@@ -1325,7 +1325,16 @@ class MigrationManager {
       List<String>? specificIndexes}) async {
     try {
       if (operations.isEmpty) {
-        throw ArgumentError('Migration operations cannot be empty');
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentMissing,
+            message: "Failed to add migration task for table '$tableName' because no schema operations were provided. "
+                "If you are updating the schema programmatically, please ensure at least one operation (such as addField, renameField, or alterField) "
+                "is added to the operation list before executing the migration.",
+            parameterName: 'operations',
+            passedValue: operations,
+          ),
+        ]);
       }
 
       final sortedOperations = _sortOperations(List.from(operations));
@@ -1338,7 +1347,7 @@ class MigrationManager {
       if (pendingTask != null) {
         throw DbException([
           GeneralStatus(
-            type: ResultType.engDatabaseGeneric,
+            type: ResultType.engError,
             message: 'Table [$tableName] already has a pending migration task '
                 '[${pendingTask.taskId}]. Wait until it completes before calling updateSchema again.',
           )
@@ -2021,7 +2030,12 @@ class MigrationManager {
           for (final entry in acquiredLocks.entries.toList().reversed) {
             lockMgr.releaseExclusiveLock(entry.key, entry.value);
           }
-          throw StateError('Failed to acquire schema cutover lock for $name');
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysTimeoutLockAcquisition,
+              message: 'Failed to acquire schema cutover lock for $name',
+            ),
+          ]);
         }
         acquiredLocks[resource] = opId;
       }
@@ -3709,10 +3723,14 @@ class MigrationManager {
           specificIndexes.isNotEmpty;
 
       if (renameOp == null && needDataMigration && oldSchema == null) {
-        throw StateError(
-          'Migration task [${currentTask.taskId}] for table [$currentTableName] '
-          'requires old schema decoding, but no old schema snapshot is available.',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Migration task [${currentTask.taskId}] for table [$currentTableName] '
+                'requires old schema decoding, but no old schema snapshot is available.',
+          ),
+        ]);
       }
 
       await _invalidatePrimaryInstanceCachesForMigration(
@@ -3841,9 +3859,13 @@ class MigrationManager {
                   await _dataStore.schemaManager
                       ?.getTableSchema(currentTableName);
               if (sourceSchema == null) {
-                throw StateError(
-                  'Missing source schema for migration task ${currentTask.taskId} on table $currentTableName',
-                );
+                throw DbException([
+                  GeneralStatus(
+                    type: ResultType.engError,
+                    message:
+                        'Missing source schema for migration task ${currentTask.taskId} on table $currentTableName',
+                  ),
+                ]);
               }
 
               final sourcePkName = sourceSchema.primaryKey;
@@ -4032,8 +4054,13 @@ class MigrationManager {
                       label: 'MigrationManager._executeMigrationTask',
                     );
                     // Throwing here will be caught by the outer try-finally, releasing the lease.
-                    throw StateError(
-                        'Migration data corruption detected for table ${currentTask.tableName}');
+                    throw DbException([
+                      GeneralStatus(
+                        type: ResultType.sysIoDataCorrupted,
+                        message:
+                            'Migration data corruption detected for table ${currentTask.tableName}',
+                      ),
+                    ]);
                   }
                 }
               }
@@ -4985,10 +5012,15 @@ class MigrationManager {
       // Get both schemas for comparison
       final definitionSchema = task.targetSchemaSnapshot ??
           _dataStore.getInitialSchemas().firstWhere(
-                (s) => s.name == targetTableName,
-                orElse: () =>
-                    throw Exception('Schema not found in initial schema'),
-              );
+            (s) => s.name == targetTableName,
+            orElse: () => throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message: "Migration engine error: failed to resolve the target schema for table '$targetTableName' during task recovery. "
+                    "The schema definition might have been modified or removed while a pending migration task was still active.",
+              ),
+            ]),
+          );
 
       final currentSchema =
           await _dataStore.schemaManager?.getTableSchema(targetTableName);
@@ -5756,10 +5788,16 @@ class _RuntimeMigrationDescriptor {
   });
 }
 
-class _MigrationStoppedException implements Exception {
+class _MigrationStoppedException extends DbException {
   final String spaceName;
 
-  const _MigrationStoppedException(this.spaceName);
+  _MigrationStoppedException(this.spaceName)
+      : super([
+          GeneralStatus(
+            type: ResultType.sysCancellation,
+            message: 'Migration stopped for space [$spaceName]',
+          ),
+        ]);
 
   @override
   String toString() => 'Migration stopped for space [$spaceName]';
