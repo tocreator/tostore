@@ -1,7 +1,9 @@
-import '../../model/expr.dart';
-import '../../model/table_schema.dart';
-import '../../model/db_exception.dart';
 import '../../handler/logger.dart';
+import '../../model/db_exception.dart';
+import '../../model/expr.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
+import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
 import 'unique_ref_compute.dart';
@@ -90,11 +92,13 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
   BatchUpdatePrepareRequest request,
 ) async {
   if (request.records.length != request.existingRecords.length) {
-    throw ArgumentError(
-      'prepareBatchUpdateChunk length mismatch: '
-      'records=${request.records.length}, '
-      'existingRecords=${request.existingRecords.length}',
-    );
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'prepareBatchUpdateChunk length mismatch. Records length (${request.records.length}) does not match existing records list length (${request.existingRecords.length}).',
+      )
+    ]);
   }
 
   final primaryKey = request.schema.primaryKey;
