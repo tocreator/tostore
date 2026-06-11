@@ -1,4 +1,7 @@
 import 'buffer_entry.dart';
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 /// Index entry model, used to store index key and record primary key
 /// Supports new format (key|primaryKey)
@@ -386,9 +389,15 @@ class IndexRecordUpdate {
     final primaryKey = updateMap[primaryKeyField];
 
     if (primaryKey == null) {
-      throw ArgumentError(
-        'Primary key field "$primaryKeyField" not found in update map',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentMissing,
+          parameterName: primaryKeyField,
+          passedValue: updateMap,
+          message:
+              'Primary key field "$primaryKeyField" not found in update map. Available fields (truncated): ${updateMap.keys.take(10).toList()}.',
+        )
+      ]);
     }
 
     return IndexRecordUpdate(
