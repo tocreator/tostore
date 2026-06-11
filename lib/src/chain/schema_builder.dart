@@ -2,6 +2,9 @@ import '../core/data_store_impl.dart';
 import '../model/migration_task.dart';
 import '../model/table_schema.dart';
 import '../Interface/future_builder_mixin.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 
 /// Schema builder for chain operations
 class SchemaBuilder with FutureBuilderMixin {
@@ -126,7 +129,14 @@ class SchemaBuilder with FutureBuilderMixin {
   /// Remove index
   SchemaBuilder removeIndex({String? indexName, List<String>? fields}) {
     if (indexName == null && (fields == null || fields.isEmpty)) {
-      throw ArgumentError('must provide indexName or fields');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentMissing,
+          message:
+              'Must provide either indexName or fields to remove an index from table "$_tableName".',
+          parameterName: 'indexName/fields',
+        ),
+      ]);
     }
 
     _operations.add(MigrationOperation(
