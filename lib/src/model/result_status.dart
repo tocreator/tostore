@@ -118,6 +118,8 @@ abstract class ResultStatus {
         message: message,
         index: index,
         primaryKey: json['primaryKey']?.toString(),
+        target: json['target']?.toString(),
+        operation: json['operation']?.toString(),
       );
     }
   }
@@ -294,11 +296,19 @@ class GeneralStatus extends ResultStatus {
   @override
   final String? primaryKey;
 
+  /// Optional physical target resource associated with this status (e.g. file path, lock resource)
+  final String? target;
+
+  /// Optional operation type executed (e.g. 'readAsString', 'acquire')
+  final String? operation;
+
   GeneralStatus({
     required super.type,
     required super.message,
     super.index,
     this.primaryKey,
+    this.target,
+    this.operation,
   });
 
   @override
@@ -306,6 +316,12 @@ class GeneralStatus extends ResultStatus {
     final map = super.toJson();
     if (primaryKey != null) {
       map['primaryKey'] = primaryKey;
+    }
+    if (target != null) {
+      map['target'] = target;
+    }
+    if (operation != null) {
+      map['operation'] = operation;
     }
     return map;
   }
