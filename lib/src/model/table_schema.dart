@@ -489,7 +489,14 @@ class TableSchema {
       } else {
         fkField = fields.firstWhere(
           (f) => f.name == fkFieldName,
-          orElse: () => throw StateError('Field $fkFieldName not found'),
+          orElse: () => throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaForeignKey,
+              message: 'Field $fkFieldName not found in table $name',
+              tableName: name,
+              field: fkFieldName,
+            )
+          ]),
         );
       }
 
@@ -507,7 +514,15 @@ class TableSchema {
       } else {
         refField = referencedSchema.fields.firstWhere(
           (f) => f.name == refFieldName,
-          orElse: () => throw StateError('Field $refFieldName not found'),
+          orElse: () => throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaForeignKey,
+              message:
+                  'Field $refFieldName not found in referenced table ${referencedSchema.name}',
+              tableName: name,
+              field: refFieldName,
+            )
+          ]),
         );
         refFieldType = refField.type;
       }
@@ -1064,7 +1079,14 @@ class TableSchema {
 
     final field = fields.firstWhere(
       (f) => f.name == fieldName,
-      orElse: () => throw StateError('Unknown field $fieldName'),
+      orElse: () => throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devFieldNotFound,
+          message: 'Unknown field $fieldName in table $name',
+          parameterName: 'fieldName',
+          passedValue: fieldName,
+        )
+      ]),
     );
     return field.getDefaultValue();
   }
@@ -2362,9 +2384,15 @@ class VectorData {
 
   factory VectorData.fromBytes(Uint8List bytes) {
     if (bytes.length % 8 != 0) {
-      throw ArgumentError(
-        'Binary data length (${bytes.length}) must be a multiple of 8 bytes',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          message:
+              'Binary data length (${bytes.length}) must be a multiple of 8 bytes',
+          parameterName: 'bytes',
+          passedValue: 'Uint8List(${bytes.length} bytes)',
+        )
+      ]);
     }
 
     final buffer = bytes.buffer;
@@ -2465,9 +2493,15 @@ class VectorData {
 
   double dotProduct(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError(
-        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message:
+              'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     double result = 0;
@@ -2497,9 +2531,15 @@ class VectorData {
 
   double euclideanDistance(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError(
-        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message:
+              'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     double sumSquaredDifferences = 0;
@@ -2517,9 +2557,15 @@ class VectorData {
 
   VectorData add(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError(
-        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message:
+              'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     final result = List<double>.generate(
@@ -2535,9 +2581,15 @@ class VectorData {
 
   VectorData subtract(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError(
-        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message:
+              'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     final result = List<double>.generate(
@@ -2565,9 +2617,15 @@ class VectorData {
 
   double manhattanDistance(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError(
-        'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message:
+              'Vector dimensions mismatch: $dimensions vs ${other.dimensions}',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     double sum = 0;
@@ -2621,9 +2679,15 @@ class VectorData {
   /// ```
   VectorData truncate(int newDimensions) {
     if (newDimensions > dimensions) {
-      throw ArgumentError(
-        'New dimensions ($newDimensions) cannot be greater than current dimensions ($dimensions)',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          message:
+              'New dimensions ($newDimensions) cannot be greater than current dimensions ($dimensions)',
+          parameterName: 'newDimensions',
+          passedValue: newDimensions,
+        )
+      ]);
     }
     return subvector(0, newDimensions);
   }
@@ -2908,7 +2972,14 @@ extension VectorMethods on VectorData {
   /// Calculate dot product with another vector
   double dotProduct(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError('Vectors must have same dimensions');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message: 'Vectors must have same dimensions',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     double sum = 0;
@@ -2921,7 +2992,14 @@ extension VectorMethods on VectorData {
   /// Calculate Euclidean distance (L2) to another vector
   double l2Distance(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError('Vectors must have same dimensions');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message: 'Vectors must have same dimensions',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     double sum = 0;
@@ -2935,7 +3013,14 @@ extension VectorMethods on VectorData {
   /// Calculate cosine similarity to another vector
   double cosineSimilarity(VectorData other) {
     if (dimensions != other.dimensions) {
-      throw ArgumentError('Vectors must have same dimensions');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devVectorDimensionMismatch,
+          message: 'Vectors must have same dimensions',
+          parameterName: 'other',
+          passedValue: other.dimensions,
+        )
+      ]);
     }
 
     // Calculate dot product
