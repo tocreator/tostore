@@ -425,13 +425,12 @@ final class TableTreePartitionManager {
       }
       return leaf;
     } catch (e) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.sysIoDataCorrupted,
-          message:
-              'Corrupted B+Tree leaf page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
-        ),
-      ]);
+      throw DbException.forceWrap(
+        e,
+        forceType: ResultType.sysIoDataCorrupted,
+        message:
+            'Corrupted B+Tree leaf page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+      );
     }
   }
 
@@ -508,13 +507,12 @@ final class TableTreePartitionManager {
       }
       return page;
     } catch (e) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Corrupted B+Tree internal page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
-        ),
-      ]);
+      throw DbException.forceWrap(
+        e,
+        forceType: ResultType.engError,
+        message:
+            'Corrupted B+Tree internal page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+      );
     }
   }
 
@@ -2329,13 +2327,12 @@ final class TableTreePartitionManager {
         leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
       } catch (e) {
         final offset = pageNo * pageSize;
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message:
-                'Corrupted B+Tree page while streaming partition: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
-          ),
-        ]);
+        throw DbException.forceWrap(
+          e,
+          forceType: ResultType.engError,
+          message:
+              'Corrupted B+Tree page while streaming partition: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
+        );
       }
 
       if (leaf.keys.isEmpty) continue;
