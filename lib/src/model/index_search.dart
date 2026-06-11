@@ -1,8 +1,8 @@
-/// Represents the result of a search operation on an index.
-///
-library;
-
 import 'dart:typed_data';
+
+import 'db_exception.dart';
+import 'result_status.dart';
+import 'result_type.dart';
 
 /// Single index search entry combining primary key and raw index key bytes.
 class IndexSearchEntry {
@@ -169,7 +169,15 @@ class IndexCondition {
   /// Creates a composite-index condition using the leading indexed fields.
   factory IndexCondition.composite(List<IndexFieldCondition> components) {
     if (components.isEmpty) {
-      throw ArgumentError('Composite index components cannot be empty.');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          parameterName: 'components',
+          passedValue: components,
+          message:
+              'Composite index components cannot be empty. Received components count = ${components.length}.',
+        )
+      ]);
     }
     return IndexCondition._(
       'COMPOSITE',
@@ -182,7 +190,14 @@ class IndexCondition {
   /// It's recommended to use the specific factory constructors for new code.
   factory IndexCondition.fromMap(Map<String, dynamic> map) {
     if (map.isEmpty) {
-      throw ArgumentError('Condition map cannot be empty.');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          parameterName: 'map',
+          passedValue: map,
+          message: 'Condition map cannot be empty.',
+        )
+      ]);
     }
     final opRaw = map.keys.first;
     final value = map.values.first;
@@ -196,8 +211,15 @@ class IndexCondition {
         return IndexCondition._(opUpper, value['start'],
             endValue: value['end']);
       }
-      throw ArgumentError(
-          'For "BETWEEN" operator, value must be a List of two elements or a Map {start,end}.');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentType,
+          parameterName: 'value',
+          passedValue: value,
+          message:
+              'For "BETWEEN" operator, value must be a List of two elements or a Map {start,end}. Passed value type: ${value.runtimeType}.',
+        )
+      ]);
     }
 
     return IndexCondition._(opUpper, value);
