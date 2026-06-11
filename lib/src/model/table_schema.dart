@@ -2648,10 +2648,24 @@ class VectorData {
   /// ```
   VectorData subvector(int start, int length) {
     if (start < 0 || start >= dimensions) {
-      throw RangeError('Start index out of range: $start');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Start index out of range: $start',
+          parameterName: 'start',
+          passedValue: start,
+        )
+      ]);
     }
     if (start + length > dimensions) {
-      throw RangeError('End index out of range: ${start + length}');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'End index out of range: ${start + length}',
+          parameterName: 'length',
+          passedValue: length,
+        )
+      ]);
     }
 
     return VectorData(values.sublist(start, start + length));
@@ -2670,8 +2684,6 @@ class VectorData {
   ///
   /// Creates a new vector containing only the first `newDimensions` elements.
   ///
-  /// Throws ArgumentError if newDimensions is greater than the current dimensions.
-  ///
   /// Example:
   /// ```dart
   /// // Reduce a 1536-dim vector to 768 dimensions
@@ -2681,7 +2693,7 @@ class VectorData {
     if (newDimensions > dimensions) {
       throw DbException([
         InvalidArgumentStatus(
-          type: ResultType.devInvalidArgumentFormat,
+          type: ResultType.engError,
           message:
               'New dimensions ($newDimensions) cannot be greater than current dimensions ($dimensions)',
           parameterName: 'newDimensions',
