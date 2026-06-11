@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:math';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../handler/sha256.dart';
 
 // ChaCha20-Poly1305 old implementation
@@ -56,7 +59,16 @@ class ChaCha20Poly1305Old {
   }) {
     aad ??= Uint8List(0);
     key ??= defaultKey;
-    if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
+    if (key.length != 32) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Key must be 32 bytes',
+          parameterName: 'key',
+          passedValue: key.length.toString(),
+        )
+      ]);
+    }
     // Generate a random 12-byte nonce internally
     final nonce = _generateNonce();
 
@@ -99,16 +111,39 @@ class ChaCha20Poly1305Old {
   }) {
     aad ??= Uint8List(0);
     key ??= defaultKey;
-    if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
+    if (key.length != 32) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Key must be 32 bytes',
+          parameterName: 'key',
+          passedValue: key.length.toString(),
+        )
+      ]);
+    }
     if (encryptedData.length < 12 + 16) {
-      throw ArgumentError('Invalid input length');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Invalid input length',
+          parameterName: 'encryptedData',
+          passedValue: encryptedData.length.toString(),
+        )
+      ]);
     }
 
     // Extract nonce from the beginning
     final nonce = encryptedData.sublist(0, 12);
     final actualCipherAndTag = encryptedData.sublist(12);
     if (actualCipherAndTag.length < 16) {
-      throw ArgumentError('Invalid input length');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Invalid input length',
+          parameterName: 'actualCipherAndTag',
+          passedValue: actualCipherAndTag.length.toString(),
+        )
+      ]);
     }
 
     // Split actualCipherAndTag into ciphertext and tag
@@ -136,7 +171,12 @@ class ChaCha20Poly1305Old {
     final computedTag = Poly1305.mac(Uint8List.fromList(macData), polyKey);
 
     if (!_constantTimeEqual(Uint8List.fromList(tag), computedTag)) {
-      throw ArgumentError('Authentication failed');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Authentication failed',
+        )
+      ]);
     }
 
     final plaintext = _chacha20Encrypt(key, nonce, 1, ciphertext);
@@ -193,8 +233,26 @@ void _quarterRound(Uint32List state, int a, int b, int c, int d) {
 // ChaCha20 block function
 Uint8List _chacha20Block(Uint8List key, int counter, Uint8List nonce) {
   // Key length must be 32 bytes, nonce length 12 bytes
-  if (key.length != 32) throw ArgumentError('Key must be 32 bytes');
-  if (nonce.length != 12) throw ArgumentError('Nonce must be 12 bytes');
+  if (key.length != 32) {
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.engError,
+        message: 'Key must be 32 bytes',
+        parameterName: 'key',
+        passedValue: key.length.toString(),
+      )
+    ]);
+  }
+  if (nonce.length != 12) {
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.engError,
+        message: 'Nonce must be 12 bytes',
+        parameterName: 'nonce',
+        passedValue: nonce.length.toString(),
+      )
+    ]);
+  }
 
   // constants: "expand 32-byte k"
   final constants =
@@ -269,7 +327,16 @@ Uint8List _chacha20Encrypt(
 class Poly1305 {
   // Compute 16-byte Poly1305 authenticator for a message using a 32-byte key
   static Uint8List mac(Uint8List message, Uint8List key) {
-    if (key.length != 32) throw ArgumentError('Poly1305 key must be 32 bytes');
+    if (key.length != 32) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Poly1305 key must be 32 bytes',
+          parameterName: 'key',
+          passedValue: key.length.toString(),
+        )
+      ]);
+    }
 
     // r and s
     final r = Uint8List.view(key.buffer, key.offsetInBytes, 16);
