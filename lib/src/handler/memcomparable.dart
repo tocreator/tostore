@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'platform_byte_data.dart';
 
 /// MemComparable key encoding for high-performance binary comparison.
@@ -362,7 +365,13 @@ class MemComparableKey {
     if (value is Uint8List) return encodeBytes(value);
     // Explicitly handle null?
     // If null is not supported, throw.
-    throw ArgumentError(
-        'Unsupported type for MemComparableKey: ${value.runtimeType}');
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.devInvalidArgumentType,
+        message: 'Unsupported type for MemComparableKey: ${value.runtimeType}',
+        parameterName: 'value',
+        passedValue: value?.toString() ?? 'null',
+      )
+    ]);
   }
 }
