@@ -289,7 +289,12 @@ class ForeignKeyManager {
         for (final fieldName in fk.fields) {
           final field = schema.fields.firstWhere(
             (f) => f.name == fieldName,
-            orElse: () => throw StateError('Field $fieldName not found'),
+            orElse: () => throw DbException([
+              GeneralStatus(
+                type: ResultType.devFieldNotFound,
+                message: 'Field "$fieldName" not found in table "$tableName"',
+              ),
+            ]),
           );
           if (!field.nullable) {
             throw DbException([
@@ -397,8 +402,13 @@ class ForeignKeyManager {
         // For non-primary key fields, find the field schema and convert
         final refFieldSchema = referencedSchema.fields.firstWhere(
           (f) => f.name == refField,
-          orElse: () => throw StateError(
-              'Referenced field $refField not found in table ${fk.referencedTable}'),
+          orElse: () => throw DbException([
+            GeneralStatus(
+              type: ResultType.devFieldNotFound,
+              message:
+                  'Referenced field "$refField" not found in table "${fk.referencedTable}"',
+            ),
+          ]),
         );
         convertedValue = refFieldSchema.convertValue(fkValue);
         if (convertedValue == null && fkValue != null) {
@@ -1101,8 +1111,13 @@ class ForeignKeyManager {
             for (final fkField in fk.fields) {
               final field = childSchema.fields.firstWhere(
                 (f) => f.name == fkField,
-                orElse: () => throw StateError(
-                    'Field $fkField not found in $childTableName'),
+                orElse: () => throw DbException([
+                  GeneralStatus(
+                    type: ResultType.devFieldNotFound,
+                    message:
+                        'Field "$fkField" not found in table "$childTableName"',
+                  ),
+                ]),
               );
               updateData[fkField] = field.getDefaultValue();
             }
@@ -1170,8 +1185,13 @@ class ForeignKeyManager {
       } else {
         fieldSchema = childSchema.fields.firstWhere(
           (f) => f.name == fieldName,
-          orElse: () => throw StateError(
-              'Field $fieldName not found in table $childTableName'),
+          orElse: () => throw DbException([
+            GeneralStatus(
+              type: ResultType.devFieldNotFound,
+              message:
+                  'Field "$fieldName" not found in table "$childTableName"',
+            ),
+          ]),
         );
         convertedCondition[fieldName] = fieldSchema.convertValue(value);
       }
@@ -1244,8 +1264,13 @@ class ForeignKeyManager {
           } else {
             fieldSchema = childSchemaForConversion.fields.firstWhere(
               (f) => f.name == fieldName,
-              orElse: () => throw StateError(
-                  'Field $fieldName not found in table $childTableName'),
+              orElse: () => throw DbException([
+                GeneralStatus(
+                  type: ResultType.devFieldNotFound,
+                  message:
+                      'Field "$fieldName" not found in table "$childTableName"',
+                ),
+              ]),
             );
             convertedCondition[fieldName] = fieldSchema.convertValue(value);
           }
@@ -1549,7 +1574,13 @@ class ForeignKeyManager {
     for (final fieldName in fk.fields) {
       final field = childSchema.fields.firstWhere(
         (f) => f.name == fieldName,
-        orElse: () => throw StateError('Field $fieldName not found'),
+        orElse: () => throw DbException([
+          GeneralStatus(
+            type: ResultType.devFieldNotFound,
+            message:
+                'Field "$fieldName" not found in table "$childTableName"',
+          ),
+        ]),
       );
       if (!field.nullable) {
         throw DbException([
@@ -1615,7 +1646,13 @@ class ForeignKeyManager {
     for (final fieldName in fk.fields) {
       final field = childSchema.fields.firstWhere(
         (f) => f.name == fieldName,
-        orElse: () => throw StateError('Field $fieldName not found'),
+        orElse: () => throw DbException([
+          GeneralStatus(
+            type: ResultType.devFieldNotFound,
+            message:
+                'Field "$fieldName" not found in table "$childTableName"',
+          ),
+        ]),
       );
       final defaultValue = field.getDefaultValue();
       if (defaultValue == null && !field.nullable) {
@@ -1716,7 +1753,12 @@ class ForeignKeyManager {
             'System table $fkTableName does not exist yet. Foreign key relationships for table $tableName will not be stored in system table. '
             'This may happen during upgrade. The system table should be created before user tables.';
         if (throwOnError) {
-          throw StateError(message);
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: message,
+            ),
+          ]);
         }
         Logger.warn(
           message,
