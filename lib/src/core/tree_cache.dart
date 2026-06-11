@@ -3,6 +3,9 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'yield_controller.dart';
 
 typedef TreeCacheSizeCalculator<T> = int Function(T value);
@@ -81,7 +84,14 @@ class TreeCache<T> {
   })  : maxByteThreshold = math.max(maxByteThreshold, minByteThreshold),
         debugLabel = debugLabel ?? 'TreeCache' {
     if (groupDepth <= 0) {
-      throw ArgumentError.value(groupDepth, 'groupDepth', 'must be >= 1');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'groupDepth must be >= 1',
+          parameterName: 'groupDepth',
+          passedValue: groupDepth,
+        )
+      ]);
     }
   }
 
@@ -875,7 +885,14 @@ final class _BPlusTree<K, V> {
     this.rebalanceOnDelete = false,
   }) {
     if (order < 4) {
-      throw ArgumentError.value(order, 'order', 'must be >= 4');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'order must be >= 4',
+          parameterName: 'order',
+          passedValue: order,
+        )
+      ]);
     }
     _maxKeys = order - 1;
     _minLeafKeys = (_maxKeys + 1) ~/ 2;
