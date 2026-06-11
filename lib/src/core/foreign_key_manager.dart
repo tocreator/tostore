@@ -1577,8 +1577,7 @@ class ForeignKeyManager {
         orElse: () => throw DbException([
           GeneralStatus(
             type: ResultType.devFieldNotFound,
-            message:
-                'Field "$fieldName" not found in table "$childTableName"',
+            message: 'Field "$fieldName" not found in table "$childTableName"',
           ),
         ]),
       );
@@ -1649,8 +1648,7 @@ class ForeignKeyManager {
         orElse: () => throw DbException([
           GeneralStatus(
             type: ResultType.devFieldNotFound,
-            message:
-                'Field "$fieldName" not found in table "$childTableName"',
+            message: 'Field "$fieldName" not found in table "$childTableName"',
           ),
         ]),
       );
