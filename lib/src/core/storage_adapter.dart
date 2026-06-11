@@ -1,23 +1,38 @@
-import 'dart:typed_data';
-import 'dart:math';
 import 'dart:async';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:path/path.dart' as path;
+
+import '../Interface/file_storage_impl_stub.dart'
+    if (dart.library.io) 'file_storage_impl.dart';
 import '../Interface/storage_interface.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
-import 'lock_manager.dart';
-import 'package:path/path.dart' as path;
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/id_generator.dart';
-
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+import 'lock_manager.dart';
+import 'transaction_context.dart';
 // Import platform-specific implementations with conditional imports
 import 'web_storage_impl.dart'
     if (dart.library.io) '../Interface/web_storage_impl_stub.dart';
-import '../Interface/file_storage_impl_stub.dart'
-    if (dart.library.io) 'file_storage_impl.dart';
-import 'transaction_context.dart';
 
 /// Storage adapter to handle platform-specific storage implementations
 class StorageAdapter implements StorageInterface {
+  void _throwLockTimeout(String message, String resource) {
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.sysTimeoutLockAcquisition,
+        message: message,
+        target: resource,
+        operation: 'acquire',
+      )
+    ]);
+  }
+
   late final StorageInterface _storage;
 
   /// lock manager
@@ -264,8 +279,9 @@ class StorageAdapter implements StorageInterface {
       serializeAcquired =
           await _lockManager.acquireExclusiveLock(writeResource, serializeOpId);
       if (!serializeAcquired) {
-        throw Exception(
-            'Failed to acquire serialize lock for write: $writeResource');
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for write: $writeResource',
+            writeResource);
       }
 
       // Atomic path for non-append + flush=true: long write goes to temp without blocking readers.
@@ -281,8 +297,9 @@ class StorageAdapter implements StorageInterface {
             replaceAcquired =
                 await _lockManager.acquireExclusiveLock(resource, replaceOpId);
             if (!replaceAcquired) {
-              throw Exception(
-                  'Failed to acquire exclusive lock for atomic replace: $resource');
+              _throwLockTimeout(
+                  'Failed to acquire exclusive lock for atomic replace: $resource',
+                  resource);
             }
             await _storage.replaceFileAtomic(tempPath, path);
             TransactionContext.registerTouchedPath(path);
@@ -302,8 +319,9 @@ class StorageAdapter implements StorageInterface {
         // Legacy path for append or flush=false: hold write lock to protect readers.
         acquired = await _lockManager.acquireExclusiveLock(resource, opId);
         if (!acquired) {
-          throw Exception(
-              'Failed to acquire exclusive lock for write: $resource');
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for write: $resource',
+              resource);
         }
 
         await _storage.writeAsString(path, content,
@@ -337,8 +355,9 @@ class StorageAdapter implements StorageInterface {
       serializeAcquired =
           await _lockManager.acquireExclusiveLock(writeResource, serializeOpId);
       if (!serializeAcquired) {
-        throw Exception(
-            'Failed to acquire serialize lock for writeBytes: $writeResource');
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeBytes: $writeResource',
+            writeResource);
       }
 
       if (flush) {
@@ -353,8 +372,9 @@ class StorageAdapter implements StorageInterface {
             replaceAcquired =
                 await _lockManager.acquireExclusiveLock(resource, replaceOpId);
             if (!replaceAcquired) {
-              throw Exception(
-                  'Failed to acquire exclusive lock for atomic replace: $resource');
+              _throwLockTimeout(
+                  'Failed to acquire exclusive lock for atomic replace: $resource',
+                  resource);
             }
             await _storage.replaceFileAtomic(tempPath, path);
             TransactionContext.registerTouchedPath(path);
@@ -373,8 +393,9 @@ class StorageAdapter implements StorageInterface {
       try {
         acquired = await _lockManager.acquireExclusiveLock(resource, opId);
         if (!acquired) {
-          throw Exception(
-              'Failed to acquire exclusive lock for writeBytes: $resource');
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for writeBytes: $resource',
+              resource);
         }
 
         await _storage.writeAsBytes(path, bytes,
@@ -402,7 +423,8 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception('Failed to acquire shared lock for read: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for read: $resource', resource);
       }
       return await _storage.readAsString(path);
     } finally {
@@ -422,8 +444,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for deleteFile: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for deleteFile: $resource',
+            resource);
       }
       await _storage.deleteFile(path);
     } finally {
@@ -453,7 +476,8 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception('Failed to acquire shared lock for list: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for list: $resource', resource);
       }
       return await _storage.listDirectory(path, recursive: recursive);
     } finally {
@@ -482,8 +506,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for getFileCreationTime: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileCreationTime: $resource',
+            resource);
       }
       return await _storage.getFileCreationTime(path);
     } finally {
@@ -502,8 +527,8 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for readBytes: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readBytes: $resource', resource);
       }
       return await _storage.readAsBytes(path);
     } finally {
@@ -522,8 +547,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for readBytesAt: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readBytesAt: $resource',
+            resource);
       }
       return await _storage.readAsBytesAt(path, start, length: length);
     } finally {
@@ -538,7 +564,12 @@ class StorageAdapter implements StorageInterface {
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     if (bytes.isEmpty) return;
     if (start < 0) {
-      throw ArgumentError.value(start, 'start', 'must be >= 0');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'writeAsBytesAt: start must be >= 0, got $start.',
+        ),
+      ]);
     }
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
@@ -551,16 +582,18 @@ class StorageAdapter implements StorageInterface {
       serializeAcquired =
           await _lockManager.acquireExclusiveLock(writeResource, opId);
       if (!serializeAcquired) {
-        throw Exception(
-            'Failed to acquire serialize lock for writeAsBytesAt: $writeResource');
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeAsBytesAt: $writeResource',
+            writeResource);
       }
 
       // Block concurrent readers while applying random writes.
       resourceAcquired =
           await _lockManager.acquireExclusiveLock(resource, '$opId-path');
       if (!resourceAcquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for writeAsBytesAt: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeAsBytesAt: $resource',
+            resource);
       }
 
       await _storage.writeAsBytesAt(path, start, bytes,
@@ -590,16 +623,18 @@ class StorageAdapter implements StorageInterface {
       serializeAcquired =
           await _lockManager.acquireExclusiveLock(writeResource, opId);
       if (!serializeAcquired) {
-        throw Exception(
-            'Failed to acquire serialize lock for writeManyAsBytesAt: $writeResource');
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeManyAsBytesAt: $writeResource',
+            writeResource);
       }
 
       // Block concurrent readers while applying random writes batch.
       resourceAcquired =
           await _lockManager.acquireExclusiveLock(resource, '$opId-path');
       if (!resourceAcquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for writeManyAsBytesAt: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeManyAsBytesAt: $resource',
+            resource);
       }
 
       await _storage.writeManyAsBytesAt(path, writes,
@@ -625,8 +660,9 @@ class StorageAdapter implements StorageInterface {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
 
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for getFileModifiedTime: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileModifiedTime: $resource',
+            resource);
       }
 
       return await _storage.getFileModifiedTime(path);
@@ -646,8 +682,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for getFileSize: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileSize: $resource',
+            resource);
       }
       return await _storage.getFileSize(path);
     } finally {
@@ -666,8 +703,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for deleteDirectory: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for deleteDirectory: $resource',
+            resource);
       }
 
       await _storage.deleteDirectory(path);
@@ -706,8 +744,9 @@ class StorageAdapter implements StorageInterface {
             firstResource, '$opId-first');
       }
       if (!firstAcquired) {
-        throw Exception(
-            'Failed to acquire lock for copyDirectory first: $firstResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for copyDirectory first: $firstResource',
+            firstResource);
       }
 
       // Acquire second lock
@@ -719,8 +758,9 @@ class StorageAdapter implements StorageInterface {
             secondResource, '$opId-second');
       }
       if (!secondAcquired) {
-        throw Exception(
-            'Failed to acquire lock for copyDirectory second: $secondResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for copyDirectory second: $secondResource',
+            secondResource);
       }
 
       await _storage.copyDirectory(sourcePath, destinationPath);
@@ -761,15 +801,17 @@ class StorageAdapter implements StorageInterface {
       firstAcquired =
           await _lockManager.acquireExclusiveLock(firstResource, '$opId-first');
       if (!firstAcquired) {
-        throw Exception(
-            'Failed to acquire lock for moveDirectory first: $firstResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for moveDirectory first: $firstResource',
+            firstResource);
       }
 
       secondAcquired = await _lockManager.acquireExclusiveLock(
           secondResource, '$opId-second');
       if (!secondAcquired) {
-        throw Exception(
-            'Failed to acquire lock for moveDirectory second: $secondResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for moveDirectory second: $secondResource',
+            secondResource);
       }
 
       await _storage.moveDirectory(sourcePath, destinationPath);
@@ -811,8 +853,9 @@ class StorageAdapter implements StorageInterface {
             firstResource, '$opId-first');
       }
       if (!firstAcquired) {
-        throw Exception(
-            'Failed to acquire lock for copyFile first: $firstResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for copyFile first: $firstResource',
+            firstResource);
       }
 
       // Acquire second lock
@@ -824,8 +867,9 @@ class StorageAdapter implements StorageInterface {
             secondResource, '$opId-second');
       }
       if (!secondAcquired) {
-        throw Exception(
-            'Failed to acquire lock for copyFile second: $secondResource');
+        _throwLockTimeout(
+            'Failed to acquire lock for copyFile second: $secondResource',
+            secondResource);
       }
 
       await _storage.copyFile(sourcePath, destinationPath);
@@ -857,8 +901,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for readLinesStream: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readLinesStream: $resource',
+            resource);
       }
 
       final stream = _storage.readLinesStream(path, offset: offset);
@@ -882,8 +927,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for writeLinesStream: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeLinesStream: $resource',
+            resource);
       }
       await _storage.writeLinesStream(path, lines, append: append);
     } finally {
@@ -907,8 +953,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for appendBytes: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for appendBytes: $resource',
+            resource);
       }
       final off = await _storage.appendBytes(path, bytes,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
@@ -930,8 +977,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for appendString: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for appendString: $resource',
+            resource);
       }
       final off = await _storage.appendString(path, content,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
@@ -952,8 +1000,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireSharedLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire shared lock for readAsLines: $resource');
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readAsLines: $resource',
+            resource);
       }
       return await _storage.readAsLines(path, offset: offset);
     } finally {
@@ -996,8 +1045,9 @@ class StorageAdapter implements StorageInterface {
     try {
       acquired = await _lockManager.acquireExclusiveLock(resource, opId);
       if (!acquired) {
-        throw Exception(
-            'Failed to acquire exclusive lock for replaceFileAtomic: $resource');
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for replaceFileAtomic: $resource',
+            resource);
       }
       await _storage.replaceFileAtomic(tempPath, finalPath);
       // Register final path as touched for current transaction scope (if any)
