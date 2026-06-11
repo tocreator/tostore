@@ -6,8 +6,11 @@ import 'package:path/path.dart' as p;
 import '../Interface/storage_interface.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'ngh_page.dart';
@@ -851,8 +854,12 @@ final class NghPartitionManager {
       codebook.subspaceDimensions,
     );
     if (subspacesPerPage <= 0) {
-      throw StateError(
-          'Codebook sub-space size (${codebook.centroidsPerSubspace} × ${codebook.subspaceDimensions} × 4 bytes) exceeds page capacity');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Codebook sub-space size (${codebook.centroidsPerSubspace} × ${codebook.subspaceDimensions} × 4 bytes) exceeds page capacity',
+        ),
+      ]);
     }
 
     final totalSubspaces = codebook.subspaceCount;
@@ -902,8 +909,12 @@ final class NghPartitionManager {
       }
 
       if (countSubspaces <= 0 || pageCodebook == null || payload == null) {
-        throw StateError(
-            'Codebook sub-space size ($centroidsPerSubspace × $subspaceDimensions × 4 bytes) exceeds page capacity');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Codebook sub-space size ($centroidsPerSubspace × $subspaceDimensions × 4 bytes) exceeds page capacity',
+          ),
+        ]);
       }
 
       final pageBytes = _buildPageBytes(
