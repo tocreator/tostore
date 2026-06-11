@@ -3,6 +3,9 @@ import 'dart:typed_data';
 import 'data_store_impl.dart';
 import 'btree_page.dart';
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
@@ -459,7 +462,12 @@ class IntegrityChecker {
       try {
         final field = schema.fields.firstWhere(
           (col) => col.name == entry.key,
-          orElse: () => throw StateError('Unknown field ${entry.key}'),
+          orElse: () => throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Unknown field ${entry.key}',
+            ),
+          ]),
         );
 
         if (!field.isValidDataType(entry.value, field.type)) {
