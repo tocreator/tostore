@@ -1,6 +1,10 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+
 /// Page redo log: append-only records for crash-safe page replay.
 ///
 /// Goals:
@@ -85,7 +89,14 @@ final class PageRedoLogCodec {
   static Uint8List _u16StringBytes(String s) {
     final b = Uint8List.fromList(utf8.encode(s));
     if (b.length > 0xFFFF) {
-      throw StateError('PageRedoLog: string too long (${b.length})');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'PageRedoLog: string too long (${b.length})',
+          parameterName: 's',
+          passedValue: s,
+        ),
+      ]);
     }
     return b;
   }
@@ -106,7 +117,13 @@ final class PageRedoLogCodec {
 
     if (treeKind == PageRedoTreeKind.indexTree &&
         (indexName == null || indexName.isEmpty)) {
-      throw StateError('PageRedoLog: indexName required for index records');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'PageRedoLog: indexName required for index records',
+          parameterName: 'indexName',
+        ),
+      ]);
     }
 
     final int payloadLen = payload.length;
@@ -175,8 +192,13 @@ final class PageRedoLogCodec {
 
     if (treeKind == PageRedoTreeKind.indexTree &&
         (indexName == null || indexName.isEmpty)) {
-      throw StateError(
-          'PageRedoLog: indexName required for index meta records');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'PageRedoLog: indexName required for index meta records',
+          parameterName: 'indexName',
+        ),
+      ]);
     }
 
     final int recLen = 4 + // recLen itself
