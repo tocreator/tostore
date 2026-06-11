@@ -49,8 +49,6 @@ enum ResultType {
       20003, 'DEV_INVALID_ARGUMENT_MISSING', 'Required argument is missing'),
   devInvalidPrimaryKeyFormat(
       20005, 'DEV_INVALID_PRIMARY_KEY_FORMAT', 'Invalid primary key format'),
-  devInvalidEngineState(20006, 'DEV_INVALID_ENGINE_STATE',
-      'Invalid engine initialization or registry state'),
   devIndexOutOfBounds(
       20007, 'DEV_INDEX_OUT_OF_BOUNDS', 'Index or range is out of bounds'),
   devUnsupportedOperation(20008, 'DEV_UNSUPPORTED_OPERATION',
@@ -79,6 +77,8 @@ enum ResultType {
       'No foreign key relationship for auto join'),
   devInvalidQueryFieldAlias(20303, 'DEV_INVALID_QUERY_FIELD_ALIAS',
       'Query field alias format invalid'),
+  devInvalidExpression(20304, 'DEV_INVALID_EXPRESSION',
+      'Invalid expression configuration or execution'),
   devPermissionDeniedRead(
       21001, 'DEV_PERMISSION_DENIED_READ', 'Read permission denied'),
   devPermissionDeniedWrite(
