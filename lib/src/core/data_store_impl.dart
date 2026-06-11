@@ -279,20 +279,9 @@ class DataStoreImpl {
       );
     }
 
-    final errorMessage = error.toString();
-    final ResultType type;
-    if (errorMessage.toLowerCase().contains('io') ||
-        errorMessage.toLowerCase().contains('file') ||
-        errorMessage.toLowerCase().contains('permission') ||
-        errorMessage.toLowerCase().contains('access')) {
-      type = ResultType.sysIoGeneric;
-    } else {
-      type = ResultType.engError;
-    }
-
     return DbResult.error(
-      type: type,
-      message: 'Cascade $operation failed: $errorMessage',
+      type: ResultType.engError,
+      message: 'Cascade $operation failed: ${error.toString()}',
     );
   }
 
@@ -1372,9 +1361,12 @@ class DataStoreImpl {
     } catch (e) {
       Logger.error('Create table failed: $e', label: 'DataStore.createTable');
       // Convert any unexpected exceptions to DbResult
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Failed to create table ${schema.name}: $e',
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Failed to create table ${schema.name}');
+      return finish(DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
       ));
     }
   }
@@ -1794,11 +1786,13 @@ class DataStoreImpl {
         rethrow;
       }
 
-      return DbResult.error(
-        type: ResultType.engError,
-        message: 'Insert failed: $e',
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError, fallbackMessage: 'Insert failed');
+      return finish(DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
         failedKeys: failedKeys,
-      );
+      ));
     }
   }
 
@@ -3194,10 +3188,15 @@ class DataStoreImpl {
       ));
     } catch (e) {
       Logger.info('Clear table failed: $e', label: 'DataStore-clear');
-      // Convert any unexpected exceptions to DbResult for graceful error handling
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Failed to clear table $tableName: $e',
+      if (isInTransactionWithRollback()) {
+        rethrow;
+      }
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Failed to clear table $tableName');
+      return finish(DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
       ));
     }
   }
@@ -3585,10 +3584,12 @@ class DataStoreImpl {
       if (isInTransactionWithRollback()) {
         rethrow;
       }
-      return DbResult.error(
-        type: ResultType.engError,
-        message: 'Delete failed: $e',
-      );
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError, fallbackMessage: 'Delete failed');
+      return finish(DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
+      ));
     }
   }
 
@@ -3812,34 +3813,7 @@ class DataStoreImpl {
     if (e is TimeoutException) return ResultType.sysTimeout;
     final msg = e.toString().toLowerCase();
     if (msg.contains('timeout')) return ResultType.sysTimeout;
-    if (_looksLikeIoFailure(e, msg)) {
-      if (msg.contains('not found') || msg.contains('no such file')) return ResultType.sysIoNotFound;
-      if (msg.contains('permission') || msg.contains('access denied')) return ResultType.sysIoPermissionDenied;
-      if (msg.contains('disk full') || msg.contains('quota')) return ResultType.sysIoDiskFull;
-      if (msg.contains('locked') || msg.contains('sharing violation')) return ResultType.sysIoFileLocked;
-      return ResultType.sysIoGeneric;
-    }
-    if (msg.contains('unique') ||
-        msg.contains('constraint') ||
-        msg.contains('integrity')) {
-      if (msg.contains('primary key')) return ResultType.bizPrimaryKeyViolation;
-      if (msg.contains('unique')) return ResultType.bizUniqueViolation;
-      if (msg.contains('foreign key')) return ResultType.bizForeignKeyViolation;
-      return ResultType.sysTransactionConflict;
-    }
     return ResultType.sysTransactionAborted;
-  }
-
-  bool _looksLikeIoFailure(Object e, String msg) {
-    final typeName = e.runtimeType.toString().toLowerCase();
-    return typeName.contains('filesystemexception') ||
-        typeName.contains('ioexception') ||
-        typeName.contains('socketexception') ||
-        msg.contains('filesystem') ||
-        msg.contains('file system') ||
-        msg.contains('io error') ||
-        msg.contains('i/o') ||
-        msg.contains('disk');
   }
 
   /// drop table
@@ -3998,10 +3972,15 @@ class DataStoreImpl {
       }
     } catch (e) {
       Logger.error('Failed to delete table: $e', label: 'DataStore-dropTable');
-      // Convert any unexpected exceptions to DbResult
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Failed to drop table $tableName: $e',
+      if (isInTransactionWithRollback()) {
+        rethrow;
+      }
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Failed to drop table $tableName');
+      return finish(DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
       ));
     }
   }
@@ -4917,9 +4896,12 @@ class DataStoreImpl {
         // Ignore errors during error handling
       }
 
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Batch insertion failed: $e',
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Batch insertion failed');
+      return finish(DbResult.batch(
+        statuses: returnResultDetails ? dbEx.statuses : const [],
+        failedCount: dbEx.statuses.length,
         failedKeys: returnResultDetails ? failedKeys : const [],
       ));
     }
@@ -5122,9 +5104,12 @@ class DataStoreImpl {
       if (isInTransactionWithRollback()) {
         rethrow;
       }
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Batch upsert failed: $e',
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Batch upsert failed');
+      return finish(DbResult.batch(
+        statuses: returnResultDetails ? dbEx.statuses : const [],
+        failedCount: dbEx.statuses.length,
       ));
     }
   }
@@ -5802,10 +5787,14 @@ class DataStoreImpl {
       if (isInTransactionWithRollback()) {
         rethrow;
       }
-      return finish(DbResult.error(
-        type: ResultType.engError,
-        message: 'Batch update failed: $e',
-        statuses: returnResultDetails ? batchStatuses : const [],
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Batch update failed');
+      return finish(DbResult.batch(
+        statuses: returnResultDetails
+            ? [...batchStatuses, ...dbEx.statuses]
+            : const [],
+        failedCount: dbEx.statuses.length,
       ));
     }
   }
@@ -7820,9 +7809,12 @@ class DataStoreImpl {
       Logger.error('Failed to delete space $spaceName: $e',
           label: 'DataStore.deleteSpace');
       // Convert any unexpected exceptions to DbResult
-      return DbResult.error(
-        type: ResultType.engError,
-        message: 'Failed to delete space $spaceName: $e',
+      final dbEx = DbException.wrap(e,
+          fallbackType: ResultType.engError,
+          fallbackMessage: 'Failed to delete space $spaceName');
+      return DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
       );
     }
   }
