@@ -97,7 +97,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'listDirectory',
+          )
+        ]);
+      }
 
       final normalizedPath = _normalizePath(path);
 
@@ -168,7 +176,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'deleteFile',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       // Drop from buffer first
       _writeBuffer.remove(normalizedPath);
@@ -190,7 +206,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'deleteDirectory',
+          )
+        ]);
+      }
 
       final normalizedPath = _normalizePath(path);
       final transaction =
@@ -237,7 +261,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'existsFile',
+          )
+        ]);
+      }
 
       final normalizedPath = _normalizePath(path);
 
@@ -263,7 +295,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'existsDirectory',
+          )
+        ]);
+      }
 
       final normalizedPath = _normalizePath(path);
 
@@ -345,7 +385,15 @@ class WebStorageImpl implements StorageInterface {
         Logger.warn('Flush on close failed: $e', label: 'WebStorageAdapter');
       }
 
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'close',
+          )
+        ]);
+      }
       _db!.close();
       _instances.remove(_db!.name);
     } catch (e) {
@@ -449,7 +497,15 @@ class WebStorageImpl implements StorageInterface {
       bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'writeAsString',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       final entry = await _getOrCreateBufferedEntry(normalizedPath,
           prepareBase: append && !_writeBuffer.containsKey(normalizedPath));
@@ -474,7 +530,15 @@ class WebStorageImpl implements StorageInterface {
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'writeAsBytes',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       final entry =
           await _getOrCreateBufferedEntry(normalizedPath, prepareBase: false);
@@ -564,7 +628,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
     if (writes.isEmpty) return;
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'writeManyAsBytesAt',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       // Random writes require base for correct in-place modification.
       final entry =
@@ -611,7 +683,15 @@ class WebStorageImpl implements StorageInterface {
     await _initCompleter.future;
 
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'copyDirectory',
+          )
+        ]);
+      }
 
       final normalizedSourcePath = _normalizePath(sourcePath);
       final normalizedTargetPath = _normalizePath(targetPath);
@@ -865,7 +945,15 @@ class WebStorageImpl implements StorageInterface {
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'appendBytes',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       final entry =
           await _getOrCreateBufferedEntry(normalizedPath, prepareBase: true);
@@ -886,7 +974,15 @@ class WebStorageImpl implements StorageInterface {
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     await _initCompleter.future;
     try {
-      if (_db == null) throw Exception('Database not initialized');
+      if (_db == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Database not initialized',
+            operation: 'appendString',
+          )
+        ]);
+      }
       final normalizedPath = _normalizePath(path);
       final entry =
           await _getOrCreateBufferedEntry(normalizedPath, prepareBase: true);
@@ -1016,6 +1112,9 @@ class WebStorageImpl implements StorageInterface {
   }
 
   static DbException _wrapWebIoError(Object e, String operation, String path) {
+    if (e is DbException) {
+      return e;
+    }
     ResultType type = ResultType.sysIoGeneric;
     String message = e.toString();
 
