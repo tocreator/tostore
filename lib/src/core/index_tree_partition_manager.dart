@@ -286,13 +286,12 @@ final class IndexTreePartitionManager {
       }
       return leaf;
     } catch (e) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Corrupted B+Tree leaf page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
-        ),
-      ]);
+      throw DbException.forceWrap(
+        e,
+        forceType: ResultType.engError,
+        message:
+            'Corrupted B+Tree leaf page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+      );
     }
   }
 
@@ -362,13 +361,12 @@ final class IndexTreePartitionManager {
       }
       return page;
     } catch (e) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Corrupted B+Tree internal page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
-        ),
-      ]);
+      throw DbException.forceWrap(
+        e,
+        forceType: ResultType.engError,
+        message:
+            'Corrupted B+Tree internal page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+      );
     }
   }
 
