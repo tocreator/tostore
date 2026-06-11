@@ -213,7 +213,6 @@
   | **Code**: `20002`<br>`ResultType.devInvalidArgumentType` | 参数的数据类型不匹配（期待数字传入字符串等） | <ul><li>`parameterName`: 参数名</li><li>`passedValue`: 传入的非法类型对象，如 `{"foo": "bar"}`（被期望为 String 时）</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20003`<br>`ResultType.devInvalidArgumentMissing` | 必填的接口入参未传入 | <ul><li>`parameterName`: 缺失的必填参数名 (如 `"dbPath"`)</li><li>`passedValue`: `null` (代表该值未传)</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20005`<br>`ResultType.devInvalidPrimaryKeyFormat` | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） | <ul><li>`parameterName`: `"primaryKey"` 或 主键字段名</li><li>`passedValue`: 传入的非法主键值，例如 `"invalid_id_value"`</li><li>`primaryKey`: 传入的非法主键值</li></ul> |
-  | **Code**: `20006`<br>`ResultType.devInvalidEngineState` | 引擎状态或未初始化错误（尝试在未准备好时操作引擎组件） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20007`<br>`ResultType.devIndexOutOfBounds` | 索引或范围超限错误（如越界读写缓冲区） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20008`<br>`ResultType.devUnsupportedOperation` | 当前上下文不支持的操作（不支持该平台、未实现等） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20009`<br>`ResultType.devInvalidDataFormat` | 数据流格式或编解码失败（数据反序列化非法） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
@@ -228,7 +227,8 @@
   | **Code**: `20301`<br>`ResultType.devInvalidQuerySelectField` | 查询 Select 字段非法（不是 String 或 QueryAggregation） | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 传入的非法的查询投影字段值</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20302`<br>`ResultType.devInvalidQueryForeignKeyJoin` | 自动 Join 时两表之间未定义外键关系 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 试图进行自动 Join 的未定义关联的另一张表名</li><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `20303`<br>`ResultType.devInvalidQueryFieldAlias` | 查询字段的别名命名格式不正确 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 非法的查询别名定义</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | 传入了表中未定义的未知字段 | <ul><li>`parameterName`: 未知或不存在的字段名 (如 `"extra"`)</li><li>`passedValue`: 传入的未知字段值</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
+  | **Code**: `20304`<br>`ResultType.devInvalidExpression` | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） | <ul><li>`parameterName`: 异常维度（如 `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 非法值或参数长度</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | 传入了表中未定义的未知字段 | <ul><li>`parameterName`: 未知或不存在的字段名 (如 `"extra"`)</li><li>`passedValue`: 传入的未知字段值</li><li>`primaryKey`: 操作 of the record primary key (if any)</li></ul> |
 
 - **JSON 反序列化样例**（分页游标的排序条件与查询要求的排序条件冲突）：
   ```json
@@ -464,7 +464,6 @@ try {
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 开发者错误 | 参数的数据类型不匹配（期待数字传入字符串等） |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 开发者错误 | 必填的接口入参未传入 |
 | **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 开发者错误 | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） |
-| **20006** | `DEV_INVALID_ENGINE_STATE` | `ResultType.devInvalidEngineState` | 开发者错误 | 引擎状态或未初始化错误（尝试在未准备好时操作引擎组件） |
 | **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 开发者错误 | 索引或范围超限错误（如越界读写缓冲区） |
 | **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 开发者错误 | 当前上下文不支持的操作（不支持该平台、未实现等） |
 | **20009** | `DEV_INVALID_DATA_FORMAT` | `ResultType.devInvalidDataFormat` | 开发者错误 | 数据流格式或编解码失败（数据反序列化非法） |
@@ -479,6 +478,7 @@ try {
 | **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 开发者错误 | 查询 Select 字段非法（不是 String 或 QueryAggregation） |
 | **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 开发者错误 | 自动 Join 时两表之间未定义外键关系 |
 | **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 开发者错误 | 查询字段的别名命名格式不正确 |
+| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 开发者错误 | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） |
 | **21001** | `DEV_PERMISSION_DENIED_READ` | `ResultType.devPermissionDeniedRead` | 开发者错误 | 细粒度安全限制：读权限被拒绝 |
 | **21002** | `DEV_PERMISSION_DENIED_WRITE` | `ResultType.devPermissionDeniedWrite` | 开发者错误 | 细粒度安全限制：写权限被拒绝 |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | 开发者错误 | 要操作的数据库表名称不存在 |
