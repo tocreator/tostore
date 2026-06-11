@@ -3,6 +3,9 @@ import '../handler/logger.dart';
 import '../model/global_config.dart';
 import '../model/meta_info.dart';
 import '../model/space_config.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'data_store_impl.dart';
 
 /// Directory manager, responsible for table directory allocation and mapping logic
@@ -514,7 +517,12 @@ class DirectoryManager {
     final dirInfo = await getTableDirectoryInfo(tableName, isGlobal,
         spaceName: currentSpaceName);
     if (dirInfo == null) {
-      throw StateError('Failed to allocate directory for table $tableName');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Failed to allocate directory for table $tableName.',
+        )
+      ]);
     }
     final tablePath = _getTablePath(tableName, isGlobal, dirIndex,
         spaceName: currentSpaceName);
@@ -685,9 +693,14 @@ class DirectoryManager {
         if (existingNew != null &&
             (existingNew.dirIndex != existingOld.dirIndex ||
                 existingNew.isGlobal != existingOld.isGlobal)) {
-          throw StateError(
-            'Conflicting directory mapping already exists for table $newTableName',
-          );
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devSchemaTableExists,
+              message:
+                  'Conflicting directory mapping already exists for table $newTableName.',
+              tableName: newTableName,
+            )
+          ]);
         }
 
         final updatedTableDirMap =
@@ -714,9 +727,14 @@ class DirectoryManager {
       if (existingNew != null &&
           (existingNew.dirIndex != existingOld.dirIndex ||
               existingNew.isGlobal != existingOld.isGlobal)) {
-        throw StateError(
-          'Conflicting directory mapping already exists for table $newTableName',
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devSchemaTableExists,
+            message:
+                'Conflicting directory mapping already exists for table $newTableName.',
+            tableName: newTableName,
+          )
+        ]);
       }
 
       final updatedTableDirMap =
