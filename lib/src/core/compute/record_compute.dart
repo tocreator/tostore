@@ -347,10 +347,15 @@ dynamic _evaluateExprNode(
     return DateTime.now().toIso8601String();
   } else if (node is FieldRef) {
     if (!validFieldNames.contains(node.fieldName)) {
-      throw ArgumentError(
-        'Invalid field reference: "${node.fieldName}". '
-        'Field must exist in the table schema.',
-      );
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devFieldNotFound,
+          message:
+              'Invalid field reference: "${node.fieldName}". Field must exist in the table schema.',
+          parameterName: 'fieldName',
+          passedValue: node.fieldName,
+        )
+      ]);
     }
 
     final value = record[node.fieldName];
@@ -439,41 +444,95 @@ dynamic _evaluateExprNode(
     switch (node.functionName) {
       case 'min':
         if (args.length != 2) {
-          throw ArgumentError('min() requires exactly 2 arguments');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'min() requires exactly 2 arguments',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0] < args[1] ? args[0] : args[1];
       case 'max':
         if (args.length != 2) {
-          throw ArgumentError('max() requires exactly 2 arguments');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'max() requires exactly 2 arguments',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0] > args[1] ? args[0] : args[1];
       case 'round':
         if (args.length != 1) {
-          throw ArgumentError('round() requires exactly 1 argument');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'round() requires exactly 1 argument',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0].round();
       case 'floor':
         if (args.length != 1) {
-          throw ArgumentError('floor() requires exactly 1 argument');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'floor() requires exactly 1 argument',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0].floor();
       case 'ceil':
         if (args.length != 1) {
-          throw ArgumentError('ceil() requires exactly 1 argument');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'ceil() requires exactly 1 argument',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0].ceil();
       case 'abs':
         if (args.length != 1) {
-          throw ArgumentError('abs() requires exactly 1 argument');
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidArgumentFormat,
+              message: 'abs() requires exactly 1 argument',
+              parameterName: 'arguments',
+              passedValue: args.length,
+            )
+          ]);
         }
         return args[0].abs();
       default:
-        throw ArgumentError(
-          'Unknown function: ${node.functionName}. '
-          'Supported functions: min, max, round, floor, ceil, abs.',
-        );
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message:
+                'Unknown function: ${node.functionName}. Supported functions: min, max, round, floor, ceil, abs.',
+            parameterName: 'functionName',
+            passedValue: node.functionName,
+          )
+        ]);
     }
   }
 
-  throw ArgumentError('Unknown expression node type: ${node.runtimeType}');
+  throw DbException([
+    InvalidArgumentStatus(
+      type: ResultType.devInvalidArgumentFormat,
+      message: 'Unknown expression node type: ${node.runtimeType}',
+      parameterName: 'node',
+      passedValue: node.runtimeType.toString(),
+    )
+  ]);
 }
