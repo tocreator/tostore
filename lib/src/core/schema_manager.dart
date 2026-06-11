@@ -4,7 +4,10 @@ import 'package:path/path.dart' show dirname;
 
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
 import '../model/meta_info.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import 'data_store_impl.dart';
@@ -450,7 +453,13 @@ class SchemaManager {
   }) async {
     final resolvedSchema = schema ?? await getTableSchema(tableName);
     if (resolvedSchema == null) {
-      throw StateError('Table schema not found: $tableName');
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table schema not found: $tableName',
+          tableName: tableName,
+        ),
+      ]);
     }
     await saveTableSchema(
       tableName,
@@ -873,7 +882,7 @@ class SchemaManager {
     } catch (e) {
       Logger.error('Failed to save table schema: $tableName, $e',
           label: 'SchemaManager.saveTableSchema');
-      throw Exception('Failed to save table schema: $e');
+      throw DbException.wrap(e, fallbackMessage: 'Failed to save table schema');
     }
   }
 
@@ -1016,37 +1025,61 @@ class SchemaManager {
           _dataStore.upsertTtlPlanForSchema(newSchema);
           return;
         }
-        throw StateError('Schema for table $oldTableName does not exist');
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devTableNotFound,
+            message: 'Schema for table $oldTableName does not exist',
+            tableName: oldTableName,
+          ),
+        ]);
       }
 
       if (existingNewPartitionIndex != null &&
           existingNewPartitionIndex != oldPartitionIndex) {
-        throw StateError(
-          'Schema for table $newTableName already exists in another partition',
-        );
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devSchemaTableExists,
+            message:
+                'Schema for table $newTableName already exists in another partition',
+            tableName: newTableName,
+          ),
+        ]);
       }
 
       final dirIndex =
           await _getPartitionDirIndexForExistingPartition(oldPartitionIndex);
       if (dirIndex == null) {
-        throw StateError(
-          'Schema partition directory not found for table $oldTableName',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Schema partition directory not found for table $oldTableName',
+            target: oldTableName,
+          ),
+        ]);
       }
 
       final partitionPath = _dataStore.pathManager
           .getSchemaPartitionFilePath(oldPartitionIndex, dirIndex);
       if (!await _dataStore.storage.existsFile(partitionPath)) {
-        throw StateError(
-          'Schema partition file not found for table $oldTableName',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Schema partition file not found for table $oldTableName',
+            target: partitionPath,
+          ),
+        ]);
       }
 
       final content = await _dataStore.storage.readAsString(partitionPath);
       if (content == null || content.isEmpty) {
-        throw StateError(
-          'Schema partition file is empty for table $oldTableName',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Schema partition file is empty for table $oldTableName',
+            target: partitionPath,
+          ),
+        ]);
       }
 
       final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
@@ -1061,9 +1094,14 @@ class SchemaManager {
           _dataStore.upsertTtlPlanForSchema(newSchema);
           return;
         }
-        throw StateError(
-          'Schema payload not found for table $oldTableName in partition $oldPartitionIndex',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Schema payload not found for table $oldTableName in partition $oldPartitionIndex',
+            target: oldTableName,
+          ),
+        ]);
       }
 
       final oldLayout = _tryParseFieldStorageLayout(
