@@ -7,17 +7,17 @@ import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../model/background_write_entry.dart';
-import '../model/background_write_mode.dart';
 import '../model/background_write_type.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
+import '../model/db_exception.dart';
 import '../model/key_migration_info.dart';
 import '../model/meta_info.dart';
 import '../model/migration_meta.dart';
 import '../model/migration_task.dart';
+import '../model/migration_write_mode.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
@@ -1321,14 +1321,15 @@ class MigrationManager {
       bool startProcessing = true,
       bool allowAfterDataMigration = false,
       TableSchema? targetSchemaSnapshot,
-      BackgroundWriteMode? writeMode,
+      MigrationWriteMode? writeMode,
       List<String>? specificIndexes}) async {
     try {
       if (operations.isEmpty) {
         throw DbException([
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentMissing,
-            message: "Failed to add migration task for table '$tableName' because no schema operations were provided. "
+            message:
+                "Failed to add migration task for table '$tableName' because no schema operations were provided. "
                 "If you are updating the schema programmatically, please ensure at least one operation (such as addField, renameField, or alterField) "
                 "is added to the operation list before executing the migration.",
             parameterName: 'operations',
@@ -1582,7 +1583,7 @@ class MigrationManager {
 
       task = await _maybeEnableDeletedSlotCompaction(task, sortedOperations);
 
-      // Pre-calculate BackgroundWriteMode and specificIndexes upfront if not provided
+      // Pre-calculate MigrationWriteMode and specificIndexes upfront if not provided
       if (task.writeMode == null || task.specificIndexes == null) {
         final calcOldSchema = task.oldSchemaSnapshot ?? oldSchema;
         final calcTargetSchema = task.targetSchemaSnapshot ?? targetSchema;
@@ -1598,11 +1599,11 @@ class MigrationManager {
         final derivedWriteMode = task.writeMode ??
             (currentNeedsTableWrite
                 ? (indexesToBuild.isNotEmpty
-                    ? BackgroundWriteMode.tableAndIndex
-                    : BackgroundWriteMode.tableOnly)
+                    ? MigrationWriteMode.tableAndIndex
+                    : MigrationWriteMode.tableOnly)
                 : (indexesToBuild.isNotEmpty
-                    ? BackgroundWriteMode.indexOnly
-                    : BackgroundWriteMode.tableAndIndex));
+                    ? MigrationWriteMode.indexOnly
+                    : MigrationWriteMode.none));
         final derivedSpecificIndexes = task.specificIndexes ?? indexesToBuild;
 
         task = task.copyWith(
@@ -3718,9 +3719,11 @@ class MigrationManager {
 
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
       final specificIndexes = currentTask.specificIndexes ?? const <String>[];
-      final needDataMigration = currentTask.forceDataMigration ||
-          needsTableWrite ||
-          specificIndexes.isNotEmpty;
+      final needDataMigration =
+          currentTask.writeMode != MigrationWriteMode.none &&
+              (currentTask.forceDataMigration ||
+                  needsTableWrite ||
+                  specificIndexes.isNotEmpty);
 
       if (renameOp == null && needDataMigration && oldSchema == null) {
         throw DbException([
@@ -3880,7 +3883,7 @@ class MigrationManager {
               final startCursor = currentTask.checkpointKeyForSpace(space);
 
               final writeMode =
-                  currentTask.writeMode ?? BackgroundWriteMode.tableAndIndex;
+                  currentTask.writeMode ?? MigrationWriteMode.tableAndIndex;
               final specificIndexes = currentTask.specificIndexes != null &&
                       currentTask.specificIndexes!.isNotEmpty
                   ? currentTask.specificIndexes
@@ -5012,15 +5015,16 @@ class MigrationManager {
       // Get both schemas for comparison
       final definitionSchema = task.targetSchemaSnapshot ??
           _dataStore.getInitialSchemas().firstWhere(
-            (s) => s.name == targetTableName,
-            orElse: () => throw DbException([
-              GeneralStatus(
-                type: ResultType.engError,
-                message: "Migration engine error: failed to resolve the target schema for table '$targetTableName' during task recovery. "
-                    "The schema definition might have been modified or removed while a pending migration task was still active.",
-              ),
-            ]),
-          );
+                (s) => s.name == targetTableName,
+                orElse: () => throw DbException([
+                  GeneralStatus(
+                    type: ResultType.engError,
+                    message:
+                        "Migration engine error: failed to resolve the target schema for table '$targetTableName' during task recovery. "
+                        "The schema definition might have been modified or removed while a pending migration task was still active.",
+                  ),
+                ]),
+              );
 
       final currentSchema =
           await _dataStore.schemaManager?.getTableSchema(targetTableName);
