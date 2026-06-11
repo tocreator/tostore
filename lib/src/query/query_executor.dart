@@ -81,7 +81,7 @@ class QueryExecutor {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Schema manager not initialized',
         )
       ]);
@@ -112,7 +112,7 @@ class QueryExecutor {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Query optimizer not initialized',
         )
       ]);
@@ -2664,12 +2664,11 @@ class QueryExecutor {
       return data;
     } catch (e) {
       Logger.error('Sort failed: $e', label: "QueryExecutor-_applySort");
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.devInvalidArgumentFormat,
-          message: 'Error applying sort: ${e.toString()}',
-        )
-      ]);
+      throw DbException.wrap(
+        e,
+        fallbackType: ResultType.devInvalidArgumentFormat,
+        fallbackMessage: 'Error applying sort',
+      );
     }
   }
 
@@ -2777,7 +2776,8 @@ class QueryExecutor {
       if (allIndexes == null) return (fields: <String>[], isUnique: false);
       final idx = allIndexes.firstWhere((i) => i.actualIndexName == indexName);
       return (fields: idx.fields, isUnique: idx.unique);
-    } catch (_) {
+    } catch (e) {
+      if (e is DbException) rethrow;
       // Fallback for implicit unique single-field indexes (uniq_field).
       if (indexName.startsWith('uniq_') && indexName.length > 5) {
         return (fields: <String>[indexName.substring(5)], isUnique: true);
@@ -3473,7 +3473,7 @@ class QueryExecutor {
     if (schemaMgr == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Schema manager not initialized',
         )
       ]);
@@ -3500,7 +3500,7 @@ class QueryExecutor {
     if (optimizer == null) {
       throw DbException([
         GeneralStatus(
-          type: ResultType.devInvalidEngineState,
+          type: ResultType.engError,
           message: 'Query optimizer not initialized',
         )
       ]);
