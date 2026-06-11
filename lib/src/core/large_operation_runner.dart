@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:math';
 
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_mode.dart';
 import '../model/background_write_type.dart';
@@ -569,7 +572,17 @@ class LargeOperationRunner {
                   skipBufferCheck: true,
                 );
                 if (violation != null) {
-                  throw violation;
+                  throw DbException([
+                    ConstraintStatus(
+                      type: ResultType.bizUniqueViolation,
+                      message: violation.message,
+                      tableName: tableName,
+                      constraintName: violation.indexName,
+                      fields: violation.fields,
+                      conflictingKeys: [violation.value],
+                      primaryKey: pkValueStr,
+                    ),
+                  ]);
                 }
               } catch (e) {
                 if (reservedKeys != null) {
@@ -634,7 +647,17 @@ class LargeOperationRunner {
                     skipBufferCheck: true,
                   );
                   if (violation != null) {
-                    throw violation;
+                    throw DbException([
+                      ConstraintStatus(
+                        type: ResultType.bizUniqueViolation,
+                        message: violation.message,
+                        tableName: tableName,
+                        constraintName: violation.indexName,
+                        fields: violation.fields,
+                        conflictingKeys: [violation.value],
+                        primaryKey: newPkVal,
+                      ),
+                    ]);
                   }
                 } catch (e) {
                   if (pkReservedKeys != null) {
