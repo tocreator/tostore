@@ -11,6 +11,9 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/table_schema.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/vector_batch_prepare_compute.dart';
 import 'compute_manager.dart';
@@ -132,11 +135,14 @@ class VectorIndexManager {
     );
     for (final result in results) {
       if (result.vectors.length != result.primaryKeys.length) {
-        throw StateError(
-          'Vector prepare result length mismatch: '
-          'vectors=${result.vectors.length}, '
-          'primaryKeys=${result.primaryKeys.length}',
-        );
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Vector prepare result length mismatch: '
+                'vectors=${result.vectors.length}, '
+                'primaryKeys=${result.primaryKeys.length}',
+          ),
+        ]);
       }
 
       for (int i = 0; i < result.vectors.length; i++) {
