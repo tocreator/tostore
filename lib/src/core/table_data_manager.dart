@@ -3,21 +3,21 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import '../handler/logger.dart';
 import '../handler/binary_schema_codec.dart';
+import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_aggregation.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/transaction_models.dart';
@@ -755,7 +755,12 @@ class TableDataManager {
       // Use ID pool optimization - batch generation method is implemented internally
       final ids = await generator.getId(1);
       if (ids.isEmpty) {
-        throw Exception('Failed to generate ID, returned empty list');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Failed to generate ID, returned empty list',
+          ),
+        ]);
       }
 
       // If it's a sequential increment type, update max ID value
@@ -1928,7 +1933,13 @@ class TableDataManager {
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        throw Exception('Table schema is null, cannot get batch ids');
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devTableNotFound,
+            message: 'Table schema is null, cannot get batch ids',
+            tableName: tableName,
+          ),
+        ]);
       }
 
       final generator = IdGeneratorFactory.createGenerator(
@@ -2542,9 +2553,13 @@ class TableDataManager {
   }) async {
     final lockManager = _dataStore.lockManager;
     if (lockManager == null) {
-      throw StateError(
-        'Cannot acquire table write lock after database shutdown: $tableName',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Cannot acquire table write lock after database shutdown: $tableName',
+        ),
+      ]);
     }
 
     final lockKey = _tableLockResource(tableName);
@@ -2555,10 +2570,14 @@ class TableDataManager {
       operationId,
     );
     if (!acquired) {
-      throw TimeoutException(
-        'Timed out waiting for table write lock: $tableName',
-        Duration(milliseconds: lockManager.baseLockTimeout),
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysTimeoutLockAcquisition,
+          message: 'Timed out waiting for table write lock: $tableName',
+          target: lockKey,
+          operation: 'acquireTableWriteLock',
+        ),
+      ]);
     }
     return TableWriteLock._(
       tableName: tableName,
@@ -2570,7 +2589,13 @@ class TableDataManager {
   void releaseTableWriteLock(TableWriteLock lock) {
     if (lock._released) return;
     if (lock.tableName.isEmpty) {
-      throw StateError('Invalid table write lock');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Invalid table write lock: tableName is empty',
+          parameterName: 'lock',
+        ),
+      ]);
     }
     _dataStore.lockManager?.releaseExclusiveLock(
       lock.resource,
@@ -4381,12 +4406,21 @@ final class TableWriteLock {
 
   void validateBorrowedFor(String expectedTableName) {
     if (_released) {
-      throw StateError('Table write lock already released: $tableName');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Table write lock already released: $tableName',
+        ),
+      ]);
     }
     if (tableName != expectedTableName) {
-      throw StateError(
-        'Table write lock mismatch: expected $expectedTableName, got $tableName',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Table write lock mismatch: expected $expectedTableName, got $tableName',
+        ),
+      ]);
     }
   }
 }
