@@ -3,6 +3,10 @@ import 'dart:math';
 
 import 'dart:typed_data';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+
 import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../handler/value_matcher.dart';
@@ -1093,7 +1097,14 @@ class _IsolateBase62Encoder {
   /// Encode BigInt to Base62 string
   static String encode(BigInt value) {
     if (value < BigInt.zero) {
-      throw ArgumentError('Base62 encoding does not support negative numbers');
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'Base62 encoding does not support negative numbers',
+          parameterName: 'value',
+          passedValue: value.toString(),
+        )
+      ]);
     }
     if (value == BigInt.zero) {
       return '0';
@@ -1672,7 +1683,12 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     await yieldController.maybeYield();
     final p = pages[i];
     if (p.typeIndex < 0 || p.typeIndex >= BTreePageType.values.length) {
-      throw StateError('Invalid BTree page type index: ${p.typeIndex}');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Invalid BTree page type index: ${p.typeIndex}',
+        )
+      ]);
     }
     final pageType = BTreePageType.values[p.typeIndex];
     final plainPayload = _resolveBTreePagePayload(p, pageType);
@@ -1695,13 +1711,16 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     final int totalLen = BTreePageHeader.size + encodedPayload.length;
     if (totalLen > pageSize) {
       final int keyId = request.customKeyId ?? EncoderHandler.getCurrentKeyId();
-      throw StateError(
-        'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
-        '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
-        'plainPayload=${plainPayload.length}, typeIndex=${p.typeIndex}, '
-        'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
-        'encryptionTypeIndex=${request.encryptionTypeIndex}, keyId=$keyId).',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
+              '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
+              'plainPayload=${plainPayload.length}, typeIndex=${p.typeIndex}, '
+              'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
+              'encryptionTypeIndex=${request.encryptionTypeIndex}, keyId=$keyId).',
+        )
+      ]);
     }
 
     final pageBytes = BTreePageIO.buildPageBytes(
@@ -1758,13 +1777,23 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.leaf:
       final page = item.leafPage;
       if (page == null) {
-        throw StateError('Leaf page encode item is missing leafPage');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Leaf page encode item is missing leafPage',
+          )
+        ]);
       }
       return page.encodePayload();
     case BTreePageType.internal:
       final page = item.internalPage;
       if (page == null) {
-        throw StateError('Internal page encode item is missing internalPage');
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Internal page encode item is missing internalPage',
+          )
+        ]);
       }
       return page.encodePayload();
     case BTreePageType.meta:
@@ -1775,9 +1804,13 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.nghPqCode:
     case BTreePageType.nghRawVector:
     case BTreePageType.nghCodebook:
-      throw StateError(
-        'BTree page encode item for $pageType requires a prebuilt payload',
-      );
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'BTree page encode item for $pageType requires a prebuilt payload',
+        )
+      ]);
   }
 }
 
