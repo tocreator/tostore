@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'background_write_mode.dart';
+import 'migration_write_mode.dart';
 import 'meta_info.dart';
 import 'table_schema.dart';
 import 'wal_pointer.dart';
@@ -40,7 +40,7 @@ class MigrationTask {
   // path to the pre-migration backup
   final String? backupPath;
   // target write mode for background execution
-  final BackgroundWriteMode? writeMode;
+  final MigrationWriteMode? writeMode;
   // specific index names to build during execution (null means all)
   final List<String>? specificIndexes;
 
@@ -109,7 +109,7 @@ class MigrationTask {
             : const <String, String>{},
         backupPath: json['backupPath'] as String?,
         writeMode: json['writeMode'] != null
-            ? BackgroundWriteMode.values
+            ? MigrationWriteMode.values
                 .firstWhere((e) => e.name == json['writeMode'])
             : null,
         specificIndexes: (json['specificIndexes'] as List?)?.cast<String>(),
@@ -211,7 +211,7 @@ class MigrationTask {
     bool? forceDataMigration,
     Map<String, String>? spaceCheckpointKeys,
     String? backupPath,
-    BackgroundWriteMode? writeMode,
+    MigrationWriteMode? writeMode,
     List<String>? specificIndexes,
   }) =>
       MigrationTask(
