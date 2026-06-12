@@ -5,9 +5,11 @@ import '../Interface/future_builder_mixin.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/schema_update_result.dart';
+import '../model/migration_write_mode.dart';
 
 /// Schema builder for chain operations
-class SchemaBuilder with FutureBuilderMixin {
+class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
   final DataStoreImpl _dataStore;
   final String _tableName;
   final List<MigrationOperation> _operations = [];
@@ -267,20 +269,59 @@ class SchemaBuilder with FutureBuilderMixin {
     return this;
   }
 
-  /// Get future result - returns migration task ID for tracking
+  /// Get future result - returns schema update result model
   @override
-  Future<String> get future async {
-    // create migration task (schema is updated immediately; data migration runs async)
-    final task = await _dataStore.migrationManager?.addMigrationTask(
-        _tableName, _operations,
+  Future<SchemaUpdateResult> get future async {
+    try {
+      final task = await _dataStore.migrationManager?.addMigrationTask(
+        _tableName,
+        _operations,
         startProcessing: true,
-        allowAfterDataMigration: _allowAfterDataMigration);
+        allowAfterDataMigration: _allowAfterDataMigration,
+      );
 
-    if (task == null) {
-      return ''; // Return empty string to indicate creation failed
+      if (task == null) {
+        return SchemaUpdateResult(
+          validationStatuses: [
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Failed to add migration task: returned task is null',
+            )
+          ],
+          taskId: null,
+          estimateDuration: Duration.zero,
+          writeMode: MigrationWriteMode.none,
+        );
+      }
+
+      final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
+      final duration = task.estimateDuration ?? Duration.zero;
+
+      return SchemaUpdateResult(
+        validationStatuses: const [],
+        taskId: task.taskId,
+        estimateDuration: duration,
+        writeMode: derivedWriteMode,
+      );
+    } on DbException catch (e) {
+      return SchemaUpdateResult(
+        validationStatuses: e.statuses,
+        taskId: null,
+        estimateDuration: Duration.zero,
+        writeMode: MigrationWriteMode.none,
+      );
+    } catch (e) {
+      return SchemaUpdateResult(
+        validationStatuses: [
+          GeneralStatus(
+            type: ResultType.engError,
+            message: e.toString(),
+          )
+        ],
+        taskId: null,
+        estimateDuration: Duration.zero,
+        writeMode: MigrationWriteMode.none,
+      );
     }
-
-    // Return immediately; caller can poll status via queryMigrationTaskStatus
-    return task.taskId;
   }
 }
