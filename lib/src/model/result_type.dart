@@ -227,7 +227,5 @@ enum ResultType {
   bool get isEngineError => code >= 99000 && code < 100000;
 
   /// Whether the error is a fatal error that must throw exception in any environment
-  bool get isFatalError =>
-      this == ResultType.devEngineIncompatible ||
-      name.startsWith('devMigration');
+  bool get isFatalError => this == ResultType.devEngineIncompatible;
 }
