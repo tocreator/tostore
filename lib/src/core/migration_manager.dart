@@ -1612,6 +1612,18 @@ class MigrationManager {
         );
       }
 
+      // Calculate and set estimateDuration
+      if (task.estimateDuration == null) {
+        final recordCount =
+            await _dataStore.tableDataManager.getTableRecordCount(tableName);
+        final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
+        final duration =
+            _estimateMigrationDuration(derivedWriteMode, recordCount);
+        task = task.copyWith(
+          estimateDuration: duration,
+        );
+      }
+
       // For the active space, immediately set `isBuilding = true` for target indexes
       if (task.specificIndexes != null && task.specificIndexes!.isNotEmpty) {
         final currentSchema = task.targetSchemaSnapshot ?? targetSchema;
@@ -3583,6 +3595,21 @@ class MigrationManager {
           success = false;
           errors.add(e);
 
+          final List<ResultStatus> newErrors = [];
+          if (e is DbException) {
+            newErrors.addAll(e.statuses);
+          } else {
+            newErrors.add(GeneralStatus(
+              type: ResultType.engError,
+              message: e.toString(),
+            ));
+          }
+          final updatedTask = task.copyWith(
+            errors: newErrors,
+          );
+          await _saveMigrationTask(updatedTask);
+          _updatePendingTaskInMemory(updatedTask);
+
           // Keep the task on disk and in memory so startup / the next scheduler
           // pass can retry idempotent cutover steps after a crash or transient error.
           _unregisterRuntimeMigrationForTask(task);
@@ -4921,6 +4948,8 @@ class MigrationManager {
           pendingSpaces: const [],
           processedSpacesCount: 0,
           totalSpacesCount: 0,
+          errors: const [],
+          writeMode: MigrationWriteMode.none,
         );
       }
 
@@ -4944,6 +4973,8 @@ class MigrationManager {
           pendingSpaces: const [],
           processedSpacesCount: 0,
           totalSpacesCount: 0,
+          errors: const [],
+          writeMode: MigrationWriteMode.none,
         );
       }
 
@@ -4982,6 +5013,8 @@ class MigrationManager {
         totalRecordsProcessed: stats?.totalRecords ?? 0,
         throughput: stats?.calculateThroughput() ?? 0.0,
         currentSpaceProgress: stats?.calculateCurrentSpaceProgress() ?? 0.0,
+        errors: task.errors ?? const [],
+        writeMode: task.writeMode,
       );
     } catch (e) {
       Logger.error(
@@ -5675,6 +5708,31 @@ class MigrationManager {
       }
     }
     return result;
+  }
+
+  /// Estimate migration duration based on writeMode and recordCount
+  Duration _estimateMigrationDuration(
+      MigrationWriteMode writeMode, int recordCount) {
+    if (writeMode == MigrationWriteMode.none) {
+      return const Duration(milliseconds: 5); // Base schema write overhead
+    }
+    double msPerRecord = 0.0;
+    switch (writeMode) {
+      case MigrationWriteMode.indexOnly:
+        msPerRecord = 0.03;
+        break;
+      case MigrationWriteMode.tableOnly:
+        msPerRecord = 0.08;
+        break;
+      case MigrationWriteMode.tableAndIndex:
+        msPerRecord = 0.12;
+        break;
+      case MigrationWriteMode.none:
+        msPerRecord = 0.0;
+        break;
+    }
+    final calculatedMs = (recordCount * msPerRecord).round() + 5;
+    return Duration(milliseconds: calculatedMs);
   }
 }
 
