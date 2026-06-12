@@ -2,6 +2,7 @@ import '../core/data_store_impl.dart';
 import '../model/migration_task.dart';
 import '../model/table_schema.dart';
 import '../Interface/future_builder_mixin.dart';
+import '../handler/platform_handler.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -272,6 +273,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
   /// Get future result - returns schema update result model
   @override
   Future<SchemaUpdateResult> get future async {
+    SchemaUpdateResult result;
     try {
       final task = await _dataStore.migrationManager?.addMigrationTask(
         _tableName,
@@ -281,7 +283,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
       );
 
       if (task == null) {
-        return SchemaUpdateResult(
+        result = SchemaUpdateResult(
           validationStatuses: [
             GeneralStatus(
               type: ResultType.engError,
@@ -292,26 +294,29 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
           estimateDuration: Duration.zero,
           writeMode: MigrationWriteMode.none,
         );
+      } else {
+        final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
+        final duration = task.estimateDuration ?? Duration.zero;
+
+        result = SchemaUpdateResult(
+          validationStatuses: const [],
+          taskId: task.taskId,
+          estimateDuration: duration,
+          writeMode: derivedWriteMode,
+        );
       }
-
-      final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
-      final duration = task.estimateDuration ?? Duration.zero;
-
-      return SchemaUpdateResult(
-        validationStatuses: const [],
-        taskId: task.taskId,
-        estimateDuration: duration,
-        writeMode: derivedWriteMode,
-      );
     } on DbException catch (e) {
-      return SchemaUpdateResult(
+      result = SchemaUpdateResult(
         validationStatuses: e.statuses,
         taskId: null,
         estimateDuration: Duration.zero,
         writeMode: MigrationWriteMode.none,
       );
     } catch (e) {
-      return SchemaUpdateResult(
+      if (PlatformHandler.isDebug) {
+        rethrow;
+      }
+      result = SchemaUpdateResult(
         validationStatuses: [
           GeneralStatus(
             type: ResultType.engError,
@@ -323,5 +328,8 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
         writeMode: MigrationWriteMode.none,
       );
     }
+
+    DbException.checkDeveloperError(result);
+    return result;
   }
 }
