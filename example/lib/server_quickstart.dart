@@ -324,33 +324,37 @@ class ServerSchemaManager {
     log('🔄 Running schema update examples...');
 
     // Example 1: Add new field to users table
-    final taskId1 = await _db
+    final result1 = await _db
         .updateSchema('users')
         .addField('phone', type: DataType.text)
         .addField('avatar_url', type: DataType.text)
         .addIndex(fields: ['phone'], unique: true);
 
-    log('📝 Schema update task 1 created: $taskId1');
+    log('📝 Schema update task 1 created: ${result1.taskId}');
 
     // Example 2: Modify existing field
-    final taskId2 = await _db
+    final result2 = await _db
         .updateSchema('products')
         .modifyField('name', maxLength: 300)
         .addField('tags', type: DataType.array)
         .addField('metadata', type: DataType.json);
 
-    log('📝 Schema update task 2 created: $taskId2');
+    log('📝 Schema update task 2 created: ${result2.taskId}');
 
     // Example 3: Rename field and table
-    final taskId3 = await _db
+    final result3 = await _db
         .updateSchema('products')
         .renameField('description', 'product_description')
         .renameTable('inventory_items');
 
-    log('📝 Schema update task 3 created: $taskId3');
+    log('📝 Schema update task 3 created: ${result3.taskId}');
 
     // Check migration status
-    await _checkMigrationStatus([taskId1, taskId2, taskId3]);
+    await _checkMigrationStatus([
+      result1.taskId ?? '',
+      result2.taskId ?? '',
+      result3.taskId ?? '',
+    ]);
   }
 
   /// Check migration task status
