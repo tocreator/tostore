@@ -502,7 +502,7 @@ class ToStoreExample {
     );
 
     // update table structure
-    final taskId = await db
+    final result = await db
         .updateSchema('users')
         .renameTable('newTableName') // rename table
         .modifyField('username',
@@ -516,9 +516,12 @@ class ToStoreExample {
         .setPrimaryKeyConfig(// set primary key config
             const PrimaryKeyConfig(type: PrimaryKeyType.shortCode));
 
-    // query migration task status
-    final status = await db.queryMigrationTaskStatus(taskId);
-    logService.add('migration progress: ${status?.progressPercentage}%');
+    final taskId = result.taskId;
+    if (taskId != null) {
+      // query migration task status
+      final status = await db.queryMigrationTaskStatus(taskId);
+      logService.add('migration progress: ${status?.progressPercentage}%');
+    }
   }
 
   /// Example: Complex nested queries with predefined conditions
