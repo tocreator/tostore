@@ -433,17 +433,19 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       result = await _future!;
     } catch (e) {
       if (e is DbException) {
-        return QueryResult.error(
+        DbException.checkDeveloperError(e);
+        return QueryResult<Map<String, dynamic>>.error(
           type: e.statuses.isNotEmpty
               ? e.statuses.first.type
               : ResultType.engError,
           message: e.message,
         );
       }
-      return QueryResult.error(
+      final queryResult = QueryResult<Map<String, dynamic>>.error(
         type: ResultType.engError,
         message: e.toString(),
       );
+      return queryResult;
     }
 
     Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
