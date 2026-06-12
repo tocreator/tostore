@@ -429,6 +429,10 @@ final result = await db.updateSchema('users')
 // Monitor migration progress
 final taskId = result.taskId;
 if (taskId != null) {
+  // Inspect migration metadata
+  print('Estimated duration: ${result.estimateDuration?.inMilliseconds} ms');
+  print('Migration write mode: ${result.writeMode}'); // e.g. MigrationWriteMode.indexOnly
+
   final status = await db.queryMigrationTaskStatus(taskId);
   print('Migration progress: ${status?.progressPercentage}%');
 }
