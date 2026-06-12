@@ -1,5 +1,5 @@
-import 'result_type.dart';
 import 'result_status.dart';
+import 'result_type.dart';
 
 /// Database operation result model
 /// Used to represent the result of database operations (insert, update, delete, createTable, dropTable, etc.)
