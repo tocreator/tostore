@@ -52,6 +52,8 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
       allowAll: _allowAll,
       returnResultDetails: !_skipResultDetails,
     );
-    return _future!;
+    final result = await _future!;
+    DbException.checkDeveloperError(result);
+    return result;
   }
 }
