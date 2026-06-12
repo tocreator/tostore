@@ -432,7 +432,7 @@ final db = await ToStore.open();
 await db.createTables(appSchemas);
 
 // 在线表结构更新
-final taskId = await db.updateSchema('users')
+final result = await db.updateSchema('users')
   .renameTable('users_new')                // 修改表名
   .modifyField(
     'username',
@@ -449,8 +449,11 @@ final taskId = await db.updateSchema('users')
   );
     
 // 监控迁移进度
-final status = await db.queryMigrationTaskStatus(taskId);
-print('迁移进度: ${status?.progressPercentage}%');
+final taskId = result.taskId;
+if (taskId != null) {
+  final status = await db.queryMigrationTaskStatus(taskId);
+  print('迁移进度: ${status?.progressPercentage}%');
+}
 
     
 // 纯服务端性能调优 (可选)
