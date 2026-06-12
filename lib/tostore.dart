@@ -336,7 +336,9 @@ class ToStore implements DataStoreInterface {
   /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> createTable(TableSchema schema) async {
-    return await _impl.createTable(schema);
+    final result = await _impl.createTable(schema);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Create multiple tables
@@ -360,7 +362,9 @@ class ToStore implements DataStoreInterface {
   /// ```
   @override
   Future<DbResult> createTables(List<TableSchema> schemas) async {
-    return await _impl.createTables(schemas);
+    final result = await _impl.createTables(schemas);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Insert a record into a table.
@@ -379,7 +383,9 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be accessed manually', 'ToStore.insert');
 
-    return await _impl.insert(tableName, data);
+    final result = await _impl.insert(tableName, data);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Get a query builder for chain-style operations.
@@ -457,11 +463,13 @@ class ToStore implements DataStoreInterface {
   /// [data] 要插入或更新的数据。
   /// 返回 [DbResult] 表示操作成功或失败。
   @override
-  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) {
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
     _checkSystemTableAccess(
         tableName, 'cannot be modified manually', 'ToStore.upsert');
 
-    return _impl.upsert(tableName, data);
+    final result = await _impl.upsert(tableName, data);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Perform an approximate nearest neighbor (ANN) vector similarity search.
@@ -621,12 +629,14 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be batchInserted manually', 'ToStore.batchInsert');
 
-    return await _impl.batchInsert(
+    final result = await _impl.batchInsert(
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
     );
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Batch upsert multiple records based on unique constraints.
@@ -677,12 +687,14 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpserted manually', 'ToStore.batchUpsert');
 
-    return await _impl.batchUpsert(
+    final result = await _impl.batchUpsert(
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
     );
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Batch update multiple records based on primary key.
@@ -720,12 +732,14 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpdated manually', 'ToStore.batchUpdate');
 
-    return await _impl.batchUpdate(
+    final result = await _impl.batchUpdate(
       tableName,
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
     );
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Set a key-value pair in the KV store.
@@ -753,13 +767,15 @@ class ToStore implements DataStoreInterface {
     DateTime? expiresAt,
     bool isGlobal = false,
   }) async {
-    return await _impl.setValue(
+    final result = await _impl.setValue(
       key,
       value,
       ttl: ttl,
       expiresAt: expiresAt,
       isGlobal: isGlobal,
     );
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Get a value from the KV store.
@@ -842,7 +858,9 @@ class ToStore implements DataStoreInterface {
   /// [isGlobal] 是否为全局键值对，默认false
   @override
   Future<DbResult> removeValue(String key, {bool isGlobal = false}) async {
-    return await _impl.removeValue(key, isGlobal: isGlobal);
+    final result = await _impl.removeValue(key, isGlobal: isGlobal);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Create a backup of the database.
@@ -903,11 +921,13 @@ class ToStore implements DataStoreInterface {
   Future<TransactionResult> transaction<T>(FutureOr<T> Function() action,
       {bool rollbackOnError = true,
       bool? persistRecoveryOnCommit,
-      TransactionIsolationLevel? isolation}) {
-    return _impl.transaction<T>(action,
+      TransactionIsolationLevel? isolation}) async {
+    final result = await _impl.transaction<T>(action,
         rollbackOnError: rollbackOnError,
         persistRecoveryOnCommit: persistRecoveryOnCommit,
         isolation: isolation);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Get a delete builder to remove records.
@@ -973,7 +993,9 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be dropped manually', 'ToStore.dropTable');
 
-    return await _impl.dropTable(tableName);
+    final result = await _impl.dropTable(tableName);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Clear all data in a table.
@@ -990,7 +1012,9 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be cleared manually', 'ToStore.clear');
 
-    return await _impl.clear(tableName);
+    final result = await _impl.clear(tableName);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// Check if a table has been defined in the current database (space‑agnostic).
@@ -1216,7 +1240,9 @@ class ToStore implements DataStoreInterface {
   /// 返回 [DbResult] 方便处理业务逻辑错误
   @override
   Future<DbResult> deleteSpace(String spaceName) async {
-    return await _impl.deleteSpace(spaceName);
+    final result = await _impl.deleteSpace(spaceName);
+    DbException.checkDeveloperError(result);
+    return result;
   }
 
   /// List all space names (e.g. for multi-account switch or admin).
