@@ -150,7 +150,8 @@ class PathManager {
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist or path cannot be determined',
+          message:
+              'Table $tableName does not exist or path cannot be determined',
           tableName: tableName,
         ),
       ]);
