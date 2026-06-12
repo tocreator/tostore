@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Added `ResultStatus` (along with `SuccessStatus` and `GeneralStatus`) to represent granular item-level diagnostic outcomes, optimized for AI agents and automated scripts to precisely inspect operation results.
 
 ### Changed
+- Changed `db.updateSchema(...)` return value from a plain `String` (taskId) to `SchemaUpdateResult` to carry validation statuses, task identifier, estimated duration, and migration write mode.
 - Standardized response models (`DbResult`, `QueryResult`, `TransactionResult`) and exception model `DbException` under a unified diagnostic architecture.
 - Refactored `ResultType` to support granular error classifications with unique numeric codes and semantic string keys (`codeKey`).
 - Renamed `nextCursor` and `prevCursor` to `nextCursorToken` and `prevCursorToken` to clarify their role as stateless pagination tokens.
