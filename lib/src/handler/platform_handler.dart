@@ -9,7 +9,9 @@ class PlatformHandler {
   /// Build mode detection
   static bool get isRelease => const bool.fromEnvironment('dart.vm.product');
   static bool get isProfile => const bool.fromEnvironment('dart.vm.profile');
-  static bool get isDebug {
+  static final bool isDebug = _calculateIsDebug();
+
+  static bool _calculateIsDebug() {
     var inDebug = false;
     assert(() {
       inDebug = true;
