@@ -1,5 +1,10 @@
+import '../handler/platform_handler.dart';
+import 'db_result.dart';
+import 'query_result.dart';
 import 'result_status.dart';
 import 'result_type.dart';
+import 'schema_update_result.dart';
+import 'transaction_result.dart';
 
 /// Database operation exception
 /// Used to represent fatal developer mistakes or initialization-stage schema verification failures.
@@ -57,6 +62,49 @@ class DbException implements Exception {
         message: 'Original cause: $e',
       ),
     ]);
+  }
+
+  /// Check if the result contains a developer error in debug mode, and throw a [DbException] if so.
+  static void checkDeveloperError(dynamic result) {
+    if (result == null) return;
+    if (!PlatformHandler.isDebug) return;
+
+    if (result is DbException) {
+      final hasDev = result.statuses.any((s) => s.isDeveloperError);
+      if (hasDev) {
+        throw result;
+      }
+    } else if (result is DbResult) {
+      if (result.hasErrors) {
+        final hasDev = result.statuses.any((s) => s.isDeveloperError);
+        if (hasDev) {
+          throw DbException(result.statuses);
+        }
+      }
+    } else if (result is QueryResult) {
+      if (result.hasErrors && result.type.isDeveloperError) {
+        throw DbException([
+          GeneralStatus(
+            type: result.type,
+            message: result.message,
+          )
+        ]);
+      }
+    } else if (result is SchemaUpdateResult) {
+      if (result.hasValidationErrors) {
+        final hasDev = result.validationStatuses.any((s) => s.isDeveloperError);
+        if (hasDev) {
+          throw DbException(result.validationStatuses);
+        }
+      }
+    } else if (result is TransactionResult) {
+      if (result.hasErrors) {
+        final hasDev = result.statuses.any((s) => s.isDeveloperError);
+        if (hasDev) {
+          throw DbException(result.statuses);
+        }
+      }
+    }
   }
 
   @override
