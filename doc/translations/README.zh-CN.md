@@ -451,6 +451,10 @@ final result = await db.updateSchema('users')
 // 监控迁移进度
 final taskId = result.taskId;
 if (taskId != null) {
+  // 查看迁移元数据
+  print('预估迁移耗时: ${result.estimateDuration?.inMilliseconds} 毫秒');
+  print('涉及迁移数据重构模式: ${result.writeMode}'); // 例如 MigrationWriteMode.indexOnly
+
   final status = await db.queryMigrationTaskStatus(taskId);
   print('迁移进度: ${status?.progressPercentage}%');
 }
