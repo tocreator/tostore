@@ -410,7 +410,7 @@ final db = await ToStore.open();
 await db.createTables(appSchemas);
 
 // Online schema updates
-final taskId = await db.updateSchema('users')
+final result = await db.updateSchema('users')
   .renameTable('users_new')                // Rename table
   .modifyField(
     'username',
@@ -427,8 +427,11 @@ final taskId = await db.updateSchema('users')
   );
 
 // Monitor migration progress
-final status = await db.queryMigrationTaskStatus(taskId);
-print('Migration progress: ${status?.progressPercentage}%');
+final taskId = result.taskId;
+if (taskId != null) {
+  final status = await db.queryMigrationTaskStatus(taskId);
+  print('Migration progress: ${status?.progressPercentage}%');
+}
 
 
 // Optional performance tuning for pure server workloads
