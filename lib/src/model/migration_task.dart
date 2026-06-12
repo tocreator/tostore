@@ -545,9 +545,15 @@ class MigrationStatus {
   final MigrationWriteMode? writeMode;
 
   /// progress percentage (0-100)
-  double get progressPercentage => totalSpacesCount > 0
-      ? (processedSpacesCount / totalSpacesCount * 100)
-      : 100.0;
+  double get progressPercentage {
+    if (totalSpacesCount <= 0) return 100.0;
+    if (isCompleted) return 100.0;
+    final double completedWeight = processedSpacesCount.toDouble();
+    final double currentWeight = currentSpaceProgress.clamp(0.0, 1.0);
+    final double progress =
+        (completedWeight + currentWeight) / totalSpacesCount;
+    return (progress * 100.0).clamp(0.0, 100.0);
+  }
 
   /// convenience getter to check for errors
   bool get hasErrors => errors.isNotEmpty;
