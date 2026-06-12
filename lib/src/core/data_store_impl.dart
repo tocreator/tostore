@@ -967,33 +967,16 @@ class DataStoreImpl {
           isSystemTable: true,
         );
         if (systemTablesResult.hasErrors) {
-          Logger.warn(
-            'Failed to create system tables: ${systemTablesResult.message}',
-            label: 'DataStoreImpl._startSetupAndUpgrade',
-          );
+          throw DbException(systemTablesResult.statuses);
         }
 
         await schemaManager?.updateSystemSchemaHash(systemSchemas);
 
         // Create user tables
-        // Use createTables instead of loop to automatically sort by foreign key dependencies
-        // This ensures parent tables are created before child tables, regardless of definition order
         if (userSchemas.isNotEmpty) {
           final userTablesResult = await createTables(userSchemas);
-          if (userTablesResult.hasErrors &&
-              userTablesResult.failedKeys.isNotEmpty) {
-            // If all tables failed, throw error; if partial success, log warning but continue
-            if (userTablesResult.successKeys.isEmpty) {
-              Logger.error(
-                'Failed to create user tables: ${userTablesResult.message}',
-                label: 'DataStoreImpl._startSetupAndUpgrade',
-              );
-            } else {
-              Logger.warn(
-                'Some user tables failed to create: ${userTablesResult.failedKeys.join(", ")}',
-                label: 'DataStoreImpl._startSetupAndUpgrade',
-              );
-            }
+          if (userTablesResult.hasErrors) {
+            throw DbException(userTablesResult.statuses);
           }
           await schemaManager?.updateUserSchemaHash(userSchemas);
         }
