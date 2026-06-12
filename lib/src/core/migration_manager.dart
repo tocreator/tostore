@@ -3613,6 +3613,13 @@ class MigrationManager {
           // Keep the task on disk and in memory so startup / the next scheduler
           // pass can retry idempotent cutover steps after a crash or transient error.
           _unregisterRuntimeMigrationForTask(task);
+
+          if (e is DbException) {
+            final hasFatal = e.statuses.any((s) => s.type.isFatalError);
+            if (hasFatal) {
+              rethrow;
+            }
+          }
           break;
         }
       }
@@ -3625,6 +3632,14 @@ class MigrationManager {
       );
       success = false;
       errors.add(e);
+      if (e is DbException) {
+        final hasFatal = e.statuses.any((s) => s.type.isFatalError);
+        if (hasFatal) {
+          rethrow;
+        }
+      } else {
+        rethrow;
+      }
     } finally {
       _isProcessingTasks = false;
     }
