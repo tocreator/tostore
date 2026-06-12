@@ -54,6 +54,7 @@ export 'src/model/query_aggregation.dart';
 export 'src/model/query_result.dart';
 export 'src/model/result_status.dart';
 export 'src/model/result_type.dart';
+export 'src/model/schema_update_result.dart';
 export 'src/model/space_info.dart';
 export 'src/model/table_info.dart';
 export 'src/model/table_schema.dart';
@@ -1150,11 +1151,12 @@ class ToStore implements DataStoreInterface {
   ///
   /// Example:
   /// ```dart
-  /// final taskId = await db.updateSchema('users')
+  /// final result = await db.updateSchema('users')
   ///   .addField('age', DataType.integer)
   ///   .removeField('old_field')
   ///   .renameField('name', 'full_name')
   ///   .modifyField('email', (field) => field.unique());
+  /// final taskId = result.taskId;
   /// ```
   ///
   /// 更新表结构，支持链式操作
@@ -1173,12 +1175,15 @@ class ToStore implements DataStoreInterface {
   /// Example:
   /// ```dart
   /// // 先执行更新操作获取任务ID
-  /// final taskId = await db.updateSchema('users')
+  /// final result = await db.updateSchema('users')
   ///   .renameField('nickname', 'displayName');
+  /// final taskId = result.taskId;
   ///
   /// // 查询任务状态
-  /// final status = await db.queryMigrationTaskStatus(taskId);
-  /// print('Migration progress: ${status?.progressPercentage}%');
+  /// if (taskId != null) {
+  ///   final status = await db.queryMigrationTaskStatus(taskId);
+  ///   print('Migration progress: ${status?.progressPercentage}%');
+  /// }
   /// ```
   @override
   Future<MigrationStatus?> queryMigrationTaskStatus(String taskId) async {
