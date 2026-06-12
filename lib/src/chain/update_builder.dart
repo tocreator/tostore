@@ -258,6 +258,8 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
       continueOnPartialErrors: _continueOnPartialErrors,
       returnResultDetails: !_skipResultDetails,
     );
-    return _future!;
+    final result = await _future!;
+    DbException.checkDeveloperError(result);
+    return result;
   }
 }
