@@ -1,6 +1,6 @@
 import 'buffer_entry.dart';
 import 'background_write_type.dart';
-import 'background_write_mode.dart';
+import 'migration_write_mode.dart';
 
 /// Entry representing a background write operation scheduled for flushing.
 class BackgroundWriteEntry {
@@ -17,7 +17,7 @@ class BackgroundWriteEntry {
   final BackgroundWriteType type;
 
   /// The background write mode.
-  final BackgroundWriteMode mode;
+  final MigrationWriteMode mode;
 
   /// The wrapped data entry containing mutation details.
   final BufferEntry entry;
@@ -54,7 +54,7 @@ class BackgroundWriteEntry {
     String? tableName,
     String? primaryKey,
     BackgroundWriteType? type,
-    BackgroundWriteMode? mode,
+    MigrationWriteMode? mode,
     BufferEntry? entry,
     List<String>? specificIndexes,
     String? currentCursor,
