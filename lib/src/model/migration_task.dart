@@ -4,6 +4,7 @@ import 'migration_write_mode.dart';
 import 'meta_info.dart';
 import 'table_schema.dart';
 import 'wal_pointer.dart';
+import 'result_status.dart';
 
 /// migration task, for storing table structure, table data migration operations
 class MigrationTask {
@@ -43,6 +44,10 @@ class MigrationTask {
   final MigrationWriteMode? writeMode;
   // specific index names to build during execution (null means all)
   final List<String>? specificIndexes;
+  // execution errors
+  final List<ResultStatus>? errors;
+  // estimated migration duration
+  final Duration? estimateDuration;
 
   const MigrationTask({
     required this.taskId,
@@ -63,6 +68,8 @@ class MigrationTask {
     this.backupPath,
     this.writeMode,
     this.specificIndexes,
+    this.errors,
+    this.estimateDuration,
   });
 
   /// create from json
@@ -113,6 +120,13 @@ class MigrationTask {
                 .firstWhere((e) => e.name == json['writeMode'])
             : null,
         specificIndexes: (json['specificIndexes'] as List?)?.cast<String>(),
+        errors: (json['errors'] as List?)
+            ?.map((e) =>
+                ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList(),
+        estimateDuration: json['estimateDuration'] != null
+            ? Duration(microseconds: json['estimateDuration'] as int)
+            : null,
       );
 
   /// convert to json
@@ -136,6 +150,9 @@ class MigrationTask {
         if (backupPath != null) 'backupPath': backupPath,
         if (writeMode != null) 'writeMode': writeMode!.name,
         if (specificIndexes != null) 'specificIndexes': specificIndexes,
+        if (errors != null) 'errors': errors!.map((e) => e.toJson()).toList(),
+        if (estimateDuration != null)
+          'estimateDuration': estimateDuration!.inMicroseconds,
       };
 
   String? checkpointKeyForSpace(String spaceName) =>
@@ -213,6 +230,8 @@ class MigrationTask {
     String? backupPath,
     MigrationWriteMode? writeMode,
     List<String>? specificIndexes,
+    List<ResultStatus>? errors,
+    Duration? estimateDuration,
   }) =>
       MigrationTask(
         taskId: taskId ?? this.taskId,
@@ -236,6 +255,8 @@ class MigrationTask {
         backupPath: backupPath ?? this.backupPath,
         writeMode: writeMode ?? this.writeMode,
         specificIndexes: specificIndexes ?? this.specificIndexes,
+        errors: errors ?? this.errors,
+        estimateDuration: estimateDuration ?? this.estimateDuration,
       );
 }
 
@@ -517,10 +538,19 @@ class MigrationStatus {
   /// current migration throughput (records/second)
   final double throughput;
 
+  /// execution errors
+  final List<ResultStatus> errors;
+
+  /// write mode defining rewritten components
+  final MigrationWriteMode? writeMode;
+
   /// progress percentage (0-100)
   double get progressPercentage => totalSpacesCount > 0
       ? (processedSpacesCount / totalSpacesCount * 100)
       : 100.0;
+
+  /// convenience getter to check for errors
+  bool get hasErrors => errors.isNotEmpty;
 
   const MigrationStatus({
     required this.taskId,
@@ -532,6 +562,8 @@ class MigrationStatus {
     this.totalRecordsProcessed = 0,
     this.currentSpaceProgress = 0.0,
     this.throughput = 0.0,
+    this.errors = const [],
+    this.writeMode,
   });
 
   Map<String, dynamic> toJson() {
@@ -545,6 +577,8 @@ class MigrationStatus {
       'totalRecordsProcessed': totalRecordsProcessed,
       'currentSpaceProgress': currentSpaceProgress,
       'throughput': throughput,
+      'errors': errors.map((e) => e.toJson()).toList(),
+      if (writeMode != null) 'writeMode': writeMode!.name,
     };
   }
 
@@ -560,6 +594,15 @@ class MigrationStatus {
       currentSpaceProgress:
           (json['currentSpaceProgress'] as num?)?.toDouble() ?? 0.0,
       throughput: (json['throughput'] as num?)?.toDouble() ?? 0.0,
+      errors: (json['errors'] as List?)
+              ?.map((e) =>
+                  ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
+              .toList() ??
+          const [],
+      writeMode: json['writeMode'] != null
+          ? MigrationWriteMode.values
+              .firstWhere((e) => e.name == json['writeMode'])
+          : null,
     );
   }
 
@@ -570,6 +613,8 @@ class MigrationStatus {
         'spaceProgress: ${(currentSpaceProgress * 100).toStringAsFixed(1)}%, '
         'records: $totalRecordsProcessed, '
         'throughput: ${throughput.toStringAsFixed(1)} rec/s, '
+        'errors: ${errors.length}, '
+        'writeMode: ${writeMode?.name}, '
         'pendingSpaces: ${pendingSpaces.length}}';
   }
 }
