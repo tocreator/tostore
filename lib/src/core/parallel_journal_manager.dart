@@ -11,7 +11,7 @@ import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
 import '../model/background_write_entry.dart';
-import '../model/background_write_mode.dart';
+import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/id_generator.dart';
@@ -785,8 +785,8 @@ class ParallelJournalManager {
 
                   // First load background writes (if mode includes table write)
                   for (final bgEntry in activeBgEntries) {
-                    if (bgEntry.mode == BackgroundWriteMode.tableOnly ||
-                        bgEntry.mode == BackgroundWriteMode.tableAndIndex) {
+                    if (bgEntry.mode == MigrationWriteMode.tableOnly ||
+                        bgEntry.mode == MigrationWriteMode.tableAndIndex) {
                       unifiedPkMap[bgEntry.primaryKey] = bgEntry.entry;
                     }
                   }
@@ -939,8 +939,8 @@ class ParallelJournalManager {
                   // Background writes (merged into global if specIdxs is empty)
                   for (final bgEntry in activeBgEntries) {
                     final mode = bgEntry.mode;
-                    if (mode == BackgroundWriteMode.indexOnly ||
-                        mode == BackgroundWriteMode.tableAndIndex) {
+                    if (mode == MigrationWriteMode.indexOnly ||
+                        mode == MigrationWriteMode.tableAndIndex) {
                       final specIdxs = bgEntry.specificIndexes;
                       if (specIdxs == null || specIdxs.isEmpty) {
                         final be = bgEntry.entry;
