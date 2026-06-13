@@ -12,7 +12,7 @@ class InternalConfig {
   static const bool showLoggerInternalLabel = false;
 
   /// public label
-  static const String publicLabel = 'tostore';
+  static const String publicLabel = 'ToStore';
 
   /// engine/storage version (global config + space config)
   static const int engineVersion = 3;
