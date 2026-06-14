@@ -26,7 +26,6 @@ import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
-import '../model/log_config.dart';
 import '../model/memory_info.dart';
 import '../model/migration_task.dart';
 import '../model/ngh_index_meta.dart';
@@ -513,7 +512,7 @@ class DataStoreImpl {
       }
       return parsed;
     } catch (e) {
-      Logger.error('Failed to parse init config: $e');
+      Logger.error('Failed to parse init config', rawError: e);
       return null;
     }
   }
@@ -532,7 +531,7 @@ class DataStoreImpl {
         _spaceConfigCache = config;
       }
     } catch (e) {
-      Logger.error('Failed to save space config: $e', label: 'spaceConfig');
+      Logger.error('Failed to save space config', rawError: e);
     }
   }
 
@@ -674,12 +673,6 @@ class DataStoreImpl {
       _config ??= DataStoreConfig();
       _dbName ??= _config?.dbName;
 
-      // Apply log configuration as early as possible.
-      LogConfig.setConfig(
-        enableLog: _config!.enableLog,
-        logLevel: _config!.logLevel,
-      );
-
       // Initialize YieldController global limit
       YieldController.globalSettings.enabled = true;
       YieldController.globalSettings.targetBudgetMs = _config!.yieldDurationMs;
@@ -702,7 +695,6 @@ class DataStoreImpl {
       if (PlatformHandler.isWeb && _config!.enableJournal) {
         Logger.warn(
           'Web does not support enableJournal efficiently. Keeping it on can noticeably slow writes and startup. Recommended: set DataStoreConfig(enableJournal: false).',
-          label: 'DataStore.initialize',
         );
       }
 
@@ -884,13 +876,12 @@ class DataStoreImpl {
       });
 
       return true;
-    } catch (e, stack) {
+    } catch (e) {
       _isInitialized = false;
       if (!_initCompleter.isCompleted) {
         _initCompleter.completeError(e);
       }
-      Logger.error('Database initialization failed: $e\n$stack',
-          label: 'DataStore.initialize');
+      Logger.error('Database initialization failed', rawError: e);
       try {
         // Prevent ReadViewManager callback leak if initialization failed after its creation
         readViewManager.dispose();
@@ -910,8 +901,7 @@ class DataStoreImpl {
       await storage.deleteDirectory(tempDir);
       await storage.ensureDirectoryExists(tempDir);
     } catch (e) {
-      Logger.warn('Reset temp directory failed: $e',
-          label: 'DataStore.initialize');
+      Logger.warn('Reset temp directory failed', rawError: e);
     }
   }
 
@@ -1000,11 +990,8 @@ class DataStoreImpl {
           await schemaManager?.updateUserSchemaHash(userSchemas);
         }
       }
-    } catch (e, stack) {
-      Logger.error(
-        'Setup and upgrade failed: $e\n$stack',
-        label: 'DataStoreImpl._startSetupAndUpgrade',
-      );
+    } catch (e) {
+      Logger.error('Setup and upgrade failed', rawError: e);
       rethrow;
     }
   }
@@ -1081,8 +1068,7 @@ class DataStoreImpl {
           }
           await parallelJournalManager.drainAndStop();
         } catch (e) {
-          Logger.warn('Stop journal manager failed: $e',
-              label: 'DataStoreImpl');
+          Logger.warn('Stop journal manager failed', rawError: e);
         }
 
         try {
@@ -1091,7 +1077,7 @@ class DataStoreImpl {
             await walManager.persistMeta(flush: true);
           }
         } catch (e) {
-          Logger.warn('Flush WAL failed: $e', label: 'DataStoreImpl');
+          Logger.warn('Flush WAL failed', rawError: e);
         }
 
         // Flush weight data
@@ -1112,7 +1098,7 @@ class DataStoreImpl {
             await storage.close(isMigrationInstance: isMigrationInstance);
           }
         } catch (e) {
-          Logger.warn('Storage flush/close failed: $e', label: 'DataStoreImpl');
+          Logger.warn('Storage flush/close failed', rawError: e);
         } finally {
           lockManager?.exitMaintenance();
         }
@@ -1126,8 +1112,7 @@ class DataStoreImpl {
             await saveGlobalConfig(globalConfig.clearActiveSpace());
           }
         } catch (e) {
-          Logger.error('Clear activeSpace on close failed: $e',
-              label: 'DataStoreImpl.close');
+          Logger.error('Clear activeSpace on close failed', rawError: e);
         }
       }
 
@@ -1168,7 +1153,7 @@ class DataStoreImpl {
         lockManager = null;
       }
     } catch (e) {
-      Logger.error('Database shutdown error: $e', label: 'DataStoreImpl.close');
+      Logger.error('Database shutdown error', rawError: e);
       rethrow;
     } finally {
       _initializing = false;
@@ -1183,8 +1168,7 @@ class DataStoreImpl {
       }
 
       if (removeRegistry || closeStorage) {
-        Logger.info('Database instance has been closed: $_instanceKey',
-            label: 'DataStoreImpl.close');
+        Logger.info('Database instance has been closed: $_instanceKey');
       }
     }
   }
@@ -1208,8 +1192,7 @@ class DataStoreImpl {
       // Check if table already exists
       final tableExists = await this.tableExists(schema.name);
       if (tableExists) {
-        Logger.warn('Table ${schema.name} already exists',
-            label: 'DataStore.createTable');
+        Logger.warn('Table ${schema.name} already exists');
         return finish(DbResult.error(
           type: ResultType.devSchemaTableExists,
           message: 'Table ${schema.name} already exists',
@@ -1312,7 +1295,6 @@ class DataStoreImpl {
         if (!SystemTable.isSystemTable(schema.name)) {
           Logger.info(
             'Table ${schema.name} created successfully${schema.isGlobal ? ' (global)' : ' (space)'}',
-            label: 'DataStore.createTable',
           );
         }
 
@@ -1328,7 +1310,7 @@ class DataStoreImpl {
           await directoryManager!.releaseTableDirectory(schema.name);
         }
 
-        Logger.error('Create table failed: $e', label: 'DataStore.createTable');
+        Logger.error('Create table failed', rawError: e);
         // Convert exception to DbResult for graceful error handling
         if (e is DbException) {
           return finish(DbResult.batch(
@@ -1342,7 +1324,7 @@ class DataStoreImpl {
         ));
       }
     } catch (e) {
-      Logger.error('Create table failed: $e', label: 'DataStore.createTable');
+      Logger.error('Create table failed', rawError: e);
       // Convert any unexpected exceptions to DbResult
       final dbEx = DbException.wrap(e,
           fallbackType: ResultType.engError,
@@ -1423,7 +1405,6 @@ class DataStoreImpl {
         'Circular foreign key dependencies detected. Tables with circular dependencies: ${unsorted.map((s) => s.name).join(', ')}. '
         'These tables will be created in their original order, which may cause foreign key validation to fail. '
         'Please review your foreign key definitions.',
-        label: 'DataStoreImpl._sortTablesByDependencies',
       );
       // Add unsorted tables at the end (they may have circular dependencies)
       sorted.addAll(unsorted);
@@ -1521,8 +1502,7 @@ class DataStoreImpl {
       // 1. Data validation
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStore.insert');
+        Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
@@ -1631,8 +1611,7 @@ class DataStoreImpl {
             );
           } catch (_) {}
 
-          Logger.error('Foreign key constraint validation failed: $e',
-              label: 'DataStore.insert');
+          Logger.error('Foreign key constraint validation failed', rawError: e);
           return finish(DbResult.error(
             type: ResultType.bizForeignKeyViolation,
             message: e.toString(),
@@ -1724,7 +1703,7 @@ class DataStoreImpl {
         message: 'Insert successful',
       ));
     } catch (e) {
-      Logger.error('Insert failed: $e', label: 'DataStore.insert');
+      Logger.error('Insert failed', rawError: e);
 
       try {
         // Clear cache
@@ -1747,8 +1726,7 @@ class DataStoreImpl {
           }
         }
       } catch (rollbackError) {
-        Logger.error('Rollback failed: $rollbackError',
-            label: 'DataStore.insert');
+        Logger.error('Rollback failed: $rollbackError', rawError: e);
       }
 
       // Identify the failed record's key
@@ -1800,7 +1778,6 @@ class DataStoreImpl {
         }
         Logger.error(
           'Data validation failed: Failed to generate primary key',
-          label: 'DataStore._validateAndProcessData',
         );
         return null;
       }
@@ -2250,7 +2227,6 @@ class DataStoreImpl {
       Logger.warn(
         'Backup is not supported in memory persistence mode. '
         'This operation will be a no-op and return empty path.',
-        label: 'DataStoreImpl.backup',
       );
       return '';
     }
@@ -2269,7 +2245,7 @@ class DataStoreImpl {
       );
       return backupPath;
     } catch (e) {
-      Logger.error('Create backup failed: $e', label: 'DataStore-backup');
+      Logger.error('Create backup failed', rawError: e);
       rethrow;
     }
   }
@@ -2283,7 +2259,6 @@ class DataStoreImpl {
       Logger.warn(
         'Restore is not supported in memory persistence mode. '
         'This operation will be a no-op and return false.',
-        label: 'DataStoreImpl.restore',
       );
       return false;
     }
@@ -2308,10 +2283,7 @@ class DataStoreImpl {
 
       return true;
     } catch (e) {
-      Logger.error(
-        'Failed to restore database: $e',
-        label: 'DataStoreImpl.restore',
-      );
+      Logger.error('Failed to restore database', rawError: e);
       return false;
     }
   }
@@ -2364,8 +2336,7 @@ class DataStoreImpl {
     // check if condition is empty, avoid accidental update of all records
     if (condition.isEmpty && !allowAll) {
       Logger.warn(
-          'Update operation without condition, this may cause accidental update of all records, please use allowUpdateAll() method to explicitly confirm.',
-          label: 'DataStore.updateInternal');
+          'Update operation without condition, this may cause accidental update of all records, please use allowUpdateAll() method to explicitly confirm.');
       const message =
           'Update operation must specify a filter condition. If you really need to update all records, please use allowUpdateAll() method to explicitly confirm.';
       return finish(DbResult.error(
@@ -2386,8 +2357,7 @@ class DataStoreImpl {
       // validate data
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStore.updateInternal');
+        Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
@@ -2686,8 +2656,7 @@ class DataStoreImpl {
                     oldPkValues: oldPkValue,
                   );
                 } catch (e) {
-                  Logger.error('RESTRICT constraint check failed: $e',
-                      label: 'DataStore.updateInternal');
+                  Logger.error('RESTRICT constraint check failed', rawError: e);
                   return finish(_normalizeCascadeError(e, 'update'));
                 }
 
@@ -2709,8 +2678,7 @@ class DataStoreImpl {
                       skipRestrictCheck: true, // RESTRICT already checked above
                     );
                   } catch (e) {
-                    Logger.error('Cascade update failed: $e',
-                        label: 'DataStore.updateInternal');
+                    Logger.error('Cascade update failed', rawError: e);
                     return finish(_normalizeCascadeError(e, 'update'));
                   }
                 }
@@ -2829,8 +2797,8 @@ class DataStoreImpl {
                   );
                 } catch (_) {}
 
-                Logger.error('Foreign key constraint validation failed: $e',
-                    label: 'DataStore.updateInternal');
+                Logger.error('Foreign key constraint validation failed',
+                    rawError: e);
                 if (continueOnPartialErrors) {
                   if (returnResultDetails) {
                     failedKeys.add(recordKey);
@@ -3055,7 +3023,7 @@ class DataStoreImpl {
         }
       }
     } catch (e) {
-      Logger.error('Update failed: $e', label: 'DataStore-update');
+      Logger.error('Update failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -3094,7 +3062,7 @@ class DataStoreImpl {
     final schema = await schemaManager?.getTableSchema(tableName);
 
     if (schema == null) {
-      Logger.error('Table $tableName does not exist', label: 'DataStore.clear');
+      Logger.error('Table $tableName does not exist');
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
@@ -3116,8 +3084,7 @@ class DataStoreImpl {
         await walManager.registerTableOp(op);
         clearOpId = opId;
       } catch (e) {
-        Logger.warn('Register clear table op failed: $e',
-            label: 'DataStore.clear');
+        Logger.warn('Register clear table op failed', rawError: e);
       }
     }
 
@@ -3128,7 +3095,7 @@ class DataStoreImpl {
         try {
           await _foreignKeyManager!.handleCascadeClear(tableName);
         } catch (e) {
-          Logger.error('Cascade clear failed: $e', label: 'DataStore.clear');
+          Logger.error('Cascade clear failed', rawError: e);
           // Convert exception to DbResult for graceful error handling
           // This allows developers to handle business logic errors (e.g., RESTRICT constraints)
           // without using try-catch, making the API consistent with insert/update/delete
@@ -3161,8 +3128,7 @@ class DataStoreImpl {
         try {
           await walManager.completeTableOp(clearOpId);
         } catch (e) {
-          Logger.warn('Complete clear table op failed: $e',
-              label: 'DataStore.clear');
+          Logger.warn('Complete clear table op failed', rawError: e);
         }
       }
 
@@ -3170,7 +3136,7 @@ class DataStoreImpl {
         message: 'Table $tableName cleared successfully',
       ));
     } catch (e) {
-      Logger.info('Clear table failed: $e', label: 'DataStore-clear');
+      Logger.warn('Clear table failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -3214,8 +3180,7 @@ class DataStoreImpl {
     if (condition.isEmpty) {
       if (!allowAll) {
         Logger.warn(
-            'Delete operation without condition, this may cause accidental deletion of all records, please use allowDeleteAll() method to explicitly confirm.',
-            label: 'DataStore.deleteInternal');
+            'Delete operation without condition, this may cause accidental deletion of all records, please use allowDeleteAll() method to explicitly confirm.');
         const message =
             'Delete operation must specify a filter condition. If you really need to delete all records, please use allowDeleteAll() method to explicitly confirm.';
         return finish(DbResult.error(
@@ -3233,8 +3198,7 @@ class DataStoreImpl {
       } else {
         // If allowAll=true and no condition, use clear() for better performance
         Logger.info(
-            'Using clear() for better performance when deleting all records',
-            label: 'DataStore.deleteInternal');
+            'Using clear() for better performance when deleting all records');
 
         // Use clear() for better performance when deleting all records
         // clear() now returns DbResult for graceful error handling
@@ -3264,8 +3228,7 @@ class DataStoreImpl {
       // get table schema
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.warn('Table $tableName does not exist',
-            label: 'DataStore.deleteInternal');
+        Logger.warn('Table $tableName does not exist');
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
@@ -3391,8 +3354,7 @@ class DataStoreImpl {
                   deletedPkValues: pkValue,
                 );
               } catch (e) {
-                Logger.error('RESTRICT constraint check failed: $e',
-                    label: 'DataStore.deleteInternal');
+                Logger.error('RESTRICT constraint check failed', rawError: e);
                 return finish(_normalizeCascadeError(e, 'delete'));
               }
 
@@ -3411,8 +3373,7 @@ class DataStoreImpl {
                     skipRestrictCheck: true, // RESTRICT already checked above
                   );
                 } catch (e) {
-                  Logger.error('Cascade delete failed: $e',
-                      label: 'DataStore.deleteInternal');
+                  Logger.error('Cascade delete failed', rawError: e);
                   return finish(_normalizeCascadeError(e, 'delete'));
                 }
               }
@@ -3563,7 +3524,7 @@ class DataStoreImpl {
         ));
       }
     } catch (e) {
-      Logger.error('Delete failed: $e', label: 'DataStore-delete');
+      Logger.error('Delete failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -3596,7 +3557,6 @@ class DataStoreImpl {
             if (clearResult.hasErrors) {
               Logger.error(
                 'Failed to resume clear operation for table ${op.table}: ${clearResult.message}',
-                label: 'DataStore._resumePendingTableOps',
               );
               // Continue with next operation even if this one failed
               continue;
@@ -3610,7 +3570,6 @@ class DataStoreImpl {
             if (dropResult.hasErrors) {
               Logger.error(
                 'Failed to resume drop operation for table ${op.table}: ${dropResult.message}',
-                label: 'DataStore._resumePendingTableOps',
               );
               // Continue with next operation even if this one failed
               continue;
@@ -3622,22 +3581,17 @@ class DataStoreImpl {
             await walManager.completeTableOp(op.opId);
           } catch (e) {
             Logger.warn(
-              'Complete resumed table operation failed for ${op.opId}: $e',
-              label: 'DataStore.resumeTableOps',
-            );
+                'Complete resumed table operation failed for ${op.opId}',
+                rawError: e);
           }
         } catch (e) {
           Logger.warn(
-            'Resume table operation failed for ${op.opId} (${op.type} ${op.table}): $e',
-            label: 'DataStore.resumeTableOps',
-          );
+              'Resume table operation failed for ${op.opId} (${op.type} ${op.table})',
+              rawError: e);
         }
       }
     } catch (e) {
-      Logger.error(
-        'Resume pending table operations failed: $e',
-        label: 'DataStore.resumeTableOps',
-      );
+      Logger.error('Resume pending table operations failed', rawError: e);
     }
   }
 
@@ -3828,7 +3782,6 @@ class DataStoreImpl {
         // During migration, only delete the table data directory in the current space
         Logger.info(
           'Deleting table $tableName data in space $_currentSpaceName during migration',
-          label: 'DataStore.dropTable',
         );
 
         // Get table directory path
@@ -3840,7 +3793,6 @@ class DataStoreImpl {
           await storage.deleteDirectory(tablePath);
           Logger.info(
             'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
-            label: 'DataStore.dropTable',
           );
         }
 
@@ -3867,8 +3819,7 @@ class DataStoreImpl {
             await walManager.registerTableOp(op);
             dropOpId = opId;
           } catch (e) {
-            Logger.warn('Register drop table op failed: $e',
-                label: 'DataStore.dropTable');
+            Logger.warn('Register drop table op failed', rawError: e);
           }
         }
 
@@ -3880,8 +3831,7 @@ class DataStoreImpl {
           try {
             await _foreignKeyManager!.handleCascadeClear(tableName);
           } catch (e) {
-            Logger.error('Cascade drop failed: $e',
-                label: 'DataStore.dropTable');
+            Logger.error('Cascade drop failed', rawError: e);
             // Convert exception to DbResult for graceful error handling
             return finish(_normalizeCascadeError(e, 'drop'));
           }
@@ -3935,13 +3885,11 @@ class DataStoreImpl {
           try {
             await walManager.completeTableOp(dropOpId);
           } catch (e) {
-            Logger.warn('Complete drop table op failed: $e',
-                label: 'DataStore.dropTable');
+            Logger.warn('Complete drop table op failed', rawError: e);
           }
         }
 
-        Logger.info('Table $tableName has been successfully deleted',
-            label: 'DataStore.dropTable');
+        Logger.info('Table $tableName has been successfully deleted');
 
         // Notify watchers that the table has been dropped/cleared
         notificationManager.notify(ChangeEvent(
@@ -3954,7 +3902,7 @@ class DataStoreImpl {
         ));
       }
     } catch (e) {
-      Logger.error('Failed to delete table: $e', label: 'DataStore-dropTable');
+      Logger.error('Failed to delete table', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -3996,10 +3944,7 @@ class DataStoreImpl {
       final schema = await schemaManager!.getTableSchema(tableName);
       return schema != null;
     } catch (e) {
-      Logger.error(
-        'Failed to check table existence: $e',
-        label: 'DataStoreImpl._tableExists',
-      );
+      Logger.error('Failed to check table existence', rawError: e);
       return false;
     }
   }
@@ -4010,10 +3955,7 @@ class DataStoreImpl {
     try {
       return await schemaManager!.listAllTables();
     } catch (e) {
-      Logger.error(
-        'Failed to get table names: $e',
-        label: 'DataStoreImpl.getTableNames',
-      );
+      Logger.error('Failed to get table names', rawError: e);
       return [];
     }
   }
@@ -4051,8 +3993,7 @@ class DataStoreImpl {
       // 1. Get table schema and validate data
       schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null || schema.name.isEmpty) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStore.batchInsert');
+        Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
@@ -4260,9 +4201,8 @@ class DataStoreImpl {
                     // This keeps correctness (still checks committed data) while preventing
                     // "all failed" outcomes caused by transient overload.
                     Logger.warn(
-                      'Batch unique disk check failed for ${recs.length} records, fallback to chunked checks: $e',
-                      label: 'DataStore.batchInsert',
-                    );
+                        'Batch unique disk check failed for ${recs.length} records, fallback to chunked checks',
+                        rawError: e);
                     const int chunkSize = 512;
                     final out = List<UniqueViolation?>.filled(recs.length, null,
                         growable: false);
@@ -4362,10 +4302,7 @@ class DataStoreImpl {
                     ..addAll(keepOriginalById);
                 }
               } catch (e) {
-                Logger.warn(
-                  'Batch unique disk check failed: $e',
-                  label: 'DataStore.batchInsert',
-                );
+                Logger.warn('Batch unique disk check failed', rawError: e);
                 // Safety: if we cannot validate uniqueness reliably, treat as failure to avoid corruption.
                 // We conservatively fail all pending records in this flush batch.
                 final failYield =
@@ -4554,10 +4491,8 @@ class DataStoreImpl {
                       operation: ForeignKeyOperation.insert,
                     );
                   } catch (e) {
-                    Logger.error(
-                      'Foreign key constraint validation failed: $e',
-                      label: 'DataStore.batchInsert',
-                    );
+                    Logger.error('Foreign key constraint validation failed',
+                        rawError: e);
                     invalidRecords.add(record);
                     final failedKey = validData[primaryKey]?.toString() ?? '';
                     if (returnResultDetails && failedKey.isNotEmpty) {
@@ -4672,7 +4607,7 @@ class DataStoreImpl {
                       } catch (err) {
                         Logger.warn(
                             'Failed to auto-correct PK conflict in batch: $err',
-                            label: 'DataStore.batchInsert');
+                            rawError: e);
                       }
                       record[primaryKey] = null;
                       triedPkConflictRetry = true;
@@ -4730,10 +4665,7 @@ class DataStoreImpl {
                 }
               }
             } catch (e) {
-              Logger.warn(
-                'Error processing record: $e',
-                label: 'DataStore.batchInsert',
-              );
+              Logger.warn('Error processing record', rawError: e);
               invalidRecords.add(record);
               final failedKey = record[primaryKey]?.toString() ?? '';
               if (returnResultDetails && failedKey.isNotEmpty) {
@@ -4858,8 +4790,7 @@ class DataStoreImpl {
         rethrow;
       }
     } catch (e) {
-      Logger.error('Batch insertion failed: $e',
-          label: 'DataStore-batchInsert');
+      Logger.error('Batch insertion failed', rawError: e);
 
       if (isInTransactionWithRollback()) {
         rethrow;
@@ -4960,8 +4891,7 @@ class DataStoreImpl {
           if (validationErrorsForResult.length < 10) {
             validationErrorsForResult.add('pk=$failedKey: $err');
           }
-          Logger.warn('Upsert validation failed for $failedKey: $err',
-              label: 'DataStore.batchUpsert');
+          Logger.warn('Upsert validation failed for $failedKey: $err');
 
           if (!allowPartialErrors) {
             return finish(DbResult.error(
@@ -5083,7 +5013,7 @@ class DataStoreImpl {
         message: message,
       ));
     } catch (e) {
-      Logger.error('Batch upsert failed: $e', label: 'DataStore.batchUpsert');
+      Logger.error('Batch upsert failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -5766,7 +5696,7 @@ class DataStoreImpl {
         ));
       }
     } catch (e) {
-      Logger.error('Batch update failed: $e', label: 'DataStore.batchUpdate');
+      Logger.error('Batch update failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
       }
@@ -5877,8 +5807,7 @@ class DataStoreImpl {
           // If already closing/closed, suppress errors from missing managers
           if (!_isInitialized) break;
 
-          Logger.error('Load table data failed: $tableName, error: $e',
-              label: 'DataStore._executePrewarm');
+          Logger.error('Load table data failed: $tableName', rawError: e);
           continue; // Continue load other tables
         }
       }
@@ -5899,8 +5828,7 @@ class DataStoreImpl {
       );
     } catch (e) {
       if (_isInitialized) {
-        Logger.error('Error in _executePrewarm: $e',
-            label: 'DataStore._executePrewarm');
+        Logger.error('Error in _executePrewarm', rawError: e);
       }
     } finally {
       _isGlobalPrewarming = false;
@@ -5943,8 +5871,7 @@ class DataStoreImpl {
         await yieldController.maybeYield();
       } catch (e) {
         if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
-        Logger.warn('Prewarm KV store failed for $tableName: $e',
-            label: 'DataStore.prewarm');
+        Logger.warn('Prewarm KV store failed for $tableName', rawError: e);
       }
     }
 
@@ -6034,8 +5961,7 @@ class DataStoreImpl {
         await yieldController.maybeYield();
       } catch (e) {
         if (!_isInitialized) break;
-        Logger.warn('Prewarm user table failed for $tableName: $e',
-            label: 'DataStore.prewarm');
+        Logger.warn('Prewarm user table failed for $tableName', rawError: e);
       }
     }
   }
@@ -6100,9 +6026,8 @@ class DataStoreImpl {
       return sorted;
     } catch (e) {
       Logger.warn(
-        'Failed to prioritize tables by weight: $e, falling back to default priority',
-        label: 'DataStore._prioritizeTablesByWeight',
-      );
+          'Failed to prioritize tables by weight, falling back to default priority',
+          rawError: e);
       return await _prioritizeTables(allTables);
     }
   }
@@ -6133,8 +6058,7 @@ class DataStoreImpl {
     try {
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStore.queryById');
+        Logger.error('Table $tableName does not exist');
         return null;
       }
       final condition = QueryCondition()..where(schema.primaryKey, '=', id);
@@ -6146,7 +6070,7 @@ class DataStoreImpl {
       );
       return results.isEmpty ? null : results.first;
     } catch (e) {
-      Logger.error('Query by id failed: $e', label: 'DataStore.queryById');
+      Logger.error('Query by id failed', rawError: e);
       rethrow;
     }
   }
@@ -6160,15 +6084,14 @@ class DataStoreImpl {
     try {
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStore.queryBy');
+        Logger.error('Table $tableName does not exist');
         return [];
       }
       final condition = QueryCondition()..where(field, '=', value);
 
       return await executeQuery(tableName, condition);
     } catch (e) {
-      Logger.error('Query by field failed: $e', label: 'DataStore.queryBy');
+      Logger.error('Query by field failed', rawError: e);
       rethrow;
     }
   }
@@ -6265,7 +6188,6 @@ class DataStoreImpl {
 
       Logger.info(
         'Switched space from [$oldSpaceName] to [$spaceName]',
-        label: 'DataStoreImpl.switchSpace',
       );
 
       return true;
@@ -6275,7 +6197,7 @@ class DataStoreImpl {
       if (_config != null) {
         _config = _config!.copyWith(spaceName: oldSpaceName);
       }
-      Logger.error('Space switch failed: $e', label: 'DataStore.switchSpace');
+      Logger.error('Space switch failed', rawError: e);
       return false;
     }
   }
@@ -6303,8 +6225,7 @@ class DataStoreImpl {
       // 5) Ensure buffered IO is flushed to disk (releases handles on Windows)
       await storage.flushAll(closeHandles: true);
     } catch (e) {
-      Logger.error('Failed to save cache before exit: $e',
-          label: 'DataStoreImpl.saveAllCacheBeforeExit');
+      Logger.error('Failed to save cache before exit', rawError: e);
     }
   }
 
@@ -6321,8 +6242,7 @@ class DataStoreImpl {
 
       _instances.remove(_instanceKey);
     } catch (e) {
-      Logger.error('Delete database failed: $e',
-          label: 'DataStore.deleteDatabase');
+      Logger.error('Delete database failed', rawError: e);
       rethrow;
     }
   }
@@ -6932,10 +6852,8 @@ class DataStoreImpl {
         ..where(_kvExpiresAtField, '=', expiresAtIso);
       await deleteInternal(tableName, condition, limit: 1);
     } catch (e) {
-      Logger.warn(
-        'Failed to cleanup expired kv key "$key" in $tableName: $e',
-        label: 'DataStore._deleteExpiredKvRecordExact',
-      );
+      Logger.warn('Failed to cleanup expired kv key "$key" in $tableName',
+          rawError: e);
     }
   }
 
@@ -6949,8 +6867,8 @@ class DataStoreImpl {
       return jsonDecode(encodedValue);
     } catch (e) {
       Logger.warn(
-          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`. Error: $e',
-          label: 'DataStore.getValue');
+          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`.',
+          rawError: e);
       return rawValue;
     }
   }
@@ -6960,8 +6878,7 @@ class DataStoreImpl {
     await ensureInitialized();
     final schema = await schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error('Table $tableName does not exist',
-          label: 'DataStore.getTableInfo');
+      Logger.error('Table $tableName does not exist');
       return null;
     }
     final dataPath = await pathManager.getDataMetaPath(tableName);
@@ -7220,11 +7137,10 @@ class DataStoreImpl {
           newPath: newPath,
           spaceName: currentSpace,
         );
-      } catch (rollbackError, rollbackStackTrace) {
+      } catch (rollbackError) {
         Logger.error(
-          'Failed to rollback table rename $oldTableName -> $newTableName after error: $rollbackError\n$rollbackStackTrace',
-          label: 'DataStoreImpl.renameTableForMigration',
-        );
+            'Failed to rollback table rename $oldTableName -> $newTableName after error',
+            rawError: rollbackError);
       }
       Error.throwWithStackTrace(error, stackTrace);
     }
@@ -7584,8 +7500,7 @@ class DataStoreImpl {
 
       return config;
     } catch (e) {
-      Logger.error('Failed to get global config: $e',
-          label: 'DataStoreImpl.getGlobalConfig');
+      Logger.error('Failed to get global config', rawError: e);
       return null;
     }
   }
@@ -7607,8 +7522,7 @@ class DataStoreImpl {
       final content = jsonEncode(config.toJson());
       await storage.writeAsString(configPath, content);
     } catch (e) {
-      Logger.error('Failed to save global config: $e',
-          label: 'DataStoreImpl.saveGlobalConfig');
+      Logger.error('Failed to save global config', rawError: e);
     }
   }
 
@@ -7628,8 +7542,7 @@ class DataStoreImpl {
         await saveGlobalConfig(updatedConfig);
       }
     } catch (e) {
-      Logger.error('Failed to add space to global config: $e',
-          label: 'DataStoreImpl.addSpaceToGlobalConfig');
+      Logger.error('Failed to add space to global config', rawError: e);
     }
   }
 
@@ -7646,8 +7559,8 @@ class DataStoreImpl {
       // Execute migration (this operation will block the main thread)
       await migrationHandler.migrate();
     } catch (e) {
-      Logger.error('Error checking and migrating old path structure: $e',
-          label: 'DataStoreImpl._migrateOldStructureIfNeeded');
+      Logger.error('Error checking and migrating old path structure',
+          rawError: e);
       // Error doesn't affect continued use, just log it
     }
   }
@@ -7664,8 +7577,8 @@ class DataStoreImpl {
       final tableKey = '$spacePrefix:$tableName';
       return spaceConfig.tableDirectoryMap.containsKey(tableKey);
     } catch (e) {
-      Logger.error('Error checking if table exists in current space: $e',
-          label: 'DataStoreImpl.tableExistsInCurrentSpace');
+      Logger.error('Error checking if table exists in current space',
+          rawError: e);
       return false;
     }
   }
@@ -7705,8 +7618,7 @@ class DataStoreImpl {
         tables: userTables,
       );
     } catch (e) {
-      Logger.error('Failed to get space info: $e',
-          label: 'DataStoreImpl.getSpaceInfo');
+      Logger.error('Failed to get space info', rawError: e);
       rethrow;
     }
   }
@@ -7720,7 +7632,6 @@ class DataStoreImpl {
     if (spaceName == 'default') {
       Logger.warn(
         'Cannot delete the default space',
-        label: 'DataStore.deleteSpace',
       );
       return DbResult.error(
         type: ResultType.devInvalidArgumentFormat,
@@ -7739,7 +7650,6 @@ class DataStoreImpl {
     if (spaceName == _currentSpaceName) {
       Logger.warn(
         'Cannot delete the currently active space. Please switch to another space before deleting.',
-        label: 'DataStore.deleteSpace',
       );
       return DbResult.error(
         type: ResultType.devInvalidArgumentFormat,
@@ -7761,8 +7671,7 @@ class DataStoreImpl {
       final globalConfig = await getGlobalConfig();
       if (globalConfig == null ||
           !globalConfig.spaceNames.contains(spaceName)) {
-        Logger.warn('Space $spaceName does not exist, no need to delete.',
-            label: 'DataStore.deleteSpace');
+        Logger.warn('Space $spaceName does not exist, no need to delete.');
         return DbResult.error(
           type: ResultType.devSpaceNotFound,
           message: 'Space $spaceName does not exist',
@@ -7783,14 +7692,12 @@ class DataStoreImpl {
       final updatedConfig = globalConfig.copyWith(spaceNames: updatedSpaces);
       await saveGlobalConfig(updatedConfig);
 
-      Logger.info('Space $spaceName has been successfully deleted.',
-          label: 'DataStore.deleteSpace');
+      Logger.info('Space $spaceName has been successfully deleted.');
       return DbResult.success(
         message: 'Space $spaceName deleted successfully',
       );
     } catch (e) {
-      Logger.error('Failed to delete space $spaceName: $e',
-          label: 'DataStore.deleteSpace');
+      Logger.error('Failed to delete space $spaceName', rawError: e);
       // Convert any unexpected exceptions to DbResult
       final dbEx = DbException.wrap(e,
           fallbackType: ResultType.engError,
@@ -7829,16 +7736,14 @@ class DataStoreImpl {
       await ensureInitialized();
       // Check if table exists
       if (!await tableExists(tableName)) {
-        Logger.error('Table $tableName does not exist',
-            label: 'DataStoreImpl.streamRecords');
+        Logger.error('Table $tableName does not exist');
         return;
       }
 
       // Get table schema
       final schema = await schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Failed to get schema for $tableName',
-            label: 'DataStoreImpl.streamRecords');
+        Logger.error('Failed to get schema for $tableName');
         return;
       }
 
@@ -7861,13 +7766,11 @@ class DataStoreImpl {
           yield selectFields(record, selectedFields);
         }
       } catch (e) {
-        Logger.error('Error streaming records: $e',
-            label: 'DataStoreImpl.streamRecords');
+        Logger.error('Error streaming records', rawError: e);
         rethrow;
       }
     } catch (e) {
-      Logger.error('Error streaming records: $e',
-          label: 'DataStoreImpl.streamRecords');
+      Logger.error('Error streaming records', rawError: e);
       rethrow;
     }
   }
@@ -8092,8 +7995,8 @@ class DataStoreImpl {
       };
       await upsert(conflictTable, data);
     } catch (e) {
-      Logger.error('Failed to write conflict flag to $conflictTable: $e',
-          label: 'DataStore.conflictDefense');
+      Logger.error('Failed to write conflict flag to $conflictTable',
+          rawError: e);
     }
   }
 }
