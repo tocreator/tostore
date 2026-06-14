@@ -57,14 +57,13 @@ class IntegrityChecker {
           final List<String> recordErrors = [];
           if (!_validateRecord(data, schema, errors: recordErrors)) {
             Logger.error(
-                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}',
-                label: 'IntegrityChecker.checkTableStructure');
+                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}');
             return false;
           }
           validatedCount++;
         } catch (e) {
-          Logger.error('Table structure validation exception at start: $e',
-              label: 'IntegrityChecker.checkTableStructure');
+          Logger.error('Table structure validation exception at start',
+              rawError: e);
           return false;
         }
       }
@@ -81,25 +80,22 @@ class IntegrityChecker {
           final List<String> recordErrors = [];
           if (!_validateRecord(data, schema, errors: recordErrors)) {
             Logger.error(
-                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}',
-                label: 'IntegrityChecker.checkTableStructure');
+                'Table structure validation failed for table "$tableName": ${recordErrors.join('; ')}');
             return false;
           }
           validatedCount++;
         } catch (e) {
-          Logger.error('Table structure validation exception at end: $e',
-              label: 'IntegrityChecker.checkTableStructure');
+          Logger.error('Table structure validation exception at end',
+              rawError: e);
           return false;
         }
       }
 
       Logger.info(
-          'Table structure validation completed (sampled $validatedCount records from start/end)',
-          label: 'IntegrityChecker.checkTableStructure');
+          'Table structure validation completed (sampled $validatedCount records from start/end)');
       return true;
     } catch (e) {
-      Logger.error('Table structure check failed: $e',
-          label: 'IntegrityChecker.checkTableStructure');
+      Logger.error('Table structure check failed', rawError: e);
       return false;
     }
   }
@@ -119,8 +115,7 @@ class IntegrityChecker {
       }
 
       if (fileMeta == null) {
-        Logger.warn('Table meta not found for $tableName',
-            label: 'IntegrityChecker.checkDataConsistency');
+        Logger.warn('Table meta not found for $tableName');
         return false;
       }
 
@@ -151,8 +146,7 @@ class IntegrityChecker {
             .getPartitionFilePathByNo(tableName, pNo);
         if (!await _dataStore.storage.existsFile(path)) {
           if (pNo == 0) {
-            Logger.error('First partition file missing (pNo=0)',
-                label: 'IntegrityChecker.checkDataConsistency');
+            Logger.error('First partition file missing (pNo=0)');
             return false;
           }
           continue;
@@ -161,8 +155,7 @@ class IntegrityChecker {
         final actualSize = await _dataStore.storage.getFileSize(path);
         if (actualSize <= 0) {
           if (pNo == 0) {
-            Logger.error('First partition file is empty (pNo=0)',
-                label: 'IntegrityChecker.checkDataConsistency');
+            Logger.error('First partition file is empty (pNo=0)');
             return false;
           }
           continue;
@@ -172,51 +165,43 @@ class IntegrityChecker {
           final raw0 =
               await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
           if (raw0.isEmpty) {
-            Logger.error('Partition file meta page is empty (pNo=$pNo)',
-                label: 'IntegrityChecker.checkDataConsistency');
+            Logger.error('Partition file meta page is empty (pNo=$pNo)');
             return false;
           }
           final parsed0 = BTreePageIO.parsePageBytes(raw0);
           if (parsed0.type != BTreePageType.meta) {
             Logger.error(
-                'Partition file missing meta page (pNo=$pNo, type=${parsed0.type})',
-                label: 'IntegrityChecker.checkDataConsistency');
+                'Partition file missing meta page (pNo=$pNo, type=${parsed0.type})');
             return false;
           }
           final hdr =
               PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
           if (hdr == null) {
-            Logger.error('Failed to decode PartitionMetaPage (pNo=$pNo)',
-                label: 'IntegrityChecker.checkDataConsistency');
+            Logger.error('Failed to decode PartitionMetaPage (pNo=$pNo)');
             return false;
           }
           if (hdr.partitionNo != pNo) {
             Logger.error(
-                'PartitionMetaPage.partitionNo mismatch: expected=$pNo actual=${hdr.partitionNo}',
-                label: 'IntegrityChecker.checkDataConsistency');
+                'PartitionMetaPage.partitionNo mismatch: expected=$pNo actual=${hdr.partitionNo}');
             return false;
           }
           if (hdr.fileSizeInBytes > actualSize) {
             Logger.error(
-                'PartitionMetaPage.fileSizeInBytes exceeds actual file size: pNo=$pNo hdr=${hdr.fileSizeInBytes} actual=$actualSize',
-                label: 'IntegrityChecker.checkDataConsistency');
+                'PartitionMetaPage.fileSizeInBytes exceeds actual file size: pNo=$pNo hdr=${hdr.fileSizeInBytes} actual=$actualSize');
             return false;
           }
         } catch (e) {
-          Logger.error(
-              'Validation failed for partitionNo=$pNo with exception: $e',
-              label: 'IntegrityChecker.checkDataConsistency');
+          Logger.error('Validation failed for partitionNo=$pNo with exception',
+              rawError: e);
           return false;
         }
       }
 
       Logger.info(
-          'Data consistency check completed (sampled partitions: ${partitionsToCheck.join(", ")})',
-          label: 'IntegrityChecker.checkDataConsistency');
+          'Data consistency check completed (sampled partitions: ${partitionsToCheck.join(", ")})');
       return true;
     } catch (e) {
-      Logger.error('Data consistency check failed: $e',
-          label: 'IntegrityChecker.checkDataConsistency');
+      Logger.error('Data consistency check failed', rawError: e);
       return false;
     }
   }
@@ -262,8 +247,7 @@ class IntegrityChecker {
               tableName,
             )) {
               Logger.error(
-                  'Foreign key constraint validation failed at start: ${field.name}=${data[field.name]}',
-                  label: 'IntegrityChecker.checkForeignKeyConstraints');
+                  'Foreign key constraint validation failed at start: ${field.name}=${data[field.name]}');
               return false;
             }
           }
@@ -288,8 +272,7 @@ class IntegrityChecker {
               tableName,
             )) {
               Logger.error(
-                  'Foreign key constraint validation failed at end: ${field.name}=${data[field.name]}',
-                  label: 'IntegrityChecker.checkForeignKeyConstraints');
+                  'Foreign key constraint validation failed at end: ${field.name}=${data[field.name]}');
               return false;
             }
           }
@@ -297,12 +280,10 @@ class IntegrityChecker {
       }
 
       Logger.info(
-          'Foreign key constraint validation completed (sampled records from start/end)',
-          label: 'IntegrityChecker.checkForeignKeyConstraints');
+          'Foreign key constraint validation completed (sampled records from start/end)');
       return true;
     } catch (e) {
-      Logger.error('Foreign key constraint check failed: $e',
-          label: 'IntegrityChecker.checkForeignKeyConstraints');
+      Logger.error('Foreign key constraint check failed', rawError: e);
       return false;
     }
   }
@@ -338,8 +319,8 @@ class IntegrityChecker {
       return record.records.isNotEmpty;
     } catch (e) {
       Logger.warn(
-          'Foreign key reference validation error: $e (table=$referencedTable, value=$value)',
-          label: 'IntegrityChecker._validateForeignKeyReference');
+          'Foreign key reference validation error (table=$referencedTable, value=$value)',
+          rawError: e);
       return false;
     }
   }
@@ -385,8 +366,7 @@ class IntegrityChecker {
             .getIndexMetaPath(tableName, index.actualIndexName);
         if (!await _dataStore.storage.existsFile(indexMetaPath)) {
           Logger.warn(
-              'Unique index metadata file not found: ${index.actualIndexName}',
-              label: 'IntegrityChecker.checkUniqueConstraints');
+              'Unique index metadata file not found: ${index.actualIndexName}');
           // Don't fail for missing index metadata (might be a new index)
           continue;
         }
@@ -397,27 +377,24 @@ class IntegrityChecker {
               ?.getIndexMeta(tableName, index.actualIndexName);
           if (indexMeta == null) {
             Logger.warn(
-                'Failed to load unique index metadata: ${index.actualIndexName}',
-                label: 'IntegrityChecker.checkUniqueConstraints');
+                'Failed to load unique index metadata: ${index.actualIndexName}');
             // Don't fail, might be a new index
             continue;
           }
         } catch (e) {
           Logger.warn(
-              'Error loading unique index metadata: ${index.actualIndexName}, $e',
-              label: 'IntegrityChecker.checkUniqueConstraints');
+              'Error loading unique index metadata: ${index.actualIndexName}, ',
+              rawError: e);
           // Don't fail, might be a new index
           continue;
         }
       }
 
       Logger.info(
-          'Unique constraint validation completed (validated index metadata structure)',
-          label: 'IntegrityChecker.checkUniqueConstraints');
+          'Unique constraint validation completed (validated index metadata structure)');
       return true;
     } catch (e) {
-      Logger.error('Unique constraint check failed: $e',
-          label: 'IntegrityChecker.checkUniqueConstraints');
+      Logger.error('Unique constraint check failed', rawError: e);
       return false;
     }
   }
@@ -492,7 +469,7 @@ class IntegrityChecker {
         // this may be due to table structure change
         Logger.warn(
             'Unknown field encountered during record validation: ${entry.key}',
-            label: 'IntegrityChecker._validateRecord');
+            rawError: e);
         continue;
       }
     }
@@ -526,8 +503,7 @@ class IntegrityChecker {
 
       if (isNewTable) {
         Logger.info(
-            'Table[$tableName] is a new table or has no data written yet, skipping data file validation, only validating table structure',
-            label: 'IntegrityChecker.validateMigration');
+            'Table[$tableName] is a new table or has no data written yet, skipping data file validation, only validating table structure');
       } else {
         // for table with data, validate B+Tree index meta data
         // (vector indexes use separate meta paths managed by VectorIndexManager)
@@ -540,8 +516,7 @@ class IntegrityChecker {
 
           if (!await _dataStore.storage.existsFile(indexMetaPath)) {
             Logger.info(
-                'Index metadata does not exist: ${index.actualIndexName}, possibly a new index',
-                label: 'IntegrityChecker.validateMigration');
+                'Index metadata does not exist: ${index.actualIndexName}, possibly a new index');
             // for new index, do not fail
           }
         }
@@ -585,8 +560,7 @@ class IntegrityChecker {
         final results = await Future.wait(
             toCheck.map((pNo) => validatePartitionMetaPage(pNo)));
         if (results.contains(false)) {
-          Logger.error('Partition meta page validation failed',
-              label: 'IntegrityChecker.validateMigration');
+          Logger.error('Partition meta page validation failed');
           return false;
         }
       }
@@ -616,15 +590,14 @@ class IntegrityChecker {
               final List<String> recordErrors = [];
               if (!_validateRecord(record, newSchema, errors: recordErrors)) {
                 Logger.error(
-                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}',
-                    label: 'IntegrityChecker.validateMigration');
+                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}');
                 return false;
               }
               validatedCount++;
             } catch (recordError) {
               Logger.error(
-                  'Record structure validation exception for table [$tableName]: $recordError',
-                  label: 'IntegrityChecker.validateMigration');
+                  'Record structure validation exception for table [$tableName]',
+                  rawError: recordError);
               return false;
             }
           }
@@ -642,26 +615,23 @@ class IntegrityChecker {
               final List<String> recordErrors = [];
               if (!_validateRecord(record, newSchema, errors: recordErrors)) {
                 Logger.error(
-                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}',
-                    label: 'IntegrityChecker.validateMigration');
+                    'Record structure validation failed for table [$tableName]: ${recordErrors.join("; ")}');
                 return false;
               }
               validatedCount++;
             } catch (recordError) {
               Logger.error(
-                  'Record structure validation exception for table [$tableName]: $recordError',
-                  label: 'IntegrityChecker.validateMigration');
+                  'Record structure validation exception for table [$tableName]',
+                  rawError: recordError);
               return false;
             }
           }
 
           Logger.info(
-              'Migration validation sampled $validatedCount records from start/end',
-              label: 'IntegrityChecker.validateMigration');
+              'Migration validation sampled $validatedCount records from start/end');
         }
-      } catch (e, stack) {
-        Logger.error('Table structure validation failed: $e\n$stack',
-            label: 'IntegrityChecker.validateMigration');
+      } catch (e) {
+        Logger.error('Table structure validation failed', rawError: e);
         return false;
       }
 
@@ -669,16 +639,14 @@ class IntegrityChecker {
       stopwatch.stop();
       Logger.info(
         'Migration validation completed: Table[$tableName], Time[${stopwatch.elapsedMilliseconds}ms]',
-        label: 'IntegrityChecker.validateMigration',
       );
 
       return true;
     } catch (e) {
       stopwatch.stop();
       Logger.error(
-        'Migration validation error: Table[$tableName], Error[$e], Time[${stopwatch.elapsedMilliseconds}ms]',
-        label: 'IntegrityChecker.validateMigration',
-      );
+          'Migration validation error: Table[$tableName], Error[], Time[${stopwatch.elapsedMilliseconds}ms]',
+          rawError: e);
       return false;
     }
   }
