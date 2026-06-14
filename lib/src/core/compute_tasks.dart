@@ -866,11 +866,8 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
       migratedEntries: migratedEntries,
       success: true,
     );
-  } catch (e, stack) {
-    Logger.error(
-      'Failed to process migration records: $e\n$stack',
-      label: 'ComputeTasks.processMigrationRecords',
-    );
+  } catch (e) {
+    Logger.error('Failed to process migration records', rawError: e);
     return MigrationRecordProcessResult(
       migratedEntries: [],
       success: false,
@@ -921,9 +918,8 @@ Map<String, dynamic> applyFieldModification(
     } catch (e) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
       Logger.warn(
-        'Failed to convert field ${fieldUpdate.name} to type ${fieldUpdate.type}, using default value: $e',
-        label: 'processMigrationRecords._applyFieldModification',
-      );
+          'Failed to convert field ${fieldUpdate.name} to type ${fieldUpdate.type}, using default value',
+          rawError: e);
     }
   }
 
@@ -934,7 +930,6 @@ Map<String, dynamic> applyFieldModification(
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
     Logger.debug(
       'Field ${fieldUpdate.name} is now non-nullable, applied default value',
-      label: 'processMigrationRecords._applyFieldModification',
     );
   }
 
@@ -944,7 +939,6 @@ Map<String, dynamic> applyFieldModification(
     record[fieldUpdate.name] = fieldUpdate.defaultValue;
     Logger.debug(
       'Field ${fieldUpdate.name} has new default value, applied to null value',
-      label: 'processMigrationRecords._applyFieldModification',
     );
   }
 
@@ -952,7 +946,6 @@ Map<String, dynamic> applyFieldModification(
   if (fieldUpdate.unique != null && fieldUpdate.unique!) {
     Logger.debug(
       'Field ${fieldUpdate.name} now has unique constraint, further validation may be needed',
-      label: 'processMigrationRecords._applyFieldModification',
     );
   }
 
@@ -967,7 +960,6 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] = value.substring(0, fieldUpdate.maxLength!);
       Logger.warn(
         'Field ${fieldUpdate.name} exceeds max length of ${fieldUpdate.maxLength}, truncated',
-        label: 'processMigrationRecords._applyFieldModification',
       );
     }
     if (fieldUpdate.isExplicitlySet('minLength') &&
@@ -976,7 +968,6 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
       Logger.warn(
         'Field ${fieldUpdate.name} is shorter than min length of ${fieldUpdate.minLength}, using default value',
-        label: 'processMigrationRecords._applyFieldModification',
       );
     }
   }
@@ -993,7 +984,6 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] = fieldUpdate.minValue;
       Logger.warn(
         'Field ${fieldUpdate.name} below min value of ${fieldUpdate.minValue}, set to min',
-        label: 'processMigrationRecords._applyFieldModification',
       );
     }
 
@@ -1003,7 +993,6 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] = fieldUpdate.maxValue;
       Logger.warn(
         'Field ${fieldUpdate.name} exceeds max value of ${fieldUpdate.maxValue}, set to max',
-        label: 'processMigrationRecords._applyFieldModification',
       );
     }
   }
@@ -1014,7 +1003,6 @@ Map<String, dynamic> applyFieldModification(
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
     Logger.warn(
       'Field ${fieldUpdate.name} value does not meet constraints after updates, using default value',
-      label: 'processMigrationRecords._applyFieldModification',
     );
   }
 
