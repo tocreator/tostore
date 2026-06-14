@@ -81,8 +81,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         }
       } catch (e) {
         // Silently ignore pre-warm errors
-        Logger.debug('Pre-warm next page failed (ignoring): $e',
-            label: 'QueryBuilder.prewarm');
+        Logger.debug('Pre-warm next page failed (ignoring): $e');
       }
     });
   }
