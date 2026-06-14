@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
 
-ToStore es un motor de datos moderno diseñado para la era AGI y los escenarios de inteligencia de vanguardia. Admite de forma nativa sistemas distribuidos, fusión multimodal, datos estructurados relacionales, vectores de alta dimensión y almacenamiento de datos no estructurados. Construido sobre una arquitectura de nodo de autoenrutamiento y un motor inspirado en una red neuronal, brinda a los nodos una alta autonomía y una escalabilidad horizontal elástica al tiempo que desacopla lógicamente el rendimiento de la escala de datos. Incluye transacciones ACID, consultas relacionales complejas (JOIN y claves externas en cascada), TTL a nivel de tabla y agregaciones, junto con múltiples algoritmos de clave primaria distribuidos, expresiones atómicas, reconocimiento de cambios de esquema, cifrado, aislamiento de datos multiespacio, programación de carga inteligente con reconocimiento de recursos y recuperación automática ante desastres/fallos.
+ToStore es un motor de datos moderno diseñado para la era de la AGI y escenarios de inteligencia perimetral. Admite de forma nativa sistemas distribuidos, fusión multimodal, datos estructurados relacionales, vectores de alta dimensión y almacenamiento de datos no estructurados. Basado en una arquitectura de nodos autoenrutados (Self-Routing) y un motor inspirado en redes neuronales, otorga a los nodos una alta autonomía y escalabilidad horizontal elástica, desacoplando lógicamente el rendimiento de la escala de datos. Cuenta con transacciones ACID, consultas relacionales complejas (JOINs y claves externas en cascada), TTL a nivel de tabla y agregaciones, además de soporte para análisis de estado de O&M automatizado y procesamiento de datos completamente asíncrono, logrando una evolución de arquitectura transparente (incluyendo actualizaciones de esquema, cambios de clave y operaciones de datos a gran escala) sin interrupciones. Con claves primarias distribuidas integradas, expresiones atómicas, cifrado, aislamiento multiespacio, programación inteligente de carga sensible a recursos y autorrecuperación ante desastres/fallos, ToStore evoluciona continuamente en escenarios de alta continuidad como Agentes y O&M automatizado, manteniendo el servicio siempre activo.
 
 A medida que la informática continúa avanzando hacia la inteligencia de punta, los agentes, sensores y otros dispositivos ya no son simplemente "pantallas de contenido". Son nodos inteligentes responsables de la generación local, la conciencia ambiental, la toma de decisiones en tiempo real y los flujos de datos coordinados. Las soluciones de bases de datos tradicionales están limitadas por su arquitectura subyacente y sus extensiones integradas, lo que hace que sea cada vez más difícil satisfacer los requisitos de baja latencia y estabilidad de las aplicaciones inteligentes de nube perimetral en escrituras de alta concurrencia, conjuntos de datos masivos, recuperación de vectores y generación colaborativa.
 
@@ -62,15 +62,15 @@ ToStore brinda capacidades distribuidas de borde lo suficientemente sólidas par
   - Colaboración paralela de múltiples nodos y descomposición de tareas.
   - La división del tiempo mantiene las animaciones de la interfaz de usuario fluidas incluso bajo cargas pesadas
 
-- 🔍 **Consultas estructuradas y recuperación de vectores**
-  - Admite predicados complejos, JOIN, agregaciones y TTL a nivel de tabla
-  - Admite campos vectoriales, índices vectoriales y recuperación del vecino más cercano
-  - Los datos estructurados y vectoriales pueden trabajar juntos dentro del mismo motor.
+- 🔑 **Esquema, índices y búsqueda eficiente**
+  - Claves diversas (secuencial, marca temporal, prefijo, código corto)
+  - Restricciones multidimensionales (índice compuesto/vector, claves foráneas)
+  - Búsqueda de fusión (predicados complejos, JOIN, búsqueda vectorial)
 
-- 🔑 **Claves primarias, índices y evolución de esquemas**
-  - Algoritmos de clave principal integrados que incluyen estrategias secuenciales, de marca de tiempo, con prefijo de fecha y de código corto
-  - Admite índices únicos, índices compuestos, índices vectoriales y restricciones de clave externa
-  - Detecta automáticamente cambios de esquema y completa el trabajo de migración
+- 🤖 **O&M inteligente y evolución transparente**
+  - Especificación de estado integrada para reconocimiento de O&M y Agentes
+  - Actualizaciones de esquema y cambios de clave fluidos y sin fricciones
+  - Actualizaciones en caliente sin interrupción del servicio para mayor estabilidad
 
 - 🛡️ **Transacciones, seguridad y recuperación**
   - Proporciona transacciones ACID, actualizaciones de expresiones atómicas y claves externas en cascada
