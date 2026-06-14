@@ -283,9 +283,11 @@ class ForeignKeyManager {
           final field = schema.fields.firstWhere(
             (f) => f.name == fieldName,
             orElse: () => throw DbException([
-              GeneralStatus(
+              InvalidArgumentStatus(
                 type: ResultType.devFieldNotFound,
                 message: 'Field "$fieldName" not found in table "$tableName"',
+                parameterName: 'fieldName',
+                passedValue: fieldName,
               ),
             ]),
           );
@@ -396,10 +398,12 @@ class ForeignKeyManager {
         final refFieldSchema = referencedSchema.fields.firstWhere(
           (f) => f.name == refField,
           orElse: () => throw DbException([
-            GeneralStatus(
+            InvalidArgumentStatus(
               type: ResultType.devFieldNotFound,
               message:
                   'Referenced field "$refField" not found in table "${fk.referencedTable}"',
+              parameterName: 'refField',
+              passedValue: refField,
             ),
           ]),
         );
@@ -1091,10 +1095,12 @@ class ForeignKeyManager {
               final field = childSchema.fields.firstWhere(
                 (f) => f.name == fkField,
                 orElse: () => throw DbException([
-                  GeneralStatus(
+                  InvalidArgumentStatus(
                     type: ResultType.devFieldNotFound,
                     message:
                         'Field "$fkField" not found in table "$childTableName"',
+                    parameterName: 'fkField',
+                    passedValue: fkField,
                   ),
                 ]),
               );
@@ -1164,10 +1170,12 @@ class ForeignKeyManager {
         fieldSchema = childSchema.fields.firstWhere(
           (f) => f.name == fieldName,
           orElse: () => throw DbException([
-            GeneralStatus(
+            InvalidArgumentStatus(
               type: ResultType.devFieldNotFound,
               message:
                   'Field "$fieldName" not found in table "$childTableName"',
+              parameterName: 'fieldName',
+              passedValue: fieldName,
             ),
           ]),
         );
@@ -1242,10 +1250,12 @@ class ForeignKeyManager {
             fieldSchema = childSchemaForConversion.fields.firstWhere(
               (f) => f.name == fieldName,
               orElse: () => throw DbException([
-                GeneralStatus(
+                InvalidArgumentStatus(
                   type: ResultType.devFieldNotFound,
                   message:
                       'Field "$fieldName" not found in table "$childTableName"',
+                  parameterName: 'fieldName',
+                  passedValue: fieldName,
                 ),
               ]),
             );
@@ -1548,9 +1558,11 @@ class ForeignKeyManager {
       final field = childSchema.fields.firstWhere(
         (f) => f.name == fieldName,
         orElse: () => throw DbException([
-          GeneralStatus(
+          InvalidArgumentStatus(
             type: ResultType.devFieldNotFound,
             message: 'Field "$fieldName" not found in table "$childTableName"',
+            parameterName: 'fieldName',
+            passedValue: fieldName,
           ),
         ]),
       );
@@ -1618,9 +1630,11 @@ class ForeignKeyManager {
       final field = childSchema.fields.firstWhere(
         (f) => f.name == fieldName,
         orElse: () => throw DbException([
-          GeneralStatus(
+          InvalidArgumentStatus(
             type: ResultType.devFieldNotFound,
             message: 'Field "$fieldName" not found in table "$childTableName"',
+            parameterName: 'fieldName',
+            passedValue: fieldName,
           ),
         ]),
       );
