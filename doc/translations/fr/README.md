@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>Pourquoi choisir ToStore ?
 
-ToStore est un moteur de données moderne conçu pour l'ère AGI et les scénarios d'intelligence de pointe. Il prend en charge nativement les systèmes distribués, la fusion multimodale, les données relationnelles structurées, les vecteurs de grande dimension et le stockage de données non structurées. Construit sur une architecture de nœuds à auto-routage et un moteur inspiré des réseaux neuronaux, il offre aux nœuds une grande autonomie et une évolutivité horizontale élastique tout en dissociant logiquement les performances de l'échelle des données. Il comprend des transactions ACID, des requêtes relationnelles complexes (JOIN et clés étrangères en cascade), des TTL au niveau des tables et des agrégations, ainsi que plusieurs algorithmes de clé primaire distribués, des expressions atomiques, la reconnaissance des modifications de schéma, le cryptage, l'isolation des données multi-espaces, la planification de charge intelligente tenant compte des ressources et la récupération automatique après sinistre/accident.
+ToStore est un moteur de données moderne conçu pour l'ère de l'AGI et les scénarios d'intelligence en périphérie (edge intelligence). Il prend en charge nativement les systèmes distribués, la fusion multimodale, les données structurées relationnelles, les vecteurs de grande dimension et le stockage de données non structurées. Basé sur une architecture de nœuds auto-routés (Self-Routing) et un moteur inspiré des réseaux neuronaux, il confère aux nœuds une grande autonomie et une extensibilité horizontale élastique, découplant logiquement les performances de l'échelle des données. Il combine des transactions ACID, des requêtes relationnelles complexes (JOINs et clés étrangères en cascade), le TTL au niveau table et des agrégations, tout en prenant en charge l'analyse automatisée de l'état d'exploitation et le traitement de données entièrement asynchrone, permettant une évolution d'architecture fluide et invisible (y compris les mises à niveau de schéma, les changements de clé et les opérations de données à grande échelle). Avec des clés primaires distribuées intégrées, des expressions atomiques, le chiffrement, l'isolation multi-espace, une planification intelligente de la charge sensible aux ressources et une auto-restauration après sinistre/panne, ToStore évolue continuellement dans des scénarios à haute continuité comme les Agents et l'exploitation automatisée, gardant le service toujours en ligne.
 
 Alors que l’informatique continue d’évoluer vers l’intelligence de pointe, les agents, capteurs et autres appareils ne sont plus de simples « affichages de contenu ». Ce sont des nœuds intelligents responsables de la production locale, de la sensibilisation à l’environnement, de la prise de décision en temps réel et des flux de données coordonnés. Les solutions de bases de données traditionnelles sont limitées par leur architecture sous-jacente et leurs extensions intégrées, ce qui rend de plus en plus difficile de satisfaire aux exigences de faible latence et de stabilité des applications intelligentes du cloud périphérique dans des contextes d'écritures à haute concurrence, d'ensembles de données massifs, de récupération vectorielle et de génération collaborative.
 
@@ -62,15 +62,15 @@ ToStore offre des capacités distribuées de pointe suffisamment puissantes pour
   - Collaboration parallèle multi-nœuds et décomposition des tâches
   - Le découpage temporel maintient les animations de l'interface utilisateur fluides même sous une charge importante
 
-- 🔍 **Requêtes structurées et récupération de vecteurs**
-  - Prend en charge les prédicats complexes, les JOIN, les agrégations et le TTL au niveau de la table
-  - Prend en charge les champs vectoriels, les index vectoriels et la récupération du voisin le plus proche
-  - Les données structurées et vectorielles peuvent fonctionner ensemble dans le même moteur
+- 🔑 **Schéma, index & recherche efficace**
+  - Clés diversifiées (séquentielle, horodatage, préfixe, code court)
+  - Contraintes multidimensionnelles (index composé/vecteur, clés étrangères)
+  - Recherche fusionnée (prédicats complexes, JOIN, recherche vectorielle)
 
-- 🔑 **Clés primaires, index et évolution de schéma**
-  - Algorithmes de clé primaire intégrés comprenant des stratégies séquentielles, d'horodatage, de préfixe de date et de code court
-  - Prend en charge les index uniques, les index composites, les index vectoriels et les contraintes de clé étrangère
-  - Détecte automatiquement les modifications de schéma et termine le travail de migration
+- 🤖 **Exploitation intelligente & évolution fluide**
+  - Spécification d'état intégrée pour la reconnaissance O&M et Agent
+  - Mises à niveau de schéma et changements de clé fluides et invisibles
+  - Mises à jour à chaud sans interruption de service pour une stabilité accrue
 
 - 🛡️ **Transactions, sécurité et récupération**
   - Fournit des transactions ACID, des mises à jour d'expressions atomiques et des clés étrangères en cascade
