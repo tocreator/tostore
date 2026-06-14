@@ -437,7 +437,6 @@ class TreeCache<T> {
         Logger.debug(
           '[$debugLabel] cleanup removed=$removedTotal target=$targetRemove '
           'entries=$_totalEntries bytes=$_estimatedTotalSizeBytes',
-          label: debugLabel,
         );
       }
       // Update cooldown timestamp AFTER cleanup completes.
