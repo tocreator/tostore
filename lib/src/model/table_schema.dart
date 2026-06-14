@@ -90,7 +90,6 @@ class TableSchema {
       if (_isPrimaryKeyOnlyIndex(index)) {
         Logger.warn(
           'Table $name contains redundant primary-key index ${index.actualIndexName}; table data is already range-partitioned by PK, ignoring this index.',
-          label: 'TableSchema.getAllIndexes',
         );
         continue;
       }
@@ -604,7 +603,6 @@ class TableSchema {
     if (_isPrimaryKeyOnlyIndex(index)) {
       Logger.warn(
         'Table $name contains redundant primary key-only index: ${index.actualIndexName}. Table data is already range-partitioned by primary key.',
-        label: 'TableSchema.validateIndexFields',
       );
       // do not return false, because this is just a warning, should not block the table creation
     }
@@ -860,7 +858,6 @@ class TableSchema {
                 stringValue.length > fieldSchema.maxLength!) {
               Logger.warn(
                 'Field ${fieldSchema.name} exceeds maximum length ${fieldSchema.maxLength}, will truncate',
-                label: 'TableSchema.validateData',
               );
               result[entry.key] =
                   stringValue.substring(0, fieldSchema.maxLength!);
@@ -877,10 +874,8 @@ class TableSchema {
       }
       rethrow;
     } catch (e) {
-      Logger.warn(
-        'Unexpected data validation error for table $name: $e',
-        label: 'TableSchema.validateData',
-      );
+      Logger.warn('Unexpected data validation error for table $name',
+          rawError: e);
       errors?.add(e.toString());
       return null;
     }
@@ -935,7 +930,7 @@ class TableSchema {
       return field.getMatcherType();
     } catch (e) {
       Logger.warn('Field $fieldName not found, using unsupported matcher',
-          label: 'TableSchema.getFieldMatcherType');
+          rawError: e);
       return MatcherType.unsupported;
     }
   }
@@ -1063,8 +1058,7 @@ class TableSchema {
           return false;
       }
     } catch (e) {
-      Logger.error('Check primary key order failed: $e',
-          label: 'TableSchema.isPrimaryKeyOrdered');
+      Logger.error('Check primary key order failed', rawError: e);
       return false;
     }
   }
@@ -1590,10 +1584,8 @@ class FieldSchema {
           try {
             return value.toIso8601String();
           } catch (e) {
-            Logger.warn(
-              'Failed to convert DateTime to string: $value',
-              label: 'DataStore._toString',
-            );
+            Logger.warn('Failed to convert DateTime to string: $value',
+                rawError: e);
             return null;
           }
         } else {
@@ -1627,10 +1619,8 @@ class FieldSchema {
           try {
             return DateTime.parse(value).toIso8601String();
           } catch (e) {
-            Logger.warn(
-              'Failed to parse DateTime from string: $value',
-              label: 'DataStore._toDateTimeString',
-            );
+            Logger.warn('Failed to parse DateTime from string: $value',
+                rawError: e);
             return null;
           }
         }
@@ -1638,10 +1628,8 @@ class FieldSchema {
           try {
             return DateTime.fromMillisecondsSinceEpoch(value).toIso8601String();
           } catch (e) {
-            Logger.warn(
-              'Failed to convert timestamp to DateTime: $value',
-              label: 'DataStore._toDateTimeString',
-            );
+            Logger.warn('Failed to convert timestamp to DateTime: $value',
+                rawError: e);
             return null;
           }
         }
@@ -1654,10 +1642,8 @@ class FieldSchema {
             }
             return null; // Out of range
           } catch (e) {
-            Logger.warn(
-              'Failed to convert BigInt to DateTime: $value',
-              label: 'DataStore._toDateTimeString',
-            );
+            Logger.warn('Failed to convert BigInt to DateTime: $value',
+                rawError: e);
             return null;
           }
         }
@@ -1681,10 +1667,7 @@ class FieldSchema {
           try {
             return VectorData.fromBytes(value);
           } catch (e) {
-            Logger.warn(
-              'Failed to convert binary data to vector: $e',
-              label: 'DataStore._toVector',
-            );
+            Logger.warn('Failed to convert binary data to vector', rawError: e);
             return null;
           }
         }
@@ -1695,10 +1678,8 @@ class FieldSchema {
               return VectorData.fromList(jsonList.cast<num>());
             }
           } catch (e) {
-            Logger.warn(
-              'Failed to parse vector from string: $value',
-              label: 'DataStore._toVector',
-            );
+            Logger.warn('Failed to parse vector from string: $value',
+                rawError: e);
           }
         }
         return null;
