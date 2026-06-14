@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1232,10 +1232,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
+if (!txResult.hasErrors) {
   print('Transaction committed successfully');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('Transaction rolled back due to:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1330,14 +1335,30 @@ final restored = await db.restore(
 
 ### Status Codes and Error Handling
 
+There are two channels for error and exception feedback in ToStore:
 
-ToStore uses a unified response model for data operations:
+> [!NOTE]
+> **Unified Diagnosis Foundation**: Whether returned via the response result model (`statuses` in `DbResult`/`QueryResult`) or thrown via fatal exceptions (`statuses` in `DbException`), all diagnostic states are uniformly based on the structured **`ResultStatus`** system and share the same status codes, ensuring consistency.
 
-- `ResultType`: the unified status enum used for branching logic
-- `result.code`: a stable numeric code corresponding to `ResultType`
-- `result.message`: a readable message describing the current error
-- `successKeys` / `failedKeys`: lists of successful and failed primary keys in bulk operations
+1. Response Result Model (Result-based Response)
+For daily operations such as insert, update, delete, query, transactions, and runtime schema creation/modification. These operations **will not throw exceptions** when encountering constraint violations, validation failures, or invalid arguments. Instead, ToStore wraps the results using `DbResult` or `QueryResult`, recording all diagnosis information in the status list. This guarantees that ordinary business logical errors do not interrupt the database.
 
+- **`hasErrors`: Indicates if there are any errors in the current operation. In batch operations or transactions, if at least one error is present, this property is `true`.**
+- **`statuses`: A detailed list of all `ResultStatus` diagnoses for the operation. It supports 1:1 order-matching, which is very useful for batch operations.**
+- **`firstPrimaryKey`: Read the physically generated primary key directly during a single insert/write operation without parsing `statuses` manually.**
+- **`ResultType`: Enum for the category of state, convenient for branch handling and checks (e.g. `isBusinessError`, `isDeveloperError`).**
+
+2. Exception Throwing (Exception-based Throwing)
+For fatal errors caused by developer oversight or design flaws (e.g. schema verification failure during `ToStore.open`, engine version mismatch, fatal data migration corruption, etc.). In these cases, ToStore throws `DbException` to halt execution, urging the developer to rectify it.
+
+> [!WARNING]
+> **Development Guidelines**: Ordinary business errors must not throw exceptions; they should be returned in the response result model to avoid disrupting application runtime.
+
+---
+
+### Error and Exception Examples
+
+#### 1. Single Write Response Handling
 
 ```dart
 final result = await db.insert('users', {
@@ -1345,76 +1366,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // Get the first error type and description
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('Write succeeded, primary key is: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. Batch Write Fine-Grained Diagnosis
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('Batch operation partially failed: succeeded \${batchResult.successCount}, failed \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] constraint violation! Table: \${status.tableName}, fields: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] argument error! Parameter! Parameter: \${status.parameterName}, passed value: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] error occurred: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-Common status code examples:
-Success returns `0`; negative numbers indicate errors.
-- `ResultType.success` (`0`): operation succeeded
-- `ResultType.partialSuccess` (`1`): bulk operation partially succeeded
-- `ResultType.unknown` (`-1`): unknown error
-- `ResultType.uniqueViolation` (`-2`): unique index conflict
-- `ResultType.primaryKeyViolation` (`-3`): primary key conflict
-- `ResultType.foreignKeyViolation` (`-4`): foreign key reference does not satisfy constraints
-- `ResultType.notNullViolation` (`-5`): a required field is missing or a disallowed `null` was passed
-- `ResultType.validationFailed` (`-6`): length, range, format, or other validation failed
-- `ResultType.notFound` (`-11`): target table, space, or resource does not exist
-- `ResultType.resourceExhausted` (`-15`): insufficient system resources; reduce load or retry
-- `ResultType.dbError` (`-91`): database error
-- `ResultType.ioError` (`-90`): filesystem error
-- `ResultType.timeout` (`-92`): timeout
+#### 3. Fatal Error and Initialization Exception Capture (DbException)
 
-### Transaction Result Handling
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ Fatal database exception! Error message: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('Schema validation failed! Table! Table: \${status.tableName}, field: \${status.field}, invalid configuration: \${status.wrongValue}');
+    } else {
+      print('Diagnostic info: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-Transaction error types:
-- `TransactionErrorType.operationError`: a regular operation failed inside the transaction, such as field validation failure, invalid resource state, or another business-level error
-- `TransactionErrorType.integrityViolation`: integrity or constraint conflict, such as primary key, unique key, foreign key, or non-null failure
-- `TransactionErrorType.timeout`: timeout
-- `TransactionErrorType.io`: underlying storage or filesystem I/O error
-- `TransactionErrorType.conflict`: a conflict caused the transaction to fail
-- `TransactionErrorType.userAbort`: user-initiated abort (throw-based manual abort is not currently supported)
-- `TransactionErrorType.unknown`: any other error
+For the full list of error types, leaf status codes, JSON serialization formats, and field mappings, please refer to the complete spec: [ToStore ResultStatus Automatic Diagnosis and Status Parsing Specification](doc/result_status_specification.md).
 
 
 ### Log Callback and Database Diagnostics
