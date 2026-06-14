@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+  <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
 <p align="center">
@@ -19,17 +19,17 @@
 
 
 <p align="center">
-  <a href="../../README.md">English</a> | 
-  简体中文 | 
-  <a href="README.ja.md">日本語</a> | 
-  <a href="README.ko.md">한국어</a> | 
-  <a href="README.es.md">Español</a> | 
-  <a href="README.pt-BR.md">Português (Brasil)</a> | 
-  <a href="README.ru.md">Русский</a> | 
-  <a href="README.de.md">Deutsch</a> | 
-  <a href="README.fr.md">Français</a> | 
-  <a href="README.it.md">Italiano</a> | 
-  <a href="README.tr.md">Türkçe</a>
+  <a href="../../../README.md">English</a> |
+  简体中文 |
+  <a href="../ja/README.md">日本語</a> |
+  <a href="../ko/README.md">한국어</a> |
+  <a href="../es/README.md">Español</a> |
+  <a href="../pt-BR/README.md">Português (Brasil)</a> |
+  <a href="../ru/README.md">Русский</a> |
+  <a href="../de/README.md">Deutsch</a> |
+  <a href="../fr/README.md">Français</a> |
+  <a href="../it/README.md">Italiano</a> |
+  <a href="../tr/README.md">Türkçe</a>
 </p>
 
 
@@ -96,7 +96,7 @@ ToStore 赋予边缘端支撑海量数据、复杂 AI 局部生成与大规模�
 ## <a id="installation"></a>安装
 
 > [!IMPORTANT]
-> **从 v2.x 升级？** 请阅读 [v3.x 升级指南](../UPGRADE_GUIDE_v3.md) 以了解关键的迁移步骤和重大更改。
+> **从 v2.x 升级？** 请阅读 [v3.x 升级指南](../../UPGRADE_GUIDE_v3.md) 以了解关键的迁移步骤和重大更改。
 
 在 `pubspec.yaml` 中添加 `tostore` 依赖：
 
@@ -375,7 +375,7 @@ const appSchemas = [userSchema];
 
 ## <a id="mobile-integration"></a>移动、桌面等频繁启动场景集成
 
-📱 **示例**：[mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+📱 **示例**：[mobile_quickstart.dart](../../../example/lib/mobile_quickstart.dart)
 
 ```dart
 import 'package:path/path.dart' as p;
@@ -423,7 +423,7 @@ await db.close(keepActiveSpace: false);
 
 ## <a id="server-integration"></a>服务端/智能体（持续运行场景集成）
 
-🖥️ **示例**：[server_quickstart.dart](../../example/lib/server_quickstart.dart)
+🖥️ **示例**：[server_quickstart.dart](../../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
@@ -1359,7 +1359,7 @@ final restored = await db.restore(
 );
 ```
 
-### <a id="status-error-codes"></a>状态码与错误处理
+### <a id="error-handling"></a>状态码与错误处理
 
 
 ToStore 数据操作统一响应模型：
