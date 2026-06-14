@@ -1286,11 +1286,11 @@ class ToStore implements DataStoreInterface {
       final msg = 'Table $tableName is a system table and $action.';
       Logger.error(msg);
       throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devPermissionDeniedWrite,
+        GeneralStatus(
+          type: ResultType.devUnsupportedOperation,
           message: msg,
-          parameterName: 'tableName',
-          passedValue: tableName,
+          target: tableName,
+          operation: label,
         )
       ]);
     }
