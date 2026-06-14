@@ -45,8 +45,8 @@ class DbResult {
   /// List of successfully processed item primary keys.
   ///
   /// Deprecated: Use [statuses] instead for comprehensive diagnostics and exact order-matching,
-  /// or use [primaryKey] / [id] for single-item operations.
-  @Deprecated('Use statuses or primaryKey/id instead')
+  /// or use [firstPrimaryKey] instead for single-item operations.
+  @Deprecated('Use statuses or firstPrimaryKey instead')
   List<String> get successKeys {
     if (statuses.isEmpty) return const [];
     return statuses
@@ -58,8 +58,7 @@ class DbResult {
   /// List of failed item primary keys.
   ///
   /// Deprecated: Use [statuses] instead for comprehensive diagnostics and exact order-matching,
-  /// or use [primaryKey] / [id] for single-item operations.
-  @Deprecated('Use statuses or primaryKey/id instead')
+  @Deprecated('Use statuses or firstPrimaryKey instead')
   List<String> get failedKeys {
     if (statuses.isEmpty) return const [];
     return statuses
