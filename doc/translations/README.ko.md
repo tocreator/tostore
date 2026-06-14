@@ -1420,30 +1420,32 @@ if (txResult.isFailed) {
 
 
 ### <a id="logging-diagnostics"></a>로그 콜백 및 데이터베이스 진단
+ToStore는 `ToStore.setLogConfig(...)`를 통해 데이터베이스 수명 주기 로그를 비즈니스 계층으로 다시 라우팅할 수 있습니다.
 
-ToStore는 시작, 복구, 자동 마이그레이션 및 런타임 제약 조건 충돌 로그를 `LogConfig.setConfig(...)`을 통해 비즈니스 계층으로 다시 라우팅할 수 있습니다.
-
-- `onLogHandler`은 현재 `enableLog` 및 `logLevel` 필터를 통과하는 모든 로그를 수신합니다.
-- 초기화 전에 `LogConfig.setConfig(...)`을 호출하면 초기화 및 자동 마이그레이션 중에 생성된 로그도 캡처됩니다.
+- `onLog` 콜백은 현재 `enableLog` 및 `logLevel` 필터를 통과하는 모든 `LogRecord` 로그 레코드를 수신합니다.
+  - **LogLevel.error**: 로컬 오류가 발생했으나 정상 실행에는 영향을 미치지 않습니다.
+  - **LogLevel.critical**: 전역적 재난 수준의 오류(디스크 꽉 참, 메모리 부족, 마이그레이션 중대 실패 등)로 수동 개입이 필요합니다. 이 등급에서는 경보 알림을 트리거하는 것을 권장합니다.
+- 초기화 전에 `ToStore.setLogConfig(...)`를 호출하면 초기화 및 자동 마이그레이션 중에 생성된 로그도 캡처됩니다.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // 로그 매개변수 또는 콜백 구성
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // 로그 상단의 연한 회색 제목, 앱 또는 데이터베이스 인스턴스 구분용,
+    onLog: (log) {
+      // 운영 환경에서는 warn/error/critical을 백엔드 또는 로그 플랫폼에 보고할 수 있습니다
+      // log.level은 로그 레벨에 대응합니다 (LogLevel.debug, info, warn, error, critical)
+      // log.message는 처리된 로그 텍스트에 대응합니다
+      // log.status는 기본 ResultStatus 진단 상태에 대응합니다 (code 및 codeKey 포함)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>보안 구성
 
 > [!WARNING]
