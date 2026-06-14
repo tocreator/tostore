@@ -19,10 +19,14 @@ void main() async {
 
   // It's crucial to set the log handler *before* any potential errors can occur.
   // This ensures that initialization logs are captured and displayed in the UI.
-  LogConfig.setConfig(
-    onLogHandler: (message, type, label) {
+  ToStore.setLogConfig(
+    logLevel: LogLevel.debug,
+    onLog: (LogRecord log) {
+      final message = log.message;
+      final type = log.level;
+
       // 1. Suppress expected Non-Nullable Constraint warnings
-      if (type == LogType.warn &&
+      if (type == LogLevel.warn &&
           (message.contains('Field email is required and cannot be null') ||
               message.contains('Data validation failed for table users'))) {
         return;
@@ -59,7 +63,7 @@ void main() async {
         return; // Suppress expected foreign key constraint test errors
       }
 
-      logService.add('[$label] $message', type, true);
+      logService.add(message, type, true);
     },
   );
 
@@ -107,7 +111,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   final TextEditingController _searchController = TextEditingController();
   late final PageController _pageViewController;
 
-  LogType? _selectedLogType;
+  LogLevel? _selectedLogLevel;
   String _lastOperationInfo = 'Please initialize the database first.';
   bool _isDbInitialized = false;
   bool _isInitializing = true;
@@ -326,8 +330,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
       });
     } catch (e, s) {
-      logService.add('Error fetching table data: $e', LogType.error);
-      logService.add('Stacktrace: $s', LogType.error);
+      logService.add('Error fetching table data: $e', LogLevel.error);
+      logService.add('Stacktrace: $s', LogLevel.error);
     } finally {
       setState(() {
         _isDataLoading = false;
@@ -439,9 +443,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     } catch (e, s) {
       stopwatch.stop();
       logService.add(
-          '!!!!!! DATABASE INITIALIZATION FAILED !!!!!!', LogType.error);
-      logService.add('Error: $e', LogType.error);
-      logService.add('StackTrace: $s', LogType.error);
+          '!!!!!! DATABASE INITIALIZATION FAILED !!!!!!', LogLevel.error);
+      logService.add('Error: $e', LogLevel.error);
+      logService.add('StackTrace: $s', LogLevel.error);
       if (mounted) {
         setState(() {
           _isDbInitialized = false;
@@ -476,12 +480,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   }
 
   Widget _buildFilterButton(
-      String text, LogType? type, int count, BuildContext context) {
+      String text, LogLevel? type, int count, BuildContext context) {
     if (count == 0 && type != null) {
       // Don't show the button if there are no logs of this type (except for 'All')
       return const SizedBox.shrink();
     }
-    final isSelected = _selectedLogType == type;
+    final isSelected = _selectedLogLevel == type;
     final Color backgroundColor;
     final Color foregroundColor;
     final double elevation;
@@ -500,9 +504,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       shadowColor = null;
 
       // Set count color for non-selected buttons
-      if (type == LogType.error) {
+      if (type == LogLevel.critical) {
+        countColor = Colors.red.shade900;
+      } else if (type == LogLevel.error) {
         countColor = Colors.red;
-      } else if (type == LogType.warn) {
+      } else if (type == LogLevel.warn) {
         countColor = Colors.orange;
       }
     }
@@ -510,7 +516,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     return ElevatedButton(
       onPressed: () {
         setState(() {
-          _selectedLogType = type;
+          _selectedLogLevel = type;
         });
       },
       style: ElevatedButton.styleFrom(
@@ -548,15 +554,17 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     );
   }
 
-  Color _getLogColor(LogType type) {
+  Color _getLogColor(LogLevel type) {
     switch (type) {
-      case LogType.error:
+      case LogLevel.critical:
+        return Colors.red.shade900;
+      case LogLevel.error:
         return Colors.red;
-      case LogType.warn:
+      case LogLevel.warn:
         return Colors.orange;
-      case LogType.debug:
+      case LogLevel.debug:
         return Colors.blueAccent;
-      case LogType.info:
+      case LogLevel.info:
         return Colors.black;
     }
   }
@@ -1506,19 +1514,23 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                           final allCount = logs.length;
                                           final infoCount = logs
                                               .where((log) =>
-                                                  log.type == LogType.info)
+                                                  log.type == LogLevel.info)
                                               .length;
                                           final debugCount = logs
                                               .where((log) =>
-                                                  log.type == LogType.debug)
+                                                  log.type == LogLevel.debug)
                                               .length;
                                           final warnCount = logs
                                               .where((log) =>
-                                                  log.type == LogType.warn)
+                                                  log.type == LogLevel.warn)
                                               .length;
                                           final errorCount = logs
                                               .where((log) =>
-                                                  log.type == LogType.error)
+                                                  log.type == LogLevel.error)
+                                              .length;
+                                          final criticalCount = logs
+                                              .where((log) =>
+                                                  log.type == LogLevel.critical)
                                               .length;
 
                                           return Wrap(
@@ -1530,23 +1542,28 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                                   allCount, context),
                                               _buildFilterButton(
                                                   'Info',
-                                                  LogType.info,
+                                                  LogLevel.info,
                                                   infoCount,
                                                   context),
                                               _buildFilterButton(
                                                   'Debug',
-                                                  LogType.debug,
+                                                  LogLevel.debug,
                                                   debugCount,
                                                   context),
                                               _buildFilterButton(
                                                   'Warn',
-                                                  LogType.warn,
+                                                  LogLevel.warn,
                                                   warnCount,
                                                   context),
                                               _buildFilterButton(
                                                   'Error',
-                                                  LogType.error,
+                                                  LogLevel.error,
                                                   errorCount,
+                                                  context),
+                                              _buildFilterButton(
+                                                  'Critical',
+                                                  LogLevel.critical,
+                                                  criticalCount,
                                                   context),
                                             ],
                                           );
@@ -1566,10 +1583,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   valueListenable: logService.logs,
                   builder: (context, logs, child) {
                     // ... (filtering logic remains the same)
-                    final filteredByType = _selectedLogType == null
+                    final filteredByType = _selectedLogLevel == null
                         ? logs
                         : logs
-                            .where((log) => log.type == _selectedLogType)
+                            .where((log) => log.type == _selectedLogLevel)
                             .toList();
                     final searchText = _searchController.text.toLowerCase();
                     final filteredLogs = searchText.isEmpty
@@ -1758,7 +1775,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (_isWasmBuild) {
       logService.add(
         '❌ Concurrency Test is disabled on WebAssembly builds.',
-        LogType.warn,
+        LogLevel.warn,
       );
       _updateOperationInfo('❌ Concurrency Test Disabled on WebAssembly');
       return;
@@ -1820,7 +1837,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         await widget.example
             .vectorSearchBenchmark(_selectedTable, iterations, topK);
       } catch (e) {
-        logService.add('Benchmark failed: $e', LogType.error);
+        logService.add('Benchmark failed: $e', LogLevel.error);
         _updateOperationInfo('❌ Vector search benchmark failed.');
       } finally {
         if (mounted) {
@@ -1885,8 +1902,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           );
         }
       } catch (e, s) {
-        logService.add('Failed to add data: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to add data: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
         // 'elapsed' remains -1, indicating failure.
       }
 
@@ -1942,7 +1959,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
     if (confirmed ?? false) {
       if (_primaryKey == null) {
-        logService.add('Cannot delete without a primary key.', LogType.error);
+        logService.add('Cannot delete without a primary key.', LogLevel.error);
         return;
       }
 
@@ -1958,16 +1975,16 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         logService.add(
             'Deleted ${result.successCount} of ${_selectedRows.length} records.',
-            !result.hasErrors ? LogType.info : LogType.warn);
+            !result.hasErrors ? LogLevel.info : LogLevel.warn);
 
         if (result.failedCount > 0) {
           logService.add(
               'Failed to delete ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}',
-              LogType.error);
+              LogLevel.error);
         }
       } catch (e, s) {
-        logService.add('Failed to delete data: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to delete data: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
       }
 
       _selectedRows.clear();
@@ -1979,7 +1996,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     final schema = await widget.example.db.getTableSchema(_selectedTable);
     if (schema == null) {
       logService.add('Cannot edit row: Schema not found for $_selectedTable.',
-          LogType.warn);
+          LogLevel.warn);
       return;
     }
 
@@ -2007,7 +2024,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             .where(schema.primaryKeyConfig.name, '=', pkValue);
 
         if (!result.hasErrors) {
-          logService.add('Row successfully updated.', LogType.info);
+          logService.add('Row successfully updated.', LogLevel.info);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
@@ -2018,7 +2035,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           }
         } else {
           final errorMsg = _dbResultErrorMessage(result);
-          logService.add('Failed to update row: $errorMsg', LogType.error);
+          logService.add('Failed to update row: $errorMsg', LogLevel.error);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -2029,8 +2046,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           }
         }
       } catch (e, s) {
-        logService.add('Failed to update data: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to update data: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
       }
 
       await _fetchTableData();
@@ -2042,7 +2059,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (schema == null) {
       logService.add(
           'Cannot modify rows: Schema not found for $_selectedTable.',
-          LogType.warn);
+          LogLevel.warn);
       return;
     }
 
@@ -2070,7 +2087,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         final successMsg =
             'Successfully updated ${result.successCount} of ${_selectedRows.length} records.';
-        logService.add(successMsg, LogType.info);
+        logService.add(successMsg, LogLevel.info);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -2083,7 +2100,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         if (result.failedCount > 0) {
           final errorMsg =
               'Failed to update ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}';
-          logService.add(errorMsg, LogType.error);
+          logService.add(errorMsg, LogLevel.error);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -2095,8 +2112,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           }
         }
       } catch (e, s) {
-        logService.add('Failed to bulk update data: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to bulk update data: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
       }
 
       _selectedRows.clear();
@@ -2109,7 +2126,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (schema == null) {
       logService.add(
           'Cannot perform custom delete: Schema not found for $_selectedTable.',
-          LogType.warn);
+          LogLevel.warn);
       return;
     }
     if (!mounted) return;
@@ -2125,7 +2142,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       final value = result['value'];
 
       if (value == null) {
-        logService.add('Invalid value for custom delete.', LogType.warn);
+        logService.add('Invalid value for custom delete.', LogLevel.warn);
         return;
       }
       if (!mounted) return;
@@ -2163,7 +2180,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
           logService.add(
               'Custom delete affected ${result.successCount} record(s).',
-              !result.hasErrors ? LogType.info : LogType.warn);
+              !result.hasErrors ? LogLevel.info : LogLevel.warn);
 
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -2174,8 +2191,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             );
           }
         } catch (e, s) {
-          logService.add('Failed to perform custom delete: $e', LogType.error);
-          logService.add('Stacktrace: $s', LogType.error);
+          logService.add('Failed to perform custom delete: $e', LogLevel.error);
+          logService.add('Stacktrace: $s', LogLevel.error);
         }
 
         await _fetchTableData(resetPage: true);
@@ -2214,11 +2231,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       try {
         await widget.example.db.deleteDatabase();
-        logService.add('Database deleted for restoration.', LogType.info);
+        logService.add('Database deleted for restoration.', LogLevel.info);
         await _initializeDatabase();
       } catch (e, s) {
-        logService.add('Failed to restore initialization: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to restore initialization: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
         if (mounted) {
           setState(() {
             _isInitializing = false;
@@ -2231,8 +2248,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   Future<void> _showFilterDialog() async {
     final schema = await widget.example.db.getTableSchema(_selectedTable);
     if (schema == null) {
-      logService.add(
-          'Cannot filter: Schema not found for $_selectedTable.', LogType.warn);
+      logService.add('Cannot filter: Schema not found for $_selectedTable.',
+          LogLevel.warn);
       return;
     }
 
@@ -2285,10 +2302,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       try {
         await widget.example.db.clear(_selectedTable);
-        logService.add('Cleared table $_selectedTable.', LogType.info);
+        logService.add('Cleared table $_selectedTable.', LogLevel.info);
       } catch (e, s) {
-        logService.add('Failed to clear table: $e', LogType.error);
-        logService.add('Stacktrace: $s', LogType.error);
+        logService.add('Failed to clear table: $e', LogLevel.error);
+        logService.add('Stacktrace: $s', LogLevel.error);
       }
       await _fetchTableData(resetPage: true);
     }
@@ -2312,9 +2329,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     var filteredLogs = logs;
 
     // Filter by type
-    if (_selectedLogType != null) {
+    if (_selectedLogLevel != null) {
       filteredLogs =
-          filteredLogs.where((log) => log.type == _selectedLogType).toList();
+          filteredLogs.where((log) => log.type == _selectedLogLevel).toList();
     }
 
     // Filter by search text
@@ -2693,7 +2710,7 @@ class _AddDataDialogState extends State<AddDataDialog> {
         _isLoading = false;
       });
     } catch (e) {
-      logService.add('Error loading foreign key data: $e', LogType.error);
+      logService.add('Error loading foreign key data: $e', LogLevel.error);
       setState(() {
         _isLoading = false;
       });
