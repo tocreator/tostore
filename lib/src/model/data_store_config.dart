@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import '../handler/common.dart';
 import '../handler/platform_handler.dart';
-import '../model/log_config.dart';
+import '../handler/logger.dart';
 import 'migration_config.dart';
 
 /// data store config
@@ -54,9 +54,11 @@ class DataStoreConfig {
 
   /// Enable diagnostic logging (info/debug/warn/error).
   /// This controls application/engine diagnostic prints, not commit log/WAL.
+  @Deprecated('Use ToStore.setLogConfig() instead')
   final bool enableLog;
 
   /// Diagnostic log level for application/engine logs (not commit log/WAL).
+  @Deprecated('Use ToStore.setLogConfig() instead')
   final LogLevel logLevel;
 
   /// Maximum concurrency for CPU-bound tasks (isolates)
