@@ -214,8 +214,7 @@ class TtlCleanupManager {
       _planCacheFullyLoaded = true;
       return Map<String, _TtlCleanupPlan>.from(_planCache);
     } catch (e) {
-      Logger.warn('Refresh TTL plan cache failed: $e',
-          label: 'TtlCleanupManager._getCleanupPlans');
+      Logger.warn('Refresh TTL plan cache failed', rawError: e);
       return Map<String, _TtlCleanupPlan>.from(_planCache);
     } finally {
       lease?.release();
@@ -267,7 +266,6 @@ class TtlCleanupManager {
         if (!r.isSuccess) {
           Logger.warn(
             'TTL cleanup delete failed on ${plan.tableName}: ${r.message}',
-            label: 'TtlCleanupManager._runCleanupCycle',
           );
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
@@ -312,10 +310,8 @@ class TtlCleanupManager {
               }
             }
           } catch (e) {
-            Logger.warn(
-              'TTL index cleanup failed on ${plan.tableName}: $e',
-              label: 'TtlCleanupManager._runCleanupBatch',
-            );
+            Logger.warn('TTL index cleanup failed on ${plan.tableName}',
+                rawError: e);
           }
         }
 
@@ -334,15 +330,13 @@ class TtlCleanupManager {
       if (!r.isSuccess) {
         Logger.warn(
           'TTL cleanup delete failed on ${plan.tableName}: ${r.message}',
-          label: 'TtlCleanupManager._runCleanupCycle',
         );
         return const _TtlBatchResult(deleted: 0, ok: false);
       }
 
       return _TtlBatchResult(deleted: r.successKeys.length, ok: true);
     } catch (e) {
-      Logger.warn('TTL cleanup batch failed on ${plan.tableName}: $e',
-          label: 'TtlCleanupManager._runCleanupCycle');
+      Logger.warn('TTL cleanup batch failed on ${plan.tableName}', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
     }
   }
@@ -455,7 +449,6 @@ class TtlCleanupManager {
         if (!deleteResult.isSuccess) {
           Logger.warn(
             'KV TTL cleanup delete failed on $tableName pk=${entry.primaryKey}: ${deleteResult.message}',
-            label: 'TtlCleanupManager._runKvCleanupBatch',
           );
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
@@ -489,8 +482,7 @@ class TtlCleanupManager {
 
       return _TtlBatchResult(deleted: deletedCount, ok: true);
     } catch (e) {
-      Logger.warn('KV TTL cleanup batch failed on $tableName: $e',
-          label: 'TtlCleanupManager._runKvCleanupBatch');
+      Logger.warn('KV TTL cleanup batch failed on $tableName', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
     }
   }
@@ -570,7 +562,6 @@ class TtlCleanupManager {
                 totalDeleted += deleted;
                 Logger.info(
                   'TTL cleanup deleted $deleted rows from table ${plan.tableName}',
-                  label: 'TtlCleanupManager._runCleanupCycle',
                 );
               }
 
@@ -612,7 +603,6 @@ class TtlCleanupManager {
                 totalDeleted += deleted;
                 Logger.info(
                   'KV TTL cleanup deleted $deleted rows from table $tableName',
-                  label: 'TtlCleanupManager._runCleanupCycle',
                 );
               }
 
@@ -663,13 +653,11 @@ class TtlCleanupManager {
         final elapsedMs = DateTime.now().millisecondsSinceEpoch - cycleStartMs;
         Logger.info(
           'TTL cleanup cycle deleted $totalDeleted rows in ${elapsedMs}ms',
-          label: 'TtlCleanupManager._runCleanupCycle',
         );
       }
     } catch (e) {
       if (_dataStore.isInitialized) {
-        Logger.warn('TTL cleanup cycle failed: $e',
-            label: 'TtlCleanupManager._runCleanupCycle');
+        Logger.warn('TTL cleanup cycle failed', rawError: e);
       }
     } finally {
       // If this cycle did not see any backlog, it is safe to release the
