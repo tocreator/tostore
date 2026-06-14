@@ -1419,21 +1419,26 @@ Transaction error types:
 
 ### Log Callback and Database Diagnostics
 
-ToStore can route startup, recovery, automatic migration, and runtime constraint-conflict logs back to the business layer through `LogConfig.setConfig(...)`.
+ToStore can route database lifecycle logs back to the business layer through `ToStore.setLogConfig(...)`.
 
-- `onLogHandler` receives all logs that pass the current `enableLog` and `logLevel` filters.
-- Call `LogConfig.setConfig(...)` before initialization so logs generated during initialization and automatic migration are also captured.
+- `onLog` callback receives all `LogRecord` instances that pass the current `enableLog` and `logLevel` filters.
+  - **LogLevel.error**: Localized errors that do not affect normal execution.
+  - **LogLevel.critical**: Global disaster-level errors (such as disk full, out of memory, critical migration failure, etc.) that require manual intervention. Triggering alarms or notifications at this level is recommended.
+- Call `ToStore.setLogConfig(...)` before initialization so logs generated during initialization and automatic migration are also captured.
 
 ```dart
   // Configure log parameters or callback
-  LogConfig.setConfig(
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Light gray header label to distinguish apps or database instances
+    onLog: (log) {
+      // In production, warn/error/critical can be reported to your backend or logging platform
+      // log.level corresponds to log levels (LogLevel.debug, info, warn, error, critical)
+      // log.message corresponds to the formatted log message
+      // log.status corresponds to the underlying ResultStatus diagnosis status (containing code and codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
