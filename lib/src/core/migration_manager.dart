@@ -3557,8 +3557,8 @@ class MigrationManager {
           _unregisterRuntimeMigrationForTask(task);
 
           if (e is DbException) {
-            final hasFatal = e.statuses.any((s) => s.type.isFatalError);
-            if (hasFatal) {
+            final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
+            if (hasCritical) {
               rethrow;
             }
           }
@@ -3572,8 +3572,8 @@ class MigrationManager {
       success = false;
       errors.add(e);
       if (e is DbException) {
-        final hasFatal = e.statuses.any((s) => s.type.isFatalError);
-        if (hasFatal) {
+        final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
+        if (hasCritical) {
           rethrow;
         }
       } else {
@@ -4110,14 +4110,14 @@ class MigrationManager {
       }
       _telemetry.recordTaskFailure(task.taskId, e.toString());
       Logger.critical(GeneralStatus(
-        type: ResultType.devMigrationBatchExecutionFailed,
+        type: ResultType.sysMigrationBatchExecutionFailed,
         message: 'Execute migration task failed: $e',
       ));
 
       // If a backup was made, inform the user that it has been preserved
       if (currentTask.backupPath != null) {
         Logger.critical(GeneralStatus(
-          type: ResultType.devMigrationBatchExecutionFailed,
+          type: ResultType.sysMigrationBatchExecutionFailed,
           message:
               'CRITICAL: Migration for table [${currentTask.tableName}] failed during background data movement. '
               'To prevent overwriting new data written during migration, NO automatic restoration was performed. '
@@ -4624,7 +4624,7 @@ class MigrationManager {
         // Critical error: fail the entire migration task to prevent data loss
         throw DbException([
           GeneralStatus(
-            type: ResultType.devMigrationBatchExecutionFailed,
+            type: ResultType.sysMigrationBatchExecutionFailed,
             message: 'Batch migration failed: ${batchResult.errorMessage}',
           )
         ]);
