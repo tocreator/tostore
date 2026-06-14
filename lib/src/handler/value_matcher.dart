@@ -301,8 +301,8 @@ class ValueMatcher {
     try {
       return a.toString().compareTo(b.toString());
     } catch (e) {
-      Logger.warn('Unsupported comparison failed between $a and $b. Error: $e',
-          label: 'ValueMatcher._unsupportedMatcher');
+      Logger.warn('Unsupported comparison failed between $a and $b.',
+          rawError: e);
       return -1;
     }
   }
@@ -325,7 +325,7 @@ class ValueMatcher {
           .replaceAll('_', '.');
       return RegExp('^$regexPattern\$').hasMatch(value);
     } catch (e) {
-      Logger.warn('Invalid LIKE pattern: $pattern', label: '_matchesLike');
+      Logger.warn('Invalid LIKE pattern: $pattern', rawError: e);
       return false;
     }
   }
@@ -399,9 +399,8 @@ class ConditionRecordMatcher {
         }
       }
       return ConditionRecordMatcher._(condition, condition.rootNode, matchers);
-    } catch (e, s) {
-      Logger.error('Condition evaluation failed: $e\n$s',
-          label: 'ValueMatcher.matches');
+    } catch (e) {
+      Logger.error('Condition evaluation failed', rawError: e);
       // Return a dummy evaluator that will prevent further errors.
       return ConditionRecordMatcher._(
           condition, ConditionNode(type: NodeType.and), const {});
@@ -607,7 +606,7 @@ class ConditionRecordMatcher {
       case 'IS NOT':
         return value != null && compareValue == null;
       default:
-        Logger.warn('Unknown operator: $operator', label: '_evaluateOperator');
+        Logger.warn('Unknown operator: $operator');
         return false;
     }
   }
