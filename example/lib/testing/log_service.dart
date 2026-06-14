@@ -6,7 +6,7 @@ import 'package:tostore/tostore.dart';
 /// A simple class to hold log data along with its type.
 class LogEntry {
   final String message;
-  final LogType type;
+  final LogLevel type;
   final DateTime timestamp;
 
   LogEntry(
@@ -19,7 +19,7 @@ class LogService {
   ValueNotifier<List<LogEntry>> get logs => _logs;
 
   void add(String message,
-      [LogType type = LogType.info, bool fromCallback = false]) {
+      [LogLevel type = LogLevel.info, bool fromCallback = false]) {
     // Increased the limit to 500. ListView.builder in Flutter handles 500 entries efficiently.
     const maxLogs = 500;
     const pruneTo =
@@ -44,7 +44,7 @@ class LogService {
         final e = currentLogs[i];
         // In the older half of logs, skip debug/info entries until we reach prune target.
         if (removed < toRemoveCount &&
-            (e.type == LogType.debug || e.type == LogType.info)) {
+            (e.type == LogLevel.debug || e.type == LogLevel.info)) {
           removed++;
           continue;
         }
