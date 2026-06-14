@@ -92,8 +92,8 @@ class PlatformHandlerImpl implements PlatformInterface {
 
       return tempPath;
     } catch (e) {
-      Logger.error('Web platform create temporary directory failed: $e',
-          label: 'PlatformHandlerWeb.createTempDirectory');
+      Logger.error('Web platform create temporary directory failed',
+          rawError: e);
 
       final fallbackPath =
           'temp/fallback_${DateTime.now().millisecondsSinceEpoch}';
@@ -112,8 +112,7 @@ class PlatformHandlerImpl implements PlatformInterface {
         await storage.deleteDirectory(path);
       }
     } catch (e) {
-      Logger.error('Web platform delete directory failed: $path - $e',
-          label: 'PlatformHandlerWeb.deleteDirectory');
+      Logger.error('Web platform delete directory failed: $path', rawError: e);
     } finally {
       // remove from record
       _tempDirs.remove(path);
@@ -149,13 +148,11 @@ class PlatformHandlerImpl implements PlatformInterface {
                   ArchiveFile(relativePath, bytes.length, bytes);
               archive.addFile(archiveFile);
             } else {
-              Logger.warn('File read is empty: $filePath',
-                  label: 'PlatformHandlerWeb.compressDirectory');
+              Logger.warn('File read is empty: $filePath');
             }
           }
         } catch (fileError) {
-          Logger.error('Error processing file: $filePath - $fileError',
-              label: 'PlatformHandlerWeb.compressDirectory');
+          Logger.error('Error processing file: $filePath', rawError: fileError);
         }
       }
 
@@ -171,8 +168,7 @@ class PlatformHandlerImpl implements PlatformInterface {
         Logger.info('ZIP encoding result is empty');
       }
     } catch (e) {
-      Logger.error('Web platform compress directory failed: $e',
-          label: 'PlatformHandlerWeb.compressDirectory');
+      Logger.error('Web platform compress directory failed', rawError: e);
       rethrow;
     }
   }
@@ -214,8 +210,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       // decode ZIP file
       final archive = ZipDecoder().decodeBytes(bytes);
       Logger.info(
-          'Web platform decode ZIP file successfully, contains ${archive.files.length} files',
-          label: 'PlatformHandlerWeb.extractZip');
+          'Web platform decode ZIP file successfully, contains ${archive.files.length} files');
 
       for (final file in archive) {
         try {
@@ -233,13 +228,12 @@ class PlatformHandlerImpl implements PlatformInterface {
             await storage.ensureDirectoryExists('$targetDir/$filename');
           }
         } catch (fileError) {
-          Logger.error('Error decompressing file: ${file.name} - $fileError',
-              label: 'PlatformHandlerWeb.extractZip');
+          Logger.error('Error decompressing file: ${file.name}',
+              rawError: fileError);
         }
       }
     } catch (e) {
-      Logger.error('Web platform extract ZIP file failed: $e',
-          label: 'PlatformHandlerWeb.extractZip');
+      Logger.error('Web platform extract ZIP file failed', rawError: e);
       rethrow;
     }
   }
@@ -252,16 +246,14 @@ class PlatformHandlerImpl implements PlatformInterface {
 
       // Check if file exists
       if (!await storage.existsFile(zipPath)) {
-        Logger.warn('ZIP file does not exist: $zipPath',
-            label: 'PlatformHandlerWeb.verifyZipFile');
+        Logger.warn('ZIP file does not exist: $zipPath');
         return false;
       }
 
       // Read file bytes
       final bytes = await storage.readAsBytes(zipPath);
       if (bytes.isEmpty) {
-        Logger.warn('ZIP file is empty: $zipPath',
-            label: 'PlatformHandlerWeb.verifyZipFile');
+        Logger.warn('ZIP file is empty: $zipPath');
         return false;
       }
 
@@ -273,8 +265,7 @@ class PlatformHandlerImpl implements PlatformInterface {
           bytes[2] != 0x03 || // '\x03'
           bytes[3] != 0x04) {
         // '\x04'
-        Logger.warn('File is not a valid ZIP (wrong signature): $zipPath',
-            label: 'PlatformHandlerWeb.verifyZipFile');
+        Logger.warn('File is not a valid ZIP (wrong signature): $zipPath');
         return false;
       }
 
@@ -288,21 +279,18 @@ class PlatformHandlerImpl implements PlatformInterface {
           // Check if the required file exists
           final hasRequiredFile = archive.findFile(requiredFile) != null;
           if (!hasRequiredFile) {
-            Logger.warn('Required file not found in ZIP: $requiredFile',
-                label: 'PlatformHandlerWeb.verifyZipFile');
+            Logger.warn('Required file not found in ZIP: $requiredFile');
             return false;
           }
         } catch (decodeError) {
-          Logger.error('Failed to decode ZIP file: $decodeError',
-              label: 'PlatformHandlerWeb.verifyZipFile');
+          Logger.error('Failed to decode ZIP file', rawError: decodeError);
           return false;
         }
       }
 
       return true;
     } catch (e) {
-      Logger.error('Error verifying ZIP file: $e',
-          label: 'PlatformHandlerWeb.verifyZipFile');
+      Logger.error('Error verifying ZIP file', rawError: e);
       return false;
     }
   }
