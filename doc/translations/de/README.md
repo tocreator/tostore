@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
 
-ToStore ist eine moderne Daten-Engine, die für die AGI-Ära und Edge-Intelligence-Szenarien entwickelt wurde. Es unterstützt nativ verteilte Systeme, multimodale Fusion, relationale strukturierte Daten, hochdimensionale Vektoren und unstrukturierte Datenspeicherung. Es basiert auf einer Self-Routing-Knotenarchitektur und einer von neuronalen Netzwerken inspirierten Engine und verleiht den Knoten eine hohe Autonomie und elastische horizontale Skalierbarkeit, während es gleichzeitig die Leistung logisch von der Datenskala entkoppelt. Es umfasst ACID-Transaktionen, komplexe relationale Abfragen (JOINs und kaskadierende Fremdschlüssel), TTL auf Tabellenebene und Aggregationen sowie mehrere verteilte Primärschlüsselalgorithmen, atomare Ausdrücke, Erkennung von Schemaänderungen, Verschlüsselung, Multispace-Datenisolierung, ressourcenbewusste intelligente Lastplanung und selbstheilende Wiederherstellung nach einem Notfall/Absturz.
+ToStore ist eine moderne Daten-Engine, die für die AGI-Ära und Szenarien der Edge-Intelligence entwickelt wurde. Sie unterstützt nativ verteilte Systeme, multimodale Fusion, relationale strukturierte Daten, hochdimensionale Vektoren und unstrukturierte Datenspeicherung. Basierend auf einer selbstroutierenden Knotenarchitektur (Self-Routing) und einer neuronalen Netzwerk-Engine bietet sie Knoten hohe Autonomie und elastische horizontale Skalierbarkeit, wodurch Leistung und Datenskalierung logisch entkoppelt werden. Sie kombiniert ACID-Transaktionen, komplexe relationale Abfragen (JOINs und kaskadierende Fremdschlüssel), TTL auf Tabellenebene und Aggregationen mit automatisierter Betriebsstatusanalyse und vollständig asynchroner Datenverarbeitung. Dies ermöglicht eine nahtlose, unsichtbare Architekturentwicklung (einschließlich Schema-Upgrades, Schlüsseländerungen und großflächiger Datenoperationen) ohne Unterbrechung. Mit integrierten verteilten Primärschlüsseln, atomaren Ausdrücken, Verschlüsselung, Multi-Space-Isolierung, ressourcenbewusster intelligenter Lastverteilung und Katastrophen-Selbstheilung entwickelt sich ToStore in Szenarien mit hoher Kontinuität wie Agenten und automatisierter O&M kontinuierlich weiter und bleibt immer online.
 
 Da sich die Datenverarbeitung immer weiter in Richtung Edge Intelligence verlagert, sind Agenten, Sensoren und andere Geräte nicht mehr nur „Inhaltsanzeigen“. Sie sind intelligente Knoten, die für die lokale Erzeugung, das Umweltbewusstsein, die Entscheidungsfindung in Echtzeit und den koordinierten Datenfluss verantwortlich sind. Herkömmliche Datenbanklösungen sind durch ihre zugrunde liegende Architektur und angehängte Erweiterungen eingeschränkt, wodurch es immer schwieriger wird, die Anforderungen an niedrige Latenz und Stabilität intelligenter Edge-Cloud-Anwendungen bei Schreibvorgängen mit hoher Parallelität, umfangreichen Datensätzen, Vektorabruf und kollaborativer Generierung zu erfüllen.
 
@@ -60,17 +60,15 @@ ToStore bietet dem Edge verteilte Funktionen, die stark genug für riesige Daten
 - ⚡ **Parallele Ausführung und Ressourcenplanung**
   - Ressourcenbewusste intelligente Lastplanung mit hoher Verfügbarkeit
   - Parallele Zusammenarbeit mit mehreren Knoten und Aufgabenzerlegung
-  - Time-Slicing sorgt dafür, dass UI-Animationen auch unter hoher Last flüssig bleiben
+- 🔑 **Schema, Indizes & effiziente Abfragen**
+  - Vielfältige Primärschlüssel (sequenziell, Zeitstempel, Präfix, Kurzcode)
+  - Mehrdimensionale Constraints (Verbund-/Vektorindex, Fremdschlüssel)
+  - Fusionssuche (komplexe Prädikate, JOIN, Vektorsuche)
 
-- 🔍 **Strukturierte Abfragen und Vektorabfrage**
-  - Unterstützt komplexe Prädikate, JOINs, Aggregationen und TTL auf Tabellenebene
-  - Unterstützt Vektorfelder, Vektorindizes und den Abruf des nächsten Nachbarn
-  - Strukturierte und Vektordaten können innerhalb derselben Engine zusammenarbeiten
-
-- 🔑 **Primärschlüssel, Indizes und Schemaentwicklung**
-  - Integrierte Primärschlüsselalgorithmen, einschließlich sequentieller, Zeitstempel-, Datums-Präfix- und Kurzcode-Strategien
-  – Unterstützt eindeutige Indizes, zusammengesetzte Indizes, Vektorindizes und Fremdschlüsseleinschränkungen
-  - Erkennt automatisch Schemaänderungen und schließt die Migrationsarbeit ab
+- 🤖 **Intelligente O&M & nahtlose Evolution**
+  - Integrierte Statusspezifikation für O&M- und Agenten-Erkennung
+  - Reibungslose, unsichtbare Schema-Upgrades und Schlüsselmigrationen
+  - Hot-Updates ohne Dienstunterbrechung für langfristige Stabilität
 
 - 🛡️ **Transaktionen, Sicherheit und Wiederherstellung**
   – Bietet ACID-Transaktionen, atomare Ausdrucksaktualisierungen und kaskadierende Fremdschlüssel
