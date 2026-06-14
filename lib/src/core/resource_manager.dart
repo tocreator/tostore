@@ -5,6 +5,8 @@ import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
 import '../model/memory_info.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 
@@ -118,8 +120,7 @@ class ResourceManager {
       _memoryThresholdInMB =
           max(_memoryThresholdInMB, _getMinimumMemoryThreshold());
     } catch (e) {
-      Logger.error('Failed to configure memory threshold: $e',
-          label: 'ResourceManager._configureMemoryThreshold');
+      Logger.error('Failed to configure memory threshold', rawError: e);
       // Set default threshold
       _memoryThresholdInMB = _getDefaultMemoryThreshold();
     }
@@ -187,8 +188,7 @@ class ResourceManager {
       // Notify data store to update cached pressure status
       _dataStore?.updatePressureStatus();
     } catch (e) {
-      Logger.error('Failed to check resource usage: $e',
-          label: 'ResourceManager._checkResourceUsage');
+      Logger.error('Failed to check resource usage', rawError: e);
     }
   }
 
@@ -223,16 +223,26 @@ class ResourceManager {
 
     if (newStatus != _status) {
       if (newStatus == ResourceStatus.critical) {
-        Logger.error(
+        final ResultType type = (diskStatus == ResourceStatus.critical &&
+                memoryStatus == ResourceStatus.critical)
+            ? ResultType.sysResourceExhausted
+            : (diskStatus == ResourceStatus.critical
+                ? ResultType.sysIoDiskFull
+                : ResultType.sysResourceExhaustedMemory);
+
+        Logger.critical(
             'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
-            label: 'ResourceManager._updateResourceStatus');
+            rawError: GeneralStatus(
+              type: type,
+              message:
+                  'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+            ));
       } else if (newStatus == ResourceStatus.warning) {
         Logger.warn(
-            'Low resources detected! Triggering cache eviction. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
-            label: 'ResourceManager._updateResourceStatus');
+          'Low resources detected! Triggering cache eviction. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+        );
       } else {
-        Logger.info('Resources recovered to normal levels.',
-            label: 'ResourceManager._updateResourceStatus');
+        Logger.info('Resources recovered to normal levels.');
       }
       _status = newStatus;
     }
@@ -248,7 +258,7 @@ class ResourceManager {
           await PlatformHandler.getDiskFreeSpaceMB(_dataStore!.instancePath!);
       return mb.toDouble();
     } catch (e) {
-      Logger.warn('Failed to get disk space: $e', label: 'ResourceManager');
+      Logger.warn('Failed to get disk space', rawError: e);
       return 10240.0;
     }
   }
@@ -289,8 +299,8 @@ class ResourceManager {
 
         await _evictCacheAndCheck(MemoryQuotaType.indexData);
       } catch (e) {
-        Logger.error('An error occurred during cache eviction process: $e',
-            label: 'ResourceManager._triggerCacheEviction');
+        Logger.error('An error occurred during cache eviction process',
+            rawError: e);
       } finally {
         _isCleaning = false;
       }
@@ -334,12 +344,11 @@ class ResourceManager {
         int freedBytes = beforeSize - afterSize;
         double freedMB = freedBytes / (1024 * 1024);
         Logger.debug(
-            'Cache eviction for ${cacheType.name}: freed ${freedMB.toStringAsFixed(2)}MB (${((beforeSize - afterSize) * 100 / beforeSize).toStringAsFixed(1)}%)',
-            label: 'ResourceManager._evictCacheByType');
+            'Cache eviction for ${cacheType.name}: freed ${freedMB.toStringAsFixed(2)}MB (${((beforeSize - afterSize) * 100 / beforeSize).toStringAsFixed(1)}%)');
       }
     } catch (e) {
-      Logger.error('Error in cache eviction callback for ${cacheType.name}: $e',
-          label: 'ResourceManager._evictCacheByType');
+      Logger.error('Error in cache eviction callback for ${cacheType.name}',
+          rawError: e);
     }
   }
 
@@ -369,8 +378,8 @@ class ResourceManager {
           return tableMetaSize + indexMetaSize;
       }
     } catch (e) {
-      Logger.error('Failed to get current cache size for ${cacheType.name}: $e',
-          label: 'ResourceManager._getCurrentCacheSizeByType');
+      Logger.error('Failed to get current cache size for ${cacheType.name}',
+          rawError: e);
       return 0;
     }
   }
