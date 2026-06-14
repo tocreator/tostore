@@ -164,7 +164,7 @@ class QueryOptimizer {
         naturalOrderBy: <String>[schema.primaryKey],
       );
     } catch (e) {
-      Logger.error('query optimization failed: $e', label: 'QueryOptimizer');
+      Logger.error('query optimization failed', rawError: e);
       // use full table scan when error occurs
       return _createTableScanPlan(tableName);
     }
