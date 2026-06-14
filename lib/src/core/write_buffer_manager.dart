@@ -708,7 +708,6 @@ class WriteBufferManager {
         // Should never happen for modern batch paths; skip enqueue to preserve queue integrity.
         Logger.warn(
           'Batch insert missing walPointer: table=$tableName pk=$recordId, skipping enqueue',
-          label: 'WriteBufferManager.addInsertBatch',
         );
         continue;
       }
