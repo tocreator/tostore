@@ -1449,21 +1449,26 @@ if (txResult.isFailed) {
 
 ### <a id="logging-diagnostics"></a>日志回调与数据库诊断
 
-ToStore 可以通过 `LogConfig.setConfig(...)` 把启动、恢复、自动迁移、运行时约束冲突等日志统一回调给业务层。
+ToStore 可以通过 `ToStore.setLogConfig(...)` 把数据库生命周期的日志统一回调给业务层。
 
-- `onLogHandler` 会收到所有通过当前 `enableLog` 与 `logLevel` 过滤后的日志。
-- 请在初始化之前调用 `LogConfig.setConfig(...)`，这样初始化和自动迁移阶段的日志也能被捕获。
+- `onLog` 回调会收到所有通过当前 `enableLog` 与 `logLevel` 过滤后的日志记录 `LogRecord`。
+  - **LogLevel.error**：局部性发生错误，不影响正常运行。
+  - **LogLevel.critical**：全局性灾难级错误（如磁盘已满、内存不足、迁移重大失败等），需要人工介入解决，建议在此等级触发报警通知。
+- 请在初始化之前调用 `ToStore.setLogConfig(...)`，这样初始化和自动迁移阶段的日志也能被捕获。
 
 ```dart
   // 配置日志参数或回调
-  LogConfig.setConfig(
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // 生产环境可以将 warn/error上报后端或日志平台
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // 日志顶部浅灰标题，用于区分应用或数据库实例
+    onLog: (log) {
+      // 生产环境可以将 warn/error/critical 上报后端或日志平台
+      // log.level 对应日志等级（LogLevel.debug, info, warn, error, critical）
+      // log.message 对应处理后的日志文本
+      // log.status 对应底层的 ResultStatus 诊断状态（包含 code 与 codeKey）
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
