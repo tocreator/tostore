@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1234,10 +1234,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+if (!txResult.hasErrors) {
+  print('트랜잭션이 성공적으로 커밋되었습니다');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('다음과 같은 이유로 트랜잭션이 롤백되었습니다:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1332,14 +1337,30 @@ final restored = await db.restore(
 
 ### <a id="error-handling"></a>상태 코드 및 오류 처리
 
+ToStore에는 오류 및 예외 피드백을 위한 두 가지 채널이 있습니다.
 
-ToStore는 데이터 작업에 통합 응답 모델을 사용합니다.
+> [!NOTE]
+> **통합 진단 기반**: 응답 결과 모델(DbResult/QueryResult의 `statuses`)을 통해 반환되든, 치명적인 예외(DbException의 `statuses`)를 통해 발생하든, 모든 진단 상태는 구조화된 **`ResultStatus`** 시스템을 기반으로 하며 동일한 상태 코드를 공유하므로 일관성이 보장됩니다.
 
-- `ResultType`: 분기 논리에 사용되는 통합 상태 열거형
-- `result.code`: `ResultType`에 해당하는 안정적인 숫자 코드
-- `result.message`: 현재 오류를 설명하는 읽을 수 있는 메시지
-- `successKeys` / `failedKeys`: 대량 작업에서 성공 및 실패한 기본 키 목록
+1. 응답 결과 모델 (Result-based Response)
+삽입, 업데이트, 삭제, 쿼리, 트랜잭션 및 런타임 스키마 생성/수정과 같은 일상적인 작업에 사용됩니다. 이러한 작업은 제약 조건 위반, 유효성 검사 실패 또는 잘못된 인수를 발견하더라도 예외를 발생시키지 않습니다. 대신 ToStore는 `DbResult` 또는 `QueryResult`를 사용하여 결과를 래핑하고 모든 진단 정보를 상태 목록에 기록합니다. 이는 일반적인 비즈니스 논리 오류가 데이터베이스를 중단시키지 않도록 보장합니다.
 
+- **`hasErrors`: 현재 작업에 오류가 있는지 여부를 나타냅니다. 배치 작업이나 트랜잭션에서 하나 이상의 오류가 있으면 이 속성은 `true`입니다.**
+- **`statuses`: 작업에 대한 모든 `ResultStatus` 진단 목록입니다. 배치 작업에 매우 유용한 1:1 순서 매칭을 지원합니다.**
+- **`firstPrimaryKey`: 단일 삽입/쓰기 작업 성공 시 `statuses`를 수동으로 분석하지 않고 생성된 물리적 기본 키를 직접 읽습니다.**
+- **`ResultType`: 상태 범주를 나타내는 열거형으로, 분기 처리 및 검사(예: `isBusinessError`, `isDeveloperError`)에 편리합니다.**
+
+2. 예외 발생 (Exception-based Throwing)
+개발자의 실수나 설계 결함으로 인한 치명적인 오류(예: `ToStore.open` 시 스키마 유효성 검사 실패, 엔진 버전 불일치, 치명적인 데이터 마이그레이션 손상 등)에 사용됩니다. 이 경우 ToStore는 실행을 중단하기 위해 `DbException`을 발생시켜 개발자가 수정하도록 합니다.
+
+> [!WARNING]
+> 개발 가이드라인: 일반적인 비즈니스 오류는 예외를 발생시켜서는 안 되며, 애플리케이션 런타임이 중단되지 않도록 응답 결과 모델로 반환해야 합니다.
+
+---
+
+### 오류 및 예외 처리 예시
+
+#### 1. 단일 쓰기 응답 처리
 
 ```dart
 final result = await db.insert('users', {
@@ -1347,77 +1368,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // 첫 번째 오류 유형 및 설명 가져오기
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('쓰기 성공, 기본 키는: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. 배치 쓰기 정밀 진단
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('배치 작업이 부분적으로 실패했습니다: 성공 \${batchResult.successCount}, 실패 \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] 제약 조건 위반! 테이블! 테이블: \${status.tableName}, 필드: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] 인수 오류! 매개변수! Parameter: \${status.parameterName}, 전달된 값: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] 오류가 발생했습니다: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-일반적인 상태 코드 예:
-성공하면 `0`이 반환됩니다. 음수는 오류를 나타냅니다.
-- `ResultType.success` (`0`) : 작업 성공
-- `ResultType.partialSuccess` (`1`) : 일괄 작업이 부분적으로 성공했습니다.
-- `ResultType.unknown`(`-1`): 알 수 없는 오류
-- `ResultType.uniqueViolation` (`-2`): 고유 인덱스 충돌
-- `ResultType.primaryKeyViolation` (`-3`): 기본 키 충돌
-- `ResultType.foreignKeyViolation`(`-4`): 외래 키 참조가 제약 조건을 충족하지 않습니다.
-- `ResultType.notNullViolation`(`-5`): 필수 필드가 누락되었거나 허용되지 않는 `null`이 전달되었습니다.
-- `ResultType.validationFailed`(`-6`): 길이, 범위, 형식 또는 기타 유효성 검사에 실패했습니다.
-- `ResultType.notFound`(`-11`): 대상 테이블, 공간 또는 리소스가 존재하지 않습니다.
-- `ResultType.resourceExhausted`(`-15`): 시스템 리소스가 부족합니다. 로드를 줄이거나 다시 시도하세요.
-- `ResultType.dbError`(`-91`): 데이터베이스 오류
-- `ResultType.ioError` (`-90`): 파일 시스템 오류
-- `ResultType.timeout`(`-92`): 시간 초과
+#### 3. 치명적 오류 및 초기화 예외 캡처 (DbException)
 
-### 거래결과 처리
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ 치명적인 데이터베이스 예외! 오류 메시지: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('조정된 스키마 검증 실패! 테이블! 테이블: \${status.tableName}, 필드: \${status.field}, 잘못된 구성: \${status.wrongValue}');
+    } else {
+      print('진단 정보: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-거래 오류 유형:
-- `TransactionErrorType.operationError`: 필드 유효성 검사 실패, 잘못된 리소스 상태 또는 기타 비즈니스 수준 오류 등 트랜잭션 내부의 일반 작업이 실패했습니다.
-- `TransactionErrorType.integrityViolation`: 기본 키, 고유 키, 외래 키 또는 null이 아닌 오류와 같은 무결성 또는 제약 조건 충돌
-- `TransactionErrorType.timeout`: 시간 초과
-- `TransactionErrorType.io`: 기본 저장소 또는 파일 시스템 I/O 오류
-- `TransactionErrorType.conflict`: 충돌로 인해 거래가 실패했습니다.
-- `TransactionErrorType.userAbort`: 사용자가 시작한 중단(throw 기반 수동 중단은 현재 지원되지 않음)
-- `TransactionErrorType.unknown`: 기타 오류
-
+오류 유형, 상세 상태 코드, JSON 직렬화 형식 및 필드 매핑의 전체 목록은 전체 사양서를 참조하십시오: [ToStore ResultStatus 자동 진단 및 상태 해제 사양서](result_status_specification.md).
 
 ### <a id="logging-diagnostics"></a>로그 콜백 및 데이터베이스 진단
 ToStore는 `ToStore.setLogConfig(...)`를 통해 데이터베이스 수명 주기 로그를 비즈니스 계층으로 다시 라우팅할 수 있습니다.
