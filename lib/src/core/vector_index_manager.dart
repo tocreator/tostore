@@ -634,8 +634,7 @@ class VectorIndexManager {
       final content = jsonEncode(meta.toJson());
       await _dataStore.storage.writeAsString(path, content, flush: false);
     } catch (e) {
-      Logger.error('Failed to persist NGH meta: $e',
-          label: 'VectorIndexManager');
+      Logger.error('Failed to persist NGH meta', rawError: e);
     }
   }
 
@@ -711,12 +710,10 @@ class VectorIndexManager {
       return quantizer;
     }
 
-    Logger.warn(
-        'Existing quantizer mismatch for $indexName: '
+    Logger.warn('Existing quantizer mismatch for $indexName: '
         'loaded(${quantizer.dimensions}d, ${quantizer.subspaces}m) != '
         'meta(${meta.dimensions}d, ${meta.pqSubspaces}m). '
-        'Retraining might be required.',
-        label: 'VectorIndexManager');
+        'Retraining might be required.');
 
     return null;
   }
@@ -769,8 +766,8 @@ class VectorIndexManager {
         );
       } catch (e) {
         // Fallback if scheduler not available or error
-        Logger.warn('Failed to acquire workload lease, proceeding without: $e',
-            label: 'VectorIndexManager');
+        Logger.warn('Failed to acquire workload lease, proceeding without',
+            rawError: e);
       }
 
       try {
