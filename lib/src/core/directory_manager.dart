@@ -79,10 +79,7 @@ class DirectoryManager {
         return pathJoin(subDir, tableName);
       }
     } catch (e) {
-      Logger.error(
-        'Failed to get table directory path: $e',
-        label: 'DirectoryManager.getTableDirectoryPath',
-      );
+      Logger.error('Failed to get table directory path', rawError: e);
       return null;
     }
   }
@@ -131,10 +128,7 @@ class DirectoryManager {
         spaceName: currentSpaceName,
       );
     } catch (e) {
-      Logger.error(
-        'Failed to get scoped table directory path: $e',
-        label: 'DirectoryManager.getTableDirectoryPathByScope',
-      );
+      Logger.error('Failed to get scoped table directory path', rawError: e);
       return null;
     }
   }
@@ -424,10 +418,7 @@ class DirectoryManager {
       // If not found, return null indicating table does not exist
       return null;
     } catch (e) {
-      Logger.error(
-        'Failed to get table global property: $e',
-        label: 'DirectoryManager.isTableGlobal',
-      );
+      Logger.error('Failed to get table global property', rawError: e);
       return null;
     }
   }
@@ -465,7 +456,6 @@ class DirectoryManager {
       if (!createIfMappingMissing) {
         Logger.warn(
           'Table directory mapping missing for existing schema: $tableName',
-          label: 'DirectoryManager.getTablePathIfExists',
         );
         return null;
       }
@@ -597,10 +587,7 @@ class DirectoryManager {
         return true;
       }
     } catch (e) {
-      Logger.error(
-        'Failed to remove table directory mapping: $e',
-        label: 'DirectoryManager.removeTableDirectoryMapping',
-      );
+      Logger.error('Failed to remove table directory mapping', rawError: e);
       return false;
     }
   }
@@ -659,10 +646,7 @@ class DirectoryManager {
       );
       return true;
     } catch (e) {
-      Logger.error(
-        'Failed to ensure table directory mapping: $e',
-        label: 'DirectoryManager.ensureTableDirectoryMapping',
-      );
+      Logger.error('Failed to ensure table directory mapping', rawError: e);
       return false;
     }
   }
@@ -748,10 +732,7 @@ class DirectoryManager {
       );
       return true;
     } catch (e) {
-      Logger.error(
-        'Failed to rename table directory mapping: $e',
-        label: 'DirectoryManager.renameTableDirectoryMapping',
-      );
+      Logger.error('Failed to rename table directory mapping', rawError: e);
       return false;
     }
   }
