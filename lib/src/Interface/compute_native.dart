@@ -3,7 +3,7 @@ import 'dart:isolate';
 import 'dart:collection';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
-import '../model/log_config.dart';
+import '../model/result_status.dart';
 
 class _IsolateTask<R> {
   final Completer<R> completer = Completer<R>();
@@ -173,7 +173,7 @@ class _IsolatePool {
         _sendPorts[idleIsolateId]!.send({
           'function': task.function,
           'message': task.message,
-          'logConfig': LogConfig.snapshotForIsolate(),
+          'logConfig': Logger.snapshotForIsolate(),
           'taskId': _taskCount[idleIsolateId], // add task ID for debugging
         });
       }
@@ -233,19 +233,24 @@ class _IsolatePool {
   }
 
   void _handleWorkerLog(Map<dynamic, dynamic> message) {
-    final level = message['level'];
+    final levelIndex = message['level'];
     final text = message['message'];
-    final label = message['label'];
+    final statusMap = message['status'];
 
-    if (level is! int ||
-        level < 0 ||
-        level >= LogType.values.length ||
-        text is! String ||
-        label is! String) {
+    if (levelIndex is! int ||
+        levelIndex < 0 ||
+        levelIndex >= LogLevel.values.length ||
+        (text != null && text is! String)) {
       return;
     }
 
-    Logger.logFromIsolate(text, LogType.values[level], label);
+    final level = LogLevel.values[levelIndex];
+    ResultStatus? status;
+    if (statusMap is Map) {
+      status = ResultStatus.fromJson(Map<String, dynamic>.from(statusMap));
+    }
+
+    Logger.logFromIsolate(text ?? '', level, status);
   }
 }
 
@@ -266,7 +271,7 @@ void _isolateEntryPoint(SendPort mainSendPort) {
 
       try {
         if (logConfig is Map) {
-          LogConfig.applyIsolateSnapshot(logConfig);
+          Logger.applyIsolateSnapshot(logConfig);
         }
 
         // execute the function with minimal overhead
