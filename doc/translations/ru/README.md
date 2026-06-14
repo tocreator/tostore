@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1232,10 +1232,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+if (!txResult.hasErrors) {
+  print('Транзакция успешно зафиксирована');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('Откат транзакции по следующим причинам:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1330,14 +1335,30 @@ final restored = await db.restore(
 
 ### <a id="error-handling"></a>Коды состояния и обработка ошибок
 
+В ToStore существует два канала для обратной связи по ошибкам и исключениям:
 
-ToStore использует унифицированную модель ответа для операций с данными:
+> [!NOTE]
+> **Единая диагностическая база**: Независимо от того, возвращаются ли они через модель результата ответа (`statuses` в `DbResult`/`QueryResult`) или генерируются через критические исключения (`statuses` в `DbException`), все диагностические состояния единообразно основаны на структурированной системе **`ResultStatus`** и используют одни и те же коды состояния, что гарантирует согласованность.
 
-- `ResultType`: унифицированное перечисление статуса, используемое для логики ветвления.
-- `result.code`: стабильный числовой код, соответствующий `ResultType`
-- `result.message`: читаемое сообщение с описанием текущей ошибки.
-- `successKeys` / `failedKeys`: списки успешных и неудачных первичных ключей в массовых операциях.
+1. Модель результата ответа (Result-based Response)
+Для повседневных операций, таких как вставка, обновление, удаление, выборка, транзакции и изменение схемы таблицы во время выполнения. Эти операции **не вызывают исключений** при нарушении ограничений, сбоях валидации или недопустимых аргументах. Вместо этого ToStore упаковывает результаты с помощью `DbResult` или `QueryResult`, записывая всю диагностическую информацию в список состояний. Это гарантирует, что обычные ошибки бизнес-логики не нарушат работу базы данных.
 
+- **`hasErrors`: Указывает, есть ли ошибки в текущей операции. В пакетных операциях или транзакциях, если присутствует хотя бы одна ошибка, это свойство принимает значение `true`.**
+- **`statuses`: Подробный список всех диагностических записей `ResultStatus` для операции. Он поддерживает сопоставление порядка 1:1, что очень полезно для пакетных операций.**
+- **`firstPrimaryKey`: Считывает физически сгенерированный первичный ключ напрямую во время одной операции вставки/записи без ручного разбора `statuses`.**
+- **`ResultType`: Перечисление категорий состояния, удобное для ветвления кода и проверок (например, `isBusinessError`, `isDeveloperError`).**
+
+2. Генерация исключений (Exception-based Throwing)
+Для критических ошибок, вызванных невнимательностью разработчика или ошибками проектирования (например, сбой проверки схемы при `ToStore.open`, несоответствие версий движка, критическое повреждение при миграции данных и т. д.). В таких случаях ToStore генерирует `DbException` для остановки выполнения, призывая разработчика исправить проблему.
+
+> [!WARNING]
+> Рекомендации по разработке: Обычные бизнес-ошибки не должны вызывать исключений; они должны возвращаться в модели результата ответа во избежание сбоев в работе приложения.
+
+---
+
+### Примеры обработки ошибок и исключений
+
+#### 1. Обработка ответа для одиночной записи
 
 ```dart
 final result = await db.insert('users', {
@@ -1345,77 +1366,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // Получить первый тип ошибки и описание
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('Запись прошла успешно, первичный ключ: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. Детализированная диагностика при пакетной записи
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('Пакетная операция частично завершилась ошибкой: успешно \${batchResult.successCount}, не удалось \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] Нарушение ограничения! Таблица! Таблица: \${status.tableName}, поля: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] Ошибка аргумента! Параметр! Parameter: \${status.parameterName}, переданное значение: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] произошла ошибка: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-Общие примеры кодов состояния:
-Успех возвращается `0`; отрицательные числа указывают на ошибки.
-- `ResultType.success` (`0`): операция выполнена успешно.
-- `ResultType.partialSuccess` (`1`): массовая операция частично успешна
-- `ResultType.unknown` (`-1`): неизвестная ошибка
-- `ResultType.uniqueViolation` (`-2`): конфликт уникальных индексов.
-- `ResultType.primaryKeyViolation` (`-3`): конфликт первичного ключа.
-- `ResultType.foreignKeyViolation` (`-4`): ссылка на внешний ключ не удовлетворяет ограничениям.
-- `ResultType.notNullViolation` (`-5`): обязательное поле отсутствует или было передано запрещенное поле `null`.
-- `ResultType.validationFailed` (`-6`): длина, диапазон, формат или другая проверка не удалась.
-- `ResultType.notFound` (`-11`): целевая таблица, пространство или ресурс не существует.
-- `ResultType.resourceExhausted` (`-15`): недостаточно системных ресурсов; уменьшите нагрузку или повторите попытку
-- `ResultType.dbError` (`-91`): ошибка базы данных.
-- `ResultType.ioError` (`-90`): ошибка файловой системы.
-- `ResultType.timeout` (`-92`): тайм-аут
+#### 3. Критическая ошибка и перехват исключения инициализации (DbException)
 
-### Обработка результатов транзакции
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ Критическое исключение базы данных! Сообщение об ошибке: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('Сбой валидации схемы! Таблица! Таблица: \${status.tableName}, поле: \${status.field}, недопустимая конфигурация: \${status.wrongValue}');
+    } else {
+      print('Диагностическая информация: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-Типы ошибок транзакции:
-- `TransactionErrorType.operationError`: сбой обычной операции внутри транзакции, например сбой проверки поля, неверное состояние ресурса или другая ошибка бизнес-уровня.
-- `TransactionErrorType.integrityViolation`: конфликт целостности или ограничений, например, первичный ключ, уникальный ключ, внешний ключ или ненулевой сбой.
-- `TransactionErrorType.timeout`: тайм-аут
-- `TransactionErrorType.io`: базовая ошибка ввода-вывода хранилища или файловой системы.
-- `TransactionErrorType.conflict`: конфликт привел к сбою транзакции.
-- `TransactionErrorType.userAbort`: прерывание по инициативе пользователя (ручное прерывание на основе выдачи в настоящее время не поддерживается)
-- `TransactionErrorType.unknown`: любая другая ошибка
-
+Полный список типов ошибок, конечных кодов состояния, форматов сериализации JSON и сопоставлений полей см. в полной спецификации: [Спецификация автодиагностики и разрешения состояния ToStore ResultStatus](result_status_specification.md).
 
 ### <a id="logging-diagnostics"></a>Обратный вызов журнала и диагностика базы данных
 ToStore может направлять журналы жизненного цикла базы данных обратно на бизнес-уровень через `ToStore.setLogConfig(...)`.
