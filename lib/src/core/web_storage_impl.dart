@@ -67,8 +67,7 @@ class WebStorageImpl implements StorageInterface {
       request.onerror = ((Event event) {
         final error =
             request.error ?? 'Unknown error during database initialization';
-        Logger.error('Database open failed: $error',
-            label: 'WebStorageAdapter');
+        Logger.error('Database open failed: $error');
         if (!_initCompleter.isCompleted) {
           _initCompleter.completeError(error);
         }
@@ -76,7 +75,7 @@ class WebStorageImpl implements StorageInterface {
 
       await _initCompleter.future;
     } catch (e) {
-      Logger.error('IndexedDB init failed: $e', label: 'WebStorageAdapter');
+      Logger.error('IndexedDB init failed', rawError: e);
       rethrow;
     }
   }
@@ -165,7 +164,7 @@ class WebStorageImpl implements StorageInterface {
 
       return directChildren.toList();
     } catch (e) {
-      Logger.error('List directory failed: $e', label: 'WebStorageAdapter');
+      Logger.error('List directory failed', rawError: e);
       return [];
     }
   }
@@ -195,7 +194,7 @@ class WebStorageImpl implements StorageInterface {
       // delete file itself
       await _wrapRequest(store.delete(normalizedPath.toJS));
     } catch (e) {
-      Logger.error('Delete file failed: $e', label: 'WebStorageImpl');
+      Logger.error('Delete file failed', rawError: e);
       throw _wrapWebIoError(e, 'deleteFile', path);
     }
   }
@@ -250,7 +249,7 @@ class WebStorageImpl implements StorageInterface {
         _writeBuffer.remove(p);
       }
     } catch (e) {
-      Logger.error('Delete directory failed: $e', label: 'WebStorageImpl');
+      Logger.error('Delete directory failed', rawError: e);
       throw _wrapWebIoError(e, 'deleteDirectory', path);
     }
   }
@@ -285,7 +284,7 @@ class WebStorageImpl implements StorageInterface {
       final result = await _wrapRequest(store.get(normalizedPath.toJS));
       return result != null;
     } catch (e) {
-      Logger.error('Check file exists failed: $e', label: 'WebStorageAdapter');
+      Logger.error('Check file exists failed', rawError: e);
       return false;
     }
   }
@@ -332,8 +331,7 @@ class WebStorageImpl implements StorageInterface {
       }
       return false;
     } catch (e) {
-      Logger.error('Check directory exists failed: $e',
-          label: 'WebStorageAdapter');
+      Logger.error('Check directory exists failed', rawError: e);
       return false;
     }
   }
@@ -382,7 +380,7 @@ class WebStorageImpl implements StorageInterface {
       try {
         await flushAll();
       } catch (e) {
-        Logger.warn('Flush on close failed: $e', label: 'WebStorageAdapter');
+        Logger.warn('Flush on close failed', rawError: e);
       }
 
       if (_db == null) {
@@ -397,7 +395,7 @@ class WebStorageImpl implements StorageInterface {
       _db!.close();
       _instances.remove(_db!.name);
     } catch (e) {
-      Logger.error('Close database failed: $e', label: 'WebStorageAdapter');
+      Logger.error('Close database failed', rawError: e);
       throw _wrapWebIoError(e, 'close', 'IndexedDB');
     }
   }
@@ -413,7 +411,7 @@ class WebStorageImpl implements StorageInterface {
       final request = window.indexedDB.deleteDatabase(dbName);
       await _wrapDeleteRequest(request);
     } catch (e) {
-      Logger.error('Delete database failed: $e', label: 'WebStorageAdapter');
+      Logger.error('Delete database failed', rawError: e);
       throw _wrapWebIoError(e, 'deleteDatabase', dbName);
     }
   }
@@ -442,7 +440,7 @@ class WebStorageImpl implements StorageInterface {
     try {
       await _wrapRequest(store.put(fileInfo.toJson().jsify()));
     } catch (e) {
-      Logger.error('Write file failed: $e');
+      Logger.error('Write file failed', rawError: e);
       throw _wrapWebIoError(e, 'storeFileInfo', fileInfo.path);
     }
   }
@@ -484,7 +482,7 @@ class WebStorageImpl implements StorageInterface {
       final bytes = _convertDataToList(fileInfo.data);
       return utf8.decode(bytes);
     } catch (e) {
-      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsString');
+      Logger.error('Read failed', rawError: e);
       return null;
     }
   }
@@ -519,7 +517,7 @@ class WebStorageImpl implements StorageInterface {
         await _flushPath(normalizedPath);
       }
     } catch (e) {
-      Logger.error('Write failed: $e', label: 'WebStorageImpl.writeAsString');
+      Logger.error('Write failed', rawError: e);
       throw _wrapWebIoError(e, 'writeAsString', path);
     }
   }
@@ -547,8 +545,7 @@ class WebStorageImpl implements StorageInterface {
         await _flushPath(normalizedPath);
       }
     } catch (e) {
-      Logger.error('Write bytes failed: $e',
-          label: 'WebStorageImpl.writeAsBytes');
+      Logger.error('Write bytes failed', rawError: e);
       throw _wrapWebIoError(e, 'writeAsBytes', path);
     }
   }
@@ -566,7 +563,7 @@ class WebStorageImpl implements StorageInterface {
       if (fileInfo == null || fileInfo.data == null) return Uint8List(0);
       return _convertDataToUint8List(fileInfo.data);
     } catch (e) {
-      Logger.error('Read failed: $e', label: 'WebStorageImpl.readAsBytes');
+      Logger.error('Read failed', rawError: e);
       return Uint8List(0);
     }
   }
@@ -596,7 +593,7 @@ class WebStorageImpl implements StorageInterface {
 
       return fullData.sublist(start, end);
     } catch (e) {
-      Logger.error('Read bytes at offset failed: $e', label: 'WebStorageImpl');
+      Logger.error('Read bytes at offset failed', rawError: e);
       return Uint8List(0);
     }
   }
@@ -646,8 +643,7 @@ class WebStorageImpl implements StorageInterface {
         await _flushPath(normalizedPath);
       }
     } catch (e) {
-      Logger.error('Write bytes at offsets failed: $e',
-          label: 'WebStorageImpl.writeManyAsBytesAt');
+      Logger.error('Write bytes at offsets failed', rawError: e);
       throw _wrapWebIoError(e, 'writeManyAsBytesAt', path);
     }
   }
@@ -659,7 +655,7 @@ class WebStorageImpl implements StorageInterface {
       final normalizedPath = _normalizePath(path);
       await _flushPath(normalizedPath);
     } catch (e) {
-      Logger.error('Flush file failed: $e', label: 'WebStorageImpl.flushFile');
+      Logger.error('Flush file failed', rawError: e);
       throw _wrapWebIoError(e, 'flushFile', path);
     }
   }
@@ -674,7 +670,7 @@ class WebStorageImpl implements StorageInterface {
       final data = await readAsBytes(normalizedSource);
       await writeAsBytes(normalizedDest, data, flush: true);
     } catch (e) {
-      Logger.error('Copy file failed: $e', label: 'WebStorageImpl.copyFile');
+      Logger.error('Copy file failed', rawError: e);
     }
   }
 
@@ -716,13 +712,11 @@ class WebStorageImpl implements StorageInterface {
           await copyFile(itemPath, targetItemPath);
         } else {
           Logger.debug(
-              'Skipping non-file item during directory copy: $itemPath',
-              label: 'WebStorageImpl.copyDirectory');
+              'Skipping non-file item during directory copy: $itemPath');
         }
       }
     } catch (e) {
-      Logger.error('Copy directory failed: $e',
-          label: 'WebStorageImpl.copyDirectory');
+      Logger.error('Copy directory failed', rawError: e);
     }
   }
 
@@ -788,7 +782,7 @@ class WebStorageImpl implements StorageInterface {
       final meta = await _getFileMeta(path);
       return meta?.timestamps.created;
     } catch (e) {
-      Logger.error('Get creation time failed: $e');
+      Logger.error('Get creation time failed', rawError: e);
       return null;
     }
   }
@@ -964,7 +958,7 @@ class WebStorageImpl implements StorageInterface {
       }
       return offset;
     } catch (e) {
-      Logger.error('Append bytes failed: $e', label: 'WebStorageImpl');
+      Logger.error('Append bytes failed', rawError: e);
       rethrow;
     }
   }
@@ -993,7 +987,7 @@ class WebStorageImpl implements StorageInterface {
       }
       return offset;
     } catch (e) {
-      Logger.error('Append string failed: $e', label: 'WebStorageImpl');
+      Logger.error('Append string failed', rawError: e);
       rethrow;
     }
   }
@@ -1012,7 +1006,7 @@ class WebStorageImpl implements StorageInterface {
           .transform(const LineSplitter())
           .toList();
     } catch (e) {
-      Logger.error('Read as lines failed: $e', label: 'WebStorageImpl');
+      Logger.error('Read as lines failed', rawError: e);
       return [];
     }
   }
@@ -1067,8 +1061,7 @@ class WebStorageImpl implements StorageInterface {
       await writeAsBytes(normalizedFinal, bytes, flush: true);
       await deleteFile(normalizedTmp);
     } catch (e) {
-      Logger.error('replaceFileAtomic (web fallback) failed: $e',
-          label: 'WebStorageImpl');
+      Logger.error('replaceFileAtomic (web fallback) failed', rawError: e);
       rethrow;
     }
   }
