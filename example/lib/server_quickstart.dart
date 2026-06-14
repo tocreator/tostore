@@ -10,12 +10,13 @@ import 'package:tostore/tostore.dart';
 /// Call this function directly to run the full example
 Future<void> serverMain() async {
   // Configure log callback to capture all database logs
-  LogConfig.setConfig(
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: LogLevel.debug,
-    onLogHandler: (String message, LogType type, String label) {
-      log(message,
-          name: label); // Replace with the actual logging logic of your project
+    onLog: (record) {
+      log(record.message,
+          name:
+              "ToStore"); // Replace with the actual logging logic of your project
     },
   );
 
