@@ -688,7 +688,7 @@ class ToStoreExample {
           // If no foreign key value is provided, record a warning but continue (database will validate)
           logService.add(
               'Warning: Foreign key field "${field.name}" in table "${schema.name}" has no provided value.',
-              LogType.warn);
+              LogLevel.warn);
         }
         continue;
       }
@@ -782,7 +782,7 @@ class ToStoreExample {
     if (schema == null) {
       logService.add(
           'Cannot add examples: Schema for table "$tableName" not found.',
-          LogType.error);
+          LogLevel.error);
       return -1;
     }
 
@@ -818,7 +818,7 @@ class ToStoreExample {
       if (result.hasErrors) {
         logService.add(
             'Batch insert failed at offset $processedCount: ${_statusErrorMessage(result.statuses)}',
-            LogType.error);
+            LogLevel.error);
         return -1;
       }
 
@@ -831,7 +831,7 @@ class ToStoreExample {
       records.clear();
 
       logService.add('Progress: $processedCount/$count records inserted...',
-          LogType.info, true);
+          LogLevel.info, true);
     }
 
     totalStopwatch.stop();
@@ -855,7 +855,7 @@ class ToStoreExample {
     if (schema == null) {
       logService.add(
           'Cannot add examples: Schema for table "$tableName" not found.',
-          LogType.error);
+          LogLevel.error);
       return -1;
     }
 
@@ -929,7 +929,7 @@ class ToStoreExample {
   /// Example: Expression operations for atomic field updates
   /// Demonstrates using Expr for atomic calculations without race conditions
   Future<void> expressionExamples() async {
-    logService.add('--- Expression Examples ---', LogType.info);
+    logService.add('--- Expression Examples ---', LogLevel.info);
 
     // Example 1: Simple increment using expression
     await db.insert('users', {
@@ -1012,13 +1012,13 @@ class ToStoreExample {
     //                  (Expr.value(1) - Expr.field('discount'))),
     // }).where('title', '=', 'Product A');
 
-    logService.add('Expression examples completed', LogType.info);
+    logService.add('Expression examples completed', LogLevel.info);
   }
 
   /// Example: Transaction operations
   /// Demonstrates transaction commit, rollback, and atomic operations
   Future<void> transactionExamples() async {
-    logService.add('--- Transaction Examples ---', LogType.info);
+    logService.add('--- Transaction Examples ---', LogLevel.info);
 
     // Example 1: Basic transaction with commit
     // All operations in the transaction are atomic - either all succeed or all fail
@@ -1038,7 +1038,7 @@ class ToStoreExample {
     });
 
     if (!txResult1.hasErrors) {
-      logService.add('Transaction committed: 2 users inserted', LogType.info);
+      logService.add('Transaction committed: 2 users inserted', LogLevel.info);
     }
 
     // Example 2: Transaction with rollback on error
@@ -1055,10 +1055,10 @@ class ToStoreExample {
     if (txResult2.hasErrors) {
       logService.add(
           'Transaction rolled back: ${_statusErrorMessage(txResult2.statuses, fallback: 'Transaction failed')}',
-          LogType.info);
+          LogLevel.info);
     }
 
-    logService.add('Transaction examples completed', LogType.info);
+    logService.add('Transaction examples completed', LogLevel.info);
   }
 
   // --- Vector Benchmarking ---
@@ -1078,7 +1078,7 @@ class ToStoreExample {
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
       logService.add('Benchmark failed: Schema for "$tableName" not found.',
-          LogType.error);
+          LogLevel.error);
       return -1;
     }
 
@@ -1088,7 +1088,7 @@ class ToStoreExample {
 
     if (vectorField.name.isEmpty) {
       logService.add('Benchmark failed: No vector field found in "$tableName".',
-          LogType.error);
+          LogLevel.error);
       return -1;
     }
 
@@ -1096,7 +1096,7 @@ class ToStoreExample {
     if (dims == 0) {
       logService.add(
           'Benchmark failed: Vector dimensions not configured for "${vectorField.name}".',
-          LogType.error);
+          LogLevel.error);
       return -1;
     }
 
@@ -1106,7 +1106,7 @@ class ToStoreExample {
     if (!hasVectorIndex) {
       logService.add(
           'Warning: No vector index found on "${vectorField.name}". Search will be slow.',
-          LogType.warn);
+          LogLevel.warn);
     }
 
     final random = Random();
@@ -1148,7 +1148,7 @@ class ToStoreExample {
           if (r.score < -1.0001 || r.score > 1.0001) {
             logService.add(
                 'Validation Error: Invalid similarity score ${r.score} (expected -1.0 to 1.0 for Cosine)',
-                LogType.error);
+                LogLevel.error);
             validationFailed = true;
           }
         }
@@ -1157,7 +1157,7 @@ class ToStoreExample {
       // Periodically log progress for long tests
       if (iterations >= 1000 && (i + 1) % (iterations ~/ 10) == 0) {
         logService.add(
-            'Progress: ${i + 1}/$iterations completed...', LogType.info, true);
+            'Progress: ${i + 1}/$iterations completed...', LogLevel.info, true);
       }
 
       // Small delay to allow UI refresh in very long loops
@@ -1202,7 +1202,7 @@ class ToStoreExample {
       } catch (e) {
         logService.add(
             'Warning: Failed to query max ID for field value generation: $e',
-            LogType.warn);
+            LogLevel.warn);
       }
       return 0;
     }
