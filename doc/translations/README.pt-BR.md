@@ -1418,30 +1418,32 @@ Tipos de erros de transação:
 
 
 ### <a id="logging-diagnostics"></a>Log de retorno de chamada e diagnóstico de banco de dados
+O ToStore pode rotear logs do ciclo de vida do banco de dados de volta para a camada de negócios por meio de `ToStore.setLogConfig(...)`.
 
-O ToStore pode rotear logs de inicialização, recuperação, migração automática e conflitos de restrição de tempo de execução de volta para a camada de negócios por meio de `LogConfig.setConfig(...)`.
-
-- `onLogHandler` recebe todos os logs que passam pelos filtros `enableLog` e `logLevel` atuais.
-- Chame `LogConfig.setConfig(...)` antes da inicialização para que os logs gerados durante a inicialização e a migração automática também sejam capturados.
+- O retorno de chamada `onLog` recebe todos os registros de log `LogRecord` que passam pelos filtros atuais `enableLog` e `logLevel`.
+  - **LogLevel.error**: Ocorreu um erro local, não afeta o funcionamento normal.
+  - **LogLevel.critical**: Erro global de nível de desastre (como disco cheio, memória insuficiente, falha grave de migração, etc.) que requer intervenção manual. É recomendável acionar notificações de alarme neste nível.
+- Chame `ToStore.setLogConfig(...)` antes da inicialização para que os logs gerados durante a inicialização e a migração automática também sejam capturados.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Configurar parâmetros de log ou retorno de chamada
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Título cinza claro no topo do log para distinguir aplicativos ou instâncias de banco de dados,
+    onLog: (log) {
+      // Em produção, warn/error/critical podem ser reportados ao backend ou plataforma de log
+      // log.level corresponde ao nível de log (LogLevel.debug, info, warn, error, critical)
+      // log.message corresponde ao texto do log processado
+      // log.status corresponde ao estado de diagnóstico ResultStatus subjacente (contém code e codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Configuração de segurança
 
 > [!WARNING]
