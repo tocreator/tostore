@@ -258,8 +258,7 @@ final class TableTreePartitionManager {
       await _leafPageCache.cleanup(removeRatio: ratio);
       await _internalPageCache.cleanup(removeRatio: ratio);
     } catch (e) {
-      Logger.warn('Evict page cache failed: $e',
-          label: 'TableTreePartitionManager.evictPageCache');
+      Logger.warn('Evict page cache failed', rawError: e);
     }
   }
 
@@ -269,8 +268,7 @@ final class TableTreePartitionManager {
       _leafPageCache.clear();
       _internalPageCache.clear();
     } catch (e) {
-      Logger.warn('Clear page cache failed: $e',
-          label: 'TableTreePartitionManager.clearPageCacheSync');
+      Logger.warn('Clear page cache failed', rawError: e);
     }
   }
 
@@ -280,8 +278,7 @@ final class TableTreePartitionManager {
       _leafPageCache.remove([tableName]);
       _internalPageCache.remove([tableName]);
     } catch (e) {
-      Logger.warn('Clear page cache for table failed: $e',
-          label: 'TableTreePartitionManager.clearPageCacheForTable');
+      Logger.warn('Clear page cache for table failed', rawError: e);
     }
   }
 
@@ -1774,8 +1771,7 @@ final class TableTreePartitionManager {
       final totalRecordsAfter = updatedMeta.totalRecords;
       final totalSizeAfter = updatedMeta.totalSizeInBytes;
       Logger.debug(
-          'Table persistence: table=$tableName, partitions=${updatedMeta.btreePartitionCount}, batchRecords=$totalRecords, totalRecords=$totalRecordsAfter, totalSize=${(totalSizeAfter / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at',
-          label: 'TableTreePartitionManager.writeChanges');
+          'Table persistence: table=$tableName, partitions=${updatedMeta.btreePartitionCount}, batchRecords=$totalRecords, totalRecords=$totalRecordsAfter, totalSize=${(totalSizeAfter / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
