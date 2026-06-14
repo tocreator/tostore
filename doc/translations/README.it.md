@@ -1418,30 +1418,32 @@ Tipi di errori di transazione:
 
 
 ### <a id="logging-diagnostics"></a>Registra richiamate e diagnostica del database
+ToStore può instradare i registri del ciclo de vida del database al livello aziendale tramite `ToStore.setLogConfig(...)`.
 
-ToStore può instradare i registri di avvio, ripristino, migrazione automatica e conflitti tra vincoli di runtime al livello aziendale tramite `LogConfig.setConfig(...)`.
-
-- `onLogHandler` riceve tutti i registri che superano gli attuali filtri `enableLog` e `logLevel`.
-- Chiamare `LogConfig.setConfig(...)` prima dell'inizializzazione in modo che vengano acquisiti anche i log generati durante l'inizializzazione e la migrazione automatica.
+- La callback `onLog` riceve tutti i record di log `LogRecord` che superano i filtri correnti `enableLog` e `logLevel`.
+  - **LogLevel.error**: Si è verificato un errore locale, non influisce sul normale funzionamento.
+  - **LogLevel.critical**: Errore globale a livello di disastro (come disco pieno, memoria insufficiente, grave errore di migração, ecc.) che richiede l'intervento manuale. Si consiglia di attivare notifiche di allarme a questo livello.
+- Chiamare `ToStore.setLogConfig(...)` prima dell'inizializzazione in modo che vengano acquisiti anche i log generati durante l'inizializzazione e la migrazione automatica.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Configura i parametri di log o la callback
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Titolo grigio chiaro in alto nel log per distinguere app o istanze di database,
+    onLog: (log) {
+      // In produzione, warn/error/critical possono essere segnalati al backend o alla piattaforma di log
+      // log.level corrisponde al livello di log (LogLevel.debug, info, warn, error, critical)
+      // log.message corrisponde al testo del log elaborato
+      // log.status corrisponde allo stato di diagnostica ResultStatus sottostante (contiene code e codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Configurazione della sicurezza
 
 > [!WARNING]
