@@ -149,7 +149,7 @@ class TransactionManager {
         }
       } catch (_) {}
     } catch (e) {
-      Logger.warn('periodicCleanup failed: $e', label: 'TxnManager');
+      Logger.warn('periodicCleanup failed', rawError: e);
     } finally {
       _cleanupRunning = false;
     }
@@ -172,7 +172,7 @@ class TransactionManager {
         }
       }
     } catch (e) {
-      Logger.warn('Load TransactionMainMeta failed: $e', label: 'TxnManager');
+      Logger.warn('Load TransactionMainMeta failed', rawError: e);
     }
     _mainMetaCache ??= TransactionMainMeta();
 
@@ -338,7 +338,7 @@ class TransactionManager {
             .flushAll(path: walMetaPath, closeHandles: false);
       }
     } catch (e) {
-      Logger.warn('Flush on commit failed: $e', label: 'TxnManager');
+      Logger.warn('Flush on commit failed', rawError: e);
     }
 
     await _maybeCleanupPartition(pIndex);
@@ -558,7 +558,7 @@ class TransactionManager {
       // Rotate partition if needed (size-based)
       await rotateIfNeeded();
     } catch (e) {
-      Logger.warn('Persist commit plan failed: $e', label: 'TxnManager');
+      Logger.warn('Persist commit plan failed', rawError: e);
     }
   }
 
@@ -604,8 +604,7 @@ class TransactionManager {
       }
       return null;
     } catch (e) {
-      Logger.warn('Load commit plan from partition log failed: $e',
-          label: 'TxnManager');
+      Logger.warn('Load commit plan from partition log failed', rawError: e);
       return null;
     }
   }
@@ -639,8 +638,7 @@ class TransactionManager {
         final schema = await _dataStore.schemaManager?.getTableSchema(table);
         if (schema == null) {
           Logger.warn(
-              'Schema not found for table $table during applyCommitPlan',
-              label: 'TxnManager');
+              'Schema not found for table $table during applyCommitPlan');
           continue;
         }
 
@@ -697,8 +695,7 @@ class TransactionManager {
         final schema = await _dataStore.schemaManager?.getTableSchema(table);
         if (schema == null) {
           Logger.warn(
-              'Schema not found for table $table during applyCommitPlan',
-              label: 'TxnManager');
+              'Schema not found for table $table during applyCommitPlan');
           continue;
         }
 
@@ -817,8 +814,8 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Cascade delete during applyCommitPlan failed on ${cd.tableName}: $e',
-                label: 'TxnManager');
+                'Cascade delete during applyCommitPlan failed on ${cd.tableName}',
+                rawError: e);
             rethrow;
           }
         }
@@ -840,8 +837,8 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Cascade update during applyCommitPlan failed on ${cu.tableName}: $e',
-                label: 'TxnManager');
+                'Cascade update during applyCommitPlan failed on ${cu.tableName}',
+                rawError: e);
             rethrow;
           }
         }
@@ -863,8 +860,8 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Heavy delete during applyCommitPlan failed on ${hd.tableName}: $e',
-                label: 'TxnManager');
+                'Heavy delete during applyCommitPlan failed on ${hd.tableName}',
+                rawError: e);
             rethrow;
           }
         }
@@ -887,8 +884,8 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Heavy update during applyCommitPlan failed on ${hu.tableName}: $e',
-                label: 'TxnManager');
+                'Heavy update during applyCommitPlan failed on ${hu.tableName}',
+                rawError: e);
             rethrow;
           }
         }
@@ -900,7 +897,7 @@ class TransactionManager {
 
       _dataStore.tableDataManager.clearTransactionState(plan.transactionId);
     } catch (e) {
-      Logger.warn('Apply commit plan failed: $e', label: 'TxnManager');
+      Logger.warn('Apply commit plan failed', rawError: e);
       rethrow;
     }
   }
@@ -1006,12 +1003,11 @@ class TransactionManager {
             await rollback(txId);
           }
         } catch (e) {
-          Logger.warn('Recovery for $txId failed: $e', label: 'TxnManager');
+          Logger.warn('Recovery for $txId failed', rawError: e);
         }
       }
     } catch (e) {
-      Logger.warn('recoverUnfinishedTransactionsOnStartup failed: $e',
-          label: 'TxnManager');
+      Logger.warn('recoverUnfinishedTransactionsOnStartup failed', rawError: e);
     }
   }
 
@@ -1296,7 +1292,7 @@ class TransactionManager {
         meta = TransactionPartitionMeta(partitionIndex: partitionIndex);
       }
     } catch (e) {
-      Logger.warn('Load txn partition meta failed: $e', label: 'TxnManager');
+      Logger.warn('Load txn partition meta failed', rawError: e);
       meta = TransactionPartitionMeta(partitionIndex: partitionIndex);
     }
     _partitionMetaCache[partitionIndex] = meta;
@@ -1367,7 +1363,7 @@ class TransactionManager {
           shardIsEmpty = false;
         }
       } catch (e) {
-        Logger.warn('Delete txn partition dir failed: $e', label: 'TxnManager');
+        Logger.warn('Delete txn partition dir failed', rawError: e);
       }
       _partitionMetaCache.remove(partitionIndex);
       _mainMetaCache?.activePartitions.remove(partitionIndex);
@@ -1437,8 +1433,7 @@ class TransactionManager {
           }
         }
       } catch (e) {
-        Logger.warn('Stream unfinished tx failed for p=$p: $e',
-            label: 'TxnManager');
+        Logger.warn('Stream unfinished tx failed for p=$p', rawError: e);
       }
     }
   }
