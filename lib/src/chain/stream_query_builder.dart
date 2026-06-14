@@ -49,8 +49,7 @@ class StreamQueryBuilder {
       // Only warn about each invalid operator once
       if (!_warnedInvalidOperators.contains(operator)) {
         Logger.error(
-            'Invalid operator: "$operator". Valid operators are: ${_validOperators.join(', ')}',
-            label: 'StreamQueryBuilder.where');
+            'Invalid operator: "$operator". Valid operators are: ${_validOperators.join(', ')}');
         _warnedInvalidOperators.add(operator);
       }
       // Use equals as a safe fallback
