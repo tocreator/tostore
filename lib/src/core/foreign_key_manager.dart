@@ -77,10 +77,7 @@ class ForeignKeyManager {
 
       await _cacheLoadingFuture;
     } catch (e) {
-      Logger.error(
-        'Failed to ensure cache loaded: $e',
-        label: 'ForeignKeyManager._ensureCacheLoaded',
-      );
+      Logger.error('Failed to ensure cache loaded', rawError: e);
     } finally {
       _cacheLoadingFuture = null;
     }
@@ -111,10 +108,7 @@ class ForeignKeyManager {
         _cacheNeedsRebuild = false;
       }
     } catch (e) {
-      Logger.error(
-        'Failed to load foreign key cache: $e',
-        label: 'ForeignKeyManager._loadCache',
-      );
+      Logger.error('Failed to load foreign key cache', rawError: e);
       // Don't throw - allow operations to continue
       // Cache will be retried on next access
       _cacheNeedsRebuild = true;
@@ -230,9 +224,8 @@ class ForeignKeyManager {
       return true;
     } catch (e) {
       Logger.warn(
-        'Failed to load cache from system table: $e, will rebuild from schemas',
-        label: 'ForeignKeyManager._loadCacheFromSystemTable',
-      );
+          'Failed to load cache from system table, will rebuild from schemas',
+          rawError: e);
       return false;
     }
   }
@@ -714,10 +707,8 @@ class ForeignKeyManager {
             totalCascaded += deletedCount;
           } catch (e) {
             // Propagate error immediately - transaction will rollback
-            Logger.error(
-              'Cascade delete failed for table $childTableName: $e',
-              label: 'ForeignKeyManager.handleCascadeDelete',
-            );
+            Logger.error('Cascade delete failed for table $childTableName',
+                rawError: e);
             rethrow;
           }
         } else if (fk.onDelete == ForeignKeyCascadeAction.setNull) {
@@ -730,10 +721,8 @@ class ForeignKeyManager {
               parentPkValues: deletedPkValues,
             );
           } catch (e) {
-            Logger.error(
-              'Failed to set foreign key to NULL in $childTableName: $e',
-              label: 'ForeignKeyManager.handleCascadeDelete',
-            );
+            Logger.error('Failed to set foreign key to NULL in $childTableName',
+                rawError: e);
             rethrow;
           }
         } else if (fk.onDelete == ForeignKeyCascadeAction.setDefault) {
@@ -747,9 +736,8 @@ class ForeignKeyManager {
             );
           } catch (e) {
             Logger.error(
-              'Failed to set foreign key to default in $childTableName: $e',
-              label: 'ForeignKeyManager.handleCascadeDelete',
-            );
+                'Failed to set foreign key to default in $childTableName',
+                rawError: e);
             rethrow;
           }
         }
@@ -787,7 +775,6 @@ class ForeignKeyManager {
     if (visited.contains(tableName)) {
       Logger.warn(
         'Circular foreign key reference detected during cascade update involving table $tableName',
-        label: 'ForeignKeyManager.handleCascadeUpdate',
       );
       return 0;
     }
@@ -851,10 +838,8 @@ class ForeignKeyManager {
             );
             totalCascaded += updatedCount;
           } catch (e) {
-            Logger.error(
-              'Cascade update failed for table $childTableName: $e',
-              label: 'ForeignKeyManager.handleCascadeUpdate',
-            );
+            Logger.error('Cascade update failed for table $childTableName',
+                rawError: e);
             rethrow;
           }
 
@@ -888,9 +873,8 @@ class ForeignKeyManager {
             );
           } catch (e) {
             Logger.error(
-              'Failed to set foreign key to NULL in $childTableName during cascade update: $e',
-              label: 'ForeignKeyManager.handleCascadeUpdate',
-            );
+                'Failed to set foreign key to NULL in $childTableName during cascade update',
+                rawError: e);
             rethrow;
           }
         } else if (fk.onUpdate == ForeignKeyCascadeAction.setDefault) {
@@ -904,9 +888,8 @@ class ForeignKeyManager {
             );
           } catch (e) {
             Logger.error(
-              'Failed to set foreign key to default in $childTableName during cascade update: $e',
-              label: 'ForeignKeyManager.handleCascadeUpdate',
-            );
+                'Failed to set foreign key to default in $childTableName during cascade update',
+                rawError: e);
             rethrow;
           }
         }
@@ -998,9 +981,8 @@ class ForeignKeyManager {
             // If query fails, assume there might be references and block the clear
             // This is a safety measure - better to block than to allow potentially unsafe clear
             Logger.warn(
-              'Failed to check RESTRICT constraint for $referencingTableName: $e. Blocking clear operation for safety.',
-              label: 'ForeignKeyManager.handleCascadeClear',
-            );
+                'Failed to check RESTRICT constraint for $referencingTableName. Blocking clear operation for safety.',
+                rawError: e);
             hasRestrict = true;
             if (!restrictTables.contains(referencingTableName)) {
               restrictTables.add(referencingTableName);
@@ -1062,9 +1044,8 @@ class ForeignKeyManager {
             await deleteBuilder.allowDeleteAll().future;
           } catch (e) {
             Logger.error(
-              'Failed to cascade delete from $childTableName during clear: $e',
-              label: 'ForeignKeyManager.handleCascadeClear',
-            );
+                'Failed to cascade delete from $childTableName during clear',
+                rawError: e);
             rethrow;
           }
         } else if (fk.onDelete == ForeignKeyCascadeAction.setNull) {
@@ -1087,9 +1068,8 @@ class ForeignKeyManager {
             await updateBuilder.future;
           } catch (e) {
             Logger.error(
-              'Failed to set foreign key to NULL in $childTableName during clear: $e',
-              label: 'ForeignKeyManager.handleCascadeClear',
-            );
+                'Failed to set foreign key to NULL in $childTableName during clear',
+                rawError: e);
             rethrow;
           }
         } else if (fk.onDelete == ForeignKeyCascadeAction.setDefault) {
@@ -1101,7 +1081,6 @@ class ForeignKeyManager {
             if (childSchema == null) {
               Logger.warn(
                 'Child table $childTableName does not exist during cascade clear, skipping',
-                label: 'ForeignKeyManager.handleCascadeClear',
               );
               continue;
             }
@@ -1133,9 +1112,8 @@ class ForeignKeyManager {
             await updateBuilder.future;
           } catch (e) {
             Logger.error(
-              'Failed to set foreign key to default in $childTableName during clear: $e',
-              label: 'ForeignKeyManager.handleCascadeClear',
-            );
+                'Failed to set foreign key to default in $childTableName during clear',
+                rawError: e);
             rethrow;
           }
         }
@@ -1233,7 +1211,6 @@ class ForeignKeyManager {
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade delete, skipping',
-        label: 'ForeignKeyManager._cascadeDeleteWithRecursion',
       );
       return 0;
     }
@@ -1343,9 +1320,8 @@ class ForeignKeyManager {
                   // Propagate error immediately - don't continue with partial deletes
                   // The transaction will rollback, ensuring data consistency
                   Logger.error(
-                    'Cascade delete failed during recursive deletion of $grandChildTableName: $e',
-                    label: 'ForeignKeyManager._cascadeDeleteWithRecursion',
-                  );
+                      'Cascade delete failed during recursive deletion of $grandChildTableName',
+                      rawError: e);
                   rethrow;
                 }
               }
@@ -1369,9 +1345,8 @@ class ForeignKeyManager {
       } catch (e) {
         // If deletion fails, propagate error to trigger transaction rollback
         Logger.error(
-          'Cascade delete failed when deleting records from $childTableName: $e',
-          label: 'ForeignKeyManager._cascadeDeleteWithRecursion',
-        );
+            'Cascade delete failed when deleting records from $childTableName',
+            rawError: e);
         rethrow;
       }
 
@@ -1417,7 +1392,6 @@ class ForeignKeyManager {
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade update, skipping',
-        label: 'ForeignKeyManager._cascadeUpdateChildren',
       );
       return 0;
     }
@@ -1566,7 +1540,6 @@ class ForeignKeyManager {
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set NULL operation, skipping',
-        label: 'ForeignKeyManager._setForeignKeyToNull',
       );
       return;
     }
@@ -1634,7 +1607,6 @@ class ForeignKeyManager {
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set DEFAULT operation, skipping',
-        label: 'ForeignKeyManager._setForeignKeyToDefault',
       );
       return;
     }
@@ -1760,7 +1732,6 @@ class ForeignKeyManager {
         }
         Logger.warn(
           message,
-          label: 'ForeignKeyManager.updateSystemTableForTable',
         );
         return;
       }
@@ -1862,10 +1833,8 @@ class ForeignKeyManager {
       // Invalidate cache to force reload
       invalidateCache();
     } catch (e) {
-      Logger.warn(
-        'Failed to update system table for table $tableName: $e',
-        label: 'ForeignKeyManager.updateSystemTableForTable',
-      );
+      Logger.warn('Failed to update system table for table $tableName',
+          rawError: e);
       if (throwOnError) {
         rethrow;
       }
@@ -1917,13 +1886,10 @@ class ForeignKeyManager {
 
       Logger.debug(
         'Cleaned up system table entries for dropped table: $tableName',
-        label: 'ForeignKeyManager.cleanupSystemTableForDroppedTable',
       );
     } catch (e) {
-      Logger.warn(
-        'Failed to cleanup system table for dropped table $tableName: $e',
-        label: 'ForeignKeyManager.cleanupSystemTableForDroppedTable',
-      );
+      Logger.warn('Failed to cleanup system table for dropped table $tableName',
+          rawError: e);
       if (throwOnError) {
         rethrow;
       }
@@ -1996,14 +1962,12 @@ class ForeignKeyManager {
           await _dataStore.indexManager?.createIndex(tableName, coveringIndex);
           Logger.info(
             'Ensured index ${coveringIndex.actualIndexName} exists for foreign key ${fk.actualName}',
-            label: 'ForeignKeyManager.createForeignKeyIndexes',
           );
         } catch (e) {
           // Ignore "index already exists" type errors if they are noisy, but logging warning is safer
           Logger.warn(
-            'Failed to create/ensure index for foreign key ${fk.actualName}: $e',
-            label: 'ForeignKeyManager.createForeignKeyIndexes',
-          );
+              'Failed to create/ensure index for foreign key ${fk.actualName}',
+              rawError: e);
         }
       }
     }
