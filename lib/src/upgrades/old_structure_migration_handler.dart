@@ -41,15 +41,13 @@ class OldStructureMigrationHandler {
       // get all space names
       List<String> allSpaces = await _getAllSpaceNames();
       Logger.info(
-          'Detected ${allSpaces.length} spaces need to migrate old path structure: $allSpaces',
-          label: 'OldStructureMigrationHandler.migrate');
+          'Detected ${allSpaces.length} spaces need to migrate old path structure: $allSpaces');
 
       final yieldController =
           YieldController('migrate_old_spaces', checkInterval: 1);
       // migrate each space one by one
       for (final spaceName in allSpaces) {
-        Logger.info('Starting to migrate space: $spaceName',
-            label: 'OldStructureMigrationHandler.migrate');
+        Logger.info('Starting to migrate space: $spaceName');
         await yieldController.maybeYield();
 
         // create a migration instance for a specific space
@@ -86,11 +84,10 @@ class OldStructureMigrationHandler {
 
         if (!hasOldStructure) {
           Logger.info(
-              'Space $spaceName did not detect old path structure, will create initial configuration',
-              label: 'OldStructureMigrationHandler.migrate');
+              'Space $spaceName did not detect old path structure, will create initial configuration');
         } else {
-          Logger.info('Space $spaceName old path structure migration completed',
-              label: 'OldStructureMigrationHandler.migrate');
+          Logger.info(
+              'Space $spaceName old path structure migration completed');
         }
 
         // close migration instance
@@ -105,12 +102,10 @@ class OldStructureMigrationHandler {
       }
 
       Logger.info(
-          'All space old file structure migration and cleanup completed',
-          label: 'OldStructureMigrationHandler.migrate');
+          'All space old file structure migration and cleanup completed');
     } catch (e) {
-      Logger.error(
-          'Error occurred during old directory structure migration: $e',
-          label: 'OldStructureMigrationHandler.migrate');
+      Logger.error('Error occurred during old directory structure migration',
+          rawError: e);
     }
   }
 
@@ -135,8 +130,7 @@ class OldStructureMigrationHandler {
         }).toList();
       }
     } catch (e) {
-      Logger.error('Failed to get space names: $e',
-          label: 'OldStructureMigrationHandler._getAllSpaceNames');
+      Logger.error('Failed to get space names', rawError: e);
     }
 
     // if failed to get space names, return default space
@@ -200,15 +194,13 @@ class OldStructureMigrationHandler {
             await _storage.deleteDirectory(tableDir);
           } else {
             Logger.warn(
-                'Skipping deletion of directories that may conflict with the new structure: $tableName',
-                label: 'OldStructureMigrationHandler._migrateOldPathStructure');
+                'Skipping deletion of directories that may conflict with the new structure: $tableName');
           }
         }
       }
     } catch (e) {
-      Logger.error(
-          'Error occurred during old path structure data migration: $e',
-          label: 'OldStructureMigrationHandler._migrateOldPathStructure');
+      Logger.error('Error occurred during old path structure data migration',
+          rawError: e);
     }
   }
 
@@ -221,8 +213,7 @@ class OldStructureMigrationHandler {
       DataStoreImpl dataStore) async {
     try {
       Logger.info(
-          'Starting to migrate table: $tableName (${isGlobal ? 'Global Table' : 'Normal Table'})',
-          label: 'OldStructureMigrationHandler._migrateTable');
+          'Starting to migrate table: $tableName (${isGlobal ? 'Global Table' : 'Normal Table'})');
 
       // build old file paths
       final oldTablePath = pathJoin(oldPath, tableName);
@@ -233,8 +224,7 @@ class OldStructureMigrationHandler {
       // check if table structure file exists
       if (!await _storage.existsFile(oldSchemaPath)) {
         Logger.warn(
-            'Table $tableName structure file does not exist, skipping migration',
-            label: 'OldStructureMigrationHandler._migrateTable');
+            'Table $tableName structure file does not exist, skipping migration');
         return;
       }
 
@@ -249,12 +239,11 @@ class OldStructureMigrationHandler {
             tableName,
             schemaJson,
           );
-          Logger.info('Table $tableName structure migration succeeded',
-              label: 'OldStructureMigrationHandler._migrateTable');
+          Logger.info('Table $tableName structure migration succeeded');
         } catch (e) {
           Logger.error(
-              'Error occurred during parsing table $tableName structure: $e',
-              label: 'OldStructureMigrationHandler._migrateTable');
+              'Error occurred during parsing table $tableName structure',
+              rawError: e);
           return; // if table structure migration failed, skip this table
         }
       }
@@ -275,8 +264,8 @@ class OldStructureMigrationHandler {
                 records.add(record);
               } catch (e) {
                 Logger.error(
-                    'Error occurred during parsing table $tableName data line: $e',
-                    label: 'OldStructureMigrationHandler._migrateTable');
+                    'Error occurred during parsing table $tableName data line',
+                    rawError: e);
                 // continue to process the next line
               }
             }
@@ -307,12 +296,11 @@ class OldStructureMigrationHandler {
               }
             } catch (e) {
               Logger.error(
-                  'Error occurred during writing table $tableName data: $e',
-                  label: 'OldStructureMigrationHandler._migrateTable');
+                  'Error occurred during writing table $tableName data',
+                  rawError: e);
             }
           } else {
-            Logger.info('Table $tableName has no valid data to migrate',
-                label: 'OldStructureMigrationHandler._migrateTable');
+            Logger.info('Table $tableName has no valid data to migrate');
           }
         }
       }
@@ -332,11 +320,10 @@ class OldStructureMigrationHandler {
         }
       }
 
-      Logger.info('Table $tableName migration completed',
-          label: 'OldStructureMigrationHandler._migrateTable');
+      Logger.info('Table $tableName migration completed');
     } catch (e) {
-      Logger.error('Error occurred during migrating table $tableName: $e',
-          label: 'OldStructureMigrationHandler._migrateTable');
+      Logger.error('Error occurred during migrating table $tableName',
+          rawError: e);
     }
   }
 }
