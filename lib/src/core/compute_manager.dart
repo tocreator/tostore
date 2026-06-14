@@ -37,12 +37,10 @@ class ComputeManager {
     try {
       // try to run in isolate
       return await compute_impl.compute(task.function, task.message);
-    } catch (isolateError, stack) {
+    } catch (isolateError) {
       if (fallbackToMainThread) {
-        Logger.error(
-          'Isolate execution failed, fallback to main thread: $isolateError\n$stack',
-          label: 'ComputeManager.run',
-        );
+        Logger.error('Isolate execution failed, fallback to main thread',
+            rawError: isolateError);
         return task.function(task.message);
       }
       rethrow;
@@ -120,10 +118,8 @@ class ComputeManager {
     try {
       await compute_impl.prewarm();
     } catch (e) {
-      Logger.warn(
-        'Compute worker pre-warming not available on this platform.',
-        label: 'ComputeManager.prewarm',
-      );
+      Logger.warn('Compute worker pre-warming not available on this platform.',
+          rawError: e);
     }
   }
 }
