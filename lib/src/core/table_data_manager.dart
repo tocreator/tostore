@@ -411,10 +411,8 @@ class TableDataManager {
         tableName,
       );
     } catch (e) {
-      Logger.warn(
-        'Failed to query table record weight for $tableName: $e',
-        label: 'TableDataManager._queryTableRecordWeight',
-      );
+      Logger.warn('Failed to query table record weight for $tableName',
+          rawError: e);
       return null;
     }
   }
@@ -536,8 +534,7 @@ class TableDataManager {
         }
       }
     } catch (e) {
-      Logger.warn('persistRuntimeMetaIfNeeded failed: $e',
-          label: 'TableDataManager');
+      Logger.warn('persistRuntimeMetaIfNeeded failed', rawError: e);
     }
   }
 
@@ -546,8 +543,7 @@ class TableDataManager {
     try {
       await _tableMetaCache.cleanup(removeRatio: ratio);
     } catch (e) {
-      Logger.warn('Evict table meta cache failed: $e',
-          label: 'TableDataManager.evictTableMetaCache');
+      Logger.warn('Evict table meta cache failed', rawError: e);
     }
   }
 
@@ -566,8 +562,7 @@ class TableDataManager {
         _totalDataSizeBytes = config.totalDataSizeBytes;
       }
     } catch (e) {
-      Logger.error('Failed to load table statistics: $e',
-          label: 'TableDataManager._loadStatisticsFromConfig');
+      Logger.error('Failed to load table statistics', rawError: e);
     }
   }
 
@@ -580,8 +575,7 @@ class TableDataManager {
         await recalculateAllStatistics();
       }
     } catch (e) {
-      Logger.error('Failed to check for updated statistics: $e',
-          label: 'TableDataManager._updateTableStatisticsIfNeeded');
+      Logger.error('Failed to check for updated statistics', rawError: e);
     }
   }
 
@@ -641,11 +635,9 @@ class TableDataManager {
       await _saveStatisticsToConfig();
 
       Logger.debug(
-          'Table statistics calculation completed: table count=$tableCount, record count=$totalRecords, data size=${totalSize / 1024 / 1024}MB',
-          label: 'TableDataManager._calculateTableStatistics');
+          'Table statistics calculation completed: table count=$tableCount, record count=$totalRecords, data size=${totalSize / 1024 / 1024}MB');
     } catch (e) {
-      Logger.error('Failed to calculate table statistics: $e',
-          label: 'TableDataManager._calculateTableStatistics');
+      Logger.error('Failed to calculate table statistics', rawError: e);
     }
   }
 
@@ -673,8 +665,7 @@ class TableDataManager {
         _needSaveStats = false;
       }
     } catch (e) {
-      Logger.error('Failed to save table statistics: $e',
-          label: 'TableDataManager._saveStatisticsToConfig');
+      Logger.error('Failed to save table statistics', rawError: e);
     }
   }
 
@@ -722,13 +713,13 @@ class TableDataManager {
             await updateTableMeta(tableName, updatedMeta);
           }
         } catch (e) {
-          Logger.error('Failed to update FileMeta maxAutoIncrementId: $e',
-              label: 'TableDataManager.updateMaxIdInMemory');
+          Logger.error('Failed to update FileMeta maxAutoIncrementId',
+              rawError: e);
         }
       }
     } catch (e) {
-      Logger.error('Failed to update max ID: $e, tableName=$tableName, id=$id',
-          label: 'TableDataManager.updateMaxIdInMemory');
+      Logger.error('Failed to update max ID, tableName=$tableName, id=$id',
+          rawError: e);
     }
   }
 
@@ -738,8 +729,6 @@ class TableDataManager {
       // Get table schema
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table schema is null, cannot get next id',
-            label: 'TableDataManager.getNextId');
         return '';
       }
       // Check if initialization of auto-increment ID is needed for the table (lazy loading)
@@ -773,8 +762,7 @@ class TableDataManager {
 
       return ids.first;
     } catch (e) {
-      Logger.error('Failed to get next ID: $e',
-          label: 'TableDataManager.getNextId');
+      Logger.error('Failed to get next ID', rawError: e);
       return '';
     }
   }
@@ -813,8 +801,7 @@ class TableDataManager {
 
       return ids;
     } catch (e) {
-      Logger.error('Failed to get batch of IDs: $e',
-          label: 'TableDataManager.getBatchIds');
+      Logger.error('Failed to get batch of IDs', rawError: e);
       return [];
     }
   }
@@ -862,8 +849,7 @@ class TableDataManager {
       _totalDataSizeBytes = 0;
       _needSaveStats = false;
     } catch (e) {
-      Logger.error('Failed to dispose TableDataManager: $e',
-          label: 'TableDataManager.dispose');
+      Logger.error('Failed to dispose TableDataManager', rawError: e);
     } finally {}
   }
 
@@ -892,8 +878,7 @@ class TableDataManager {
         _maxIdsDirty[tableName] = false;
       }
     } catch (e) {
-      Logger.error('Failed to flush max IDs: $e',
-          label: 'TableDataManager.flushMaxIds');
+      Logger.error('Failed to flush max IDs', rawError: e);
     }
   }
 
@@ -908,7 +893,6 @@ class TableDataManager {
       if (configuredSize > systemMax) {
         Logger.warn(
           'Table $tableName configured partition size ${configuredSize ~/ 1024}KB exceeds system limit ${systemMax ~/ 1024}KB, will use system limit',
-          label: 'TableDataManager._getPartitionSizeLimit',
         );
         return systemMax;
       }
@@ -918,7 +902,6 @@ class TableDataManager {
       if (configuredSize < minSize) {
         Logger.warn(
           'Table $tableName configured partition size ${configuredSize ~/ 1024}KB is too small, will use minimum value ${minSize ~/ 1024}KB',
-          label: 'TableDataManager._getPartitionSizeLimit',
         );
         return minSize;
       }
@@ -935,7 +918,6 @@ class TableDataManager {
     if (sizeInBytes <= 0) {
       Logger.warn(
         'Attempted to set partition size for table $tableName to $sizeInBytes, invalid value, will use default',
-        label: 'TableDataManager.setTablePartitionSize',
       );
       _tablePartitionSizes
           .remove(tableName); // Remove invalid config, use default
@@ -947,7 +929,6 @@ class TableDataManager {
     // Log configuration change
     Logger.debug(
       'Set partition size for table $tableName to ${sizeInBytes ~/ 1024}KB',
-      label: 'TableDataManager.setTablePartitionSize',
     );
   }
 
@@ -967,8 +948,7 @@ class TableDataManager {
   }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error('Table schema is null, cannot add to buffer',
-          label: 'TableDataManager.addToBuffer');
+      Logger.error('Table schema is null, cannot add to buffer');
       return;
     }
     final primaryKey = schema.primaryKey;
@@ -976,7 +956,6 @@ class TableDataManager {
     if (recordId == null) {
       Logger.error(
         'Record in table $tableName does not have a primary key value, cannot add to buffer',
-        label: 'TableDataManager.addToBuffer',
       );
       return;
     }
@@ -1268,8 +1247,8 @@ class TableDataManager {
           }
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn(
-              'Txn deferred batch op failed: $tableName pk=$recordId: $e');
+          Logger.warn('Txn deferred batch op failed: $tableName pk=$recordId',
+              rawError: e);
           failedIds.add(recordId);
         }
       }
@@ -1324,7 +1303,8 @@ class TableDataManager {
           }
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn('Memory batch op failed: $tableName pk=$recordId: $e');
+          Logger.warn('Memory batch op failed: $tableName pk=$recordId',
+              rawError: e);
           failedIds.add(recordId);
         }
       }
@@ -1418,7 +1398,8 @@ class TableDataManager {
           }
         }
       } catch (e) {
-        Logger.error('Persistent batch WAL append failed: $tableName: $e');
+        Logger.error('Persistent batch WAL append failed: $tableName',
+            rawError: e);
         // Fallback or fail whole batch? Fail whole batch for consistency.
         return (
           successRecordIds: const <String>[],
@@ -1555,8 +1536,7 @@ class TableDataManager {
 
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error('Table schema is null, cannot add to delete buffer',
-          label: 'TableDataManager.addToDeleteBuffer');
+      Logger.error('Table schema is null, cannot add to delete buffer');
       return;
     }
 
@@ -1683,8 +1663,7 @@ class TableDataManager {
         markStatsDirty();
       }
     } catch (e) {
-      Logger.error('Failed to update table deleted stats: $e',
-          label: 'TableDataManager.tableDeleted');
+      Logger.error('Failed to update table deleted stats', rawError: e);
     }
   }
 
@@ -1838,8 +1817,7 @@ class TableDataManager {
         final decodedString =
             await _dataStore.storage.readAsString(mainFilePath);
         if (decodedString == null) {
-          Logger.error("Failed to decode file meta: $mainFilePath",
-              label: 'TableDataManager.getTableMeta');
+          Logger.error("Failed to decode file meta: $mainFilePath");
           return null;
         }
 
@@ -1849,8 +1827,8 @@ class TableDataManager {
           jsonData = jsonDecode(decodedString) as Map<String, dynamic>;
         } catch (e) {
           Logger.error(
-              "Failed to parse JSON meta: $e\ncontent: ${decodedString.substring(0, min(100, decodedString.length))}...",
-              label: 'TableDataManager.getTableMeta');
+              "Failed to parse JSON meta\ncontent: ${decodedString.substring(0, min(100, decodedString.length))}...",
+              rawError: e);
           return null;
         }
 
@@ -1859,13 +1837,11 @@ class TableDataManager {
         _tableMetaCache.put(tableName, meta);
         return meta;
       } catch (e) {
-        Logger.error('Failed to parse table meta: $e',
-            label: 'TableDataManager.getTableMeta');
+        Logger.error('Failed to parse table meta', rawError: e);
         return null; // Return null on parse error
       }
     } catch (e) {
-      Logger.error('Failed to get table meta: $e',
-          label: 'TableDataManager.getTableMeta');
+      Logger.error('Failed to get table meta', rawError: e);
       rethrow;
     }
   }
@@ -1894,8 +1870,7 @@ class TableDataManager {
       await _dataStore.storage
           .writeAsString(mainFilePath, jsonEncode(meta.toJson()), flush: flush);
     } catch (e) {
-      Logger.error('Failed to update table meta: $e',
-          label: 'TableDataManager.updateTableMeta');
+      Logger.error('Failed to update table meta', rawError: e);
       // Re-throw to handle at higher level
       rethrow;
     }
@@ -1961,8 +1936,8 @@ class TableDataManager {
             }
           } catch (e) {
             Logger.error(
-                'Failed to set id generator current value: $e, value=$currentId',
-                label: 'TableDataManager._createIdGeneratorForTable');
+                'Failed to set id generator current value, value=$currentId',
+                rawError: e);
           }
         } else {
           final initialValue =
@@ -1987,8 +1962,7 @@ class TableDataManager {
               }
               generator.setIdRange(currentInt, maxInt);
             } catch (e) {
-              Logger.error('Failed to set id generator range: $e',
-                  label: 'TableDataManager._createIdGeneratorForTable');
+              Logger.error('Failed to set id generator range', rawError: e);
             }
           }
         }
@@ -1996,10 +1970,7 @@ class TableDataManager {
 
       return generator;
     } catch (e) {
-      Logger.error(
-        'Failed to get id generator: $e',
-        label: 'TableDataManager._createIdGeneratorForTable',
-      );
+      Logger.error('Failed to get id generator', rawError: e);
       const defaultConfig = SequentialIdConfig();
       final defaultGenerator =
           SequentialIdGenerator(defaultConfig, tableName: tableName);
@@ -2035,8 +2006,8 @@ class TableDataManager {
           };
         } catch (e) {
           Logger.error(
-              'Failed to save id range: cannot parse string id to integer: $e',
-              label: 'TableDataManager._saveIdRange');
+              'Failed to save id range: cannot parse string id to integer',
+              rawError: e);
         }
       } else {
         // non-numeric string id, save current value directly
@@ -2079,8 +2050,7 @@ class TableDataManager {
     try {
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Table schema is null, cannot update max id',
-            label: 'TableDataManager.updateMaxIdFromTable');
+        Logger.error('Table schema is null, cannot update max id');
         return;
       }
       // handle sequential primary key
@@ -2185,10 +2155,7 @@ class TableDataManager {
         await updateTableMeta(tableName, fileMeta);
       }
     } catch (e) {
-      Logger.error(
-        'Failed to update max id for table $tableName: $e',
-        label: 'TableDataManager.updateMaxIdFromTable',
-      );
+      Logger.error('Failed to update max id for table $tableName', rawError: e);
     }
   }
 
@@ -2258,7 +2225,6 @@ class TableDataManager {
 
         Logger.warn(
           'Table $tableName has primary key conflict, update auto increment start: $newMaxId',
-          label: 'TableDataManager.handlePrimaryKeyConflict',
         );
 
         // update generator current id (only for numeric id)
@@ -2271,7 +2237,7 @@ class TableDataManager {
               generator.setCurrentId(newIdInt);
             } catch (e) {
               Logger.error('Failed to parse new id to integer: $newMaxId',
-                  label: 'TableDataManager.handlePrimaryKeyConflict');
+                  rawError: e);
             }
           }
         }
@@ -2279,14 +2245,10 @@ class TableDataManager {
         // if current id is greater than conflict id, no need to adjust
         Logger.debug(
           'Table $tableName has primary key conflict, but current max id $currentMaxId is greater than conflict id $conflictId, no need to adjust',
-          label: 'TableDataManager.handlePrimaryKeyConflict',
         );
       }
     } catch (e) {
-      Logger.error(
-        'Failed to handle primary key conflict: $e',
-        label: 'TableDataManager.handlePrimaryKeyConflict',
-      );
+      Logger.error('Failed to handle primary key conflict', rawError: e);
     }
   }
 
@@ -2297,8 +2259,7 @@ class TableDataManager {
       {Uint8List? customKey, int? customKeyId}) async* {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error('Failed to get schema for $tableName',
-          label: 'TableDataManager.streamRecords');
+      Logger.error('Failed to get schema for $tableName');
       return;
     }
     final primaryKey = schema.primaryKey;
@@ -2620,7 +2581,6 @@ class TableDataManager {
     if (_dataStore.lockManager == null) {
       Logger.debug(
         'Skip table write lock after database shutdown: $tableName',
-        label: 'TableDataManager.withTableWriteLock',
       );
       return;
     }
@@ -2662,7 +2622,7 @@ class TableDataManager {
           } catch (e) {
             Logger.warn(
                 'Failed to update stats during clearTable for $tableName',
-                label: 'TableDataManager.clearTable');
+                rawError: e);
           }
 
           await _dataStore.writeBufferManager.clearTable(tableName);
@@ -2677,14 +2637,12 @@ class TableDataManager {
               // delete and recreate empty directory, ensure directory structure is complete
               await _dataStore.storage.ensureDirectoryExists(dataPath);
               Logger.debug(
-                  'deleted entire partition directory for table $tableName',
-                  label: 'TableDataManager.clearTable');
+                  'deleted entire partition directory for table $tableName');
               deletedDir = true;
             }
           } catch (e) {
-            Logger.error(
-                'delete table $tableName partition directory failed: $e',
-                label: 'TableDataManager.clearTable');
+            Logger.error('delete table $tableName partition directory failed',
+                rawError: e);
           }
 
           // 3. create empty table meta
@@ -2731,8 +2689,8 @@ class TableDataManager {
               _idRanges.remove(tableName);
             }
           } catch (e) {
-            Logger.error('reset table $tableName auto increment ID failed: $e',
-                label: 'TableDataManager.clearTable');
+            Logger.error('reset table $tableName auto increment ID failed',
+                rawError: e);
           }
 
           // 7. clean other caches
@@ -2744,8 +2702,7 @@ class TableDataManager {
         operationPrefix: 'clear_table_',
       );
     } catch (e) {
-      Logger.error('clear table $tableName failed: $e',
-          label: 'TableDataManager.clearTable');
+      Logger.error('clear table $tableName failed', rawError: e);
       rethrow; // rethrow error to upper level
     } finally {
       // clear table flush flag
@@ -2775,7 +2732,6 @@ class TableDataManager {
     if (lockManager == null) {
       Logger.debug(
         'Skip rewriteRecordsFromSourceTable after database shutdown',
-        label: 'TableDataManager.rewriteRecordsFromSourceTable',
       );
       return;
     }
@@ -2789,8 +2745,7 @@ class TableDataManager {
         final lk = 'table_$t';
         final ok = await lockManager.acquireExclusiveLock(lk, opId);
         if (!ok) {
-          Logger.warn('Failed to acquire lock for $t, abort rewrite',
-              label: 'TableDataManager.rewriteRecordsFromSourceTable');
+          Logger.warn('Failed to acquire lock for $t, abort rewrite');
           // release any previous locks
           for (final prev in tablesToLock) {
             if (prev == t) break;
@@ -2863,11 +2818,8 @@ class TableDataManager {
       try {
         await _dataStore.storage.flushAll();
       } catch (_) {}
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to rewrite records from source table: $e\n$stack',
-        label: 'TableDataManager.rewriteRecordsFromSourceTable',
-      );
+    } catch (e) {
+      Logger.error('Failed to rewrite records from source table', rawError: e);
     } finally {
       // Release locks
       for (final t in tablesToLock) {
@@ -3210,8 +3162,7 @@ class TableDataManager {
         _txnDeferredOps.remove(tx);
       }
     } catch (e) {
-      Logger.warn('cleanupTransactionalState failed: $e',
-          label: 'TableDataManager');
+      Logger.warn('cleanupTransactionalState failed', rawError: e);
     }
   }
 
