@@ -12,6 +12,9 @@ class DbException implements Exception {
   /// Grand list of diagnostic statuses
   final List<ResultStatus> statuses;
 
+  /// Whether this exception instance has been logged by the Logger
+  bool isLogged = false;
+
   DbException(this.statuses);
 
   /// Get combined human-readable message from all statuses
