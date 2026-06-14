@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+  <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
 <p align="center">
@@ -16,17 +16,17 @@
 </p>
 
 <p align="center">
-  <a href="../../README.md">English</a> | 
-  <a href="README.zh-CN.md">简体中文</a> | 
-  <a href="README.ja.md">日本語</a> | 
-  한국어 | 
-  <a href="README.es.md">Español</a> | 
-  <a href="README.pt-BR.md">Português (Brasil)</a> | 
-  <a href="README.ru.md">Русский</a> | 
-  <a href="README.de.md">Deutsch</a> | 
-  <a href="README.fr.md">Français</a> | 
-  <a href="README.it.md">Italiano</a> | 
-  <a href="README.tr.md">Türkçe</a>
+  <a href="../../../README.md">English</a> |
+  <a href="../zh-CN/README.md">简体中文</a> |
+  <a href="../ja/README.md">日本語</a> |
+  한국어 |
+  <a href="../es/README.md">Español</a> |
+  <a href="../pt-BR/README.md">Português (Brasil)</a> |
+  <a href="../ru/README.md">Русский</a> |
+  <a href="../de/README.md">Deutsch</a> |
+  <a href="../fr/README.md">Français</a> |
+  <a href="../it/README.md">Italiano</a> |
+  <a href="../tr/README.md">Türkçe</a>
 </p>
 
 ## 빠른 탐색
@@ -85,7 +85,7 @@ ToStore는 대규모 데이터 세트, 복잡한 로컬 AI 생성 및 대규모 
 ## <a id="installation"></a>설치
 
 > [!IMPORTANT]
-> **v2.x에서 업그레이드하시겠습니까?** 중요한 마이그레이션 단계 및 주요 변경 사항에 대해서는 [v3.x 업그레이드 가이드](../UPGRADE_GUIDE_v3.md)를 읽어보세요.
+> **v2.x에서 업그레이드하시겠습니까?** 중요한 마이그레이션 단계 및 주요 변경 사항에 대해서는 [v3.x 업그레이드 가이드](../../UPGRADE_GUIDE_v3.md)를 읽어보세요.
 
 `pubspec.yaml`에 `tostore`을 추가하세요.
 
@@ -355,7 +355,7 @@ const appSchemas = [userSchema];
 
 ## <a id="mobile-integration"></a>모바일, 데스크탑 및 기타 빈번한 시작 시나리오를 위한 통합
 
-📱 **예**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+📱 **예**: [mobile_quickstart.dart](../../../example/lib/mobile_quickstart.dart)
 
 ```dart
 import 'package:path/path.dart' as p;
@@ -401,7 +401,7 @@ await db.close(keepActiveSpace: false);
 
 ## <a id="server-integration"></a>서버측/에이전트 통합(장기 실행 시나리오)
 
-🖥️ **예**: [server_quickstart.dart](../../example/lib/server_quickstart.dart)
+🖥️ **예**: [server_quickstart.dart](../../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
