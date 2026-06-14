@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1232,10 +1232,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+if (!txResult.hasErrors) {
+  print('İşlem başarıyla tamamlandı');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('İşlem şu nedenlerle geri alındı:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1328,16 +1333,32 @@ final restored = await db.restore(
 );
 ```
 
-### <a id="error-handling"></a>Durum Kodları ve Hata İşleme
+### <a id="error-handling"></a>Durum Kodları ve Hata Yönetimi
 
+ToStore'da hata ve istisna geri bildirimi için iki kanal vardır:
 
-ToStore, veri işlemleri için birleşik bir yanıt modeli kullanır:
+> [!NOTE]
+> **Birleşik Teşhis Temeli**: Yanıt sonuç modeli (`statuses` in `DbResult`/`QueryResult`) aracılığıyla döndürülsün veya ölümcül istisnalar (`statuses` in `DbException`) aracılığıyla fırlatılsın, tüm teşhis durumları yapılandırılmış **`ResultStatus`** sistemine birleşik olarak dayanır ve aynı durum kodlarını paylaşır, bu da tutarlılığı garanti eder.
 
-- `ResultType`: dallanma mantığı için kullanılan birleşik durum listesi
-- `result.code`: `ResultType`'ye karşılık gelen sabit bir sayısal kod
-- `result.message`: mevcut hatayı açıklayan okunabilir bir mesaj
-- `successKeys` / `failedKeys`: toplu işlemlerde başarılı ve başarısız birincil anahtarların listesi
+1. Yanıt Sonuç Modeli (Result-based Response)
+Ekleme, güncelleme, silme, sorgulama, işlemler ve çalışma zamanı tablo şeması oluşturma/değiştirme gibi günlük işlemler için. Bu işlemler, kısıt ihlalleri, doğrulama hataları veya geçersiz bağımsız değişkenlerle karşılaştığında istisna fırlatmaz. Bunun yerine ToStore, sonuçları `DbResult` veya `QueryResult` kullanarak sarmalar ve tüm teşhis bilgilerini durum listesine kaydeder. Bu, sıradan iş mantığı hatalarının veritabanını kesintiye uğratmamasını garanti eder.
 
+- **`hasErrors`: Geçerli işlemde herhangi bir hata olup olmadığını belirtir. Toplu işlemlerde veya işlemlerde en az bir hata varsa bu özellik `true` olur.**
+- **`statuses`: İşlem için tüm `ResultStatus` teşhislerinin ayrıntılı bir listesi. Toplu işlemler için çok yararlı olan 1:1 sıra eşleşmesini destekler.**
+- **`firstPrimaryKey`: `statuses` bileşenini manuel olarak ayrıştırmadan, tek bir ekleme/yazma işlemi sırasında doğrudan fiziksel olarak oluşturulan birincil anahtarı okur.**
+- **`ResultType`: Dal yönetimi ve kontroller için uygun durum kategorisi numaralandırması (örneğin, `isBusinessError`, `isDeveloperError`).**
+
+2. İstisna Fırlatma (Exception-based Throwing)
+Geliştirici hatası veya tasarım kusurlarından kaynaklanan ölümcül hatalar için (örneğin, `ToStore.open` sırasında şema doğrulama hatası, motor sürümü uyuşmazlığı, ölümcül veri taşıma bozulması vb.). Bu durumlarda ToStore, yürütmeyi durdurmak için `DbException` fırlatır ve geliştiriciyi bunu düzeltmeye teşvik eder.
+
+> [!WARNING]
+> Geliştirme Kılavuzları: Sıradan iş hataları istisna fırlatmamalıdır; uygulamanın çalışma zamanını bozmamak için yanıt sonuç modelinde döndürülmelidir.
+
+---
+
+### Hata ve İstisna Örnekleri
+
+#### 1. Tekli Yazma Yanıtı Yönetimi
 
 ```dart
 final result = await db.insert('users', {
@@ -1345,77 +1366,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // İlk hata türünü ve açıklamasını al
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('Yazma başarılı, birincil anahtar: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. Toplu Yazma Hassas Teşhis
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('Toplu işlem kısmen başarısız oldu: başarılı \${batchResult.successCount}, başarısız \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] Kısıt ihlali! Tablo! Tablo: \${status.tableName}, alanlar: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] Bağımsız değişken hatası! Parametre! Parameter: \${status.parameterName}, geçen değer: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] bir hata oluştu: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-Yaygın durum kodu örnekleri:
-Başarı geri döner `0`; Negatif sayılar hataları gösterir.
-- `ResultType.success` (`0`): işlem başarılı oldu
-- `ResultType.partialSuccess` (`1`): toplu işlem kısmen başarılı oldu
-- `ResultType.unknown` (`-1`): bilinmeyen hata
-- `ResultType.uniqueViolation` (`-2`): benzersiz dizin çakışması
-- `ResultType.primaryKeyViolation` (`-3`): birincil anahtar çakışması
-- `ResultType.foreignKeyViolation` (`-4`): yabancı anahtar referansı kısıtlamaları karşılamıyor
-- `ResultType.notNullViolation` (`-5`): zorunlu bir alan eksik veya izin verilmeyen bir `null` geçildi
-- `ResultType.validationFailed` (`-6`): uzunluk, aralık, format veya diğer doğrulama başarısız oldu
-- `ResultType.notFound` (`-11`): hedef tablo, alan veya kaynak mevcut değil
-- `ResultType.resourceExhausted` (`-15`): yetersiz sistem kaynakları; yükü azaltın veya yeniden deneyin
-- `ResultType.dbError` (`-91`): veritabanı hatası
-- `ResultType.ioError` (`-90`): dosya sistemi hatası
-- `ResultType.timeout` (`-92`): zaman aşımı
+#### 3. Ölümcül Hata og Başlatma İstisnası Yakalama (DbException)
 
-### İşlem Sonucu İşleme
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ Ölümcül veritabanı istisnası! Hata mesajı: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('Şema doğrulaması başarısız oldu! Tablo! Tablo: \${status.tableName}, alan: \${status.field}, geçersiz yapılandırma: \${status.wrongValue}');
+    } else {
+      print('Teşhis bilgisi: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-İşlem hatası türleri:
-- `TransactionErrorType.operationError`: alan doğrulama hatası, geçersiz kaynak durumu veya iş düzeyindeki başka bir hata gibi işlem içinde normal bir işlem başarısız oldu
-- `TransactionErrorType.integrityViolation`: birincil anahtar, benzersiz anahtar, yabancı anahtar veya boş olmayan hata gibi bütünlük veya kısıtlama çakışması
-- `TransactionErrorType.timeout`: zaman aşımı
-- `TransactionErrorType.io`: temel depolama veya dosya sistemi G/Ç hatası
-- `TransactionErrorType.conflict`: bir çakışma işlemin başarısız olmasına neden oldu
-- `TransactionErrorType.userAbort`: kullanıcı tarafından başlatılan iptal (atmaya dayalı manuel iptal şu anda desteklenmemektedir)
-- `TransactionErrorType.unknown`: başka herhangi bir hata
-
+Hata türleri, yaprak durum kodları, JSON serileştirme biçimleri ve alan eşlemelerinin tam listesi için lütfen tam spesifikasyona bakın: [ToStore ResultStatus Otomatik Teşhis ve Durum Çözümleme Spesifikasyonu](result_status_specification.md).
 
 ### <a id="logging-diagnostics"></a>Günlük Geri Arama ve Veritabanı Tanılama
 ToStore, veritabanı yaşam döngüsü günlüklerini `ToStore.setLogConfig(...)` aracılığıyla iş katmanına geri yönlendirebilir.
