@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+  <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
 <p align="center">
@@ -16,16 +16,16 @@
 </p>
 
 <p align="center">
-  <a href="../../README.md">English</a> | 
-  <a href="README.zh-CN.md">简体中文</a> | 
-  <a href="README.ja.md">日本語</a> | 
-  <a href="README.ko.md">한국어</a> | 
-  <a href="README.es.md">Español</a> | 
-  <a href="README.pt-BR.md">Português (Brasil)</a> | 
-  <a href="README.ru.md">Русский</a> | 
-  <a href="README.de.md">Deutsch</a> | 
-  <a href="README.fr.md">Français</a> | 
-  <a href="README.it.md">Italiano</a> | 
+  <a href="../../../README.md">English</a> |
+  <a href="../zh-CN/README.md">简体中文</a> |
+  <a href="../ja/README.md">日本語</a> |
+  <a href="../ko/README.md">한국어</a> |
+  <a href="../es/README.md">Español</a> |
+  <a href="../pt-BR/README.md">Português (Brasil)</a> |
+  <a href="../ru/README.md">Русский</a> |
+  <a href="../de/README.md">Deutsch</a> |
+  <a href="../fr/README.md">Français</a> |
+  <a href="../it/README.md">Italiano</a> |
   Türkçe
 </p>
 
@@ -85,7 +85,7 @@ ToStore, büyük veri kümeleri, karmaşık yerel yapay zeka üretimi ve büyük
 ## <a id="installation"></a>Kurulum
 
 > [!IMPORTANT]
-> **V2.x'ten yükseltme mi yapıyorsunuz?** Kritik geçiş adımları ve önemli değişiklikler için lütfen [v3.x Yükseltme Kılavuzu](../UPGRADE_GUIDE_v3.md)'nu okuyun.
+> **V2.x'ten yükseltme mi yapıyorsunuz?** Kritik geçiş adımları ve önemli değişiklikler için lütfen [v3.x Yükseltme Kılavuzu](../../UPGRADE_GUIDE_v3.md)'nu okuyun.
 
 `pubspec.yaml`'ınıza `tostore` ekleyin:
 
@@ -355,7 +355,7 @@ Ayrıca `unique: true` otomatik olarak tek alanlı benzersiz bir dizin oluşturu
 
 ## <a id="mobile-integration"></a>Mobil, Masaüstü ve Diğer Sık Başlatma Senaryoları için Entegrasyon
 
-📱 **Örnek**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+📱 **Örnek**: [mobile_quickstart.dart](../../../example/lib/mobile_quickstart.dart)
 
 ```dart
 import 'package:path/path.dart' as p;
@@ -401,7 +401,7 @@ await db.close(keepActiveSpace: false);
 
 ## <a id="server-integration"></a>Sunucu Tarafı / Aracı Entegrasyonu (Uzun Süreli Senaryolar)
 
-🖥️ **Örnek**: [sunucu_hızlıbaşlangıç.dart](../../example/lib/server_quickstart.dart)
+🖥️ **Örnek**: [sunucu_hızlıbaşlangıç.dart](../../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
