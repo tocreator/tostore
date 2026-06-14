@@ -17,16 +17,16 @@
 
 <p align="center">
   English |
-  <a href="doc/translations/README.zh-CN.md">简体中文</a> |
-  <a href="doc/translations/README.ja.md">日本語</a> |
-  <a href="doc/translations/README.ko.md">한국어</a> |
-  <a href="doc/translations/README.es.md">Español</a> |
-  <a href="doc/translations/README.pt-BR.md">Português (Brasil)</a> |
-  <a href="doc/translations/README.ru.md">Русский</a> |
-  <a href="doc/translations/README.de.md">Deutsch</a> |
-  <a href="doc/translations/README.fr.md">Français</a> |
-  <a href="doc/translations/README.it.md">Italiano</a> |
-  <a href="doc/translations/README.tr.md">Türkçe</a>
+  <a href="doc/translations/zh-CN/README.md">简体中文</a> |
+  <a href="doc/translations/ja/README.md">日本語</a> |
+  <a href="doc/translations/ko/README.md">한국어</a> |
+  <a href="doc/translations/es/README.md">Español</a> |
+  <a href="doc/translations/pt-BR/README.md">Português (Brasil)</a> |
+  <a href="doc/translations/ru/README.md">Русский</a> |
+  <a href="doc/translations/de/README.md">Deutsch</a> |
+  <a href="doc/translations/fr/README.md">Français</a> |
+  <a href="doc/translations/it/README.md">Italiano</a> |
+  <a href="doc/translations/tr/README.md">Türkçe</a>
 </p>
 
 ## Quick Navigation
