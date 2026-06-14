@@ -191,7 +191,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Delete file failed: $e', label: 'FileStorageImpl');
+      Logger.error('Delete file failed', rawError: e);
       throw _wrapIoError(e, 'deleteFile', path);
     }
   }
@@ -223,7 +223,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Delete directory failed: $e', label: 'FileStorageImpl');
+      Logger.error('Delete directory failed', rawError: e);
       throw _wrapIoError(e, 'deleteDirectory', path);
     }
   }
@@ -234,8 +234,7 @@ class FileStorageImpl implements StorageInterface {
     try {
       return await Directory(path).exists();
     } catch (e) {
-      Logger.error('Check directory exists failed: $e',
-          label: 'FileStorageImpl');
+      Logger.error('Check directory exists failed', rawError: e);
       return false;
     }
   }
@@ -246,7 +245,7 @@ class FileStorageImpl implements StorageInterface {
     try {
       return await File(path).exists();
     } catch (e) {
-      Logger.error('Check file exists failed: $e', label: 'FileStorageImpl');
+      Logger.error('Check file exists failed', rawError: e);
       return false;
     }
   }
@@ -272,7 +271,7 @@ class FileStorageImpl implements StorageInterface {
       }
       return entries;
     } catch (e) {
-      Logger.error('List directory failed: $e', label: 'FileStorageImpl');
+      Logger.error('List directory failed', rawError: e);
       return [];
     }
   }
@@ -299,7 +298,7 @@ class FileStorageImpl implements StorageInterface {
       _lru.clear();
       _handleLengths.clear();
     } catch (e) {
-      Logger.error('Close storage failed: $e', label: 'FileStorageImpl');
+      Logger.error('Close storage failed', rawError: e);
     }
   }
 
@@ -340,7 +339,7 @@ class FileStorageImpl implements StorageInterface {
         }
       });
     } catch (e) {
-      Logger.error('Write string failed: $e', label: 'FileStorageImpl');
+      Logger.error('Write string failed', rawError: e);
       throw _wrapIoError(e, 'writeAsString', path);
     }
   }
@@ -372,7 +371,7 @@ class FileStorageImpl implements StorageInterface {
         }
       });
     } catch (e) {
-      Logger.error('Write bytes failed: $e', label: 'FileStorageImpl');
+      Logger.error('Write bytes failed', rawError: e);
       throw _wrapIoError(e, 'writeAsBytes', path);
     }
   }
@@ -386,7 +385,7 @@ class FileStorageImpl implements StorageInterface {
       }
       return await file.readAsBytes();
     } catch (e) {
-      Logger.error('Read bytes failed: $e', label: 'FileStorageImpl');
+      Logger.error('Read bytes failed', rawError: e);
       throw _wrapIoError(e, 'readAsBytes', path);
     }
   }
@@ -421,7 +420,7 @@ class FileStorageImpl implements StorageInterface {
       if (_isFileNotFound(e)) {
         return Uint8List(0);
       }
-      Logger.error('Read bytes at offset failed: $e', label: 'FileStorageImpl');
+      Logger.error('Read bytes at offset failed', rawError: e);
       return Uint8List(0);
     }
   }
@@ -540,8 +539,7 @@ class FileStorageImpl implements StorageInterface {
         }
       });
     } catch (e) {
-      Logger.error('Write many bytes at offsets failed: $e',
-          label: 'FileStorageImpl.writeManyAsBytesAt');
+      Logger.error('Write many bytes at offsets failed', rawError: e);
       rethrow;
     }
   }
@@ -555,7 +553,7 @@ class FileStorageImpl implements StorageInterface {
       }
       return await file.readAsString();
     } catch (e) {
-      Logger.error('Read string failed: $e', label: 'FileStorageImpl');
+      Logger.error('Read string failed', rawError: e);
       return null;
     }
   }
@@ -570,8 +568,7 @@ class FileStorageImpl implements StorageInterface {
       final stat = await file.stat();
       return stat.modified;
     } catch (e) {
-      Logger.error('Get file creation time failed: $e',
-          label: 'FileStorageImpl');
+      Logger.error('Get file creation time failed', rawError: e);
       return null;
     }
   }
@@ -616,8 +613,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Copy directory failed: $e',
-          label: 'FileStorageImpl.copyDirectory');
+      Logger.error('Copy directory failed', rawError: e);
       rethrow;
     }
   }
@@ -660,8 +656,7 @@ class FileStorageImpl implements StorageInterface {
         await deleteDirectory(sourcePath);
       }
     } catch (e) {
-      Logger.error('Move directory failed: $e',
-          label: 'FileStorageImpl.moveDirectory');
+      Logger.error('Move directory failed', rawError: e);
       throw _wrapIoError(e, 'moveDirectory', '$sourcePath -> $destinationPath');
     }
   }
@@ -676,7 +671,7 @@ class FileStorageImpl implements StorageInterface {
       await Directory(p.dirname(destinationPath)).create(recursive: true);
       await srcFile.copy(destinationPath);
     } catch (e) {
-      Logger.error('Copy file failed: $e', label: 'FileStorageImpl.copyFile');
+      Logger.error('Copy file failed', rawError: e);
       throw _wrapIoError(e, 'copyFile', '$sourcePath -> $destinationPath');
     }
   }
@@ -754,8 +749,7 @@ class FileStorageImpl implements StorageInterface {
         }
         await raf.flush();
       } catch (e) {
-        Logger.error('Write lines stream failed: $path, error: $e',
-            label: 'FileStorageImpl');
+        Logger.error('Write lines stream failed: $path', rawError: e);
         throw _wrapIoError(e, 'writeLinesStream', path);
       }
     });
@@ -860,7 +854,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Flush file failed: $e', label: 'FileStorageImpl.flushFile');
+      Logger.error('Flush file failed', rawError: e);
       rethrow;
     }
   }
@@ -940,7 +934,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Flush all failed: $e', label: 'FileStorageImpl');
+      Logger.error('Flush all failed', rawError: e);
     }
   }
 
@@ -1018,8 +1012,8 @@ class FileStorageImpl implements StorageInterface {
             rethrow;
           }
           // Log transient error but continue retrying
-          Logger.warn('Atomic replace transient failure (attempt $attempt): $e',
-              label: 'FileStorageImpl');
+          Logger.warn('Atomic replace transient failure (attempt $attempt)',
+              rawError: e);
 
           await flushAll(path: finalPath, closeHandles: true);
           await flushAll(path: tempPath, closeHandles: true);
@@ -1027,7 +1021,7 @@ class FileStorageImpl implements StorageInterface {
         }
       }
     } catch (e) {
-      Logger.error('Atomic replace failed: $e', label: 'FileStorageImpl');
+      Logger.error('Atomic replace failed', rawError: e);
       throw _wrapIoError(e, 'replaceFileAtomic', '$tempPath -> $finalPath');
     }
   }
