@@ -113,8 +113,7 @@ final class IndexTreePartitionManager {
       await _leafPageCache.cleanup(removeRatio: ratio);
       await _internalPageCache.cleanup(removeRatio: ratio);
     } catch (e) {
-      Logger.warn('Evict page cache failed: $e',
-          label: 'IndexTreePartitionManager.evictPageCache');
+      Logger.warn('Evict page cache failed', rawError: e);
     }
   }
 
@@ -124,8 +123,7 @@ final class IndexTreePartitionManager {
       _leafPageCache.clear();
       _internalPageCache.clear();
     } catch (e) {
-      Logger.warn('Clear page cache failed: $e',
-          label: 'IndexTreePartitionManager.clearPageCacheSync');
+      Logger.warn('Clear page cache failed', rawError: e);
     }
   }
 
@@ -135,8 +133,7 @@ final class IndexTreePartitionManager {
       _leafPageCache.remove([tableName]);
       _internalPageCache.remove([tableName]);
     } catch (e) {
-      Logger.warn('Clear page cache for table failed: $e',
-          label: 'IndexTreePartitionManager.clearPageCacheForTable');
+      Logger.warn('Clear page cache for table failed', rawError: e);
     }
   }
 
@@ -146,8 +143,7 @@ final class IndexTreePartitionManager {
       _leafPageCache.remove([tableName, indexName]);
       _internalPageCache.remove([tableName, indexName]);
     } catch (e) {
-      Logger.warn('Clear page cache for index failed: $e',
-          label: 'IndexTreePartitionManager.clearPageCacheForIndex');
+      Logger.warn('Clear page cache for index failed', rawError: e);
     }
   }
 
@@ -1515,8 +1511,7 @@ final class IndexTreePartitionManager {
       final totalEntries = max(0, meta.totalEntries + entriesDeltaSum);
       final totalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
       Logger.debug(
-          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexName, batchEntries=$totalDeltas, totalEntries=$totalEntries, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at',
-          label: 'IndexTreePartitionManager.writeChanges');
+          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexName, batchEntries=$totalDeltas, totalEntries=$totalEntries, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
