@@ -10,9 +10,11 @@ All notable changes to this project will be documented in this file.
 - Added dynamic field storage layout and optimized index building to support schema modifications (such as adding or dropping fields) without requiring full table data rewrites.
 - Added `next()` and `prev()` methods to `QueryResult` for seamless and stateful cursor-based pagination.
 - Added `ResultStatus` (along with `SuccessStatus` and `GeneralStatus`) to represent granular item-level diagnostic outcomes, optimized for AI agents and automated scripts to precisely inspect operation results.
+- Added `LogRecord` structure and `LogLevel.critical` level for human-intervention-required events.
 
 ### Changed
 - Changed `db.updateSchema(...)` return value from a plain `String` (taskId) to `SchemaUpdateResult` to carry validation statuses, task identifier, estimated duration, and migration write mode.
+- Deprecated `LogConfig.setConfig` in favor of `ToStore.setLogConfig()`.
 - Standardized response models (`DbResult`, `QueryResult`, `TransactionResult`) and exception model `DbException` under a unified diagnostic architecture.
 - Refactored `ResultType` to support granular error classifications with unique numeric codes and semantic string keys (`codeKey`).
 - Renamed `nextCursor` and `prevCursor` to `nextCursorToken` and `prevCursorToken` to clarify their role as stateless pagination tokens.
