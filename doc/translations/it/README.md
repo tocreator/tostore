@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
 
-ToStore è un moderno motore di dati progettato per l'era AGI e gli scenari di edge intelligence. Supporta nativamente sistemi distribuiti, fusione multimodale, dati strutturati relazionali, vettori ad alta dimensione e archiviazione di dati non strutturati. Costruito su un'architettura di nodi Self-Routing e un motore ispirato alla rete neurale, offre ai nodi un'elevata autonomia e una scalabilità orizzontale elastica, disaccoppiando logicamente le prestazioni dalla scalabilità dei dati. Include transazioni ACID, query relazionali complesse (JOIN e chiavi esterne a cascata), TTL a livello di tabella e aggregazioni, insieme a più algoritmi di chiave primaria distribuiti, espressioni atomiche, riconoscimento delle modifiche dello schema, crittografia, isolamento dei dati multi-spazio, pianificazione del carico intelligente basata sulle risorse e ripristino con autoriparazione in caso di disastro/arresto anomalo.
+ToStore è un motore di dati moderno progettato per l'era dell'AGI e scenari di edge intelligence. Supporta nativamente sistemi distribuiti, fusione multimodale, dati strutturati relazionali, vettori ad alta dimensione e archiviazione di dati non strutturati. Basato su un'architettura di nodi auto-instradanti (Self-Routing) e un motor ispirato a reti neurali, offre ai nodi un'elevata autonomia e scalabilità orizzontale elastica, disaccoppiando logicamente le prestazioni dalla scala dei dati. Combina transazioni ACID, query relazionali complesse (JOIN e chiavi esterne in cascata), TTL a livello di tabella e aggregazioni, supportando al contempo l'analisi automatizzata dello stato operativo e l'elaborazione dei dati completamente asincrona, consentendo un'evoluzione fluida e trasparente dell'architettura (inclusi aggiornamenti di schema, modifiche alle chiavi e operazioni sui dati su larga scala) senza interruzioni. Grazie a chiavi primarie distribuite integrate, espressioni atomiche, crittografia, isolamento multi-spazio, pianificazione intelligente del carico sensibile alle risorse e autoriparazione da disastri/crash, ToStore evolve continuamente in scenari ad alta continuità come Agent e O&M automatizzato, mantenendo il servizio sempre online.
 
 Mentre l'informatica continua a spostarsi verso l'intelligenza periferica, agenti, sensori e altri dispositivi non sono più solo "visualizzazioni di contenuti". Sono nodi intelligenti responsabili della generazione locale, della consapevolezza ambientale, del processo decisionale in tempo reale e dei flussi di dati coordinati. Le soluzioni di database tradizionali sono limitate dall'architettura sottostante e dalle estensioni integrate, rendendo sempre più difficile soddisfare i requisiti di bassa latenza e stabilità delle applicazioni intelligenti edge-cloud con scritture ad alta concorrenza, set di dati di grandi dimensioni, recupero di vettori e generazione collaborativa.
 
@@ -62,15 +62,15 @@ ToStore offre funzionalità distribuite all'edge sufficientemente potenti per se
   - Collaborazione parallela multi-nodo e scomposizione delle attività
   - Il time-slicing mantiene fluide le animazioni dell'interfaccia utente anche in caso di carico pesante
 
-- 🔍 **Query strutturate e recupero di vettori**
-  - Supporta predicati complessi, JOIN, aggregazioni e TTL a livello di tabella
-  - Supporta campi vettoriali, indici vettoriali e recupero del vicino più vicino
-  - I dati strutturati e vettoriali possono funzionare insieme all'interno dello stesso motore
+- 🔑 **Schema, indici e ricerca efficiente**
+  - Chiavi diversificate (sequenziale, timestamp, prefisso, codice breve)
+  - Vincoli multidimensionali (indice composto/vettoriale, chiavi esterne)
+  - Ricerca a fusione (predicati complessi, JOIN, ricerca vettoriale)
 
-- 🔑 **Chiavi primarie, indici ed evoluzione dello schema**
-  - Algoritmi di chiave primaria integrati tra cui strategie sequenziali, timestamp, con prefisso di data e codici brevi
-  - Supporta indici univoci, indici compositi, indici vettoriali e vincoli di chiave esterna
-  - Rileva automaticamente le modifiche allo schema e completa il lavoro di migrazione
+- 🤖 **O&M intelligente ed evoluzione trasparente**
+  - Specifica di stato integrata per riconoscimento O&M e Agent
+  - Aggiornamenti di schema e migrazioni di chiavi fluidi e invisibili
+  - Aggiornamenti a caldo senza interruzione del servizio per stabilità a lungo termine
 
 - 🛡️ **Transazioni, sicurezza e recupero**
   - Fornisce transazioni ACID, aggiornamenti delle espressioni atomiche e chiavi esterne a cascata
