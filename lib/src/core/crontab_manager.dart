@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import '../handler/logger.dart';
 
 /// Usage example:
@@ -357,12 +358,11 @@ class _IntervalGroup {
         // This is important for async callbacks like weight decay that should not block the timer
         if (result is Future) {
           result.catchError((e) {
-            Logger.error('Error executing async callback: $e',
-                label: 'CrontabManager');
+            Logger.error('Error executing async callback', rawError: e);
           });
         }
       } catch (e) {
-        Logger.error('Error executing callback: $e', label: 'CrontabManager');
+        Logger.error('Error executing callback', rawError: e);
       }
     }
   }
