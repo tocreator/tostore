@@ -37,7 +37,7 @@ import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
 export 'src/Interface/status_provider.dart';
-export 'src/handler/logger.dart' show LogType;
+export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
 export 'src/model/backup_scope.dart';
 export 'src/model/config_info.dart';
@@ -45,7 +45,6 @@ export 'src/model/data_store_config.dart';
 export 'src/model/db_exception.dart';
 export 'src/model/db_result.dart';
 export 'src/model/expr.dart';
-export 'src/model/log_config.dart';
 export 'src/model/memory_info.dart';
 export 'src/model/migration_config.dart';
 export 'src/model/migration_task.dart';
@@ -1285,7 +1284,7 @@ class ToStore implements DataStoreInterface {
   void _checkSystemTableAccess(String tableName, String action, String label) {
     if (SystemTable.isKnownSystemTable(tableName)) {
       final msg = 'Table $tableName is a system table and $action.';
-      Logger.error(msg, label: label);
+      Logger.error(msg);
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.devPermissionDeniedWrite,
@@ -1295,5 +1294,32 @@ class ToStore implements DataStoreInterface {
         )
       ]);
     }
+  }
+
+  /// Configure global log settings.
+  ///
+  /// [onLog] Global log record callback.
+  /// [logLabel] Light gray header label displayed on the top line, used to identify the app or database instance.
+  /// [logLevel] Minimum log level threshold to output.
+  /// [enableLog] Whether to enable database logging.
+  ///
+  /// 配置全局日志设置。
+  ///
+  /// [onLog] 全局日志记录回调。
+  /// [logLabel] 日志顶部浅灰标题标签，用于区分应用或数据库实例。
+  /// [logLevel] 允许输出的最低日志级别门槛。
+  /// [enableLog] 是否启用数据库日志记录。
+  static void setLogConfig({
+    void Function(LogRecord log)? onLog,
+    String? logLabel,
+    LogLevel? logLevel,
+    bool enableLog = true,
+  }) {
+    Logger.setLogConfig(
+      enableLog: enableLog,
+      onLog: onLog,
+      logLabel: logLabel,
+      logLevel: logLevel,
+    );
   }
 }
