@@ -1,81 +1,95 @@
-# ToStore ResultStatus 自动化诊断与状态解析规范文档
+# ToStore ResultStatus Automated Diagnosis & Status Resolution Specification
 
-为了方便自动化运维、AI 智能体代理、自动化测试脚本以及客户端程序精准识别数据库的各种运行结果和异常状态，ToStore 在新版本中引入了结构化的 `ResultStatus` 体系。
+To enable automated operations (Ops), AI agents, automated test scripts, and client applications to accurately identify various database execution results and exception states, ToStore introduces a structured `ResultStatus` system in its latest version.
 
-本规范文档旨在详细介绍 `ResultStatus` 的状态码设计原则、语义化标识规范、以及各类状态的专属字段结构，以帮助数据库用户和开发者自主完成状态解析开发。
+This specification document details the design principles of status codes, semantic identifier key specifications, and the dedicated field structures of various status types to help database users and developers independently implement status resolution.
 
 ---
 
-## 1. 核心设计原则
+## 1. Core Design Principles
 
-### 1.1 状态码 (code) 数字规范
+### 1.1 Status Code (code) Numeric Specification
 
-所有的数字状态码 (`code`) 均采用固定长度的 5 位数字进行定义（除成功状态外）：
+All numeric status codes (`code`) are defined using a fixed length of 5 digits (except for the success state):
 
-- **成功状态（Special Success Code）**：特殊固定为 `0`。
-- **其他状态（Error & Diagnostic Codes）**：统一为 5 位数字。
-- **Class Code（大类代码）**：状态码的前两位数字，用于快速圈定大类范围。
-- **Leaf Code（叶子节点代码）**：状态码的后三位数字，代表具体错误场景。
+- **Success State (Special Success Code)**: Specially fixed to `0`.
+- **Other States (Error & Diagnostic Codes)**: Unified as 5 digits.
+- **Class Code**: The first two digits of the status code, used to quickly identify the major category.
+- **Leaf Code**: The last three digits of the status code, representing the specific error scenario.
 
 > [!TIP]
-> 开发者可以直接通过状态码的前两位数字（大类代码）或者其所处的数值区间，在逻辑中快速路由到相应的异常处理器，然后再根据叶子节点进行精细化处理。
+> When developing automated ops, AI agents, or external test scripts, developers can route to corresponding exception handlers using the first two digits (Class Code) or the range, and then perform fine-grained handling based on the Leaf Code.
 
-### 1.2 语义化状态标识符 (codeKey) 规范
+> [!IMPORTANT]
+> **In-Memory Check Best Practice**:
+> When reading database operation results in memory (e.g., in client or Dart/Flutter code), **the most recommended and efficient method is to directly use the built-in read-only properties** of `ResultStatus` or `ResultType` (such as `isBusinessError`, `isCriticalError`, etc., see [Section 3.2](#32-in-memory-helper-getters)), avoiding manual parsing of numeric ranges or string prefix matching.
 
-每个状态都对应一个唯一的字符串标识符 `codeKey`：
+### 1.2 Semantic State Identifier (codeKey) Specification
 
-- **命名格式**：`[大类前缀]_[多层级详情标识]`。
-- **命名规范**：由大写英文字母和下划线 `_` 构成，不包含空格或特殊字符。
-- **大类前缀**：前缀指示其属于哪个核心业务大类。如果包含多层大类，最重要、最通用的大类前缀置于最前方，以便进行前缀检索和范围过滤。
+Each status corresponds to a unique string identifier `codeKey`:
 
----
-
-## 2. 大类代码 (Class Code) 快速检索表
-
-以下是 ToStore 中所有 Class Code 大类的映射定义：
-
-
-| 数值区间 (Code Range) | Class Code (前两位) | 语义化前缀 (Prefix) | 错误范畴 (Category)               | 异常抛出策略 (Exception Strategy)                                                                      |
-| ----------------- | ---------------- | -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------ |
-| `0`               | `00`             | `SUCCESS`      | **操作成功**                      | 不抛出异常，正常返回                                                                                       |
-| `10000 - 19999`   | `10 - 19`        | `BIZ_`         | **业务错误** (终端用户输入错误，如约束违反等)    | 不抛出异常，均通过 `DbResult` 或 `QueryResult` 正常响应                                                        |
-| `20000 - 49999`   | `20 - 49`        | `DEV_`         | **开发者错误** (接口传参非法、表结构配置无效等)   | **调试环境下直接抛出** `DbException` 打断运行以警告开发者修改；**生产环境下则保持作为结果正常返回**。*(注：版本不兼容及数据迁移重大冲突为致命错误，生产下也强制抛出)* |
-| `50000 - 79999`   | `50 - 79`        | `SYS_`         | **系统错误** (磁盘空间不足、IO 异常、锁超时等) | 影响正常运行时抛出异常；其它（如事务冲突）作为结果响应 |
-| `99000 - 99999`   | `99`             | `ENG_`         | **引擎错误** (引擎逻辑出错、数据文件损坏、未知错误) | 一般错误不抛出异常，严重时抛出异常                                                                           |
-
+- **Naming Format**: `[Major Category Prefix]_[Multi-level Detail Identifier]`.
+- **Naming Rule**: Composed of uppercase English letters and underscores `_`, containing no spaces or special characters.
+- **Major Category Prefix**: Indicates which core business category the state belongs to. If multiple category levels exist, the most generic prefix is placed at the front to facilitate prefix search and range filtering.
 
 ---
 
-## 3. ResultStatus 公共字段结构
+## 2. Class Code Quick Reference Table
 
-所有类型的 `ResultStatus` 转化为 JSON 时，都包含以下 4 个基础公共字段。用户可以直接读取这 4 个字段进行初步判定。
+Below is the mapping definition of all Class Codes in ToStore:
 
-
-| 字段名 (Field) | 类型 (Type) | 字段含义 (Description)                        |
-| ----------- | --------- | ----------------------------------------- |
-| `index`     | `int`     | 在批量操作中的记录序号/索引。若是单条操作，则固定为 `0`            |
-| `code`      | `int`     | 数字状态码（0 代表成功，5 位数字代表异常）                   |
-| `codeKey`   | `String`  | 语义化状态标识符，例如 `CONSTRAINT_VIOLATION_UNIQUE` |
-| `message`   | `String`  | 人类可读的状态详情描述信息                             |
-
+| Code Range | Class Code (First 2 Digits) | Semantic Prefix | Category | Exception Strategy |
+| :--- | :--- | :--- | :--- | :--- |
+| `0` | `00` | `SUCCESS` | **Operation Successful** | Does not throw exception, returns normally. |
+| `10000 - 19999` | `10 - 19` | `BIZ_` | **Business Error** (End-user input errors, e.g. constraint violations) | Does not throw exception, always responded via `DbResult` or `QueryResult`. |
+| `20000 - 49999` | `20 - 49` | `DEV_` | **Developer Error** (Invalid API parameters, invalid table schema configuration, etc.) | **Throws `DbException` directly in debug environments** to warn developers; **returns normally as results in production environments**. *(Note: Engine version incompatibility and major migration batch execution failures are critical errors, which throw exceptions even in production)* |
+| `50000 - 79999` | `50 - 79` | `SYS_` | **System Error** (Disk space full, IO exceptions, lock acquisition timeout, etc.) | Throws exception when normal execution is blocked; others (e.g. transaction conflict) are responded as results. |
+| `99000 - 99999` | `99` | `ENG_` | **Engine Error** (Engine logic error, data file corruption, unknown internal error) | Generally does not throw exceptions; throws exceptions for severe cases. |
 
 ---
 
-## 4. 详细解析结构与专属字段说明
+## 3. ResultStatus Common Field Structure and In-Memory Helpers
 
-根据不同的 `code` / `codeKey` 范围和 `ResultStatus` 具体的子类，序列化后的 JSON 结构会携带不同的**专属诊断字段**。以下详细列出了 5 个状态子类的字段取值规范与适用场景映射。
+### 3.1 Common Fields (Serialized JSON Structure)
 
-### 4.1 SuccessStatus（操作成功状态）
+All types of `ResultStatus`, when serialized to JSON, contain the following 4 basic common fields. Users can read these fields directly for preliminary checks.
 
-- **大类范围**：`code == 0`，`codeKey == "SUCCESS"`
-- **适用场景**：记录插入、修改、删除等操作完全成功。
-- **专属字段定义**：
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `index` | `int` | Sequence index in batch operations. For single operations, this is fixed to `0`. |
+| `code` | `int` | Numeric status code (`0` for success, 5-digit number for exception). |
+| `codeKey` | `String` | Semantic state identifier key, e.g., `CONSTRAINT_VIOLATION_UNIQUE`. |
+| `message` | `String` | Human-readable status detail description. |
 
-  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                                                             |
-  | ------------ | --------- | ----------------------------------------------------------------------------------------------- |
-  | `primaryKey` | `String?` | **非必填**。仅在单条记录写入（如 `insert`）、更新（如 `update`）成功时返回，代表物理生成或修改的记录主键值。批量写入时，子项的 `primaryKey` 也会对应填充。 |
+### 3.2 In-Memory Helper Getters
 
-- **JSON 反序列化样例**：
+In Dart/Flutter, `ResultStatus` and `ResultType` encapsulate highly efficient `O(1)` read-only properties (Getters) for checking category and severity in memory without manual range checks or string matching:
+
+| Property | Type | Description |
+| :--- | :--- | :--- |
+| `isBusinessError` | `bool` | Whether this is a **Business Error** (e.g. constraint conflict, cast failure; range `10000 - 19999`). |
+| `isDeveloperError` | `bool` | Whether this is a **Developer Error** (e.g. invalid Schema, parameter mismatch, table not found; range `20000 - 49999`). |
+| `isSystemError` | `bool` | Whether this is a **System Error** (e.g. lock timeout, disk full, file lock; range `50000 - 79999`). |
+| `isEngineError` | `bool` | Whether this is an **Engine Error** (range `99000 - 99999`). |
+| `isCriticalError` | `bool` | Whether this is a **Critical Error / Disaster-level Event** (requires manual or operations intervention, e.g. disk full, out of memory, severe data file corruption, incompatible migration failure, etc.). |
+
+---
+
+## 4. Detailed Resolution Structures and Dedicated Fields
+
+Depending on the `code` / `codeKey` range and the specific subclass of `ResultStatus`, the serialized JSON structure will carry different **dedicated diagnostic fields**. Below are the field specifications and application mapping for the 5 status subclasses.
+
+### 4.1 SuccessStatus (Operation Successful)
+
+- **Category Range**: `code == 0`, `codeKey == "SUCCESS"`
+- **Applicable Scenario**: Records inserted, modified, or deleted successfully.
+- **Dedicated Field Definition**:
+
+  | Field | Type | Details |
+  | :--- | :--- | :--- |
+  | `primaryKey` | `String?` | **Optional**. Returned only on single-row writes (e.g., `insert`) or updates (e.g., `update`) representing the physically generated or modified record primary key. |
+
+- **JSON Example**:
   ```json
   {
     "index": 0,
@@ -88,42 +102,42 @@
 
 ---
 
-### 4.2 ConstraintStatus（数据完整性与约束冲突状态）
+### 4.2 ConstraintStatus (Data Integrity & Constraint Conflicts)
 
-- **大类范围**：`code` 处于区间 `[10000, 19999]` 之间（主要为数据校验与完整性冲突）。
-- **专属字段定义**：
+- **Category Range**: `code` inside `[10000, 19999]` (primarily validation and integrity constraint conflicts).
+- **Dedicated Field Definition**:
 
-  | 专属字段 (Field)      | 类型 (Type)       | 字段含义及通用填充规则 (Details)                                                                                   |
-  | ----------------- | --------------- | ------------------------------------------------------------------------------------------------------- |
-  | `tableName`       | `String`        | **必填**。触发该完整性冲突或未找到错误的具体数据库表名。                                                                          |
-  | `constraintName`  | `String?`       | **可选**。导致错误的具体约束名称。如是外键冲突，这里填充外键名称（如 `fk_users_profile`）；如是唯一性索引冲突，这里填充索引名；对于普通的非空或类型强转等无名约束，则为 `null`。 |
-  | `fields`          | `List<String>`  | **必填**。参与或导致冲突的字段名列表。如果是多字段联合唯一索引或复合外键，则这里会包含多个字段。                                                      |
-  | `conflictingKeys` | `List<dynamic>` | **必填**。引发冲突的具体非空、重复或越界的数据值列表，其顺序与 `fields` 字段列表完全一一对应。如果字段是 null，则列表项为 `null`。                          |
-  | `primaryKey`      | `String?`       | **可选**。关联到当前被操作或发生冲突的记录的物理主键。如果发生冲突的不是单条记录操作，或在内存阶段被阻断，则为 `null`。                                       |
-  | `referencedTable`  | `String?`       | **可选**。仅在外键约束冲突（如父项不存在、子记录限制等）时填充，代表被关联引用的父表（目标表）名，以便自动化或智能体无需反查 Schema 元数据直接定位关联关系。        |
-
-- **叶子状态码的具体字段填充规范对照表**：
-
-  | 状态与内存类型<br>(Code & ResultType) | 场景描述<br>(Description) | 专属字段填充规范 (Field Guidelines) |
+  | Field | Type | Details |
   | :--- | :--- | :--- |
-  | `10000`<br>`bizValidationFailed` | 数据格式、值域验证失败 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反校验的字段列表，例如 `["email"]`</li><li>`conflictingKeys`: 导致校验失败的非法值，例如 `["invalid-email"]`</li><li>`primaryKey`: 操作的记录主键值（如有）</li></ul> |
-  | `10001`<br>`bizNotNullViolation` | 非空约束冲突（缺少必要非空字段值） | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反非空限制的字段，例如 `["email"]`</li><li>`conflictingKeys`: 恒为 `[null]`</li><li>`primaryKey`: 正在操作的记录主键值（如有）</li></ul> |
-  | `10002`<br>`bizTypeCastFailed` | 数据类型转换或强转失败 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 强转失败的字段列表，例如 `["age"]`</li><li>`conflictingKeys`: 导致转换失败的非法值，例如 `["not_a_number"]`</li><li>`primaryKey`: 正在操作的记录主键值（如有）</li></ul> |
-  | `11001`<br>`bizPrimaryKeyViolation` | 主键冲突（主键已存在） | <ul><li>`tableName`: 触发冲突的表名</li><li>`constraintName`: 约束名或 `"PRIMARY"`</li><li>`fields`: 主键字段，例如 `["id"]`</li><li>`conflictingKeys`: 冲突的重复主键值，例如 `["usr_101"]`</li><li>`primaryKey`: 冲突的主键值，如 `"usr_101"`</li></ul> |
-  | `11002`<br>`bizUniqueViolation` | 唯一索引冲突 | <ul><li>`tableName`: 触发冲突的表名</li><li>`constraintName`: 唯一索引名，例如 `"uk_email"`</li><li>`fields`: 构成唯一性的字段，例如 `["email"]`</li><li>`conflictingKeys`: 导致冲突的输入值，例如 `["test@a.com"]`</li><li>`primaryKey`: 冲突的记录主键（如有）</li></ul> |
-  | `11003`<br>`bizForeignKeyViolation` | 外键约束冲突 (通用) | <ul><li>`tableName`: 触发冲突的表名</li><li>`constraintName`: 外键约束名称</li><li>`fields`: 外键涉及的字段名列表</li><li>`conflictingKeys`: 导致冲突的外键值</li><li>`primaryKey`: 操作的记录主键（如有）</li><li>`referencedTable`: 被引用的父表名</li></ul> |
-  | `11004`<br>`bizCheckViolation` | Check 校验约束未通过 | <ul><li>`tableName`: 触发冲突的表名</li><li>`constraintName`: Check 约束名</li><li>`fields`: 触发 Check 校验的字段列表</li><li>`conflictingKeys`: 引起校验失败的非法值</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `11005`<br>`bizForeignKeyParentNotExist` | 引用的外键父级记录不存在 | <ul><li>`tableName`: 子表名</li><li>`constraintName`: 外键约束名称</li><li>`fields`: 子表外键字段列表，例如 `["userId"]`</li><li>`conflictingKeys`: 引用的在父表中不存在的键值，例如 `["non_parent"]`</li><li>`primaryKey`: 操作的子表记录主键（如有）</li><li>`referencedTable`: 被引用的父表名</li></ul> |
-  | `11006`<br>`bizForeignKeyChildRestrict` | 被子记录关联，无法删除或更新父级记录 | <ul><li>`tableName`: 被删除/更新的父表名</li><li>`constraintName`: 外键约束名称</li><li>`fields`: 被引用的父表字段列表（通常是主键）</li><li>`conflictingKeys`: 试图删除的被子记录引用的父表主键值</li><li>`primaryKey`: 试图删除的父记录主键值</li><li>`referencedTable`: 关联的子表名</li></ul> |
-  | `11007`<br>`bizForeignKeyCompositeMismatch` | 复合外键的部分键值未填写导致不完整 | <ul><li>`tableName`: 子表名</li><li>`constraintName`: 外键约束名称</li><li>`fields`: 复合外键的字段列表</li><li>`conflictingKeys`: 传入的复合值列表（包含了部分 null 值）</li><li>`primaryKey`: 操作的子表记录主键（如有）</li><li>`referencedTable`: 被引用的父表名</li></ul> |
-  | `11008`<br>`bizForeignKeyTypeMismatch` | 外键两端字段的数据类型不匹配 | <ul><li>`tableName`: 子表名</li><li>`constraintName`: 外键约束名称</li><li>`fields`: 外键的字段列表</li><li>`conflictingKeys`: 无法被正确强转的非法输入值</li><li>`primaryKey`: 操作的记录主键（如有）</li><li>`referencedTable`: 被引用的父表名</li></ul> |
-  | `11009`<br>`bizValueExceedsMaxLength` | 值长度超过了 Schema 约束设定的最大长度 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最大长度限制的字段，例如 `["name"]`</li><li>`conflictingKeys`: 导致超限的具体值，例如 `["a" * 1000]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `11010`<br>`bizValueLessThanMinLength` | 值长度小于 Schema 约束设定的最小长度 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最小长度限制的字段，例如 `["code"]`</li><li>`conflictingKeys`: 导致长度不足的具体值，例如 `["ab"]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `11011`<br>`bizValueLessThanMinValue` | 数值小于 Schema 约束设定的最小值 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最小值限制的字段，例如 `["age"]`</li><li>`conflictingKeys`: 导致小于最小值的具体值，例如 `[-5]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `11012`<br>`bizValueExceedsMaxValue` | 数值大于 Schema 约束设定的最大值 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最大值限制的字段，例如 `["score"]`</li><li>`conflictingKeys`: 导致超过最大值的具体值，例如 `[105]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | 目标记录不存在 / 指定的主键值未找到 | <ul><li>`tableName`: 操作的表名</li><li>`constraintName`: `null`</li><li>`fields`: 被查询定位的字段列表，例如 `["id"]`</li><li>`conflictingKeys`: 试图定位但未找到的键值，例如 `["non_exist_id"]`</li><li>`primaryKey`: 未找到的记录主键 `"non_exist_id"`</li></ul> | |
+  | `tableName` | `String` | **Required**. Table name where the integrity constraint conflict or not-found error occurred. |
+  | `constraintName` | `String?` | **Optional**. The name of the specific constraint that caused the error (e.g., `fk_users_profile` for foreign key, index name for unique conflict, or `null` for non-null/cast errors). |
+  | `fields` | `List<String>` | **Required**. List of fields causing the conflict. |
+  | `conflictingKeys` | `List<dynamic>` | **Required**. List of input values causing the conflict, mapping 1:1 to `fields`. If a field is null, the corresponding item in the list is `null`. |
+  | `primaryKey` | `String?` | **Optional**. Associated record primary key. If not a single-row write, or blocked at memory stage, this will be `null`. |
+  | `referencedTable` | `String?` | **Optional**. Parent table name in foreign key conflicts. |
 
-- **JSON 反序列化样例**（外键父项不存在冲突）：
+- **Leaf Code Guidelines**:
+
+  | Code & ResultType | Scenario | Field Guidelines |
+  | :--- | :--- | :--- |
+  | `10000`<br>`bizValidationFailed` | Data format or range validation failed | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating validation, e.g. `["email"]`</li><li>`conflictingKeys`: Invalid values causing failure, e.g. `["invalid-email"]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `10001`<br>`bizNotNullViolation` | Not null constraint violation | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating not-null restriction, e.g. `["email"]`</li><li>`conflictingKeys`: Always `[null]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `10002`<br>`bizTypeCastFailed` | Data type conversion or cast failed | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields failing cast, e.g. `["age"]`</li><li>`conflictingKeys`: Invalid values causing failure, e.g. `["not_a_number"]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `11001`<br>`bizPrimaryKeyViolation` | Primary key conflict (already exists) | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `"PRIMARY"` or constraint name</li><li>`fields`: Primary key fields, e.g. `["id"]`</li><li>`conflictingKeys`: Duplicate values, e.g. `["usr_101"]`</li><li>`primaryKey`: Conflicting value, e.g. `"usr_101"`</li></ul> |
+  | `11002`<br>`bizUniqueViolation` | Unique constraint violation | <ul><li>`tableName`: Affected table</li><li>`constraintName`: Unique index name, e.g. `"uk_email"`</li><li>`fields`: Fields making up uniqueness, e.g. `["email"]`</li><li>`conflictingKeys`: Values causing conflict, e.g. `["test@a.com"]`</li><li>`primaryKey`: Conflicting record primary key (if any)</li></ul> |
+  | `11003`<br>`bizForeignKeyViolation` | Foreign key constraint violation (Generic) | <ul><li>`tableName`: Child table</li><li>`constraintName`: Foreign key constraint name</li><li>`fields`: Foreign key columns</li><li>`conflictingKeys`: Input values causing conflict</li><li>`primaryKey`: Record primary key (if any)</li><li>`referencedTable`: Parent table</li></ul> |
+  | `11004`<br>`bizCheckViolation` | Check constraint violation | <ul><li>`tableName`: Affected table</li><li>`constraintName`: Check constraint name</li><li>`fields`: Fields checked</li><li>`conflictingKeys`: Values violating check</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `11005`<br>`bizForeignKeyParentNotExist` | Referenced parent key does not exist | <ul><li>`tableName`: Child table</li><li>`constraintName`: Foreign key constraint name</li><li>`fields`: Foreign key columns, e.g. `["userId"]`</li><li>`conflictingKeys`: Non-existent reference value, e.g. `["non_parent"]`</li><li>`primaryKey`: Record primary key (if any)</li><li>`referencedTable`: Parent table</li></ul> |
+  | `11006`<br>`bizForeignKeyChildRestrict` | Delete/update restricted by child records | <ul><li>`tableName`: Parent table</li><li>`constraintName`: Foreign key constraint name</li><li>`fields`: Parent referenced columns</li><li>`conflictingKeys`: Parent key values referenced by child table</li><li>`primaryKey`: Parent key values</li><li>`referencedTable`: Child table</li></ul> |
+  | `11007`<br>`bizForeignKeyCompositeMismatch` | Incomplete composite foreign key values | <ul><li>`tableName`: Child table</li><li>`constraintName`: Foreign key constraint name</li><li>`fields`: Composite foreign key columns</li><li>`conflictingKeys`: Input values (contains partial nulls)</li><li>`primaryKey`: Record primary key (if any)</li><li>`referencedTable`: Parent table</li></ul> |
+  | `11008`<br>`bizForeignKeyTypeMismatch` | Foreign key type mismatch | <ul><li>`tableName`: Child table</li><li>`constraintName`: Foreign key constraint name</li><li>`fields`: Foreign key columns</li><li>`conflictingKeys`: Values failing cast</li><li>`primaryKey`: Record primary key (if any)</li><li>`referencedTable`: Parent table</li></ul> |
+  | `11009`<br>`bizValueExceedsMaxLength` | Value length exceeds maximum constraint | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating limit, e.g. `["name"]`</li><li>`conflictingKeys`: Transgressing values, e.g. `["a" * 1000]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `11010`<br>`bizValueLessThanMinLength` | Value length is less than minimum constraint | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating limit, e.g. `["code"]`</li><li>`conflictingKeys`: Values shorter than minimum, e.g. `["ab"]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `11011`<br>`bizValueLessThanMinValue` | Numeric value is less than minimum constraint | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating limit, e.g. `["age"]`</li><li>`conflictingKeys`: Values less than minimum, e.g. `[-5]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `11012`<br>`bizValueExceedsMaxValue` | Numeric value exceeds maximum constraint | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Fields violating limit, e.g. `["score"]`</li><li>`conflictingKeys`: Values exceeding maximum, e.g. `[105]`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `12002`<br>`bizRecordNotFound` | Resource does not exist / Record not found | <ul><li>`tableName`: Affected table</li><li>`constraintName`: `null`</li><li>`fields`: Search target fields, e.g. `["id"]`</li><li>`conflictingKeys`: Target keys not found, e.g. `["non_exist_id"]`</li><li>`primaryKey`: Value of missing key, e.g. `"non_exist_id"`</li></ul> |
+
+- **JSON Example** (Foreign key parent record does not exist):
   ```json
   {
     "index": 0,
@@ -141,42 +155,41 @@
 
 ---
 
-### 4.3 SchemaValidationStatus（数据库表结构校验与不兼容迁移状态）
+### 4.3 SchemaValidationStatus (Table Schema Validation & Incompatible Migration)
 
-- **大类范围**：`code` 处于区间 `[30000, 39999]` 之间（主要为 Schema 静态校验错误以及表结构版本物理迁移不兼容错误）。
-- **专属字段定义**：
+- **Category Range**: `code` inside `[30000, 39999]` (schema configuration verification errors and physical migration mismatches).
+- **Dedicated Field Definition**:
 
-  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                                                     |
-  | ------------ | --------- | --------------------------------------------------------------------------------------- |
-  | `tableName`  | `String`  | **必填**。正在操作或尝试升级/校验的数据库表名。                                              |
-  | `field`      | `String?` | **可选**。发生表结构校验或迁移错误的具体字段名称。                                          |
-  | `wrongValue`  | `dynamic` | **可选**。导致校验失败或物理不兼容迁移的非法/错误配置值或冲突的差异属性。                      |
-
-- **叶子状态码的具体字段填充规范对照表**：
-
-  | 状态与内存类型<br>(Code & ResultType) | 场景描述<br>(Description) | 专属字段填充规范 (Field Guidelines) |
+  | Field | Type | Details |
   | :--- | :--- | :--- |
-  | `30000`<br>`devInvalidSchema` | 表的 Schema 结构定义配置不正确 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 无效的配置 Map，或 `null`</li></ul> |
-  | `30001`<br>`devInvalidSchemaTableName` | Schema 表名包含非法字符或超过长度限制 | <ul><li>`tableName`: 非法的表名</li><li>`field`: `null`</li><li>`wrongValue`: 非法的表名值</li></ul> |
-  | `30002`<br>`devInvalidSchemaFieldName` | Schema 字段名包含非法字符 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 非法的字段名</li><li>`wrongValue`: 非法的字段名值</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | Schema 主键配置格式非法或缺失 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `"primaryKey"` 或 主键字段名</li><li>`wrongValue`: 无效的主键配置定义</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | 该表配置的索引数超出了 16 个的系统限制 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 超限的索引配置列表</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | 创建表冲突，目标表已经存在 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | 结构升级中，添加了已经存在的同名字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 冲突的字段名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | 追加了同名的索引配置 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: `null`</li></ul> |
-  | `30008`<br>`devInvalidSchemaForeignKey` | 外键定义格式非法（如自引用、字段数不对应） | <ul><li>`tableName`: 数据库表名</li><li>`field`: 外键名称</li><li>`wrongValue`: 无效的外键配置定义</li></ul> |
-  | `30009`<br>`devInvalidSchemaSpaceMismatch` | 全局表/Space空间表范围定义越界或冲突 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | 结构物理迁移要求对已有数据表进行列修改/删除等有损物理变动，但调用未显式授权允许物理迁移 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 进行迁移的升级差异集</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | 物理迁移：不支持且极高风险的数据类型转换操作 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 迁移时发生转换冲突的类型参数，如 `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30012`<br>`devMigrationBatchExecutionFailed` | 批量表结构迁移物理执行失败 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 执行失败的批处理迁移 SQL/DDL 指令</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 试图添加的非空字段名</li><li>`wrongValue`: 冲突的迁移参数，如 `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 冲突的迁移参数，同 30013</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 导致收紧唯一性的索引定义</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | 表的 TTL（数据生存周期）配置项非法 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 生效的 TTL 字段名</li><li>`wrongValue`: 无效的 TTL 配置 Map，如 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | 字段重复配置冲突 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 重复的字段名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | 索引指向了表中并不存在的字段名 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: 索引指向的但在表结构中未定义的非法字段名</li></ul> |
+  | `tableName` | `String` | **Required**. Table name being validated or physically migrated. |
+  | `field` | `String?` | **Optional**. The specific field name triggering the schema or migration error. |
+  | `wrongValue` | `dynamic` | **Optional**. Invalid configuration value or migration diff config causing the conflict. |
 
-- **JSON 反序列化样例**（对已有数据的表强加非空且无默认值字段）：
+- **Leaf Code Guidelines**:
+
+  | Code & ResultType | Scenario | Field Guidelines |
+  | :--- | :--- | :--- |
+  | `30000`<br>`devInvalidSchema` | Invalid table schema definition | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: Invalid configuration map, or `null`</li></ul> |
+  | `30001`<br>`devInvalidSchemaTableName` | Table name validation failed (illegal characters or too long) | <ul><li>`tableName`: Transgressing name</li><li>`field`: `null`</li><li>`wrongValue`: Transgressing string</li></ul> |
+  | `30002`<br>`devInvalidSchemaFieldName` | Field name validation failed (illegal characters) | <ul><li>`tableName`: Table name</li><li>`field`: Transgressing field name</li><li>`wrongValue`: Transgressing string</li></ul> |
+  | `30003`<br>`devInvalidSchemaPrimaryKey` | Primary key validation failed (missing or invalid format) | <ul><li>`tableName`: Table name</li><li>`field`: `"primaryKey"` or primary key field name</li><li>`wrongValue`: Primary key config details</li></ul> |
+  | `30004`<br>`devInvalidSchemaIndexLimit` | Table index count exceeds the system limit of 16 | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: Index configurations list</li></ul> |
+  | `30005`<br>`devSchemaTableExists` | Table already exists | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30006`<br>`devSchemaFieldExists` | Schema upgrade: adding a field that already exists | <ul><li>`tableName`: Table name</li><li>`field`: Conflicting field name</li><li>`wrongValue`: `null`</li></ul> |
+  | `30007`<br>`devSchemaIndexExists` | Schema upgrade: adding an index that already exists | <ul><li>`tableName`: Table name</li><li>`field`: Index name</li><li>`wrongValue`: `null`</li></ul> |
+  | `30008`<br>`devInvalidSchemaForeignKey` | Foreign key definition invalid (e.g. mismatch columns) | <ul><li>`tableName`: Table name</li><li>`field`: Foreign key name</li><li>`wrongValue`: Foreign key config details</li></ul> |
+  | `30009`<br>`devInvalidSchemaSpaceMismatch` | Global/Space-specific boundary mismatch | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30010`<br>`devMigrationNotAllowedWithData` | Migration requires data modification and was not explicitly allowed | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: Migration upgrade diffs map</li></ul> |
+  | `30011`<br>`devMigrationUnsafeTypeConversion` | Physical migration: unsupported type conversion for field | <ul><li>`tableName`: Table name</li><li>`field`: Field name</li><li>`wrongValue`: Conflicting types map, e.g. `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `30013`<br>`devMigrationCannotAddNonNullField` | Cannot add non-nullable field without a default value to non-empty table | <ul><li>`tableName`: Table name</li><li>`field`: Transgressing field name</li><li>`wrongValue`: Migration parameters, e.g. `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | Physical migration: changing field from nullable to non-nullable | <ul><li>`tableName`: Table name</li><li>`field`: Field name</li><li>`wrongValue`: Migration parameters, same as 30013</li></ul> |
+  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | Physical migration: tightening field constraint to UNIQUE | <ul><li>`tableName`: Table name</li><li>`field`: Field name</li><li>`wrongValue`: Index definition causing unique constraint</li></ul> |
+  | `30016`<br>`devInvalidSchemaTtlConfig` | TTL configuration validation failed | <ul><li>`tableName`: Table name</li><li>`field`: TTL timestamp field</li><li>`wrongValue`: Invalid TTL config map, e.g., `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | Duplicate field name in table schema | <ul><li>`tableName`: Table name</li><li>`field`: Duplicate field name</li><li>`wrongValue`: `null`</li></ul> |
+  | `30018`<br>`devInvalidSchemaIndexField` | Index references non-existent field | <ul><li>`tableName`: Table name</li><li>`field`: Index name</li><li>`wrongValue`: Field name causing mismatch</li></ul> |
+
+- **JSON Example** (Adding a non-nullable field without default value to a non-empty table):
   ```json
   {
     "index": 0,
@@ -194,43 +207,40 @@
 
 ---
 
-### 4.4 InvalidArgumentStatus（接口传参及游标分页校验异常）
+### 4.4 InvalidArgumentStatus (API Arguments & Cursor Pagination Validation)
 
-- **大类范围**：`code` 处于区间 `[20000, 20999]` 之间（主要为 API 接口的入参格式、传参类型或分页游标不合法校验错误）。
-- **专属字段定义**：
+- **Category Range**: `code` inside `[20000, 20999]` (validation failures for API parameters, query structures, or paging tokens).
+- **Dedicated Field Definition**:
 
-  | 专属字段 (Field)    | 类型 (Type) | 字段含义及填充规则 (Details)                                                                   |
-  | --------------- | --------- | ------------------------------------------------------------------------------------- |
-  | `parameterName` | `String`  | **必填**。发生传参错误的参数名称。常见的如 `"cursor"`（分页游标错误）、`"orderBy"`（排序项错误），或具体字段的传参键名（如 `"id"` 等）。 |
-  | `passedValue`   | `dynamic` | **可选**。调用方传入的具体非法值或格式错误的数据。出于数据安全，复杂对象通常会转换为字符串类型再序列化输出。                              |
-  | `primaryKey`    | `String?` | **可选**。本次操作中尝试读取、写入或查询关联的单条记录的主键。                                                     |
-
-- **叶子状态码的具体字段填充规范对照表**：
-
-  | 状态与内存类型<br>(Identity & Type) | 场景描述<br>(Description) | 专属字段填充规范 (Field Guidelines) |
+  | Field | Type | Details |
   | :--- | :--- | :--- |
-  | **Code**: `20001`<br>`ResultType.devInvalidArgumentFormat` | 传参值格式错误（如非法的 key 格式） | <ul><li>`parameterName`: 非法传参的参数名 (如 `"id"`, `"age"`)</li><li>`passedValue`: 传入的非法格式值，如 `"twenty"`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | **Code**: `20002`<br>`ResultType.devInvalidArgumentType` | 参数的数据类型不匹配（期待数字传入字符串等） | <ul><li>`parameterName`: 参数名</li><li>`passedValue`: 传入的非法类型对象，如 `{"foo": "bar"}`（被期望为 String 时）</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | **Code**: `20003`<br>`ResultType.devInvalidArgumentMissing` | 必填的接口入参未传入 | <ul><li>`parameterName`: 缺失的必填参数名 (如 `"dbPath"`)</li><li>`passedValue`: `null` (代表该值未传)</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | **Code**: `20005`<br>`ResultType.devInvalidPrimaryKeyFormat` | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） | <ul><li>`parameterName`: `"primaryKey"` 或 主键字段名</li><li>`passedValue`: 传入的非法主键值，例如 `"invalid_id_value"`</li><li>`primaryKey`: 传入的非法主键值</li></ul> |
-  | **Code**: `20007`<br>`ResultType.devIndexOutOfBounds` | 索引或范围超限错误（如越界读写缓冲区） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20008`<br>`ResultType.devUnsupportedOperation` | 当前上下文不支持的操作（不支持该平台、未实现等） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20009`<br>`ResultType.devInvalidDataFormat` | 数据流格式或编解码失败（数据反序列化非法） | <ul><li>`parameterName`: `null`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20010`<br>`ResultType.devVectorDimensionMismatch` | 向量计算或比较时维度不匹配（如点积、距离计算等） | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 传入向量的非法维度值</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20011`<br>`ResultType.devIndexFieldMissing` | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 缺失的字段名</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20201`<br>`ResultType.devInvalidCursorPagination` | 分页冲突（游标分页和 Offset 分页不能同时配置） | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 冲突的分页配置对象</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20202`<br>`ResultType.devInvalidCursorTable` | 游标包含的表与当前查询表不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标字符串 (指出游标和当前表不相符)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20203`<br>`ResultType.devInvalidCursorSignature` | 游标签名哈希校验失败（游标已被篡改） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标值 (指出签名校验已被损坏或篡改)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20204`<br>`ResultType.devInvalidCursorOrderBy` | 游标的 orderBy 配置不合规或与原查询不匹配 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: 传入的 orderBy 配置数组，如 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20205`<br>`ResultType.devInvalidCursorMode` | 游标 Token 模式不匹配 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 当前尝试读取的游标模式字符串，如 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20206`<br>`ResultType.devInvalidCursorPayload` | 无法解码或反序列化的非法游标载荷 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null` (代表不可解析的乱码或非法游标 Payload)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20301`<br>`ResultType.devInvalidQuerySelectField` | 查询 Select 字段非法（不是 String 或 QueryAggregation） | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 传入的非法的查询投影字段值</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20302`<br>`ResultType.devInvalidQueryForeignKeyJoin` | 自动 Join 时两表之间未定义外键关系 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 试图进行自动 Join 的未定义关联的另一张表名</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20303`<br>`ResultType.devInvalidQueryFieldAlias` | 查询字段的别名命名格式不正确 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 非法的查询别名定义</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20304`<br>`ResultType.devInvalidExpression` | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） | <ul><li>`parameterName`: 异常维度（如 `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 非法值或参数长度</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | 传入了表中未定义的未知字段 | <ul><li>`parameterName`: 未知或不存在的字段名 (如 `"extra"`)</li><li>`passedValue`: 传入的未知字段值</li><li>`primaryKey`: 操作 of the record primary key (if any)</li></ul> |
+  | `parameterName` | `String` | **Required**. Argument name triggering the validation failure (e.g. `"cursor"`, `"orderBy"`, or specific column key). |
+  | `passedValue` | `dynamic` | **Optional**. Non-compliant input value passed by the caller. Complex objects are converted to strings. |
+  | `primaryKey` | `String?` | **Optional**. Associated record primary key. |
 
-- **JSON 反序列化样例**（分页游标的排序条件与查询要求的排序条件冲突）：
+- **Leaf Code Guidelines**:
+
+  | Code & ResultType | Scenario | Field Guidelines |
+  | :--- | :--- | :--- |
+  | `20001`<br>`devInvalidArgumentFormat` | Argument format error | <ul><li>`parameterName`: Invalid argument name</li><li>`passedValue`: Value passed, e.g. `"twenty"`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `20002`<br>`devInvalidArgumentType` | Argument type mismatch | <ul><li>`parameterName`: Parameter name</li><li>`passedValue`: Value passed, e.g. `{"foo": "bar"}` (when String expected)</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `20003`<br>`devInvalidArgumentMissing` | Required argument is missing | <ul><li>`parameterName`: Missing parameter name, e.g. `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+  | `20005`<br>`devInvalidPrimaryKeyFormat` | Invalid primary key format | <ul><li>`parameterName`: `"primaryKey"` or primary key field</li><li>`passedValue`: Invalid primary key value, e.g., `"invalid_id_value"`</li><li>`primaryKey`: Invalid primary key value</li></ul> |
+  | `20010`<br>`devVectorDimensionMismatch` | Vector dimensions mismatch | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Transgressing dimension size</li><li>`primaryKey`: `null`</li></ul> |
+  | `20011`<br>`devIndexFieldMissing` | Required index field is missing in record for cursor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Missing index field</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidCursorPagination` | Cursor pagination and offset are mutually exclusive | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Conflicting pagination parameters</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidCursorTable` | Cursor does not match target table | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Cursor token</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidCursorSignature` | Mismatched cursor signature (tampered) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Cursor token</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidCursorOrderBy` | Cursor orderBy configuration invalid or mismatched | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: OrderBy list, e.g. `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20205`<br>`devInvalidCursorMode` | Cursor token mode mismatch | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Token mode, e.g., `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20206`<br>`devInvalidCursorPayload` | Invalid cursor payload (undecodable) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20301`<br>`devInvalidQuerySelectField` | Query select field must be String or QueryAggregation | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Invalid select field definition</li><li>`primaryKey`: `null`</li></ul> |
+  | `20302`<br>`devInvalidQueryForeignKeyJoin` | No foreign key relationship for auto join | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: Target table lacking relation</li><li>`primaryKey`: `null`</li></ul> |
+  | `20303`<br>`devInvalidQueryFieldAlias` | Query field alias format invalid | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Invalid alias string</li><li>`primaryKey`: `null`</li></ul> |
+  | `20304`<br>`devInvalidExpression` | Invalid expression configuration or execution | <ul><li>`parameterName`: Error aspect (e.g. `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Invalid value or count</li><li>`primaryKey`: `null`</li></ul> |
+  | `22005`<br>`devFieldNotFound` | Field not found | <ul><li>`parameterName`: Unknown field name, e.g. `"extra"`</li><li>`passedValue`: Input value passed for field</li><li>`primaryKey`: Record primary key (if any)</li></ul> |
+
+- **JSON Example** (Cursor order fields mismatch query order fields):
   ```json
   {
     "index": 0,
@@ -245,23 +255,23 @@
 
 ---
 
-### 4.5 TransactionOperationStatus（事务冲突与回滚异常状态）
+### 4.5 TransactionOperationStatus (Transaction Conflict & Abort)
 
-- **大类范围**：`code` 处于区间 `[50000, 50999]` 之间（主要为事务主动回滚、被动中止或并发更新导致的序列化冲突）。
-- **专属字段定义**：
+- **Category Range**: `code` inside `[50000, 50999]` (transaction rollback, explicit abort, or serializability conflicts).
+- **Dedicated Field Definition**:
 
-  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                     |
-  | ------------ | --------- | ------------------------------------------------------- |
-  | `txId`       | `String`  | **必填**。发生冲突或被中止的事务全局唯一流水标识 ID。前端或运维可依据此 ID 定位具体的事务追踪链路。 |
-
-- **叶子状态码的具体字段填充规范对照表**：
-
-  | 状态与内存类型<br>(Identity & Type) | 场景描述<br>(Description) | 专属字段填充规范 (Field Guidelines) |
+  | Field | Type | Details |
   | :--- | :--- | :--- |
-  | **Code**: `50001`<br>`ResultType.sysTransactionAborted` | 事务内某些原子操作失败、主动执行了 `rollback`，或者由于底层的级联更新策略失败导致事务崩溃。 | <ul><li>`txId`: 当前作用域内的事务 ID</li></ul> |
-  | **Code**: `50002`<br>`ResultType.sysTransactionConflict` | 在开启了 SSI (可序列化快照隔离) 或在写入缓冲区合并检测时，发现另一个并发事务已经修改了同一行实体（版本号不匹配）。 | <ul><li>`txId`: 当前发生写-写冲突的事务 ID</li></ul> |
+  | `txId` | `String` | **Required**. Globally unique transaction stream identifier ID. Used to trace txn lifecycle. |
 
-- **JSON 反序列化样例**（并发写写冲突导致事务失败）：
+- **Leaf Code Guidelines**:
+
+  | Code & ResultType | Scenario | Field Guidelines |
+  | :--- | :--- | :--- |
+  | `50001`<br>`sysTransactionAborted` | Transaction aborted (explicit rollback or cascade fail) | <ul><li>`txId`: Active transaction ID</li></ul> |
+  | `50002`<br>`sysTransactionConflict` | Transaction conflict (concurrent updates to same key in SSI/WAL) | <ul><li>`txId`: Conflicting transaction ID</li></ul> |
+
+- **JSON Example** (SSI Concurrent Write-Write conflict):
   ```json
   {
     "index": 0,
@@ -274,46 +284,47 @@
 
 ---
 
-### 4.6 GeneralStatus（通用及系统级异常状态）
+### 4.6 GeneralStatus (Generic & System-level Exceptions)
 
-- **大类范围**：除以上情况外，未归属于上述四个子类的所有其他状态码，均作为通用异常输出（主要为底层物理限制、系统故障、无权限访问或未知硬件错误）。
-- **专属字段定义**：
+- **Category Range**: Fallback for any other status codes (low-level IO, hardware errors, system timeouts, etc.).
+- **Dedicated Field Definition**:
 
-  | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details) |
-  | ------------ | --------- | ------------------------------------------------------- |
-  | `primaryKey` | `String?` | **可选**。只有当异常能明确归属到某一特定的主键时才会填充，绝大多数底层系统或引擎级异常时为 `null`。 |
-  | `target`     | `String?` | **可选**。操作的物理目标标识符。例如：I/O 错误时的**物理路径**；并发锁超时时的**锁资源名**；网络请求时的 **URL**。 |
-  | `operation`  | `String?` | **可选**。具体的底层系统操作动作名称。例如：I/O 错误时的 `'readAsString'`、`'delete'`；锁超时时的 `'acquire'`。 |
-
-- **叶子状态码的具体字段填充规范对照表**：
-
-  | 状态与内存类型<br>(Identity & Type) | 级别分类与典型触发场景<br>(Level & Trigger) | 专属字段填充规范 (Field Guidelines) |
+  | Field | Type | Details |
   | :--- | :--- | :--- |
-  | **Code**: `21001`<br>`ResultType.devPermissionDeniedRead` | **级别**：开发者错误<br>细粒度安全规则拦截，试图读取不具权限的实体（例如特定行记录）。 | <ul><li>`primaryKey`: 试图读取的行主键（如有）</li></ul> |
-  | **Code**: `21002`<br>`ResultType.devPermissionDeniedWrite` | **级别**：开发者错误<br>细粒度安全规则拦截，试图修改不具写权限的行。 | <ul><li>`primaryKey`: 试图修改的行主键（如有）</li></ul> |
-  | **Code**: `22001`<br>`ResultType.devTableNotFound` | **级别**：开发者错误<br>执行 Query 或写入时，传入了尚未创建的非物理表名。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22003`<br>`ResultType.devIndexNotFound` | **级别**：开发者错误<br>执行 ForceIndex 查询时，指定了根本没有在 Schema 中建立的索引。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | **级别**：开发者错误<br>传入了表中未定义的未知字段。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `23001`<br>`ResultType.devLargeScaleOperationBypassRequired` | **级别**：开发者错误<br>超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `24001`<br>`ResultType.devEngineIncompatible` | **级别**：**致命错误**<br>库配置或数据文件与当前引擎版本不兼容，强制拦截抛出。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `51001`<br>`ResultType.sysTimeoutLockAcquisition` | **级别**：系统错误<br>并发控制：在高负载下等待行锁或表锁，锁获取超时（默认 10s）。 | <ul><li>`primaryKey`: 等待获取锁的主键值（如有）</li><li>`target`: 锁定的资源名称</li><li>`operation`: `"acquire"`</li></ul> |
-  | **Code**: `51002`<br>`ResultType.sysTimeout` | **级别**：系统错误<br>系统超时：整个异步运算执行时间超时未归还。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `51003`<br>`ResultType.sysCancellation` | **级别**：系统错误<br>操作取消：异步操作或计算任务被 CancellationToken 中途取消。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `52001`<br>`ResultType.sysResourceExhaustedMemory` | **级别**：系统错误<br>内存报警：JVM / Dart 虚拟机所分配的堆内存空间面临 OOM. | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `52002`<br>`ResultType.sysResourceExhausted` | **级别**：系统错误<br>磁盘空间耗尽，无法执行落盘写入。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `53001`<br>`ResultType.sysIoNotFound` | **级别**：系统错误<br>物理文件或目录路径不存在。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53002`<br>`ResultType.sysIoPermissionDenied` | **级别**：系统错误<br>物理文件读写权限不足/拒绝访问。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53003`<br>`ResultType.sysIoDiskFull` | **级别**：系统错误<br>磁盘空间不足或写数据超过配额限额。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53004`<br>`ResultType.sysIoFileLocked` | **级别**：系统错误<br>物理文件已被其它进程占用/共享冲突/锁定。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53005`<br>`ResultType.sysIoDeviceFault` | **级别**：系统错误<br>存储设备或介质硬件故障。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53006`<br>`ResultType.sysIoWebStorageUnavailable` | **级别**：系统错误<br>Web 端 IndexedDB 满额、被禁用或初始化失败。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53007`<br>`ResultType.sysBackupCorrupted` | **级别**：系统错误<br>备份包已损坏或缺少清单文件。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理清单文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53008`<br>`ResultType.sysIoDataCorrupted` | **级别**：系统错误<br>数据库数据文件损坏或 CRC 校验失败。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理数据文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `53099`<br>`ResultType.sysIoGeneric` | **级别**：系统错误<br>物理文件系统底层遭遇其他硬件或物理 I/O 错误。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
-  | **Code**: `99001`<br>`ResultType.engError` | **级别**：引擎错误<br>数据库底层引擎发生代码崩溃、未知内部异常或运行时逻辑缺陷。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `primaryKey` | `String?` | **Optional**. Associated record primary key. |
+  | `target` | `String?` | **Optional**. Target physical resource, e.g. physical file paths, locks, or URLs. |
+  | `operation` | `String?` | **Optional**. Active system call name, e.g., `'readAsString'`, `'delete'`, `'acquire'`. |
 
-- **JSON 反序列化样例**（表不存在错误）：
+- **Leaf Code Guidelines**:
+
+  | Code & ResultType | Scenario / Level | Field Guidelines |
+  | :--- | :--- | :--- |
+  | `20007`<br>`devIndexOutOfBounds` | Index or range is out of bounds (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devUnsupportedOperation` | Operation is not supported in the current context (Developer Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: Target table/resource (if any)</li><li>`operation`: Method name (if any)</li></ul> |
+  | `22001`<br>`devTableNotFound` | Table not found (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devIndexNotFound` | Index not found (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devSpaceNotFound` | Space not found (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationBypassRequired` | Skip details required to prevent OOM (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `24001`<br>`devEngineIncompatible` | **Critical**: Engine version incompatible | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysMigrationBatchExecutionFailed` | Batch migration execution failed (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51001`<br>`sysTimeoutLockAcquisition` | Lock acquisition timeout (System Error) | <ul><li>`primaryKey`: Target key (if any)</li><li>`target`: Lock resource ID</li><li>`operation`: `"acquire"`</li></ul> |
+  | `51002`<br>`sysTimeout` | Operation timeout (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysCancellation` | Operation was cancelled (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `52001`<br>`sysResourceExhaustedMemory` | Memory resource exhausted (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `52002`<br>`sysResourceExhausted` | System resources exhausted, e.g. disk full (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `53001`<br>`sysIoNotFound` | Physical file or path does not exist (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File or folder path</li><li>`operation`: I/O operation</li></ul> |
+  | `53002`<br>`sysIoPermissionDenied` | Permission denied for file access (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File path</li><li>`operation`: I/O operation</li></ul> |
+  | `53003`<br>`sysIoDiskFull` | Disk full or storage quota exceeded (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File path</li><li>`operation`: I/O operation</li></ul> |
+  | `53004`<br>`sysIoFileLocked` | File is locked or in use by another process (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File path</li><li>`operation`: I/O operation</li></ul> |
+  | `53005`<br>`sysIoDeviceFault` | Storage device or media fault (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File path</li><li>`operation`: I/O operation</li></ul> |
+  | `53006`<br>`sysIoWebStorageUnavailable` | Web IndexedDB or storage is unavailable (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: IndexedDB resource</li><li>`operation`: I/O operation</li></ul> |
+  | `53007`<br>`sysBackupCorrupted` | Backup package is corrupted or missing metadata (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: Backup path</li><li>`operation`: Backup read/write</li></ul> |
+  | `53008`<br>`sysIoDataCorrupted` | Database data file is corrupted or checksum failed (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: Data file path</li><li>`operation`: I/O operation</li></ul> |
+  | `53009`<br>`sysInvalidDataFormat` | Data stream formatting or parsing failed (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: Data stream key</li><li>`operation`: `"decode"` / `"deserialize"`</li></ul> |
+  | `53099`<br>`sysIoGeneric` | Generic system IO error (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File path</li><li>`operation`: I/O operation</li></ul> |
+  | `99001`<br>`engError` | Engine error (Engine Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+
+- **JSON Example** (Table not found error):
   ```json
   {
     "index": 0,
@@ -326,110 +337,110 @@
 
 ---
 
-## 5. 数据库用户操作结果解析与异常处理建议 (Dart/Flutter 示例)
+## 5. Database User Resolution & Exception Handling Recommendations (Dart/Flutter Examples)
 
-在 ToStore 中，所有核心的数据操作（如 Insert, Update, Delete 等）都会返回 `DbResult`。对于查询会返回 `QueryResult`，对于事务操作会返回 `TransactionResult`。若发生结构性或致命的开发配置错误，则会抛出 `DbException`。
+In ToStore, all core writing operations (Insert, Update, Delete) return `DbResult`. Queries return `QueryResult`, and transaction operations return `TransactionResult`. Structural configuration mistakes throw `DbException`.
 
-以下是作为**数据库用户（开发者）**，如何优雅地消费、解析这些响应以及诊断错误的示例：
+Below are code examples illustrating how developer applications should consume, parse, and gracefully handle database statuses:
 
-### 5.1 处理增删改操作响应 (`DbResult`)
+### 5.1 Handling Write Operation Responses (`DbResult`)
 
 ```dart
 import 'package:tostore/tostore.dart';
 
 void handleDatabaseWriteResult(DbResult result) {
-  // 1. 快速判断操作是否整体成功（有无任一条目失败）
+  // 1. Instantly check if the write completed entirely without errors
   if (!result.hasErrors) {
-    print("所有写入操作全部成功，影响条数: ${result.successCount}");
+    print("All write operations succeeded. Affected: ${result.successCount}");
 
-    // 单条操作可通过 firstPrimaryKey 获取主键，无需遍历 statuses
+    // For single-row writes, fetch key directly without iterating statuses
     if (result.firstPrimaryKey != null) {
-      print("第一条成功记录的主键: ${result.firstPrimaryKey}");
+      print("Primary key of the first successful record: ${result.firstPrimaryKey}");
     }
   } else {
-    print("🛑 存在执行失败的条目。成功数: ${result.successCount}, 失败数: ${result.failedCount}");
-    print("首个错误类型: ${result.firstType.codeKey} (${result.firstType.code})");
+    print("🛑 Error detected. Succeeded: ${result.successCount}, Failed: ${result.failedCount}");
+    print("First error: ${result.firstType.codeKey} (${result.firstType.code})");
 
-    // 2. 遍历 statuses（与批量操作输入列表的 index 顺序一一对应）
+    // 2. Iterate statuses (index aligns 1:1 with input batch array)
     for (final status in result.statuses) {
-      final int idx = status.index; // 操作在批处理中的索引位置
+      final int idx = status.index;
 
-      // 3. 使用模式匹配 (Pattern Matching) 针对不同失败大类做处理
+      // 3. Pattern match subclasses to route handling logic
       if (status is SuccessStatus) {
-        print("索引 [$idx] 操作成功，主键: ${status.primaryKey}");
+        print("Index [$idx] Succeeded. Primary key: ${status.primaryKey}");
       } 
       else if (status is ConstraintStatus) {
-        // 数据完整性约束冲突（主键冲突、唯一索引冲突、非空约束违背、外键校验失败等）
-        print("索引 [$idx] 约束冲突！表名: ${status.tableName}, 冲突的字段: ${status.fields}");
-        print("导致冲突的具体值: ${status.conflictingKeys}, 主键: ${status.primaryKey}");
-        print("错误消息: ${status.message}"); // 包含数据库底层返回的真实诊断文本
+        // Handle constraint violation (primary key, unique, check, foreign key, etc.)
+        print("Index [$idx] Constraint violation! Table: ${status.tableName}, Columns: ${status.fields}");
+        print("Conflicting values: ${status.conflictingKeys}, PK: ${status.primaryKey}");
+        print("Error Message: ${status.message}");
       } 
       else if (status is InvalidArgumentStatus) {
-        // 参数格式或类型不符
-        print("索引 [$idx] 传参无效！字段名: ${status.parameterName}, 非法值: ${status.passedValue}");
+        // Handle parameter failures
+        print("Index [$idx] Invalid parameter! Parameter: ${status.parameterName}, Passed Value: ${status.passedValue}");
       } 
       else if (status is GeneralStatus) {
-        // 超时、资源不足、文件IO等通用异常
-        print("索引 [$idx] 发生通用异常！错误码: ${status.code} (${status.codeKey})");
-        print("错误描述: ${status.message}");
+        // Handle lock timeout, disk full, system I/O issues, etc.
+        print("Index [$idx] Generic exception! Code: ${status.code} (${status.codeKey})");
+        print("Message: ${status.message}");
       }
     }
   }
 }
 ```
 
-### 5.2 捕获表结构与操作异常 (`DbException`)
+### 5.2 Catching Table Schema and Operation Exception (`DbException`)
 
-对于表创建 (`createTable`)、Schema 变更等致命错误，ToStore 会直接抛出 `DbException`，这同样可以通过捕获并解析其内部的 `statuses` 列表来获取最准确的根因：
+For table creation (`createTable`) or schema changes (`updateSchema`), or in cases where schema definitions fail code-level checks, ToStore throws a `DbException` in production:
 
 ```dart
 try {
-  // 假设存在一个非法的表 Schema 迁移或定义
-  await ToStore.open(schemas:[..]);
+  // Opening the database with schema updates
+  await ToStore.open(schemas: [..]);
 } on DbException catch (e) {
-  print("❌ 数据库执行致命异常！统一组合报错: \n${e.message}");
+  print("❌ Fatal database exception! Aggregated error: \n${e.message}");
   
-  // 遍历异常中的每一个诊断状态
+  // Iterate through individual statuses in exception
   for (final status in e.statuses) {
     if (status is SchemaValidationStatus) {
-      // 处理表结构校验失败
-      print("表结构校验失败！表: ${status.tableName}");
+      // Schema validator issues
+      print("Schema validation failed! Table: ${status.tableName}");
       if (status.field != null) {
-        print("问题字段: ${status.field}, 非法的配置值: ${status.wrongValue}");
+        print("Transgressing field: ${status.field}, Invalid configuration: ${status.wrongValue}");
       }
     } else {
-      print("诊断详情: [${status.codeKey}] (Code ${status.code}): ${status.message}");
+      print("Diagnostics: [${status.codeKey}] (Code ${status.code}): ${status.message}");
     }
   }
 }
 ```
 
-### 5.3 处理查询操作结果 (`QueryResult`) 与事务控制 (`TransactionResult`)
+### 5.3 Handling Query Operations (`QueryResult`) & Transaction Controls (`TransactionResult`)
 
-- **对于查询**：
+- **For Queries**:
   ```dart
   final queryResult = await db.query('users').where('age', '>', 18);
   if (queryResult.hasErrors) {
-    // 处理查询层面的异常（例如游标失效、表不存在等）
-    print("查询失败！错误码: ${queryResult.type.code}, 消息: ${queryResult.message}");
+    // Handle query exceptions (e.g. invalid cursor, missing table)
+    print("Query failed! Code: ${queryResult.type.code}, Message: ${queryResult.message}");
   } else {
-    // 成功获取数据
+    // Query executed successfully
     final List<Map<String, dynamic>> users = queryResult.data;
-    print("查询成功，共拉取到 ${users.length} 条数据，是否有下一页: ${queryResult.hasMore}");
+    print("Fetched ${users.length} records. Has more: ${queryResult.hasMore}");
   }
   ```
-- **对于事务**：
+- **For Transactions**:
   ```dart
   final txnResult = await db.transaction(() async {
     await db.insert('users', newUser);
   });
 
   if (txnResult.hasErrors) {
-    print("事务回滚！事务ID: ${txnResult.txId}");
-    // 提取事务中报错子操作的详细诊断
+    print("Transaction rolled back! TxId: ${txnResult.txId}");
+    // Pull detailed sub-operation failures
     for (final status in txnResult.statuses) {
       if (status.type != ResultType.success) {
-        print("事务失败原因: [${status.codeKey}] ${status.message}");
+        print("Failure cause: [${status.codeKey}] ${status.message}");
       }
     }
   }
@@ -437,89 +448,87 @@ try {
 
 ---
 
-## 6. 全量叶子状态码及语义化标识规范
+## 6. Full Leaf Status Codes and Semantic Identifier Reference
 
-开发者与智能体可以对照下表，进行精准的状态路由与解析：
+Refer to the table below for exact status routing and parsing:
 
-| 状态码 (Code) | 状态标识符 (CodeKey) | 内存枚举类型 (ResultType) | 级别 (Level) | 状态含义描述 (Description) |
+| Status Code (Code) | Identifier (CodeKey) | Memory Enum (ResultType) | Category | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `0` | `SUCCESS` | `ResultType.success` | 成功 | 操作完全执行成功 |
-| **10000** | `BIZ_VALIDATION_FAILED` | `ResultType.bizValidationFailed` | 业务错误 | 数据格式、值域验证失败 |
-| **10001** | `BIZ_NOT_NULL_VIOLATION` | `ResultType.bizNotNullViolation` | 业务错误 | 非空约束冲突（缺少必要非空字段值） |
-| **10002** | `BIZ_VALIDATION_TYPE_CAST` | `ResultType.bizTypeCastFailed` | 业务错误 | 数据类型转换或强转失败 |
-| **11001** | `BIZ_CONSTRAINT_PRIMARY_KEY` | `ResultType.bizPrimaryKeyViolation` | 业务错误 | 主键冲突（主键已存在） |
-| **11002** | `BIZ_CONSTRAINT_UNIQUE` | `ResultType.bizUniqueViolation` | 业务错误 | 唯一索引冲突 |
-| **11003** | `BIZ_CONSTRAINT_FOREIGN_KEY` | `ResultType.bizForeignKeyViolation` | 业务错误 | 外键约束冲突 (通用) |
-| **11004** | `BIZ_CONSTRAINT_CHECK` | `ResultType.bizCheckViolation` | 业务错误 | Check 校验约束未通过 |
-| **11005** | `BIZ_CONSTRAINT_FOREIGN_KEY_PARENT_NOT_EXIST` | `ResultType.bizForeignKeyParentNotExist` | 业务错误 | 引用的外键父级记录不存在 |
-| **11006** | `BIZ_CONSTRAINT_FOREIGN_KEY_CHILD_RESTRICT` | `ResultType.bizForeignKeyChildRestrict` | 业务错误 | 被子记录关联，无法删除或更新父级记录 |
-| **11007** | `BIZ_CONSTRAINT_FOREIGN_KEY_COMPOSITE_MISMATCH` | `ResultType.bizForeignKeyCompositeMismatch` | 业务错误 | 复合外键的部分键值未填写导致不完整 |
-| **11008** | `BIZ_CONSTRAINT_FOREIGN_KEY_TYPE_MISMATCH` | `ResultType.bizForeignKeyTypeMismatch` | 业务错误 | 外键两端字段的数据类型不匹配 |
-| **11009** | `BIZ_CONSTRAINT_MAX_LENGTH` | `ResultType.bizValueExceedsMaxLength` | 业务错误 | 值长度超过了 Schema 约束设定的最大长度 |
-| **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | 业务错误 | 值长度小于 Schema 约束设定的最小长度 |
-| **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | 业务错误 | 数值小于 Schema 约束设定的最小值 |
-| **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | 业务错误 | 数值大于 Schema 约束设定的最大值 |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | 业务错误 | 目标记录不存在 / 指定的主键值未找到 |
-| **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | 开发者错误 | 传参值格式错误（如非法的 key 格式） |
-| **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 开发者错误 | 参数的数据类型不匹配（期待数字传入字符串等） |
-| **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 开发者错误 | 必填的接口入参未传入 |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 开发者错误 | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 开发者错误 | 索引或范围超限错误（如越界读写缓冲区） |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 开发者错误 | 当前上下文不支持的操作（不支持该平台、未实现等） |
-| **20009** | `DEV_INVALID_DATA_FORMAT` | `ResultType.devInvalidDataFormat` | 开发者错误 | 数据流格式或编解码失败（数据反序列化非法） |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 开发者错误 | 向量计算或比较时维度不匹配（如点积、距离计算等） |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 开发者错误 | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 开发者错误 | 分页冲突（游标分页和 Offset 分页不能同时配置） |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 开发者错误 | 游标包含的表与当前查询表不一致 |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 开发者错误 | 游标签名哈希校验失败（游标已被篡改） |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 开发者错误 | 游标的 orderBy 配置不合规或与原查询不匹配 |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 开发者错误 | 游标 Token 模式不匹配 |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 开发者错误 | 无法解码或反序列化的非法游标载荷 |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 开发者错误 | 查询 Select 字段非法（不是 String 或 QueryAggregation） |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 开发者错误 | 自动 Join 时两表之间未定义外键关系 |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 开发者错误 | 查询字段的别名命名格式不正确 |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 开发者错误 | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） |
-| **21001** | `DEV_PERMISSION_DENIED_READ` | `ResultType.devPermissionDeniedRead` | 开发者错误 | 细粒度安全限制：读权限被拒绝 |
-| **21002** | `DEV_PERMISSION_DENIED_WRITE` | `ResultType.devPermissionDeniedWrite` | 开发者错误 | 细粒度安全限制：写权限被拒绝 |
-| **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | 开发者错误 | 要操作的数据库表名称不存在 |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 开发者错误 | 指定查询引用的索引不存在 |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 开发者错误 | 指定的存储空间（Space）在物理或逻辑上不存在 |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 开发者错误 | 传入了表中未定义的未知字段 |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | 开发者错误 | 超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式 |
-| **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | **致命错误** | 库配置或数据文件与当前引擎版本不兼容，强制拦截抛出 |
-| **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 开发者错误 | 表的 Schema 结构定义配置不正确 |
-| **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 开发者错误 | Schema 表名包含非法字符或超过长度限制 |
-| **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | 开发者错误 | Schema 字段名包含非法字符 |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 开发者错误 | Schema 主键配置格式非法或缺失 |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 开发者错误 | 该表配置的索引数超出了 16 个的系统限制 |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 开发者错误 | 创建表冲突，目标表已经存在 |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 开发者错误 | 结构升级中，添加了已经存在的同名字段 |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 开发者错误 | 追加了同名的索引配置 |
-| **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | 开发者错误 | 外键定义格式非法（如自引用、字段数不对应） |
-| **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | 开发者错误 | 跨 Space 表关系校验冲突 |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | **致命错误** | 结构迁移需要物理变更字段但未被显式允许（`allowPhysicalMigration=false`） |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | **致命错误** | 物理迁移：不支持且极高风险的数据类型转换操作 |
-| **30012** | `DEV_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.devMigrationBatchExecutionFailed` | **致命错误** | 批量表结构迁移物理执行失败 |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | **致命错误** | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | **致命错误** | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | **致命错误** | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 开发者错误 | 表的 TTL（数据生存周期）配置项非法 |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 开发者错误 | 字段重复配置冲突 |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 开发者错误 | 索引指向了表中并不存在的字段名 |
-| **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | 系统错误 | 事务主动回滚或被强制中止 |
-| **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 系统错误 | 并发事务修改了同一实体导致版本冲突 |
-| **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 系统错误 | 事务内获取排他锁超时 |
-| **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 系统错误 | 查询、写入等底层操作执行超时 |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | 系统错误 | 异步操作或计算任务被 CancellationToken 中途取消 |
-| **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | 系统错误 | 物理内存耗尽，可能面临 OOM 风险 |
-| **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | 系统错误 | 磁盘空间耗尽，无法执行落盘写入 |
-| **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | 系统错误 | 物理文件或目录路径不存在 |
-| **53002** | `SYS_IO_PERMISSION_DENIED` | `ResultType.sysIoPermissionDenied` | 系统错误 | 物理文件读写权限不足/拒绝访问 |
-| **53003** | `SYS_IO_DISK_FULL` | `ResultType.sysIoDiskFull` | 系统错误 | 磁盘空间不足或写数据超过配额限额 |
-| **53004** | `SYS_IO_FILE_LOCKED` | `ResultType.sysIoFileLocked` | 系统错误 | 物理文件已被其它进程占用/共享冲突/锁定 |
-| **53005** | `SYS_IO_DEVICE_FAULT` | `ResultType.sysIoDeviceFault` | 系统错误 | 存储设备或介质硬件故障 |
-| **53006** | `SYS_IO_WEB_STORAGE_UNAVAILABLE` | `ResultType.sysIoWebStorageUnavailable` | 系统错误 | Web 端 IndexedDB 满额、被禁用或初始化失败 |
-| **53007** | `SYS_BACKUP_CORRUPTED` | `ResultType.sysBackupCorrupted` | 系统错误 | 备份包已损坏或缺少清单文件 |
-| **53008** | `SYS_IO_DATA_CORRUPTED` | `ResultType.sysIoDataCorrupted` | 系统错误 | 数据库数据文件损坏或 CRC 校验失败 |
-| **53099** | `SYS_IO_GENERIC` | `ResultType.sysIoGeneric` | 系统错误 | 物理文件系统底层遭遇其他硬件或物理 I/O 错误 |
-| **99001** | `ENG_ERROR` | `ResultType.engError` | 引擎错误 | 数据库底层引擎发生代码崩溃、未知内部异常或运行时逻辑缺陷 |
+| `0` | `SUCCESS` | `ResultType.success` | Success | Operation executed successfully |
+| **10000** | `BIZ_VALIDATION_FAILED` | `ResultType.bizValidationFailed` | Business Error | Data format or range validation failed |
+| **10001** | `BIZ_NOT_NULL_VIOLATION` | `ResultType.bizNotNullViolation` | Business Error | Not null constraint violation |
+| **10002** | `BIZ_VALIDATION_TYPE_CAST` | `ResultType.bizTypeCastFailed` | Business Error | Data type conversion or cast failed |
+| **11001** | `BIZ_CONSTRAINT_PRIMARY_KEY` | `ResultType.bizPrimaryKeyViolation` | Business Error | Primary key conflict (already exists) |
+| **11002** | `BIZ_CONSTRAINT_UNIQUE` | `ResultType.bizUniqueViolation` | Business Error | Unique constraint violation |
+| **11003** | `BIZ_CONSTRAINT_FOREIGN_KEY` | `ResultType.bizForeignKeyViolation` | Business Error | Foreign key constraint violation (Generic) |
+| **11004** | `BIZ_CONSTRAINT_CHECK` | `ResultType.bizCheckViolation` | Business Error | Check constraint violation |
+| **11005** | `BIZ_CONSTRAINT_FOREIGN_KEY_PARENT_NOT_EXIST` | `ResultType.bizForeignKeyParentNotExist` | Business Error | Referenced parent key does not exist |
+| **11006** | `BIZ_CONSTRAINT_FOREIGN_KEY_CHILD_RESTRICT` | `ResultType.bizForeignKeyChildRestrict` | Business Error | Delete/update restricted by child records |
+| **11007** | `BIZ_CONSTRAINT_FOREIGN_KEY_COMPOSITE_MISMATCH` | `ResultType.bizForeignKeyCompositeMismatch` | Business Error | Incomplete composite foreign key values |
+| **11008** | `BIZ_CONSTRAINT_FOREIGN_KEY_TYPE_MISMATCH` | `ResultType.bizForeignKeyTypeMismatch` | Business Error | Foreign key type mismatch |
+| **11009** | `BIZ_CONSTRAINT_MAX_LENGTH` | `ResultType.bizValueExceedsMaxLength` | Business Error | Value length exceeds maximum constraint |
+| **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | Business Error | Value length is less than minimum constraint |
+| **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | Business Error | Numeric value is less than minimum constraint |
+| **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | Business Error | Numeric value exceeds maximum constraint |
+| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | Business Error | Resource does not exist / Record not found |
+| **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | Developer Error | Argument format error |
+| **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | Developer Error | Argument type mismatch |
+| **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | Developer Error | Required argument is missing |
+| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Developer Error | Invalid primary key format |
+| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Developer Error | Index or range is out of bounds |
+| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Developer Error | Operation is not supported in the current context |
+| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Developer Error | Vector dimensions mismatch |
+| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Developer Error | Required index field is missing in record for cursor |
+| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Developer Error | Cursor pagination and offset are mutually exclusive |
+| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Developer Error | Cursor does not match target table |
+| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Developer Error | Mismatched cursor signature (tampered) |
+| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Developer Error | Cursor orderBy configuration invalid or mismatched |
+| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Developer Error | Cursor token mode mismatch |
+| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Developer Error | Invalid cursor payload (undecodable) |
+| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Developer Error | Query select field must be String or QueryAggregation |
+| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Developer Error | No foreign key relationship for auto join |
+| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Developer Error | Query field alias format invalid |
+| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Developer Error | Invalid expression configuration or execution |
+| **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | Developer Error | Table not found |
+| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Developer Error | Index not found |
+| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Developer Error | Space not found |
+| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Developer Error | Field not found |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | Developer Error | Large-scale operation requires skipping result details to prevent OOM |
+| **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Developer Error | **Critical**: Engine version incompatible |
+| **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Developer Error | Invalid table schema definition |
+| **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Developer Error | Table name validation failed |
+| **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | Developer Error | Field name validation failed |
+| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Developer Error | Primary key validation failed |
+| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Developer Error | Index count validation failed |
+| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Developer Error | Table already exists |
+| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Developer Error | Field already exists |
+| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Developer Error | Index already exists |
+| **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | Developer Error | Foreign key definition invalid |
+| **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | Developer Error | Global/Space-specific boundary mismatch |
+| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Developer Error | Migration requires data modification and was not explicitly allowed |
+| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Developer Error | Unsupported data type change for field |
+| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Developer Error | Cannot add non-nullable field without a default value |
+| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Developer Error | Changing field from nullable to non-nullable is not allowed |
+| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Developer Error | Changing field from non-unique to unique is not allowed |
+| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Developer Error | TTL configuration validation failed |
+| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Developer Error | Duplicate field name in table schema |
+| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Developer Error | Index references non-existent field |
+| **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | System Error | Transaction aborted |
+| **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | System Error | Transaction conflict |
+| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | System Error | **Critical**: Batch migration execution failed |
+| **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | System Error | Lock acquisition timeout |
+| **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | System Error | Operation timeout |
+| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | System Error | Operation was cancelled |
+| **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | System Error | **Critical**: Memory resource exhausted |
+| **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | System Error | **Critical**: System resources exhausted |
+| **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | System Error | Physical file or path does not exist |
+| **53002** | `SYS_IO_PERMISSION_DENIED` | `ResultType.sysIoPermissionDenied` | System Error | Permission denied for file access |
+| **53003** | `SYS_IO_DISK_FULL` | `ResultType.sysIoDiskFull` | System Error | **Critical**: Disk full or storage quota exceeded |
+| **53004** | `SYS_IO_FILE_LOCKED` | `ResultType.sysIoFileLocked` | System Error | File is locked or in use by another process |
+| **53005** | `SYS_IO_DEVICE_FAULT` | `ResultType.sysIoDeviceFault` | System Error | **Critical**: Storage device or media fault |
+| **53006** | `SYS_IO_WEB_STORAGE_UNAVAILABLE` | `ResultType.sysIoWebStorageUnavailable` | System Error | Web IndexedDB or storage is unavailable |
+| **53007** | `SYS_BACKUP_CORRUPTED` | `ResultType.sysBackupCorrupted` | System Error | Backup package is corrupted or missing metadata |
+| **53008** | `SYS_IO_DATA_CORRUPTED` | `ResultType.sysIoDataCorrupted` | System Error | **Critical**: Database data file is corrupted or checksum failed |
+| **53009** | `SYS_INVALID_DATA_FORMAT` | `ResultType.sysInvalidDataFormat` | System Error | Data stream formatting or parsing failed |
+| **53099** | `SYS_IO_GENERIC` | `ResultType.sysIoGeneric` | System Error | Generic system IO error |
+| **99001** | `ENG_ERROR` | `ResultType.engError` | Engine Error | Engine error |
