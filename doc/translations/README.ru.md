@@ -1418,30 +1418,32 @@ if (txResult.isFailed) {
 
 
 ### <a id="logging-diagnostics"></a>Обратный вызов журнала и диагностика базы данных
+ToStore может направлять журналы жизненного цикла базы данных обратно на бизнес-уровень через `ToStore.setLogConfig(...)`.
 
-ToStore может направлять журналы запуска, восстановления, автоматической миграции и конфликтов ограничений времени выполнения обратно на бизнес-уровень через `LogConfig.setConfig(...)`.
-
-- `onLogHandler` получает все журналы, прошедшие текущие фильтры `enableLog` и `logLevel`.
-- Вызовите `LogConfig.setConfig(...)` перед инициализацией, чтобы также были записаны журналы, созданные во время инициализации и автоматической миграции.
+- Обратный вызов `onLog` получает все записи журнала `LogRecord`, которые проходят текущие фильтры `enableLog` и `logLevel`.
+  - **LogLevel.error**: Произошла локальная ошибка, не влияющая на нормальную работу.
+  - **LogLevel.critical**: Глобальная ошибка уровня катастрофы (например, переполнение диска, недостаток памяти, критический сбой миграции и т. д.), требующая ручного вмешательства. Рекомендуется настроить оповещения на этом уровне.
+- Вызовите `ToStore.setLogConfig(...)` перед инициализацией, чтобы также были записаны журналы, созданные во время инициализации и автоматической миграции.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Настройка параметров журнала или обратного вызова
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Светло-серый заголовок вверху журнала для различения приложений или экземпляров баз данных,
+    onLog: (log) {
+      // В рабочей среде warn/error/critical можно отправлять в бэкенд или на платформу логирования
+      // log.level соответствует уровню журнала (LogLevel.debug, info, warn, error, critical)
+      // log.message соответствует обработанному тексту журнала
+      // log.status соответствует базовому состоянию диагностики ResultStatus (содержит code и codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Конфигурация безопасности
 
 > [!WARNING]
