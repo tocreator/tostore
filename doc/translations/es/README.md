@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1232,10 +1232,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+if (!txResult.hasErrors) {
+  print('Transacción confirmada con éxito');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('Transacción revertida debido a:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1330,14 +1335,30 @@ final restored = await db.restore(
 
 ### <a id="error-handling"></a>Códigos de estado y manejo de errores
 
+Hay dos canales para la retroalimentación de errores y excepciones en ToStore:
 
-ToStore utiliza un modelo de respuesta unificado para operaciones de datos:
+> [!NOTE]
+> **Base de diagnóstico unificada**: Ya sea que se devuelvan a través del modelo de resultado de respuesta (`statuses` en `DbResult`/`QueryResult`) o se lancen a través de excepciones fatales (`statuses` en `DbException`), todos los estados de diagnóstico se basan uniformemente en el sistema estructurado **`ResultStatus`** y comparten los mesmos códigos de estado, lo que garantiza la coherencia.
 
-- `ResultType`: la enumeración de estado unificada utilizada para la lógica de ramificación
-- `result.code`: un código numérico estable correspondiente a `ResultType`
-- `result.message`: un mensaje legible que describe el error actual
-- `successKeys` / `failedKeys`: listas de claves primarias exitosas y fallidas en operaciones masivas
+1. Modelo de resultado de respuesta (Result-based Response)
+Para operaciones cotidianas como inserción, actualización, eliminación, consulta, transacciones y modificaciones del esquema de tabla en tiempo de ejecución. Estas operaciones **no lanzarán excepciones** cuando ocurran violaciones de restricciones, fallos de validación o argumentos no válidos. En su lugar, ToStore envuelve los resultados usando `DbResult` o `QueryResult`, registrando toda la información de diagnóstico en la lista de estados. Esto garantiza que los errores ordinarios de lógica empresarial no interrumpan la base de datos.
 
+- **`hasErrors`: Indica si hay errores en la operación actual. En operaciones por lotes o transacciones, si hay al menos un error, esta propiedad es `true`.**
+- **`statuses`: Una lista detallada de todos los diagnósticos `ResultStatus` de la operación. Admite una coincidencia de orden 1:1, lo cual es muy útil para operaciones por lotes.**
+- **`firstPrimaryKey`: Lee la clave primaria generada físicamente de forma directa durante una única operación de inserción/escritura sin necesidad de analizar `statuses` manualmente.**
+- **`ResultType`: Enumeración para la categoría de estado, conveniente para el manejo de bifurcaciones y comprobaciones (por ejemplo, `isBusinessError`, `isDeveloperError`).**
+
+2. Lanzamiento de excepciones (Exception-based Throwing)
+Para errores fatales causados por descuidos del desarrollador o fallos de diseño (por ejemplo, fallo en la verificación del esquema durante `ToStore.open`, incompatibilidad de la versión del motor, corrupción fatal en la migración de datos, etc.). En estos casos, ToStore lanza `DbException` para detener la ejecución, instando al desarrollador a rectificarla.
+
+> [!WARNING]
+> **Pautas de desarrollo**: Los errores comerciales ordinarios no deben lanzar excepciones; deben devolverse en el modelo de resultado de respuesta para evitar interrumpir el tiempo de ejecución de la aplicación.
+
+---
+
+### Ejemplos de errores y excepciones
+
+#### 1. Manejo de respuesta para una sola escritura
 
 ```dart
 final result = await db.insert('users', {
@@ -1345,77 +1366,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // Obtener el primer tipo de error y descripción
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('Escritura exitosa, la clave primaria es: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. Diagnóstico detallado en escritura por lotes
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('Operación por lotes fallida parcialmente: exitosos \${batchResult.successCount}, fallidos \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] Violación de restricción! Tabla! Tabla: \${status.tableName}, campos: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] Error de argumento! Parámetro! Parameter: \${status.parameterName}, valor pasado: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] Ocurrió un error: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-Ejemplos de códigos de estado comunes:
-El éxito regresa `0`; los números negativos indican errores.
-- `ResultType.success` (`0`): operación exitosa
-- `ResultType.partialSuccess` (`1`): operación masiva parcialmente exitosa
-- `ResultType.unknown` (`-1`): error desconocido
-- `ResultType.uniqueViolation` (`-2`): conflicto de índice único
-- `ResultType.primaryKeyViolation` (`-3`): conflicto de clave primaria
-- `ResultType.foreignKeyViolation` (`-4`): la referencia de clave externa no satisface las restricciones
-- `ResultType.notNullViolation` (`-5`): falta un campo obligatorio o se pasó un `null` no permitido
-- `ResultType.validationFailed` (`-6`): longitud, rango, formato u otra validación fallida
-- `ResultType.notFound` (`-11`): la tabla, el espacio o el recurso de destino no existe
-- `ResultType.resourceExhausted` (`-15`): recursos del sistema insuficientes; reducir la carga o volver a intentarlo
-- `ResultType.dbError` (`-91`): error de base de datos
-- `ResultType.ioError` (`-90`): error del sistema de archivos
-- `ResultType.timeout` (`-92`): tiempo de espera
+#### 3. Error fatal y captura de excepción de inicialización (DbException)
 
-### Manejo de resultados de transacciones
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ Excepción fatal de base de datos! Mensaje de error: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('Fallo en la validación del esquema! Tabla! Tabla: \${status.tableName}, campo: \${status.field}, configuración no válida: \${status.wrongValue}');
+    } else {
+      print('Información de diagnóstico: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-Tipos de errores de transacción:
-- `TransactionErrorType.operationError`: una operación normal falló dentro de la transacción, como una falla de validación de campo, un estado de recurso no válido u otro error a nivel empresarial
-- `TransactionErrorType.integrityViolation`: conflicto de integridad o restricción, como clave primaria, clave única, clave externa o falla no nula
-- `TransactionErrorType.timeout`: tiempo de espera
-- `TransactionErrorType.io`: error de E/S de almacenamiento subyacente o sistema de archivos
-- `TransactionErrorType.conflict`: un conflicto provocó que la transacción fallara
-- `TransactionErrorType.userAbort`: cancelación iniciada por el usuario (actualmente no se admite la cancelación manual basada en lanzamientos)
-- `TransactionErrorType.unknown`: cualquier otro error
-
+Para obtener la lista completa de tipos de errores, códigos de estado hoja, formatos de serialización JSON y asignaciones de campos, consulte la especificación completa: [Especificación de diagnóstico automático y resolución de estado de ToStore ResultStatus](result_status_specification.md).
 
 ### <a id="logging-diagnostics"></a>Registrar devolución de llamada y diagnóstico de base de datos
 ToStore puede enrutar los registros del ciclo de vida de la base de datos a la capa empresarial a través de `ToStore.setLogConfig(...)`.
