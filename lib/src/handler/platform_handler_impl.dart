@@ -46,8 +46,7 @@ class PlatformHandlerImpl implements PlatformInterface {
         _cachedIsMobile = Platform.isAndroid || Platform.isIOS;
       } catch (e) {
         _cachedIsMobile = false;
-        Logger.warn('Error detecting mobile platform: $e',
-            label: 'PlatformHandlerImpl.isMobile');
+        Logger.warn('Error detecting mobile platform', rawError: e);
       }
     }
     return _cachedIsMobile!;
@@ -62,8 +61,7 @@ class PlatformHandlerImpl implements PlatformInterface {
             Platform.isWindows || Platform.isMacOS || Platform.isLinux;
       } catch (e) {
         _cachedIsDesktop = false;
-        Logger.warn('Error detecting desktop platform: $e',
-            label: 'PlatformHandlerImpl.isDesktop');
+        Logger.warn('Error detecting desktop platform', rawError: e);
       }
     }
     return _cachedIsDesktop!;
@@ -174,8 +172,7 @@ class PlatformHandlerImpl implements PlatformInterface {
         _cachedIsServerEnvironment = isLinux;
       } catch (e) {
         _cachedIsServerEnvironment = false;
-        Logger.warn('Error detecting server environment: $e',
-            label: 'PlatformHandlerImpl.isServerEnvironment');
+        Logger.warn('Error detecting server environment', rawError: e);
       }
     }
     return _cachedIsServerEnvironment!;
@@ -381,8 +378,7 @@ class PlatformHandlerImpl implements PlatformInterface {
 
       if (fallbackMB > 0) return fallbackMB;
     } catch (e) {
-      Logger.error('Failed to get disk free space for $path: $e',
-          label: 'PlatformHandlerImpl.getDiskFreeSpaceMB');
+      Logger.error('Failed to get disk free space for $path', rawError: e);
     }
     // Safe default: 10GB if all detection methods fail or are unsupported
     return 10240;
@@ -464,8 +460,7 @@ class PlatformHandlerImpl implements PlatformInterface {
         }
       }
     } catch (e) {
-      Logger.error('Error getting environment variables for path: $e',
-          label: 'PlatformHandlerImpl.getPathApp');
+      Logger.error('Error getting environment variables for path', rawError: e);
     }
 
     if (basePath != null && basePath.isNotEmpty) {
@@ -482,17 +477,15 @@ class PlatformHandlerImpl implements PlatformInterface {
         _cachedAppPath = directory.path;
         return _cachedAppPath!;
       } catch (e) {
-        Logger.error(
-            'Failed to create application directory at $appPath. Error: $e',
-            label: 'PlatformHandlerImpl.getPathApp');
+        Logger.error('Failed to create application directory at $appPath.',
+            rawError: e);
         // Fall through to the final fallback.
       }
     }
 
     // Final fallback: use a directory in the system temp folder.
     Logger.error(
-        'Could not determine a standard application data directory. Falling back to a temporary directory. Data may be lost on system restart. Please set dbPath to a persistent database root path (e.g., via ToStore(dbPath: ...) or DataStoreConfig(dbPath: ...)).',
-        label: 'PlatformHandlerImpl.getPathApp');
+        'Could not determine a standard application data directory. Falling back to a temporary directory. Data may be lost on system restart. Please set dbPath to a persistent database root path (e.g., via ToStore(dbPath: ...) or DataStoreConfig(dbPath: ...)).');
     try {
       final tempPath =
           path.join(Directory.systemTemp.path, appName, dataDirName);
@@ -503,8 +496,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       _cachedAppPath = tempDir.path;
       return _cachedAppPath!;
     } catch (e) {
-      Logger.error('Failed to create temporary directory. Error: $e',
-          label: 'PlatformHandlerImpl.getPathApp');
+      Logger.error('Failed to create temporary directory.', rawError: e);
       // As an absolute last resort, use a path in the current directory.
       final fallbackPath = path.join(Directory.current.path, '.tostore_data');
       final fallbackDir = Directory(fallbackPath);
@@ -892,8 +884,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       await encoder.addDirectory(Directory(sourceDir), includeDirName: false);
       await encoder.close();
     } catch (e) {
-      Logger.error('compress directory failed: $e',
-          label: 'PlatformHandlerImpl.compressDirectory');
+      Logger.error('compress directory failed', rawError: e);
       rethrow;
     }
   }
@@ -909,8 +900,7 @@ class PlatformHandlerImpl implements PlatformInterface {
 
       await extractFileToDisk(zipPath, targetDir);
     } catch (e) {
-      Logger.error('decompress ZIP file failed: $e',
-          label: 'PlatformHandlerImpl.extractZip');
+      Logger.error('decompress ZIP file failed', rawError: e);
 
       // try alternative decompression method
       try {
@@ -931,7 +921,7 @@ class PlatformHandlerImpl implements PlatformInterface {
       } catch (fallbackError) {
         Logger.error(
             'alternative decompression method also failed: $fallbackError',
-            label: 'PlatformHandlerImpl.extractZip');
+            rawError: e);
         rethrow;
       }
     }
@@ -944,16 +934,14 @@ class PlatformHandlerImpl implements PlatformInterface {
       // Check if file exists
       final file = File(zipPath);
       if (!await file.exists()) {
-        Logger.warn('ZIP file does not exist: $zipPath',
-            label: 'PlatformHandlerImpl.verifyZipFile');
+        Logger.warn('ZIP file does not exist: $zipPath');
         return false;
       }
 
       // Read file bytes
       final bytes = await file.readAsBytes();
       if (bytes.isEmpty) {
-        Logger.warn('ZIP file is empty: $zipPath',
-            label: 'PlatformHandlerImpl.verifyZipFile');
+        Logger.warn('ZIP file is empty: $zipPath');
         return false;
       }
 
@@ -965,21 +953,18 @@ class PlatformHandlerImpl implements PlatformInterface {
         if (requiredFile != null) {
           final hasRequiredFile = archive.findFile(requiredFile) != null;
           if (!hasRequiredFile) {
-            Logger.warn('Required file not found in ZIP: $requiredFile',
-                label: 'PlatformHandlerImpl.verifyZipFile');
+            Logger.warn('Required file not found in ZIP: $requiredFile');
             return false;
           }
         }
 
         return true;
       } catch (decodeError) {
-        Logger.error('Failed to decode ZIP file: $decodeError',
-            label: 'PlatformHandlerImpl.verifyZipFile');
+        Logger.error('Failed to decode ZIP file', rawError: decodeError);
         return false;
       }
     } catch (e) {
-      Logger.error('Error verifying ZIP file: $e',
-          label: 'PlatformHandlerImpl.verifyZipFile');
+      Logger.error('Error verifying ZIP file', rawError: e);
       return false;
     }
   }
