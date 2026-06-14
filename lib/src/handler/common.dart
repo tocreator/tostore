@@ -55,10 +55,7 @@ String toStringWithAll(Object? object) {
       value = object.toString();
     }
   } catch (e) {
-    Logger.error(
-      'cannot convert ${object.runtimeType} to string: $e',
-      label: 'toStringWithAll',
-    );
+    Logger.error('cannot convert ${object.runtimeType} to string', rawError: e);
   }
   return value;
 }
@@ -234,7 +231,7 @@ int calculateUtf8Length(String content) {
   try {
     return content.isEmpty ? 0 : utf8.encode(content).length;
   } catch (e) {
-    Logger.error('UTF8 encode error: $e');
+    Logger.error('UTF8 encode error', rawError: e);
     // downgrade: return character count (non-exact value)
     return content.length;
   }
