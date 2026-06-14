@@ -53,8 +53,6 @@ enum ResultType {
       20007, 'DEV_INDEX_OUT_OF_BOUNDS', 'Index or range is out of bounds'),
   devUnsupportedOperation(20008, 'DEV_UNSUPPORTED_OPERATION',
       'Operation is not supported in the current context'),
-  devInvalidDataFormat(20009, 'DEV_INVALID_DATA_FORMAT',
-      'Data stream formatting or parsing failed'),
   devVectorDimensionMismatch(
       20010, 'DEV_VECTOR_DIMENSION_MISMATCH', 'Vector dimensions mismatch'),
   devIndexFieldMissing(20011, 'DEV_INDEX_FIELD_MISSING',
@@ -79,10 +77,6 @@ enum ResultType {
       'Query field alias format invalid'),
   devInvalidExpression(20304, 'DEV_INVALID_EXPRESSION',
       'Invalid expression configuration or execution'),
-  devPermissionDeniedRead(
-      21001, 'DEV_PERMISSION_DENIED_READ', 'Read permission denied'),
-  devPermissionDeniedWrite(
-      21002, 'DEV_PERMISSION_DENIED_WRITE', 'Write permission denied'),
   devTableNotFound(22001, 'DEV_NOT_FOUND_TABLE', 'Table not found'),
   devIndexNotFound(22003, 'DEV_NOT_FOUND_INDEX', 'Index not found'),
   devSpaceNotFound(22004, 'DEV_NOT_FOUND_SPACE', 'Space not found'),
@@ -92,7 +86,8 @@ enum ResultType {
       'DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS',
       'Large-scale operation requires skipping result details to prevent OOM'),
   devEngineIncompatible(
-      24001, 'DEV_ENGINE_INCOMPATIBLE', 'Engine version incompatible'),
+      24001, 'DEV_ENGINE_INCOMPATIBLE', 'Engine version incompatible',
+      isCritical: true),
   devInvalidSchema(
       30000, 'DEV_INVALID_SCHEMA', 'Invalid table schema definition'),
   devInvalidSchemaTableName(
@@ -119,10 +114,6 @@ enum ResultType {
       30011,
       'DEV_MIGRATION_UNSAFE_TYPE_CONVERSION',
       'Unsupported data type change for field'),
-  devMigrationBatchExecutionFailed(
-      30012,
-      'DEV_MIGRATION_BATCH_EXECUTION_FAILED',
-      'Batch migration execution failed'),
   devMigrationCannotAddNonNullField(
       30013,
       'DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD',
@@ -149,30 +140,42 @@ enum ResultType {
       50001, 'SYS_TRANSACTION_ABORTED', 'Transaction aborted'),
   sysTransactionConflict(
       50002, 'SYS_TRANSACTION_CONFLICT', 'Transaction conflict'),
+  sysMigrationBatchExecutionFailed(
+      50003,
+      'SYS_MIGRATION_BATCH_EXECUTION_FAILED',
+      'Batch migration execution failed',
+      isCritical: true),
   sysTimeoutLockAcquisition(
       51001, 'SYS_TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
   sysTimeout(51002, 'SYS_TIMEOUT', 'Operation timeout'),
   sysCancellation(51003, 'SYS_CANCELLATION', 'Operation was cancelled'),
   sysResourceExhaustedMemory(
-      52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted'),
+      52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted',
+      isCritical: true),
   sysResourceExhausted(
-      52002, 'SYS_RESOURCE_EXHAUSTED', 'System resources exhausted'),
+      52002, 'SYS_RESOURCE_EXHAUSTED', 'System resources exhausted',
+      isCritical: true),
   sysIoNotFound(
       53001, 'SYS_IO_NOT_FOUND', 'Physical file or path does not exist'),
   sysIoPermissionDenied(
       53002, 'SYS_IO_PERMISSION_DENIED', 'Permission denied for file access'),
   sysIoDiskFull(
-      53003, 'SYS_IO_DISK_FULL', 'Disk full or storage quota exceeded'),
+      53003, 'SYS_IO_DISK_FULL', 'Disk full or storage quota exceeded',
+      isCritical: true),
   sysIoFileLocked(53004, 'SYS_IO_FILE_LOCKED',
       'File is locked or in use by another process'),
   sysIoDeviceFault(
-      53005, 'SYS_IO_DEVICE_FAULT', 'Storage device or media fault'),
+      53005, 'SYS_IO_DEVICE_FAULT', 'Storage device or media fault',
+      isCritical: true),
   sysIoWebStorageUnavailable(53006, 'SYS_IO_WEB_STORAGE_UNAVAILABLE',
       'Web IndexedDB or storage is unavailable'),
   sysBackupCorrupted(53007, 'SYS_BACKUP_CORRUPTED',
       'Backup package is corrupted or missing metadata'),
   sysIoDataCorrupted(53008, 'SYS_IO_DATA_CORRUPTED',
-      'Database data file is corrupted or checksum failed'),
+      'Database data file is corrupted or checksum failed',
+      isCritical: true),
+  sysInvalidDataFormat(53009, 'SYS_INVALID_DATA_FORMAT',
+      'Data stream formatting or parsing failed'),
   sysIoGeneric(53099, 'SYS_IO_GENERIC', 'Generic system IO error'),
 
   // "ENG_" - Engine Error (99)
@@ -187,8 +190,12 @@ enum ResultType {
   /// Default status description
   final String message;
 
+  /// Whether the error is a critical system error requiring manual intervention
+  final bool isCritical;
+
   /// Constructor
-  const ResultType(this.code, this.codeKey, this.message);
+  const ResultType(this.code, this.codeKey, this.message,
+      {this.isCritical = false});
 
   /// Get the corresponding enum from the status code value
   static ResultType fromCode(int code) {
@@ -226,6 +233,7 @@ enum ResultType {
   /// Whether the error belongs to Engine Error (99)
   bool get isEngineError => code >= 99000 && code < 100000;
 
-  /// Whether the error is a fatal error that must throw exception in any environment
-  bool get isFatalError => this == ResultType.devEngineIncompatible;
+  /// Whether the error is a critical system error requiring manual intervention
+  /// (e.g., out of memory, disk full, critical migration failures)
+  bool get isCriticalError => isCritical;
 }
