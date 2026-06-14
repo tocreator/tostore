@@ -36,6 +36,9 @@ abstract class ResultStatus {
   /// Whether this status is an Engine Error
   bool get isEngineError => type.isEngineError;
 
+  /// Whether this status is a critical system error requiring manual intervention
+  bool get isCriticalError => type.isCriticalError;
+
   ResultStatus({
     required this.type,
     required this.message,
@@ -105,7 +108,7 @@ abstract class ResultStatus {
         passedValue: json['passedValue'],
         primaryKey: json['primaryKey']?.toString(),
       );
-    } else if (type.code >= 50000 && type.code < 51000) {
+    } else if (type.code == 50001 || type.code == 50002) {
       return TransactionOperationStatus(
         type: type,
         message: message,
