@@ -14,7 +14,6 @@ class V3Upgrade {
   Future<void> execute(GlobalConfig oldGlobalConfig) async {
     Logger.info(
       'Starting database upgrade to version 3',
-      label: 'V3Upgrade.execute',
     );
 
     final spaces = oldGlobalConfig.spaceNames.isNotEmpty
@@ -31,7 +30,6 @@ class V3Upgrade {
 
     Logger.info(
       'Database upgrade to version 3 completed',
-      label: 'V3Upgrade.execute',
     );
   }
 
@@ -50,10 +48,8 @@ class V3Upgrade {
         spaceName: spaceName,
       );
     } catch (e) {
-      Logger.warn(
-        'Skip upgrading space [$spaceName] config to v3: $e',
-        label: 'V3Upgrade._upgradeSpaceVersion',
-      );
+      Logger.warn('Skip upgrading space [$spaceName] config to v3',
+          rawError: e);
     }
   }
 }
