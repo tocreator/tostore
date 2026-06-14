@@ -31,15 +31,13 @@ final class CacheManager {
         // Evict record cache first
         await _dataStore.tableDataManager.evictTableRecordCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict hot record cache failed: $e',
-            label: 'CacheManager.tableData');
+        Logger.warn('Evict hot record cache failed', rawError: e);
       }
       try {
         // Then evict page cache (B+Tree pages)
         await _dataStore.tableTreePartitionManager?.evictPageCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict page cache failed: $e',
-            label: 'CacheManager.tableData');
+        Logger.warn('Evict page cache failed', rawError: e);
       }
     });
 
@@ -49,15 +47,13 @@ final class CacheManager {
         // Evict B+Tree page cache
         await _dataStore.indexTreePartitionManager?.evictPageCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict index page cache failed: $e',
-            label: 'CacheManager.indexData');
+        Logger.warn('Evict index page cache failed', rawError: e);
       }
       try {
         // Evict NGH vector index caches
         await _dataStore.vectorIndexManager?.evictCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict vector index cache failed: $e',
-            label: 'CacheManager.indexData');
+        Logger.warn('Evict vector index cache failed', rawError: e);
       }
     });
 
@@ -66,8 +62,7 @@ final class CacheManager {
       try {
         await _dataStore.queryExecutor.evictQueryCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict query cache failed: $e',
-            label: 'CacheManager.queryResult');
+        Logger.warn('Evict query cache failed', rawError: e);
       }
     });
 
@@ -76,8 +71,7 @@ final class CacheManager {
       try {
         await _dataStore.schemaManager?.evictSchemaCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict schema cache failed: $e',
-            label: 'CacheManager.schema');
+        Logger.warn('Evict schema cache failed', rawError: e);
       }
     });
 
@@ -86,14 +80,12 @@ final class CacheManager {
       try {
         await _dataStore.tableDataManager.evictTableMetaCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict table meta cache failed: $e',
-            label: 'CacheManager.meta');
+        Logger.warn('Evict table meta cache failed', rawError: e);
       }
       try {
         await _dataStore.indexManager?.evictIndexMetaCache(0.3);
       } catch (e) {
-        Logger.warn('Evict index meta cache failed: $e',
-            label: 'CacheManager.meta');
+        Logger.warn('Evict index meta cache failed', rawError: e);
       }
     });
   }
@@ -158,7 +150,7 @@ final class CacheManager {
     _dataStore.clearAllTtlPlanCache();
     _statsCache.clear();
 
-    Logger.debug('Clear all cache', label: 'CacheManager.clear');
+    Logger.debug('Clear all cache');
   }
 
   /// Invalidate all caches of a table
@@ -213,10 +205,9 @@ final class CacheManager {
       }
     } catch (e) {
       Logger.error(
-        'Invalidate table cache failed: $e\n'
-        'tableName: $tableName',
-        label: 'CacheManager.invalidateCache',
-      );
+          'Invalidate table cache failed\n'
+          'tableName: $tableName',
+          rawError: e);
     }
   }
 
