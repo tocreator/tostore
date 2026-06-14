@@ -44,8 +44,7 @@ class LargeOperationRunner {
   /// Cooperatively pause ongoing background tasks for switch space or shutdown.
   static Future<void> pauseForShutdown(DataStoreImpl dataStore) async {
     final space = dataStore.currentSpaceName;
-    Logger.info('Stopping background large operations for space [$space]...',
-        label: 'LargeOperationRunner');
+    Logger.info('Stopping background large operations for space [$space]...');
     requestPause(space);
 
     final task = _activeTasks[space];
@@ -61,8 +60,7 @@ class LargeOperationRunner {
     dataStore.backgroundWriteScheduler
         .clearEntriesOfType(BackgroundWriteType.largeUpdate);
 
-    Logger.info('Background large operations stopped for space [$space].',
-        label: 'LargeOperationRunner');
+    Logger.info('Background large operations stopped for space [$space].');
   }
 
   /// Run or resume pending large delete/update operations for the given [dataStore] space.
@@ -81,10 +79,9 @@ class LargeOperationRunner {
     unawaited(() async {
       try {
         await _executePendingLoop(dataStore, token);
-      } catch (e, s) {
-        Logger.error(
-            'Error running pending operations for space $space: $e\n$s',
-            label: 'LargeOperationRunner');
+      } catch (e) {
+        Logger.error('Error running pending operations for space $space',
+            rawError: e);
       } finally {
         _activeTokens.remove(space);
         _activeTasks.remove(space);
@@ -151,8 +148,7 @@ class LargeOperationRunner {
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
     Logger.info(
-        'Starting/resuming background delete for table [${op.table}] (opId: ${op.opId}).',
-        label: 'LargeOperationRunner');
+        'Starting/resuming background delete for table [${op.table}] (opId: ${op.opId}).');
 
     try {
       final tableName = op.table;
@@ -248,9 +244,8 @@ class LargeOperationRunner {
                   deletedPkValues: pkValue,
                 );
               } catch (e) {
-                Logger.error(
-                    'RESTRICT constraint check failed in heavy delete: $e',
-                    label: 'LargeOperationRunner');
+                Logger.error('RESTRICT constraint check failed in heavy delete',
+                    rawError: e);
                 rethrow;
               }
 
@@ -261,8 +256,8 @@ class LargeOperationRunner {
                   skipRestrictCheck: true,
                 );
               } catch (e) {
-                Logger.error('Cascade delete failed in heavy delete: $e',
-                    label: 'LargeOperationRunner');
+                Logger.error('Cascade delete failed in heavy delete',
+                    rawError: e);
                 rethrow;
               }
             }
@@ -328,12 +323,10 @@ class LargeOperationRunner {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeDelete(op.opId);
         Logger.info(
-            'Background delete completed for table [${op.table}] (opId: ${op.opId}).',
-            label: 'LargeOperationRunner');
+            'Background delete completed for table [${op.table}] (opId: ${op.opId}).');
       } catch (_) {}
-    } catch (e, s) {
-      Logger.error('Large delete failed for ${op.opId}: $e\n$s',
-          label: 'LargeOperationRunner');
+    } catch (e) {
+      Logger.error('Large delete failed for ${op.opId}', rawError: e);
       try {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.cancelLargeDelete(op.opId);
@@ -355,8 +348,7 @@ class LargeOperationRunner {
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
     Logger.info(
-        'Starting/resuming background update for table [${op.table}] (opId: ${op.opId}).',
-        label: 'LargeOperationRunner');
+        'Starting/resuming background update for table [${op.table}] (opId: ${op.opId}).');
 
     try {
       final tableName = op.table;
@@ -552,12 +544,12 @@ class LargeOperationRunner {
                 );
               } catch (e) {
                 Logger.error(
-                    'Unique constraint check failed in heavy update reserve: $e',
-                    label: 'LargeOperationRunner');
+                    'Unique constraint check failed in heavy update reserve',
+                    rawError: e);
                 if (op.continueOnPartialErrors) {
                   Logger.warn(
-                      'Skip updating record with PK $pkValueStr due to unique constraint conflict: $e',
-                      label: 'LargeOperationRunner');
+                      'Skip updating record with PK $pkValueStr due to unique constraint conflict',
+                      rawError: e);
                   continue;
                 }
                 rethrow;
@@ -593,13 +585,12 @@ class LargeOperationRunner {
                     );
                   } catch (_) {}
                 }
-                Logger.error(
-                    'Unique constraint check failed in heavy update: $e',
-                    label: 'LargeOperationRunner');
+                Logger.error('Unique constraint check failed in heavy update',
+                    rawError: e);
                 if (op.continueOnPartialErrors) {
                   Logger.warn(
-                      'Skip updating record with PK $pkValueStr due to unique constraint conflict: $e',
-                      label: 'LargeOperationRunner');
+                      'Skip updating record with PK $pkValueStr due to unique constraint conflict',
+                      rawError: e);
                   continue;
                 }
                 rethrow;
@@ -627,12 +618,12 @@ class LargeOperationRunner {
                   );
                 } catch (e) {
                   Logger.error(
-                      'Unique constraint check failed in primary key update reserve: $e',
-                      label: 'LargeOperationRunner');
+                      'Unique constraint check failed in primary key update reserve',
+                      rawError: e);
                   if (op.continueOnPartialErrors) {
                     Logger.warn(
-                        'Skip primary key update for record with PK $pkValueStr due to unique conflict: $e',
-                        label: 'LargeOperationRunner');
+                        'Skip primary key update for record with PK $pkValueStr due to unique conflict',
+                        rawError: e);
                     continue;
                   }
                   rethrow;
@@ -669,12 +660,12 @@ class LargeOperationRunner {
                     } catch (_) {}
                   }
                   Logger.error(
-                      'Unique constraint check failed in primary key update: $e',
-                      label: 'LargeOperationRunner');
+                      'Unique constraint check failed in primary key update',
+                      rawError: e);
                   if (op.continueOnPartialErrors) {
                     Logger.warn(
-                        'Skip primary key update for record with PK $pkValueStr due to unique conflict: $e',
-                        label: 'LargeOperationRunner');
+                        'Skip primary key update for record with PK $pkValueStr due to unique conflict',
+                        rawError: e);
                     continue;
                   }
                   rethrow;
@@ -690,8 +681,8 @@ class LargeOperationRunner {
                     );
                   } catch (e) {
                     Logger.error(
-                        'RESTRICT constraint check failed in primary key update: $e',
-                        label: 'LargeOperationRunner');
+                        'RESTRICT constraint check failed in primary key update',
+                        rawError: e);
                     rethrow;
                   }
 
@@ -702,8 +693,8 @@ class LargeOperationRunner {
                       newPkValues: newPkVal,
                     );
                   } catch (e) {
-                    Logger.error('Cascade update failed in heavy update: $e',
-                        label: 'LargeOperationRunner');
+                    Logger.error('Cascade update failed in heavy update',
+                        rawError: e);
                     rethrow;
                   }
                 }
@@ -728,8 +719,8 @@ class LargeOperationRunner {
                   operation: ForeignKeyOperation.update,
                 );
               } catch (e) {
-                Logger.error('Foreign key check failed in heavy update: $e',
-                    label: 'LargeOperationRunner');
+                Logger.error('Foreign key check failed in heavy update',
+                    rawError: e);
                 rethrow;
               }
             }
@@ -836,12 +827,10 @@ class LargeOperationRunner {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeUpdate(op.opId);
         Logger.info(
-            'Background update completed for table [${op.table}] (opId: ${op.opId}).',
-            label: 'LargeOperationRunner');
+            'Background update completed for table [${op.table}] (opId: ${op.opId}).');
       } catch (_) {}
-    } catch (e, s) {
-      Logger.error('Large update failed for ${op.opId}: $e\n$s',
-          label: 'LargeOperationRunner');
+    } catch (e) {
+      Logger.error('Large update failed for ${op.opId}', rawError: e);
       try {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.cancelLargeUpdate(op.opId);
@@ -865,8 +854,7 @@ class LargeOperationRunner {
       if (token.isCancelled) break;
       if (++rounds > 512) {
         Logger.warn(
-            'Background write drain hit round limit for operation $opId',
-            label: 'LargeOperationRunner');
+            'Background write drain hit round limit for operation $opId');
         break;
       }
       await dataStore.parallelJournalManager.flushCompletely();
