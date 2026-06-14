@@ -41,8 +41,7 @@ class BackupManager {
 
     try {
       Logger.info(
-          'Creating backup using directory-based approach, scope=$scope',
-          label: 'BackupManager.createBackup');
+          'Creating backup using directory-based approach, scope=$scope');
 
       // Ensure backup directory exists
       await _dataStore.storage.ensureDirectoryExists(backupPath);
@@ -121,24 +120,21 @@ class BackupManager {
           // Delete original directory after successful compression
           await _dataStore.storage.deleteDirectory(backupDir);
 
-          Logger.info('Created compressed backup: $zipPath',
-              label: 'BackupManager.createBackup');
+          Logger.info('Created compressed backup: $zipPath');
           return zipPath;
         } catch (e) {
           // if compression failed, log error and return original backup directory
           Logger.error(
-              'Failed to compress backup directory: $e, returning uncompressed backup.',
-              label: 'BackupManager.createBackup');
+              'Failed to compress backup directory, returning uncompressed backup.',
+              rawError: e);
           return backupDir;
         }
       }
 
-      Logger.info('Backup created successfully: $backupDir',
-          label: 'BackupManager.createBackup');
+      Logger.info('Backup created successfully: $backupDir');
       return backupDir;
     } catch (e) {
-      Logger.error('Failed to create backup: $e',
-          label: 'BackupManager.createBackup');
+      Logger.error('Failed to create backup', rawError: e);
       rethrow;
     }
   }
@@ -154,16 +150,13 @@ class BackupManager {
   /// Using PlatformHandler for cross-platform support
   Future<void> _compressDirectory(String sourceDir, String targetZip) async {
     try {
-      Logger.info('Compressing directory: $sourceDir to $targetZip',
-          label: 'BackupManager._compressDirectory');
+      Logger.info('Compressing directory: $sourceDir to $targetZip');
 
       await PlatformHandler.compressDirectory(sourceDir, targetZip);
 
-      Logger.info('Directory compressed successfully',
-          label: 'BackupManager._compressDirectory');
+      Logger.info('Directory compressed successfully');
     } catch (e) {
-      Logger.error('Failed to compress directory: $e',
-          label: 'BackupManager._compressDirectory');
+      Logger.error('Failed to compress directory', rawError: e);
       rethrow;
     }
   }
@@ -235,8 +228,7 @@ class BackupManager {
         }
       }
     } catch (e) {
-      Logger.error('Error copying directory: $e',
-          label: 'BackupManager._safeCopyDirectory');
+      Logger.error('Error copying directory', rawError: e);
       rethrow;
     }
   }
@@ -250,8 +242,7 @@ class BackupManager {
       // If all previous methods fail, try direct copy
       await _dataStore.storage.copyFile(sourcePath, destPath);
     } catch (e) {
-      Logger.error('Error safely copying file: $e',
-          label: 'BackupManager._safeCopyFile');
+      Logger.error('Error safely copying file', rawError: e);
       rethrow;
     }
   }
@@ -284,8 +275,7 @@ class BackupManager {
         }
       }
     } catch (e) {
-      Logger.error('Error during full backup restoration: $e',
-          label: 'BackupManager.restore');
+      Logger.error('Error during full backup restoration', rawError: e);
       rethrow;
     }
   }
@@ -329,8 +319,7 @@ class BackupManager {
         }
       }
     } catch (e) {
-      Logger.error('Error during partial backup restoration: $e',
-          label: 'BackupManager.restore');
+      Logger.error('Error during partial backup restoration', rawError: e);
       rethrow;
     }
   }
@@ -397,8 +386,7 @@ class BackupManager {
           await _dataStore.close(persistChanges: false, closeStorage: false);
         }
       } catch (e) {
-        Logger.warn('Close datastore before restore failed: $e',
-            label: 'BackupManager.restore');
+        Logger.warn('Close datastore before restore failed', rawError: e);
       }
 
       if (metadata.scope == BackupScope.database) {
@@ -430,11 +418,9 @@ class BackupManager {
 
       await _dataStore.initialize(reinitialize: true);
 
-      Logger.info('Database restored successfully',
-          label: 'BackupManager.restore');
+      Logger.info('Database restored successfully');
     } catch (e) {
-      Logger.error('Failed to restore from backup: $e',
-          label: 'BackupManager.restore');
+      Logger.error('Failed to restore from backup', rawError: e);
       rethrow;
     }
   }
@@ -446,21 +432,18 @@ class BackupManager {
         await PlatformHandler.createTempDirectory('tostore_backup_');
 
     try {
-      Logger.info('Extracting zip backup to: $tempPath',
-          label: 'BackupManager._extractZipBackup');
+      Logger.info('Extracting zip backup to: $tempPath');
 
       // use PlatformHandler's extractZip method
       await PlatformHandler.extractZip(zipPath, tempPath);
 
-      Logger.info('Zip backup extracted successfully',
-          label: 'BackupManager._extractZipBackup');
+      Logger.info('Zip backup extracted successfully');
 
       return tempPath;
     } catch (e) {
       // Clean up temp directory on failure
       await PlatformHandler.deleteDirectory(tempPath);
-      Logger.error('Failed to extract zip backup: $e',
-          label: 'BackupManager._extractZipBackup');
+      Logger.error('Failed to extract zip backup', rawError: e);
       rethrow;
     }
   }
@@ -475,8 +458,7 @@ class BackupManager {
       final isDirectory = await _isDirectory(backupPath);
 
       if (!isDirectory && !isZip) {
-        Logger.error('Invalid backup format: not a directory or zip file',
-            label: 'BackupManager.verifyBackup');
+        Logger.error('Invalid backup format: not a directory or zip file');
         return false;
       }
 
@@ -486,8 +468,7 @@ class BackupManager {
           if (!await _dataStore.storage.existsFile(backupPath)) return false;
           final size = await _dataStore.storage.getFileSize(backupPath);
           if (size <= 2048) {
-            Logger.warn('ZIP file size too small to be valid: ${size}B',
-                label: 'BackupManager.verifyBackup');
+            Logger.warn('ZIP file size too small to be valid: ${size}B');
             return false;
           }
 
@@ -498,8 +479,7 @@ class BackupManager {
           return await PlatformHandler.verifyZipFile(backupPath,
               requiredFile: 'meta.json');
         } catch (e) {
-          Logger.error('Zip file verification failed: $e',
-              label: 'BackupManager.verifyBackup');
+          Logger.error('Zip file verification failed', rawError: e);
           return false;
         }
       }
@@ -507,8 +487,7 @@ class BackupManager {
       // For directories, check for essential components
       final metaPath = pathJoin(backupPath, 'meta.json');
       if (!await _dataStore.storage.existsFile(metaPath)) {
-        Logger.error('Missing metadata file in backup',
-            label: 'BackupManager.verifyBackup');
+        Logger.error('Missing metadata file in backup');
         return false;
       }
 
@@ -520,8 +499,7 @@ class BackupManager {
           BackupMetadata.fromJson(metaMap);
           return true;
         } catch (e) {
-          Logger.error('Fast verify: failed to parse metadata: $e',
-              label: 'BackupManager.verifyBackup');
+          Logger.error('Fast verify: failed to parse metadata', rawError: e);
           return false;
         }
       }
@@ -556,8 +534,7 @@ class BackupManager {
 
               if (spacesFiles.isNotEmpty || globalFiles.isNotEmpty) {
                 Logger.warn(
-                    'Web platform: Directory existence check failed but found files in spaces or global directories',
-                    label: 'BackupManager.verifyBackup');
+                    'Web platform: Directory existence check failed but found files in spaces or global directories');
                 return true;
               }
             } catch (e) {
@@ -565,8 +542,7 @@ class BackupManager {
             }
           }
 
-          Logger.error('Missing essential directories in full backup',
-              label: 'BackupManager.verifyBackup');
+          Logger.error('Missing essential directories in full backup');
           return false;
         }
       } else {
@@ -576,8 +552,7 @@ class BackupManager {
             final items =
                 await _dataStore.storage.listDirectory(backupSpaceDir);
             if (items.isEmpty) {
-              Logger.error('Spaces directory is empty in partial backup',
-                  label: 'BackupManager.verifyBackup');
+              Logger.error('Spaces directory is empty in partial backup');
               return false;
             }
           } catch (e) {
@@ -590,22 +565,19 @@ class BackupManager {
                   await _dataStore.storage.listDirectory(backupSpaceDir);
               if (files.isNotEmpty) {
                 Logger.warn(
-                    'Web platform: Directory existence check failed but found files in spaces',
-                    label: 'BackupManager.verifyBackup');
+                    'Web platform: Directory existence check failed but found files in spaces');
                 return true;
               }
             } catch (_) {}
           }
-          Logger.error('Missing spaces directory in partial backup',
-              label: 'BackupManager.verifyBackup');
+          Logger.error('Missing spaces directory in partial backup');
           return false;
         }
       }
 
       return true;
     } catch (e) {
-      Logger.error('Failed to verify backup: $e',
-          label: 'BackupManager.verifyBackup');
+      Logger.error('Failed to verify backup', rawError: e);
       return false;
     }
   }
@@ -644,13 +616,11 @@ class BackupManager {
       final items = await _dataStore.storage.listDirectory(path);
       if (items.isNotEmpty) {
         Logger.warn(
-            'Path $path is considered a directory based on listDirectory result, despite existsDirectory returning false',
-            label: 'BackupManager._isDirectory');
+            'Path $path is considered a directory based on listDirectory result, despite existsDirectory returning false');
         return true;
       }
     } catch (e) {
-      Logger.warn('Failed to list directory for path $path: $e',
-          label: 'BackupManager._isDirectory');
+      Logger.warn('Failed to list directory for path $path', rawError: e);
     }
     return false;
   }
