@@ -38,9 +38,6 @@ final class OverflowManager {
     return _locks.putIfAbsent(path, () => SimpleLock());
   }
 
-  // Marker to help future debugging (not a public guarantee).
-  static const String _label = 'OverflowManager';
-
   int _thresholdForPageSize(int pageSize) {
     // Only externalize when value is large enough to materially impact splits.
     final t = pageSize ~/ 4;
@@ -572,8 +569,7 @@ final class OverflowManager {
       try {
         final parsed = BTreePageIO.parsePageBytes(bytes);
         if (parsed.type != BTreePageType.free) {
-          Logger.warn('Overflow freelist corrupted at page=$head',
-              label: _label);
+          Logger.warn('Overflow freelist corrupted at page=$head');
           break;
         }
         final decodedPayload = BTreePageCodec.decodePayload(
@@ -590,7 +586,7 @@ final class OverflowManager {
         currentFreeHead = free.nextFreePageNo;
         currentFreeCount = currentFreeCount > 0 ? currentFreeCount - 1 : 0;
       } catch (e) {
-        Logger.warn('Error popping from freelist: $e', label: _label);
+        Logger.warn('Error popping from freelist', rawError: e);
         break;
       }
     }
