@@ -26,7 +26,6 @@ class V2Upgrade {
   Future<void> execute(GlobalConfig oldGlobalConfig) async {
     Logger.info(
       'Starting database upgrade to version 2',
-      label: 'V2Upgrade.execute',
     );
 
     // Upgrade Schema partition mapping (global, not space-specific)
@@ -58,7 +57,6 @@ class V2Upgrade {
 
     Logger.info(
       'Database upgrade to version 2 completed',
-      label: 'V2Upgrade.execute',
     );
   }
 
@@ -67,7 +65,6 @@ class V2Upgrade {
       {bool upgradeGlobal = false}) async {
     Logger.info(
       'Upgrading space [$spaceName] to database version 2',
-      label: 'V2Upgrade._upgradeSpaceToV2',
     );
 
     final spaceConfigPath =
@@ -80,8 +77,7 @@ class V2Upgrade {
       final content = await _dataStore.storage.readAsString(spaceConfigPath);
       if (content != null && content.isNotEmpty) {
         await _dataStore.storage.writeAsString(backupConfigPath, content);
-        Logger.info('Backed up space config to $backupConfigPath',
-            label: 'V2Upgrade._upgradeSpaceToV2');
+        Logger.info('Backed up space config to $backupConfigPath');
       }
     }
 
@@ -151,14 +147,11 @@ class V2Upgrade {
       if (await _dataStore.storage.existsFile(backupConfigPath)) {
         await _dataStore.storage.deleteFile(backupConfigPath);
         Logger.info(
-            'Deleted backup config $backupConfigPath after successful upgrade',
-            label: 'V2Upgrade._upgradeSpaceToV2');
+            'Deleted backup config $backupConfigPath after successful upgrade');
       }
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to upgrade space [$spaceName] to version 2: $e\n$stack',
-        label: 'V2Upgrade._upgradeSpaceToV2',
-      );
+    } catch (e) {
+      Logger.error('Failed to upgrade space [$spaceName] to version 2',
+          rawError: e);
       // Ensure we keep the backup on failure so we can resume
       rethrow;
     } finally {
@@ -193,8 +186,7 @@ class V2Upgrade {
         } catch (e) {
           // might be already upgraded if we are resuming?
           // but backup is "v1" config, so it should be old.
-          Logger.warn('Failed to decrypt old key from backup: $e',
-              label: 'V2Upgrade');
+          Logger.warn('Failed to decrypt old key from backup', rawError: e);
         }
       }
 
@@ -206,12 +198,10 @@ class V2Upgrade {
       if (fallbackKeys.isNotEmpty) {
         EncoderHandler.setFallbackKeys(fallbackKeys);
         Logger.info(
-            'Set ${fallbackKeys.length} fallback keys from backup config',
-            label: 'V2Upgrade');
+            'Set ${fallbackKeys.length} fallback keys from backup config');
       }
     } catch (e) {
-      Logger.error('Failed to setup fallback keys from backup: $e',
-          label: 'V2Upgrade');
+      Logger.error('Failed to setup fallback keys from backup', rawError: e);
     }
   }
 
@@ -291,13 +281,9 @@ class V2Upgrade {
 
       Logger.info(
         'Upgraded Schema partition directory mapping',
-        label: 'V2Upgrade._upgradeSchemaPartitionMapping',
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to upgrade Schema partition mapping: $e\n$stack',
-        label: 'V2Upgrade._upgradeSchemaPartitionMapping',
-      );
+    } catch (e) {
+      Logger.error('Failed to upgrade Schema partition mapping', rawError: e);
       // Do not rethrow here so that other upgrades can continue.
     }
   }
@@ -361,13 +347,9 @@ class V2Upgrade {
 
       Logger.info(
         'Upgraded migration metadata to version 2 format',
-        label: 'V2Upgrade._upgradeMigrationMeta',
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to upgrade migration metadata: $e\n$stack',
-        label: 'V2Upgrade._upgradeMigrationMeta',
-      );
+    } catch (e) {
+      Logger.error('Failed to upgrade migration metadata', rawError: e);
       // Do not rethrow here so that other upgrades can continue.
     }
   }
@@ -379,7 +361,6 @@ class V2Upgrade {
     try {
       Logger.info(
         'Starting table data upgrade for table: $tableName',
-        label: 'V2Upgrade._upgradeTableDataToNewFormat',
       );
 
       // Manually build old table meta path (old format: main.dat)
@@ -396,7 +377,6 @@ class V2Upgrade {
       if (oldMetaContent == null || oldMetaContent.isEmpty) {
         Logger.info(
           'No old data meta file found for table: $tableName, skipping',
-          label: 'V2Upgrade._upgradeTableDataToNewFormat',
         );
         return;
       }
@@ -412,7 +392,6 @@ class V2Upgrade {
       if (oldPartitions == null || oldPartitions.isEmpty) {
         Logger.info(
           'No partitions found for table: $tableName, skipping',
-          label: 'V2Upgrade._upgradeTableDataToNewFormat',
         );
         return;
       }
@@ -427,7 +406,6 @@ class V2Upgrade {
 
       Logger.info(
         'Found ${oldPartitionMetas.length} old partitions for table: $tableName',
-        label: 'V2Upgrade._upgradeTableDataToNewFormat',
       );
 
       // Delete new ranges directory and data meta file to avoid data migration confusion
@@ -496,7 +474,6 @@ class V2Upgrade {
             if (schema == null) {
               Logger.warn(
                 'Schema not found for table $tableName, skipping batch',
-                label: 'V2Upgrade._upgradeTableDataToNewFormat',
               );
               return;
             }
@@ -527,7 +504,6 @@ class V2Upgrade {
 
             Logger.debug(
               'Wrote ${batchRecords.length} records and indexes directly to table $tableName',
-              label: 'V2Upgrade._upgradeTableDataToNewFormat',
             );
           }
         } finally {
@@ -580,13 +556,10 @@ class V2Upgrade {
       }
       Logger.info(
         'Table data upgrade preparation completed for table: $tableName (records ready for migration)',
-        label: 'V2Upgrade._upgradeTableDataToNewFormat',
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to upgrade table data for table $tableName: $e\n$stack',
-        label: 'V2Upgrade._upgradeTableDataToNewFormat',
-      );
+    } catch (e) {
+      Logger.error('Failed to upgrade table data for table $tableName',
+          rawError: e);
       // Do not rethrow - allow other tables to continue upgrading
     }
   }
@@ -603,7 +576,6 @@ class V2Upgrade {
       if (oldPartitionIndex == null) {
         Logger.warn(
           'Old partition meta missing index for table: $tableName',
-          label: 'V2Upgrade._parseOldPartitionFile',
         );
         return [];
       }
@@ -673,15 +645,11 @@ class V2Upgrade {
 
       Logger.info(
         'Parsed ${records.length} records from old partition file: $oldPartitionPath (partition index: $oldPartitionIndex)',
-        label: 'V2Upgrade._parseOldPartitionFile',
       );
 
       return records;
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to parse old partition file: $e\n$stack',
-        label: 'V2Upgrade._parseOldPartitionFile',
-      );
+    } catch (e) {
+      Logger.error('Failed to parse old partition file', rawError: e);
       return [];
     }
   }
