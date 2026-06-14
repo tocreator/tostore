@@ -3,26 +3,26 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../core/compute/batch_match_runner.dart';
-import '../model/cancellation_token.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
 import '../core/transaction_context.dart';
 import '../core/tree_cache.dart';
 import '../core/workload_scheduler.dart';
 import '../core/yield_controller.dart';
+import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
-import '../handler/binary_schema_codec.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/buffer_entry.dart';
+import '../model/cancellation_token.dart';
+import '../model/db_exception.dart';
 import '../model/index_search.dart';
 import '../model/join_clause.dart';
 import '../model/query_aggregation.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_schema.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
@@ -89,8 +89,7 @@ class QueryExecutor {
 
     final schema = await schemaMgr.getTableSchema(tableName);
     if (schema == null) {
-      Logger.error('Table $tableName not found, cannot execute query.',
-          label: 'QueryExecutor.execute');
+      Logger.error('Table $tableName not found, cannot execute query.');
       return const ExecuteResult.empty();
     }
 
@@ -668,7 +667,6 @@ class QueryExecutor {
             'Query results for table "$tableName" reached the default limit of $effectiveLimit. '
             'Some records may have been truncated. To prevent memory issues with many records, '
             'please explicitly call .limit() if you need more data.',
-            label: 'QueryExecutor',
           );
         }
       }
@@ -774,14 +772,8 @@ class QueryExecutor {
         executionTimeMs: stopwatch.elapsedMilliseconds,
         tableTotalCount: tableTotalCount,
       );
-    } on DbException catch (e) {
-      // Business/Validation errors should not clutter logs with stack traces.
-      Logger.error(e.message, label: 'QueryExecutor.execute');
-      rethrow;
-    } catch (e, stackTrace) {
-      Logger.error('query execution failed: $e',
-          label: 'QueryExecutor.execute');
-      Logger.debug('stack trace: $stackTrace');
+    } catch (e) {
+      Logger.error('query execution failed', rawError: e);
       rethrow;
     }
   }
@@ -1116,8 +1108,7 @@ class QueryExecutor {
         } catch (e) {
           // Log warning but safe fallthrough (buffer records won't be pre-filtered,
           // will be filtered by query plan merge later presumably, or just returning extra records is safeish)
-          Logger.warn('Failed to build buffer cursor filter: $e',
-              label: 'QueryExecutor');
+          Logger.warn('Failed to build buffer cursor filter', rawError: e);
         }
       }
 
@@ -1787,8 +1778,7 @@ class QueryExecutor {
         decodeFieldStructureOverride: decodeFieldStructureOverride,
       );
     } catch (e) {
-      Logger.error('Table scan failed: $e',
-          label: 'QueryExecutor._performTableScan');
+      Logger.error('Table scan failed', rawError: e);
       return TableScanResult(records: []);
     }
   }
@@ -2584,8 +2574,7 @@ class QueryExecutor {
         records: selector.toSortedList(),
       );
     } catch (e) {
-      Logger.error('Index scan failed: $e',
-          label: 'QueryExecutor._performIndexScan');
+      Logger.error('Index scan failed', rawError: e);
       return await _performTableScan(tableName, matcher,
           limit: limit,
           offset: offset,
@@ -2663,7 +2652,7 @@ class QueryExecutor {
           data, sortFields, sortDirections, schemas, tableName);
       return data;
     } catch (e) {
-      Logger.error('Sort failed: $e', label: "QueryExecutor-_applySort");
+      Logger.error('Sort failed', rawError: e);
       throw DbException.wrap(
         e,
         fallbackType: ResultType.devInvalidArgumentFormat,
