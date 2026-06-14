@@ -40,7 +40,6 @@ Future<DeleteBatchPrepareResult> prepareDeleteBatchChunk(
     if (recordId == null) {
       Logger.warn(
         'Record in table ${request.tableName} does not have a primary key value, skipping',
-        label: 'TableDataManager.addToDeleteBuffer',
       );
       continue;
     }
