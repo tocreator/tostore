@@ -134,11 +134,8 @@ class WeightManager {
     try {
       await _loadWeights();
       _initialized = true;
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to initialize WeightManager: $e\n$stack',
-        label: 'WeightManager',
-      );
+    } catch (e) {
+      Logger.error('Failed to initialize WeightManager', rawError: e);
       rethrow;
     }
   }
@@ -204,12 +201,9 @@ class WeightManager {
       _rebuildHighWeightCache();
 
       completer.complete();
-    } catch (e, stack) {
+    } catch (e) {
       completer.completeError(e);
-      Logger.error(
-        'Failed to load weights from file: $filePath, error: $e\n$stack',
-        label: 'WeightManager',
-      );
+      Logger.error('Failed to load weights from file: $filePath', rawError: e);
       // If loading fails, initialize weight data
       await _initializeWeights(spaceName: spaceName);
     } finally {
@@ -292,11 +286,8 @@ class WeightManager {
       // Save weight data
       await _saveWeights(spaceName: spaceName);
       _rebuildHighWeightCache();
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to initialize weights: $e\n$stack',
-        label: 'WeightManager',
-      );
+    } catch (e) {
+      Logger.error('Failed to initialize weights', rawError: e);
       rethrow;
     }
   }
@@ -347,11 +338,8 @@ class WeightManager {
         jsonEncode(json),
         flush: true,
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to save weights to file: $e\n$stack',
-        label: 'WeightManager',
-      );
+    } catch (e) {
+      Logger.error('Failed to save weights to file', rawError: e);
       // Do not throw exception, avoid affecting main process
     } finally {
       completer.complete();
@@ -648,11 +636,8 @@ class WeightManager {
 
       // Mark as dirty and notify activity
       _onMutation();
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to perform weight decay: $e\n$stack',
-        label: 'WeightManager',
-      );
+    } catch (e) {
+      Logger.error('Failed to perform weight decay', rawError: e);
     }
   }
 
