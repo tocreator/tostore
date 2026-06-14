@@ -1,6 +1,6 @@
+import '../core/data_store_impl.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../core/data_store_impl.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -52,7 +52,6 @@ class VersionUpgradeManager {
       // 3. Handle Upgrade: Current engine is newer than the database.
       Logger.info(
         'Database version upgrade required: v$currentVersion -> v$engineVersion',
-        label: 'VersionUpgradeManager',
       );
 
       // Route to specific version upgrade handlers
@@ -65,13 +64,10 @@ class VersionUpgradeManager {
         final v3Upgrade = V3Upgrade(_dataStore);
         await v3Upgrade.execute(globalConfig);
       }
-    } catch (e, stack) {
+    } catch (e) {
       if (e is DbException) rethrow;
 
-      Logger.error(
-        'Database version upgrade failed: $e\n$stack',
-        label: 'VersionUpgradeManager.runDatabaseUpgradesIfNeeded',
-      );
+      Logger.critical('Database version upgrade failed', rawError: e);
       rethrow;
     }
   }
