@@ -1420,30 +1420,32 @@ if (txResult.isFailed) {
 
 
 ### <a id="logging-diagnostics"></a>ログ コールバックとデータベース診断
+ToStore は、`ToStore.setLogConfig(...)` を通じて、データベースのライフサイクルログをビジネス層にルーティングできます。
 
-ToStore は、`LogConfig.setConfig(...)` を通じて、起動、回復、自動移行、実行時の制約競合ログをビジネス層にルーティングできます。
-
-- `onLogHandler` は、現在の `enableLog` フィルターと `logLevel` フィルターを通過するすべてのログを受信します。
-- 初期化前に `LogConfig.setConfig(...)` を呼び出し、初期化および自動移行中に生成されたログもキャプチャされるようにします。
+- `onLog` コールバックは、現在の `enableLog` フィルターと `logLevel` フィルターを通過するすべての `LogRecord` ログレコードを受信します。
+  - **LogLevel.error**: 局所的なエラーが発生しましたが、通常の動作には影響しません。
+  - **LogLevel.critical**: グローバルな災害級エラー（ディスクフル、メモリ不足、移行の重大な失敗など）であり、手動での介入が必要です。このレベルでアラート通知をトリガーすることをお勧めします。
+- 初期化前に `ToStore.setLogConfig(...)` を呼び出し、初期化および自動移行中に生成されたログもキャプチャされるようにします。
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // ログパラメータまたはコールバックの構成
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // ログ上部の薄いグレーのタイトル。アプリやデータベースインスタンスの区別用,
+    onLog: (log) {
+      // 本番環境では warn/error/critical をバックエンドやログプラットフォームに報告できます
+      // log.level はログレベルに対応します (LogLevel.debug, info, warn, error, critical)
+      // log.message は処理後のログテキストに対応します
+      // log.status は下層の ResultStatus 診断ステータスに対応します (code と codeKey を含む)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>セキュリティ構成
 
 > [!WARNING]
