@@ -179,9 +179,9 @@ final result = await db.insert('users', {
 });
 
 // Unified operation result model: DbResult
-// It is recommended to always check isSuccess
-if (result.isSuccess) {
-  print('Insert succeeded, generated primary key ID: ${result.successKeys.first}');
+// It is recommended to check hasErrors
+if (!result.hasErrors) {
+  print('Insert succeeded, generated primary key ID: ${result.firstPrimaryKey}');
 } else {
   print('Insert failed: ${result.message}');
 }
@@ -1234,10 +1234,15 @@ final txResult = await db.transaction(() async {
   // If any operation fails, all changes are rolled back automatically
 });
 
-if (txResult.isSuccess) {
-  print('Transaction committed successfully');
+if (!txResult.hasErrors) {
+  print('トランザクションが正常にコミットされました');
 } else {
-  print('Transaction rolled back: ${txResult.error?.message}');
+  print('トランザクションは次の理由でロールバックされました:');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [$status.codeKey}] $status.message}');
+    }
+  }
 }
 
 // Automatic rollback on error
@@ -1332,14 +1337,30 @@ final restored = await db.restore(
 
 ### <a id="error-handling"></a>ステータスコードとエラー処理
 
+ToStore には、エラーと例外のフィードバック用に次の 2 つのチャネルがあります。
 
-ToStore は、データ操作に統合応答モデルを使用します。
+> [!NOTE]
+> **統一された診断基盤**: 応答結果モデル（DbResult/QueryResult 内の statuses）を介して返されるか、致命的な例外（DbException 内の statuses）を介してスローされるかに関係なく、すべての診断ステータスは構造化された **`ResultStatus`** システムに統一され、同じステータスコードを共有するため、一貫性が保証されます。
 
-- `ResultType`: 分岐ロジックに使用される統合ステータス列挙型
-- `result.code`: `ResultType` に対応する安定した数値コード
-- `result.message`: 現在のエラーを説明する読み取り可能なメッセージ
-- `successKeys` / `failedKeys`: 一括操作で成功した主キーと失敗した主キーのリスト
+1. 応答結果モデル（Result-based Response）
+挿入、更新、削除、クエリ、トランザクション、および実行時のテーブルスキーマの作成や変更などの日常的な操作を対象とします。これらの操作は、制約違反、バリデーションエラー、または無効な引数に遭遇した場合でも、例外をスローしてデータ操作を中断することはありません。代わりに、ToStore は `DbResult` または `QueryResult` を使用して結果をラップし、すべての診断情報をステータスリストに記録します。これにより、通常のビジネスロジックエラーがデータベースの正常な稼働を妨げないことが保証されます。
 
+- **`hasErrors`: 現在の操作にエラーが存在するかどうかを示します。一括操作またはトランザクションにおいて、少なくとも 1 つのエラーが含まれる場合、この属性は `true` になります。**
+- **`statuses`: 操作に関するすべての `ResultStatus` 診断情報の詳細リスト。1:1 の順序一致をサポートしているため、一括操作で非常に便利です。**
+- **`firstPrimaryKey`: 単一の挿入/書き込み操作의成功時に、`statuses` を手動で解析することなく、物理的に生成された主キーを直接読み取ります。**
+- **`ResultType`: 分岐処理や大枠のチェックに便利な、ステータスのカテゴリを示す列挙型（例：`isBusinessError`、`isDeveloperError`）。**
+
+2. 例外のスロー（Exception-based Throwing）
+開発者の過失または設計上の欠陥に起因する致命的なエラー（例：`ToStore.open` 時のスキーマ検証エラー、エンジンバージョンの不一致、致命的なデータ移行破損など）を対象とします。これらのケースでは、ToStore は実行を停止するために `DbException` をスローし、開発者に修正を促します。
+
+> [!WARNING]
+> 開発ガイドライン: 通常のビジネスエラーは例外をスローしてはなりません。アプリケーションの実行を妨げないように、応答結果モデルで返す必要があります。
+
+---
+
+### エラーと例外の処理例
+
+#### 1. 単一書き込みに対する応答の処理
 
 ```dart
 final result = await db.insert('users', {
@@ -1347,77 +1368,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('Target resource does not exist: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('Data validation failed: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('Unique constraint conflict: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('Foreign key constraint failed: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('System is busy. Please retry later: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('Underlying storage error. Please record the logs: ${result.message}');
-      break;
-    default:
-      print('Error type: ${result.type}, code: ${result.code}, message: ${result.message}');
+if (result.hasErrors) {
+  // 最初のエラータイプと説明を取得
+  print('Operation failed: [\${result.firstType.codeKey}] \${result.message}');
+} else {
+  print('書き込み成功、主キーは: \${result.firstPrimaryKey}');
+}
+```
+
+#### 2. 一括書き込みにおける詳細な診断
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
+]);
+
+if (batchResult.hasErrors) {
+  print('一括操作が一部失敗しました: 成功 \${batchResult.successCount}, 失敗 \${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('Index [\$idx] 制約違反！テーブル! テーブル: \${status.tableName}, フィールド: \${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('Index [\$idx] 引数エラー！パラメーター! Parameter: \${status.parameterName}, 渡された値: \${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('Index [\$idx] エラーが発生しました: [\${status.codeKey}] \${status.message}');
+    }
   }
 }
 ```
 
-一般的なステータス コードの例:
-成功すると `0` が返されます。負の数値はエラーを示します。
-- `ResultType.success` (`0`): 操作は成功しました
-- `ResultType.partialSuccess` (`1`): 一括操作が部分的に成功しました
-- `ResultType.unknown` (`-1`): 不明なエラー
-- `ResultType.uniqueViolation` (`-2`): 一意のインデックスの競合
-- `ResultType.primaryKeyViolation` (`-3`): 主キーの競合
-- `ResultType.foreignKeyViolation` (`-4`): 外部キー参照が制約を満たしていません
-- `ResultType.notNullViolation` (`-5`): 必須フィールドが欠落しているか、許可されていない `null` が渡されました
-- `ResultType.validationFailed` (`-6`): 長さ、範囲、形式、またはその他の検証に失敗しました
-- `ResultType.notFound` (`-11`): ターゲットのテーブル、スペース、またはリソースが存在しません
-- `ResultType.resourceExhausted` (`-15`): システム リソースが不足しています。負荷を減らすか再試行してください
-- `ResultType.dbError` (`-91`): データベース エラー
-- `ResultType.ioError` (`-90`): ファイルシステムエラー
-- `ResultType.timeout` (`-92`): タイムアウト
+#### 3. 致命的なエラーと初期化例外のキャッチ（DbException）
 
-### トランザクション結果の処理
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed: transaction failed; txResult.isSuccess: transaction succeeded
-if (txResult.isFailed) {
-  print('Transaction error type: ${txResult.error?.type}');
-  print('Transaction error message: ${txResult.error?.message}');
+try {
+  // Initialize database with schemas that might have validation issues
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ 致命的なデータベース例外! エラーメッセージ: \n\${e.message}');
+  
+  // Iterate through the detailed status list in the exception
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('スキーマ検証失敗！テーブル! テーブル: \${status.tableName}, フィールド: \${status.field}, 無効な構成: \${status.wrongValue}');
+    } else {
+      print('診断情報: [\${status.codeKey}] \${status.message}');
+    }
+  }
 }
 ```
 
-トランザクション エラーの種類:
-- `TransactionErrorType.operationError`: フィールド検証の失敗、無効なリソース状態、または別のビジネスレベルのエラーなど、トランザクション内で通常の操作が失敗しました。
-- `TransactionErrorType.integrityViolation`: 整合性または制約の競合 (主キー、一意キー、外部キー、または非 null エラーなど)
-- `TransactionErrorType.timeout`: タイムアウト
-- `TransactionErrorType.io`: 基礎となるストレージまたはファイルシステムの I/O エラー
-- `TransactionErrorType.conflict`: 競合によりトランザクションが失敗しました
-- `TransactionErrorType.userAbort`: ユーザーが開始した中止 (スローベースの手動中止は現在サポートされていません)
-- `TransactionErrorType.unknown`: その他のエラー
-
+エラータイプ、詳細なステータスコード、JSON シリアル化形式、およびフィールドマッピングの完全なリストについては、完全な仕様書を参照してください: [ToStore ResultStatus 自動診断およびステータス解決仕様書](result_status_specification.md).
 
 ### <a id="logging-diagnostics"></a>ログ コールバックとデータベース診断
 ToStore は、`ToStore.setLogConfig(...)` を通じて、データベースのライフサイクルログをビジネス層にルーティングできます。
