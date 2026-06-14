@@ -374,10 +374,8 @@ class IndexManager {
         indexKey,
       );
     } catch (e) {
-      Logger.warn(
-        'Failed to query index data weight for $tableName:$indexName: $e',
-        label: 'IndexManager._queryIndexDataWeight',
-      );
+      Logger.warn('Failed to query index data weight for $tableName:$indexName',
+          rawError: e);
       return null;
     }
   }
@@ -590,9 +588,8 @@ class IndexManager {
       );
     } catch (e) {
       Logger.warn(
-        'Failed to remove internal KV expiry index entry for $tableName: $e',
-        label: 'IndexManager.removeInternalKvExpiryIndexEntryByRawKey',
-      );
+          'Failed to remove internal KV expiry index entry for $tableName',
+          rawError: e);
     }
   }
 
@@ -603,11 +600,9 @@ class IndexManager {
       await _indexMetaCache.cleanup(removeRatio: ratio);
       Logger.info(
         'Evicted ${(ratio * 100).toStringAsFixed(0)}% index meta cache due to memory pressure',
-        label: 'IndexManager.evictIndexMetaCache',
       );
     } catch (e) {
-      Logger.error('Failed to evict index meta cache: $e',
-          label: 'IndexManager.evictIndexMetaCache');
+      Logger.error('Failed to evict index meta cache', rawError: e);
     }
   }
 
@@ -700,8 +695,7 @@ class IndexManager {
         }
       }
     } catch (e) {
-      Logger.warn('Failed to update index cache: $e',
-          label: 'IndexManager.updateIndexDataCache');
+      Logger.warn('Failed to update index cache', rawError: e);
     }
   }
 
@@ -1097,8 +1091,7 @@ class IndexManager {
 
       return meta;
     } catch (e) {
-      Logger.error('Failed to get index metadata: $e',
-          label: 'IndexManager._doLoadIndexMeta');
+      Logger.error('Failed to get index metadata', rawError: e);
       return null;
     }
   }
@@ -1146,9 +1139,8 @@ class IndexManager {
       _indexMetaCache.put([tableName, indexName], meta);
 
       return meta;
-    } catch (e, stack) {
-      Logger.error('Failed to update index metadata: $e\n$stack',
-          label: 'IndexManager.updateIndexMeta');
+    } catch (e) {
+      Logger.error('Failed to update index metadata', rawError: e);
       return null;
     } finally {
       // Release lock (if acquired)
@@ -1226,12 +1218,10 @@ class IndexManager {
         if (meta.isBuilding) {
           Logger.warn(
             'Detected incomplete index build for $tableName.$indexName, deleting stale artifacts before rebuild',
-            label: 'IndexManager.createIndex',
           );
           await deletePhysicalIndexArtifacts(tableName, indexName);
         } else {
-          Logger.debug('Index already exists: $indexName',
-              label: 'IndexManager.createIndex');
+          Logger.debug('Index already exists: $indexName');
           return;
         }
       }
@@ -1248,7 +1238,6 @@ class IndexManager {
       if (schema.fields.length == 1 && schema.fields.first == primaryKeyName) {
         Logger.warn(
           'Skipping creation of redundant primary key index: $indexName, primary key "$primaryKeyName" is already range-partitioned in table data',
-          label: 'IndexManager.createIndex',
         );
         return; // Skip creation of redundant primary key index
       }
@@ -1265,7 +1254,6 @@ class IndexManager {
         if (autoIndexMeta != null && indexName != autoUniqueIndexName) {
           Logger.warn(
             'Detected redundant unique index creation: $indexName would duplicate the auto-created unique index "$autoUniqueIndexName". Removing auto-created index and proceeding with explicit index.',
-            label: 'IndexManager.createIndex',
           );
 
           // Remove the auto-created unique index before creating the explicit one
@@ -1282,18 +1270,15 @@ class IndexManager {
       );
 
       if (!SystemTable.isSystemTable(tableName)) {
-        Logger.info('Created index for $tableName: $indexName',
-            label: 'IndexManager.createIndex');
+        Logger.info('Created index for $tableName: $indexName');
       }
-    } catch (e, stack) {
+    } catch (e) {
       await deletePhysicalIndexArtifacts(tableName, indexName);
       if (e is IndexBuildCancelledException) {
-        Logger.info('$e; partial artifacts removed',
-            label: 'IndexManager.createIndex');
+        Logger.info('$e; partial artifacts removed');
         rethrow;
       }
-      Logger.error('Failed to create index: $e\n$stack',
-          label: 'IndexManager.createIndex');
+      Logger.error('Failed to create index', rawError: e);
       rethrow;
     } finally {
       if (indexLocked && lockMgr != null) {
@@ -1397,8 +1382,8 @@ class IndexManager {
               await _dataStore.storage.deleteDirectory(indexPath);
             }
           } catch (e) {
-            Logger.warn('Failed to delete index directory for $indexName: $e',
-                label: 'IndexManager.resetIndexes');
+            Logger.warn('Failed to delete index directory for $indexName',
+                rawError: e);
           }
         }
 
@@ -1410,8 +1395,7 @@ class IndexManager {
         // Use optimized batch index building mechanism
         await _rebuildTableIndexes(tableName, schema, indexesToBuild);
 
-        Logger.debug('Reset table indexes completed: $tableName',
-            label: 'IndexManager.resetIndexes');
+        Logger.debug('Reset table indexes completed: $tableName');
       } finally {
         if (lockMgr != null) {
           for (final entry in acquiredLocks.entries) {
@@ -1420,8 +1404,7 @@ class IndexManager {
         }
       }
     } catch (e) {
-      Logger.error('Failed to reset indexes: $e',
-          label: 'IndexManager.resetIndexes');
+      Logger.error('Failed to reset indexes', rawError: e);
       rethrow;
     }
   }
@@ -1468,7 +1451,6 @@ class IndexManager {
           if (hasActiveTask) {
             Logger.debug(
               'Skip empty-index repair for $tableName.$indexName because there is an active migration task',
-              label: 'IndexManager._scheduleEmptyIndexRepair',
             );
             return;
           }
@@ -1476,7 +1458,6 @@ class IndexManager {
 
         Logger.warn(
           'Detected empty index $tableName.$indexName while table has $persistedTableRecords persisted records, scheduling async repair',
-          label: 'IndexManager._scheduleEmptyIndexRepair',
         );
 
         // Clean physical index files before repair starts
@@ -1515,11 +1496,10 @@ class IndexManager {
             specificIndexes: [indexName],
           );
         }
-      } catch (e, stack) {
+      } catch (e) {
         Logger.error(
-          'Empty-index rebuild scheduling failed for $tableName.$indexName: $e\n$stack',
-          label: 'IndexManager._scheduleEmptyIndexRepair',
-        );
+            'Empty-index rebuild scheduling failed for $tableName.$indexName',
+            rawError: e);
       } finally {
         _emptyIndexRepairFutures.remove(repairKey);
         if (!completer.isCompleted) {
@@ -1585,9 +1565,8 @@ class IndexManager {
               transactionId: currentTxId,
             );
             if (conflictId != null) {
-              Logger.warn(
+              Logger.debug(
                 "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
-                label: 'IndexManager.checkUniqueConstraints',
               );
               return UniqueViolation(
                 tableName: tableName,
@@ -1622,9 +1601,8 @@ class IndexManager {
                   pkStr,
                   transactionId: currentTxId,
                 )) {
-              Logger.warn(
+              Logger.debug(
                 "[Unique Constraint Violation] Table '$tableName' Field(s) [$primaryKey] already contain value '$primaryValue'",
-                label: 'IndexManager.checkUniqueConstraints',
               );
               return UniqueViolation(
                 tableName: tableName,
@@ -1634,10 +1612,8 @@ class IndexManager {
               );
             }
           } catch (e) {
-            Logger.warn(
-              'Primary key unique check failed for pk=$pkStr, error: $e',
-              label: 'IndexManager.checkUniqueConstraints',
-            );
+            Logger.debug('Primary key unique check failed for pk=$pkStr',
+                rawError: e);
             // Still treat as violation for safety, but with error info
             return UniqueViolation(
               tableName: tableName,
@@ -1709,9 +1685,8 @@ class IndexManager {
               );
             }
             if (conflictId != null) {
-              Logger.warn(
-                  "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (buffer/reservation)",
-                  label: 'IndexManager.checkUniqueConstraints');
+              Logger.debug(
+                  "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (buffer/reservation)");
               return UniqueViolation(
                 tableName: tableName,
                 fields: constraint.fields,
@@ -1902,7 +1877,6 @@ class IndexManager {
             if (existingPk == null || existingPk.isEmpty) {
               Logger.warn(
                 'Unique key exists but owner lookup returned null: table=$tableName index=$indexName value=${constraint.value}',
-                label: 'IndexManager.checkUniqueConstraints',
               );
             } else {
               if (_isPrimaryKeyHiddenByDeleteOverlay(
@@ -1920,9 +1894,8 @@ class IndexManager {
               }
             }
 
-            Logger.warn(
-                "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (disk check)",
-                label: 'IndexManager.checkUniqueConstraints');
+            Logger.debug(
+                "[Unique Constraint Violation] Table '$tableName' Field(s) [${constraint.fields.join(', ')}] already contain value '${constraint.value}' (disk check)");
             return UniqueViolation(
               tableName: tableName,
               fields: constraint.fields,
@@ -1932,15 +1905,13 @@ class IndexManager {
           }
         }
       } catch (e) {
-        Logger.error('Batch unique constraint disk check failed: $e',
-            label: 'IndexManager.checkUniqueConstraints');
+        Logger.error('Batch unique constraint disk check failed', rawError: e);
         rethrow;
       }
 
       return null; // No violations found
-    } catch (e, stack) {
-      Logger.error('Failed to check unique constraints: $e\n$stack',
-          label: 'IndexManager.checkUniqueConstraints');
+    } catch (e) {
+      Logger.error('Failed to check unique constraints', rawError: e);
       return UniqueViolation(
         tableName: tableName,
         fields: const [],
@@ -2381,8 +2352,7 @@ class IndexManager {
       // get table schema
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.error('Failed to add index: table $tableName does not exist',
-            label: 'IndexManager.addIndex');
+        Logger.error('Failed to add index: table $tableName does not exist');
         return;
       }
 
@@ -2396,7 +2366,6 @@ class IndexManager {
       if (!existsInSchema && existingMeta != null) {
         Logger.warn(
           'Detected orphaned index metadata for ${index.actualIndexName} in table $tableName, cleaning it up before rebuild',
-          label: 'IndexManager.addIndex',
         );
         await deletePhysicalIndexArtifacts(tableName, index.actualIndexName);
       }
@@ -2406,7 +2375,6 @@ class IndexManager {
       if (existsInSchema && existingMeta != null) {
         Logger.warn(
           'Index ${index.actualIndexName} already exists in table $tableName',
-          label: 'IndexManager.addIndex',
         );
         return;
       }
@@ -2434,7 +2402,7 @@ class IndexManager {
         await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
       }
     } catch (e) {
-      Logger.error('Failed to add index: $e', label: 'IndexManager.addIndex');
+      Logger.error('Failed to add index', rawError: e);
       rethrow;
     }
   }
@@ -2488,8 +2456,7 @@ class IndexManager {
       // 2. create new index
       await addIndex(tableName, newIndex);
     } catch (e) {
-      Logger.error('Failed to modify index: $e',
-          label: 'IndexManager.modifyIndex');
+      Logger.error('Failed to modify index', rawError: e);
       rethrow;
     }
   }
@@ -2517,8 +2484,7 @@ class IndexManager {
 
       final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
       if (schema == null) {
-        Logger.warn('table $tableName does not exist, cannot remove index',
-            label: 'IndexManager.removeIndex');
+        Logger.warn('table $tableName does not exist, cannot remove index');
         return;
       }
 
@@ -2615,8 +2581,7 @@ class IndexManager {
         }
       }
     } catch (e) {
-      Logger.error('Failed to remove index: $e',
-          label: 'IndexManager.removeIndex');
+      Logger.error('Failed to remove index', rawError: e);
       rethrow;
     }
   }
@@ -2654,10 +2619,8 @@ class IndexManager {
 
       await deletePhysicalIndexArtifacts(tableName, indexName);
     } catch (e) {
-      Logger.error(
-        'Failed to delete index artifacts for migration: $e',
-        label: 'IndexManager.deleteIndexArtifactsForMigration',
-      );
+      Logger.error('Failed to delete index artifacts for migration',
+          rawError: e);
       rethrow;
     } finally {
       if (indexLocked && lockMgr != null) {
@@ -2695,8 +2658,7 @@ class IndexManager {
       _indexMetaCache.remove([tableName, indexName]);
       _indexDataCache.remove([tableName, indexName]);
     } catch (e) {
-      Logger.error('Failed to delete index file: $e',
-          label: 'IndexManager._deleteIndexFiles');
+      Logger.error('Failed to delete index file', rawError: e);
       rethrow;
     }
   }
@@ -2846,8 +2808,7 @@ class IndexManager {
         );
       }
     } catch (e) {
-      Logger.error('Failed to rename index: $e',
-          label: 'IndexManager.renameIndex');
+      Logger.error('Failed to rename index', rawError: e);
       rethrow;
     } finally {
       if (lockMgr != null) {
@@ -2972,9 +2933,8 @@ class IndexManager {
           updatedMeta: builtMeta.copyWith(isBuilding: false),
         );
       }
-    } catch (e, stack) {
-      Logger.error('Failed to rebuild table indexes: $e\n$stack',
-          label: 'IndexManager._rebuildTableIndexes');
+    } catch (e) {
+      Logger.error('Failed to rebuild table indexes', rawError: e);
       rethrow;
     }
   }
@@ -3094,10 +3054,8 @@ class IndexManager {
         await _dataStore.storage.deleteDirectory(indexPath);
       }
     } catch (e) {
-      Logger.warn(
-        'Failed to clean index artifacts for $tableName.$indexName: $e',
-        label: 'IndexManager._deletePhysicalIndexArtifacts',
-      );
+      Logger.warn('Failed to clean index artifacts for $tableName.$indexName',
+          rawError: e);
     }
   }
 
@@ -3302,7 +3260,6 @@ class IndexManager {
     if (InternalConfig.showLoggerInternalLabel) {
       Logger.debug(
         'Index persistence: table=$tableName, btreeIndexes=${idxTasks.length}, concurrency=$idxLevelConcurrency, timeout=$timeout',
-        label: 'IndexManager',
       );
     }
 
@@ -4395,9 +4352,8 @@ class IndexManager {
 
       // LIKE / != / others: fallback to table scan for correctness.
       return IndexSearchResult.tableScan();
-    } catch (e, s) {
-      Logger.error('searchIndex failed: $e\n$s',
-          label: 'IndexManager.searchIndex');
+    } catch (e) {
+      Logger.error('searchIndex failed', rawError: e);
       return IndexSearchResult.tableScan();
     }
   }
@@ -4456,9 +4412,8 @@ class IndexManager {
       try {
         await Future.wait(futures).timeout(const Duration(seconds: 5));
       } catch (e) {
-        Logger.warn(
-            'IndexManager dispose: some futures failed or timed out: $e',
-            label: 'IndexManager');
+        Logger.warn('IndexManager dispose: some futures failed or timed out',
+            rawError: e);
       }
     }
 
