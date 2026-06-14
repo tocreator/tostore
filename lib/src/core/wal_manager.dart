@@ -588,7 +588,7 @@ class WalManager {
         await _dataStore.storage.deleteDirectory(walRoot);
       }
     } catch (e) {
-      Logger.error('Failed to delete WAL directory: $e', label: 'WalManager');
+      Logger.error('Failed to delete WAL directory', rawError: e);
     }
 
     // 2. Reset in-memory state
@@ -602,7 +602,7 @@ class WalManager {
     _currentPartitionSizeLoaded = false;
     _currentPartitionSizeApprox = 0;
 
-    Logger.info('WAL destroyed.', label: 'WalManager');
+    Logger.info('WAL destroyed.');
   }
 
   Future<void> initializeAndRecover() async {
@@ -643,8 +643,8 @@ class WalManager {
           }
         } catch (e) {
           // Primary meta is corrupted or unreadable; fallback to backup.
-          Logger.warn('Primary WAL meta is invalid, will try backup. Error: $e',
-              label: 'WalManager');
+          Logger.warn('Primary WAL meta is invalid, will try backup.',
+              rawError: e);
         }
 
         // 2) Fallback to backup WAL meta if primary failed
@@ -656,12 +656,10 @@ class WalManager {
               loaded = WalMeta.fromJson(jsonMap);
               recoveredFromBackup = true;
               Logger.warn(
-                  'Recovered WAL meta from backup after primary failure.',
-                  label: 'WalManager');
+                  'Recovered WAL meta from backup after primary failure.');
             }
           } catch (e) {
-            Logger.error('Backup WAL meta is also invalid. Error: $e',
-                label: 'WalManager');
+            Logger.error('Backup WAL meta is also invalid.', rawError: e);
           }
         }
 
@@ -714,9 +712,8 @@ class WalManager {
         // Lazy: do NOT persist or create directories here.
         // We will create WAL directories and persist meta on first actual append or rotation.
         _initialized = true;
-      } catch (e, s) {
-        Logger.error('Failed to initialize WAL meta: $e\n$s',
-            label: 'WalManager');
+      } catch (e) {
+        Logger.error('Failed to initialize WAL meta', rawError: e);
         rethrow;
       } finally {
         _initFuture = null;
@@ -1090,7 +1087,7 @@ class WalManager {
       );
       await persistMeta();
     } catch (e) {
-      Logger.error('cleanupObsoletePartitions failed: $e', label: 'WalManager');
+      Logger.error('cleanupObsoletePartitions failed', rawError: e);
     }
   }
 
@@ -1215,9 +1212,8 @@ class WalManager {
                 _currentPartitionSizeApprox += combined.length;
               }
             }
-          } catch (e, s) {
-            Logger.error('WAL append batch failed: $e\n$s',
-                label: 'WalManager');
+          } catch (e) {
+            Logger.error('WAL append batch failed', rawError: e);
           }
 
           // Predictive Rotation Logic (Moved inside loop to access rawEntries/combined)
@@ -1446,7 +1442,7 @@ class WalManager {
       );
       return WalPointer(partitionIndex: pIdx, entrySeq: allEntries.length);
     } catch (e) {
-      Logger.warn('readLastWalPointer failed: $e', label: 'WalManager');
+      Logger.warn('readLastWalPointer failed', rawError: e);
       return WalPointer(partitionIndex: pIdx, entrySeq: 0);
     }
   }
@@ -1528,12 +1524,12 @@ class WalManager {
         await myCompleter.future.timeout(
           const Duration(seconds: 30),
           onTimeout: () {
-            Logger.warn('persistMeta wait timeout after 30s, proceeding anyway',
-                label: 'WalManager');
+            Logger.warn(
+                'persistMeta wait timeout after 30s, proceeding anyway');
           },
         );
       } catch (e) {
-        Logger.warn('persistMeta wait error: $e', label: 'WalManager');
+        Logger.warn('persistMeta wait error', rawError: e);
       }
 
       // Check if we were superseded by a newer request
@@ -1579,16 +1575,15 @@ class WalManager {
             }
           } catch (e) {
             // Backup failure should not block forward progress; just log it.
-            Logger.error('Backup WAL meta failed: $e', label: 'WalManager');
+            Logger.error('Backup WAL meta failed', rawError: e);
           }
         }
 
         final jsonStr = jsonEncode(_meta.toJson());
         await _dataStore.storage.writeAsString(metaPath, jsonStr, flush: flush);
-      } catch (e, stackTrace) {
+      } catch (e) {
         // Log the full error with stack trace for debugging
-        Logger.error('Failed to persist WAL meta: $e\n$stackTrace',
-            label: 'WalManager');
+        Logger.error('Failed to persist WAL meta', rawError: e);
         // Don't rethrow: allow the operation to fail gracefully.
         // The next persistMeta call will retry, and the in-memory _meta
         // state remains correct even if persistence fails temporarily.
