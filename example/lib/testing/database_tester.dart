@@ -32,11 +32,11 @@ class DatabaseTester {
   DatabaseTester(this.db, this.log, this._updateLastOperation);
 
   void _passTest(String message) {
-    log.add('✅ PASS: $message', LogType.info);
+    log.add('✅ PASS: $message', LogLevel.info);
   }
 
   bool _failTest(String message) {
-    log.add('❌ FAIL: $message', LogType.error);
+    log.add('❌ FAIL: $message', LogLevel.error);
     return false;
   }
 
@@ -106,7 +106,7 @@ class DatabaseTester {
   /// Main test runner that executes all test suites.
   Future<bool> runAllTests() async {
     log.clear();
-    log.add('--- Starting Database Run All Tests ---', LogType.info);
+    log.add('--- Starting Database Run All Tests ---', LogLevel.info);
     _updateLastOperation('Running All Tests...');
     await Future.delayed(
         const Duration(milliseconds: 100)); // Allow UI to update
@@ -173,7 +173,7 @@ class DatabaseTester {
           allTestsPassed
               ? '✅ --- All tests passed successfully! ---'
               : '❌ --- Some tests FAILED! Please review the logs. ---',
-          allTestsPassed ? LogType.info : LogType.error);
+          allTestsPassed ? LogLevel.info : LogLevel.error);
     } catch (e, s) {
       _failTest('An unexpected error occurred during tests: $e\n$s');
       allTestsPassed = false;
@@ -181,7 +181,7 @@ class DatabaseTester {
       // CRITICAL: Clean up all tables after tests are finished to ensure a clean state.
       _updateLastOperation('Cleaning up test data...');
       await _clearTablesSafely();
-      log.add('--- All test data cleared. ---', LogType.info);
+      log.add('--- All test data cleared. ---', LogLevel.info);
     }
 
     _updateLastOperation(
@@ -220,7 +220,7 @@ class DatabaseTester {
   /// CRITICAL TEST: Verifies that clearing a table or deleting all records works as expected.
   /// If this fails, the database state is considered unreliable for other tests.
   Future<bool> _testClearAndDeleteAll() async {
-    log.add('--- Testing: Clear Table and Delete All ---', LogType.debug);
+    log.add('--- Testing: Clear Table and Delete All ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       // Ensure a clean slate before this critical test, preventing state leakage from previous runs.
@@ -543,7 +543,7 @@ class DatabaseTester {
     } catch (e) {
       log.add(
         'Schema auto-upgrade test database cleanup skipped: $e',
-        LogType.warn,
+        LogLevel.warn,
       );
     } finally {
       if (cleanupDb != null) {
@@ -889,13 +889,13 @@ class DatabaseTester {
 
   /// Benchmarks and validates batch operations.
   Future<bool> _testBatchOperations() async {
-    log.add('--- Testing: Batch Operations Benchmark ---', LogType.debug);
+    log.add('--- Testing: Batch Operations Benchmark ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
 
       const int count = 100;
-      log.add('Preparing $count records for batch test...', LogType.info);
+      log.add('Preparing $count records for batch test...', LogLevel.info);
 
       final insertRecords = List.generate(
           count,
@@ -911,7 +911,7 @@ class DatabaseTester {
       final insertResult = await db.batchInsert('users', insertRecords);
       sw.stop();
       log.add('🚀 Batch Insert $count records took ${sw.elapsedMilliseconds}ms',
-          LogType.info);
+          LogLevel.info);
 
       isTestPassed &= _expect(
           'Batch Insert should be successful', !insertResult.hasErrors, true);
@@ -935,7 +935,7 @@ class DatabaseTester {
       final updateResult = await db.batchUpdate('users', updateRecords);
       sw.stop();
       log.add('🚀 Batch Update $count records took ${sw.elapsedMilliseconds}ms',
-          LogType.info);
+          LogLevel.info);
 
       isTestPassed &= _expect(
           'Batch Update should be successful', !updateResult.hasErrors, true);
@@ -943,7 +943,7 @@ class DatabaseTester {
           updateResult.successCount, count);
 
       // 4. Verify Correctness
-      log.add('Verifying data integrity after batch update...', LogType.info);
+      log.add('Verifying data integrity after batch update...', LogLevel.info);
 
       // Check middle record to avoid just checking boundaries
       const middleIdx = count ~/ 2;
@@ -985,7 +985,7 @@ class DatabaseTester {
   /// Validates the robustness of the write buffer pipeline.
   /// Checks for coalescing, duplicate prevention, and partial updates visibility.
   Future<bool> _testBufferPipelineRobustness() async {
-    log.add('--- Testing: Buffer Pipeline Robustness ---', LogType.debug);
+    log.add('--- Testing: Buffer Pipeline Robustness ---', LogLevel.debug);
     bool isTestPassed = true;
 
     try {
@@ -1090,7 +1090,7 @@ class DatabaseTester {
 
   /// Tests basic Create, Read, Update, Delete operations.
   Future<bool> _testBasicCrud() async {
-    log.add('--- Testing: Basic CRUD Operations ---', LogType.debug);
+    log.add('--- Testing: Basic CRUD Operations ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1257,7 +1257,8 @@ class DatabaseTester {
 
   /// Tests the upsert and cache synchronization logic.
   Future<bool> _testUpsertAndCacheSync() async {
-    log.add('--- Testing: Upsert and Cache Synchronization ---', LogType.debug);
+    log.add(
+        '--- Testing: Upsert and Cache Synchronization ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1454,7 +1455,7 @@ class DatabaseTester {
 
   /// Tests multi-table JOIN queries.
   Future<bool> _testJoinQueries() async {
-    log.add('--- Testing: JOIN Queries ---', LogType.debug);
+    log.add('--- Testing: JOIN Queries ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1492,7 +1493,7 @@ class DatabaseTester {
 
   /// Tests multi-space data isolation.
   Future<bool> _testMultiSpace() async {
-    log.add('--- Testing: Multi-Space Isolation ---', LogType.debug);
+    log.add('--- Testing: Multi-Space Isolation ---', LogLevel.debug);
     bool isTestPassed = true;
     final originalSpace = (await db.getSpaceInfo()).spaceName;
 
@@ -1544,7 +1545,7 @@ class DatabaseTester {
 
   /// Tests advanced queries, including string sorting, LIKE, numeric comparisons, etc.
   Future<bool> _testAdvancedQueriesAndEdgeCases() async {
-    log.add('--- Testing: Advanced Queries & Edge Cases ---', LogType.debug);
+    log.add('--- Testing: Advanced Queries & Edge Cases ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1654,7 +1655,7 @@ class DatabaseTester {
 
   /// Tests that non-nullable fields correctly reject null values.
   Future<bool> _testNonNullConstraint() async {
-    log.add('--- Testing: Non-Nullable Constraint ---', LogType.debug);
+    log.add('--- Testing: Non-Nullable Constraint ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -1686,7 +1687,7 @@ class DatabaseTester {
 
   /// Verifies that .count() returns a value consistent with the actual number of records.
   Future<bool> _testCountVerification() async {
-    log.add('--- Testing: .count() Verification ---', LogType.debug);
+    log.add('--- Testing: .count() Verification ---', LogLevel.debug);
     bool isTestPassed = true;
 
     Future<bool> verify(String step) async {
@@ -1741,7 +1742,7 @@ class DatabaseTester {
   /// Flow:
   /// 1) clear tables; 2) insert base data; 3) backup; 4) mutate data; 5) restore; 6) verify data rolled back to backup snapshot.
   Future<bool> _testBackupAndRestore() async {
-    log.add('--- Testing: Backup & Restore ---', LogType.debug);
+    log.add('--- Testing: Backup & Restore ---', LogLevel.debug);
     bool ok = true;
     String backupPath = '';
     try {
@@ -1836,14 +1837,14 @@ class DatabaseTester {
     if (_isWasmBuild) {
       log.add(
           '❌ Concurrency Stress Test is skipped on WebAssembly due to dart2wasm/wasm-opt compatibility.',
-          LogType.warn);
+          LogLevel.warn);
       _updateLastOperation('❌ Concurrency Test Skipped on WebAssembly');
       return false;
     }
 
     log.add(
         '--- Testing: Configurable Concurrency Stress Test (users & settings) ---',
-        LogType.debug);
+        LogLevel.debug);
     _updateLastOperation('Starting Configurable Concurrency Test...');
     bool isTestPassed = true;
     final stopwatch = Stopwatch()..start();
@@ -1928,7 +1929,7 @@ class DatabaseTester {
           }
           log.add(
               'Created ${baseItems.length}/$baseCount base records for $tableName.',
-              LogType.info);
+              LogLevel.info);
         }
 
         if (baseItems.isEmpty && baseCount > 0) {
@@ -2027,7 +2028,7 @@ class DatabaseTester {
       _updateLastOperation(
           'Executing ${operations.length} mixed operations concurrently...');
       log.add('Executing ${operations.length} mixed operations concurrently...',
-          LogType.info);
+          LogLevel.info);
       operations.shuffle(random);
 
       // Track actual deletion results
@@ -2211,10 +2212,10 @@ class DatabaseTester {
       await db.clear('posts');
       await db.clear('users');
       await db.clear('settings');
-      log.add('Test data cleaned up.', LogType.info);
+      log.add('Test data cleaned up.', LogLevel.info);
       log.add(
           'Concurrency test finished in ${stopwatch.elapsedMilliseconds}ms.',
-          LogType.info);
+          LogLevel.info);
     }
     _updateLastOperation(isTestPassed
         ? '✅ Concurrency Test Passed'
@@ -2225,14 +2226,14 @@ class DatabaseTester {
   /// Comprehensive test for foreign key operations.
   /// Tests constraint validation, cascade delete, cascade update, RESTRICT, and clear/drop operations.
   Future<bool> _testForeignKeyOperations() async {
-    log.add('--- Testing: Foreign Key Operations ---', LogType.debug);
+    log.add('--- Testing: Foreign Key Operations ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
 
       // ========== Test 1: Foreign Key Constraint Validation ==========
-      log.add(
-          '--- Sub-test: Foreign Key Constraint Validation ---', LogType.debug);
+      log.add('--- Sub-test: Foreign Key Constraint Validation ---',
+          LogLevel.debug);
 
       // Insert a valid user
       final userResult = await db.insert('users', {
@@ -2299,7 +2300,7 @@ class DatabaseTester {
           !invalidCommentResult2.hasErrors, false);
 
       // ========== Test 2: Cascade Delete (CASCADE) ==========
-      log.add('--- Sub-test: Cascade Delete ---', LogType.debug);
+      log.add('--- Sub-test: Cascade Delete ---', LogLevel.debug);
 
       await _clearTablesSafely();
 
@@ -2400,7 +2401,7 @@ class DatabaseTester {
           'Comments should be cascade deleted', commentsAfter.length, 0);
 
       // ========== Test 3: Cascade Update (CASCADE) ==========
-      log.add('--- Sub-test: Cascade Update ---', LogType.debug);
+      log.add('--- Sub-test: Cascade Update ---', LogLevel.debug);
 
       await _clearTablesSafely();
 
@@ -2454,7 +2455,7 @@ class DatabaseTester {
           updateCommentBefore?['post_id']?.toString(), updatePostId.toString());
 
       // ========== Test 4: RESTRICT Constraint ==========
-      log.add('--- Sub-test: RESTRICT Constraint ---', LogType.debug);
+      log.add('--- Sub-test: RESTRICT Constraint ---', LogLevel.debug);
 
       await _clearTablesSafely();
 
@@ -2523,7 +2524,7 @@ class DatabaseTester {
           true);
 
       // ========== Test 5: Clear and Drop Operations ==========
-      log.add('--- Sub-test: Clear and Drop Operations ---', LogType.debug);
+      log.add('--- Sub-test: Clear and Drop Operations ---', LogLevel.debug);
 
       await _clearTablesSafely();
 
@@ -2660,7 +2661,7 @@ class DatabaseTester {
   /// Comprehensive test for expression operations.
   /// Tests atomic field expressions including increment, multiply, complex calculations, and timestamp.
   Future<bool> _testExpressionOperations() async {
-    log.add('--- Testing: Expression Operations ---', LogType.debug);
+    log.add('--- Testing: Expression Operations ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -2825,7 +2826,7 @@ class DatabaseTester {
   /// Comprehensive test for transaction operations.
   /// Tests transaction isolation, rollback, unique constraints, and concurrent transactions.
   Future<bool> _testTransactionOperations() async {
-    log.add('--- Testing: Transaction Operations ---', LogType.debug);
+    log.add('--- Testing: Transaction Operations ---', LogLevel.debug);
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
@@ -2993,7 +2994,7 @@ class DatabaseTester {
 
   /// Validates all Key-Value Store (db.kv) operations.
   Future<bool> _testKvStoreOperations() async {
-    log.add('--- Testing: KV Store Operations ---', LogType.debug);
+    log.add('--- Testing: KV Store Operations ---', LogLevel.debug);
     bool isTestPassed = true;
     final kv = db.kv;
 
