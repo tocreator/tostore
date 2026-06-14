@@ -1,8 +1,8 @@
 import '../../handler/logger.dart';
 import '../../model/db_exception.dart';
+import '../../model/expr.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
-import '../../model/expr.dart';
 import '../../model/table_schema.dart';
 
 /// Pure record validation + conversion path that is safe to run in an isolate.
@@ -97,9 +97,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
             value = evaluateExpressionForRecord(raw, emptyRecord, schema);
           } catch (e) {
             Logger.warn(
-              'Failed to evaluate expression for insert on field ${field.name}: $e. Using 0 as default.',
-              label: 'RecordCompute.validateAndProcessRecordPure',
-            );
+                'Failed to evaluate expression for insert on field ${field.name}. Using 0 as default.',
+                rawError: e);
             value = 0;
           }
         }
@@ -118,9 +117,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       ignoreUnknownFields: ignoreUnknownFields,
     );
     if (validatedResult == null) {
-      Logger.warn(
+      Logger.debug(
         'Data validation failed for table $tableName',
-        label: 'RecordCompute.validateAndProcessRecordPure',
       );
       return null;
     }
@@ -129,10 +127,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   } on DbException {
     rethrow;
   } catch (e) {
-    Logger.error(
-      'Data validation failed: $e',
-      label: 'RecordCompute.validateAndProcessRecordPure',
-    );
+    Logger.error('Data validation failed', rawError: e);
     if (validationErrors != null) {
       validationErrors.add(e.toString());
     }
@@ -241,7 +236,6 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
           (result[field.name] as String).length > field.maxLength!) {
         Logger.warn(
           'Warning: field ${field.name} exceeds max length',
-          label: 'RecordCompute.validateAndProcessUpdateDataPure',
         );
         result[field.name] =
             (result[field.name] as String).substring(0, field.maxLength!);
@@ -252,10 +246,7 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   } on DbException {
     rethrow;
   } catch (e) {
-    Logger.error(
-      'Update data validation failed: $e',
-      label: 'RecordCompute.validateAndProcessUpdateDataPure',
-    );
+    Logger.error('Update data validation failed', rawError: e);
     return null;
   }
 }
@@ -368,7 +359,6 @@ dynamic _evaluateExprNode(
 
     Logger.warn(
       'Field "${node.fieldName}" has non-numeric value: $value. Treating as 0.',
-      label: 'RecordCompute.evaluateExpressionForRecord',
     );
     return 0;
   } else if (node is Constant) {
@@ -398,7 +388,6 @@ dynamic _evaluateExprNode(
         if (right == 0) {
           Logger.warn(
             'Division by zero in expression. Returning 0.',
-            label: 'RecordCompute.evaluateExpressionForRecord',
           );
           return 0;
         }
@@ -407,7 +396,6 @@ dynamic _evaluateExprNode(
         if (right == 0) {
           Logger.warn(
             'Modulo by zero in expression. Returning 0.',
-            label: 'RecordCompute.evaluateExpressionForRecord',
           );
           return 0;
         }
