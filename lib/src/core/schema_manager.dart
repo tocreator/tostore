@@ -583,8 +583,7 @@ class SchemaManager {
           }
           return _schemaMeta!;
         } catch (e) {
-          Logger.error('Failed to load schema meta: $e',
-              label: 'SchemaManager.loadSchemaMeta');
+          Logger.error('Failed to load schema meta', rawError: e);
         }
       }
     }
@@ -657,10 +656,7 @@ class SchemaManager {
       // create new partition
       return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
     } catch (e) {
-      Logger.error(
-        'Failed to find suitable partition: $e',
-        label: 'SchemaManager._findSuitablePartition',
-      );
+      Logger.error('Failed to find suitable partition', rawError: e);
       // create new partition when error
       final existingPartitions = meta.tablePartitionMap.values.toSet().toList();
       return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
@@ -773,8 +769,7 @@ class SchemaManager {
     try {
       return SchemaPartitionMeta.fromJson(jsonDecode(content));
     } catch (e) {
-      Logger.error('Failed to load partition meta: $e',
-          label: 'SchemaPartitionManager._loadPartitionMeta');
+      Logger.error('Failed to load partition meta', rawError: e);
       return null;
     }
   }
@@ -880,8 +875,7 @@ class SchemaManager {
       // Precise TTL cache update (no global invalidate).
       _dataStore.upsertTtlPlanForSchema(schema);
     } catch (e) {
-      Logger.error('Failed to save table schema: $tableName, $e',
-          label: 'SchemaManager.saveTableSchema');
+      Logger.error('Failed to save table schema: $tableName, ', rawError: e);
       throw DbException.wrap(e, fallbackMessage: 'Failed to save table schema');
     }
   }
@@ -957,15 +951,11 @@ class SchemaManager {
         }
         return schema;
       } catch (e) {
-        Logger.error('Failed to parse table schema: $tableName, $e',
-            label: 'SchemaManager.getTableSchema');
+        Logger.error('Failed to parse table schema: $tableName, ', rawError: e);
         return null;
       }
     } catch (e) {
-      Logger.error(
-        'Failed to get table schema: $tableName, $e',
-        label: 'SchemaManager.getTableSchema',
-      );
+      Logger.error('Failed to get table schema: $tableName, ', rawError: e);
       return null;
     }
   }
@@ -993,10 +983,7 @@ class SchemaManager {
 
       return success;
     } catch (e) {
-      Logger.error(
-        'Failed to delete table schema: $tableName, $e',
-        label: 'SchemaManager.deleteTableSchema',
-      );
+      Logger.error('Failed to delete table schema: $tableName, ', rawError: e);
       return false;
     }
   }
@@ -1175,9 +1162,8 @@ class SchemaManager {
       _dataStore.upsertTtlPlanForSchema(newSchema);
     } catch (e) {
       Logger.error(
-        'Failed to rename table schema: $oldTableName -> $newTableName, $e',
-        label: 'SchemaManager.renameTableSchema',
-      );
+          'Failed to rename table schema: $oldTableName -> $newTableName, ',
+          rawError: e);
       rethrow;
     }
   }
@@ -1228,8 +1214,7 @@ class SchemaManager {
 
       return true;
     } catch (e) {
-      Logger.error('Failed to delete table schema: $e',
-          label: 'SchemaPartitionManager.deleteTableSchema');
+      Logger.error('Failed to delete table schema', rawError: e);
       return false;
     }
   }
@@ -1290,10 +1275,7 @@ class SchemaManager {
       result['partitionDetails'] = partitionDetails;
       return result;
     } catch (e) {
-      Logger.error(
-        'Failed to get partition stats: $e',
-        label: 'SchemaManager.getPartitionStats',
-      );
+      Logger.error('Failed to get partition stats', rawError: e);
       return {'error': '$e', 'totalTables': 0, 'partitionDetails': []};
     }
   }
@@ -1302,14 +1284,12 @@ class SchemaManager {
   Future<bool> optimizePartitions() async {
     try {
       final startTime = DateTime.now();
-      Logger.debug('Start partition optimization...',
-          label: 'SchemaManager.optimizePartitions');
+      Logger.debug('Start partition optimization...');
 
       // get meta
       final meta = await getSchemaMeta();
       if (meta.tablePartitionMap.isEmpty) {
-        Logger.debug('No table info, skip optimization',
-            label: 'SchemaManager.optimizePartitions');
+        Logger.debug('No table info, skip optimization');
         return true;
       }
 
@@ -1317,8 +1297,7 @@ class SchemaManager {
       final uniquePartitions = meta.tablePartitionMap.values.toSet().toList();
 
       if (uniquePartitions.isEmpty) {
-        Logger.debug('No partition info, skip optimization',
-            label: 'SchemaManager.optimizePartitions');
+        Logger.debug('No partition info, skip optimization');
         return true;
       }
 
@@ -1335,8 +1314,7 @@ class SchemaManager {
       }
 
       if (partitionMetas.isEmpty) {
-        Logger.debug('No valid partition meta, skip optimization',
-            label: 'SchemaManager.optimizePartitions');
+        Logger.debug('No valid partition meta, skip optimization');
         return true;
       }
 
@@ -1363,7 +1341,6 @@ class SchemaManager {
       if (overloadedPartitions.isEmpty) {
         Logger.debug(
           'No partitions need optimization, all partitions are balanced',
-          label: 'SchemaManager.optimizePartitions',
         );
         return true;
       }
@@ -1420,7 +1397,6 @@ class SchemaManager {
 
           Logger.debug(
             'Moving table $tableName from partition $overloadedIndex to partition $targetPartition (size: $tableSize bytes)',
-            label: 'SchemaManager.optimizePartitions',
           );
 
           // delete table from source partition
@@ -1496,15 +1472,11 @@ class SchemaManager {
       final duration = DateTime.now().difference(startTime);
       Logger.debug(
         'Partition optimization completed: moved ${tablesMovedCount.length} tables, time taken ${duration.inMilliseconds}ms',
-        label: 'SchemaManager.optimizePartitions',
       );
 
       return true;
     } catch (e) {
-      Logger.error(
-        'Partition optimization failed: $e',
-        label: 'SchemaManager.optimizePartitions',
-      );
+      Logger.error('Partition optimization failed', rawError: e);
       return false;
     }
   }
@@ -1531,10 +1503,7 @@ class SchemaManager {
 
       return tableSchemas;
     } catch (e) {
-      Logger.error(
-        'Failed to get all table schemas: $e',
-        label: 'SchemaManager.getAllTableSchemas',
-      );
+      Logger.error('Failed to get all table schemas', rawError: e);
       return [];
     }
   }
@@ -1568,10 +1537,7 @@ class SchemaManager {
         oldHash,
       );
     } catch (e) {
-      Logger.error(
-        'Failed to judge table schema change: $e',
-        label: 'SchemaManager.isSchemaChanged',
-      );
+      Logger.error('Failed to judge table schema change', rawError: e);
       return true; // return true when error, for safety upgrade
     }
   }
@@ -1587,10 +1553,7 @@ class SchemaManager {
         oldHash,
       );
     } catch (e) {
-      Logger.error(
-        'Failed to judge system schema change: $e',
-        label: 'SchemaManager.isSystemSchemaChanged',
-      );
+      Logger.error('Failed to judge system schema change', rawError: e);
       return true;
     }
   }
@@ -1604,10 +1567,7 @@ class SchemaManager {
       _schemaMeta = meta.copyWith(userSchemaHash: hash);
       await saveSchemaStructure();
     } catch (e) {
-      Logger.error(
-        'Failed to update user schema hash: $e',
-        label: 'SchemaManager.updateUserSchemaHash',
-      );
+      Logger.error('Failed to update user schema hash', rawError: e);
     }
   }
 
@@ -1620,10 +1580,7 @@ class SchemaManager {
       _schemaMeta = meta.copyWith(systemSchemaHash: hash);
       await saveSchemaStructure();
     } catch (e) {
-      Logger.error(
-        'Failed to update system schema hash: $e',
-        label: 'SchemaManager.updateSystemSchemaHash',
-      );
+      Logger.error('Failed to update system schema hash', rawError: e);
     }
   }
 }
