@@ -222,10 +222,8 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
         } catch (e) {
           // Preserve mature behavior: expression failures are logged and the
           // current field is skipped without failing the whole record.
-          Logger.error(
-            'Expression evaluation failed for $fieldName: $e',
-            label: 'Compute.batchUpdate.prepare',
-          );
+          Logger.error('Expression evaluation failed for $fieldName',
+              rawError: e);
         }
       } else {
         if (updatedRecord[fieldName] != proposed) {
@@ -312,10 +310,8 @@ Future<UniformUpdatePrepareResult> prepareUniformUpdateChunk(
           );
           updatedRecord[fieldName] = field.convertValue(result);
         } catch (e) {
-          Logger.error(
-            'Failed to evaluate expression for field $fieldName: $e',
-            label: 'Compute.updateInternal.prepare',
-          );
+          Logger.error('Failed to evaluate expression for field $fieldName',
+              rawError: e);
           updatedRecord[fieldName] = record[fieldName];
         }
       } else if (request.validData.containsKey(fieldName)) {
