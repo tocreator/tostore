@@ -1418,30 +1418,32 @@ if (txResult.isFailed) {
 
 
 ### <a id="logging-diagnostics"></a>Günlük Geri Arama ve Veritabanı Tanılama
+ToStore, veritabanı yaşam döngüsü günlüklerini `ToStore.setLogConfig(...)` aracılığıyla iş katmanına geri yönlendirebilir.
 
-ToStore, başlatma, kurtarma, otomatik geçiş ve çalışma zamanı kısıtlama çakışması günlüklerini `LogConfig.setConfig(...)` aracılığıyla iş katmanına geri yönlendirebilir.
-
-- `onLogHandler` mevcut `enableLog` ve `logLevel` filtrelerini geçen tüm günlükleri alır.
-- Başlatmadan önce `LogConfig.setConfig(...)`'yi arayın, böylece başlatma ve otomatik geçiş sırasında oluşturulan günlükler de yakalanır.
+- `onLog` geri araması, mevcut `enableLog` ve `logLevel` filtrelerini geçen tüm `LogRecord` günlük kayıtlarını alır.
+  - **LogLevel.error**: Yerel bir hata oluştu, normal çalışmayı etkilemez.
+  - **LogLevel.critical**: Manuel müdahale gerektiren genel afet düzeyinde hata (disk dolu, yetersiz bellek, kritik geçiş hatası vb.). Bu düzeyde alarm bildirimlerinin tetiklenmesi önerilir.
+- Başlatmadan önce `ToStore.setLogConfig(...)`'yi çağırın, böylece başlatma ve otomatik geçiş sırasında oluşturulan günlükler de yakalanır.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Günlük parametrelerini veya geri aramayı yapılandırın
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Uygulamaları veya veritabanı örneklerini ayırt etmek için günlüğün üstündeki açık gri başlık,
+    onLog: (log) {
+      // Üretimde, warn/error/critical backend veya günlük platformuna bildirilebilir
+      // log.level günlük düzeyine karşılık gelir (LogLevel.debug, info, warn, error, critical)
+      // log.message işlenen günlük metnine karşılık gelir
+      // log.status temel ResultStatus teşhis durumuna karşılık gelir (code ve codeKey içerir)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Güvenlik Yapılandırması
 
 > [!WARNING]
