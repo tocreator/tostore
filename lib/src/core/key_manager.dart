@@ -133,10 +133,7 @@ class KeyManager {
       // This will handle key comparison and setup fallback keys including new key if changed
       keyChangeInfo = await updateEncoderHandlerKeys(spaceConfig);
     } catch (e) {
-      Logger.error(
-        'Failed to set Encoder key: $e',
-        label: 'KeyManager.initialize',
-      );
+      Logger.error('Failed to set Encoder key', rawError: e);
     }
 
     if (_dataStore.isMigrationInstance) {
@@ -201,7 +198,7 @@ class KeyManager {
           isPlaintext: true,
         );
       } catch (e) {
-        Logger.error('Failed to decrypt current key: $e');
+        Logger.error('Failed to decrypt current key', rawError: e);
       }
     }
 
@@ -217,7 +214,6 @@ class KeyManager {
       keyIdToUse = newKeyId;
       Logger.info(
         'Encoding key changed, preparing async migration with new keyId: $newKeyId',
-        label: 'KeyManager.updateEncoderHandlerKeys',
       );
       keyChangeInfo = KeyChangeInfo(
         hasChanged: true,
@@ -260,8 +256,8 @@ class KeyManager {
       );
     } catch (e) {
       Logger.error(
-        'Failed to create or encrypt key during first-time initialization: $e',
-      );
+          'Failed to create or encrypt key during first-time initialization',
+          rawError: e);
       return SpaceConfig(
         current: const EncryptionKeyInfo(key: '', keyId: 0),
         previous: null,
@@ -308,7 +304,6 @@ class KeyManager {
       Logger.warn(
         'Stale key migration meta (targetKeyId=${info.targetKeyId}, '
         'current=${EncoderHandler.getCurrentKeyId()}); abandoning resume',
-        label: 'KeyManager._resumeKeyMigrationIfNeeded',
       );
       return;
     }
@@ -317,14 +312,12 @@ class KeyManager {
     if (resumeInfo == null) {
       Logger.error(
         'Cannot resume key migration: failed to rebuild KeyChangeInfo',
-        label: 'KeyManager._resumeKeyMigrationIfNeeded',
       );
       return;
     }
 
     Logger.info(
       'Resuming key migration for keyId ${info.targetKeyId}',
-      label: 'KeyManager._resumeKeyMigrationIfNeeded',
     );
     _scheduleKeyMigrationRun(resumeInfo);
   }
@@ -389,7 +382,6 @@ class KeyManager {
       Logger.warn(
         'Key migration did not stop within ${timeout.inSeconds}s; '
         'forcing shutdown flush',
-        label: 'KeyManager.pauseKeyMigration',
       );
       await KeyMigrationRunner.pauseForShutdown(_dataStore);
     } catch (_) {}
@@ -400,7 +392,6 @@ class KeyManager {
     _keyMigrationScheduled = true;
     Logger.info(
       'Scheduling background key migration for keyId ${info.newKeyId}',
-      label: 'KeyManager._scheduleKeyMigrationRun',
     );
     unawaited(_keyMigrationFuture = _runKeyMigration(info));
   }
