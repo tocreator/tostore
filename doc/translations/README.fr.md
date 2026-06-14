@@ -1418,30 +1418,32 @@ Types d'erreurs de transaction :
 
 
 ### <a id="logging-diagnostics"></a>Rappel du journal et diagnostics de la base de données
+ToStore peut acheminer les journaux du cycle de vie de la base de données vers la couche métier via `ToStore.setLogConfig(...)`.
 
-ToStore peut acheminer les journaux de démarrage, de récupération, de migration automatique et de conflits de contraintes d'exécution vers la couche métier via `LogConfig.setConfig(...)`.
-
-- `onLogHandler` reçoit tous les journaux qui passent les filtres `enableLog` et `logLevel` actuels.
-- Appelez `LogConfig.setConfig(...)` avant l'initialisation afin que les journaux générés lors de l'initialisation et de la migration automatique soient également capturés.
+- Le rappel `onLog` reçoit tous les enregistrements de journal `LogRecord` qui passent les filtres `enableLog` et `logLevel` actuels.
+  - **LogLevel.error**: Une erreur locale s'est produite, n'affecte pas le fonctionnement normal.
+  - **LogLevel.critical**: Erreur globale de niveau catastrophe (telle que disque plein, mémoire insuffisante, échec de migration critique, etc.) nécessitant une intervention manuelle. Il est recommandé de déclencher des notifications d'alarme à ce niveau.
+- Appelez `ToStore.setLogConfig(...)` avant l'initialisation afin que les journaux générés lors de l'initialisation et de la migration automatique soient également capturés.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Configurer les paramètres de journalisation ou le rappel
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Titre gris clair en haut du journal pour distinguer les applications ou les instances de base de données,
+    onLog: (log) {
+      // En production, warn/error/critical peuvent être signalés au backend ou à la plateforme de journalisation
+      // log.level correspond au niveau de journalisation (LogLevel.debug, info, warn, error, critical)
+      // log.message correspond au texte du journal traité
+      // log.status correspond à l'état de diagnostic ResultStatus sous-jacent (contient code et codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Configuration de la sécurité
 
 > [!WARNING]
