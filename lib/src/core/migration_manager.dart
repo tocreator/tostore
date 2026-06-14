@@ -316,8 +316,7 @@ class MigrationManager {
         _telemetry.recordRecordsProcessed(taskId, progress.count);
       }
     } catch (e) {
-      Logger.error('Failed to notify background write completion: $e',
-          label: 'MigrationManager.onBackgroundWritePersisted');
+      Logger.error('Failed to notify background write completion', rawError: e);
     }
   }
 
@@ -348,8 +347,7 @@ class MigrationManager {
   Future<void> stopMigrationForSpace(String spaceName) async {
     final controller = _activeControllers[spaceName];
     if (controller != null) {
-      Logger.info('Stopping background migration for space [$spaceName]...',
-          label: 'MigrationManager');
+      Logger.info('Stopping background migration for space [$spaceName]...');
       controller.cancel();
       // Do not remove from _activeControllers yet, let the task finish
     }
@@ -361,11 +359,9 @@ class MigrationManager {
         await taskFuture;
       } catch (e) {
         if (e is _MigrationStoppedException) {
-          Logger.info('Migration for space [$spaceName] stopped gracefully',
-              label: 'MigrationManager');
+          Logger.info('Migration for space [$spaceName] stopped gracefully');
         } else {
-          Logger.error('Failed to wait for migration task stop: $e',
-              label: 'MigrationManager');
+          Logger.error('Failed to wait for migration task stop', rawError: e);
         }
       }
     }
@@ -376,8 +372,7 @@ class MigrationManager {
       try {
         await instance.close();
       } catch (e) {
-        Logger.error('Failed to close migration instance: $e',
-            label: 'MigrationManager');
+        Logger.error('Failed to close migration instance', rawError: e);
       }
     }
 
@@ -615,7 +610,6 @@ class MigrationManager {
 
       Logger.info(
         'Start database migration: involving ${targetSchemas.length} tables',
-        label: 'MigrationManager.migrate',
       );
 
       // Performance optimization: Skip migration if no schemas
@@ -703,7 +697,6 @@ class MigrationManager {
           if (!SystemTable.isSystemTable(oldTableName)) {
             Logger.info(
               'Table [$oldTableName -> ${newSchema.name}] generated ${operations.length} migration operations',
-              label: 'MigrationManager.migrate',
             );
           }
 
@@ -716,11 +709,10 @@ class MigrationManager {
             targetSchemaSnapshot: newSchema,
           );
           allTasks.add(task);
-        } catch (e, stack) {
+        } catch (e) {
           Logger.error(
-            'Failed to handle table renaming [$oldTableName -> ${newSchema.name}]: $e\n$stack',
-            label: 'MigrationManager.migrate',
-          );
+              'Failed to handle table renaming [$oldTableName -> ${newSchema.name}]',
+              rawError: e);
           rethrow;
         }
       }
@@ -756,15 +748,11 @@ class MigrationManager {
             if (!SystemTable.isSystemTable(schema.name)) {
               Logger.info(
                 'Create new table: ${schema.name}',
-                label: 'MigrationManager.migrate',
               );
             }
           }
-        } catch (e, stack) {
-          Logger.error(
-            'Failed to handle table [${schema.name}]: $e\n$stack',
-            label: 'MigrationManager.migrate',
-          );
+        } catch (e) {
+          Logger.error('Failed to handle table [${schema.name}]', rawError: e);
           rethrow;
         }
       }
@@ -793,14 +781,11 @@ class MigrationManager {
           if (!SystemTable.isSystemTable(tableName)) {
             Logger.info(
               'Handle table deletion: $tableName',
-              label: 'MigrationManager.migrate',
             );
           }
-        } catch (e, stack) {
-          Logger.error(
-            'Failed to handle table deletion [$tableName]: $e\n$stack',
-            label: 'MigrationManager.migrate',
-          );
+        } catch (e) {
+          Logger.error('Failed to handle table deletion [$tableName]',
+              rawError: e);
           rethrow;
         }
       }
@@ -810,14 +795,12 @@ class MigrationManager {
         if (waitForCompletion) {
           Logger.info(
             'Database migration generated ${allTasks.length} migration tasks, starting execution...',
-            label: 'MigrationManager.migrate',
           );
           final migrateResult = await processMigrationTasks();
 
           if (!migrateResult.success) {
             Logger.error(
               'Some migration tasks failed, please check the log for details',
-              label: 'MigrationManager.migrate',
             );
             if (migrateResult.errors.isNotEmpty) {
               final firstError = migrateResult.errors.first;
@@ -841,13 +824,11 @@ class MigrationManager {
           } else {
             Logger.info(
               'All migration tasks have been successfully completed',
-              label: 'MigrationManager.migrate',
             );
           }
         } else {
           Logger.info(
             'Database migration generated ${allTasks.length} migration tasks, running asynchronously in background.',
-            label: 'MigrationManager.migrate',
           );
           unawaited(processMigrationTasks());
         }
@@ -859,13 +840,9 @@ class MigrationManager {
 
       Logger.info(
         'Database migration completed:  Renamed tables [${renamedTables.length}], Updated tables [$tablesUpdated], New tables [$tablesCreated], Deleted tables [$tablesDropped], Total duration [${duration.inMilliseconds}ms]',
-        label: 'MigrationManager.migrate',
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Database migration failed: $e\n$stack',
-        label: 'MigrationManager.migrate',
-      );
+    } catch (e) {
+      Logger.error('Database migration failed', rawError: e);
       rethrow;
     }
   }
@@ -1055,7 +1032,6 @@ class MigrationManager {
               .join(', ');
           Logger.info(
             'Final result of table renaming detection: $renameInfo',
-            label: 'MigrationManager._detectRenamedTables',
           );
         }
       }
@@ -1067,7 +1043,6 @@ class MigrationManager {
         if (userTablesToCreate.isNotEmpty) {
           Logger.info(
             'Tables to be created: ${userTablesToCreate.join(', ')}',
-            label: 'MigrationManager._detectRenamedTables',
           );
         }
       }
@@ -1079,7 +1054,6 @@ class MigrationManager {
         if (userTablesToDrop.isNotEmpty) {
           Logger.info(
             'Tables to be deleted: ${userTablesToDrop.join(', ')}',
-            label: 'MigrationManager._detectRenamedTables',
           );
         }
       }
@@ -1089,11 +1063,9 @@ class MigrationManager {
         tablesToCreate: tablesToCreate,
         tablesToDrop: tablesToDrop,
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Error occurred during table renaming detection: $e\n$stack',
-        label: 'MigrationManager._detectRenamedTables',
-      );
+    } catch (e) {
+      Logger.error('Error occurred during table renaming detection',
+          rawError: e);
 
       // Return empty result in case of error to avoid misjudgment
       return const RenamedTableResult(
@@ -1255,11 +1227,9 @@ class MigrationManager {
           break;
         }
       }
-    } catch (e, stack) {
-      Logger.error(
-        'Error during parallel table similarity detection: $e\n$stack',
-        label: 'MigrationManager._detectRenamedTablesBySimilarity',
-      );
+    } catch (e) {
+      Logger.error('Error during parallel table similarity detection',
+          rawError: e);
     }
   }
 
@@ -1288,7 +1258,6 @@ class MigrationManager {
       if (!SystemTable.isSystemTable(tableName)) {
         Logger.info(
           'Found ${operations.length} changes for table $tableName',
-          label: 'MigrationManager._migrateExistingTable',
         );
       }
     }
@@ -1299,7 +1268,6 @@ class MigrationManager {
     if (existingTaskIds.isNotEmpty) {
       Logger.info(
         'Table [$tableName] already has ${existingTaskIds.length} unfinished schema migration tasks (${existingTaskIds.join(',')}), skipping adding new task',
-        label: 'MigrationManager._migrateExistingTable',
       );
       return null;
     }
@@ -1682,11 +1650,8 @@ class MigrationManager {
       }
 
       return task;
-    } catch (e, stack) {
-      Logger.error(
-        'Add migration task failed: $e\n$stack',
-        label: 'MigrationManager.addMigrationTask',
-      );
+    } catch (e) {
+      Logger.error('Add migration task failed', rawError: e);
       rethrow;
     }
   }
@@ -2151,12 +2116,11 @@ class MigrationManager {
           await _dataStore.storage.deleteFile(backupPath);
         }
 
-        Logger.info('Cleaned up migration backup: $backupPath',
-            label: 'MigrationManager');
+        Logger.info('Cleaned up migration backup: $backupPath');
       } catch (e) {
         // Just log warning, backup cleanup is non-critical
-        Logger.warn('Failed to cleanup migration backup [$backupPath]: $e',
-            label: 'MigrationManager');
+        Logger.warn('Failed to cleanup migration backup [$backupPath]',
+            rawError: e);
       }
     }());
   }
@@ -2189,7 +2153,6 @@ class MigrationManager {
           _mayNeedDataRewriteWithoutSnapshot(task.operations)) {
         Logger.error(
           'Migration task [${task.taskId}] is missing an old schema snapshot for rename + data rewrite. Continuing would decode old records with the wrong layout.',
-          label: 'MigrationManager._resolveOldSchemaSnapshot',
         );
         return null;
       }
@@ -2199,7 +2162,6 @@ class MigrationManager {
       if (currentSchema != null) {
         Logger.warn(
           'Migration task [${task.taskId}] is missing an old schema snapshot for rename-only migration. Falling back to the current schema of ${currentSchema.name}.',
-          label: 'MigrationManager._resolveOldSchemaSnapshot',
         );
       }
       return currentSchema;
@@ -2211,7 +2173,6 @@ class MigrationManager {
       if (currentSchema != null) {
         Logger.warn(
           'Migration task [${task.taskId}] is missing an old schema snapshot. Falling back to the current schema of ${task.tableName}.',
-          label: 'MigrationManager._resolveOldSchemaSnapshot',
         );
       }
       return currentSchema;
@@ -2219,7 +2180,6 @@ class MigrationManager {
 
     Logger.error(
       'Migration task [${task.taskId}] is missing an old schema snapshot after schema update. In-place data rewrite cannot continue safely.',
-      label: 'MigrationManager._resolveOldSchemaSnapshot',
     );
     return null;
   }
@@ -2487,7 +2447,6 @@ class MigrationManager {
         Logger.warn(
           'Attempted to change "isGlobal" for table $tableName with existing data (recordCount=$recordCount). '
           'This requires complex data migration between spaces and the global scope and is therefore rejected.',
-          label: 'MigrationManager._compareSchemasAndGenerateOperations',
         );
         throw DbException([
           SchemaValidationStatus(
@@ -2508,7 +2467,6 @@ class MigrationManager {
       Logger.info(
         'Table $tableName has no data (recordCount=0), allowing "isGlobal" change '
         'from ${oldSchema.isGlobal} to ${newSchema.isGlobal}.',
-        label: 'MigrationManager._compareSchemasAndGenerateOperations',
       );
     }
     final operations = <MigrationOperation>[];
@@ -2578,7 +2536,6 @@ class MigrationManager {
     if (oldSchema.primaryKeyConfig.name != newSchema.primaryKeyConfig.name) {
       Logger.info(
         'Primary key name change detected: ${oldSchema.primaryKeyConfig.name} -> ${newSchema.primaryKeyConfig.name}',
-        label: 'MigrationManager._isPrimaryKeyConfigChanged',
       );
       return true;
     }
@@ -2588,7 +2545,6 @@ class MigrationManager {
         newSchema.primaryKeyConfig.isOrdered) {
       Logger.info(
         'Primary key ordering change detected: ${oldSchema.primaryKeyConfig.isOrdered} -> ${newSchema.primaryKeyConfig.isOrdered}',
-        label: 'MigrationManager._isPrimaryKeyConfigChanged',
       );
       return true;
     }
@@ -2697,7 +2653,6 @@ class MigrationManager {
         if (!SystemTable.isSystemTable(newSchema.name)) {
           Logger.info(
             'Table ${newSchema.name}, field ${newField.name} has been modified',
-            label: 'MigrationManager._compareSchemas',
           );
         }
         operations.add(MigrationOperation(
@@ -2824,7 +2779,6 @@ class MigrationManager {
       if (!SystemTable.isSystemTable(oldSchema.name)) {
         Logger.info(
           'Detected index to be removed: ${indexToRemove.actualIndexName}, fields: ${indexToRemove.fields.join(", ")}',
-          label: 'MigrationManager._compareIndexes',
         );
       }
 
@@ -2975,7 +2929,6 @@ class MigrationManager {
       if (!SystemTable.isSystemTable(oldSchema.name)) {
         Logger.info(
           'Detected foreign key to be removed: ${fkToRemove.actualName}',
-          label: 'MigrationManager._compareForeignKeys',
         );
       }
 
@@ -3330,7 +3283,6 @@ class MigrationManager {
         jsonEncode(newField.vectorConfig?.toJson())) {
       Logger.warn(
         'Detected a change in vectorConfig for field "${newField.name}". This is considered a breaking change.',
-        label: 'MigrationManager._isFieldModified',
       );
       return true;
     }
@@ -3430,10 +3382,7 @@ class MigrationManager {
         _migrationMetaCache = MigrationMeta.initial();
       }
     } catch (e) {
-      Logger.warn(
-        'Load migration meta failed, use initial: $e',
-        label: 'MigrationManager._loadMigrationMeta',
-      );
+      Logger.warn('Load migration meta failed, use initial', rawError: e);
       _migrationMetaCache = MigrationMeta.initial();
     }
 
@@ -3470,10 +3419,7 @@ class MigrationManager {
       _migrationMetaCache = meta;
       _updateCurrentDirIndexCache();
     } catch (e) {
-      Logger.warn(
-        'Save migration meta failed: $e',
-        label: 'MigrationManager._saveMigrationMeta',
-      );
+      Logger.warn('Save migration meta failed', rawError: e);
     }
   }
 
@@ -3562,7 +3508,6 @@ class MigrationManager {
               .timeout(taskTimeout, onTimeout: () {
             Logger.error(
               'Task execution timed out: taskId=${task.taskId}, tableName=${task.tableName}',
-              label: 'MigrationManager.processMigrationTasks',
             );
 
             // timeout consider as failed
@@ -3581,15 +3526,12 @@ class MigrationManager {
           _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
           await _cleanupTask(task);
           _unregisterRuntimeMigrationForTask(task);
-        } catch (e, stack) {
+        } catch (e) {
           if (e is _MigrationStoppedException) {
             break;
           }
 
-          Logger.error(
-            'Migration task execution failed: $e\n$stack',
-            label: 'MigrationManager.processMigrationTasks',
-          );
+          Logger.error('Migration task execution failed', rawError: e);
 
           // task execution failed
           success = false;
@@ -3625,11 +3567,8 @@ class MigrationManager {
       }
 
       await syncHasMigrationTask();
-    } catch (e, stack) {
-      Logger.error(
-        'Process migration tasks failed: $e\n$stack',
-        label: 'MigrationManager.processMigrationTasks',
-      );
+    } catch (e) {
+      Logger.error('Process migration tasks failed', rawError: e);
       success = false;
       errors.add(e);
       if (e is DbException) {
@@ -3663,7 +3602,6 @@ class MigrationManager {
       if (!SystemTable.isSystemTable(task.tableName)) {
         Logger.info(
           'Starting migration task execution: ${task.taskId}, table: ${task.tableName}',
-          label: 'MigrationManager._executeMigrationTask',
         );
       }
 
@@ -3720,13 +3658,11 @@ class MigrationManager {
           if (isValid) {
             Logger.info(
               'Found valid existing pre-migration backup at [${currentTask.backupPath}], skipping re-backup.',
-              label: 'MigrationManager',
             );
             needNewBackup = false;
           } else {
             Logger.warn(
               'Recorded backup at [${currentTask.backupPath}] is missing or invalid.',
-              label: 'MigrationManager',
             );
           }
         }
@@ -3734,7 +3670,6 @@ class MigrationManager {
         if (needNewBackup) {
           Logger.info(
             'Starting scheduled backup before data migration for table [${currentTask.tableName}]...',
-            label: 'MigrationManager',
           );
           try {
             final path = await _dataStore.backup();
@@ -3742,8 +3677,7 @@ class MigrationManager {
             await _saveMigrationTask(currentTask);
             _updatePendingTaskInMemory(currentTask);
           } catch (e) {
-            Logger.error('Pre-migration backup failed: $e',
-                label: 'MigrationManager');
+            Logger.error('Pre-migration backup failed', rawError: e);
             // In strict mode, backup failure stops the migration for safety
             if (_dataStore.config.migrationConfig?.strictMode ?? false) {
               rethrow;
@@ -3809,7 +3743,6 @@ class MigrationManager {
 
       Logger.info(
         'Preparing to migrate data for ${pendingSpaces.length} spaces',
-        label: 'MigrationManager._executeMigrationTask',
       );
 
       // process data migration for each space
@@ -3857,7 +3790,6 @@ class MigrationManager {
             if (!exists && !SystemTable.isSystemTable(originalTableName)) {
               Logger.info(
                 'Skip migration for table [$originalTableName] in space [$space]: table mapping not found',
-                label: 'MigrationManager._executeMigrationTask',
               );
               return;
             }
@@ -4096,7 +4028,6 @@ class MigrationManager {
                     Logger.error(
                       'Background migration validation failed for space [$space] in table [${currentTask.tableName}]. '
                       'Stopping migration for safety.',
-                      label: 'MigrationManager._executeMigrationTask',
                     );
                     // Throwing here will be caught by the outer try-finally, releasing the lease.
                     throw DbException([
@@ -4139,7 +4070,6 @@ class MigrationManager {
         spaceStopwatch.stop();
         Logger.info(
           'Space [$space] migration completed, time taken: ${spaceStopwatch.elapsedMilliseconds}ms',
-          label: 'MigrationManager._executeMigrationTask',
         );
       }
 
@@ -4162,7 +4092,6 @@ class MigrationManager {
           Logger.info(
             'Migration task finished successfully: ${currentTask.taskId}, table: ${currentTask.tableName}. '
             'Summary: ${_telemetry.getTaskSummary(currentTask.taskId)}',
-            label: 'MigrationManager._executeMigrationTask',
           );
         }
 
@@ -4172,29 +4101,29 @@ class MigrationManager {
           _cleanupMigrationBackup(currentTask.backupPath!);
         }
       }
-    } catch (e, stack) {
+    } catch (e) {
       if (e is _MigrationStoppedException) {
         Logger.info(
-          'Migration task ${task.taskId} paused: $e',
-          label: 'MigrationManager._executeMigrationTask',
+          'Migration task ${task.taskId} paused',
         );
         rethrow;
       }
       _telemetry.recordTaskFailure(task.taskId, e.toString());
-      Logger.error(
-        'Execute migration task failed: $e\n$stack',
-        label: 'MigrationManager._executeMigrationTask',
-      );
+      Logger.critical(GeneralStatus(
+        type: ResultType.devMigrationBatchExecutionFailed,
+        message: 'Execute migration task failed: $e',
+      ));
 
       // If a backup was made, inform the user that it has been preserved
       if (currentTask.backupPath != null) {
-        Logger.error(
-          'CRITICAL: Migration for table [${currentTask.tableName}] failed during background data movement. '
-          'To prevent overwriting new data written during migration, NO automatic restoration was performed. '
-          'A safety snapshot of the state BEFORE migration is preserved at: ${currentTask.backupPath}. '
-          'If you decide to restore manually using this backup, be aware that any data written after the migration started will be LOST.',
-          label: 'MigrationManager._executeMigrationTask',
-        );
+        Logger.critical(GeneralStatus(
+          type: ResultType.devMigrationBatchExecutionFailed,
+          message:
+              'CRITICAL: Migration for table [${currentTask.tableName}] failed during background data movement. '
+              'To prevent overwriting new data written during migration, NO automatic restoration was performed. '
+              'A safety snapshot of the state BEFORE migration is preserved at: ${currentTask.backupPath}. '
+              'If you decide to restore manually using this backup, be aware that any data written after the migration started will be LOST.',
+        ));
       }
       rethrow;
     }
@@ -4728,10 +4657,7 @@ class MigrationManager {
         await _saveMigrationMeta(updatedMeta);
       }
     } catch (e) {
-      Logger.error(
-        'Cleanup migration task failed: $e',
-        label: 'MigrationManager._cleanupTask',
-      );
+      Logger.error('Cleanup migration task failed', rawError: e);
     }
   }
 
@@ -4741,11 +4667,8 @@ class MigrationManager {
       _runtimeMigrations.clear();
       await _recoverPendingSchemaTasksFromDisk();
       await syncHasMigrationTask();
-    } catch (e, stack) {
-      Logger.error(
-        'Failed to initialize migration manager: $e\n$stack',
-        label: 'MigrationManager.initialize',
-      );
+    } catch (e) {
+      Logger.error('Failed to initialize migration manager', rawError: e);
     }
   }
 
@@ -4768,7 +4691,6 @@ class MigrationManager {
         if (!fileExists) {
           Logger.warn(
             'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-            label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
           );
           tasksToRemove.add(taskId);
           continue;
@@ -4783,28 +4705,23 @@ class MigrationManager {
             if (_pendingTasks.any((t) => t.taskId == task.taskId)) continue;
             Logger.info(
               'Found unfinished migration task: taskId[${task.taskId}], table[${task.tableName}], remaining spaces[${task.pendingMigrationSpaces.length}]',
-              label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
             );
             _pendingTasks.add(task);
           } else {
             Logger.info(
               'Task completed but still in mapping: taskId[$taskId], cleaning up mapping',
-              label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
             );
             tasksToRemove.add(taskId);
           }
         } else {
           Logger.warn(
             'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-            label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
           );
           tasksToRemove.add(taskId);
         }
       } catch (e) {
-        Logger.warn(
-          'Failed to load task: taskId[$taskId], error[$e], cleaning up mapping',
-          label: 'MigrationManager._recoverPendingSchemaTasksFromDisk',
-        );
+        Logger.warn('Failed to load task: taskId[$taskId], cleaning up mapping',
+            rawError: e);
         tasksToRemove.add(taskId);
       }
     }
@@ -4890,14 +4807,10 @@ class MigrationManager {
 
         Logger.info(
           'Cleaned up ${taskIds.length} orphaned task mapping(s)',
-          label: 'MigrationManager._cleanupOrphanedMappings',
         );
       }
     } catch (e) {
-      Logger.error(
-        'Failed to cleanup orphaned mappings: $e',
-        label: 'MigrationManager._cleanupOrphanedMappings',
-      );
+      Logger.error('Failed to cleanup orphaned mappings', rawError: e);
     }
   }
 
@@ -4978,7 +4891,6 @@ class MigrationManager {
         // File doesn't exist but mapping has it - cleanup mapping
         Logger.warn(
           'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-          label: 'MigrationManager.queryTaskStatus',
         );
         await _cleanupOrphanedMappings([taskId]);
         return MigrationStatus(
@@ -4999,7 +4911,6 @@ class MigrationManager {
         // File exists but is empty - cleanup mapping
         Logger.warn(
           'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
-          label: 'MigrationManager.queryTaskStatus',
         );
         await _cleanupOrphanedMappings([taskId]);
         return null;
@@ -5032,10 +4943,7 @@ class MigrationManager {
         writeMode: task.writeMode,
       );
     } catch (e) {
-      Logger.error(
-        'Failed to query task status: $e',
-        label: 'MigrationManager.queryTaskStatus',
-      );
+      Logger.error('Failed to query task status', rawError: e);
       return null;
     }
   }
@@ -5089,14 +4997,10 @@ class MigrationManager {
       } else {
         Logger.debug(
           'Schema for table [$targetTableName] is already consistent with definition',
-          label: 'MigrationManager._ensureSchemaConsistency',
         );
       }
-    } catch (e, stack) {
-      Logger.error(
-        'Schema consistency check failed: $e\n$stack',
-        label: 'MigrationManager._ensureSchemaConsistency',
-      );
+    } catch (e) {
+      Logger.error('Schema consistency check failed', rawError: e);
     }
   }
 
@@ -5194,7 +5098,6 @@ class MigrationManager {
       '${(currentLayout.deletedSlotsRatio * 100).toStringAsFixed(1)}%, '
       'enabled background rewrite migration for task ${task.taskId} '
       'to purge deleted-slot payload values.',
-      label: 'MigrationManager._maybeEnableDeletedSlotCompaction',
     );
 
     return updatedTask;
@@ -5233,7 +5136,6 @@ class MigrationManager {
             }
             Logger.warn(
               'Data migration required: adding or modifying unique index "${newIdx.actualIndexName}" on table "${oldSchema.name}".',
-              label: 'MigrationManager._requiresDataMigration',
             );
             return true;
           }
@@ -5272,7 +5174,6 @@ class MigrationManager {
             }
             Logger.warn(
               'Data migration required: adding non-nullable field "${field.name}" without a default value.',
-              label: 'MigrationManager._requiresDataMigration',
             );
             return true;
           }
@@ -5330,7 +5231,6 @@ class MigrationManager {
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from nullable to non-nullable.',
-                label: 'MigrationManager._requiresDataMigration',
               );
               return true;
             }
@@ -5354,7 +5254,6 @@ class MigrationManager {
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type}.',
-                label: 'MigrationManager._requiresDataMigration',
               );
               return true;
             }
@@ -5378,7 +5277,6 @@ class MigrationManager {
               }
               Logger.warn(
                 'Data migration required: changing field "${fieldUpdate.name}" from non-unique to unique.',
-                label: 'MigrationManager._requiresDataMigration',
               );
               return true;
             }
@@ -5408,7 +5306,6 @@ class MigrationManager {
             }
             Logger.warn(
               'Data migration required: changing primary key name or type.',
-              label: 'MigrationManager._requiresDataMigration',
             );
             return true;
           }
