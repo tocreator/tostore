@@ -145,8 +145,7 @@ class SequentialIdGenerator implements IdGenerator {
         generated++;
       }
     } catch (e) {
-      Logger.error('SequentialIdGenerator refill failed: $e',
-          label: 'SequentialIdGenerator._refillIdPool');
+      Logger.error('SequentialIdGenerator refill failed', rawError: e);
     } finally {
       _idGenerationInProgress = false;
       if (acquired) {
@@ -184,8 +183,7 @@ class SequentialIdGenerator implements IdGenerator {
     while (result.length < count) {
       if (DateTime.now().isAfter(endTime)) {
         Logger.warn(
-            'SequentialIdGenerator getId timeout: Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds}s',
-            label: 'SequentialIdGenerator.getId');
+            'SequentialIdGenerator getId timeout: Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds}s');
         break;
       }
       if (_idPool.isNotEmpty) {
@@ -238,8 +236,7 @@ class SequentialIdGenerator implements IdGenerator {
       }
       return false;
     } catch (e) {
-      Logger.error('Request ID segment failed: $e',
-          label: 'SequentialIdGenerator');
+      Logger.error('Request ID segment failed', rawError: e);
       return false;
     }
   }
@@ -517,8 +514,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Add duplicate fill check
     if (_idGenerationInProgress[tableName] == true) {
       Logger.debug(
-          'Skip duplicate ID pool fill request: $tableName, fill task already running',
-          label: 'TimeBasedIdGenerator._refillIdPool');
+          'Skip duplicate ID pool fill request: $tableName, fill task already running');
       return;
     }
 
@@ -535,8 +531,7 @@ class TimeBasedIdGenerator implements IdGenerator {
           await _lockManager.acquireExclusiveLock(lockResource, operationId);
       if (!acquired) {
         Logger.warn(
-            'Failed to acquire exclusive lock for ID pool refill: $tableName',
-            label: 'TimeBasedIdGenerator._refillIdPool');
+            'Failed to acquire exclusive lock for ID pool refill: $tableName');
         return;
       }
 
@@ -596,8 +591,7 @@ class TimeBasedIdGenerator implements IdGenerator {
 
             Logger.debug(
                 'ID isolate batch generated: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
-                'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
-                label: 'TimeBasedIdGenerator._refillIdPool');
+                'Duration: ${duration}ms, Generation rate: $genRate IDs/s');
           }
         } else {
           // Old serial generation method remains unchanged
@@ -669,8 +663,7 @@ class TimeBasedIdGenerator implements IdGenerator {
           final purpose = totalGenerated > 1000 ? "refill" : "preheat";
           Logger.debug(
               'ID ${purpose}ed: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
-              'Duration: ${duration}ms, Generation rate: $genRate IDs/s',
-              label: 'TimeBasedIdGenerator._refillIdPool');
+              'Duration: ${duration}ms, Generation rate: $genRate IDs/s');
         }
       } finally {
         // Ensure mark is cleared
@@ -679,8 +672,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     } catch (e) {
       // Ensure mark is cleared (even if exception occurs)
       _idGenerationInProgress[tableName] = false;
-      Logger.error('Refill ID pool failed: $e',
-          label: 'TimeBasedIdGenerator._refillIdPool');
+      Logger.error('Refill ID pool failed', rawError: e);
       rethrow; // Re-throw exception for caller to handle
     } finally {
       // Release lock
@@ -752,8 +744,7 @@ class TimeBasedIdGenerator implements IdGenerator {
 
       return result.ids;
     } catch (e) {
-      Logger.error('Single isolate ID generation failed: $e',
-          label: 'TimeBasedIdGenerator._generateIdsInParallel');
+      Logger.error('Single isolate ID generation failed', rawError: e);
 
       // If error occurs, fall back to traditional generation method
       final numericIds = await _generateIds(neededCount, recentTotal);
@@ -823,8 +814,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         // Timeout check: If it has exceeded the set time, exit loop
         if (DateTime.now().isAfter(endTime)) {
           Logger.warn(
-              'Get ID timeout: Table=$tableName, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds',
-              label: 'TimeBasedIdGenerator.getId');
+              'Get ID timeout: Table=$tableName, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds');
           break; // Exit loop, return retrieved IDs
         }
         // Directly get latest queue state from _idPools
@@ -836,8 +826,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         }
       }
     } catch (e) {
-      Logger.error('ID pool fill or get failed: $e',
-          label: 'TimeBasedIdGenerator.getId');
+      Logger.error('ID pool fill or get failed', rawError: e);
     }
 
     // If no ID is retrieved, throw exception
@@ -910,8 +899,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         _idPools.remove(tableName);
         _idPoolLastUpdateTime.remove(tableName);
 
-        Logger.debug('Clean up expired ID pool: $tableName',
-            label: 'TimeBasedIdGenerator._cleanupExpiredPools');
+        Logger.debug('Clean up expired ID pool: $tableName');
       }
     }
   }
@@ -1118,13 +1106,11 @@ class TimeBasedIdGenerator implements IdGenerator {
           _lastInstanceAccessTime.remove(key);
 
           // Record instance recycling
-          Logger.debug('Recycle idle ID generator instance: $key',
-              label: 'TimeBasedIdGenerator._cleanupIdleInstances');
+          Logger.debug('Recycle idle ID generator instance: $key');
         }
       }
     } catch (e) {
-      Logger.error('Clean up idle generator instance failed: $e',
-          label: 'TimeBasedIdGenerator._cleanupIdleInstances');
+      Logger.error('Clean up idle generator instance failed', rawError: e);
     }
   }
 
@@ -1154,8 +1140,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         }
       }
     } catch (e) {
-      Logger.error('ID pool periodic maintenance failed: $e',
-          label: 'TimeBasedIdGenerator._periodicMaintenance');
+      Logger.error('ID pool periodic maintenance failed', rawError: e);
     }
   }
 
@@ -1230,8 +1215,7 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     // If attempt count reaches upper limit without obtaining new timestamp, force return subsequent timestamp
     if (timestamp <= lastTimestamp) {
-      Logger.warn('Timestamp wait timeout, force increment timestamp',
-          label: 'TimeBasedIdGenerator._waitNextTimestamp');
+      Logger.warn('Timestamp wait timeout, force increment timestamp');
       return lastTimestamp + 1;
     }
 
@@ -1267,8 +1251,7 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     // If attempt count reaches upper limit without obtaining new date string, force generate subsequent date
     if (dateString.compareTo(lastDate) <= 0) {
-      Logger.warn('Date wait timeout, force increment date',
-          label: 'TimeBasedIdGenerator._waitNextSecond');
+      Logger.warn('Date wait timeout, force increment date');
 
       try {
         // Parse date string and increment 1 second
@@ -1312,7 +1295,7 @@ class TimeBasedIdGenerator implements IdGenerator {
       dateValue = BigInt.parse(dateString);
     } catch (e) {
       Logger.error('Date string conversion to number failed: $dateString',
-          label: 'TimeBasedIdGenerator');
+          rawError: e);
       // Use current timestamp as fallback solution
       dateValue = BigInt.from(
           (DateTime.now().millisecondsSinceEpoch ~/ 1000) % 10000000000);
