@@ -185,8 +185,7 @@ class LockManager {
 
       _deadlockDetectionCycle++;
     } catch (e) {
-      Logger.error('Error in unified management task: $e',
-          label: 'LockManager._unifiedManagementTask');
+      Logger.error('Error in unified management task', rawError: e);
     }
   }
 
@@ -209,19 +208,16 @@ class LockManager {
       // Proactively timeout long-waiting requests to prevent indefinite waiting
       for (final request in requestsToTimeout) {
         Logger.warn(
-            'Proactively timing out long-waiting request: ${request.operationId} (waited ${now.difference(request.requestTime).inMilliseconds}ms)',
-            label: 'LockManager._checkForLongWaitingRequests');
+            'Proactively timing out long-waiting request: ${request.operationId} (waited ${now.difference(request.requestTime).inMilliseconds}ms)');
         _handleTimeoutSafely(request);
       }
 
       if (requestsToTimeout.isNotEmpty) {
         Logger.info(
-            'Proactively timed out ${requestsToTimeout.length} long-waiting requests',
-            label: 'LockManager._checkForLongWaitingRequests');
+            'Proactively timed out ${requestsToTimeout.length} long-waiting requests');
       }
     } catch (e) {
-      Logger.error('Error checking for long waiting requests: $e',
-          label: 'LockManager._checkForLongWaitingRequests');
+      Logger.error('Error checking for long waiting requests', rawError: e);
     }
   }
 
@@ -302,12 +298,10 @@ class LockManager {
       // Log cleanup results if significant
       if (totalCleaned > 0) {
         Logger.debug(
-            'Safe cleanup completed: removed $totalCleaned items (${requestsToRemove.length} timeouts, ${orphanedOperations.length} orphans, ${emptyQueues.length} empty queues)',
-            label: 'LockManager._performSafeCleanup');
+            'Safe cleanup completed: removed $totalCleaned items (${requestsToRemove.length} timeouts, ${orphanedOperations.length} orphans, ${emptyQueues.length} empty queues)');
       }
     } catch (e) {
-      Logger.error('Error during safe cleanup: $e',
-          label: 'LockManager._performSafeCleanup');
+      Logger.error('Error during safe cleanup', rawError: e);
     }
   }
 
@@ -317,8 +311,7 @@ class LockManager {
     _removeRequestSafely(request);
 
     Logger.warn(
-        'Lock timeout for operation ${request.operationId} on resource ${request.resource}',
-        label: 'LockManager._handleTimeoutSafely');
+        'Lock timeout for operation ${request.operationId} on resource ${request.resource}');
   }
 
   /// Remove a request safely without triggering additional cleanup
@@ -340,8 +333,7 @@ class LockManager {
         request.completer.complete(false);
       } catch (e) {
         // Ignore "Future already completed" errors
-        Logger.debug('Request already completed: ${request.operationId}',
-            label: 'LockManager._removeRequestSafely');
+        Logger.debug('Request already completed: ${request.operationId}');
       }
     }
   }
@@ -364,8 +356,7 @@ class LockManager {
     // Reject during shutdown (except system ops)
     if (_shutdownMode && !TransactionContext.isSystemOperation()) {
       Logger.warn(
-          'Shutdown mode active: reject shared lock $operationId on $resource',
-          label: 'LockManager');
+          'Shutdown mode active: reject shared lock $operationId on $resource');
       return false;
     }
     // Intercept during maintenance: user ops wait until maintenance ends;
@@ -386,8 +377,7 @@ class LockManager {
   Future<bool> acquireExclusiveLock(String resource, String operationId) async {
     if (_shutdownMode && !TransactionContext.isSystemOperation()) {
       Logger.warn(
-          'Shutdown mode active: reject exclusive lock $operationId on $resource',
-          label: 'LockManager');
+          'Shutdown mode active: reject exclusive lock $operationId on $resource');
       return false;
     }
     // Intercept during maintenance: user ops wait; system ops (e.g. migration) bypass.
@@ -432,14 +422,13 @@ class LockManager {
 
     // Check if operation already has a lock
     if (_operationToRequest.containsKey(operationId)) {
-      Logger.warn('Operation $operationId already has a lock',
-          label: 'LockManager');
+      Logger.warn('Operation $operationId already has a lock');
       return false;
     }
 
     // Validate operation ID format to prevent duplicates
     if (operationId.isEmpty || operationId.length > 100) {
-      Logger.warn('Invalid operation ID: $operationId', label: 'LockManager');
+      Logger.warn('Invalid operation ID: $operationId');
       return false;
     }
 
@@ -447,8 +436,7 @@ class LockManager {
     if (!_checkResourceLimits(resource)) {
       _totalRejected++;
       Logger.warn(
-          'Resource limit exceeded for $resource (current load: $_currentLoad)',
-          label: 'LockManager');
+          'Resource limit exceeded for $resource (current load: $_currentLoad)');
       return false;
     }
 
@@ -485,7 +473,7 @@ class LockManager {
       return result;
     } catch (e) {
       _removeRequest(request);
-      Logger.error('Lock acquisition failed: $e', label: 'LockManager');
+      Logger.error('Lock acquisition failed', rawError: e);
       return false;
     }
   }
@@ -585,8 +573,7 @@ class LockManager {
           request.completer.complete(true);
         } catch (e) {
           // Ignore "Future already completed" errors
-          Logger.debug('Request already completed: ${request.operationId}',
-              label: 'LockManager._tryProcessRequest');
+          Logger.debug('Request already completed: ${request.operationId}');
         }
       }
 
@@ -701,8 +688,7 @@ class LockManager {
             request.completer.complete(true);
           } catch (e) {
             // Ignore "Future already completed" errors
-            Logger.debug('Request already completed: ${request.operationId}',
-                label: 'LockManager._processResourceQueue');
+            Logger.debug('Request already completed: ${request.operationId}');
           }
         }
 
@@ -728,8 +714,7 @@ class LockManager {
   void _releaseLock(String resource, String operationId, LockType lockType) {
     final request = _operationToRequest.remove(operationId);
     if (request == null) {
-      Logger.warn('Attempted to release non-existent lock: $operationId',
-          label: 'LockManager');
+      Logger.warn('Attempted to release non-existent lock: $operationId');
       // Best-effort self-heal: if the operation mapping was lost (e.g. due to a bug
       // or stale cleanup), attempt to remove the held lock from the resource to
       // prevent permanent deadlocks.
@@ -758,8 +743,7 @@ class LockManager {
             _activeLocks.remove(resource);
           }
           Logger.warn(
-              'Recovered orphaned lock state for $operationId on $resource',
-              label: 'LockManager._releaseLock');
+              'Recovered orphaned lock state for $operationId on $resource');
         }
       }
       return;
@@ -767,7 +751,7 @@ class LockManager {
 
     final lockResource = _activeLocks[resource];
     if (lockResource == null) {
-      Logger.warn('Lock resource not found: $resource', label: 'LockManager');
+      Logger.warn('Lock resource not found: $resource');
       return;
     }
 
@@ -792,8 +776,7 @@ class LockManager {
         request.completer.complete(false);
       } catch (e) {
         // Ignore "Future already completed" errors
-        Logger.debug('Request already completed: ${request.operationId}',
-            label: 'LockManager._releaseLock');
+        Logger.debug('Request already completed: ${request.operationId}');
       }
     }
 
@@ -812,8 +795,7 @@ class LockManager {
     _removeRequest(request);
 
     Logger.warn(
-        'Lock timeout for operation ${request.operationId} on resource ${request.resource}',
-        label: 'LockManager');
+        'Lock timeout for operation ${request.operationId} on resource ${request.resource}');
   }
 
   /// Remove a request from all tracking structures
@@ -835,8 +817,7 @@ class LockManager {
         request.completer.complete(false);
       } catch (e) {
         // Ignore "Future already completed" errors
-        Logger.debug('Request already completed: ${request.operationId}',
-            label: 'LockManager._removeRequest');
+        Logger.debug('Request already completed: ${request.operationId}');
       }
     }
   }
@@ -880,8 +861,7 @@ class LockManager {
         _cleanupBatchSize = 50; // Smaller batches
       }
     } catch (e) {
-      Logger.error('Error adjusting dynamic limits: $e',
-          label: 'LockManager._adjustDynamicLimits');
+      Logger.error('Error adjusting dynamic limits', rawError: e);
     }
   }
 
@@ -897,7 +877,7 @@ class LockManager {
       // Use full deadlock detection for smaller scenarios
       _detectDeadlocksFull();
     } catch (e) {
-      Logger.error('Error during deadlock detection: $e', label: 'LockManager');
+      Logger.error('Error during deadlock detection', rawError: e);
     }
   }
 
@@ -948,8 +928,7 @@ class LockManager {
     }
 
     Logger.debug(
-        'Completed sampling-based deadlock detection on ${sampledResources.length} resources from ${resources.length} total',
-        label: 'LockManager._detectDeadlocksSampling');
+        'Completed sampling-based deadlock detection on ${sampledResources.length} resources from ${resources.length} total');
   }
 
   /// Check for cycles in lock graph
@@ -1007,8 +986,7 @@ class LockManager {
 
     if (oldestRequest != null) {
       Logger.warn(
-          'Deadlock detected, timing out oldest request: ${oldestRequest.operationId}',
-          label: 'LockManager');
+          'Deadlock detected, timing out oldest request: ${oldestRequest.operationId}');
       _handleTimeout(oldestRequest);
     }
   }
@@ -1025,8 +1003,7 @@ class LockManager {
         '$_totalDeadlocks deadlocks, $_totalRejected rejected, ${requestsPerSecond.toStringAsFixed(2)} req/s, '
         '${_activeLocks.length} active resources, ${_resourceQueues.length} resource queues, '
         'current load: $_currentLoad, peak load: $_peakLoad, '
-        'limits: $_maxActiveResources resources, $_maxLocksPerResource locks/resource',
-        label: 'LockManager');
+        'limits: $_maxActiveResources resources, $_maxLocksPerResource locks/resource');
 
     // Reset counters
     _totalRequests = 0;
@@ -1076,8 +1053,7 @@ class LockManager {
             request.completer.complete(false);
           } catch (e) {
             // Ignore "Future already completed" errors
-            Logger.debug('Request already completed: ${request.operationId}',
-                label: 'LockManager.dispose');
+            Logger.debug('Request already completed: ${request.operationId}');
           }
         }
       }
