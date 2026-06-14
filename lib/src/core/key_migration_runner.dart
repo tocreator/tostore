@@ -97,7 +97,6 @@ class KeyMigrationRunner {
       if (migrationManager != null && migrationManager.hasPendingTasks) {
         Logger.info(
           'Completing pending schema migration before key migration',
-          label: 'KeyMigrationRunner.run',
         );
         await migrationManager.processMigrationTasks();
         _throwIfPaused();
@@ -168,13 +167,9 @@ class KeyMigrationRunner {
     } on KeyMigrationPausedException {
       Logger.info(
         'Key migration paused',
-        label: 'KeyMigrationRunner.run',
       );
-    } catch (e, stack) {
-      Logger.error(
-        'Key migration runner failed: $e\n$stack',
-        label: 'KeyMigrationRunner.run',
-      );
+    } catch (e) {
+      Logger.error('Key migration runner failed', rawError: e);
       final migrationManager = primaryInstance.migrationManager;
       if (migrationManager != null) {
         await migrationManager.persistKeyMigrationInfo(
@@ -307,12 +302,9 @@ class KeyMigrationRunner {
           tableName: tableName,
           spaceName: scope,
         );
-      } catch (e, stack) {
+      } catch (e) {
         if (e is KeyMigrationPausedException) rethrow;
-        Logger.error(
-          'Key migration failed for table $tableName: $e\n$stack',
-          label: 'KeyMigrationRunner._migrateTables',
-        );
+        Logger.error('Key migration failed for table $tableName', rawError: e);
         rethrow;
       } finally {
         _activeTableMigrations.remove(tableName);
@@ -333,7 +325,6 @@ class KeyMigrationRunner {
       if (++rounds > maxRounds) {
         Logger.warn(
           'Stopped flushing $type scheduler entries after $maxRounds rounds',
-          label: 'KeyMigrationRunner._flushSchedulerEntriesOfType',
         );
         break;
       }
@@ -349,7 +340,6 @@ class KeyMigrationRunner {
       if (++rounds > 512) {
         Logger.warn(
           'Background write drain hit round limit; scheduler may still have entries',
-          label: 'KeyMigrationRunner._drainBackgroundWrites',
         );
         break;
       }
@@ -365,7 +355,6 @@ class KeyMigrationRunner {
     if (spaceConfig == null) {
       Logger.error(
         'Space config missing when finalizing key migration',
-        label: 'KeyMigrationRunner._finalizeKeyMigration',
       );
       return;
     }
@@ -398,7 +387,6 @@ class KeyMigrationRunner {
 
     Logger.info(
       'Key migration completed for keyId ${keyChangeInfo.newKeyId}',
-      label: 'KeyMigrationRunner._finalizeKeyMigration',
     );
   }
 
@@ -474,10 +462,8 @@ class KeyMigrationRunner {
       }
       return true;
     } catch (e) {
-      Logger.warn(
-        'Could not probe key migration state for $tableName: $e',
-        label: 'KeyMigrationRunner._isTableAlreadyMigrated',
-      );
+      Logger.warn('Could not probe key migration state for $tableName',
+          rawError: e);
       return false;
     }
   }
