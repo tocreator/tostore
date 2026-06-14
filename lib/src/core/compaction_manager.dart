@@ -87,7 +87,7 @@ final class CompactionManager {
     try {
       await _pumpOnce();
     } catch (e) {
-      Logger.warn('Compaction tick failed: $e', label: 'CompactionManager');
+      Logger.warn('Compaction tick failed', rawError: e);
     } finally {
       _pumpInProgress = false;
     }
