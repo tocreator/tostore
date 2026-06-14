@@ -1418,30 +1418,32 @@ Transaktionsfehlertypen:
 
 
 ### <a id="logging-diagnostics"></a>Protokollrückruf und Datenbankdiagnose
+ToStore kann Datenbank-Lebenszyklusprotokolle über `ToStore.setLogConfig(...)` an die Geschäftsschicht weiterleiten.
 
-ToStore kann Start-, Wiederherstellungs-, automatische Migrations- und Laufzeiteinschränkungskonfliktprotokolle über `LogConfig.setConfig(...)` zurück an die Geschäftsschicht weiterleiten.
-
-- `onLogHandler` empfängt alle Protokolle, die die aktuellen Filter `enableLog` und `logLevel` bestehen.
-- Rufen Sie `LogConfig.setConfig(...)` vor der Initialisierung auf, damit auch die während der Initialisierung und der automatischen Migration generierten Protokolle erfasst werden.
+- Der `onLog`-Callback empfängt alle `LogRecord`-Protokolleinträge, die die aktuellen Filter `enableLog` und `logLevel` passieren.
+  - **LogLevel.error**: Ein lokaler Fehler ist aufgetreten, der den normalen Betrieb nicht beeinträchtigt.
+  - **LogLevel.critical**: Globaler Fehler auf Katastrophenebene (z. B. Festplatte voll, unzureichender Arbeitsspeicher, schwerwiegender Migrationsfehler usw.), der ein manuelles Eingreifen erfordert. Es wird empfohlen, auf dieser Stufe Alarmbenachrichtigungen auszulösen.
+- Rufen Sie `ToStore.setLogConfig(...)` vor der Initialisierung auf, damit auch die während der Initialisierung und der automatischen Migration generierten Protokolle erfasst werden.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Protokollparameter oder Callback konfigurieren
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Hellgrauer Header-Titel oben im Protokoll zur Unterscheidung von Apps oder Datenbankinstanzen,
+    onLog: (log) {
+      // In der Produktion können warn/error/critical an das Backend oder die Protokollplattform gemeldet werden
+      // log.level entspricht der Protokollstufe (LogLevel.debug, info, warn, error, critical)
+      // log.message entspricht dem verarbeiteten Protokolltext
+      // log.status entspricht dem zugrunde liegenden ResultStatus-Diagnosestatus (enthält code und codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Sicherheitskonfiguration
 
 > [!WARNING]
