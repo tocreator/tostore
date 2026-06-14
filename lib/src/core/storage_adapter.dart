@@ -95,7 +95,7 @@ class StorageAdapter implements StorageInterface {
       }
       await configureStorage(maxOpenHandles: maxOpenHandles);
     } catch (e) {
-      Logger.error('Configure storage failed: $e', label: 'StorageAdapter');
+      Logger.error('Configure storage failed', rawError: e);
     }
   }
 
