@@ -146,10 +146,8 @@ class ParallelProcessor {
         }
       } catch (e, s) {
         if (e != 'stopped') {
-          Logger.error(
-            '$effectiveLabel Parallel task at index $index failed: $e\n$s',
-            label: "ParallelProcessor$effectiveLabel",
-          );
+          Logger.error('$effectiveLabel Parallel task at index $index failed',
+              rawError: e);
         }
 
         if (!effectiveContinueOnError) {
@@ -177,14 +175,10 @@ class ParallelProcessor {
               effectiveConcurrency = newConcurrency;
               Logger.debug(
                 'Concurrency adjusted to $newConcurrency after completing $tasksCompleted tasks',
-                label: 'ParallelProcessor$effectiveLabel',
               );
             }
           } catch (e) {
-            Logger.warn(
-              'Failed to adjust concurrency: $e',
-              label: 'ParallelProcessor$effectiveLabel',
-            );
+            Logger.warn('Failed to adjust concurrency', rawError: e);
           }
         }
 
@@ -210,10 +204,8 @@ class ParallelProcessor {
       // This path is taken only when continueOnError is false.
       // At this point, controller is cancelled and other tasks are completing with null.
       // We rethrow the original error.
-      Logger.error(
-        '$effectiveLabel Parallel execution failed with error: $e',
-        label: "ParallelProcessor$effectiveLabel",
-      );
+      Logger.error('$effectiveLabel Parallel execution failed with error',
+          rawError: e);
       rethrow;
     }
   }
