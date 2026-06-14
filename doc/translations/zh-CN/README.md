@@ -193,9 +193,9 @@ final result = await db.insert('users', {
   'age': 25,
 });
 
-// 统一操作模型 DbResult，推荐始终检查 isSuccess
-if (result.isSuccess) {
-  print('数据插入成功，生成的主键ID为: ${result.successKeys.first}');
+// 统一操作模型 DbResult，推荐检查 hasErrors 判定结果
+if (!result.hasErrors) {
+  print('数据插入成功，生成的主键ID为: ${result.firstPrimaryKey}');
 } else {
   print('插入失败: ${result.message}');
 }
@@ -1262,10 +1262,15 @@ final txResult = await db.transaction(() async {
   // 如果任何操作失败，所有更改都会自动回滚
 });
 
-if (txResult.isSuccess) {
+if (!txResult.hasErrors) {
   print('事务提交成功');
 } else {
-  print('事务回滚: ${txResult.error?.message}');
+  print('事务回滚，原因如下：');
+  for (final status in txResult.statuses) {
+    if (status.type != ResultType.success) {
+      print(' - [${status.codeKey}] ${status.message}');
+    }
+  }
 }
 
 // 错误时自动回滚
@@ -1361,14 +1366,31 @@ final restored = await db.restore(
 
 ### <a id="error-handling"></a>状态码与错误处理
 
+ToStore 引入了结构化的自动诊断体系，以保障在自动化运维、AI 智能体代理、自动化测试及客户端逻辑中精准捕获数据操作状态与异常。
 
-ToStore 数据操作统一响应模型：
+> [!NOTE]
+> **统一诊断基石**：无论是响应结果模型中的 `statuses` 还是致命异常中的 `statuses`，均统一基于结构化的 **`ResultStatus`** 体系，通用状态码规范，确保了数据诊断接口的高度一致性。
 
-- `ResultType`：统一的状态枚举，可直接用于分支处理
-- `result.code`：`ResultType` 对应的稳定数值码
-- `result.message`：当前错误的可读说明
-- `successKeys` / `failedKeys`：批量操作的成功与失败主键列表
+在 ToStore 的运维与数据处理中，存在以下两种错误与异常反馈渠道：
 
+#### 1. 响应结果模型（Result-based Response）
+针对日常的插入、更新、删除、查询、事务以及运行时的表结构创建与更新等操作。这些操作即使在遭遇约束冲突、数据校验失败或参数错误时，**也不会抛出异常中断数据操作**。ToStore 采用 `DbResult` 或 `QueryResult` 包装返回结果，将所有诊断信息记录在状态列表中。这保证了普通业务逻辑的错误不会打断数据库的正常运作。
+
+响应模型主要支持以下核心设计：
+- **`hasErrors`**：指示当前操作是否存在任何错误。在批量操作或事务中，只要包含至少一个错误，此属性即为 `true`。
+- **`statuses`**：包含本次操作的所有 `ResultStatus` 详细诊断列表。支持 1:1 的顺序匹配，对于批量操作非常友好。
+- **`firstPrimaryKey`**：在单条插入/写入操作成功时，可快捷读取物理生成的主键，无需手动解析 `statuses`。
+- **`ResultType`**：细分状态类型枚举，支持便捷判断（如 `isBusinessError` 、`isDeveloperError` 等）。
+
+#### 2. 异常抛出（Exception-based Throwing）
+主要应对属于开发者失误或致命错误（如在 `ToStore.open` 初始化阶段发生的表结构规范校验失败、引擎版本不兼容、数据迁移时发现数据重大问题等）。在调试环境下，ToStore 会抛出 `DbException` 强制中断运行，提醒开发者纠正修复。
+
+
+---
+
+### 错误与异常处理示例
+
+#### 1. 单条写入操作的结果处理
 
 ```dart
 final result = await db.insert('users', {
@@ -1376,76 +1398,60 @@ final result = await db.insert('users', {
   'email': 'john@example.com',
 });
 
-if (!result.isSuccess) {
-  switch (result.type) {
-    case ResultType.notFound:
-      print('目标资源不存在: ${result.message}');
-      break;
-    case ResultType.notNullViolation:
-    case ResultType.validationFailed:
-      print('数据校验失败: ${result.message}');
-      break;
-    case ResultType.primaryKeyViolation:
-    case ResultType.uniqueViolation:
-      print('唯一约束冲突: ${result.message}');
-      break;
-    case ResultType.foreignKeyViolation:
-      print('外键约束失败: ${result.message}');
-      break;
-    case ResultType.resourceExhausted:
-    case ResultType.timeout:
-      print('系统繁忙，可稍后重试: ${result.message}');
-      break;
-    case ResultType.ioError:
-    case ResultType.dbError:
-      print('底层存储异常，请记录日志: ${result.message}');
-      break;
-    default:
-      print('错误类型: ${result.type}, 数值码: ${result.code}, 消息: ${result.message}');
+if (result.hasErrors) {
+  // 获取首个错误类型及其描述
+  print('操作失败: [${result.firstType.codeKey}] ${result.message}');
+} else {
+  print('写入成功，主键为: ${result.firstPrimaryKey}');
+}
+```
+
+#### 2. 批量写入操作的精细化诊断
+
+```dart
+final batchResult = await db.insertAll('users', [
+  {'username': 'alice', 'email': 'alice@example.com'},
+  {'username': 'bob', 'email': 'invalid-email-format'}, // 格式校验失败
+]);
+
+if (batchResult.hasErrors) {
+  print('批量操作中存在部分失败：成功 ${batchResult.successCount}，失败 ${batchResult.failedCount}');
+  
+  for (final status in batchResult.statuses) {
+    final int idx = status.index;
+    
+    if (status is ConstraintStatus) {
+      print('索引 [$idx] 约束冲突！表: ${status.tableName}，字段: ${status.fields}');
+    } else if (status is InvalidArgumentStatus) {
+      print('索引 [$idx] 参数错误！参数名: ${status.parameterName}，传入值: ${status.passedValue}');
+    } else if (status.type != ResultType.success) {
+      print('索引 [$idx] 发生错误: [${status.codeKey}] ${status.message}');
+    }
   }
 }
 ```
 
-常见状态码示例：
-成功返回0，负数为错误异常
-- `ResultType.success`(0)：操作成功
-- `ResultType.partialSuccess`(1)：批量操作时部分成功
-- `ResultType.unknown`(-1)：未知错误
-- `ResultType.uniqueViolation`(-2)：唯一索引冲突
-- `ResultType.primaryKeyViolation`(-3)：主键冲突
-- `ResultType.foreignKeyViolation`(-4)：外键引用不满足约束
-- `ResultType.notNullViolation`(-5)：必填字段缺失或传入了不允许的 `null`
-- `ResultType.validationFailed`(-6)：长度、范围、格式、约束等校验未通过
-- `ResultType.notFound`(-11)：目标表、空间或目标资源不存在
-- `ResultType.resourceExhausted`(-15)：系统资源不足，建议降载或重试
-- `ResultType.dbError`（-91）：数据库异常
-- `ResultType.ioError`(-90)：文件系统异常
-- `ResultType.timeout`(-92)：超时
+#### 3. 致命错误与初始化异常捕获（DbException）
 
-### 事务响应结果处理
 ```dart
-final txResult = await db.transaction(() async {
-  await db.insert('users', {
-    'username': 'john',
-    'email': 'john@example.com',
-  });
-});
-
-// txResult.isFailed:事务失败；txResult.isSuccess:事务成功
-if (txResult.isFailed) {
-  print('事务错误类型: ${txResult.error?.type}');
-  print('事务错误消息: ${txResult.error?.message}');
+try {
+  // 传入可能存在定义冲突或验证失败的 schemas 初始化数据库
+  final db = await ToStore.open(schemas: appSchemas);
+} on DbException catch (e) {
+  print('❌ 致命数据库异常! 错误信息: \n${e.message}');
+  
+  // 遍历异常携带的详细状态列表以精确定位问题
+  for (final status in e.statuses) {
+    if (status is SchemaValidationStatus) {
+      print('表结构校验失败! 表: ${status.tableName}, 字段: ${status.field}, 无效配置: ${status.wrongValue}');
+    } else {
+      print('错误诊断: [${status.codeKey}] ${status.message}');
+    }
+  }
 }
 ```
-事务错误类型：
-- `TransactionErrorType.operationError`：事务中的普通操作失败，例如字段校验失败、资源状态不满足要求或其他业务级异常
-- `TransactionErrorType.integrityViolation`：完整性或约束冲突，例如主键、唯一键、外键、非空等约束失败
-- `TransactionErrorType.timeout`：超时
-- `TransactionErrorType.io`：底层存储或文件系统 I/O 异常
-- `TransactionErrorType.conflict`：冲突导致事务失败
-- `TransactionErrorType.userAbort`：用户主动中止事务（抛异常暂不支持此类）；
-- `TransactionErrorType.unknown`：其他异常
 
+具体的错误大类、叶子状态码、JSON 序列化格式规范以及字段对照，请参阅完整的：[ToStore ResultStatus 自动诊断与状态解析规范](result_status_specification.md)。
 
 ### <a id="logging-diagnostics"></a>日志回调与数据库诊断
 
