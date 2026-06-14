@@ -1418,30 +1418,32 @@ Tipos de errores de transacción:
 
 
 ### <a id="logging-diagnostics"></a>Registrar devolución de llamada y diagnóstico de base de datos
+ToStore puede enrutar los registros del ciclo de vida de la base de datos a la capa empresarial a través de `ToStore.setLogConfig(...)`.
 
-ToStore puede enrutar registros de inicio, recuperación, migración automática y conflictos de restricciones de tiempo de ejecución a la capa empresarial a través de `LogConfig.setConfig(...)`.
-
-- `onLogHandler` recibe todos los registros que pasan los filtros actuales `enableLog` y `logLevel`.
-- Llame a `LogConfig.setConfig(...)` antes de la inicialización para que también se capturen los registros generados durante la inicialización y la migración automática.
+- La devolución de llamada `onLog` recibe todos los registros de registro `LogRecord` que pasan los filtros actuales `enableLog` y `logLevel`.
+  - **LogLevel.error**: Ocurrió un error local, no afecta el funcionamiento normal.
+  - **LogLevel.critical**: Error global a nivel de desastre (como disco lleno, memoria insuficiente, falla grave de migración, etc.) que requiere intervención manual. Se recomienda activar notificaciones de alarma en este nivel.
+- Llame a `ToStore.setLogConfig(...)` antes de la inicialización para que también se capturen los registros generados durante la inicialización y la dinámica migración.
 
 ```dart
-  // Configure log parameters or callback
-  LogConfig.setConfig(
+  // Configurar parámetros de registro o devolución de llamada
+  ToStore.setLogConfig(
     enableLog: true,
     logLevel: debugMode ? LogLevel.debug : LogLevel.warn,
-    publicLabel: 'my_app_db',
-    onLogHandler: (message, type, label) {
-      // In production, warn/error can be reported to your backend or logging platform
-      if (!debugMode && (type == LogType.warn || type == LogType.error)) {
-        developer.log(message, name: label);
+    logLabel: 'my_app_db', // Título gris claro en la parte superior del registro para distinguir aplicaciones o instancias de bases de datos,
+    onLog: (log) {
+      // En producción, se puede reportar warn/error/critical al backend o plataforma de registro
+      // log.level corresponde al nivel de registro (LogLevel.debug, info, warn, error, critical)
+      // log.message corresponde al texto del registro procesado
+      // log.status corresponde al estado de diagnóstico ResultStatus subyacente (contiene code y codeKey)
+      if (!debugMode && (log.level == LogLevel.warn || log.level == LogLevel.error || log.level == LogLevel.critical)) {
+        developer.log(log.message, name: 'my_app_db', time: log.timestamp);
       }
     },
   );
 
   final db = await ToStore.open();
 ```
-
-
 ## <a id="security-config"></a>Configuración de seguridad
 
 > [!WARNING]
