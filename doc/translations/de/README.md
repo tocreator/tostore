@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="../resource/logo-tostore.svg" width="400" alt="ToStore">
+  <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
 <p align="center">
@@ -16,17 +16,17 @@
 </p>
 
 <p align="center">
-  <a href="../../README.md">English</a> | 
-  <a href="README.zh-CN.md">简体中文</a> | 
-  <a href="README.ja.md">日本語</a> | 
-  <a href="README.ko.md">한국어</a> | 
-  <a href="README.es.md">Español</a> | 
-  <a href="README.pt-BR.md">Português (Brasil)</a> | 
-  <a href="README.ru.md">Русский</a> | 
-  Deutsch | 
-  <a href="README.fr.md">Français</a> | 
-  <a href="README.it.md">Italiano</a> | 
-  <a href="README.tr.md">Türkçe</a>
+  <a href="../../../README.md">English</a> |
+  <a href="../zh-CN/README.md">简体中文</a> |
+  <a href="../ja/README.md">日本語</a> |
+  <a href="../ko/README.md">한국어</a> |
+  <a href="../es/README.md">Español</a> |
+  <a href="../pt-BR/README.md">Português (Brasil)</a> |
+  <a href="../ru/README.md">Русский</a> |
+  Deutsch |
+  <a href="../fr/README.md">Français</a> |
+  <a href="../it/README.md">Italiano</a> |
+  <a href="../tr/README.md">Türkçe</a>
 </p>
 
 ## Schnelle Navigation
@@ -85,7 +85,7 @@ ToStore bietet dem Edge verteilte Funktionen, die stark genug für riesige Daten
 ## <a id="installation"></a>Installation
 
 > [!IMPORTANT]
-> **Upgrade von v2.x?** Bitte lesen Sie den [v3.x-Upgrade-Leitfaden](../UPGRADE_GUIDE_v3.md) für wichtige Migrationsschritte und wichtige Änderungen.
+> **Upgrade von v2.x?** Bitte lesen Sie den [v3.x-Upgrade-Leitfaden](../../UPGRADE_GUIDE_v3.md) für wichtige Migrationsschritte und wichtige Änderungen.
 
 Fügen Sie `tostore` zu Ihrem `pubspec.yaml` hinzu:
 
@@ -355,7 +355,7 @@ Darüber hinaus erstellt `unique: true` automatisch einen eindeutigen Einzelfeld
 
 ## <a id="mobile-integration"></a>Integration für Mobilgeräte, Desktops und andere häufige Startszenarien
 
-📱 **Beispiel**: [mobile_quickstart.dart](../../example/lib/mobile_quickstart.dart)
+📱 **Beispiel**: [mobile_quickstart.dart](../../../example/lib/mobile_quickstart.dart)
 
 ```dart
 import 'package:path/path.dart' as p;
@@ -401,7 +401,7 @@ await db.close(keepActiveSpace: false);
 
 ## <a id="server-integration"></a>Serverseitige / Agenten-Integration (Langzeitszenarien)
 
-🖥️ **Beispiel**: [server_quickstart.dart](../../example/lib/server_quickstart.dart)
+🖥️ **Beispiel**: [server_quickstart.dart](../../../example/lib/server_quickstart.dart)
 
 ```dart
 final db = await ToStore.open();
