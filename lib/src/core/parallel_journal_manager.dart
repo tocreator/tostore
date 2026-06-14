@@ -127,8 +127,7 @@ class ParallelJournalManager {
       bool cleaned = false;
       if (_walManager.hasExistingLogs) {
         Logger.info(
-            'Journal disabled but existing logs found. Draining legacy WAL...',
-            label: 'ParallelJournalManager');
+            'Journal disabled but existing logs found. Draining legacy WAL...');
         await flushCompletely();
         await _walManager.destroyWal();
         cleaned = true;
@@ -151,13 +150,11 @@ class ParallelJournalManager {
           cleaned = true;
         }
       } catch (e) {
-        Logger.warn('Failed to cleanup parallel journal files: $e',
-            label: 'ParallelJournalManager');
+        Logger.warn('Failed to cleanup parallel journal files', rawError: e);
       }
 
       if (cleaned) {
-        Logger.info('Legacy WAL and journals drained and destroyed.',
-            label: 'ParallelJournalManager');
+        Logger.info('Legacy WAL and journals drained and destroyed.');
       }
     }
 
@@ -458,8 +455,7 @@ class ParallelJournalManager {
             ? " and $backgroundRecordsCount background write items"
             : "";
         Logger.debug(
-            "Executing batch with ${batch.length} normal items$bgSuffix",
-            label: "ParallelJournalManager._pumpFlush");
+            "Executing batch with ${batch.length} normal items$bgSuffix");
 
         firstIteration = false;
         // Compute WAL pointer range (exclude pseudo pointers where partitionIndex == -1)
@@ -738,8 +734,7 @@ class ParallelJournalManager {
               }
               if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
                 Logger.info(
-                    "Skipping stale batch for table $table because it was cleared/reset.",
-                    label: "ParallelJournalManager");
+                    "Skipping stale batch for table $table because it was cleared/reset.");
                 return;
               }
 
@@ -756,8 +751,7 @@ class ParallelJournalManager {
                   // Verify epoch hasn't changed (O(1) check for table clear race)
                   if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
                     Logger.info(
-                        "Skipping stale batch for table $table because it was cleared/reset.",
-                        label: "ParallelJournalManager");
+                        "Skipping stale batch for table $table because it was cleared/reset.");
                     return;
                   }
 
@@ -1132,11 +1126,8 @@ class ParallelJournalManager {
                   ));
                 }
               }
-            } catch (e, s) {
-              Logger.error(
-                'Flush task failed for table [$table]: $e\n$s',
-                label: 'ParallelJournalManager',
-              );
+            } catch (e) {
+              Logger.error('Flush task failed for table [$table]', rawError: e);
               rethrow;
             }
           });
@@ -1196,8 +1187,7 @@ class ParallelJournalManager {
           final at =
               '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
           Logger.debug(
-              'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at',
-              label: 'ParallelJournalManager');
+              'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at');
 
           // Trigger resource check after significant data writes
           if (batch.length >= (_dataStore.config.writeBatchSize * 0.8)) {
@@ -1252,8 +1242,7 @@ class ParallelJournalManager {
             if (_walManager.meta.pendingBatches.isEmpty) {
               _isRecovering = false;
               scheduleFlushIfNeeded(); // Trigger non-batch WAL write queue
-              Logger.debug('Parallel journal recovery completed.',
-                  label: 'ParallelJournalManager');
+              Logger.debug('Parallel journal recovery completed.');
             }
           }
         } else {
@@ -1265,9 +1254,8 @@ class ParallelJournalManager {
           }
         }
         await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
-      } catch (e, s) {
-        Logger.error('ParallelJournalManager loop failed: $e\n$s',
-            label: 'ParallelJournalManager');
+      } catch (e) {
+        Logger.error('ParallelJournalManager loop failed', rawError: e);
         // IMPORTANT: do not drop popped queue entries on failure.
         // Requeue them so the next pump/recovery can safely retry.
         if (batch.isNotEmpty) {
@@ -1557,8 +1545,7 @@ class ParallelJournalManager {
         } catch (_) {}
         return;
       } else {
-        Logger.debug('Recovery added effective entries',
-            label: 'ParallelJournalManager._recoverWAL');
+        Logger.debug('Recovery added effective entries');
       }
 
       try {
@@ -1597,13 +1584,12 @@ class ParallelJournalManager {
                 .updateMaxIdFromTable(table, forceRecalculate: true);
           }
         } catch (e) {
-          Logger.error('Failed to update maxId after WAL recovery: $e',
-              label: 'ParallelJournalManager._recoverFromWal');
+          Logger.error('Failed to update maxId after WAL recovery',
+              rawError: e);
         }
       }
-    } catch (e, s) {
-      Logger.error('Recover from WAL failed: $e\n$s',
-          label: 'ParallelJournalManager');
+    } catch (e) {
+      Logger.error('Recover from WAL failed', rawError: e);
     }
   }
 
@@ -1632,9 +1618,8 @@ class ParallelJournalManager {
       // Flush phase: chain flush tasks in background (fire-and-forget)
       // This prevents startup blocking while ensuring batches are processed in order.
       _executeRecoveryFlushChain(tasks);
-    } catch (e, s) {
-      Logger.error('Parallel journal reconcile failed: $e\n$s',
-          label: 'ParallelJournalManager');
+    } catch (e) {
+      Logger.error('Parallel journal reconcile failed', rawError: e);
       _isRecovering = false;
     }
     // Note: _isRecovering reset is handled by _executeRecoveryFlushChain at the end of the recovery chain
@@ -1656,9 +1641,8 @@ class ParallelJournalManager {
           if (!_running) break;
           try {
             await task();
-          } catch (e, s) {
-            Logger.error('Recovery flush task failed: $e\n$s',
-                label: 'ParallelJournalManager');
+          } catch (e) {
+            Logger.error('Recovery flush task failed', rawError: e);
           }
         }
       } finally {
@@ -1727,8 +1711,7 @@ class ParallelJournalManager {
         }
       }
     } catch (e) {
-      Logger.warn('Failed to scan journal for flushed partitions: $e',
-          label: 'ParallelJournalManager._recoverMaintenanceBatch');
+      Logger.warn('Failed to scan journal for flushed partitions', rawError: e);
     }
 
     // Recover table metadata
@@ -1795,9 +1778,8 @@ class ParallelJournalManager {
           }
         } catch (e) {
           Logger.warn(
-            'Failed to recover B+Tree structure for $tableName from partition $lastPartitionNo: $e',
-            label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
-          );
+              'Failed to recover B+Tree structure for $tableName from partition $lastPartitionNo',
+              rawError: e);
         }
       }
 
@@ -1831,37 +1813,31 @@ class ParallelJournalManager {
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
             'Recovered maintenance batch metadata and B+Tree structure for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
-            label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
             'Recovered maintenance batch metadata for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize)',
-            label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
             'Recovered B+Tree structure for $tableName: partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
-            label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
           );
         }
       } else if (expectedTotalRecords != null && expectedTotalSize != null) {
         // Metadata is consistent, no need to update
         Logger.info(
           'Maintenance batch metadata for $tableName is already correct: $currentTotalRecords records, $currentTotalSize bytes (verified from last flushed partition ${lastEntry.partitionNo})',
-          label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
         );
       } else {
         // Legacy entry without totalRecords/totalSizeInBytes, skip update
         Logger.info(
           'Skipping metadata update for $tableName: last flushed entry (partition ${lastEntry.partitionNo}) does not have complete statistics. Metadata will be corrected on next operation.',
-          label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
         );
       }
-    } catch (e, s) {
+    } catch (e) {
       Logger.error(
-        'Failed to recover maintenance batch metadata for $tableName: $e\n$s',
-        label: 'ParallelJournalManager._recoverTableMaintenanceMetadata',
-      );
+          'Failed to recover maintenance batch metadata for $tableName',
+          rawError: e);
     }
   }
 
@@ -1915,9 +1891,8 @@ class ParallelJournalManager {
           }
         } catch (e) {
           Logger.warn(
-            'Failed to recover B+Tree structure for $tableName.$indexName from partition $lastPartitionNo: $e',
-            label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
-          );
+              'Failed to recover B+Tree structure for $tableName.$indexName from partition $lastPartitionNo',
+              rawError: e);
         }
       }
 
@@ -1955,37 +1930,31 @@ class ParallelJournalManager {
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
             'Recovered maintenance batch metadata and B+Tree structure for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
-            label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
             'Recovered maintenance batch metadata for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize)',
-            label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
             'Recovered B+Tree structure for $tableName.$indexName: partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
-            label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
           );
         }
       } else if (expectedTotalEntries != null && expectedTotalSize != null) {
         // Metadata is consistent, no need to update
         Logger.info(
           'Maintenance batch metadata for $tableName.$indexName is already correct: $currentTotalEntries entries, $currentTotalSize bytes (verified from last flushed partition ${lastEntry.partitionNo})',
-          label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
         );
       } else {
         // Legacy entry without totalEntries/totalSizeInBytes, skip update
         Logger.info(
           'Skipping metadata update for $tableName.$indexName: last flushed entry (partition ${lastEntry.partitionNo}) does not have complete statistics. Metadata will be corrected on next operation.',
-          label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
         );
       }
-    } catch (e, s) {
+    } catch (e) {
       Logger.error(
-        'Failed to recover maintenance batch metadata for $tableName.$indexName: $e\n$s',
-        label: 'ParallelJournalManager._recoverIndexMaintenanceMetadata',
-      );
+          'Failed to recover maintenance batch metadata for $tableName.$indexName',
+          rawError: e);
     }
   }
 
@@ -2123,9 +2092,8 @@ class ParallelJournalManager {
           _flushInProgress = false;
         }
       };
-    } catch (e, s) {
-      Logger.error('Recover pending batch failed: $e\n$s',
-          label: 'ParallelJournalManager._recoverPendingBatch');
+    } catch (e) {
+      Logger.error('Recover pending batch failed', rawError: e);
       return null;
     } finally {
       _activeBatchContext = null;
@@ -2150,8 +2118,7 @@ class ParallelJournalManager {
 
       // Repair table totals using batch-level base values.
       for (final tableName in unflushedTables) {
-        Logger.debug('Restoring unflushed table base totals: $tableName',
-            label: 'ParallelJournalManager._repairUnflushedTablesAndIndexes');
+        Logger.debug('Restoring unflushed table base totals: $tableName');
         try {
           final plan = walData.tablePlans[tableName];
           if (plan == null ||
@@ -2180,8 +2147,8 @@ class ParallelJournalManager {
             flush: true,
           );
         } catch (e) {
-          Logger.warn('Failed to restore table $tableName base totals: $e',
-              label: 'ParallelJournalManager._repairUnflushedTablesAndIndexes');
+          Logger.warn('Failed to restore table $tableName base totals',
+              rawError: e);
         }
       }
 
@@ -2207,8 +2174,7 @@ class ParallelJournalManager {
           if (flushedForTable.contains(indexName)) continue;
 
           Logger.debug(
-              'Restoring unflushed index base totals: $tableName.$indexName',
-              label: 'ParallelJournalManager._repairUnflushedTablesAndIndexes');
+              'Restoring unflushed index base totals: $tableName.$indexName');
           try {
             final baseEntries = plan.baseIndexTotalEntries?[indexName];
             final baseSize = plan.baseIndexTotalSizeInBytes?[indexName];
@@ -2235,15 +2201,13 @@ class ParallelJournalManager {
             );
           } catch (e) {
             Logger.warn(
-                'Failed to restore index $tableName.$indexName base totals: $e',
-                label:
-                    'ParallelJournalManager._repairUnflushedTablesAndIndexes');
+                'Failed to restore index $tableName.$indexName base totals',
+                rawError: e);
           }
         }
       }
-    } catch (e, s) {
-      Logger.error('Failed to repair unflushed tables/indexes: $e\n$s',
-          label: 'ParallelJournalManager._repairUnflushedTablesAndIndexes');
+    } catch (e) {
+      Logger.error('Failed to repair unflushed tables/indexes', rawError: e);
     }
   }
 
@@ -2400,9 +2364,8 @@ class ParallelJournalManager {
         first = false;
         if (p == startP) break;
       }
-    } catch (e, s) {
-      Logger.error('collect WAL for batch failed: $e\n$s',
-          label: 'ParallelJournalManager');
+    } catch (e) {
+      Logger.error('collect WAL for batch failed', rawError: e);
     }
     return _BatchWalData(
       insertsByTable: inserts,
@@ -2525,9 +2488,8 @@ class ParallelJournalManager {
       try {
         await _flushRecoveryArtifactsIfNeeded();
       } catch (_) {}
-    } catch (e, s) {
-      Logger.error('Failed to complete ad-hoc batch: $e\n$s',
-          label: 'ParallelJournalManager');
+    } catch (e) {
+      Logger.error('Failed to complete ad-hoc batch', rawError: e);
     }
     _activeBatchContext = null;
   }
@@ -2907,8 +2869,7 @@ class ParallelJournalManager {
       await _dataStore.storage.writeAsString(path, '${jsonEncode(json)}\n',
           append: true, flush: false);
     } catch (e) {
-      Logger.error('Failed to append parallel journal: $e',
-          label: 'ParallelJournalManager');
+      Logger.error('Failed to append parallel journal', rawError: e);
     }
   }
 
