@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
-ToStore, AGI dönemi ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Yerel olarak dağıtılmış sistemleri, çok modlu füzyonu, ilişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı destekler. Kendi Kendini Yönlendiren düğüm mimarisi ve sinir ağından ilham alan bir motor üzerine inşa edilmiş olup, performansı veri ölçeğinden mantıksal olarak ayırırken düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlar. ACID işlemlerini, karmaşık ilişkisel sorguları (JOIN'ler ve basamaklı yabancı anahtarlar), tablo düzeyinde TTL ve toplamaların yanı sıra birden fazla dağıtılmış birincil anahtar algoritması, atomik ifadeler, şema değişikliği tanıma, şifreleme, çok alanlı veri izolasyonu, kaynağa duyarlı akıllı yük planlaması ve felaket/çökme kendi kendini onaran kurtarmayı içerir.
+ToStore, AGI çağı ve uç zeka (edge intelligence) senaryoları için tasarlanmış modern bir veri motorudur. Dağıtık sistemleri, çok modlu birleşimi (multi-modal fusion), ilişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı yerel olarak destekler. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi ve yapay sinir ağından ilham alan bir motor üzerine kurulu olan bu sistem, performansı veri ölçeğinden mantıksal olarak ayırırken düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlar. ACID işlemlerini, karmaşık ilişkisel sorguları (JOIN'ler ve basamaklı yabancı anahtarlar), tablo düzeyinde TTL'yi ve agregasyonları barındırırken, otomatik işletim durumu analizini ve tamamen eşzamansız veri işlemeyi destekleyerek kesintisiz ve şeffaf bir mimari evrime (şema yükseltmeleri, anahtar değişiklikleri ve büyük ölçekli veri işlemleri dahil) olanak tanır. Entegre dağıtık birincil anahtarlar, atomik ifadeler, şifreleme, çoklu alan yalıtımı, kaynak duyarlı akıllı yük zamanlama ve afet/çökme sonrası kendi kendini iyileştirme gibi kurumsal özelliklerle donatılan ToStore, Ajan (Agent) ve otomatik işletim gibi yüksek süreklilik gerektiren senaryolarda kesintisiz hizmet vererek sürekli gelişmeye devam eder.
 
 Bilgi işlem uç zekaya doğru kaymaya devam ettikçe aracılar, sensörler ve diğer cihazlar artık yalnızca "içerik ekranları" değildir. Bunlar yerel üretimden, çevresel farkındalıktan, gerçek zamanlı karar alma ve koordineli veri akışlarından sorumlu akıllı düğümlerdir. Geleneksel veritabanı çözümleri, temel mimarileri ve birleştirilmiş uzantıları nedeniyle sınırlıdır; bu da, yüksek eşzamanlılık yazmaları, büyük veri kümeleri, vektör alma ve işbirliğine dayalı oluşturma altında uç bulut akıllı uygulamalarının düşük gecikme ve kararlılık gereksinimlerini karşılamayı giderek zorlaştırmaktadır.
 
@@ -62,15 +62,15 @@ ToStore, büyük veri kümeleri, karmaşık yerel yapay zeka üretimi ve büyük
   - Çok düğümlü paralel işbirliği ve görev ayrıştırma
   - Zaman dilimleme, kullanıcı arayüzü animasyonlarının ağır yük altında bile düzgün kalmasını sağlar
 
-- 🔍 **Yapılandırılmış Sorgular ve Vektör Alma**
-  - Karmaşık tahminleri, JOIN'leri, toplamaları ve tablo düzeyinde TTL'yi destekler
-  - Vektör alanlarını, vektör indekslerini ve en yakın komşu alımını destekler
-  - Yapılandırılmış ve vektörel veriler aynı motor içerisinde birlikte çalışabilmektedir.
+- 🔑 **Şema, İndeksler ve Etkin Arama**
+  - Çeşitlendirilmiş anahtarlar (ardışık, zaman damgası, önek, kısa kod)
+  - Çok boyutlu kısıtlamalar (bileşik/vektör indeksi, yabancı anahtarlar)
+  - Birleşik arama (karmaşık koşullar, JOIN, vektör arama)
 
-- 🔑 **Birincil Anahtarlar, Dizinler ve Şema Gelişimi**
-  - Sıralı, zaman damgası, tarih öneki ve kısa kod stratejilerini içeren yerleşik birincil anahtar algoritmaları
-  - Benzersiz indeksleri, bileşik indeksleri, vektör indekslerini ve yabancı anahtar kısıtlamalarını destekler
-  - Şema değişikliklerini otomatik olarak algılar ve taşıma işlemini tamamlar
+- 🤖 **Akıllı İşletim ve Kesintisiz Evrim**
+  - Otomatik işletim ve Ajan algılaması için entegre durum özellikleri
+  - Sorunsuz, sıfır kesintili şema yükseltmeleri ve şeffaf anahtar geçişleri
+  - Sistem kararlılığı için hizmet kesintisi olmadan sıcak güncellemeler
 
 - 🛡️ **İşlemler, Güvenlik ve Kurtarma**
   - ACID işlemleri, atomik ifade güncellemeleri ve basamaklı yabancı anahtarlar sağlar
