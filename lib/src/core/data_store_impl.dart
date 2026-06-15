@@ -3939,7 +3939,7 @@ class DataStoreImpl {
 
   /// check table exists
   Future<bool> tableExists(String tableName) async {
-    if (!_isInitialized || schemaManager == null) return false;
+    if (schemaManager == null) return false;
     try {
       final schema = await schemaManager!.getTableSchema(tableName);
       return schema != null;
@@ -3951,7 +3951,7 @@ class DataStoreImpl {
 
   /// get all table names
   Future<List<String>> getTableNames() async {
-    if (!_isInitialized || schemaManager == null) return <String>[];
+    if (schemaManager == null) return <String>[];
     try {
       return await schemaManager!.listAllTables();
     } catch (e) {

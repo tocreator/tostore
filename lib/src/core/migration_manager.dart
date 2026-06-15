@@ -1582,8 +1582,9 @@ class MigrationManager {
 
       // Calculate and set estimateDuration
       if (task.estimateDuration == null) {
-        final recordCount =
-            await _dataStore.tableDataManager.getTableRecordCount(tableName);
+        final physicalTableName = task.currentTableName ?? targetTableName;
+        final recordCount = await _dataStore.tableDataManager
+            .getTableRecordCount(physicalTableName);
         final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
         final duration =
             _estimateMigrationDuration(derivedWriteMode, recordCount);
