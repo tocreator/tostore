@@ -38,7 +38,7 @@
 
 ## <a id="why-tostore"></a>Por que escolher a ToStore?
 
-ToStore é um mecanismo de dados moderno projetado para a era AGI e cenários de inteligência de ponta. Ele oferece suporte nativo a sistemas distribuídos, fusão multimodal, dados estruturados relacionais, vetores de alta dimensão e armazenamento de dados não estruturados. Construído em uma arquitetura de nós com roteamento automático e um mecanismo inspirado em redes neurais, ele oferece aos nós alta autonomia e escalabilidade horizontal elástica, ao mesmo tempo em que desvincula logicamente o desempenho da escala de dados. Inclui transações ACID, consultas relacionais complexas (JOINs e chaves estrangeiras em cascata), TTL em nível de tabela e agregações, juntamente com vários algoritmos de chave primária distribuídos, expressões atômicas, reconhecimento de alterações de esquema, criptografia, isolamento de dados em vários espaços, agendamento de carga inteligente com reconhecimento de recursos e recuperação de autocorreção de desastres/travamentos.
+O ToStore é um mecanismo de dados moderno projetado para a era da AGI e cenários de inteligência de borda. Ele suporta nativamente sistemas distribuídos, fusão multimodal, dados estruturados relacionais, vetores de alta dimensão e armazenamento de dados não estruturados. Baseado em uma arquitetura de nós auto-roteados (Self-Routing) e em um mecanismo inspirado em redes neurais, ele concede aos nós alta autonomia e escalabilidade horizontal elástica, desacoplando logicamente o desempenho da escala de dados. Possui transações ACID, consultas relacionais complexas (JOINs e chaves estrangeiras em cascata), TTL no nível da tabela e agregações, além de suporte para análise automatizada de status de O&M e processamento de dados totalmente assíncrono, permitindo uma evolução de arquitetura transparente (incluindo atualizações de esquema, alterações de chave e operações de dados em larga escala) sem interrupções. Com chaves primarias distribuidas integradas, expressões atômicas, criptografia, isolamento multiespaço, escalonamento inteligente de carga sensível a recursos e autorrecuperação de desastres/falhas, o ToStore evolui continuamente em cenários de alta continuidade, como Agentes e O&M automatizado, mantendo o serviço sempre online.
 
 À medida que a computação continua migrando para a inteligência de ponta, agentes, sensores e outros dispositivos não são mais apenas “exibições de conteúdo”. São nós inteligentes responsáveis ​​pela geração local, consciência ambiental, tomada de decisões em tempo real e fluxos de dados coordenados. As soluções de banco de dados tradicionais são limitadas por sua arquitetura subjacente e extensões integradas, tornando cada vez mais difícil satisfazer os requisitos de baixa latência e estabilidade de aplicativos inteligentes de nuvem de ponta sob gravações de alta simultaneidade, conjuntos de dados massivos, recuperação de vetores e geração colaborativa.
 
@@ -62,15 +62,15 @@ O ToStore oferece recursos distribuídos de borda fortes o suficiente para conju
   - Colaboração paralela de vários nós e decomposição de tarefas
   - O corte de tempo mantém as animações da interface do usuário suaves, mesmo sob carga pesada
 
-- 🔍 **Consultas estruturadas e recuperação de vetores**
-  - Suporta predicados complexos, JOINs, agregações e TTL em nível de tabela
-  - Suporta campos vetoriais, índices vetoriais e recuperação do vizinho mais próximo
-  - Dados estruturados e vetoriais podem trabalhar juntos dentro do mesmo mecanismo
+- 🔑 **Esquema, índices e busca eficiente**
+  - Chaves diversas (sequencial, timestamp, prefixo, código curto)
+  - Restrições multidimensionais (índice composto/vetor, chaves estrangeiras)
+  - Busca de fusão (predicados complexos, JOIN, busca vetorial)
 
-- 🔑 **Chaves primárias, índices e evolução do esquema**
-  - Algoritmos de chave primária integrados, incluindo estratégias sequenciais, de carimbo de data/hora, com prefixo de data e de código curto
-  - Suporta índices exclusivos, índices compostos, índices vetoriais e restrições de chave estrangeira
-  - Detecta automaticamente alterações de esquema e conclui o trabalho de migração
+- 🤖 **O&M inteligente e evolução transparente**
+  - Especificação de status integrada para reconhecimento de O&M e Agente
+  - Atualizações de esquema e migrações de chave fluidas e transparentes
+  - Atualizações em funcionamento sem interrupção do serviço para estabilidade
 
 - 🛡️ **Transações, Segurança e Recuperação**
   - Fornece transações ACID, atualizações de expressões atômicas e chaves estrangeiras em cascata
