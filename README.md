@@ -38,7 +38,7 @@
 
 ## Why Choose ToStore?
 
-ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. It natively supports distributed systems, multi-modal fusion, relational structured data, high-dimensional vectors, and unstructured data storage. Built on a Self-Routing node architecture and a neural-network-inspired engine, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale. It includes ACID transactions, complex relational queries (JOINs and cascading foreign keys), table-level TTL, and aggregations, along with multiple distributed primary key algorithms, atomic expressions, schema change recognition, encryption, multi-space data isolation, resource-aware intelligent load scheduling, and disaster/crash self-healing recovery.
+ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. It natively supports distributed systems, multi-modal fusion, relational structured data, high-dimensional vectors, and unstructured data storage. Built on a Self-Routing node architecture and a neural-network-inspired engine, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale. It includes ACID transactions, complex relational queries (JOINs and cascading foreign keys), table-level TTL, and aggregations, while supporting automated O&M status parsing and fully asynchronous data processing, enabling seamless, zero-downtime architecture evolution (including schema upgrades, key changes, and large-scale data operations). Built-in distributed primary keys, atomic expressions, encryption, multi-space isolation, resource-aware intelligent load scheduling, and disaster/crash self-healing recovery allow ToStore to evolve continuously in highly continuous scenarios like Agent and automated O&M, keeping services always online.
 
 As computing continues shifting toward edge intelligence, agents, sensors, and other devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. Traditional database solutions are limited by their underlying architecture and stitched-on extensions, making it increasingly difficult to satisfy the low-latency and stability requirements of edge-cloud intelligent applications under high-concurrency writes, massive datasets, vector retrieval, and collaborative generation.
 
@@ -62,15 +62,15 @@ ToStore gives the edge distributed capabilities strong enough for massive datase
   - Multi-node parallel collaboration and task decomposition
   - Time-slicing keeps UI animations smooth even under heavy load
 
-- 🔍 **Structured Queries & Vector Retrieval**
-  - Supports complex predicates, JOINs, aggregations, and table-level TTL
-  - Supports vector fields, vector indexes, and nearest-neighbor retrieval
-  - Structured and vector data can work together inside the same engine
+- 🔑 **Schema, Indexes & Efficient Retrieval**
+  - Diversified keys (sequential, timestamp, prefix, short-code)
+  - Multi-dimensional constraints (composite/vector index, foreign keys)
+  - Fusion search (complex predicates, JOIN, vector retrieval)
 
-- 🔑 **Primary Keys, Indexes & Schema Evolution**
-  - Built-in primary key algorithms including sequential, timestamp, date-prefixed, and short-code strategies
-  - Supports unique indexes, composite indexes, vector indexes, and foreign key constraints
-  - Automatically detects schema changes and completes migration work
+- 🤖 **Intelligent O&M & Seamless Evolution**
+  - Built-in status spec for O&M and Agent recognition
+  - Smooth, zero-downtime schema upgrades and key migrations
+  - Hot updates without service interruption for long-term stability
 
 - 🛡️ **Transactions, Security & Recovery**
   - Provides ACID transactions, atomic expression updates, and cascading foreign keys
