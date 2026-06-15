@@ -1,4 +1,4 @@
-<h1 align="center">
+﻿<h1 align="center">
   <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
@@ -38,47 +38,41 @@
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
 
-ToStore ist eine moderne Daten-Engine, die für die AGI-Ära und Szenarien der Edge-Intelligence entwickelt wurde. Sie unterstützt nativ verteilte Systeme, multimodale Fusion, relationale strukturierte Daten, hochdimensionale Vektoren und unstrukturierte Datenspeicherung. Basierend auf einer selbstroutierenden Knotenarchitektur (Self-Routing) und einer neuronalen Netzwerk-Engine bietet sie Knoten hohe Autonomie und elastische horizontale Skalierbarkeit, wodurch Leistung und Datenskalierung logisch entkoppelt werden. Sie kombiniert ACID-Transaktionen, komplexe relationale Abfragen (JOINs und kaskadierende Fremdschlüssel), TTL auf Tabellenebene und Aggregationen mit automatisierter Betriebsstatusanalyse und vollständig asynchroner Datenverarbeitung. Dies ermöglicht eine nahtlose, unsichtbare Architekturentwicklung (einschließlich Schema-Upgrades, Schlüsseländerungen und großflächiger Datenoperationen) ohne Unterbrechung. Mit integrierten verteilten Primärschlüsseln, atomaren Ausdrücken, Verschlüsselung, Multi-Space-Isolierung, ressourcenbewusster intelligenter Lastverteilung und Katastrophen-Selbstheilung entwickelt sich ToStore in Szenarien mit hoher Kontinuität wie Agenten und automatisierter O&M kontinuierlich weiter und bleibt immer online.
+ToStore ist eine moderne Daten-Engine für die AGI-Ära und Edge-Intelligence-Szenarien. Basierend auf einer Self-Routing-Knotenarchitektur bietet sie Knoten hohe Autonomie und elastische horizontale Skalierbarkeit, wobei Leistung und Datenumfang logisch entkoppelt werden.
 
-Da sich die Datenverarbeitung immer weiter in Richtung Edge Intelligence verlagert, sind Agenten, Sensoren und andere Geräte nicht mehr nur „Inhaltsanzeigen“. Sie sind intelligente Knoten, die für die lokale Erzeugung, das Umweltbewusstsein, die Entscheidungsfindung in Echtzeit und den koordinierten Datenfluss verantwortlich sind. Herkömmliche Datenbanklösungen sind durch ihre zugrunde liegende Architektur und angehängte Erweiterungen eingeschränkt, wodurch es immer schwieriger wird, die Anforderungen an niedrige Latenz und Stabilität intelligenter Edge-Cloud-Anwendungen bei Schreibvorgängen mit hoher Parallelität, umfangreichen Datensätzen, Vektorabruf und kollaborativer Generierung zu erfüllen.
+Runtime-Modellierung und nicht-blockierende Ausführungspfade halten die Architekturentwicklung stets online und vollständig transparent für den Geschäftsbetrieb – deklarativer Schemawechsel, Rotation der Datenkodierungsschlüssel und umfangreiches Daten-Refactoring erfolgen nahtlos online. In Agent- und automatisierten O&M-Szenarien entwickelt sich ToStore kontinuierlich weiter, ohne dass Dienste unterbrochen werden.
 
-ToStore bietet dem Edge verteilte Funktionen, die stark genug für riesige Datensätze, komplexe lokale KI-Generierung und groß angelegte Datenbewegungen sind. Die tiefgreifende intelligente Zusammenarbeit zwischen Edge- und Cloud-Knoten bietet eine zuverlässige Datengrundlage für immersive Mixed Reality, multimodale Interaktion, semantische Vektoren, räumliche Modellierung und ähnliche Szenarien.
+Eine einheitliche Daten-Engine mit nativer Unterstützung für relationale strukturierte Daten, hochdimensionale Vektoren und unstrukturierte Daten, mit Datenbankfunktionen auf Enterprise-Niveau einschließlich ACID-Transaktionen, komplexen relationalen Abfragen (JOINs, kaskadierende Fremdschlüssel), TTL auf Tabellenebene, Aggregationen sowie verteilten Primärschlüsselalgorithmen, atomaren Ausdrücken, Verschlüsselung, Multi-Space-Isolierung und Selbstheilung.
+
+Da sich die Datenverarbeitung zunehmend in Richtung Edge Intelligence verlagert, sind Geräte nicht mehr nur „Inhaltsanzeigen". Sie sind intelligente Knoten für lokale Erzeugung, Umweltbewusstsein, Echtzeitentscheidungen und koordinierten Datenfluss. ToStore bietet dem Edge verteilte Funktionen für riesige Datensätze und komplexe lokale KI-Generierung. Die tiefe intelligente Zusammenarbeit zwischen Edge- und Cloud-Knoten schafft eine zuverlässige Datengrundlage für multimodale Interaktion, semantische Vektoren, räumliche Modellierung und ähnliche Szenarien.
 
 ## <a id="key-features"></a>Hauptmerkmale
 
-- 🌐 **Einheitliche plattformübergreifende Daten-Engine**
-  - Einheitliche API für Mobil-, Desktop-, Web- und Serverumgebungen
-  - Unterstützt relationale strukturierte Daten, hochdimensionale Vektoren und unstrukturierte Datenspeicherung
-  - Baut eine Datenpipeline vom lokalen Speicher bis zur Edge-Cloud-Zusammenarbeit auf
-
-- 🧠 **Verteilte Architektur im Stil eines neuronalen Netzwerks**
-  - Selbstrouting-Knotenarchitektur, die die physische Adressierung von der Skalierung entkoppelt
-  - Hochgradig autonome Knoten arbeiten zusammen, um eine flexible Datentopologie aufzubauen
-  - Unterstützt Knotenkooperation und elastische horizontale Skalierung
-  - Tiefe Verbindung zwischen Edge-intelligenten Knoten und der Cloud
-
-- ⚡ **Parallele Ausführung und Ressourcenplanung**
-  - Ressourcenbewusste intelligente Lastplanung mit hoher Verfügbarkeit
-  - Parallele Zusammenarbeit mit mehreren Knoten und Aufgabenzerlegung
-- 🔑 **Schema, Indizes & effiziente Abfragen**
-  - Vielfältige Primärschlüssel (sequenziell, Zeitstempel, Präfix, Kurzcode)
-  - Mehrdimensionale Constraints (Verbund-/Vektorindex, Fremdschlüssel)
-  - Fusionssuche (komplexe Prädikate, JOIN, Vektorsuche)
-
-- 🤖 **Intelligente O&M & nahtlose Evolution**
-  - Integrierte Statusspezifikation für O&M- und Agenten-Erkennung
-  - Reibungslose, unsichtbare Schema-Upgrades und Schlüsselmigrationen
+- 🤖 **Runtime-Evolution und intelligentes O&M**
+  - Deklarative Definition, automatisches Refactoring, keine Versionsverwaltung
+  - Schlüsselrotation, Schemaänderungen, umfangreiches Refactoring – alles online, keine Unterbrechung
+  - Integrierte Statusspezifikation für automatisiertes O&M und Agent-Erkennung
   - Hot-Updates ohne Dienstunterbrechung für langfristige Stabilität
 
-- 🛡️ **Transaktionen, Sicherheit und Wiederherstellung**
-  – Bietet ACID-Transaktionen, atomare Ausdrucksaktualisierungen und kaskadierende Fremdschlüssel
-  – Unterstützt Crash Recovery, dauerhafte Commits und Konsistenzgarantien
-  - Unterstützt die Verschlüsselung ChaCha20-Poly1305 und AES-256-GCM
+- 🧠 **Self-Routing-Verteilte Architektur**
+  - Self-Routing-Knotenarchitektur, die physische Adressierung vom Datenumfang entkoppelt
+  - Hochautonome Knoten arbeiten zusammen für eine flexible Datentopologie
+  - Elastische horizontale Skalierung mit tiefer Edge-Cloud-Knotenverbindung
 
-- 🔄 **Multi-Space- und Daten-Workflows**
-  – Unterstützt isolierte Räume mit optional global gemeinsam genutzten Daten
-  - Unterstützt Echtzeit-Abfrage-Listener, mehrstufiges intelligentes Caching und Cursor-Paginierung
-  - Geeignet für Mehrbenutzer-, Local-First- und Offline-Kollaborationsanwendungen
+- 🌐 **Einheitliche plattformübergreifende Daten-Engine**
+  - Einheitliche API für Mobil-, Desktop-, Web- und Serverumgebungen
+  - Abdeckung relationaler strukturierter Daten, hochdimensionaler Vektoren und unstrukturierter Daten
+  - Vollständige Datenpipeline vom lokalen Speicher bis zur Edge-Cloud-Zusammenarbeit
+
+- ⚡ **Parallele Ausführung und Ressourcenplanung**
+  - Ressourcenbewusste intelligente Lastplanung für hohe Verfügbarkeit
+  - Parallele Zusammenarbeit mehrerer Knoten und Aufgabenzerlegung
+  - Time-Slicing hält UI-Animationen auch unter hoher Last flüssig
+
+- 🔐 **Datensicherheit und -isolierung**
+  - Multi-Space-Isolierung mit optionaler globaler Datenfreigabe, ideal für Multi-User- und Multi-Tenant-Szenarien
+  - Integrierte ChaCha20-Poly1305- und AES-256-GCM-Verschlüsselung
+  - Validiert durch mehrere komplexe Disaster-Recovery-Szenarien
 
 ## <a id="installation"></a>Installation
 
