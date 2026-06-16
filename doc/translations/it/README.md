@@ -38,49 +38,41 @@
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
 
-ToStore è un motore di dati moderno progettato per l'era dell'AGI e scenari di edge intelligence. Supporta nativamente sistemi distribuiti, fusione multimodale, dati strutturati relazionali, vettori ad alta dimensione e archiviazione di dati non strutturati. Basato su un'architettura di nodi auto-instradanti (Self-Routing) e un motor ispirato a reti neurali, offre ai nodi un'elevata autonomia e scalabilità orizzontale elastica, disaccoppiando logicamente le prestazioni dalla scala dei dati. Combina transazioni ACID, query relazionali complesse (JOIN e chiavi esterne in cascata), TTL a livello di tabella e aggregazioni, supportando al contempo l'analisi automatizzata dello stato operativo e l'elaborazione dei dati completamente asincrona, consentendo un'evoluzione fluida e trasparente dell'architettura (inclusi aggiornamenti di schema, modifiche alle chiavi e operazioni sui dati su larga scala) senza interruzioni. Grazie a chiavi primarie distribuite integrate, espressioni atomiche, crittografia, isolamento multi-spazio, pianificazione intelligente del carico sensibile alle risorse e autoriparazione da disastri/crash, ToStore evolve continuamente in scenari ad alta continuità come Agent e O&M automatizzato, mantenendo il servizio sempre online.
+ToStore è un motore di dati moderno progettato per l'era dell'AGI e scenari di edge intelligence. Basato su un'architettura di nodi self-routing (Self-Routing), offre ai nodi elevata autonomia e scalabilità orizzontale elastica, disaccoppiando logicamente le prestazioni dalla scala dei dati.
 
-Mentre l'informatica continua a spostarsi verso l'intelligenza periferica, agenti, sensori e altri dispositivi non sono più solo "visualizzazioni di contenuti". Sono nodi intelligenti responsabili della generazione locale, della consapevolezza ambientale, del processo decisionale in tempo reale e dei flussi di dati coordinati. Le soluzioni di database tradizionali sono limitate dall'architettura sottostante e dalle estensioni integrate, rendendo sempre più difficile soddisfare i requisiti di bassa latenza e stabilità delle applicazioni intelligenti edge-cloud con scritture ad alta concorrenza, set di dati di grandi dimensioni, recupero di vettori e generazione collaborativa.
+La modellazione a runtime e i percorsi di esecuzione non bloccanti mantengono l'evoluzione dell'architettura sempre online e totalmente trasparente per le operazioni aziendali: le modifiche dichiarative dello schema, la rotazione delle chiavi di codifica dei dati e la ristrutturazione massiva dei dati avvengono senza interruzioni. Negli scenari di Agent e O&M automatizzato, ToStore evolve continuamente mentre i servizi rimangono ininterrotti.
 
-ToStore offre funzionalità distribuite all'edge sufficientemente potenti per set di dati di grandi dimensioni, generazione di intelligenza artificiale locale complessa e spostamento di dati su larga scala. Una collaborazione profonda e intelligente tra nodi edge e cloud fornisce una base dati affidabile per realtà mista immersiva, interazione multimodale, vettori semantici, modellazione spaziale e scenari simili.
+Un motore di dati unificato che supporta nativamente dati strutturati relazionali, vettori ad alta dimensione e dati non strutturati, con capacità di database di livello enterprise che includono transazioni ACID, query relazionali complesse (JOIN, chiavi esterne in cascata), TTL a livello di tabella, aggregazioni, nonché algoritmi di chiave primaria distribuita, espressioni atomiche, crittografia, isolamento multi-spazio e ripristino automatico.
+
+Mentre l'informatica continua a spostarsi verso l'intelligenza periferica, i dispositivi non sono più semplici "visualizzatori di contenuti", ma nodi intelligenti responsabili della generazione locale, della percezione ambientale, del processo decisionale in tempo reale e del coordinamento dei dati. ToStore fornisce al perimetro capacità distribuite per set di dati massivi e generazione locale complessa di IA. La profonda collaborazione intelligente tra nodi periferici e cloud fornisce una base dati affidabile per l'interazione multimodale, i vettori semantici, la modellazione spaziale e scenari simili.
 
 ## <a id="key-features"></a>Caratteristiche principali
 
-- 🌐 **Motore dati multipiattaforma unificato**
-  - API unificata in ambienti mobili, desktop, Web e server
-  - Supporta dati strutturati relazionali, vettori ad alta dimensione e archiviazione di dati non strutturati
-  - Costruisce una pipeline di dati dall'archiviazione locale alla collaborazione edge-cloud
-
-- 🧠 **Architettura distribuita in stile rete neurale**
-  - Architettura del nodo di auto-instradamento che disaccoppia l'indirizzamento fisico dalla scala
-  - Nodi altamente autonomi collaborano per costruire una topologia di dati flessibile
-  - Supporta la cooperazione tra nodi e il ridimensionamento orizzontale elastico
-  - Profonda interconnessione tra i nodi edge-intelligenti e il cloud
-
-- ⚡ **Esecuzione parallela e pianificazione delle risorse**
-  - Pianificazione del carico intelligente in base alle risorse con elevata disponibilità
-  - Collaborazione parallela multi-nodo e scomposizione delle attività
-  - Il time-slicing mantiene fluide le animazioni dell'interfaccia utente anche in caso di carico pesante
-
-- 🔑 **Schema, indici e ricerca efficiente**
-  - Chiavi diversificate (sequenziale, timestamp, prefisso, codice breve)
-  - Vincoli multidimensionali (indice composto/vettoriale, chiavi esterne)
-  - Ricerca a fusione (predicati complessi, JOIN, ricerca vettoriale)
-
-- 🤖 **O&M intelligente ed evoluzione trasparente**
-  - Specifica di stato integrata per riconoscimento O&M e Agent
-  - Aggiornamenti di schema e migrazioni di chiavi fluidi e invisibili
+- 🤖 **Evoluzione a runtime e O&M intelligente**
+  - Definizione dichiarativa, ristrutturazione automatica, senza gestione delle versioni
+  - Rotazione delle chiavi, modifiche dello schema, ristrutturazione massiva—tutto online, senza interruzioni
+  - Specifica di stato integrata per O&M automatizzato e riconoscimento degli Agent
   - Aggiornamenti a caldo senza interruzione del servizio per stabilità a lungo termine
 
-- 🛡️ **Transazioni, sicurezza e recupero**
-  - Fornisce transazioni ACID, aggiornamenti delle espressioni atomiche e chiavi esterne a cascata
-  - Supporta il ripristino in caso di arresto anomalo del sistema, commit durevoli e garanzie di coerenza
-  - Supporta la crittografia ChaCha20-Poly1305 e AES-256-GCM
+- 🧠 **Architettura distribuita self-routing**
+  - Architettura di nodi self-routing che disaccoppia l'indirizzamento fisico dalla scala dei dati
+  - Nodi altamente autonomi collaborano per costruire una topologia di dati flessibile
+  - Scalabilità orizzontale elastica con profonda interconnessione tra nodi periferici e cloud
 
-- 🔄 **Flussi di lavoro multi-spazio e dati**
-  - Supporta spazi isolati con dati condivisi a livello globale opzionali
-  - Supporta ascoltatori di query in tempo reale, memorizzazione nella cache intelligente multilivello e impaginazione del cursore
-  - Adatto ad applicazioni multiutente, local-first e collaborative offline
+- 🌐 **Motore di dati unificato multipiattaforma**
+  - API unificata in ambienti mobili, desktop, Web e server
+  - Copre dati strutturati relazionali, vettori ad alta dimensione e dati non strutturati
+  - Pipeline di dati completa dall'archiviazione locale alla collaborazione edge-cloud
+
+- ⚡ **Esecuzione parallela e pianificazione delle risorse**
+  - Pianificazione intelligente del carico con consapevolezza delle risorse per alta disponibilità
+  - Collaborazione parallela multi-nodo e scomposizione delle attività
+  - Time-slicing che mantiene le animazioni dell'interfaccia fluide anche sotto carico pesante
+
+- 🔐 **Sicurezza e isolamento dei dati**
+  - Isolamento multi-spazio con condivisione globale opzionale, ideale per scenari multiutente e multitenant
+  - Crittografia ChaCha20-Poly1305 e AES-256-GCM integrata
+  - Verificato tramite molteplici scenari complessi di ripristino da disastri
 
 ## <a id="installation"></a>Installazione
 
