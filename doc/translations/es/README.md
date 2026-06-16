@@ -38,49 +38,41 @@
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
 
-ToStore es un motor de datos moderno diseñado para la era de la AGI y escenarios de inteligencia perimetral. Admite de forma nativa sistemas distribuidos, fusión multimodal, datos estructurados relacionales, vectores de alta dimensión y almacenamiento de datos no estructurados. Basado en una arquitectura de nodos autoenrutados (Self-Routing) y un motor inspirado en redes neuronales, otorga a los nodos una alta autonomía y escalabilidad horizontal elástica, desacoplando lógicamente el rendimiento de la escala de datos. Cuenta con transacciones ACID, consultas relacionales complejas (JOINs y claves externas en cascada), TTL a nivel de tabla y agregaciones, además de soporte para análisis de estado de O&M automatizado y procesamiento de datos completamente asíncrono, logrando una evolución de arquitectura transparente (incluyendo actualizaciones de esquema, cambios de clave y operaciones de datos a gran escala) sin interrupciones. Con claves primarias distribuidas integradas, expresiones atómicas, cifrado, aislamiento multiespacio, programación inteligente de carga sensible a recursos y autorrecuperación ante desastres/fallos, ToStore evoluciona continuamente en escenarios de alta continuidad como Agentes y O&M automatizado, manteniendo el servicio siempre activo.
+ToStore es un motor de datos moderno diseñado para la era de la AGI y escenarios de inteligencia perimetral. Basado en una arquitectura de nodos de autorruta (Self-Routing), otorga a los nodos alta autonomía y escalabilidad horizontal elástica, desacoplando lógicamente el rendimiento de la escala de datos.
 
-A medida que la informática continúa avanzando hacia la inteligencia de punta, los agentes, sensores y otros dispositivos ya no son simplemente "pantallas de contenido". Son nodos inteligentes responsables de la generación local, la conciencia ambiental, la toma de decisiones en tiempo real y los flujos de datos coordinados. Las soluciones de bases de datos tradicionales están limitadas por su arquitectura subyacente y sus extensiones integradas, lo que hace que sea cada vez más difícil satisfacer los requisitos de baja latencia y estabilidad de las aplicaciones inteligentes de nube perimetral en escrituras de alta concurrencia, conjuntos de datos masivos, recuperación de vectores y generación colaborativa.
+El modelado en tiempo de ejecución y las rutas de ejecución sin bloqueo mantienen la evolución de la arquitectura siempre en línea y totalmente transparente para las operaciones del negocio: los cambios declarativos de esquema, la rotación de claves de codificación de datos y la refactorización masiva de datos se realizan sin interrupciones. En escenarios de Agentes y O&M automatizado, ToStore evoluciona continuamente mientras los servicios permanecen ininterrumpidos.
 
-ToStore brinda capacidades distribuidas de borde lo suficientemente sólidas para conjuntos de datos masivos, generación compleja de IA local y movimiento de datos a gran escala. La colaboración inteligente profunda entre los nodos del borde y de la nube proporciona una base de datos confiable para realidad mixta inmersiva, interacción multimodal, vectores semánticos, modelado espacial y escenarios similares.
+Un motor de datos unificado que soporta nativamente datos estructurados relacionales, vectores de alta dimensión y datos no estructurados, con capacidades de base de datos de nivel empresarial que incluyen transacciones ACID, consultas relacionales complejas (JOINs, claves externas en cascada), TTL a nivel de tabla, agregaciones, así como algoritmos de clave primaria distribuida, expresiones atómicas, cifrado, aislamiento multi-espacio y recuperación automática.
+
+A medida que la computación continúa desplazándose hacia la inteligencia perimetral, los dispositivos ya no son simplemente "pantallas de contenido", sino nodos inteligentes responsables de la generación local, la percepción del entorno, la toma de decisiones en tiempo real y la coordinación de datos. ToStore otorga al borde capacidades distribuidas para conjuntos de datos masivos y generación compleja de IA local. La profunda colaboración inteligente entre nodos de borde y nube proporciona una base de datos confiable para interacción multimodal, vectores semánticos, modelado espacial y escenarios similares.
 
 ## <a id="key-features"></a>Características clave
 
+- 🤖 **Evolución en tiempo de ejecución y O&M inteligente**
+  - Definición declarativa, refactorización automática, sin gestión de versiones
+  - Rotación de claves, cambios de esquema, refactorización masiva—todo en línea, sin interrupciones
+  - Especificación de estado integrada para O&M automatizado y reconocimiento de Agentes
+  - Actualizaciones en caliente sin interrupción del servicio para estabilidad a largo plazo
+
+- 🧠 **Arquitectura distribuida de autorruta**
+  - Arquitectura de nodos de autorruta que desacopla el direccionamiento físico de la escala de datos
+  - Nodos altamente autónomos colaboran para construir una topología de datos flexible
+  - Escalabilidad horizontal elástica con profunda interconexión entre nodos de borde y nube
+
 - 🌐 **Motor de datos unificado multiplataforma**
-  - API unificada en entornos móviles, de escritorio, web y de servidor
-  - Admite datos estructurados relacionales, vectores de alta dimensión y almacenamiento de datos no estructurados.
-  - Crea un canal de datos desde el almacenamiento local hasta la colaboración en la nube perimetral
+  - API unificada en entornos móviles, de escritorio, web y servidor
+  - Cubre datos estructurados relacionales, vectores de alta dimensión y datos no estructurados
+  - Canal de datos completo desde el almacenamiento local hasta la colaboración borde-nube
 
-- 🧠 **Arquitectura distribuida estilo red neuronal**
-  - Arquitectura de nodo de autoenrutamiento que desacopla el direccionamiento físico de la escala
-  - Los nodos altamente autónomos colaboran para construir una topología de datos flexible
-  - Admite la cooperación de nodos y el escalado horizontal elástico
-  - Interconexión profunda entre los nodos inteligentes de borde y la nube
+- ⚡ **Ejecución paralela y planificación de recursos**
+  - Planificación inteligente de carga con reconocimiento de recursos para alta disponibilidad
+  - Colaboración paralela multinodo y descomposición de tareas
+  - División temporal que mantiene las animaciones de UI fluidas incluso bajo carga pesada
 
-- ⚡ **Ejecución paralela y programación de recursos**
-  - Programación de carga inteligente basada en recursos con alta disponibilidad
-  - Colaboración paralela de múltiples nodos y descomposición de tareas.
-  - La división del tiempo mantiene las animaciones de la interfaz de usuario fluidas incluso bajo cargas pesadas
-
-- 🔑 **Esquema, índices y búsqueda eficiente**
-  - Claves diversas (secuencial, marca temporal, prefijo, código corto)
-  - Restricciones multidimensionales (índice compuesto/vector, claves foráneas)
-  - Búsqueda de fusión (predicados complejos, JOIN, búsqueda vectorial)
-
-- 🤖 **O&M inteligente y evolución transparente**
-  - Especificación de estado integrada para reconocimiento de O&M y Agentes
-  - Actualizaciones de esquema y cambios de clave fluidos y sin fricciones
-  - Actualizaciones en caliente sin interrupción del servicio para mayor estabilidad
-
-- 🛡️ **Transacciones, seguridad y recuperación**
-  - Proporciona transacciones ACID, actualizaciones de expresiones atómicas y claves externas en cascada
-  - Admite recuperación de fallos, confirmaciones duraderas y garantías de coherencia
-  - Admite cifrado ChaCha20-Poly1305 y AES-256-GCM
-
-- 🔄 **Flujos de trabajo de datos y multiespacio**
-  - Admite espacios aislados con datos compartidos globalmente opcionales
-  - Admite escuchas de consultas en tiempo real, almacenamiento en caché inteligente de varios niveles y paginación del cursor
-  - Se adapta a aplicaciones multiusuario, locales primero y colaborativas fuera de línea
+- 🔐 **Seguridad y aislamiento de datos**
+  - Aislamiento multi-espacio con compartición global opcional, ideal para escenarios multiusuario y multitenant
+  - Cifrado ChaCha20-Poly1305 y AES-256-GCM integrado
+  - Verificado mediante múltiples escenarios complejos de recuperación ante desastres
 
 ## <a id="installation"></a>Instalación
 
