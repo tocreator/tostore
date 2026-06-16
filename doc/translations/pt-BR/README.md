@@ -38,49 +38,41 @@
 
 ## <a id="why-tostore"></a>Por que escolher a ToStore?
 
-O ToStore é um mecanismo de dados moderno projetado para a era da AGI e cenários de inteligência de borda. Ele suporta nativamente sistemas distribuídos, fusão multimodal, dados estruturados relacionais, vetores de alta dimensão e armazenamento de dados não estruturados. Baseado em uma arquitetura de nós auto-roteados (Self-Routing) e em um mecanismo inspirado em redes neurais, ele concede aos nós alta autonomia e escalabilidade horizontal elástica, desacoplando logicamente o desempenho da escala de dados. Possui transações ACID, consultas relacionais complexas (JOINs e chaves estrangeiras em cascata), TTL no nível da tabela e agregações, além de suporte para análise automatizada de status de O&M e processamento de dados totalmente assíncrono, permitindo uma evolução de arquitetura transparente (incluindo atualizações de esquema, alterações de chave e operações de dados em larga escala) sem interrupções. Com chaves primarias distribuidas integradas, expressões atômicas, criptografia, isolamento multiespaço, escalonamento inteligente de carga sensível a recursos e autorrecuperação de desastres/falhas, o ToStore evolui continuamente em cenários de alta continuidade, como Agentes e O&M automatizado, mantendo o serviço sempre online.
+O ToStore é um mecanismo de dados moderno projetado para a era da AGI e cenários de inteligência de borda. Baseado em uma arquitetura de nós de auto-roteamento (Self-Routing), concede aos nós alta autonomia e escalabilidade horizontal elástica, desacoplando logicamente o desempenho da escala de dados.
 
-À medida que a computação continua migrando para a inteligência de ponta, agentes, sensores e outros dispositivos não são mais apenas “exibições de conteúdo”. São nós inteligentes responsáveis ​​pela geração local, consciência ambiental, tomada de decisões em tempo real e fluxos de dados coordenados. As soluções de banco de dados tradicionais são limitadas por sua arquitetura subjacente e extensões integradas, tornando cada vez mais difícil satisfazer os requisitos de baixa latência e estabilidade de aplicativos inteligentes de nuvem de ponta sob gravações de alta simultaneidade, conjuntos de dados massivos, recuperação de vetores e geração colaborativa.
+A modelagem em tempo de execução e os caminhos de execução sem bloqueio mantêm a evolução da arquitetura sempre online e totalmente transparente para as operações do negócio: alterações declarativas de esquema, rotação de chaves de codificação de dados e refatoração massiva de dados acontecem sem interrupções. Em cenários de Agentes e O&M automatizado, o ToStore evolui continuamente enquanto os serviços permanecem ininterruptos.
 
-O ToStore oferece recursos distribuídos de borda fortes o suficiente para conjuntos de dados massivos, geração local complexa de IA e movimentação de dados em grande escala. A colaboração inteligente profunda entre nós de borda e de nuvem fornece uma base de dados confiável para realidade mista imersiva, interação multimodal, vetores semânticos, modelagem espacial e cenários semelhantes.
+Um mecanismo de dados unificado que suporta nativamente dados estruturados relacionais, vetores de alta dimensão e dados não estruturados, com capacidades de banco de dados de nível empresarial que incluem transações ACID, consultas relacionais complexas (JOINs, chaves estrangeiras em cascata), TTL no nível da tabela, agregações, bem como algoritmos de chave primária distribuída, expressões atômicas, criptografia, isolamento multi-espaço e recuperação automática.
+
+À medida que a computação continua migrando para a inteligência de borda, os dispositivos não são mais apenas "telas de conteúdo", mas nós inteligentes responsáveis pela geração local, percepção do ambiente, tomada de decisões em tempo real e coordenação de dados. O ToStore concede à borda capacidades distribuídas para conjuntos de dados massivos e geração local complexa de IA. A profunda colaboração inteligente entre nós de borda e nuvem fornece uma base de dados confiável para interação multimodal, vetores semânticos, modelagem espacial e cenários semelhantes.
 
 ## <a id="key-features"></a>Principais recursos
 
-- 🌐 **Mecanismo de dados unificado entre plataformas**
-  - API unificada em ambientes móveis, desktop, web e servidores
-  - Suporta dados estruturados relacionais, vetores de alta dimensão e armazenamento de dados não estruturados
-  - Cria um pipeline de dados desde o armazenamento local até a colaboração na nuvem
+- 🤖 **Evolução em tempo de execução e O&M inteligente**
+  - Definição declarativa, refatoração automática, sem gerenciamento de versões
+  - Rotação de chaves, alterações de esquema, refatoração massiva—tudo online, sem interrupções
+  - Especificação de estado integrada para O&M automatizado e reconhecimento de Agentes
+  - Atualizações em quente sem interrupção do serviço para estabilidade a longo prazo
 
-- 🧠 **Arquitetura distribuída em estilo de rede neural**
-  - Arquitetura de nó de auto-roteamento que separa o endereçamento físico da escala
+- 🧠 **Arquitetura distribuída de auto-roteamento**
+  - Arquitetura de nós de auto-roteamento que desacopla o endereçamento físico da escala de dados
   - Nós altamente autônomos colaboram para construir uma topologia de dados flexível
-  - Suporta cooperação de nós e dimensionamento horizontal elástico
-  - Interconexão profunda entre nós inteligentes de ponta e a nuvem
+  - Escalabilidade horizontal elástica com profunda interconexão entre nós de borda e nuvem
+
+- 🌐 **Motor de dados unificado entre plataformas**
+  - API unificada em ambientes móveis, desktop, web e servidor
+  - Cobre dados estruturados relacionais, vetores de alta dimensão e dados não estruturados
+  - Pipeline de dados completo do armazenamento local à colaboração borda-nuvem
 
 - ⚡ **Execução paralela e agendamento de recursos**
-  - Programação de carga inteligente com reconhecimento de recursos e alta disponibilidade
-  - Colaboração paralela de vários nós e decomposição de tarefas
-  - O corte de tempo mantém as animações da interface do usuário suaves, mesmo sob carga pesada
+  - Agendamento inteligente de carga com reconhecimento de recursos para alta disponibilidade
+  - Colaboração paralela de múltiplos nós e decomposição de tarefas
+  - Divisão temporal que mantém as animações da interface suaves mesmo sob carga pesada
 
-- 🔑 **Esquema, índices e busca eficiente**
-  - Chaves diversas (sequencial, timestamp, prefixo, código curto)
-  - Restrições multidimensionais (índice composto/vetor, chaves estrangeiras)
-  - Busca de fusão (predicados complexos, JOIN, busca vetorial)
-
-- 🤖 **O&M inteligente e evolução transparente**
-  - Especificação de status integrada para reconhecimento de O&M e Agente
-  - Atualizações de esquema e migrações de chave fluidas e transparentes
-  - Atualizações em funcionamento sem interrupção do serviço para estabilidade
-
-- 🛡️ **Transações, Segurança e Recuperação**
-  - Fornece transações ACID, atualizações de expressões atômicas e chaves estrangeiras em cascata
-  - Suporta recuperação de falhas, commits duráveis e garantias de consistência
-  - Suporta criptografia ChaCha20-Poly1305 e AES-256-GCM
-
-- 🔄 **Fluxos de trabalho multiespaços e de dados**
-  - Suporta espaços isolados com dados opcionais compartilhados globalmente
-  - Suporta ouvintes de consulta em tempo real, cache inteligente multinível e paginação de cursor
-  - Adapta-se a aplicativos colaborativos multiusuários, locais e off-line
+- 🔐 **Segurança e isolamento de dados**
+  - Isolamento multi-espaço com compartilhamento global opcional, ideal para cenários multiusuário e multitenant
+  - Criptografia ChaCha20-Poly1305 e AES-256-GCM integrada
+  - Verificado por meio de múltiplos cenários complexos de recuperação de desastres
 
 ## <a id="installation"></a>Instalação
 
