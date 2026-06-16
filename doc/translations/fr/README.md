@@ -36,51 +36,43 @@
 - [KV avancé](#kv-advanced) | [Opérations groupées](#bulk-operations) | [Recherche de vecteurs](#vector-advanced) | [TTL au niveau de la table](#ttl-config) | [Pagination efficace](#query-pagination) | [Cache de requêtes](#query-cache) | [Expressions atomiques](#atomic-expressions) | [Transacciones](#transactions)
 - [Administration](#database-maintenance) | [Configuration de sécurité](#security-config) | [Gestion des erreurs](#error-handling) | [Performances et diagnostics](#performance) | [Plus de ressources](#more-resources)
 
-## <a id="why-tostore"></a>Pourquoi choisir ToStore ?
+## <a id="why-tostore"></a>Pourquoi choisir ToStore ?
 
-ToStore est un moteur de données moderne conçu pour l'ère de l'AGI et les scénarios d'intelligence en périphérie (edge intelligence). Il prend en charge nativement les systèmes distribués, la fusion multimodale, les données structurées relationnelles, les vecteurs de grande dimension et le stockage de données non structurées. Basé sur une architecture de nœuds auto-routés (Self-Routing) et un moteur inspiré des réseaux neuronaux, il confère aux nœuds une grande autonomie et une extensibilité horizontale élastique, découplant logiquement les performances de l'échelle des données. Il combine des transactions ACID, des requêtes relationnelles complexes (JOINs et clés étrangères en cascade), le TTL au niveau table et des agrégations, tout en prenant en charge l'analyse automatisée de l'état d'exploitation et le traitement de données entièrement asynchrone, permettant une évolution d'architecture fluide et invisible (y compris les mises à niveau de schéma, les changements de clé et les opérations de données à grande échelle). Avec des clés primaires distribuées intégrées, des expressions atomiques, le chiffrement, l'isolation multi-espace, une planification intelligente de la charge sensible aux ressources et une auto-restauration après sinistre/panne, ToStore évolue continuellement dans des scénarios à haute continuité comme les Agents et l'exploitation automatisée, gardant le service toujours en ligne.
+ToStore est un moteur de données moderne conçu pour l'ère de l'AGI et les scénarios d'intelligence en périphérie. Basé sur une architecture de nœuds auto-routés (Self-Routing), il confère aux nœuds une grande autonomie et une extensibilité horizontale élastique, découplant logiquement les performances de l'échelle des données.
 
-Alors que l’informatique continue d’évoluer vers l’intelligence de pointe, les agents, capteurs et autres appareils ne sont plus de simples « affichages de contenu ». Ce sont des nœuds intelligents responsables de la production locale, de la sensibilisation à l’environnement, de la prise de décision en temps réel et des flux de données coordonnés. Les solutions de bases de données traditionnelles sont limitées par leur architecture sous-jacente et leurs extensions intégrées, ce qui rend de plus en plus difficile de satisfaire aux exigences de faible latence et de stabilité des applications intelligentes du cloud périphérique dans des contextes d'écritures à haute concurrence, d'ensembles de données massifs, de récupération vectorielle et de génération collaborative.
+Le modelage d'exécution et les chemins d'exécution non bloquants maintiennent l'évolution de l'architecture toujours en ligne et totalement transparente pour les opérations métier — les changements déclaratifs de schéma, la rotation des clés de codage des données et le refactoring massif de données s'effectuent sans interruption. Dans les scénarios d'Agents et d'exploitation automatisée, ToStore évolue continuellement tandis que les services restent ininterrompus.
 
-ToStore offre des capacités distribuées de pointe suffisamment puissantes pour des ensembles de données massifs, la génération d'IA locale complexe et le mouvement de données à grande échelle. Une collaboration intelligente et approfondie entre les nœuds périphériques et cloud fournit une base de données fiable pour la réalité mixte immersive, l'interaction multimodale, les vecteurs sémantiques, la modélisation spatiale et des scénarios similaires.
+Un moteur de données unifié prenant en charge nativement les données structurées relationnelles, les vecteurs de grande dimension et les données non structurées, avec des capacités de base de données de niveau entreprise comprenant les transactions ACID, les requêtes relationnelles complexes (JOINs, clés étrangères en cascade), le TTL au niveau table, les agrégations, ainsi que les algorithmes de clé primaire distribuée, les expressions atomiques, le chiffrement, l'isolation multi-espace et la récupération automatique.
+
+Alors que l'informatique continue de se déplacer vers l'intelligence en périphérie, les appareils ne sont plus de simples « affichages de contenu », mais des nœuds intelligents responsables de la génération locale, de la perception de l'environnement, de la prise de décision en temps réel et de la coordination des données. ToStore offre à la périphérie des capacités distribuées pour des ensembles de données massifs et une génération locale complexe d'IA. La collaboration intelligente approfondie entre les nœuds périphériques et cloud fournit une base de données fiable pour l'interaction multimodale, les vecteurs sémantiques, la modélisation spatiale et des scénarios similaires.
 
 ## <a id="key-features"></a>Principales fonctionnalités
 
+- 🤖 **Évolution d'exécution et exploitation intelligente**
+  - Définition déclarative, refactoring automatique, sans gestion de versions
+  - Rotation des clés, changements de schéma, refactoring massif — tout en ligne, sans interruption
+  - Spécification d'état intégrée pour l'exploitation automatisée et la reconnaissance d'Agents
+  - Mises à jour à chaud sans interruption de service pour une stabilité à long terme
+
+- 🧠 **Architecture distribuée auto-routée**
+  - Architecture de nœuds auto-routés découplant l'adressage physique de l'échelle des données
+  - Nœuds hautement autonomes collaborant pour construire une topologie de données flexible
+  - Extensibilité horizontale élastique avec interconnexion profonde entre nœuds périphériques et cloud
+
 - 🌐 **Moteur de données multiplateforme unifié**
   - API unifiée dans les environnements mobiles, de bureau, Web et serveur
-  - Prend en charge les données relationnelles structurées, les vecteurs de grande dimension et le stockage de données non structurées
-  - Crée un pipeline de données depuis le stockage local jusqu'à la collaboration Edge-Cloud
-
-- 🧠 **Architecture distribuée de style réseau neuronal**
-  - Architecture de nœud à auto-routage qui dissocie l'adressage physique de l'échelle
-  - Les nœuds hautement autonomes collaborent pour créer une topologie de données flexible
-  - Prend en charge la coopération de nœuds et la mise à l'échelle horizontale élastique
-  - Interconnexion approfondie entre les nœuds intelligents en périphérie et le cloud
+  - Couvre les données structurées relationnelles, les vecteurs de grande dimension et les données non structurées
+  - Pipeline de données complet du stockage local à la collaboration périphérie-cloud
 
 - ⚡ **Exécution parallèle et planification des ressources**
-  - Planification de charge intelligente tenant compte des ressources et haute disponibilité
+  - Planification de charge intelligente tenant compte des ressources pour une haute disponibilité
   - Collaboration parallèle multi-nœuds et décomposition des tâches
-  - Le découpage temporel maintient les animations de l'interface utilisateur fluides même sous une charge importante
+  - Découpage temporel maintenant les animations d'interface fluides même sous forte charge
 
-- 🔑 **Schéma, index & recherche efficace**
-  - Clés diversifiées (séquentielle, horodatage, préfixe, code court)
-  - Contraintes multidimensionnelles (index composé/vecteur, clés étrangères)
-  - Recherche fusionnée (prédicats complexes, JOIN, recherche vectorielle)
-
-- 🤖 **Exploitation intelligente & évolution fluide**
-  - Spécification d'état intégrée pour la reconnaissance O&M et Agent
-  - Mises à niveau de schéma et changements de clé fluides et invisibles
-  - Mises à jour à chaud sans interruption de service pour une stabilité accrue
-
-- 🛡️ **Transactions, sécurité et récupération**
-  - Fournit des transactions ACID, des mises à jour d'expressions atomiques et des clés étrangères en cascade
-  - Prend en charge la récupération après incident, les validations durables et les garanties de cohérence
-  - Prend en charge le cryptage ChaCha20-Poly1305 et AES-256-GCM
-
-- 🔄 **Flux de travail multi-espaces et données**
-  - Prend en charge les espaces isolés avec des données facultatives partagées à l'échelle mondiale
-  - Prend en charge les écouteurs de requêtes en temps réel, la mise en cache intelligente à plusieurs niveaux et la pagination du curseur
-  - Convient aux applications collaboratives multi-utilisateurs, locales et hors ligne
+- 🔐 **Sécurité et isolation des données**
+  - Isolation multi-espace avec partage global optionnel, idéal pour les scénarios multi-utilisateurs et multi-locataires
+  - Chiffrement ChaCha20-Poly1305 et AES-256-GCM intégré
+  - Vérifié par de multiples scénarios complexes de reprise après sinistre
 
 ## <a id="installation"></a>Installation
 
