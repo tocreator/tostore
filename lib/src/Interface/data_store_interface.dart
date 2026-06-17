@@ -4,6 +4,7 @@ import '../chain/schema_builder.dart';
 import '../chain/stream_query_builder.dart';
 import '../model/data_store_config.dart';
 import '../model/db_result.dart';
+import '../model/db_startup_stage.dart';
 import '../model/migration_task.dart';
 import '../model/transaction_result.dart';
 import '../model/space_info.dart';
@@ -26,6 +27,7 @@ abstract class DataStoreInterface {
     bool reinitialize = false,
     bool noPersistOnClose = false,
     bool applyActiveSpaceOnDefault = false,
+    StartupProgressCallback? onStartupProgress,
   });
 
   /// query data
