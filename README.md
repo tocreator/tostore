@@ -38,49 +38,41 @@
 
 ## Why Choose ToStore?
 
-ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. It natively supports distributed systems, multi-modal fusion, relational structured data, high-dimensional vectors, and unstructured data storage. Built on a Self-Routing node architecture and a neural-network-inspired engine, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale. It includes ACID transactions, complex relational queries (JOINs and cascading foreign keys), table-level TTL, and aggregations, while supporting automated O&M status parsing and fully asynchronous data processing, enabling seamless, zero-downtime architecture evolution (including schema upgrades, key changes, and large-scale data operations). Built-in distributed primary keys, atomic expressions, encryption, multi-space isolation, resource-aware intelligent load scheduling, and disaster/crash self-healing recovery allow ToStore to evolve continuously in highly continuous scenarios like Agent and automated O&M, keeping services always online.
+ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale.
 
-As computing continues shifting toward edge intelligence, agents, sensors, and other devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. Traditional database solutions are limited by their underlying architecture and stitched-on extensions, making it increasingly difficult to satisfy the low-latency and stability requirements of edge-cloud intelligent applications under high-concurrency writes, massive datasets, vector retrieval, and collaborative generation.
+Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. In Agent and automated O&M scenarios, ToStore evolves continuously while services remain uninterrupted.
 
-ToStore gives the edge distributed capabilities strong enough for massive datasets, complex local AI generation, and large-scale data movement. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for immersive mixed reality, multi-modal interaction, semantic vectors, spatial modeling, and similar scenarios.
+A unified data engine natively supporting relational structured data, high-dimensional vectors, and unstructured data, with enterprise-grade database capabilities including ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
+
+As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vectors, spatial modeling, and similar scenarios.
 
 ## Key Features
 
+- 🤖 **Runtime Evolution & Intelligent O&M**
+  - Declarative definition, automatic refactoring, zero version management
+  - Key rotation, schema changes, massive refactoring—all online, zero disruption
+  - Built-in status spec for automated O&M and Agent recognition
+  - Hot upgrades without service interruption for long-term stability
+
+- 🧠 **Self-Routing Distributed Architecture**
+  - Self-routing node architecture that decouples physical addressing from data scale
+  - Highly autonomous nodes collaborate to build flexible data topology
+  - Elastic horizontal scaling with deep edge-cloud node interconnection
+
 - 🌐 **Unified Cross-Platform Data Engine**
   - Unified API across mobile, desktop, web, and server environments
-  - Supports relational structured data, high-dimensional vectors, and unstructured data storage
-  - Builds a data pipeline from local storage to edge-cloud collaboration
-
-- 🧠 **Neural-Network-Style Distributed Architecture**
-  - Self-routing node architecture that decouples physical addressing from scale
-  - Highly autonomous nodes collaborate to build a flexible data topology
-  - Supports node cooperation and elastic horizontal scaling
-  - Deep interconnection between edge-intelligent nodes and the cloud
+  - Covers relational structured data, high-dimensional vectors, and unstructured data
+  - Complete data pipeline from local storage to edge-cloud collaboration
 
 - ⚡ **Parallel Execution & Resource Scheduling**
-  - Resource-aware intelligent load scheduling with high availability
+  - Resource-aware intelligent load scheduling for high availability
   - Multi-node parallel collaboration and task decomposition
   - Time-slicing keeps UI animations smooth even under heavy load
 
-- 🔑 **Schema, Indexes & Efficient Retrieval**
-  - Diversified keys (sequential, timestamp, prefix, short-code)
-  - Multi-dimensional constraints (composite/vector index, foreign keys)
-  - Fusion search (complex predicates, JOIN, vector retrieval)
-
-- 🤖 **Intelligent O&M & Seamless Evolution**
-  - Built-in status spec for O&M and Agent recognition
-  - Smooth, zero-downtime schema upgrades and key migrations
-  - Hot updates without service interruption for long-term stability
-
-- 🛡️ **Transactions, Security & Recovery**
-  - Provides ACID transactions, atomic expression updates, and cascading foreign keys
-  - Supports crash recovery, durable commits, and consistency guarantees
-  - Supports ChaCha20-Poly1305 and AES-256-GCM encryption
-
-- 🔄 **Multi-Space & Data Workflows**
-  - Supports isolated spaces with optional globally shared data
-  - Supports real-time query listeners, multi-level intelligent caching, and cursor pagination
-  - Fits multi-user, local-first, and offline-collaborative applications
+- 🔐 **Data Security & Isolation**
+  - Multi-space isolation with optional global sharing, ideal for multi-user and multi-tenant scenarios
+  - Built-in ChaCha20-Poly1305 and AES-256-GCM encryption
+  - Validated through multiple complex disaster recovery scenarios
 
 ## Installation
 
