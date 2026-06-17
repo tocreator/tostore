@@ -2343,70 +2343,6 @@ class IndexManager {
     return violations;
   }
 
-  /// Add index to table
-  Future<void> addIndex(
-    String tableName,
-    IndexSchema index,
-  ) async {
-    try {
-      // get table schema
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Failed to add index: table $tableName does not exist');
-        return;
-      }
-
-      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
-      if (allIndexes == null) return;
-
-      final bool existsInSchema =
-          allIndexes.any((i) => i.actualIndexName == index.actualIndexName);
-      final existingMeta = await getIndexMeta(tableName, index.actualIndexName);
-
-      if (!existsInSchema && existingMeta != null) {
-        Logger.warn(
-          'Detected orphaned index metadata for ${index.actualIndexName} in table $tableName, cleaning it up before rebuild',
-        );
-        await deletePhysicalIndexArtifacts(tableName, index.actualIndexName);
-      }
-
-      // If the schema already contains the index and the physical index metadata
-      // also exists, there is nothing left to do.
-      if (existsInSchema && existingMeta != null) {
-        Logger.warn(
-          'Index ${index.actualIndexName} already exists in table $tableName',
-        );
-        return;
-      }
-
-      // validate index fields
-      if (!schema.validateIndexFields(index)) {
-        throw DbException([
-          SchemaValidationStatus(
-            type: ResultType.devInvalidSchemaIndexField,
-            message:
-                'Index fields do not exist in table $tableName: ${index.fields}',
-            tableName: tableName,
-            field: index.fields.join(','),
-          ),
-        ]);
-      }
-
-      // create index file and build index
-      await createIndex(tableName, index);
-
-      // update table schema
-      if (!existsInSchema) {
-        final newIndexes = [...schema.indexes, index];
-        final newSchema = schema.copyWith(indexes: newIndexes);
-        await _dataStore.schemaManager!.saveTableSchema(tableName, newSchema);
-      }
-    } catch (e) {
-      Logger.error('Failed to add index', rawError: e);
-      rethrow;
-    }
-  }
-
   Future<String?> _findExistingPrimaryKeyByConstraint({
     required String tableName,
     required TableSchema schema,
@@ -2441,24 +2377,6 @@ class IndexManager {
       return pk;
     }
     return null;
-  }
-
-  /// modify index
-  Future<void> modifyIndex(
-    String tableName,
-    String oldIndexName,
-    IndexSchema newIndex,
-  ) async {
-    try {
-      // 1. remove old index
-      await removeIndex(tableName, indexName: oldIndexName);
-
-      // 2. create new index
-      await addIndex(tableName, newIndex);
-    } catch (e) {
-      Logger.error('Failed to modify index', rawError: e);
-      rethrow;
-    }
   }
 
   /// remove index from table
