@@ -34,7 +34,7 @@
 - [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
 - [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
-- [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [추가 자료](#more-resources)
+- [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [기여](#contribute)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### 스키마 진화
 
 `ToStore.open()` 중에 엔진은 인덱스 변경은 물론 테이블과 필드 추가, 제거, 이름 바꾸기, 변경 등 `schemas`의 구조적 변경 사항을 자동으로 감지한 다음 필요한 마이그레이션 작업을 완료합니다. 데이터베이스 버전 번호를 수동으로 유지 관리하거나 마이그레이션 스크립트를 작성할 필요가 없습니다.
+
+
+### 시작 진행 추적
+
+일반적인 스키마 변경은 비즈니스 로직에 영향을 주지 않으며 시작을 차단하지 않습니다. 모바일 앱을 자주 강제 종료하는 등 드문 예외적인 경우(예: 이전 마이그레이션이 중단된 후 새 변경 사항이 충돌 해결을 요구하거나 비정상 종료 후 간단한 데이터 유효성 검사)에만 시작 시간이 눈에 띄게 걸릴 수 있으며, 이때 `onStartupProgress`를 사용하여 스플래시 화면 또는 진행 표시기를 표시할 수 있습니다:
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('시작 진행 ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // 스플래시 화면 / 진행 표시줄 업데이트
+  },
+);
+// 데이터베이스 완전 준비됨
+```
+
+각 단계:
+- `opening` — 구성 로드, 기본 엔진 준비
+- `recovering` — 보안 검사 및 충돌 복구
+- `optimizing` — 스키마 진화 및 데이터 마이그레이션
+- `ready` — 초기화 완료, 사용 준비됨
 
 
 ### 로그인 상태 유지 및 로그아웃(활성 공간)
@@ -1551,18 +1575,16 @@ final db = await ToStore.open(
 - ✅ **표준 테스트**: 핵심 기능은 표준화된 테스트로 다룹니다.
 
 
-ToStore가 도움이 되셨다면 ⭐️댓글 부탁드려요
-이는 프로젝트를 지원하는 가장 좋은 방법 중 하나입니다. 매우 감사합니다.
+ToStore가 도움이 되셨다면 ⭐️를 부탁드립니다. 프로젝트를 지원하는 가장 좋은 방법 중 하나입니다. 매우 감사합니다!
 
+## <a id="contribute"></a>🤝 기여
 
-> **권장사항**: 프런트엔드 앱 개발의 경우 데이터 요청, 로드, 저장, 캐싱 및 프레젠테이션을 자동화하고 통합하는 풀 스택 솔루션을 제공하는 [ToApp 프레임워크](https://github.com/tocreator/toapp)을 고려하세요.
+ToStore는 지속적으로 진화하는 현대적인 데이터 엔진으로, 커뮤니티의 기여를 진심으로 환영합니다.
+버그 수정, 문서 개선, 아키텍처 개선, 새로운 아이디어 제안 등 PR을 통해 참여해 주세요:
 
-
-## <a id="more-resources"></a>추가 리소스
-
+- 🔗 **PR 제출**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **문서**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **문제 보고**: [GitHub 문제](https://github.com/tocreator/tostore/issues)
-- 💬 **기술적 토론**: [GitHub 토론](https://github.com/tocreator/tostore/discussions)
-
+- 📢 **문제 보고**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **기술적 토론**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
