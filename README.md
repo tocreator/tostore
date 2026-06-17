@@ -34,7 +34,7 @@
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
 - [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector Search](#vector-fields-vector-indexes-and-vector-search) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
-- [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [More Resources](#more-resources)
+- [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing)
 
 ## Why Choose ToStore?
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### Schema Evolution
 
 During `ToStore.open()`, the engine automatically detects structural changes in `schemas`, such as adding, removing, renaming, or changing tables and fields, as well as index changes, and then completes the necessary migration work. You do not need to manually maintain database version numbers or write migration scripts.
+
+
+### Tracking Startup Progress
+
+Normal schema changes are transparent to business logic and never block startup. Only in rare edge cases specific to mobile apps that are frequently force-closed (e.g., a previous migration was interrupted and a new schema change now requires conflict resolution, or brief data validation after an abnormal exit) may initialization take noticeable time — use `onStartupProgress` to show a splash screen or progress indicator:
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('Startup ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // Update splash screen / progress bar
+  },
+);
+// Database is fully ready here
+```
+
+Stages:
+- `opening` — Loading configuration and preparing the base engine
+- `recovering` — Security checks and crash recovery
+- `optimizing` — Schema evolution and data migration
+- `ready` — Initialization complete, ready for use
 
 
 ### Keeping Login State & Logout (Active Space)
@@ -1553,15 +1577,14 @@ final db = await ToStore.open(
 - ✅ **Standard tests**: core capabilities are covered by standardized tests
 
 
-If ToStore helps you, please give us a ⭐️
-It is one of the best ways to support the project. Thank you very much.
+If ToStore helps you, please give us a ⭐️ — it is one of the best ways to support the project. Thank you very much!
 
+## Contributing
 
-> **Recommendation**: For frontend app development, consider the [ToApp framework](https://github.com/tocreator/toapp), which provides a full-stack solution that automates and unifies data requests, loading, storage, caching, and presentation.
+ToStore is a continuously evolving modern data engine, and we warmly welcome community contributions.
+Whether it's fixing bugs, improving documentation, refining architecture, or proposing new ideas, you can participate via PR:
 
-
-## More Resources
-
+- 🔗 **Submit PR**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **Documentation**: [Wiki](https://github.com/tocreator/tostore)
 - 📢 **Issue Reporting**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Technical Discussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
