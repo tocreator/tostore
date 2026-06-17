@@ -34,7 +34,7 @@
 - [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
 - [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
-- [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [その他のリソース](#more-resources)
+- [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [貢献](#contribute)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### スキーマの進化
 
 `ToStore.open()` 中に、エンジンはテーブルやフィールドの追加、削除、名前変更、変更、インデックスの変更などの `schemas` の構造変更を自動的に検出し、必要な移行作業を完了します。データベースのバージョン番号を手動で管理したり、移行スクリプトを作成したりする必要はありません。
+
+
+### スタートアップ進捗の追跡
+
+通常のスキーマ変更はビジネスロジックに影響を与えず、起動をブロックしません。モバイルアプリを頻繁に強制終了するなど、まれな特殊ケース（前回の移行が中断された後に新しい変更が競合解決を必要とする場合や、異常終了後の短時間のデータ検証）でのみ、起動に時間がかかることがあります。その際は `onStartupProgress` を使用してスプラッシュスクリーンやプログレスインジケーターを表示できます：
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('起動進捗 ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // スプラッシュスクリーン / プログレスバーを更新
+  },
+);
+// データベースは完全に準備完了
+```
+
+各ステージ：
+- `opening` — 設定を読み込み、基本エンジンを準備
+- `recovering` — セキュリティチェックとクラッシュリカバリ
+- `optimizing` — スキーマ進化とデータ移行
+- `ready` — 初期化完了、使用可能
 
 
 ### ログイン状態の維持とログアウト (アクティブ スペース)
@@ -1551,18 +1575,16 @@ final db = await ToStore.open(
 - ✅ **標準テスト**: コア機能は標準化されたテストでカバーされます
 
 
-ToStore がお役に立てましたら、ぜひ ⭐️ をお願いします
-これはプロジェクトをサポートする最良の方法の 1 つです。どうもありがとうございます。
+ToStore がお役に立てましたら、ぜひ ⭐️ をお願いします。プロジェクトをサポートする最良の方法の 1 つです。どうもありがとうございます！
 
+## <a id="contribute"></a>🤝 貢献
 
-> **推奨事項**: フロントエンド アプリ開発の場合は、[ToApp フレームワーク](https://github.com/tocreator/toapp) を検討してください。これは、データのリクエスト、読み込み、ストレージ、キャッシュ、プレゼンテーションを自動化および統合するフルスタック ソリューションを提供します。
+ToStore は継続的に進化し続ける現代のデータエンジンであり、コミュニティからの貢献を心より歓迎します。
+バグ修正、ドキュメント改善、アーキテクチャの改良、新しいアイデアの提案など、PR を通じてご参加ください：
 
-
-## <a id="more-resources"></a>その他のリソース
-
+- 🔗 **PR 提出**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **ドキュメント**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **問題報告**: [GitHub の問題](https://github.com/tocreator/tostore/issues)
-- 💬 **技術的なディスカッション**: [GitHub ディスカッション](https://github.com/tocreator/tostore/discussions)
-
+- 📢 **問題報告**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **技術的なディスカッション**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
