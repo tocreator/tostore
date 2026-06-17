@@ -40,7 +40,7 @@
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
 - [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
-- [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [更多资源](#more-resources)
+- [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute)
 
 
 ## <a id="why-tostore"></a>为什么选择 ToStore？
@@ -390,6 +390,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### 表结构自动演进 (Schema Evolution)
 
 在 `ToStore.open()` 阶段，引擎会自动识别 `schemas` 的结构变动（如表/字段的增删、重命名及属性调整、索引的增删改等）并完成数据迁移，无需开发者手动维护数据库版本或编写迁移脚本。
+
+
+### 追踪启动进度
+
+正常表结构变更业务无感知并不阻塞启动；仅在移动端频繁关闭应用的少数特殊场景（如上次迁移被中断后又触发新变更需等待冲突处理、异常退出后的短暂数据校验）下才会出现启动耗时，此时可通过 `onStartupProgress` 展示闪屏或进度指示器：
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('启动进度 ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // 更新闪屏 / 进度条
+  },
+);
+// 数据库完全就绪
+```
+
+各阶段说明：
+- `opening` — 加载配置，准备基础引擎
+- `recovering` — 安全检查与崩溃恢复
+- `optimizing` — 表结构演进与数据迁移
+- `ready` — 初始化完成，可以正常使用
 
 
 ### 保持登录状态与退出登录（活跃空间）
@@ -1591,20 +1615,14 @@ final db = await ToStore.open(
 
 
 
-如果 ToStore 对您有所帮助，请给我们一个 ⭐️
-这是对开源的最大支持，非常感谢
+如果 ToStore 对您有所帮助，请给我们一个 ⭐️，这是对开源的最大支持，非常感谢！
 
+## <a id="contribute"></a>🤝 欢迎贡献
 
+ToStore 是一个持续演进的现代数据引擎，我们非常欢迎社区参与贡献。
+无论是修复 bug、优化文档、改进架构，还是提出新想法，都可以通过 PR 参与：
 
-
-
-> **推荐**：前端应用开发可考虑使用 [ToApp 开发框架](https://github.com/tocreator/toapp)，提供全栈开发解决方案，自动化、一体化处理数据请求、加载、存储、缓存和展示。
-
-
-
-
-## <a id="more-resources"></a>更多资源
-
+- 🔗 **提交 PR**：[Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **文档**：[Wiki](https://github.com/tocreator/tostore)
 - 📢 **问题反馈**：[GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **技术讨论**：[GitHub Discussions](https://github.com/tocreator/tostore/discussions)
