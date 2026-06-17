@@ -34,7 +34,7 @@
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
 - [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
-- [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Daha Fazla Kaynak](#more-resources)
+- [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### Şema Gelişimi
 
 `ToStore.open()` sırasında motor, `schemas`'daki tablo ve alanların eklenmesi, kaldırılması, yeniden adlandırılması veya değiştirilmesi gibi yapısal değişikliklerin yanı sıra dizin değişikliklerini de otomatik olarak algılar ve ardından gerekli geçiş çalışmasını tamamlar. Veritabanı sürüm numaralarını manuel olarak korumanıza veya geçiş komut dosyaları yazmanıza gerek yoktur.
+
+
+### Başlangıç İlerlemesini Takip Etme
+
+Normal şema değişiklikleri iş mantığına karşı şeffaftır ve başlatmayı engellemez. Yalnızca sık sık zorla kapatılan mobil uygulamalara özgü nadir istisnai durumlarda (örneğin, önceki bir geçiş kesintiye uğramış ve yeni bir şema değişikliği artık çakışma çözümü gerektiriyorsa veya anormal bir çıkıştan sonra kısa veri doğrulaması) başlatma fark edilebilir bir süre alabilir — bu durumda bir açılış ekranı veya ilerleme göstergesi göstermek için `onStartupProgress` kullanın:
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('Başlangıç ilerlemesi ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // Açılış ekranı / ilerleme çubuğunu güncelle
+  },
+);
+// Veritabanı tamamen hazır
+```
+
+Aşamalar:
+- `opening` — Yapılandırma yükleniyor, temel motor hazırlanıyor
+- `recovering` — Güvenlik kontrolleri ve çökme kurtarma
+- `optimizing` — Şema evrimi ve veri geçişi
+- `ready` — Başlatma tamamlandı, kullanıma hazır
 
 
 ### Oturum Açma Durumunu ve Oturum Kapatmayı Tutma (Aktif Alan)
@@ -1549,18 +1573,16 @@ final db = await ToStore.open(
 - ✅ **Standart testler**: temel yetenekler standart testlerin kapsamındadır
 
 
-ToStore size yardımcı oluyorsa lütfen bize bir ⭐️ verin
-Projeyi desteklemenin en iyi yollarından biridir. Çok teşekkür ederim.
+ToStore size yardımcı oluyorsa lütfen bize bir ⭐️ verin, bu projeyi desteklemenin en iyi yollarından biridir. Çok teşekkür ederim!
 
+## <a id="contribute"></a>🤝 Katkıda Bulunma
 
-> **Öneri**: Ön uç uygulama geliştirme için, veri isteklerini, yüklemeyi, depolamayı, önbelleğe almayı ve sunumu otomatikleştiren ve birleştiren tam kapsamlı bir çözüm sağlayan [ToApp çerçevesi](https://github.com/tocreator/toapp)'yi göz önünde bulundurun.
+ToStore sürekli gelişen modern bir veri motorudur ve topluluk katkılarını içtenlikle karşılıyoruz.
+İster hata düzeltme, ister belge iyileştirme, mimari geliştirme veya yeni fikir önerme olsun, PR aracılığıyla katılabilirsiniz:
 
-
-## <a id="more-resources"></a>Daha Fazla Kaynak
-
+- 🔗 **PR Gönder**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **Belgeler**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **Sorun Bildirme**: [GitHub Sorunları](https://github.com/tocreator/tostore/issues)
-- 💬 **Teknik Tartışma**: [GitHub Tartışmaları](https://github.com/tocreator/tostore/discussions)
-
+- 📢 **Sorun Bildirme**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **Teknik Tartışma**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
