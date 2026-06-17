@@ -34,7 +34,7 @@
 - [Definizione dello schema](#schema-definition) | [Architettura distribuita](#distributed-architecture) | [Chiavi esterne a cascata](#foreign-keys) | [Cellulare/Desktop](#mobile-integration) | [Server/Agente](#server-integration) | [Algoritmi a chiave primaria](#primary-key-examples)
 - [Query avanzate (JOIN)](#query-advanced) | [Aggregazione e statistiche](#aggregation-stats) | [Logica complessa (Condizione query)](#query-condition) | [Query reattiva (guarda)](#reactive-query) | [Query sullo streaming](#streaming-query)
 - [KV avanzate](#kv-advanced) | [Operazioni in blocco](#bulk-operations) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Paginazione efficiente](#query-pagination) | [Cache delle query](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
-- [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Altre risorse](#more-resources)
+- [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Contribuire](#contribute)
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### Evoluzione dello schema
 
 Durante `ToStore.open()`, il motore rileva automaticamente le modifiche strutturali in `schemas`, come l'aggiunta, la rimozione, la ridenominazione o la modifica di tabelle e campi, nonché le modifiche dell'indice, quindi completa il lavoro di migrazione necessario. Non è necessario gestire manualmente i numeri di versione del database o scrivere script di migrazione.
+
+
+### Monitoraggio del progresso di avvio
+
+Le modifiche normali allo schema sono trasparenti per la logica di business e non bloccano l'avvio. Solo in rari casi eccezionali specifici per app mobili frequentemente chiuse forzatamente (ad esempio, una migrazione precedente è stata interrotta e una nuova modifica dello schema richiede ora la risoluzione dei conflitti, o una breve convalida dei dati dopo un'uscita anomala) l'inizializzazione può richiedere un tempo percettibile — usa `onStartupProgress` per mostrare una schermata iniziale o un indicatore di avanzamento:
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('Progresso avvio ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // Aggiorna schermata iniziale / barra di avanzamento
+  },
+);
+// Database completamente pronto
+```
+
+Fasi:
+- `opening` — Caricamento configurazione, preparazione del motore di base
+- `recovering` — Controlli di sicurezza e ripristino dopo crash
+- `optimizing` — Evoluzione dello schema e migrazione dei dati
+- `ready` — Inizializzazione completata, pronto all'uso
 
 
 ### Mantenimento dello stato di accesso e disconnessione (spazio attivo)
@@ -1549,18 +1573,16 @@ final db = await ToStore.open(
 - ✅ **Test standard**: le capacità principali sono coperte da test standardizzati
 
 
-Se ToStore ti è d'aiuto, lasciaci un ⭐️
-È uno dei modi migliori per sostenere il progetto. Grazie mille.
+Se ToStore ti è d'aiuto, lasciaci un ⭐️, è uno dei modi migliori per sostenere il progetto. Grazie mille!
 
+## <a id="contribute"></a>🤝 Contribuire
 
-> **Raccomandazione**: per lo sviluppo di app frontend, prendi in considerazione il [framework ToApp](https://github.com/tocreator/toapp), che fornisce una soluzione full-stack che automatizza e unifica richieste di dati, caricamento, archiviazione, memorizzazione nella cache e presentazione.
+ToStore è un motore di dati moderno in continua evoluzione, e accogliamo con piacere i contributi della comunità.
+Che si tratti di correggere bug, migliorare la documentazione, perfezionare l'architettura o proporre nuove idee, puoi partecipare tramite PR:
 
-
-## <a id="more-resources"></a>Più risorse
-
+- 🔗 **Invia PR**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **Documentazione**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **Segnalazione dei problemi**: [Problemi GitHub](https://github.com/tocreator/tostore/issues)
-- 💬 **Discussione tecnica**: [Discussioni GitHub](https://github.com/tocreator/tostore/discussions)
-
+- 📢 **Segnalazione dei problemi**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **Discussione tecnica**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
