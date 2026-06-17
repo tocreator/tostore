@@ -1,4 +1,4 @@
-﻿<h1 align="center">
+<h1 align="center">
   <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
@@ -34,7 +34,7 @@
 - [Schemadefinition](#schema-definition) | [Verteilte Architektur](#distributed-architecture) | [Kaskadierende Fremdschlüssel](#foreign-keys) | [Mobil/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primärschlüsselalgorithmen](#primary-key-examples)
 - [Erweiterte Abfragen (JOIN)](#query-advanced) | [Aggregation & Statistik](#aggregation-stats) | [Komplexe Logik (Abfragebedingung)](#query-condition) | [Reaktive Abfrage (beobachten)](#reactive-query) | [Streaming-Anfrage](#streaming-query)
 - [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Vektorsuche](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
-- [Administration](#database-maintenance) | [Sicherheitskonfiguration](#security-config) | [Fehlerbehandlung](#error-handling) | [Leistung und Diagnose](#performance) | [Weitere Ressourcen](#more-resources)
+- [Administration](#database-maintenance) | [Sicherheitskonfiguration](#security-config) | [Fehlerbehandlung](#error-handling) | [Leistung und Diagnose](#performance) | [Mitwirken](#contribute)
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
 
@@ -370,6 +370,30 @@ await db.switchSpace(spaceName: 'user_123');
 ### Schemaentwicklung
 
 Während `ToStore.open()` erkennt die Engine automatisch strukturelle Änderungen in `schemas`, wie das Hinzufügen, Entfernen, Umbenennen oder Ändern von Tabellen und Feldern sowie Indexänderungen, und führt dann die erforderlichen Migrationsarbeiten durch. Sie müssen die Datenbankversionsnummern nicht manuell verwalten oder Migrationsskripts schreiben.
+
+
+### Startfortschritt verfolgen
+
+Normale Schema-Änderungen sind für die Geschäftslogik transparent und blockieren den Start nicht. Nur in seltenen Ausnahmefällen bei mobilen Apps, die häufig zwangsweise geschlossen werden (z. B. wenn eine vorherige Migration unterbrochen wurde und eine neue Schema-Änderung jetzt eine Konfliktlösung erfordert, oder kurze Datenvalidierung nach einem abnormalen Beenden) kann die Initialisierung spürbar dauern — verwenden Sie `onStartupProgress`, um einen Splash-Screen oder Fortschrittsbalken anzuzeigen:
+
+```dart
+final db = await ToStore.open(
+  dbPath: dbRoot,
+  schemas: appSchemas,
+  onStartupProgress: (progress, stage) {
+    // progress: 0.0 – 1.0  |  stage: opening → recovering → optimizing → ready
+    print('Startfortschritt ${(progress * 100).toStringAsFixed(0)}% [$stage]');
+    // Splash-Screen / Fortschrittsbalken aktualisieren
+  },
+);
+// Datenbank ist vollständig bereit
+```
+
+Phasen:
+- `opening` — Konfiguration laden, Basis-Engine vorbereiten
+- `recovering` — Sicherheitsprüfungen und Absturzwiederherstellung
+- `optimizing` — Schema-Evolution und Datenmigration
+- `ready` — Initialisierung abgeschlossen, einsatzbereit
 
 
 ### Anmeldestatus und Abmeldung beibehalten (aktiver Bereich)
@@ -1549,18 +1573,16 @@ final db = await ToStore.open(
 - ✅ **Standardtests**: Kernkompetenzen werden durch standardisierte Tests abgedeckt
 
 
-Wenn ToStore Ihnen hilft, geben Sie uns bitte ein ⭐️
-Es ist eine der besten Möglichkeiten, das Projekt zu unterstützen. Vielen Dank.
+Wenn ToStore Ihnen hilft, geben Sie uns bitte ein ⭐️ – das ist eine der besten Möglichkeiten, das Projekt zu unterstützen. Vielen Dank!
 
+## <a id="contribute"></a>🤝 Mitwirken
 
-> **Empfehlung**: Ziehen Sie für die Entwicklung von Frontend-Apps das [ToApp-Framework](https://github.com/tocreator/toapp) in Betracht, das eine Full-Stack-Lösung bietet, die Datenanfragen, Laden, Speichern, Caching und Präsentation automatisiert und vereinheitlicht.
+ToStore ist eine sich stetig weiterentwickelnde moderne Daten-Engine, und wir begrüßen Community-Beiträge sehr.
+Ob Fehler beheben, Dokumentation verbessern, Architektur optimieren oder neue Ideen vorschlagen – Sie können über PR teilnehmen:
 
-
-## <a id="more-resources"></a>Weitere Ressourcen
-
+- 🔗 **PR einreichen**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
 - 📖 **Dokumentation**: [Wiki](https://github.com/tocreator/tostore)
-- 📢 **Problemberichterstattung**: [GitHub-Probleme](https://github.com/tocreator/tostore/issues)
-- 💬 **Technische Diskussion**: [GitHub-Diskussionen](https://github.com/tocreator/tostore/discussions)
-
+- 📢 **Problemberichterstattung**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
+- 💬 **Technische Diskussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 
 
