@@ -56,6 +56,9 @@ class MigrationManager {
   // Telemetry for migration progress
   final _MigrationTelemetry _telemetry = _MigrationTelemetry();
 
+  // Active progress callback for blocking/synchronized migration task.
+  void Function(double progress)? _activeTaskProgressCallback;
+
   // In-memory cache for migration metadata to avoid frequent file reads
   MigrationMeta? _migrationMetaCache;
   // Current directory index cache (derived from directoryMapping)
@@ -79,6 +82,14 @@ class MigrationManager {
 
   // Key: tableName, Value: latest in-memory read cursor during active migration
   final Map<String, String> _activeReadCursors = {};
+
+  // Active executing task ID
+  String? _activeExecutingTaskId;
+  // Active executing task Future
+  Future<void>? _activeTaskFuture;
+
+  // Set of task IDs that are in version conflict during startup
+  final Set<String> _conflictTaskIds = {};
 
   /// Whether schema or key migration work is still pending.
   static bool computeHasPendingMigrationWork({
@@ -314,6 +325,18 @@ class MigrationManager {
 
         // Update telemetry
         _telemetry.recordRecordsProcessed(taskId, progress.count);
+
+        if (_activeTaskProgressCallback != null) {
+          final allSpaces =
+              await _getMigrationScopesForSchema(updatedTask.oldSchemaSnapshot);
+          final totalSpaces = allSpaces.isNotEmpty ? allSpaces.length : 1;
+          final progressVal = _telemetry.getTaskProgress(
+            taskId,
+            totalSpaces,
+            updatedTask.pendingMigrationSpaces.length,
+          );
+          _activeTaskProgressCallback!(progressVal);
+        }
       }
     } catch (e) {
       Logger.error('Failed to notify background write completion', rawError: e);
@@ -333,6 +356,11 @@ class MigrationManager {
     final spaces = _activeSpaceMigrationTasks.keys.toList();
     for (final space in spaces) {
       await stopMigrationForSpace(space);
+    }
+
+    final futures = _activeSpaceMigrationTasks.values.toList();
+    if (futures.isNotEmpty) {
+      await Future.wait(futures).catchError((_) => const []);
     }
 
     // Clear global migration caches to ensure fresh state on next open/switch
@@ -580,6 +608,7 @@ class MigrationManager {
     required List<TableSchema> systemSchemas,
     int batchSize = 1000,
     bool waitForCompletion = false,
+    void Function(double progress)? onProgress,
   }) async {
     try {
       final targetSchemas = <TableSchema>[];
@@ -615,6 +644,33 @@ class MigrationManager {
       // Performance optimization: Skip migration if no schemas
       if (targetSchemas.isEmpty) {
         return;
+      }
+
+      // Resolve version conflicts for any tables that have pending tasks
+      final tasksToWait = <MigrationTask>[];
+      for (final task in _pendingTasks) {
+        if (task.pendingMigrationSpaces.isEmpty) continue;
+        if (_conflictTaskIds.contains(task.taskId)) {
+          tasksToWait.add(task);
+        }
+      }
+
+      if (tasksToWait.isNotEmpty) {
+        for (int i = 0; i < tasksToWait.length; i++) {
+          final task = tasksToWait[i];
+          await waitForTaskCompletion(
+            task.taskId,
+            onProgress: (double taskProgress) {
+              if (onProgress != null) {
+                double totalTaskWeight = 1.0 / tasksToWait.length;
+                double currentTaskBase = i * totalTaskWeight;
+                double mappedProgress =
+                    currentTaskBase + (taskProgress * totalTaskWeight);
+                onProgress(mappedProgress.clamp(0.0, 1.0));
+              }
+            },
+          );
+        }
       }
 
       // Get all existing tables
@@ -1654,6 +1710,32 @@ class MigrationManager {
     } catch (e) {
       Logger.error('Add migration task failed', rawError: e);
       rethrow;
+    }
+  }
+
+  /// Wait for a specific migration task to complete (either currently executing or in queue).
+  Future<void> waitForTaskCompletion(
+    String taskId, {
+    void Function(double progress)? onProgress,
+  }) async {
+    if (onProgress != null) {
+      _activeTaskProgressCallback = onProgress;
+    }
+
+    // Wait until the task is no longer pending and no longer executing.
+    while (_pendingTasks.any((t) => t.taskId == taskId) ||
+        _activeExecutingTaskId == taskId) {
+      if (_activeExecutingTaskId == taskId && _activeTaskFuture != null) {
+        // Directly await the running future — zero-polling, event-driven.
+        try {
+          await _activeTaskFuture;
+        } catch (_) {
+          // Ignore task failure during wait; let the caller of migrate() surface the error.
+        }
+      } else {
+        // Task is still queued, waiting for its turn in the serial channel.
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
     }
   }
 
@@ -3504,7 +3586,9 @@ class MigrationManager {
         // only for deadlock/leak protection.
         const taskTimeout = Duration(hours: 24);
         try {
-          final completed = await _executeMigrationTask(task)
+          _activeExecutingTaskId = task.taskId;
+          _activeTaskFuture = _executeMigrationTask(task);
+          final completed = await _activeTaskFuture!
               .then((_) => true)
               .timeout(taskTimeout, onTimeout: () {
             Logger.error(
@@ -3564,6 +3648,9 @@ class MigrationManager {
             }
           }
           break;
+        } finally {
+          _activeExecutingTaskId = null;
+          _activeTaskFuture = null;
         }
       }
 
@@ -3746,8 +3833,21 @@ class MigrationManager {
         'Preparing to migrate data for ${pendingSpaces.length} spaces',
       );
 
+      final taskScopes = await _getMigrationScopesForSchema(oldSchema);
+      final int totalSpaces = taskScopes.isNotEmpty ? taskScopes.length : 1;
+
       // process data migration for each space
       for (var space in pendingSpaces) {
+        if (_activeTaskProgressCallback != null) {
+          final int remainingSpaces =
+              pendingSpaces.length - pendingSpaces.indexOf(space);
+          final progressVal = _telemetry.getTaskProgress(
+            currentTask.taskId,
+            totalSpaces,
+            remainingSpaces,
+          );
+          _activeTaskProgressCallback!(progressVal);
+        }
         final spaceStopwatch = Stopwatch()..start();
 
         final isGlobalScope = space == _globalMigrationScope;
@@ -4101,6 +4201,10 @@ class MigrationManager {
             currentTask.backupPath!.isNotEmpty) {
           _cleanupMigrationBackup(currentTask.backupPath!);
         }
+
+        if (_activeTaskProgressCallback != null) {
+          _activeTaskProgressCallback!(1.0);
+        }
       }
     } catch (e) {
       if (e is _MigrationStoppedException) {
@@ -4127,6 +4231,8 @@ class MigrationManager {
         ));
       }
       rethrow;
+    } finally {
+      _activeTaskProgressCallback = null;
     }
   }
 
@@ -4662,11 +4768,18 @@ class MigrationManager {
     }
   }
 
-  /// initialize migration manager, recover unfinished tasks
-  Future<void> initialize() async {
+  /// initialize migration manager, recover unfinished tasks and sort conflict tasks to the front
+  Future<void> initialize({
+    List<TableSchema> userSchemas = const [],
+    List<TableSchema> systemSchemas = const [],
+  }) async {
     try {
       _runtimeMigrations.clear();
-      await _recoverPendingSchemaTasksFromDisk();
+      _conflictTaskIds.clear();
+      await _recoverPendingSchemaTasksFromDisk(
+        userSchemas: userSchemas,
+        systemSchemas: systemSchemas,
+      );
       await syncHasMigrationTask();
     } catch (e) {
       Logger.error('Failed to initialize migration manager', rawError: e);
@@ -4674,7 +4787,10 @@ class MigrationManager {
   }
 
   /// Load unfinished schema migration tasks from disk into [_pendingTasks].
-  Future<void> _recoverPendingSchemaTasksFromDisk() async {
+  Future<void> _recoverPendingSchemaTasksFromDisk({
+    List<TableSchema> userSchemas = const [],
+    List<TableSchema> systemSchemas = const [],
+  }) async {
     final meta = await _getOrLoadMigrationMeta();
     if (meta.directoryMapping.idToDir.isEmpty) return;
 
@@ -4732,6 +4848,40 @@ class MigrationManager {
     }
 
     if (_pendingTasks.isNotEmpty) {
+      // Check conflict tasks and record them — check against both user and system schemas
+      final allSchemas = <TableSchema>[...userSchemas, ...systemSchemas];
+      if (allSchemas.isNotEmpty) {
+        for (final task in _pendingTasks) {
+          TableSchema? targetSchema;
+          for (final s in allSchemas) {
+            if (s.name == task.tableName) {
+              targetSchema = s;
+              break;
+            }
+          }
+          if (targetSchema != null) {
+            final bootedHash = TableSchema.generateSchemasHash([targetSchema]);
+            final pendingTargetHash = task.targetSchemaSnapshot != null
+                ? TableSchema.generateSchemasHash([task.targetSchemaSnapshot!])
+                : '';
+            if (bootedHash != pendingTargetHash) {
+              _conflictTaskIds.add(task.taskId);
+            }
+          }
+        }
+      }
+
+      // Sort _pendingTasks to prioritize conflict tasks
+      if (_conflictTaskIds.isNotEmpty) {
+        _pendingTasks.sort((a, b) {
+          final aConflict = _conflictTaskIds.contains(a.taskId);
+          final bConflict = _conflictTaskIds.contains(b.taskId);
+          if (aConflict && !bConflict) return -1;
+          if (!aConflict && bConflict) return 1;
+          return 0;
+        });
+      }
+
       _rebuildRuntimeMigrations();
       unawaited(processMigrationTasks());
     }
@@ -5669,6 +5819,15 @@ class RenamedTableResult {
 
 class _MigrationTelemetry {
   final Map<String, _TaskStats> _stats = {};
+
+  double getTaskProgress(String taskId, int totalSpaces, int remainingSpaces) {
+    final s = _stats[taskId];
+    if (s == null || totalSpaces <= 0) return 0.0;
+    final completedSpaces = totalSpaces - remainingSpaces;
+    final double currentSpaceProgress = s.calculateCurrentSpaceProgress();
+    return ((completedSpaces + currentSpaceProgress) / totalSpaces)
+        .clamp(0.0, 1.0);
+  }
 
   void recordTaskStart(String taskId) {
     _stats.putIfAbsent(taskId, () => _TaskStats(taskId)).startTime =
