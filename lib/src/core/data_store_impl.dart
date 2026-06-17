@@ -28,6 +28,7 @@ import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/memory_info.dart';
 import '../model/migration_task.dart';
+import '../model/db_startup_stage.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
@@ -101,6 +102,7 @@ class DataStoreImpl {
   Completer<void> _initCompleter = Completer<void>();
   bool _isInitialized = false;
   bool _initializing = false;
+  StartupProgressCallback? _startupProgressCallback;
   final String _instanceKey;
   final Future<void> Function(DataStoreImpl db)? _onConfigure;
   final Future<void> Function(DataStoreImpl db)? _onCreate;
@@ -623,7 +625,11 @@ class DataStoreImpl {
       DataStoreConfig? config,
       bool reinitialize = false,
       bool noPersistOnClose = false,
-      bool applyActiveSpaceOnDefault = false}) async {
+      bool applyActiveSpaceOnDefault = false,
+      StartupProgressCallback? onStartupProgress}) async {
+    if (onStartupProgress != null) {
+      _startupProgressCallback = onStartupProgress;
+    }
     if (_initializing && !_initCompleter.isCompleted) {
       await _initCompleter.future;
       return true;
@@ -637,6 +643,7 @@ class DataStoreImpl {
     }
 
     _initializing = true;
+    _startupProgressCallback?.call(0.0, DbStartupStage.opening);
     try {
       if (_config != null && (reinitialize || _isInitialized)) {
         await close(
@@ -764,6 +771,7 @@ class DataStoreImpl {
           Future(() async => await transactionManager!.initialize()),
         ]);
       }
+      _startupProgressCallback?.call(0.1, DbStartupStage.opening);
 
       // When opening with default space (first open only), use stored activeSpace so one open lands in the right space.
       // Memory mode does not persist global config, so skip.
@@ -831,10 +839,12 @@ class DataStoreImpl {
 
         // Mark base initialization complete AFTER KeyManager is initialized
         _baseInitialized = true;
+        _startupProgressCallback?.call(0.2, DbStartupStage.opening);
         if (!isMemoryMode) {
           // Prepare temp directory for crash-safe writes (native only)
           await _resetTempDir();
 
+          _startupProgressCallback?.call(0.2, DbStartupStage.recovering);
           await walManager.initializeAndRecover();
           await parallelJournalManager.start();
 
@@ -846,20 +856,30 @@ class DataStoreImpl {
 
             // Resume pending table-level clear/drop operations before WAL replay.
             await _resumePendingTableOps();
+            _startupProgressCallback?.call(0.35, DbStartupStage.recovering);
+
             // Execute old structure migration if needed
             await _migrateOldStructureIfNeeded();
+            _startupProgressCallback?.call(0.4, DbStartupStage.recovering);
 
-            // Initialize migration manager, restore unfinished migration tasks
-            await migrationManager?.initialize();
+            // Initialize migration manager, restore unfinished migration tasks and detect startup conflicts
+            final userSchemas = _getUserDefinedSchemas();
+            final systemSchemas = SystemTable.gettableSchemas;
+            await migrationManager?.initialize(
+              userSchemas: userSchemas,
+              systemSchemas: systemSchemas,
+            );
 
             // Key migration runs after schema tasks are recovered (schema before key).
             await _keyManager!.startDeferredKeyMigrationWork();
 
             await _startSetupAndUpgrade();
+            _startupProgressCallback?.call(0.8, DbStartupStage.optimizing);
           }
         }
 
         _isInitialized = true;
+        _startupProgressCallback?.call(1.0, DbStartupStage.ready);
 
         if (!_initCompleter.isCompleted) {
           _initCompleter.complete();
@@ -889,6 +909,7 @@ class DataStoreImpl {
       rethrow;
     } finally {
       _initializing = false;
+      _startupProgressCallback = null;
     }
   }
 
@@ -918,15 +939,6 @@ class DataStoreImpl {
     try {
       await _onConfigure?.call(this);
 
-      // Skip automatic schema diff/migrate while schema or key migration is pending.
-      // Recovery runs earlier: schema via MigrationManager.initialize(),
-      // key via KeyManager.startDeferredKeyMigrationWork().
-      final migrationMgr = migrationManager;
-      if (migrationMgr != null &&
-          await migrationMgr.hasAnyPendingMigrationWork()) {
-        return;
-      }
-
       final systemSchemas = SystemTable.gettableSchemas;
       final userSchemas = _getUserDefinedSchemas();
 
@@ -949,7 +961,10 @@ class DataStoreImpl {
         }
       }
 
-      // First run - create system tables and user tables
+      // First run - create system tables and user tables.
+      // This block is idempotent: if a previous startup created only some tables
+      // and then crashed, we skip "table already exists" errors on retry and
+      // only abort for true fatal errors (disk I/O, schema validation, etc.).
       if (needInitialize) {
         // Create system tables first (they have no foreign key dependencies)
         final systemTablesResult = await createTables(
@@ -957,7 +972,14 @@ class DataStoreImpl {
           isSystemTable: true,
         );
         if (systemTablesResult.hasErrors) {
-          throw DbException(systemTablesResult.statuses);
+          final systemFatalErrors = systemTablesResult.statuses
+              .where((s) =>
+                  s.type != ResultType.success &&
+                  s.type != ResultType.devSchemaTableExists)
+              .toList();
+          if (systemFatalErrors.isNotEmpty) {
+            throw DbException(systemFatalErrors);
+          }
         }
 
         await schemaManager?.updateSystemSchemaHash(systemSchemas);
@@ -966,7 +988,14 @@ class DataStoreImpl {
         if (userSchemas.isNotEmpty) {
           final userTablesResult = await createTables(userSchemas);
           if (userTablesResult.hasErrors) {
-            throw DbException(userTablesResult.statuses);
+            final userFatalErrors = userTablesResult.statuses
+                .where((s) =>
+                    s.type != ResultType.success &&
+                    s.type != ResultType.devSchemaTableExists)
+                .toList();
+            if (userFatalErrors.isNotEmpty) {
+              throw DbException(userFatalErrors);
+            }
           }
           await schemaManager?.updateUserSchemaHash(userSchemas);
         }
@@ -976,10 +1005,21 @@ class DataStoreImpl {
       }
       // Need upgrade - perform table structure migration
       else if (systemSchemaChanged || userSchemaChanged) {
+        bool optimizingCalled = false;
         await migrationManager?.migrate(
           userSchemas: userSchemas,
           systemSchemas: systemSchemas,
           batchSize: config.migrationConfig?.batchSize ?? 1000,
+          onProgress: (double progress) {
+            if (!optimizingCalled) {
+              _startupProgressCallback?.call(0.4, DbStartupStage.optimizing);
+              optimizingCalled = true;
+            }
+            double mappedProgress =
+                0.4 + (progress * 0.4); // maps 0.0-1.0 to 0.4-0.8
+            _startupProgressCallback?.call(
+                mappedProgress.clamp(0.0, 1.0), DbStartupStage.optimizing);
+          },
         );
 
         if (systemSchemaChanged) {
@@ -1192,7 +1232,7 @@ class DataStoreImpl {
       // Check if table already exists
       final tableExists = await this.tableExists(schema.name);
       if (tableExists) {
-        Logger.warn('Table ${schema.name} already exists');
+        Logger.info('Table ${schema.name} already exists, skipping creation');
         return finish(DbResult.error(
           type: ResultType.devSchemaTableExists,
           message: 'Table ${schema.name} already exists',
