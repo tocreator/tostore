@@ -38,49 +38,41 @@
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
-ToStore, AGI çağı ve uç zeka (edge intelligence) senaryoları için tasarlanmış modern bir veri motorudur. Dağıtık sistemleri, çok modlu birleşimi (multi-modal fusion), ilişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı yerel olarak destekler. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi ve yapay sinir ağından ilham alan bir motor üzerine kurulu olan bu sistem, performansı veri ölçeğinden mantıksal olarak ayırırken düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlar. ACID işlemlerini, karmaşık ilişkisel sorguları (JOIN'ler ve basamaklı yabancı anahtarlar), tablo düzeyinde TTL'yi ve agregasyonları barındırırken, otomatik işletim durumu analizini ve tamamen eşzamansız veri işlemeyi destekleyerek kesintisiz ve şeffaf bir mimari evrime (şema yükseltmeleri, anahtar değişiklikleri ve büyük ölçekli veri işlemleri dahil) olanak tanır. Entegre dağıtık birincil anahtarlar, atomik ifadeler, şifreleme, çoklu alan yalıtımı, kaynak duyarlı akıllı yük zamanlama ve afet/çökme sonrası kendi kendini iyileştirme gibi kurumsal özelliklerle donatılan ToStore, Ajan (Agent) ve otomatik işletim gibi yüksek süreklilik gerektiren senaryolarda kesintisiz hizmet vererek sürekli gelişmeye devam eder.
+ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır.
 
-Bilgi işlem uç zekaya doğru kaymaya devam ettikçe aracılar, sensörler ve diğer cihazlar artık yalnızca "içerik ekranları" değildir. Bunlar yerel üretimden, çevresel farkındalıktan, gerçek zamanlı karar alma ve koordineli veri akışlarından sorumlu akıllı düğümlerdir. Geleneksel veritabanı çözümleri, temel mimarileri ve birleştirilmiş uzantıları nedeniyle sınırlıdır; bu da, yüksek eşzamanlılık yazmaları, büyük veri kümeleri, vektör alma ve işbirliğine dayalı oluşturma altında uç bulut akıllı uygulamalarının düşük gecikme ve kararlılık gereksinimlerini karşılamayı giderek zorlaştırmaktadır.
+Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajan ve otomatik işletim senaryolarında ToStore sürekli gelişirken hizmetler kesintisiz kalır.
 
-ToStore, büyük veri kümeleri, karmaşık yerel yapay zeka üretimi ve büyük ölçekli veri hareketi için yeterince güçlü uç dağıtılmış yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, sürükleyici karma gerçeklik, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme ve benzer senaryolar için güvenilir bir veri temeli sağlar.
+İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri yerel olarak destekleyen birleşik bir veri motoru; ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemlerinin yanı sıra dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve otomatik kurtarma gibi kurumsal düzeyde veritabanı yetenekleri sunar.
+
+Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme ve benzer senaryolar için güvenilir bir veri temeli sağlar.
 
 ## <a id="key-features"></a>Temel Özellikler
 
+- 🤖 **Çalışma Zamanı Evrimi ve Akıllı İşletim**
+  - Bildirimsel tanım, otomatik yeniden yapılandırma, sürüm yönetimi gereksiz
+  - Anahtar rotasyonu, şema değişiklikleri, büyük ölçekli yeniden yapılandırma—tümü çevrimiçi, kesintisiz
+  - Otomatik işletim ve Ajan algılaması için entegre durum özellikleri
+  - Uzun vadeli kararlılık için hizmet kesintisi olmadan sıcak güncellemeler
+
+- 🧠 **Kendi Kendini Yönlendiren Dağıtık Mimari**
+  - Fiziksel adreslemeyi veri ölçeğinden ayıran kendi kendini yönlendiren düğüm mimarisi
+  - Yüksek düzeyde özerk düğümler esnek bir veri topolojisi oluşturmak için işbirliği yapar
+  - Uç ve bulut düğümleri arasında derin bağlantı ile esnek yatay ölçeklendirme
+
 - 🌐 **Birleşik Platformlar Arası Veri Motoru**
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
-  - İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış veri depolamayı destekler
-  - Yerel depolamadan uç bulut işbirliğine kadar bir veri hattı oluşturur
-
-- 🧠 **Sinir Ağı Tarzında Dağıtılmış Mimari**
-  - Fiziksel adreslemeyi ölçekten ayıran kendi kendini yönlendiren düğüm mimarisi
-  - Yüksek düzeyde özerk düğümler, esnek bir veri topolojisi oluşturmak için işbirliği yapar
-  - Düğüm işbirliğini ve elastik yatay ölçeklendirmeyi destekler
-  - Uçta akıllı düğümler ve bulut arasında derin bağlantı
+  - İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri kapsar
+  - Yerel depolamadan uç-bulut işbirliğine kadar eksiksiz veri hattı
 
 - ⚡ **Paralel Yürütme ve Kaynak Planlama**
-  - Yüksek kullanılabilirlik ile kaynağa duyarlı akıllı yük planlaması
+  - Yüksek kullanılabilirlik için kaynağa duyarlı akıllı yük planlaması
   - Çok düğümlü paralel işbirliği ve görev ayrıştırma
-  - Zaman dilimleme, kullanıcı arayüzü animasyonlarının ağır yük altında bile düzgün kalmasını sağlar
+  - Ağır yük altında bile kullanıcı arayüzü animasyonlarını akıcı tutan zaman dilimleme
 
-- 🔑 **Şema, İndeksler ve Etkin Arama**
-  - Çeşitlendirilmiş anahtarlar (ardışık, zaman damgası, önek, kısa kod)
-  - Çok boyutlu kısıtlamalar (bileşik/vektör indeksi, yabancı anahtarlar)
-  - Birleşik arama (karmaşık koşullar, JOIN, vektör arama)
-
-- 🤖 **Akıllı İşletim ve Kesintisiz Evrim**
-  - Otomatik işletim ve Ajan algılaması için entegre durum özellikleri
-  - Sorunsuz, sıfır kesintili şema yükseltmeleri ve şeffaf anahtar geçişleri
-  - Sistem kararlılığı için hizmet kesintisi olmadan sıcak güncellemeler
-
-- 🛡️ **İşlemler, Güvenlik ve Kurtarma**
-  - ACID işlemleri, atomik ifade güncellemeleri ve basamaklı yabancı anahtarlar sağlar
-  - Kilitlenme kurtarmayı, dayanıklı taahhütleri ve tutarlılık garantilerini destekler
-  - ChaCha20-Poly1305 ve AES-256-GCM şifrelemesini destekler
-
-- 🔄 **Çoklu Alan ve Veri İş Akışları**
-  - İsteğe bağlı küresel olarak paylaşılan verilerle izole alanları destekler
-  - Gerçek zamanlı sorgu dinleyicilerini, çok düzeyli akıllı önbelleğe almayı ve imleç sayfalandırmayı destekler
-  - Çok kullanıcılı, öncelikli yerel ve çevrimdışı işbirliğine dayalı uygulamalara uygundur
+- 🔐 **Veri Güvenliği ve Yalıtımı**
+  - İsteğe bağlı küresel paylaşımla çoklu alan yalıtımı, çok kullanıcılı ve çoklu kiracı senaryoları için ideal
+  - Entegre ChaCha20-Poly1305 ve AES-256-GCM şifrelemesi
+  - Birden fazla karmaşık afet kurtarma senaryosu ile doğrulanmıştır
 
 ## <a id="installation"></a>Kurulum
 
