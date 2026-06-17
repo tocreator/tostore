@@ -26,6 +26,7 @@ import 'src/model/backup_scope.dart';
 import 'src/model/data_store_config.dart';
 import 'src/model/db_exception.dart';
 import 'src/model/db_result.dart';
+import 'src/model/db_startup_stage.dart';
 import 'src/model/migration_task.dart';
 import 'src/model/query_result.dart';
 import 'src/model/result_status.dart';
@@ -43,6 +44,7 @@ export 'src/model/backup_scope.dart';
 export 'src/model/config_info.dart';
 export 'src/model/data_store_config.dart';
 export 'src/model/db_exception.dart';
+export 'src/model/db_startup_stage.dart';
 export 'src/model/db_result.dart';
 export 'src/model/expr.dart';
 export 'src/model/memory_info.dart';
@@ -137,6 +139,7 @@ class ToStore implements DataStoreInterface {
   /// [dbName] Database name (instances are stored in dbPath/dbName/).
   /// [config] Database configuration.
   /// [schemas] Initial table schemas for automatic migration.
+  /// [onStartupProgress] Callback for tracking startup progress (0.0–1.0) and the current stage.
   /// [onConfigure] Callback invoked when the database is being configured.
   /// [onCreate] Callback invoked when the database is first created.
   /// [onOpen] Callback invoked when the database is successfully opened.
@@ -153,6 +156,7 @@ class ToStore implements DataStoreInterface {
   /// [dbName] 数据库名称（实例存储在 dbPath/dbName/ 目录下）。
   /// [config] 数据库配置。
   /// [schemas] 初始表结构定义，用于自动化迁移。
+  /// [onStartupProgress] 启动进度回调，参数为当前进度（0.0–1.0）和所处阶段。
   /// [onConfigure] 数据库配置时的回调。
   /// [onCreate] 数据库首次创建时的回调。
   /// [onOpen] 数据库打开成功后的回调。
@@ -164,6 +168,7 @@ class ToStore implements DataStoreInterface {
     String? dbName,
     DataStoreConfig? config,
     List<TableSchema> schemas = const [],
+    StartupProgressCallback? onStartupProgress,
     Future<void> Function(ToStore db)? onConfigure,
     Future<void> Function(ToStore db)? onCreate,
     Future<void> Function(ToStore db)? onOpen,
@@ -189,6 +194,7 @@ class ToStore implements DataStoreInterface {
       reinitialize: reinitialize,
       noPersistOnClose: noPersistOnClose,
       applyActiveSpaceOnDefault: applyActiveSpaceOnDefault,
+      onStartupProgress: onStartupProgress,
     );
     return db;
   }
@@ -254,6 +260,7 @@ class ToStore implements DataStoreInterface {
   ///   over the corresponding fields in this config.
   /// - [reinitialize]: When true, force a re-open of the database (close then open).
   /// - [noPersistOnClose]: Used together with `reinitialize`. When true, do NOT persist pending
+  /// - [onStartupProgress]: Callback for tracking startup progress (0.0–1.0) and the current stage.
   ///
   /// Examples:
   /// ```dart
@@ -272,6 +279,7 @@ class ToStore implements DataStoreInterface {
   /// - config：数据库配置；当同时传入 dbPath/dbName 时，以参数值覆盖配置中的同名字段。
   /// - reinitialize：为 true 时强制重新初始化（先关闭后打开）。
   /// - noPersistOnClose：与 reinitialize 配合；为 true 时关闭阶段不落盘缓冲数据，直接清理缓存
+  /// - onStartupProgress：启动进度回调，参数为当前进度（0.0–1.0）和所处阶段。
   ///
   /// Examples:
   /// ```dart
@@ -285,7 +293,8 @@ class ToStore implements DataStoreInterface {
       DataStoreConfig? config,
       bool reinitialize = false,
       bool noPersistOnClose = false,
-      bool applyActiveSpaceOnDefault = true}) async {
+      bool applyActiveSpaceOnDefault = true,
+      StartupProgressCallback? onStartupProgress}) async {
     await _impl.initialize(
       dbPath: dbPath,
       dbName: dbName,
@@ -293,6 +302,7 @@ class ToStore implements DataStoreInterface {
       reinitialize: reinitialize,
       noPersistOnClose: noPersistOnClose,
       applyActiveSpaceOnDefault: applyActiveSpaceOnDefault,
+      onStartupProgress: onStartupProgress,
     );
   }
 
