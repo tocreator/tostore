@@ -309,7 +309,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Toplu geçiş yürütmesi başarısız oldu (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Kilit alma zaman aşımı (Sistem Hatası) | <ul><li>`primaryKey`: Hedef anahtar (varsa)</li><li>`target`: Kilit kaynak kimliği</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | İşlem zaman aşımı (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | İşlem iptal edildi (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | Veritabanı kapalı, işlem güvenli bir şekilde iptal edildi (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Bellek kaynağı tükendi (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Sistem kaynakları tükendi, örneğin disk dolu (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Fiziksel dosya veya yol mevcut değil (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li><li>`target`: Dosya veya klasör yolu</li><li>`operation`: G/Ç işlemi</li></ul> |
@@ -518,7 +518,7 @@ Tam durum yönlendirmesi ve ayrıştırması için aşağıdaki tabloya bakın:
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Sistem Hatası | **Kritik**: Toplu geçiş yürütmesi başarısız oldu |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Sistem Hatası | Kilit alma zaman aşımı |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Sistem Hatası | İşlem zaman aşımı |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Sistem Hatası | İşlem iptal edildi |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Sistem Hatası | Veritabanı kapalı, işlem güvenli bir şekilde iptal edildi |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Sistem Hatası | **Kritik**: Bellek kaynağı tükendi |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Sistem Hatası | **Kritik**: Sistem kaynakları tükendi |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Sistem Hatası | Fiziksel dosya veya yol mevcut değil |
