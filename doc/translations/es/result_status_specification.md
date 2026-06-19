@@ -309,7 +309,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Fallo de ejecución de migración por lotes (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Tiempo de espera de adquisición de bloqueo agotado (Error de sistema) | <ul><li>`primaryKey`: Clave objetivo (si existe)</li><li>`target`: ID del recurso de bloqueo</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Tiempo de espera de la operación agotado (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | La operación fue cancelada (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | La base de datos está cerrada, la operación se canceló de forma segura (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Recursos de memoria agotados (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Recursos del sistema agotados, por ejemplo, disco lleno (Error de sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | El archivo o la ruta física no existe (Error de sistema) | <ul><li>`primaryKey`: `null`</li><li>`target`: Ruta de archivo o carpeta</li><li>`operation`: Operación de E/S</li></ul> |
@@ -518,7 +518,7 @@ Consulte la siguiente tabla para conocer el enrutamiento y análisis de estado e
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Error de Sistema | **Crítico**: Fallo de ejecución de migración por lotes |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Error de Sistema | Tiempo de espera de adquisición de bloqueo agotado |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Error de Sistema | Tiempo de espera de la operación agotado |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Error de Sistema | La operación fue cancelada |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Error de Sistema | La base de datos está cerrada, la operação se canceló de forma segura |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Error de Sistema | **Crítico**: Recursos de memoria agotados |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Error de Sistema | **Crítico**: Recursos del sistema agotados |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Error de Sistema | El archivo o la ruta física no existe |
