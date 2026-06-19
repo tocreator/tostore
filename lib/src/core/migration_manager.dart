@@ -386,7 +386,7 @@ class MigrationManager {
       try {
         await taskFuture;
       } catch (e) {
-        if (e is _MigrationStoppedException) {
+        if (e is DbClosedException) {
           Logger.info('Migration for space [$spaceName] stopped gracefully');
         } else {
           Logger.error('Failed to wait for migration task stop', rawError: e);
@@ -1708,7 +1708,9 @@ class MigrationManager {
 
       return task;
     } catch (e) {
-      Logger.error('Add migration task failed', rawError: e);
+      if (e is! DbClosedException) {
+        Logger.error('Add migration task failed', rawError: e);
+      }
       rethrow;
     }
   }
@@ -2201,6 +2203,7 @@ class MigrationManager {
 
         Logger.info('Cleaned up migration backup: $backupPath');
       } catch (e) {
+        if (e is DbClosedException) return;
         // Just log warning, backup cleanup is non-critical
         Logger.warn('Failed to cleanup migration backup [$backupPath]',
             rawError: e);
@@ -3612,7 +3615,7 @@ class MigrationManager {
           await _cleanupTask(task);
           _unregisterRuntimeMigrationForTask(task);
         } catch (e) {
-          if (e is _MigrationStoppedException) {
+          if (e is DbClosedException) {
             break;
           }
 
@@ -4090,7 +4093,7 @@ class MigrationManager {
               );
 
               if (migrationController.isCancelled) {
-                throw _MigrationStoppedException(space);
+                throw DbClosedException('Migration stopped for space [$space]');
               }
 
               // Ensure all migration data is physically persisted before marking complete.
@@ -4207,7 +4210,7 @@ class MigrationManager {
         }
       }
     } catch (e) {
-      if (e is _MigrationStoppedException) {
+      if (e is DbClosedException) {
         Logger.info(
           'Migration task ${task.taskId} paused',
         );
@@ -4764,6 +4767,7 @@ class MigrationManager {
         await _saveMigrationMeta(updatedMeta);
       }
     } catch (e) {
+      if (e is DbClosedException) return;
       Logger.error('Cleanup migration task failed', rawError: e);
     }
   }
@@ -5920,21 +5924,6 @@ class _RuntimeMigrationDescriptor {
     required this.cutoverPointer,
     required this.currentSpaceCheckpointKey,
   });
-}
-
-class _MigrationStoppedException extends DbException {
-  final String spaceName;
-
-  _MigrationStoppedException(this.spaceName)
-      : super([
-          GeneralStatus(
-            type: ResultType.sysCancellation,
-            message: 'Migration stopped for space [$spaceName]',
-          ),
-        ]);
-
-  @override
-  String toString() => 'Migration stopped for space [$spaceName]';
 }
 
 class BgTaskProgress {
