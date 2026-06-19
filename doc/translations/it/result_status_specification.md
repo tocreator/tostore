@@ -309,7 +309,7 @@ A seconda dell'intervallo di `code` / `codeKey` e della sottoclasse specifica di
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Errore di esecuzione del batch di migrazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Timeout di acquisizione del blocco (Errore di sistema) | <ul><li>`primaryKey`: Chiave target (se presente)</li><li>`target`: ID della risorsa di blocco</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Timeout dell'operazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | L'operazione è stata annullata (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | Il database è chiuso, l'operazione è stata annullata in modo sicuro (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Risorse di memoria esaurite (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Risorse di sistema esaurite, ad esempio disco pieno (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Il file o il percorso fisico non esiste (Errore di sistema) | <ul><li>`primaryKey`: `null`</li><li>`target`: Percorso del file o della cartella</li><li>`operation`: Operazione di I/O</li></ul> |
@@ -518,7 +518,7 @@ Fare riferimento alla tabella seguente per l'instradamento e l'analisi dello sta
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Errore di Sistema | **Critico**: Errore di esecuzione del batch di migrazione |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Errore di Sistema | Timeout di acquisizione del blocco |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Errore di Sistema | Timeout dell'operazione |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Errore di Sistema | L'operazione è stata annullata |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Errore di Sistema | Il database è chiuso, l'operazione è stata annullata in modo sicuro |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Errore di Sistema | **Critico**: Risorse di memoria esaurite |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Errore di Sistema | **Critico**: Risorse di sistema esaurite |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Errore di Sistema | Il file o il percorso fisico non esiste |
