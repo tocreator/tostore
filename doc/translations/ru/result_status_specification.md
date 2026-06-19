@@ -309,7 +309,7 @@
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Сбой выполнения пакета миграции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Таймаут получения блокировки (Системная ошибка) | <ul><li>`primaryKey`: Целевой ключ (при наличии)</li><li>`target`: ID ресурса блокировки</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Таймаут операции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | Операция была отменена (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | База данных закрыта, операция безопасно отменена (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Ресурсы памяти исчерпаны (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Системные ресурсы исчерпаны, например диск заполнен (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Физический файл или путь не существует (Системная ошибка) | <ul><li>`primaryKey`: `null`</li><li>`target`: Путь к файлу или папке</li><li>`operation`: Операция ввода-вывода</li></ul> |
@@ -518,7 +518,7 @@ try {
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Системная ошибка | **Критично**: Сбой выполнения пакета миграции |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Системная ошибка | Таймаут получения блокировки |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Системная ошибка | Таймаут операции |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Системная ошибка | Операция была отменена |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Системная ошибка | База данных закрыта, операция безопасно отменена |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Системная ошибка | **Критично**: Ресурсы памяти исчерпаны |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Системная ошибка | **Критично**: Системные ресурсы исчерпаны |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Системная ошибка | Физический файл или путь не существует |
