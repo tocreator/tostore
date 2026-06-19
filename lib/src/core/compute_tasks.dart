@@ -916,9 +916,10 @@ Map<String, dynamic> applyFieldModification(
         record[fieldUpdate.name],
       );
     } catch (e) {
+      final invalidValue = record[fieldUpdate.name];
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
       Logger.warn(
-          'Failed to convert field ${fieldUpdate.name} to type ${fieldUpdate.type}, using default value',
+          'Failed to convert field ${fieldUpdate.name} in table "$tableName" (value: $invalidValue) to type ${fieldUpdate.type}, using default value',
           rawError: e);
     }
   }
@@ -929,7 +930,7 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] == null) {
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
     Logger.debug(
-      'Field ${fieldUpdate.name} is now non-nullable, applied default value',
+      'Field ${fieldUpdate.name} in table "$tableName" is now non-nullable, applied default value',
     );
   }
 
@@ -938,14 +939,14 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] == null) {
     record[fieldUpdate.name] = fieldUpdate.defaultValue;
     Logger.debug(
-      'Field ${fieldUpdate.name} has new default value, applied to null value',
+      'Field ${fieldUpdate.name} in table "$tableName" has new default value, applied to null value',
     );
   }
 
   // 4. Process unique constraint changes (only log, do not directly process data itself)
   if (fieldUpdate.unique != null && fieldUpdate.unique!) {
     Logger.debug(
-      'Field ${fieldUpdate.name} now has unique constraint, further validation may be needed',
+      'Field ${fieldUpdate.name} in table "$tableName" now has unique constraint, further validation may be needed',
     );
   }
 
@@ -959,7 +960,7 @@ Map<String, dynamic> applyFieldModification(
         value.length > fieldUpdate.maxLength!) {
       record[fieldUpdate.name] = value.substring(0, fieldUpdate.maxLength!);
       Logger.warn(
-        'Field ${fieldUpdate.name} exceeds max length of ${fieldUpdate.maxLength}, truncated',
+        'Field ${fieldUpdate.name} in table "$tableName" (value: "$value") exceeds max length of ${fieldUpdate.maxLength}, truncated',
       );
     }
     if (fieldUpdate.isExplicitlySet('minLength') &&
@@ -967,7 +968,7 @@ Map<String, dynamic> applyFieldModification(
         value.length < fieldUpdate.minLength!) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
       Logger.warn(
-        'Field ${fieldUpdate.name} is shorter than min length of ${fieldUpdate.minLength}, using default value',
+        'Field ${fieldUpdate.name} in table "$tableName" (value: "$value") is shorter than min length of ${fieldUpdate.minLength}, using default value',
       );
     }
   }
@@ -983,7 +984,7 @@ Map<String, dynamic> applyFieldModification(
         value < fieldUpdate.minValue!) {
       record[fieldUpdate.name] = fieldUpdate.minValue;
       Logger.warn(
-        'Field ${fieldUpdate.name} below min value of ${fieldUpdate.minValue}, set to min',
+        'Field ${fieldUpdate.name} in table "$tableName" (value: $value) below min value of ${fieldUpdate.minValue}, set to min',
       );
     }
 
@@ -992,17 +993,21 @@ Map<String, dynamic> applyFieldModification(
         value > fieldUpdate.maxValue!) {
       record[fieldUpdate.name] = fieldUpdate.maxValue;
       Logger.warn(
-        'Field ${fieldUpdate.name} exceeds max value of ${fieldUpdate.maxValue}, set to max',
+        'Field ${fieldUpdate.name} in table "$tableName" (value: $value) exceeds max value of ${fieldUpdate.maxValue}, set to max',
       );
     }
   }
 
   // 7. Final validation
-  if (!fieldSchema.validateValue(record[fieldUpdate.name],
-      tableName: tableName)) {
+  final validationErr = fieldSchema.getValidationError(
+    record[fieldUpdate.name],
+    tableName: tableName,
+  );
+  if (validationErr != null) {
+    final invalidValue = record[fieldUpdate.name];
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
     Logger.warn(
-      'Field ${fieldUpdate.name} value does not meet constraints after updates, using default value',
+      'Field ${fieldUpdate.name} in table "$tableName" value ($invalidValue) does not meet constraints after updates, using default value: "${fieldSchema.getDefaultValue()}". Error: $validationErr',
     );
   }
 
