@@ -20,10 +20,10 @@ class LogService {
 
   void add(String message,
       [LogLevel type = LogLevel.info, bool fromCallback = false]) {
-    // Increased the limit to 500. ListView.builder in Flutter handles 500 entries efficiently.
-    const maxLogs = 500;
+    // Increased the limit to 1000. ListView.builder in Flutter handles 1000 entries efficiently.
+    const maxLogs = 1000;
     const pruneTo =
-        350; // Prune back to 70% when limit reached (removes 150 entries)
+        700; // Prune back to 70% when limit reached (removes 300 entries)
 
     final now = DateTime.now();
     final timestampString =
