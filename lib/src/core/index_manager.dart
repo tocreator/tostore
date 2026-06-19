@@ -38,22 +38,6 @@ import 'tree_cache.dart';
 import 'weight_manager.dart';
 import 'yield_controller.dart';
 
-class IndexBuildCancelledException extends DbException {
-  final String tableName;
-  final String indexName;
-
-  IndexBuildCancelledException(this.tableName, this.indexName)
-      : super([
-          GeneralStatus(
-            type: ResultType.sysCancellation,
-            message: 'Index build cancelled for $tableName.$indexName',
-          ),
-        ]);
-
-  @override
-  String toString() => 'Index build cancelled for $tableName.$indexName';
-}
-
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
 class IndexManager {
@@ -985,6 +969,9 @@ class IndexManager {
 
   /// Checks if a newly created index should start with isBuilding = true.
   bool _shouldCreateIndexAsBuilding(String tableName, String indexName) {
+    if (_dataStore.isMigrationInstance) {
+      return true;
+    }
     final migrationMgr = _dataStore.migrationManager;
     if (migrationMgr != null &&
         migrationMgr.hasPendingIndexBuild(tableName, indexName)) {
@@ -1193,7 +1180,8 @@ class IndexManager {
 
     try {
       if (controller?.isCancelled ?? false) {
-        throw IndexBuildCancelledException(tableName, indexName);
+        throw DbClosedException(
+            'Index build cancelled for $tableName.$indexName');
       }
 
       if (lockMgr != null) {
@@ -1274,8 +1262,9 @@ class IndexManager {
       }
     } catch (e) {
       await deletePhysicalIndexArtifacts(tableName, indexName);
-      if (e is IndexBuildCancelledException) {
-        Logger.info('$e; partial artifacts removed');
+      if (e is DbClosedException) {
+        Logger.info(
+            'Index build cancelled for $tableName.$indexName; partial artifacts removed');
         rethrow;
       }
       Logger.error('Failed to create index', rawError: e);
@@ -1435,6 +1424,9 @@ class IndexManager {
     required IndexSchema index,
     required int persistedTableRecords,
   }) async {
+    if (_dataStore.isMigrationInstance) {
+      return;
+    }
     final repairKey = _getEmptyIndexRepairKey(tableName, indexName);
     if (_emptyIndexRepairFutures.containsKey(repairKey)) {
       return;
@@ -1447,7 +1439,8 @@ class IndexManager {
         final migrationMgr = _dataStore.migrationManager;
         if (migrationMgr != null) {
           final hasActiveTask = migrationMgr.pendingTasks.any((t) =>
-              t.tableName == tableName && t.pendingMigrationSpaces.isNotEmpty);
+              (t.tableName == tableName || t.currentTableName == tableName) &&
+              t.pendingMigrationSpaces.isNotEmpty);
           if (hasActiveTask) {
             Logger.debug(
               'Skip empty-index repair for $tableName.$indexName because there is an active migration task',
@@ -1497,6 +1490,11 @@ class IndexManager {
           );
         }
       } catch (e) {
+        if (e is DbClosedException) {
+          Logger.info(
+              'Empty-index rebuild cancelled for $tableName.$indexName due to database close');
+          return;
+        }
         Logger.error(
             'Empty-index rebuild scheduling failed for $tableName.$indexName',
             rawError: e);
@@ -2784,9 +2782,8 @@ class IndexManager {
         cancellationToken: controller,
         onBatch: (records, currentCursor, nextCursor) async {
           if (controller?.isCancelled ?? false) {
-            throw IndexBuildCancelledException(
-              tableName,
-              indexesToBuild.map((i) => i.actualIndexName).join(','),
+            throw DbClosedException(
+              'Index build cancelled for $tableName.${indexesToBuild.map((i) => i.actualIndexName).join(',')}',
             );
           }
 
@@ -2822,9 +2819,8 @@ class IndexManager {
           }
 
           if (controller?.isCancelled ?? false) {
-            throw IndexBuildCancelledException(
-              tableName,
-              indexesToBuild.map((i) => i.actualIndexName).join(','),
+            throw DbClosedException(
+              'Index build cancelled for $tableName.${indexesToBuild.map((i) => i.actualIndexName).join(',')}',
             );
           }
           return true;
@@ -2832,9 +2828,8 @@ class IndexManager {
       );
 
       if (controller?.isCancelled ?? false) {
-        throw IndexBuildCancelledException(
-          tableName,
-          indexesToBuild.map((i) => i.actualIndexName).join(','),
+        throw DbClosedException(
+          'Index build cancelled for $tableName.${indexesToBuild.map((i) => i.actualIndexName).join(',')}',
         );
       }
 
@@ -4330,8 +4325,14 @@ class IndexManager {
       try {
         await Future.wait(futures).timeout(const Duration(seconds: 5));
       } catch (e) {
-        Logger.warn('IndexManager dispose: some futures failed or timed out',
-            rawError: e);
+        if (!_dataStore.isInitialized) {
+          Logger.info(
+              'Index pending futures cancelled during database shutdown');
+        } else {
+          Logger.warn(
+              'Some index-related async tasks failed or timed out during shutdown',
+              rawError: e);
+        }
       }
     }
 
