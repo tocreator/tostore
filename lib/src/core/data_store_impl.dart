@@ -172,12 +172,7 @@ class DataStoreImpl {
 
   KeyManager get keyManager {
     if (_keyManager == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'KeyManager not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
     return _keyManager!;
   }
@@ -186,12 +181,7 @@ class DataStoreImpl {
 
   PathManager get pathManager {
     if (_pathManager == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'PathManager not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
     return _pathManager!;
   }
@@ -205,14 +195,7 @@ class DataStoreImpl {
   TableDataManager? _tableDataManager;
   TableDataManager get tableDataManager {
     if (_tableDataManager == null) {
-      if (_isInitialized) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message: 'TableDataManager not initialized',
-          )
-        ]);
-      }
+      throw DbClosedException();
     }
     return _tableDataManager!;
   }
@@ -314,12 +297,7 @@ class DataStoreImpl {
   QueryExecutor get queryExecutor {
     final qe = _queryExecutor;
     if (qe == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'QueryExecutor not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
     return qe;
   }
@@ -388,12 +366,7 @@ class DataStoreImpl {
   /// Get current configuration
   DataStoreConfig get config {
     if (_config == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'DataStore not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
     return _config!;
   }
@@ -6892,6 +6865,7 @@ class DataStoreImpl {
         ..where(_kvExpiresAtField, '=', expiresAtIso);
       await deleteInternal(tableName, condition, limit: 1);
     } catch (e) {
+      if (e is DbClosedException) return;
       Logger.warn('Failed to cleanup expired kv key "$key" in $tableName',
           rawError: e);
     }
@@ -6960,12 +6934,7 @@ class DataStoreImpl {
     final schemaMgr = schemaManager;
     final dirMgr = directoryManager;
     if (schemaMgr == null || dirMgr == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'Database managers are not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
 
     final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
@@ -7207,12 +7176,7 @@ class DataStoreImpl {
     final schemaMgr = schemaManager;
     final dirMgr = directoryManager;
     if (schemaMgr == null || dirMgr == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'Database managers are not initialized',
-        )
-      ]);
+      throw DbClosedException();
     }
 
     final rollbackSchema = existingOldSchema ??
