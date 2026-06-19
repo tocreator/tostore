@@ -309,7 +309,7 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Batch migration execution failed (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Lock acquisition timeout (System Error) | <ul><li>`primaryKey`: Target key (if any)</li><li>`target`: Lock resource ID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Operation timeout (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | Operation was cancelled (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | Database is closed, operation safely cancelled (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Memory resource exhausted (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | System resources exhausted, e.g. disk full (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Physical file or path does not exist (System Error) | <ul><li>`primaryKey`: `null`</li><li>`target`: File or folder path</li><li>`operation`: I/O operation</li></ul> |
@@ -518,7 +518,7 @@ Refer to the table below for exact status routing and parsing:
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | System Error | **Critical**: Batch migration execution failed |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | System Error | Lock acquisition timeout |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | System Error | Operation timeout |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | System Error | Operation was cancelled |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | System Error | Database is closed, operation safely cancelled |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | System Error | **Critical**: Memory resource exhausted |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | System Error | **Critical**: System resources exhausted |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | System Error | Physical file or path does not exist |
