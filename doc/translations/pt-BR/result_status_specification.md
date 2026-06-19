@@ -309,7 +309,7 @@ Dependendo do intervalo de `code` / `codeKey` e da subclasse específica de `Res
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Falha na execução do lote de migração (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Tempo limite de aquisição de bloqueio (Erro do Sistema) | <ul><li>`primaryKey`: Chave de destino (se houver)</li><li>`target`: ID do recurso de bloqueio</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Tempo limite da operação (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | Operação foi cancelada (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | O banco de dados está fechado, a operação foi cancelada com segurança (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Recursos de memória esgotados (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Recursos do sistema esgotados, por exemplo, disco cheio (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Arquivo ou caminho físico não existe (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li><li>`target`: Caminho do arquivo ou pasta</li><li>`operation`: Operação de E/S</li></ul> |
@@ -518,7 +518,7 @@ Consulte a tabela abaixo para roteamento e análise exatos do status:
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erro do Sistema | **Crítico**: Falha na execução do lote de migração |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Erro do Sistema | Tempo limite de aquisição de bloqueio |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Erro do Sistema | Tempo limite da operação |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Erro do Sistema | Operação foi cancelada |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Erro do Sistema | O banco de dados está fechado, a operação foi cancelada com segurança |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Erro do Sistema | **Crítico**: Recursos de memória esgotados |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Erro do Sistema | **Crítico**: Recursos do sistema esgotados |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Erro do Sistema | Arquivo ou caminho físico não existe |
