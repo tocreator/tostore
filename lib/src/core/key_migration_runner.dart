@@ -4,8 +4,6 @@ import 'dart:typed_data';
 import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
 import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
@@ -19,20 +17,6 @@ import '../model/table_schema.dart' show IndexSchema, IndexType, TableSchema;
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'yield_controller.dart';
-
-/// Thrown when key migration is paused (e.g. close / switchSpace) for later resume.
-class KeyMigrationPausedException extends DbException {
-  KeyMigrationPausedException()
-      : super([
-          GeneralStatus(
-            type: ResultType.sysCancellation,
-            message: 'Key migration paused',
-          ),
-        ]);
-
-  @override
-  String toString() => 'Key migration paused';
-}
 
 /// Background key re-encryption via [BackgroundWriteScheduler].
 class KeyMigrationRunner {
@@ -80,7 +64,7 @@ class KeyMigrationRunner {
 
   static void _throwIfPaused() {
     if (isPauseRequested) {
-      throw KeyMigrationPausedException();
+      throw DbClosedException('Key migration paused');
     }
   }
 
@@ -164,7 +148,7 @@ class KeyMigrationRunner {
       }
 
       await _finalizeKeyMigration(primaryInstance, keyChangeInfo);
-    } on KeyMigrationPausedException {
+    } on DbClosedException {
       Logger.info(
         'Key migration paused',
       );
@@ -292,7 +276,7 @@ class KeyMigrationRunner {
 
         if (isPauseRequested) {
           await _drainBackgroundWrites(dataStore);
-          throw KeyMigrationPausedException();
+          throw DbClosedException('Key migration paused');
         }
 
         await _drainBackgroundWrites(dataStore);
@@ -303,7 +287,7 @@ class KeyMigrationRunner {
           spaceName: scope,
         );
       } catch (e) {
-        if (e is KeyMigrationPausedException) rethrow;
+        if (e is DbClosedException) rethrow;
         Logger.error('Key migration failed for table $tableName', rawError: e);
         rethrow;
       } finally {
