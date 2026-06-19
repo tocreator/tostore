@@ -309,7 +309,7 @@ Selon la plage de `code` / `codeKey` et la sous-classe spécifique de `ResultSta
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Échec de l'exécution du lot de migration (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Expiration de l'acquisition du verrou (Erreur Système) | <ul><li>`primaryKey`: Clé cible (le cas échéant)</li><li>`target`: ID de la ressource de verrou</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Expiration de l'opération (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | L'opération a été annulée (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | La base de données est fermée, l'opération a été annulée en toute sécurité (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Ressources mémoire épuisées (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Ressources système épuisées, par exemple disque plein (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Le fichier ou le chemin physique n'existe pas (Erreur Système) | <ul><li>`primaryKey`: `null`</li><li>`target`: Chemin du fichier ou du dossier</li><li>`operation`: Opération I/O</li></ul> |
@@ -518,7 +518,7 @@ Reportez-vous au tableau ci-dessous pour le routage et l'analyse exacts des éta
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erreur Système | **Critique**: Échec de l'exécution du lot de migration |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Erreur Système | Expiration de l'acquisition du verrou |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Erreur Système | Expiration de l'opération |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Erreur Système | L'opération a été annulée |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Erreur Système | La base de données est fermée, l'opération a été annulée en toute sécurité |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Erreur Système | **Critique**: Ressources mémoire épuisées |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Erreur Système | **Critique**: Ressources système épuisées |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Erreur Système | Le fichier ou le chemin physique n'existe pas |
