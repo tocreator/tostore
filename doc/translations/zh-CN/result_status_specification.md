@@ -314,7 +314,7 @@
   | **Code**: `50003`<br>`ResultType.sysMigrationBatchExecutionFailed` | **级别**：系统错误<br>批量表结构迁移物理执行失败。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `51001`<br>`ResultType.sysTimeoutLockAcquisition` | **级别**：系统错误<br>并发控制：在高负载下等待行锁或表锁，锁获取超时（默认 10s）。 | <ul><li>`primaryKey`: 等待获取锁的主键值（如有）</li><li>`target`: 锁定的资源名称</li><li>`operation`: `"acquire"`</li></ul> |
   | **Code**: `51002`<br>`ResultType.sysTimeout` | **级别**：系统错误<br>系统超时：整个异步运算执行时间超时未归还。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `51003`<br>`ResultType.sysCancellation` | **级别**：系统错误<br>操作取消：异步操作或计算任务被 CancellationToken 中途取消。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `51003`<br>`ResultType.sysDbClosed` | **级别**：系统错误<br>数据库已关闭，操作安全取消。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `52001`<br>`ResultType.sysResourceExhaustedMemory` | **级别**：系统错误<br>内存报警：JVM / Dart 虚拟机所分配的堆内存空间面临 OOM. | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `52002`<br>`ResultType.sysResourceExhausted` | **级别**：系统错误<br>磁盘空间耗尽，无法执行落盘写入。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `53001`<br>`ResultType.sysIoNotFound` | **级别**：系统错误<br>物理文件或目录路径不存在。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 物理文件或目录路径</li><li>`operation`: 系统操作动作名称</li></ul> |
@@ -523,7 +523,7 @@ try {
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 系统错误 | 批量表结构迁移物理执行失败 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 系统错误 | 事务内获取排他锁超时 |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 系统错误 | 查询、写入等底层操作执行超时 |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | 系统错误 | 异步操作或计算任务被 CancellationToken 中途取消 |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | 系统错误 | 数据库已关闭，操作安全取消 |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | 系统错误 | 物理内存耗尽，可能面临 OOM 风险 |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | 系统错误 | 磁盘空间耗尽，无法执行落盘写入 |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | 系统错误 | 物理文件或目录路径不存在 |
