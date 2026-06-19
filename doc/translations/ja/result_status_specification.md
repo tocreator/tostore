@@ -309,7 +309,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `50003`<br>`sysMigrationBatchExecutionFailed` | 重大な移行バッチ実行の失敗（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | ロック取得タイムアウト（システムエラー） | <ul><li>`primaryKey`: ターゲットキー（存在する場合）</li><li>`target`: ロックリソースID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | 操作タイムアウト（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | 操作がキャンセルされました（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | データベースが閉じられています。操作は安全にキャンセルされました（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | 重大なメモリリソース枯渇（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | 重大なシステムリソース枯渇（例: ディスクフル）（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | 物理ファイルまたはパスが存在しません（システムエラー） | <ul><li>`primaryKey`: `null`</li><li>`target`: ファイルまたはフォルダパス</li><li>`operation`: I/O操作名</li></ul> |
@@ -518,7 +518,7 @@ try {
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | システムエラー | **重大**: 重大な移行バッチ実行の失敗 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | システムエラー | ロック取得タイムアウト |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | システムエラー | 操作タイムアウト |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | システムエラー | 操作がキャンセルされました |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | システムエラー | データベースが閉じられています。操作は安全にキャンセルされました |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | システムエラー | **重大**: 重大なメモリリソース枯渇 |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | システムエラー | **重大**: 重大なシステムリソース枯渇 |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | システムエラー | 物理ファイルまたはパスが存在しません |
