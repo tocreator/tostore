@@ -249,7 +249,11 @@ class Logger {
     // Directly use status.message as the final log message if available,
     // ignoring fallback message to prevent duplicate processing.
     final String text;
-    if (status != null) {
+    if (message != null && status != null) {
+      final ctx = message is String ? message : toStringWithAll(message);
+      final detail = status.message;
+      text = detail.isNotEmpty ? '$ctx: $detail' : ctx;
+    } else if (status != null) {
       text = status.message;
     } else if (message is String) {
       text = message;
