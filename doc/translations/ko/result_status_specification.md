@@ -309,7 +309,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `50003`<br>`sysMigrationBatchExecutionFailed` | 마이그레이션 배치 실행 실패(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | 락 획득 타임아웃(시스템 오류) | <ul><li>`primaryKey`: 대상 키(존재 시)</li><li>`target`: 락 리소스 ID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | 작업 타임아웃(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | 작업이 취소되었습니다(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | 데이터베이스가 닫혔습니다. 작업이 안전하게 취소되었습니다(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | 심각한 메모리 리소스 고갈(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | 심각한 시스템 리소스 고갈(예: 디스크 풀)(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | 물리 파일 또는 경로가 존재하지 않음(시스템 오류) | <ul><li>`primaryKey`: `null`</li><li>`target`: 파일 또는 폴더 경로</li><li>`operation`: I/O 작업명</li></ul> |
@@ -518,7 +518,7 @@ try {
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 시스템 오류 | **심각**: 마이그레이션 배치 실행 실패 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 시스템 오류 | 락 획득 타임아웃 |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 시스템 오류 | 작업 타임아웃 |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | 시스템 오류 | 작업이 취소되었습니다 |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | 시스템 오류 | 데이터베이스가 닫혔습니다. 작업이 안전하게 취소되었습니다 |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | 시스템 오류 | **심각**: 심각한 메모리 리소스 고갈 |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | 시스템 오류 | **심각**: 심각한 시스템 리소스 고갈 |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | 시스템 오류 | 물리 파일 또는 경로가 존재하지 않음 |
