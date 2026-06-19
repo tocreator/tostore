@@ -309,7 +309,7 @@ Abhängig vom Bereich von `code` / `codeKey` und der spezifischen Unterklasse vo
   | `50003`<br>`sysMigrationBatchExecutionFailed` | Chargenmigration-Ausführung fehlgeschlagen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Timeout beim Sperrenerwerb (Systemfehler) | <ul><li>`primaryKey`: Zielschlüssel (falls vorhanden)</li><li>`target`: ID der gesperrten Ressource</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Operation-Timeout (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `51003`<br>`sysCancellation` | Operation wurde abgebrochen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `51003`<br>`sysDbClosed` | Datenbank ist geschlossen, die Operation wurde sicher abgebrochen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52001`<br>`sysResourceExhaustedMemory` | Arbeitsspeicher erschöpft (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `52002`<br>`sysResourceExhausted` | Systemressourcen erschöpft, z. B. Festplatte voll (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `53001`<br>`sysIoNotFound` | Physische Datei oder Pfad existiert nicht (Systemfehler) | <ul><li>`primaryKey`: `null`</li><li>`target`: Datei- oder Ordnerpfad</li><li>`operation`: I/O-Operation</li></ul> |
@@ -518,7 +518,7 @@ Die genaue Zuordnung der Status-Routings und -Parsings entnehmen Sie bitte der f
 | **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Systemfehler | **Kritisch**: Chargenmigration-Ausführung fehlgeschlagen |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Systemfehler | Timeout beim Sperrenerwerb |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Systemfehler | Operation-Timeout |
-| **51003** | `SYS_CANCELLATION` | `ResultType.sysCancellation` | Systemfehler | Operation wurde abgebrochen |
+| **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Systemfehler | Datenbank ist geschlossen, die Operation wurde sicher abgebrochen |
 | **52001** | `SYS_RESOURCE_EXHAUSTED_MEMORY` | `ResultType.sysResourceExhaustedMemory` | Systemfehler | **Kritisch**: Arbeitsspeicher erschöpft |
 | **52002** | `SYS_RESOURCE_EXHAUSTED` | `ResultType.sysResourceExhausted` | Systemfehler | **Kritisch**: Systemressourcen erschöpft |
 | **53001** | `SYS_IO_NOT_FOUND` | `ResultType.sysIoNotFound` | Systemfehler | Physische Datei oder Pfad existiert nicht |
