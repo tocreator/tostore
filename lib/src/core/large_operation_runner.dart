@@ -80,6 +80,11 @@ class LargeOperationRunner {
       try {
         await _executePendingLoop(dataStore, token);
       } catch (e) {
+        if (e is DbClosedException) {
+          Logger.info(
+              'Pending large operations for space $space cancelled due to database close');
+          return;
+        }
         Logger.error('Error running pending operations for space $space',
             rawError: e);
       } finally {
