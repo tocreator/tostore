@@ -168,6 +168,7 @@ final class CacheManager {
     bool invalidateVectorCache = true,
     bool invalidateForeignKey = true,
     bool invalidateCompactionHints = true,
+    bool removeTableState = false,
   }) async {
     try {
       _statsCache.remove(tableName);
@@ -212,6 +213,12 @@ final class CacheManager {
 
       if (invalidateCompactionHints) {
         _dataStore.compactionManager.clearHintsForTable(tableName);
+      }
+
+      _dataStore.weightManager?.clearWeightsForTable(tableName);
+
+      if (removeTableState) {
+        await _dataStore.tableDataManager.removeTable(tableName);
       }
     } catch (e) {
       Logger.error(
