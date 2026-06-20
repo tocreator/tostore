@@ -148,7 +148,7 @@ enum ResultType {
   sysTimeoutLockAcquisition(
       51001, 'SYS_TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
   sysTimeout(51002, 'SYS_TIMEOUT', 'Operation timeout'),
-  sysCancellation(51003, 'SYS_CANCELLATION', 'Operation was cancelled'),
+  sysDbClosed(51003, 'SYS_DB_CLOSED', 'Database is closed'),
   sysResourceExhaustedMemory(
       52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted',
       isCritical: true),
