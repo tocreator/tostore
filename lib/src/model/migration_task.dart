@@ -338,6 +338,28 @@ class FieldSchemaUpdate {
     return _explicitlySet[propertyName] ?? false;
   }
 
+  /// Create a copy of this update with a different name
+  FieldSchemaUpdate copyWithName(String newName) {
+    final update = FieldSchemaUpdate(
+      name: newName,
+      type: type,
+      nullable: nullable,
+      defaultValue: defaultValue,
+      unique: unique,
+      comment: comment,
+      minLength: minLength,
+      maxLength: maxLength,
+      minValue: minValue,
+      maxValue: maxValue,
+      defaultValueType: defaultValueType,
+      fieldId: fieldId,
+      vectorConfig: vectorConfig,
+    );
+    update._explicitlySet.clear();
+    update._explicitlySet.addAll(_explicitlySet);
+    return update;
+  }
+
   Map<String, dynamic> toJson() {
     return {
       'name': name,
