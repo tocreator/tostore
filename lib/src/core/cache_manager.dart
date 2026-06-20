@@ -168,7 +168,6 @@ final class CacheManager {
     bool invalidateVectorCache = true,
     bool invalidateForeignKey = true,
     bool invalidateCompactionHints = true,
-    bool invalidateTtlPlan = true,
   }) async {
     try {
       _statsCache.remove(tableName);

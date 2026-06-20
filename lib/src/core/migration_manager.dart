@@ -5477,8 +5477,14 @@ class MigrationManager {
     required bool needDataMigration,
   }) async {
     if (renameOp != null) {
-      // renameTableForMigration() already handles the heavier old/new table
-      // invalidation, including path cache updates.
+      await _dataStore.cacheManager.invalidateCache(
+        originalTableName,
+        invalidateSchema: false,
+      );
+      await _dataStore.cacheManager.invalidateCache(
+        currentTableName,
+        invalidateSchema: false,
+      );
       return;
     }
 
