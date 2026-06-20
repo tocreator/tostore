@@ -133,3 +133,15 @@ class DbException implements Exception {
     return buf.toString();
   }
 }
+
+/// Exception thrown when the database is closed or closing during an operation.
+class DbClosedException extends DbException {
+  DbClosedException(
+      [String message = 'Database is closed, operation safely cancelled'])
+      : super([
+          GeneralStatus(
+            type: ResultType.sysDbClosed,
+            message: message,
+          )
+        ]);
+}
