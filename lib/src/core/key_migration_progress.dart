@@ -1,4 +1,5 @@
 import '../model/system_table.dart';
+import '../query/query_condition.dart';
 import 'data_store_impl.dart';
 import 'transaction_context.dart';
 
@@ -75,6 +76,47 @@ class KeyMigrationProgressStore {
     await TransactionContext.runAsSystemOperation(() async {
       await dataStore.clear(SystemTable.keyMigrationProgressTableName);
     });
+  }
+
+  static Future<void> renameTableProgress(
+    DataStoreImpl dataStore, {
+    required String oldTableName,
+    required String newTableName,
+    required String spaceName,
+  }) async {
+    final oldPk = progressKey(oldTableName, spaceName);
+    final rows = await dataStore.queryBy(
+      SystemTable.keyMigrationProgressTableName,
+      SystemTable.keyMigrationProgressKeyField,
+      oldPk,
+    );
+
+    if (rows.isNotEmpty) {
+      final oldRow = rows.first;
+      final status =
+          oldRow[SystemTable.keyMigrationStatusField]?.toString() ?? 'running';
+      final checkpoint =
+          oldRow[SystemTable.keyMigrationCheckpointField]?.toString();
+
+      // Delete old progress row
+      await TransactionContext.runAsSystemOperation(() async {
+        await dataStore.deleteInternal(
+          SystemTable.keyMigrationProgressTableName,
+          QueryCondition.fromMap({
+            SystemTable.keyMigrationProgressKeyField: oldPk,
+          }),
+        );
+      });
+
+      // Insert new progress row
+      await _upsert(
+        dataStore,
+        tableName: newTableName,
+        spaceName: spaceName,
+        status: status,
+        checkpointKey: checkpoint,
+      );
+    }
   }
 
   static Future<void> _upsert(
