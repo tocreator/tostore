@@ -67,6 +67,8 @@ import 'index_manager.dart';
 import 'index_tree_partition_manager.dart';
 import 'integrity_checker.dart';
 import 'key_manager.dart';
+import 'key_migration_progress.dart';
+import 'key_migration_runner.dart';
 import 'large_operation_runner.dart';
 import 'lock_manager.dart';
 import 'migration_manager.dart';
@@ -161,6 +163,40 @@ class DataStoreImpl {
   LockManager? lockManager;
   TransactionManager? transactionManager;
   ResourceManager? _resourceManager;
+
+  /// Active table renaming barriers (conversion locks) to prevent concurrent operations
+  /// during name migrations.
+  final Map<String, Completer<void>> _activeTableRenames = {};
+
+  /// Checks if there are currently any active table renames.
+  bool get hasActiveTableRenames => _activeTableRenames.isNotEmpty;
+
+  /// Check and wait if a table is currently undergoing renaming.
+  /// Returns `null` if the table is not renaming (synchronous path),
+  /// or a `Future` that completes when renaming finishes.
+  FutureOr<void> checkTableRenameBarrier(String tableName) {
+    final completer = _activeTableRenames[tableName];
+    if (completer != null) {
+      return completer.future;
+    }
+    return null;
+  }
+
+  /// Mark a table as renaming to block concurrent operations.
+  void startTableRenameBarrier(String oldTableName, String newTableName) {
+    final completer = Completer<void>();
+    _activeTableRenames[oldTableName] = completer;
+    _activeTableRenames[newTableName] = completer;
+  }
+
+  /// Mark a table renaming as finished to release blocked operations.
+  void endTableRenameBarrier(String oldTableName, String newTableName) {
+    final completer = _activeTableRenames.remove(oldTableName);
+    _activeTableRenames.remove(newTableName);
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+  }
 
   /// Key-value storage namespace
   late final KvStore kv = KvStore(this);
@@ -6931,237 +6967,324 @@ class DataStoreImpl {
       return;
     }
 
-    final schemaMgr = schemaManager;
-    final dirMgr = directoryManager;
-    if (schemaMgr == null || dirMgr == null) {
-      throw DbClosedException();
-    }
-
-    final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
-    final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
-    final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
-    if (updateSchema &&
-        actualOldSchema != null &&
-        existingNewSchema != null &&
-        oldTableName != newTableName) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devSchemaTableExists,
-          message:
-              'Cannot rename table $oldTableName -> $newTableName: target table already exists',
-          tableName: newTableName,
-        )
-      ]);
-    }
-    final schemaForLayout = existingOldSchema ?? existingNewSchema;
-    if (schemaForLayout == null) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devTableNotFound,
-          message:
-              'Cannot rename table $oldTableName -> $newTableName: schema not found',
-          parameterName: 'oldTableName',
-          passedValue: oldTableName,
-        )
-      ]);
-    }
-
-    final isGlobal = schemaForLayout.isGlobal;
-    final currentSpace = spaceName ?? currentSpaceName;
-    final renamedSchema = _schemaWithRenamedReferencedTable(
-      schemaForLayout.copyWith(name: newTableName),
-      oldTableName,
-      newTableName,
-    );
-
-    await flush();
-
-    await cacheManager.invalidateCache(oldTableName, invalidateSchema: false);
-    await cacheManager.invalidateCache(newTableName, invalidateSchema: false);
-
-    final oldDirInfo = await dirMgr
-        .getTableDirectoryInfo(oldTableName, isGlobal, spaceName: currentSpace);
-    final newDirInfo = await dirMgr
-        .getTableDirectoryInfo(newTableName, isGlobal, spaceName: currentSpace);
-    final oldPath = await dirMgr.getTableDirectoryPathByScope(
-      oldTableName,
-      isGlobal: isGlobal,
-      spaceName: currentSpace,
-    );
-    String? newPath = await dirMgr.getTableDirectoryPathByScope(
-      newTableName,
-      isGlobal: isGlobal,
-      spaceName: currentSpace,
-    );
-    final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
-    if (newPath == null && resolvedDirIndex != null) {
-      newPath = dirMgr.buildTableDirectoryPath(
-        newTableName,
-        isGlobal: isGlobal,
-        dirIndex: resolvedDirIndex,
-        spaceName: currentSpace,
-      );
-    }
-
-    // After mapping cutover the directory may still live under the old folder
-    // name inside the same shard. Resolve that legacy path for idempotent retry.
-    String? effectiveSourcePath = oldPath;
-    if (resolvedDirIndex != null) {
-      final legacySourcePath = dirMgr.buildTableDirectoryPath(
-        oldTableName,
-        isGlobal: isGlobal,
-        dirIndex: resolvedDirIndex,
-        spaceName: currentSpace,
-      );
-      if (legacySourcePath != newPath &&
-          await storage.existsDirectory(legacySourcePath)) {
-        final mappedSourceExists = effectiveSourcePath != null &&
-            effectiveSourcePath != newPath &&
-            await storage.existsDirectory(effectiveSourcePath);
-        if (!mappedSourceExists) {
-          effectiveSourcePath = legacySourcePath;
-        }
-      }
-    }
-
-    var sourceExists = effectiveSourcePath != null &&
-        effectiveSourcePath != newPath &&
-        await storage.existsDirectory(effectiveSourcePath);
-    var targetExists =
-        newPath != null && await storage.existsDirectory(newPath);
-    final updatedReferencingTables = <String>{};
-
+    startTableRenameBarrier(oldTableName, newTableName);
     try {
-      if (sourceExists && newPath != null && effectiveSourcePath != newPath) {
-        if (targetExists) {
-          // Idempotent recovery: mapping may already point to the new name while
-          // a stale source folder still exists, or a partial target was created.
-          if (newDirInfo != null && oldDirInfo == null) {
-            await storage.deleteDirectory(effectiveSourcePath);
-            sourceExists = false;
-          } else if (oldDirInfo != null && newDirInfo == null) {
-            await storage.deleteDirectory(newPath);
-            await storage.moveDirectory(effectiveSourcePath, newPath);
-            sourceExists = false;
-            targetExists = true;
-          } else {
-            throw DbException([
-              SchemaValidationStatus(
-                type: ResultType.devSchemaTableExists,
-                message:
-                    'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
-                tableName: newTableName,
-              )
-            ]);
-          }
-        } else {
-          await storage.moveDirectory(effectiveSourcePath, newPath);
-          sourceExists = false;
-          targetExists = true;
-        }
+      final schemaMgr = schemaManager;
+      final dirMgr = directoryManager;
+      if (schemaMgr == null || dirMgr == null) {
+        throw DbClosedException();
       }
 
-      var mappingRenamed = await dirMgr.renameTableDirectoryMapping(
+      final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
+      final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
+      final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
+      if (updateSchema &&
+          actualOldSchema != null &&
+          existingNewSchema != null &&
+          oldTableName != newTableName) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devSchemaTableExists,
+            message:
+                'Cannot rename table $oldTableName -> $newTableName: target table already exists',
+            tableName: newTableName,
+          )
+        ]);
+      }
+      final schemaForLayout = existingOldSchema ?? existingNewSchema;
+      if (schemaForLayout == null) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devTableNotFound,
+            message:
+                'Cannot rename table $oldTableName -> $newTableName: schema not found',
+            parameterName: 'oldTableName',
+            passedValue: oldTableName,
+          )
+        ]);
+      }
+
+      final isGlobal = schemaForLayout.isGlobal;
+      final currentSpace = spaceName ?? currentSpaceName;
+      final renamedSchema = _schemaWithRenamedReferencedTable(
+        schemaForLayout.copyWith(name: newTableName),
         oldTableName,
         newTableName,
-        isGlobal: isGlobal,
-        spaceName: currentSpace,
       );
-      if (!mappingRenamed) {
-        if (targetExists && resolvedDirIndex != null) {
-          mappingRenamed = await dirMgr.ensureTableDirectoryMapping(
+
+      // Pause running background operations for this space cooperatively
+      final hadActiveLargeOps =
+          await LargeOperationRunner.pauseAndAwait(currentSpace);
+      final keyMigrating = KeyMigrationRunner.isTableMigrating(oldTableName);
+      if (keyMigrating) {
+        await keyManager.pauseKeyMigration();
+      }
+
+      final updatedReferencingTables = <String>{};
+
+      try {
+        await flush();
+
+        await cacheManager.invalidateCache(oldTableName,
+            invalidateSchema: false);
+        await cacheManager.invalidateCache(newTableName,
+            invalidateSchema: false);
+
+        final oldDirInfo = await dirMgr.getTableDirectoryInfo(
+            oldTableName, isGlobal,
+            spaceName: currentSpace);
+        final newDirInfo = await dirMgr.getTableDirectoryInfo(
+            newTableName, isGlobal,
+            spaceName: currentSpace);
+        final oldPath = await dirMgr.getTableDirectoryPathByScope(
+          oldTableName,
+          isGlobal: isGlobal,
+          spaceName: currentSpace,
+        );
+        String? newPath = await dirMgr.getTableDirectoryPathByScope(
+          newTableName,
+          isGlobal: isGlobal,
+          spaceName: currentSpace,
+        );
+        final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
+        if (newPath == null && resolvedDirIndex != null) {
+          newPath = dirMgr.buildTableDirectoryPath(
             newTableName,
             isGlobal: isGlobal,
             dirIndex: resolvedDirIndex,
             spaceName: currentSpace,
           );
-        } else {
-          final recoveredNewDirInfo = await dirMgr.getTableDirectoryInfo(
-              newTableName, isGlobal,
-              spaceName: currentSpace);
-          mappingRenamed = recoveredNewDirInfo != null && targetExists;
         }
-      }
-      if (!mappingRenamed) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message:
-                'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
-          )
-        ]);
-      }
 
-      if (updateSchema && actualOldSchema != null) {
-        await schemaMgr.renameTableSchema(oldTableName, renamedSchema);
-      }
-      if (updateSchema) {
-        await _updateSchemasReferencingRenamedTable(
-          oldTableName,
-          newTableName,
-          updatedTables: updatedReferencingTables,
-        );
-      }
+        // After mapping cutover the directory may still live under the old folder
+        // name inside the same shard. Resolve that legacy path for idempotent retry.
+        String? effectiveSourcePath = oldPath;
+        if (resolvedDirIndex != null) {
+          final legacySourcePath = dirMgr.buildTableDirectoryPath(
+            oldTableName,
+            isGlobal: isGlobal,
+            dirIndex: resolvedDirIndex,
+            spaceName: currentSpace,
+          );
+          if (legacySourcePath != newPath &&
+              await storage.existsDirectory(legacySourcePath)) {
+            final mappedSourceExists = effectiveSourcePath != null &&
+                effectiveSourcePath != newPath &&
+                await storage.existsDirectory(effectiveSourcePath);
+            if (!mappedSourceExists) {
+              effectiveSourcePath = legacySourcePath;
+            }
+          }
+        }
 
-      await _rewriteMovedTableMetadataAfterRename(
-        newTableName,
-        schemaForLayout,
-      );
+        var sourceExists = effectiveSourcePath != null &&
+            effectiveSourcePath != newPath &&
+            await storage.existsDirectory(effectiveSourcePath);
+        var targetExists =
+            newPath != null && await storage.existsDirectory(newPath);
 
-      if (refreshForeignKeySystemTables) {
-        await _refreshForeignKeyMetadataAfterRename(
-          oldTableName,
-          newTableName,
-          referencingTables: updatedReferencingTables,
-          throwOnError: true,
-        );
-      }
+        if (sourceExists && newPath != null && effectiveSourcePath != newPath) {
+          if (targetExists) {
+            // Idempotent recovery: mapping may already point to the new name while
+            // a stale source folder still exists, or a partial target was created.
+            if (newDirInfo != null && oldDirInfo == null) {
+              await storage.deleteDirectory(effectiveSourcePath);
+              sourceExists = false;
+            } else if (oldDirInfo != null && newDirInfo == null) {
+              await storage.deleteDirectory(newPath);
+              await storage.moveDirectory(effectiveSourcePath, newPath);
+              sourceExists = false;
+              targetExists = true;
+            } else {
+              throw DbException([
+                SchemaValidationStatus(
+                  type: ResultType.devSchemaTableExists,
+                  message:
+                      'Cannot rename table $oldTableName -> $newTableName: destination directory already exists',
+                  tableName: newTableName,
+                )
+              ]);
+            }
+          } else {
+            await storage.moveDirectory(effectiveSourcePath, newPath);
+            sourceExists = false;
+            targetExists = true;
+          }
+        }
 
-      if (_weightManager != null) {
-        final btreeIndexes =
-            schemaManager?.getBtreeIndexesFor(schemaForLayout) ??
-                <IndexSchema>[];
-        final indexNames = btreeIndexes.map((i) => i.actualIndexName).toList();
-        await _weightManager!.renameTableWeights(
-          oldTableName,
-          newTableName,
-          oldIndexNames: indexNames,
-          newIndexNames: indexNames,
-          spaceName: isGlobal ? '__global__' : currentSpace,
-        );
-      }
-      await _renameTableInLargeOperations(oldTableName, newTableName);
-
-      // Synchronize in-memory structures and state for renaming
-      await transactionManager?.renameTableInCaches(oldTableName, newTableName);
-      backgroundWriteScheduler.renameTable(oldTableName, newTableName);
-    } catch (error, stackTrace) {
-      try {
-        await _rollbackRenameTableForMigration(
+        var mappingRenamed = await dirMgr.renameTableDirectoryMapping(
           oldTableName,
           newTableName,
           isGlobal: isGlobal,
-          schemaForLayout: schemaForLayout,
-          existingOldSchema: existingOldSchema,
-          updateSchema: updateSchema,
-          refreshForeignKeySystemTables: refreshForeignKeySystemTables,
-          updatedReferencingTables: updatedReferencingTables,
-          oldPath: effectiveSourcePath ?? oldPath,
-          newPath: newPath,
           spaceName: currentSpace,
         );
-      } catch (rollbackError) {
-        Logger.error(
-            'Failed to rollback table rename $oldTableName -> $newTableName after error',
-            rawError: rollbackError);
-      }
-      Error.throwWithStackTrace(error, stackTrace);
-    }
+        if (!mappingRenamed) {
+          if (targetExists && resolvedDirIndex != null) {
+            mappingRenamed = await dirMgr.ensureTableDirectoryMapping(
+              newTableName,
+              isGlobal: isGlobal,
+              dirIndex: resolvedDirIndex,
+              spaceName: currentSpace,
+            );
+          } else {
+            final recoveredNewDirInfo = await dirMgr.getTableDirectoryInfo(
+                newTableName, isGlobal,
+                spaceName: currentSpace);
+            mappingRenamed = recoveredNewDirInfo != null && targetExists;
+          }
+        }
+        if (!mappingRenamed) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
+            )
+          ]);
+        }
 
-    _pathManager?.clearTableCache(oldTableName);
-    _pathManager?.clearTableCache(newTableName);
-    await cacheManager.invalidateCache(oldTableName);
-    await cacheManager.invalidateCache(newTableName);
+        if (updateSchema && actualOldSchema != null) {
+          await schemaMgr.renameTableSchema(oldTableName, renamedSchema);
+        }
+        if (updateSchema) {
+          await _updateSchemasReferencingRenamedTable(
+            oldTableName,
+            newTableName,
+            updatedTables: updatedReferencingTables,
+          );
+        }
+
+        await _rewriteMovedTableMetadataAfterRename(
+          newTableName,
+          schemaForLayout,
+        );
+
+        if (refreshForeignKeySystemTables) {
+          await _refreshForeignKeyMetadataAfterRename(
+            oldTableName,
+            newTableName,
+            referencingTables: updatedReferencingTables,
+            throwOnError: true,
+          );
+        }
+
+        if (_weightManager != null) {
+          final btreeIndexes =
+              schemaManager?.getBtreeIndexesFor(schemaForLayout) ??
+                  <IndexSchema>[];
+          final indexNames =
+              btreeIndexes.map((i) => i.actualIndexName).toList();
+          await _weightManager!.renameTableWeights(
+            oldTableName,
+            newTableName,
+            oldIndexNames: indexNames,
+            newIndexNames: indexNames,
+            spaceName: isGlobal ? '__global__' : currentSpace,
+          );
+        }
+        await _renameTableInLargeOperations(oldTableName, newTableName);
+
+        // Synchronize in-memory structures and state for renaming
+        await transactionManager?.renameTableInCaches(
+            oldTableName, newTableName);
+        backgroundWriteScheduler.renameTable(oldTableName, newTableName);
+        writeBufferManager.renameTable(oldTableName, newTableName);
+        tableDataManager.renameTable(oldTableName, newTableName);
+
+        if (keyMigrating) {
+          KeyMigrationRunner.renameTable(oldTableName, newTableName);
+          await KeyMigrationProgressStore.renameTableProgress(
+            this,
+            oldTableName: oldTableName,
+            newTableName: newTableName,
+            spaceName: currentSpace,
+          );
+          unawaited(keyManager.startDeferredKeyMigrationWork());
+        }
+
+        if (hadActiveLargeOps) {
+          unawaited(LargeOperationRunner.runPendingOperations(this));
+        }
+      } catch (error, stackTrace) {
+        if (keyMigrating) {
+          unawaited(keyManager.startDeferredKeyMigrationWork());
+        }
+        if (hadActiveLargeOps) {
+          unawaited(LargeOperationRunner.runPendingOperations(this));
+        }
+        try {
+          final oldDirInfo = await dirMgr.getTableDirectoryInfo(
+              oldTableName, isGlobal,
+              spaceName: currentSpace);
+          final newDirInfo = await dirMgr.getTableDirectoryInfo(
+              newTableName, isGlobal,
+              spaceName: currentSpace);
+          final oldPath = await dirMgr.getTableDirectoryPathByScope(
+            oldTableName,
+            isGlobal: isGlobal,
+            spaceName: currentSpace,
+          );
+          String? newPath = await dirMgr.getTableDirectoryPathByScope(
+            newTableName,
+            isGlobal: isGlobal,
+            spaceName: currentSpace,
+          );
+          final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
+          if (newPath == null && resolvedDirIndex != null) {
+            newPath = dirMgr.buildTableDirectoryPath(
+              newTableName,
+              isGlobal: isGlobal,
+              dirIndex: resolvedDirIndex,
+              spaceName: currentSpace,
+            );
+          }
+          String? effectiveSourcePath = oldPath;
+          if (resolvedDirIndex != null) {
+            final legacySourcePath = dirMgr.buildTableDirectoryPath(
+              oldTableName,
+              isGlobal: isGlobal,
+              dirIndex: resolvedDirIndex,
+              spaceName: currentSpace,
+            );
+            if (legacySourcePath != newPath &&
+                await storage.existsDirectory(legacySourcePath)) {
+              final mappedSourceExists = effectiveSourcePath != null &&
+                  effectiveSourcePath != newPath &&
+                  await storage.existsDirectory(effectiveSourcePath);
+              if (!mappedSourceExists) {
+                effectiveSourcePath = legacySourcePath;
+              }
+            }
+          }
+
+          await _rollbackRenameTableForMigration(
+            oldTableName,
+            newTableName,
+            isGlobal: isGlobal,
+            schemaForLayout: schemaForLayout,
+            existingOldSchema: existingOldSchema,
+            updateSchema: updateSchema,
+            refreshForeignKeySystemTables: refreshForeignKeySystemTables,
+            updatedReferencingTables: updatedReferencingTables,
+            oldPath: effectiveSourcePath ?? oldPath,
+            newPath: newPath,
+            spaceName: currentSpace,
+          );
+        } catch (rollbackError) {
+          Logger.error(
+              'Failed to rollback table rename $oldTableName -> $newTableName after error',
+              rawError: rollbackError);
+        }
+        Error.throwWithStackTrace(error, stackTrace);
+      }
+
+      _pathManager?.clearTableCache(oldTableName);
+      _pathManager?.clearTableCache(newTableName);
+      await cacheManager.invalidateCache(oldTableName);
+      await cacheManager.invalidateCache(newTableName);
+    } finally {
+      endTableRenameBarrier(oldTableName, newTableName);
+    }
   }
 
   Future<void> _rollbackRenameTableForMigration(
@@ -7479,8 +7602,7 @@ class DataStoreImpl {
 
   /// Invalidate all caches for table
   Future<void> _invalidateTableCaches(String tableName) async {
-    await cacheManager.invalidateCache(tableName);
-    await tableDataManager.removeTable(tableName);
+    await cacheManager.invalidateCache(tableName, removeTableState: true);
   }
 
   /// Get global configuration
