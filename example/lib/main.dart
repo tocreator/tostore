@@ -93,7 +93,7 @@ class MyApp extends StatelessWidget {
   }
 }
 
-enum AppView { dataView, benchmark }
+enum AppView { dataView, tests }
 
 enum PaginationMode { offset, cursor }
 
@@ -603,7 +603,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                     _selectedView = newView;
                                   });
                                   // If switching to Data View, always refresh the data
-                                  // to ensure it's not stale after benchmark tests.
+                                  // to ensure it's not stale after tests.
                                   if (newView == AppView.dataView) {
                                     _fetchTableData(resetPage: true);
                                   }
@@ -611,7 +611,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                               },
                               children: [
                                 _buildDataView(),
-                                _buildBenchmarkView(),
+                                _buildTestsView(),
                               ],
                             ),
                     ),
@@ -685,9 +685,13 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       padding: const EdgeInsets.all(8.0),
       child: Center(
         child: ToggleButtons(
+          constraints: const BoxConstraints(
+            minWidth: 110.0,
+            minHeight: 36.0,
+          ),
           isSelected: [
             _selectedView == AppView.dataView,
-            _selectedView == AppView.benchmark,
+            _selectedView == AppView.tests,
           ],
           onPressed: (index) {
             _pageViewController.animateToPage(
@@ -700,14 +704,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           selectedColor: Colors.black,
           fillColor: const Color.fromARGB(255, 211, 235, 245),
           children: const [
-            Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16),
-              child: Text('Data View'),
-            ),
-            Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16),
-              child: Text('Benchmark'),
-            ),
+            Text('Data View'),
+            Text('Tests'),
           ],
         ),
       ),
@@ -1214,7 +1212,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     );
   }
 
-  Widget _buildBenchmarkView() {
+  Widget _buildTestsView() {
     return SingleChildScrollView(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16.0, 16.0, 16.0, 200.0),
@@ -1873,7 +1871,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       if (count <= 0) return;
 
       setState(() {
-        _isTesting = true; // Use the benchmark view's testing flag
+        _isTesting = true; // Use the tests view's testing flag
         _isDataLoading = true;
         _lastOperationInfo =
             'Adding $count records (${method == InsertMethod.batch ? 'batch' : 'one-by-one'})...';

@@ -3607,6 +3607,7 @@ class TableDataManager {
       // Check Real-time WriteBuffer to filter out pending deletes.
       // This prevents "page gaps" where disk records are counted towards limit
       // but later removed during mergeConsistency.
+      Map<String, dynamic> evalRecord = r;
       if (!readFromFileOnly) {
         final pk = r[primaryKey]?.toString();
         if (pk != null) {
@@ -3617,15 +3618,18 @@ class TableDataManager {
             }
           } else {
             final be = bufferMgr.getBufferedRecordForRead(tableName, pk);
-            if (be != null && be.operation == BufferOperationType.delete) {
-              return false;
+            if (be != null) {
+              if (be.operation == BufferOperationType.delete) {
+                return false;
+              }
+              evalRecord = be.data;
             }
           }
         }
       }
 
-      if (filter != null && !filter(r)) return false;
-      if (matcher != null && !matcher.matches(r)) return false;
+      if (filter != null && !filter(evalRecord)) return false;
+      if (matcher != null && !matcher.matches(evalRecord)) return false;
       return true;
     }
 

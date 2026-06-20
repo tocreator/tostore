@@ -556,16 +556,7 @@ class MigrationManager {
 
   _RuntimeMigrationDescriptor? _findRuntimeMigrationDescriptor(
       String tableName) {
-    final direct = _runtimeMigrations[tableName];
-    if (direct != null) {
-      return direct;
-    }
-    for (final descriptor in _runtimeMigrations.values) {
-      if (descriptor.tableAliases.contains(tableName)) {
-        return descriptor;
-      }
-    }
-    return null;
+    return _runtimeMigrations[tableName];
   }
 
   Uint8List? _encodeLegacyPrimaryKeyBytes(
@@ -1970,6 +1961,9 @@ class MigrationManager {
         final descriptor = _buildRuntimeDescriptorForComponent(component);
         if (descriptor == null) continue;
         _runtimeMigrations[descriptor.tableName] = descriptor;
+        for (final alias in descriptor.tableAliases) {
+          _runtimeMigrations[alias] = descriptor;
+        }
       }
     } else {
       // Incremental rebuild for a specific table component
@@ -2007,6 +2001,9 @@ class MigrationManager {
       // 5. Add new descriptor
       if (descriptor != null) {
         _runtimeMigrations[descriptor.tableName] = descriptor;
+        for (final alias in descriptor.tableAliases) {
+          _runtimeMigrations[alias] = descriptor;
+        }
       }
     }
   }

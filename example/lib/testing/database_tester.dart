@@ -139,6 +139,10 @@ class DatabaseTester {
             'test': _testInstanceSchemaAutoUpgrade
           },
           {
+            'name': 'Runtime Schema Migration Integrity',
+            'test': _testRuntimeSchemaMigrationIntegrity,
+          },
+          {
             'name': 'Advanced Queries & Edge Cases',
             'test': _testAdvancedQueriesAndEdgeCases
           },
@@ -882,6 +886,447 @@ class DatabaseTester {
       await _closeQuietly(migratedDb);
       await _closeQuietly(reopenedDb);
       await _deleteSchemaAutoUpgradeTestDatabase(config);
+    }
+
+    return isTestPassed;
+  }
+
+  Future<DataStoreConfig> _buildRuntimeSchemaMigrationTestConfig() async {
+    final resolvedDbPath = await _resolveSchemaAutoUpgradeTestDbPath();
+
+    return db.config.copyWith(
+      dbPath: resolvedDbPath,
+      dbName:
+          '${db.config.dbName}_rt_mig_${DateTime.now().millisecondsSinceEpoch}',
+      spaceName: 'default',
+      enableLog: true,
+      logLevel: LogLevel.warn,
+    );
+  }
+
+  Future<void> _deleteRuntimeSchemaMigrationTestDatabase(
+      DataStoreConfig config) async {
+    ToStore? cleanupDb;
+    try {
+      cleanupDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: const [],
+        applyActiveSpaceOnDefault: false,
+      );
+      await cleanupDb.deleteDatabase(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+      );
+      cleanupDb = null;
+    } catch (e) {
+      log.add(
+        'Runtime schema migration test database cleanup skipped: $e',
+        LogLevel.warn,
+      );
+    } finally {
+      if (cleanupDb != null) {
+        try {
+          await cleanupDb.close();
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _waitForMigrationTask(ToStore testDb, String taskId) async {
+    final timeout = DateTime.now().add(const Duration(seconds: 15));
+    while (DateTime.now().isBefore(timeout)) {
+      final status = await testDb.queryMigrationTaskStatus(taskId);
+      if (status != null && status.isCompleted) {
+        break;
+      }
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
+  /// CRITICAL TEST: Verifies that complex runtime schema migration (using db.updateSchema and db.createTables)
+  /// works correctly without dataloss, even when concurrent reads/writes hit the dynamic buffers and files.
+  Future<bool> _testRuntimeSchemaMigrationIntegrity() async {
+    if (db.config.persistenceMode == PersistenceMode.memory) {
+      _passTest(
+        'Runtime schema migration test skipped because the current instance uses memory persistence.',
+      );
+      return true;
+    }
+
+    bool isTestPassed = true;
+    final config = await _buildRuntimeSchemaMigrationTestConfig();
+
+    final legacyTableA = TableSchema(
+      name: 'legacy_table_a',
+      tableId: 'migration_test_table_a_id',
+      primaryKeyConfig: const PrimaryKeyConfig(
+        name: 'id',
+        type: PrimaryKeyType.sequential,
+      ),
+      fields: const [
+        FieldSchema(name: 'old_field_1', type: DataType.text),
+        FieldSchema(name: 'old_field_2', type: DataType.integer),
+        FieldSchema(name: 'toBeIndexed', type: DataType.text),
+        FieldSchema(name: 'shouldRemoveIndex', type: DataType.text),
+      ],
+      indexes: const [
+        IndexSchema(fields: ['shouldRemoveIndex']),
+      ],
+    );
+
+    final legacyTableB = TableSchema(
+      name: 'legacy_table_b',
+      tableId: 'migration_test_table_b_id',
+      primaryKeyConfig: const PrimaryKeyConfig(
+        name: 'id',
+        type: PrimaryKeyType.sequential,
+      ),
+      fields: const [
+        FieldSchema(name: 'name', type: DataType.text),
+      ],
+    );
+
+    final oldSchemas = [legacyTableA, legacyTableB];
+    ToStore? testDb;
+
+    try {
+      // 1. Clean state
+      await _deleteRuntimeSchemaMigrationTestDatabase(config);
+
+      // 2. Open and create initial tables dynamically using createTables
+      testDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas: const [], // start empty
+        applyActiveSpaceOnDefault: false,
+      );
+
+      final createRes = await testDb.createTables(oldSchemas);
+      isTestPassed &= _expect(
+          'Dynamic table creation should succeed', createRes.hasErrors, false);
+      if (!isTestPassed) return false;
+
+      // 3. Insert initial data into 'default' space
+      final insA1 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_1',
+        'old_field_2': 10,
+        'toBeIndexed': 'index_val_1',
+        'shouldRemoveIndex': 'rm_idx_1',
+      });
+      final insA2 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_2',
+        'old_field_2': 20,
+        'toBeIndexed': 'index_val_2',
+        'shouldRemoveIndex': 'rm_idx_2',
+      });
+      final insB1 = await testDb.insert('legacy_table_b', {
+        'name': 'b_name_1',
+      });
+      final insB2 = await testDb.insert('legacy_table_b', {
+        'name': 'b_name_2',
+      });
+
+      isTestPassed &= _expect(
+        'Initial inserts into default space should succeed',
+        !insA1.hasErrors &&
+            !insA2.hasErrors &&
+            !insB1.hasErrors &&
+            !insB2.hasErrors,
+        true,
+      );
+
+      // 4. Switch to a new space 'test_space' and insert legacy data
+      final switchedToTestSpace =
+          await testDb.switchSpace(spaceName: 'test_space');
+      isTestPassed &= _expect(
+          'Switching to test_space should succeed', switchedToTestSpace, true);
+
+      final insA3 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_3',
+        'old_field_2': 30,
+        'toBeIndexed': 'index_val_3',
+        'shouldRemoveIndex': 'rm_idx_3',
+      });
+      final insA4 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_4',
+        'old_field_2': 40,
+        'toBeIndexed': 'index_val_4',
+        'shouldRemoveIndex': 'rm_idx_4',
+      });
+      final insB3 = await testDb.insert('legacy_table_b', {
+        'name': 'b_name_3',
+      });
+      final insB4 = await testDb.insert('legacy_table_b', {
+        'name': 'b_name_4',
+      });
+
+      isTestPassed &= _expect(
+        'Initial inserts into test_space should succeed',
+        !insA3.hasErrors &&
+            !insA4.hasErrors &&
+            !insB3.hasErrors &&
+            !insB4.hasErrors,
+        true,
+      );
+
+      // 5. Close DB to flush WAL & commit everything to persistent files
+      await testDb.switchSpace(spaceName: 'default');
+      await testDb.flush();
+      await testDb.close();
+      testDb = null;
+
+      // 6. Reopen DB to load data and trigger runtime schema updates
+      testDb = await ToStore.open(
+        dbPath: config.dbPath,
+        dbName: config.dbName,
+        config: config,
+        schemas:
+            oldSchemas, // open with old schemas to preserve original catalog state
+        applyActiveSpaceOnDefault: false,
+      );
+
+      // 7. Perform runtime schema migration: 2 table renames, 2 field renames, 1 add field, 1 add index, 1 remove index
+      final updateResultA = await testDb
+          .updateSchema('legacy_table_a')
+          .renameTable('new_table_a')
+          .renameField('old_field_1', 'new_field_1')
+          .renameField('old_field_2', 'new_field_2')
+          .addField('added_field',
+              type: DataType.text, defaultValue: 'default_val')
+          .addIndex(fields: ['toBeIndexed']).removeIndex(
+              indexName: 'idx_shouldRemoveIndex');
+
+      final updateResultB = await testDb
+          .updateSchema('legacy_table_b')
+          .renameTable('new_table_b');
+
+      final taskIdA = updateResultA.taskId;
+      final taskIdB = updateResultB.taskId;
+
+      isTestPassed &= _expect(
+          'Table A migration taskId should be assigned', taskIdA != null, true);
+      isTestPassed &= _expect(
+          'Table B migration taskId should be assigned', taskIdB != null, true);
+
+      // 8. IMMEDIATELY perform Round 1 writes/reads on the new tables while migration is running (tests buffer-file coexistence)
+      final insNewA1 = await testDb.insert('new_table_a', {
+        'new_field_1': 'new_val_1',
+        'new_field_2': 100,
+        'toBeIndexed': 'idx_new_1',
+        'shouldRemoveIndex': 'rm_new_1',
+      });
+      isTestPassed &= _expect('Round 1 insert into new_table_a should succeed',
+          insNewA1.hasErrors, false);
+      if (insNewA1.hasErrors) {
+        log.add(
+            'insNewA1 error: ${insNewA1.message} statuses: ${insNewA1.statuses}',
+            LogLevel.error);
+      }
+
+      final insNewB1 = await testDb.insert('new_table_b', {
+        'name': 'new_b_1',
+      });
+      isTestPassed &= _expect('Round 1 insert into new_table_b should succeed',
+          insNewB1.hasErrors, false);
+      if (insNewB1.hasErrors) {
+        log.add(
+            'insNewB1 error: ${insNewB1.message} statuses: ${insNewB1.statuses}',
+            LogLevel.error);
+      }
+
+      // Verify newly inserted record using the newly indexed field
+      final queryNew1 = await testDb
+          .query('new_table_a')
+          .where('toBeIndexed', '=', 'idx_new_1')
+          .first();
+      isTestPassed &= _expect('Should find new record via toBeIndexed index',
+          queryNew1 != null, true);
+      if (queryNew1 != null) {
+        isTestPassed &= _expect('New record added_field default',
+            queryNew1['added_field'], 'default_val');
+        isTestPassed &=
+            _expect('New record field 2 value', queryNew1['new_field_2'], 100);
+      }
+
+      // 9. Perform Round 2 writes/reads (modifying newly written buffer data)
+      final insNewA2 = await testDb.insert('new_table_a', {
+        'new_field_1': 'new_val_2',
+        'new_field_2': 200,
+        'toBeIndexed': 'idx_new_2',
+        'shouldRemoveIndex': 'rm_new_2',
+      });
+      isTestPassed &=
+          _expect('Round 2 insert should succeed', insNewA2.hasErrors, false);
+
+      final updResult2 = await testDb
+          .update('new_table_a', {'new_field_2': 150}).where(
+              'new_field_1', '=', 'new_val_1');
+      isTestPassed &= _expect(
+          'Round 2 update of newly inserted data should succeed',
+          updResult2.hasErrors,
+          false);
+
+      final queryNew2 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'new_val_1')
+          .first();
+      isTestPassed &= _expect(
+          'Should fetch Round 2 updated record', queryNew2 != null, true);
+      if (queryNew2 != null) {
+        isTestPassed &= _expect(
+            'Round 2 updated field 2 value', queryNew2['new_field_2'], 150);
+      }
+
+      // 10. Wait for background migration execution to fully complete
+      if (taskIdA != null) {
+        await _waitForMigrationTask(testDb, taskIdA);
+      }
+      if (taskIdB != null) {
+        await _waitForMigrationTask(testDb, taskIdB);
+      }
+
+      // 11. Now that migration is complete, we can update and delete the migrated legacy records
+      // Update migrated old data (val1_1 -> val1_1_updated)
+      final updResult1 = await testDb
+          .update('new_table_a', {'new_field_1': 'val1_1_updated'}).where(
+              'new_field_1', '=', 'val1_1');
+      isTestPassed &= _expect('Update of migrated legacy data should succeed',
+          updResult1.hasErrors, false);
+      if (updResult1.hasErrors) {
+        log.add(
+            'updResult1 error: ${updResult1.message} statuses: ${updResult1.statuses}',
+            LogLevel.error);
+      }
+
+      // Delete migrated old data (val1_2)
+      final delResult1 = await testDb
+          .delete('new_table_a')
+          .where('new_field_1', '=', 'val1_2');
+      isTestPassed &= _expect('Delete of migrated legacy data should succeed',
+          delResult1.hasErrors, false);
+      if (delResult1.hasErrors) {
+        log.add(
+            'delResult1 error: ${delResult1.message} statuses: ${delResult1.statuses}',
+            LogLevel.error);
+      }
+
+      // Query verification (Post-Migration verification before flush)
+      final queryUpd1 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_1_updated')
+          .first();
+      isTestPassed &=
+          _expect('Should query updated legacy data', queryUpd1 != null, true);
+      if (queryUpd1 != null) {
+        isTestPassed &= _expect(
+            'Updated legacy record new_field_2 should be preserved',
+            queryUpd1['new_field_2'],
+            10);
+        isTestPassed &= _expect(
+            'Updated legacy record added_field should use default',
+            queryUpd1['added_field'],
+            'default_val');
+        isTestPassed &= _expect(
+            'Updated legacy record shouldRemoveIndex should exist',
+            queryUpd1['shouldRemoveIndex'],
+            'rm_idx_1');
+      }
+
+      final queryDel1 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_2')
+          .first();
+      isTestPassed &=
+          _expect('Deleted legacy record should not exist', queryDel1, null);
+
+      // 12. Call flush to force all buffers/indexes to flush to files
+      await testDb.flush();
+
+      // 13. Final query verification after flush (ensures correct physical file storage layout)
+      final finalA1 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_1_updated')
+          .first();
+      isTestPassed &= _expect(
+          'Final query check on updated legacy record after flush',
+          finalA1 != null,
+          true);
+      if (finalA1 != null) {
+        isTestPassed &=
+            _expect('Final check field 2 value', finalA1['new_field_2'], 10);
+        isTestPassed &= _expect('Final check added_field value',
+            finalA1['added_field'], 'default_val');
+      }
+
+      final finalA2 = await testDb
+          .query('new_table_a')
+          .where('toBeIndexed', '=', 'idx_new_2')
+          .first();
+      isTestPassed &= _expect(
+          'Final query check on new record after flush', finalA2 != null, true);
+      if (finalA2 != null) {
+        isTestPassed &= _expect('Final check new record field 2 value',
+            finalA2['new_field_2'], 200);
+      }
+
+      // 14. Verify index layout in catalog schema (assert index added & removed)
+      final finalSchemaA = await testDb.getTableSchema('new_table_a');
+      isTestPassed &= _expect('Final schema for new_table_a should exist',
+          finalSchemaA != null, true);
+      if (finalSchemaA != null) {
+        final hasToBeIndexed = finalSchemaA.indexes
+            .any((idx) => idx.fields.contains('toBeIndexed'));
+        isTestPassed &= _expect(
+            'Schema must contain toBeIndexed index', hasToBeIndexed, true);
+
+        final hasRemovedIndex = finalSchemaA.indexes
+            .any((idx) => idx.fields.contains('shouldRemoveIndex'));
+        isTestPassed &= _expect(
+            'Schema must NOT contain shouldRemoveIndex index',
+            hasRemovedIndex,
+            false);
+      }
+
+      // 15. Switch space to check multi-space migration correctness
+      final switchedToTestSpaceAgain =
+          await testDb.switchSpace(spaceName: 'test_space');
+      isTestPassed &= _expect('Switching back to test_space should succeed',
+          switchedToTestSpaceAgain, true);
+
+      final spaceA1 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_3')
+          .first();
+      isTestPassed &= _expect('Should find test_space migrated legacy record',
+          spaceA1 != null, true);
+      if (spaceA1 != null) {
+        isTestPassed &= _expect(
+            'test_space migrated record field 2', spaceA1['new_field_2'], 30);
+        isTestPassed &= _expect(
+            'test_space migrated record added_field default',
+            spaceA1['added_field'],
+            'default_val');
+        isTestPassed &= _expect('test_space migrated record shouldRemoveIndex',
+            spaceA1['shouldRemoveIndex'], 'rm_idx_3');
+      }
+
+      final spaceB1 = await testDb
+          .query('new_table_b')
+          .where('name', '=', 'b_name_3')
+          .first();
+      isTestPassed &= _expect(
+          'Should find test_space migrated record in table b',
+          spaceB1 != null,
+          true);
+    } catch (e, s) {
+      isTestPassed = false;
+      _failTest('Exception in _testRuntimeSchemaMigrationIntegrity: $e\n$s');
+    } finally {
+      await _closeQuietly(testDb);
+      await _deleteRuntimeSchemaMigrationTestDatabase(config);
     }
 
     return isTestPassed;
