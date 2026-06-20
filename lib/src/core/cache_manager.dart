@@ -166,6 +166,9 @@ final class CacheManager {
     bool invalidateIndexMeta = true,
     bool invalidateIndexPages = true,
     bool invalidateVectorCache = true,
+    bool invalidateForeignKey = true,
+    bool invalidateCompactionHints = true,
+    bool invalidateTtlPlan = true,
   }) async {
     try {
       _statsCache.remove(tableName);
@@ -202,6 +205,14 @@ final class CacheManager {
 
       if (invalidateVectorCache) {
         _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+      }
+
+      if (invalidateForeignKey) {
+        _dataStore.foreignKeyManager?.invalidateCache();
+      }
+
+      if (invalidateCompactionHints) {
+        _dataStore.compactionManager.clearHintsForTable(tableName);
       }
     } catch (e) {
       Logger.error(

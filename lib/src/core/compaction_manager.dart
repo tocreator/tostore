@@ -75,6 +75,12 @@ final class CompactionManager {
     _queue.add(_CompactionTask.index(tableName, indexName));
   }
 
+  /// Clear compaction hints for a table
+  void clearHintsForTable(String tableName) {
+    _tableHint.remove(tableName);
+    _indexHint.removeWhere((key, _) => key.startsWith('$tableName:'));
+  }
+
   Future<void> _tick() async {
     if (_pumpInProgress) return;
     if (_queue.isEmpty) return;
