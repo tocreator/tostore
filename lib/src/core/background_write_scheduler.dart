@@ -231,6 +231,33 @@ class BackgroundWriteScheduler {
     }
   }
 
+  /// Rename table for queued and ordered background write entries.
+  void renameTable(String oldTableName, String newTableName) {
+    if (oldTableName == newTableName) return;
+
+    // 1. Rename in _queue maps
+    final tableMap = _queue.remove(oldTableName);
+    if (tableMap != null) {
+      final updatedTableMap = <String, Map<BackgroundWriteType, BackgroundWriteEntry>>{};
+      tableMap.forEach((pk, typeMap) {
+        final updatedTypeMap = <BackgroundWriteType, BackgroundWriteEntry>{};
+        typeMap.forEach((type, entry) {
+          updatedTypeMap[type] = entry.copyWith(tableName: newTableName);
+        });
+        updatedTableMap[pk] = updatedTypeMap;
+      });
+      _queue[newTableName] = updatedTableMap;
+    }
+
+    // 2. Rename in _orderedQueue
+    for (var i = _headIndex; i < _orderedQueue.length; i++) {
+      final entry = _orderedQueue[i];
+      if (entry.tableName == oldTableName) {
+        _orderedQueue[i] = entry.copyWith(tableName: newTableName);
+      }
+    }
+  }
+
   /// Clear all pending entries in the scheduler.
   void clearAll() {
     // 1. Mark entries in queue mapping as invalid and clear

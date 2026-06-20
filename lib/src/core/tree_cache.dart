@@ -288,6 +288,36 @@ class TreeCache<T> {
     _totalEntries = 0;
   }
 
+  /// Rename group prefix from [oldGroupKey] to [newGroupKey] in O(1) group move.
+  void renameGroup(dynamic oldGroupKey, dynamic newGroupKey) {
+    if (oldGroupKey == newGroupKey) return;
+    if (groupDepth != 1) return;
+
+    final group = _groupsRoot.remove(oldGroupKey);
+    if (group == null) return;
+
+    // Update group path
+    group.groupPath[0] = newGroupKey;
+
+    // Update all entry keys in-place
+    var curr = group.lruHead;
+    while (curr != null) {
+      if (curr.key.isNotEmpty) {
+        curr.key[0] = newGroupKey;
+      }
+      curr = curr.lruNext;
+    }
+
+    _groupsRoot[newGroupKey] = group;
+
+    // Update fully cached markers
+    final isMarked = _isFullyCached(<dynamic>[oldGroupKey]);
+    if (isMarked) {
+      _setFullyCached(<dynamic>[oldGroupKey], false);
+      _setFullyCached(<dynamic>[newGroupKey], true);
+    }
+  }
+
   bool isFullyCached(dynamic keyOrPrefix) {
     final p = _normalizeKey(keyOrPrefix);
     return _isFullyCached(p);
@@ -718,7 +748,7 @@ class TreeCache<T> {
 // -------------------- Internal: group + entry + LRU --------------------
 
 final class _CacheEntry<T> {
-  final List<dynamic> key;
+  List<dynamic> key;
   T value;
   int sizeBytes;
   _CacheEntry<T>? lruPrev;
@@ -727,7 +757,7 @@ final class _CacheEntry<T> {
 }
 
 final class _Group<T> {
-  final List<dynamic> groupPath;
+  List<dynamic> groupPath;
   final int groupDepth;
   final Comparator<dynamic> firstSuffixComparator;
   final _BPlusTree<List<dynamic>, _CacheEntry<T>> tree;

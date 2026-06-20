@@ -1079,6 +1079,109 @@ class TransactionManager {
     }
   }
 
+  /// Rename table in write-sets, recent committed writes (SSI), heavy delete/update plans, and cascade operations.
+  Future<void> renameTableInCaches(
+      String oldTableName, String newTableName) async {
+    if (oldTableName == newTableName) return;
+
+    final yieldController = YieldController('txn_rename_caches');
+
+    // 1. Rename table in _txnWriteSets
+    for (final txId in _txnWriteSets.keys) {
+      await yieldController.maybeYield();
+      final tableMap = _txnWriteSets[txId];
+      if (tableMap != null && tableMap.containsKey(oldTableName)) {
+        final pks = tableMap.remove(oldTableName);
+        if (pks != null) {
+          tableMap[newTableName] = pks;
+        }
+      }
+    }
+
+    // 2. Rename table in _recentCommittedWrites (TreeCache)
+    _recentCommittedWrites.renameGroup(oldTableName, newTableName);
+
+    // 3. Rename table in _txnHeavyDeletes
+    for (final txId in _txnHeavyDeletes.keys) {
+      await yieldController.maybeYield();
+      final list = _txnHeavyDeletes[txId];
+      if (list != null) {
+        for (var i = 0; i < list.length; i++) {
+          await yieldController.maybeYield();
+          final plan = list[i];
+          if (plan.tableName == oldTableName) {
+            list[i] = HeavyDeletePlan(
+              tableName: newTableName,
+              condition: plan.condition,
+              orderBy: plan.orderBy,
+              limit: plan.limit,
+              offset: plan.offset,
+            );
+          }
+        }
+      }
+    }
+
+    // 4. Rename table in _txnHeavyUpdates
+    for (final txId in _txnHeavyUpdates.keys) {
+      await yieldController.maybeYield();
+      final list = _txnHeavyUpdates[txId];
+      if (list != null) {
+        for (var i = 0; i < list.length; i++) {
+          await yieldController.maybeYield();
+          final plan = list[i];
+          if (plan.tableName == oldTableName) {
+            list[i] = HeavyUpdatePlan(
+              tableName: newTableName,
+              condition: plan.condition,
+              updateData: plan.updateData,
+              orderBy: plan.orderBy,
+              limit: plan.limit,
+              offset: plan.offset,
+            );
+          }
+        }
+      }
+    }
+
+    // 5. Rename table in _txnCascadeDeletes
+    for (final txId in _txnCascadeDeletes.keys) {
+      await yieldController.maybeYield();
+      final list = _txnCascadeDeletes[txId];
+      if (list != null) {
+        for (var i = 0; i < list.length; i++) {
+          await yieldController.maybeYield();
+          final op = list[i];
+          if (op.tableName == oldTableName) {
+            list[i] = _CascadeDeleteOp(
+              tableName: newTableName,
+              deletedPkValues: op.deletedPkValues,
+            );
+          }
+        }
+      }
+    }
+
+    // 6. Rename table in _txnCascadeUpdates
+    for (final txId in _txnCascadeUpdates.keys) {
+      await yieldController.maybeYield();
+      final list = _txnCascadeUpdates[txId];
+      if (list != null) {
+        for (var i = 0; i < list.length; i++) {
+          await yieldController.maybeYield();
+          final op = list[i];
+          if (op.tableName == oldTableName) {
+            list[i] = _CascadeUpdateOp(
+              tableName: newTableName,
+              oldPkValues: op.oldPkValues,
+              newPkValues: op.newPkValues,
+            );
+          }
+        }
+      }
+    }
+  }
+
   /// Register a write key (table, primaryKey) for current transaction (used by SSI)
   void registerWriteKey(String txId, String tableName, String primaryKey) {
     try {
