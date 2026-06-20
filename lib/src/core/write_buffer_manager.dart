@@ -1384,40 +1384,51 @@ class WriteBufferManager {
       dynamic compositeKey, String? selfRecordId,
       {String? transactionId, dynamic internalKey}) {
     internalKey ??= _toInternalKey(compositeKey);
+    final migrationManager = _dataStore.migrationManager;
+    final candidates = migrationManager != null &&
+            migrationManager.hasRuntimeMigrationForTable(tableName)
+        ? migrationManager.getRuntimeReadTableCandidates(tableName)
+        : const <String>[];
+    final checkTables = [tableName, ...candidates];
+
     // 1. Check main buffer (committed/flushing)
-    final mainBuf = _buffersByTable[tableName];
-    if (mainBuf != null) {
-      final owners = mainBuf.uniqueKeyOwners[indexName]?[internalKey];
-      if (owners != null && owners.isNotEmpty) {
-        if (selfRecordId == null) return owners.first;
-        if (!owners.contains(selfRecordId)) return owners.first;
-        if (owners.length > 1) {
-          return owners.firstWhere((id) => id != selfRecordId);
+    for (final table in checkTables) {
+      final mainBuf = _buffersByTable[table];
+      if (mainBuf != null) {
+        final owners = mainBuf.uniqueKeyOwners[indexName]?[internalKey];
+        if (owners != null && owners.isNotEmpty) {
+          if (selfRecordId == null) return owners.first;
+          if (!owners.contains(selfRecordId)) return owners.first;
+          if (owners.length > 1) {
+            return owners.firstWhere((id) => id != selfRecordId);
+          }
         }
       }
     }
 
     // 2. Check global transaction index (O(1))
-    final globalOwners =
-        _txnGlobalUniqueKeyOwners[tableName]?[indexName]?[internalKey];
-    if (globalOwners != null && globalOwners.isNotEmpty) {
-      for (final entry in globalOwners.entries) {
-        final txId = entry.key;
-        final recordIds = entry.value;
-        if (recordIds.isEmpty) {
-          continue;
-        }
-
-        // If checking check against OWN transaction
-        if (transactionId != null && txId == transactionId) {
-          if (selfRecordId == null) return recordIds.first;
-          if (!recordIds.contains(selfRecordId)) return recordIds.first;
-          if (recordIds.length > 1) {
-            return recordIds.firstWhere((id) => id != selfRecordId);
+    for (final table in checkTables) {
+      final globalOwners =
+          _txnGlobalUniqueKeyOwners[table]?[indexName]?[internalKey];
+      if (globalOwners != null && globalOwners.isNotEmpty) {
+        for (final entry in globalOwners.entries) {
+          final txId = entry.key;
+          final recordIds = entry.value;
+          if (recordIds.isEmpty) {
+            continue;
           }
-        } else {
-          // Conflict with OTHER transaction
-          return recordIds.first;
+
+          // If checking check against OWN transaction
+          if (transactionId != null && txId == transactionId) {
+            if (selfRecordId == null) return recordIds.first;
+            if (!recordIds.contains(selfRecordId)) return recordIds.first;
+            if (recordIds.length > 1) {
+              return recordIds.firstWhere((id) => id != selfRecordId);
+            }
+          } else {
+            // Conflict with OTHER transaction
+            return recordIds.first;
+          }
         }
       }
     }
@@ -1437,28 +1448,36 @@ class WriteBufferManager {
       String indexName, dynamic compositeKey, String? selfRecordId,
       {String? transactionId, dynamic internalKey}) {
     internalKey ??= _toInternalKey(compositeKey);
+    final migrationManager = _dataStore.migrationManager;
+    final candidates = migrationManager != null &&
+            migrationManager.hasRuntimeMigrationForTable(tableName)
+        ? migrationManager.getRuntimeReadTableCandidates(tableName)
+        : const <String>[];
+    final checkTables = [tableName, ...candidates];
 
     // Only check global transaction index (O(1))
-    final globalOwners =
-        _txnGlobalUniqueKeyOwners[tableName]?[indexName]?[internalKey];
-    if (globalOwners != null && globalOwners.isNotEmpty) {
-      for (final entry in globalOwners.entries) {
-        final txId = entry.key;
-        final recordIds = entry.value;
-        if (recordIds.isEmpty) {
-          continue;
-        }
-
-        // If checking against OWN transaction
-        if (transactionId != null && txId == transactionId) {
-          if (selfRecordId == null) return recordIds.first;
-          if (!recordIds.contains(selfRecordId)) return recordIds.first;
-          if (recordIds.length > 1) {
-            return recordIds.firstWhere((id) => id != selfRecordId);
+    for (final table in checkTables) {
+      final globalOwners =
+          _txnGlobalUniqueKeyOwners[table]?[indexName]?[internalKey];
+      if (globalOwners != null && globalOwners.isNotEmpty) {
+        for (final entry in globalOwners.entries) {
+          final txId = entry.key;
+          final recordIds = entry.value;
+          if (recordIds.isEmpty) {
+            continue;
           }
-        } else {
-          // Conflict with OTHER transaction
-          return recordIds.first;
+
+          // If checking against OWN transaction
+          if (transactionId != null && txId == transactionId) {
+            if (selfRecordId == null) return recordIds.first;
+            if (!recordIds.contains(selfRecordId)) return recordIds.first;
+            if (recordIds.length > 1) {
+              return recordIds.firstWhere((id) => id != selfRecordId);
+            }
+          } else {
+            // Conflict with OTHER transaction
+            return recordIds.first;
+          }
         }
       }
     }
