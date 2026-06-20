@@ -2942,9 +2942,27 @@ class TableDataManager {
       }
 
       // handle insert buffer
-      final keys = explicitInsertKeys ??
-          _dataStore.writeBufferManager
+      Iterable<String> keys;
+      if (explicitInsertKeys != null) {
+        keys = explicitInsertKeys;
+      } else {
+        final candidates = _dataStore.migrationManager
+                ?.getRuntimeReadTableCandidates(tableName) ??
+            const <String>[];
+        if (candidates.isEmpty) {
+          keys = _dataStore.writeBufferManager
               .getBufferedInsertKeys(tableName, reverse: reverse);
+        } else {
+          final allInsertKeys = <String>[];
+          allInsertKeys.addAll(_dataStore.writeBufferManager
+              .getBufferedInsertKeys(tableName, reverse: reverse));
+          for (final candidate in candidates) {
+            allInsertKeys.addAll(_dataStore.writeBufferManager
+                .getBufferedInsertKeys(candidate, reverse: reverse));
+          }
+          keys = allInsertKeys;
+        }
+      }
 
       for (final key in keys) {
         await yieldController.maybeYield();
