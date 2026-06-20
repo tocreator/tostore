@@ -238,7 +238,8 @@ class BackgroundWriteScheduler {
     // 1. Rename in _queue maps
     final tableMap = _queue.remove(oldTableName);
     if (tableMap != null) {
-      final updatedTableMap = <String, Map<BackgroundWriteType, BackgroundWriteEntry>>{};
+      final updatedTableMap =
+          <String, Map<BackgroundWriteType, BackgroundWriteEntry>>{};
       tableMap.forEach((pk, typeMap) {
         final updatedTypeMap = <BackgroundWriteType, BackgroundWriteEntry>{};
         typeMap.forEach((type, entry) {
