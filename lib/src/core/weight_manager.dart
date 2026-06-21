@@ -730,6 +730,32 @@ class WeightManager {
     }
   }
 
+  /// Clear weights for a specific table
+  void clearWeightsForTable(String tableName) {
+    bool changed = false;
+
+    // 1. Remove table record weight
+    if (_weightCache[WeightType.tableRecord]!.containsKey(tableName)) {
+      _weightCache[WeightType.tableRecord]!.remove(tableName);
+      changed = true;
+    }
+
+    // 2. Remove index weights
+    final indexCache = _weightCache[WeightType.indexData]!;
+    final prefix = '$tableName:';
+    final keysToRemove =
+        indexCache.keys.where((k) => k.startsWith(prefix)).toList();
+    for (final key in keysToRemove) {
+      indexCache.remove(key);
+      changed = true;
+    }
+
+    if (changed) {
+      _rebuildHighWeightCache();
+      _dirty = true;
+    }
+  }
+
   /// Clear weight data (for testing or reset)
   Future<void> clear({String? spaceName}) async {
     clearMemory();
