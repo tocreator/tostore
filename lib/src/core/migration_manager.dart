@@ -1560,12 +1560,15 @@ class MigrationManager {
         targetSchema ?? oldSchema,
       );
       final cutoverPointer = _dataStore.walManager.currentPointer;
+      final physicalRenameSpaces =
+          renameOp != null ? List<String>.from(spaces) : <String>[];
 
       var task = MigrationTask(
         taskId: taskId,
         tableName: tableName,
         isSchemaUpdated: false,
         pendingMigrationSpaces: spaces,
+        pendingPhysicalRenameSpaces: physicalRenameSpaces,
         operations: sortedOperations,
         createTime: DateTime.now(),
         dirIndex: dirIndex,
@@ -1691,6 +1694,10 @@ class MigrationManager {
         needDataMigration: needDataMigration,
       );
       _registerRuntimeMigration(task);
+
+      if (renameOp != null && renameOp.newTableName != null) {
+        _startAsyncRenameTableOnDiskForCurrentSpace(task);
+      }
 
       // only trigger task processing when startProcessing is true
       if (startProcessing) {
@@ -2120,7 +2127,7 @@ class MigrationManager {
       final fieldRenameHints = _buildFieldRenameHints(operations);
 
       if (renameOp != null && renameOp.newTableName != null) {
-        await _dataStore.renameTableForMigration(
+        await _dataStore.renameTableInMemory(
           tableName,
           currentTableName,
           oldSchemaSnapshot: oldSchema,
@@ -3896,14 +3903,35 @@ class MigrationManager {
             }
 
             if (renameOp != null && renameOp.newTableName != null) {
-              await migrationInstance.renameTableForMigration(
-                originalTableName,
-                currentTableName,
-                oldSchemaSnapshot: oldSchema,
-                updateSchema: false,
-                refreshForeignKeySystemTables: true,
-                spaceName: space,
-              );
+              final cutover = currentTask.schemaCutoverWalPointer;
+              if (cutover != null) {
+                // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
+                // This ensures all buffered old-name writes are safely flushed to disk.
+                while (!_dataStore.walManager.isAtOrBefore(
+                    cutover, _dataStore.walManager.meta.checkpoint)) {
+                  await Future.delayed(const Duration(milliseconds: 100));
+                }
+              }
+
+              if (currentTask.pendingPhysicalRenameSpaces.contains(space)) {
+                // After checkpoint catchup, perform physical renaming cutover.
+                await migrationInstance.renameTableOnDisk(
+                  originalTableName,
+                  currentTableName,
+                  oldSchemaSnapshot: oldSchema,
+                  updateSchema: false,
+                  refreshForeignKeySystemTables: true,
+                  spaceName: space,
+                );
+
+                currentTask =
+                    currentTask.removePendingPhysicalRenameSpace(space);
+                _updatePendingTaskInMemory(currentTask);
+                await _saveMigrationTask(currentTask);
+              }
+
+              // Remove from _pendingTableRenames now that the physical cutover is complete
+              _dataStore.pendingTableRenames.remove(currentTableName);
             }
 
             await _reconcileSchemaSideEffectsAfterSchemaCutover(
@@ -4744,6 +4772,11 @@ class MigrationManager {
   /// Cleanup task files after completion
   Future<void> _cleanupTask(MigrationTask task) async {
     try {
+      final renameOp = _findRenameOperation(task.operations);
+      if (renameOp != null && renameOp.newTableName != null) {
+        _dataStore.pendingTableRenames.remove(renameOp.newTableName!);
+      }
+
       final taskPath = _dataStore.pathManager
           .getMigrationTaskPath(task.dirIndex, task.taskId);
 
@@ -4781,10 +4814,179 @@ class MigrationManager {
         userSchemas: userSchemas,
         systemSchemas: systemSchemas,
       );
+
+      // Re-hydrate pending table renames map from recovered unfinished tasks for current space only
+      _dataStore.pendingTableRenames.clear();
+      final currentSpace = _dataStore.currentSpaceName;
+      for (final task in _pendingTasks) {
+        final renameOp = _findRenameOperation(task.operations);
+        if (renameOp != null && renameOp.newTableName != null) {
+          if (task.pendingPhysicalRenameSpaces.contains(currentSpace)) {
+            _dataStore.pendingTableRenames[renameOp.newTableName!] =
+                task.tableName;
+          }
+        }
+      }
+
       await syncHasMigrationTask();
+      await catchUpPendingPhysicalRenamesOnStartup();
     } catch (e) {
       Logger.error('Failed to initialize migration manager', rawError: e);
     }
+  }
+
+  /// For any pending renameTable migration tasks, perform their physical renaming
+  /// (moving directory, writing schemas, updating mappings) synchronously before WAL replay.
+  /// Note: This only blocks on the current space. Other spaces will be processed asynchronously later.
+  Future<void> catchUpPendingPhysicalRenamesOnStartup() async {
+    for (final task in _pendingTasks) {
+      if (!task.isSchemaUpdated) continue;
+      final renameOp = _findRenameOperation(task.operations);
+      var currentTask = task;
+      if (renameOp != null && renameOp.newTableName != null) {
+        final oldTableName = currentTask.tableName;
+        final newTableName = renameOp.newTableName!;
+
+        final currentSpace = _dataStore.currentSpaceName;
+        // Perform physical rename cutovers for current space only, blocking!
+        if (currentTask.pendingPhysicalRenameSpaces.contains(currentSpace)) {
+          try {
+            Logger.info(
+                'Catching up pending physical rename on startup: $oldTableName -> $newTableName in space $currentSpace');
+            await _dataStore.renameTableOnDisk(
+              oldTableName,
+              newTableName,
+              oldSchemaSnapshot: currentTask.oldSchemaSnapshot,
+              updateSchema: true,
+              refreshForeignKeySystemTables: true,
+              spaceName: currentSpace,
+            );
+
+            currentTask =
+                currentTask.removePendingPhysicalRenameSpace(currentSpace);
+            await _saveMigrationTask(currentTask);
+            _updatePendingTaskInMemory(currentTask);
+          } catch (e) {
+            Logger.error(
+                'Failed to catch up physical rename on startup: $oldTableName -> $newTableName in space $currentSpace',
+                rawError: e);
+          }
+        }
+      }
+    }
+  }
+
+  void _startAsyncRenameTableOnDiskForCurrentSpace(MigrationTask task) {
+    unawaited(() async {
+      try {
+        final currentSpace = _dataStore.currentSpaceName;
+        // Verify if it is still pending physical rename in current space
+        if (!task.pendingPhysicalRenameSpaces.contains(currentSpace)) {
+          return;
+        }
+
+        final renameOp = _findRenameOperation(task.operations);
+        if (renameOp == null || renameOp.newTableName == null) return;
+        final newTableName = renameOp.newTableName!;
+        final oldTableName = task.tableName;
+
+        final cutover = task.schemaCutoverWalPointer;
+        if (cutover != null) {
+          // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
+          // This ensures all buffered old-name writes are safely flushed to disk.
+          while (!_dataStore.walManager
+              .isAtOrBefore(cutover, _dataStore.walManager.meta.checkpoint)) {
+            await Future.delayed(const Duration(milliseconds: 100));
+          }
+        }
+
+        // Check again if the task has been updated/completed while waiting
+        final freshTask = _findPendingTaskById(task.taskId);
+        if (freshTask == null ||
+            !freshTask.pendingPhysicalRenameSpaces.contains(currentSpace)) {
+          return;
+        }
+
+        Logger.info(
+            'Checkpoint cleared. Performing async physical rename for current space [$currentSpace]: $oldTableName -> $newTableName');
+        await _dataStore.renameTableOnDisk(
+          oldTableName,
+          newTableName,
+          oldSchemaSnapshot: freshTask.oldSchemaSnapshot,
+          updateSchema: false,
+          refreshForeignKeySystemTables: true,
+          spaceName: currentSpace,
+        );
+
+        // Update task state
+        var updatedTask =
+            freshTask.removePendingPhysicalRenameSpace(currentSpace);
+        await _saveMigrationTask(updatedTask);
+        _updatePendingTaskInMemory(updatedTask);
+
+        // Remove from _pendingTableRenames now that the physical cutover is complete for this space
+        _dataStore.pendingTableRenames.remove(newTableName);
+      } catch (e) {
+        Logger.error('Failed in async renameTableOnDisk for current space',
+            rawError: e);
+      }
+    }());
+  }
+
+  MigrationTask? _findPendingTaskById(String taskId) {
+    for (final t in _pendingTasks) {
+      if (t.taskId == taskId) return t;
+    }
+    return null;
+  }
+
+  /// Returns a map of pending table renames: oldTableName -> newTableName
+  Map<String, String> getPendingTableRenames() {
+    final renames = <String, String>{};
+    for (final task in _pendingTasks) {
+      final renameOp = _findRenameOperation(task.operations);
+      if (renameOp != null && renameOp.newTableName != null) {
+        renames[task.tableName] = renameOp.newTableName!;
+      }
+    }
+    return renames;
+  }
+
+  /// Translates a legacy WAL entry table name and field names to current table name and field names.
+  Map<String, dynamic> translateLegacyWalEntry(
+    String oldTableName,
+    Map<String, dynamic> data,
+  ) {
+    MigrationTask? task;
+    for (final t in _pendingTasks) {
+      if (t.tableName == oldTableName) {
+        task = t;
+        break;
+      }
+    }
+    if (task == null) return data;
+
+    // Resolve field rename mapping for this task
+    final fieldRenames = <String, String>{}; // oldFieldName -> newFieldName
+    for (final op in task.operations) {
+      if (op.type == MigrationType.renameField &&
+          op.fieldName != null &&
+          op.newName != null) {
+        fieldRenames[op.fieldName!] = op.newName!;
+      }
+    }
+
+    if (fieldRenames.isEmpty) {
+      return data;
+    }
+
+    final translatedData = <String, dynamic>{};
+    data.forEach((key, val) {
+      final newKey = fieldRenames[key] ?? key;
+      translatedData[newKey] = val;
+    });
+
+    return translatedData;
   }
 
   /// Load unfinished schema migration tasks from disk into [_pendingTasks].
