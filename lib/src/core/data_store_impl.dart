@@ -182,6 +182,20 @@ class DataStoreImpl {
     return null;
   }
 
+  /// Wait until all active table renames are completed.
+  Future<void> awaitActiveTableRenames() async {
+    while (_activeTableRenames.isNotEmpty) {
+      final futures = _activeTableRenames.values.map((c) => c.future).toList();
+      if (futures.isNotEmpty) {
+        try {
+          await Future.wait(futures);
+        } catch (_) {}
+      } else {
+        break;
+      }
+    }
+  }
+
   /// Mark a table as renaming to block concurrent operations.
   void startTableRenameBarrier(String oldTableName, String newTableName) {
     final completer = Completer<void>();

@@ -401,6 +401,10 @@ class ParallelJournalManager {
           break;
         }
 
+        if (_dataStore.hasActiveTableRenames) {
+          await _dataStore.awaitActiveTableRenames();
+        }
+
         final batchSw = Stopwatch()..start();
 
         final int backgroundRecordsCount;
