@@ -358,9 +358,10 @@ class DirectoryManager {
   Future<TableDirectoryInfo?> getTableDirectoryInfo(
       String tableName, bool isGlobal,
       {String? spaceName}) async {
+    final physicalName = _dataStore.resolvePhysicalTableName(tableName);
     final currentSpaceName = _resolveSpaceName(spaceName);
     final spacePrefix = isGlobal ? 'global' : currentSpaceName;
-    final tableKey = _getTableKey(spacePrefix, tableName);
+    final tableKey = _getTableKey(spacePrefix, physicalName);
 
     if (isGlobal) {
       final globalConfig = await _dataStore.getGlobalConfig() ?? GlobalConfig();
@@ -474,9 +475,10 @@ class DirectoryManager {
   /// Get table path (internal method)
   String _getTablePath(String tableName, bool isGlobal, int dirIndex,
       {String? spaceName}) {
+    final physicalName = _dataStore.resolvePhysicalTableName(tableName);
     final subDir =
         _getTableSubDirectoryPath(isGlobal, dirIndex, spaceName: spaceName);
-    return pathJoin(subDir, tableName);
+    return pathJoin(subDir, physicalName);
   }
 
   /// Build a table directory path from a resolved directory shard.
@@ -486,6 +488,7 @@ class DirectoryManager {
     required int dirIndex,
     String? spaceName,
   }) {
+    final physicalName = _dataStore.resolvePhysicalTableName(tableName);
     final subDir = isGlobal
         ? pathJoin(_dataStore.pathManager.getGlobalPath(), 'tables_$dirIndex')
         : pathJoin(
@@ -494,7 +497,7 @@ class DirectoryManager {
             ),
             'tables_$dirIndex',
           );
-    return pathJoin(subDir, tableName);
+    return pathJoin(subDir, physicalName);
   }
 
   /// Get table path, if table does not exist, allocate directory and create path
