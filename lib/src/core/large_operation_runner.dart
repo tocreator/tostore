@@ -41,6 +41,20 @@ class LargeOperationRunner {
     _activeTokens[spaceName]?.cancel();
   }
 
+  /// Request cooperative pause for all tasks in a specific space and wait for them to finish.
+  static Future<bool> pauseAndAwait(String spaceName) async {
+    final token = _activeTokens[spaceName];
+    if (token == null) return false;
+    token.cancel();
+    final task = _activeTasks[spaceName];
+    if (task != null) {
+      try {
+        await task;
+      } catch (_) {}
+    }
+    return true;
+  }
+
   /// Cooperatively pause ongoing background tasks for switch space or shutdown.
   static Future<void> pauseForShutdown(DataStoreImpl dataStore) async {
     final space = dataStore.currentSpaceName;
