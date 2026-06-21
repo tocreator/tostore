@@ -373,6 +373,72 @@ class WriteBufferManager {
     return (_tableClearEpochs[tableName] ?? 0) + _globalClearEpoch;
   }
 
+  /// Rename table in write-sets, buffers, clear epochs, transaction buffers, queues, and cleanups.
+  void renameTable(String oldTableName, String newTableName) {
+    if (oldTableName == newTableName) return;
+
+    // 1. Rename key in _buffersByTable
+    final buffer = _buffersByTable.remove(oldTableName);
+    if (buffer != null) {
+      _buffersByTable[newTableName] = buffer;
+    }
+
+    // 2. Rename key in _tableClearEpochs
+    final epoch = _tableClearEpochs.remove(oldTableName);
+    if (epoch != null) {
+      _tableClearEpochs[newTableName] = epoch;
+    }
+
+    // 3. Rename key in _txnBuffers (transactionId -> tableName -> _TxnUniqueTableBuffer)
+    for (final txnId in _txnBuffers.keys) {
+      final txnTables = _txnBuffers[txnId];
+      if (txnTables != null) {
+        final txnBuf = txnTables.remove(oldTableName);
+        if (txnBuf != null) {
+          txnTables[newTableName] = txnBuf;
+        }
+      }
+    }
+
+    // 4. Rename in _writeQueue (Queue<WriteQueueEntry>)
+    final updatedQueue = Queue<WriteQueueEntry>();
+    while (_writeQueue.isNotEmpty) {
+      final entry = _writeQueue.removeFirst();
+      if (entry.tableName == oldTableName) {
+        updatedQueue.add(WriteQueueEntry(
+          tableName: newTableName,
+          recordId: entry.recordId,
+          operationType: entry.operationType,
+          walPointer: entry.walPointer,
+        ));
+      } else {
+        updatedQueue.add(entry);
+      }
+    }
+    _writeQueue.addAll(updatedQueue);
+
+    // 5. Rename in _pendingCleanupQueue (Queue<_PendingCleanup>)
+    final updatedCleanupQueue = Queue<_PendingCleanup>();
+    while (_pendingCleanupQueue.isNotEmpty) {
+      final pc = _pendingCleanupQueue.removeFirst();
+      final entry = pc.entry;
+      if (entry.tableName == oldTableName) {
+        updatedCleanupQueue.add(_PendingCleanup(
+          WriteQueueEntry(
+            tableName: newTableName,
+            recordId: entry.recordId,
+            operationType: entry.operationType,
+            walPointer: entry.walPointer,
+          ),
+          pc.flushMarker,
+        ));
+      } else {
+        updatedCleanupQueue.add(pc);
+      }
+    }
+    _pendingCleanupQueue.addAll(updatedCleanupQueue);
+  }
+
   /// Remove a specific record from buffer and queue (best effort)
   void removeRecord(String tableName, String recordId) {
     // 1) Cleanup table buffers
