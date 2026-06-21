@@ -34,7 +34,7 @@ abstract class IdGenerator {
 class SequentialIdGenerator implements IdGenerator {
   final SequentialIdConfig config;
   final DistributedNodeConfig? nodeConfig;
-  final String? tableName;
+  String? tableName;
   final CentralServerClient? centralClient;
 
   int _currentId;
@@ -255,6 +255,10 @@ class SequentialIdGenerator implements IdGenerator {
 
   /// Current id position (for persistence/recovery). Last allocated id.
   int get currentId => _currentId;
+
+  void renameTable(String newTableName) {
+    tableName = newTableName;
+  }
 }
 
 /// Base62 encoder (used for generating short code IDs)
@@ -328,7 +332,7 @@ class Base62Encoder {
 class TimeBasedIdGenerator implements IdGenerator {
   final PrimaryKeyType keyType; // timestampBased, datePrefixed or shortCode
   final DistributedNodeConfig nodeConfig;
-  final String tableName;
+  String tableName;
 
   // Timestamp/date prefix ID generation related properties
   final Map<String, int> _sequenceMap =
@@ -383,6 +387,79 @@ class TimeBasedIdGenerator implements IdGenerator {
 
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
+
+  /// Clean up static states when a table is renamed
+  static void handleTableRename(String oldTableName, String newTableName) {
+    if (oldTableName == newTableName) return;
+
+    final keysToRename = <String>[];
+    for (final key in _instances.keys) {
+      if (key.endsWith('_$oldTableName')) {
+        keysToRename.add(key);
+      }
+    }
+
+    for (final oldKey in keysToRename) {
+      final generator = _instances.remove(oldKey);
+      if (generator != null) {
+        final keyType = generator.keyType;
+        final newKey = '${keyType}_$newTableName';
+        _instances[newKey] = generator;
+
+        if (_lastInstanceAccessTime.containsKey(oldKey)) {
+          _lastInstanceAccessTime[newKey] =
+              _lastInstanceAccessTime.remove(oldKey)!;
+        }
+
+        // Rename table-scoped state maps internally via the generator instance
+        if (generator._sequenceMap.containsKey(oldTableName)) {
+          generator._sequenceMap[newTableName] =
+              generator._sequenceMap.remove(oldTableName)!;
+        }
+        if (generator._lastValueMap.containsKey(oldTableName)) {
+          generator._lastValueMap[newTableName] =
+              generator._lastValueMap.remove(oldTableName)!;
+        }
+        if (generator._idPools.containsKey(oldTableName)) {
+          generator._idPools[newTableName] =
+              generator._idPools.remove(oldTableName)!;
+        }
+        if (generator._idPoolLastUpdateTime.containsKey(oldTableName)) {
+          generator._idPoolLastUpdateTime[newTableName] =
+              generator._idPoolLastUpdateTime.remove(oldTableName)!;
+        }
+        if (generator._idGenerationInProgress.containsKey(oldTableName)) {
+          generator._idGenerationInProgress[newTableName] =
+              generator._idGenerationInProgress.remove(oldTableName)!;
+        }
+        if (generator._recentRequestCount.containsKey(oldTableName)) {
+          generator._recentRequestCount[newTableName] =
+              generator._recentRequestCount.remove(oldTableName)!;
+        }
+        if (generator._lastCountResetTime.containsKey(oldTableName)) {
+          generator._lastCountResetTime[newTableName] =
+              generator._lastCountResetTime.remove(oldTableName)!;
+        }
+
+        generator.tableName = newTableName;
+      }
+    }
+  }
+
+  /// Clean up static states when a table is deleted to avoid memory leaks
+  static void handleTableDelete(String tableName) {
+    final keysToRemove = <String>[];
+    for (final key in _instances.keys) {
+      if (key.endsWith('_$tableName')) {
+        keysToRemove.add(key);
+      }
+    }
+
+    for (final key in keysToRemove) {
+      _instances.remove(key);
+      _lastInstanceAccessTime.remove(key);
+    }
+  }
 
   /// Get generator from instance map, create new instance if not exists
   static TimeBasedIdGenerator getInstance(PrimaryKeyType keyType,
