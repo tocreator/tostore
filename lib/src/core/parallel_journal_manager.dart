@@ -1704,16 +1704,32 @@ class ParallelJournalManager {
             if (entry != null) {
               if (entry is TablePartitionFlushedEntry &&
                   entry.batchId == batch.batchId) {
+                var resolvedTable = entry.table;
+                final migMgr = _dataStore.migrationManager;
+                if (migMgr != null) {
+                  final pendingRenames = migMgr.getPendingTableRenames();
+                  if (pendingRenames.containsKey(entry.table)) {
+                    resolvedTable = pendingRenames[entry.table]!;
+                  }
+                }
                 // Track the last flushed entry (max partitionNo) for each table
-                final existing = tableLastFlushedEntry[entry.table];
+                final existing = tableLastFlushedEntry[resolvedTable];
                 if (existing == null ||
                     entry.partitionNo > existing.partitionNo) {
-                  tableLastFlushedEntry[entry.table] = entry;
+                  tableLastFlushedEntry[resolvedTable] = entry;
                 }
               } else if (entry is IndexPartitionFlushedEntry &&
                   entry.batchId == batch.batchId) {
+                var resolvedTable = entry.table;
+                final migMgr = _dataStore.migrationManager;
+                if (migMgr != null) {
+                  final pendingRenames = migMgr.getPendingTableRenames();
+                  if (pendingRenames.containsKey(entry.table)) {
+                    resolvedTable = pendingRenames[entry.table]!;
+                  }
+                }
                 // Track the last flushed entry (max partitionNo) for each index
-                final indexKey = '${entry.table}:${entry.index}';
+                final indexKey = '$resolvedTable:${entry.index}';
                 final existing = indexLastFlushedEntry[indexKey];
                 if (existing == null ||
                     entry.partitionNo > existing.partitionNo) {
@@ -2324,9 +2340,19 @@ class ParallelJournalManager {
                 (entry['oldValues'] as Map?)?.cast<String, dynamic>();
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
+
+            var resolvedTable = table;
+            final migMgr = _dataStore.migrationManager;
+            if (migMgr != null) {
+              final pendingRenames = migMgr.getPendingTableRenames();
+              if (pendingRenames.containsKey(table)) {
+                resolvedTable = pendingRenames[table]!;
+              }
+            }
+
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = tableCutoffs[table];
+            final cutoffs = tableCutoffs[resolvedTable] ?? tableCutoffs[table];
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -2346,26 +2372,29 @@ class ParallelJournalManager {
             _WalOp walOp;
             switch (op) {
               case BufferOperationType.insert:
-                (inserts.putIfAbsent(table, () => <Map<String, dynamic>>[]))
-                    .add(data);
+                (inserts.putIfAbsent(
+                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
                 walOp = _WalOp(op, data, walPointer: walPtr);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
-                orderedOpsInWalOrder.add((table: table, op: walOp));
+                (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
+                    .add(walOp);
+                orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
                 break;
               case BufferOperationType.update:
-                (updates.putIfAbsent(table, () => <Map<String, dynamic>>[]))
-                    .add(data);
+                (updates.putIfAbsent(
+                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
                 walOp =
                     _WalOp(op, data, oldValues: oldValues, walPointer: walPtr);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
-                orderedOpsInWalOrder.add((table: table, op: walOp));
+                (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
+                    .add(walOp);
+                orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
                 break;
               case BufferOperationType.delete:
-                (deletes.putIfAbsent(table, () => <Map<String, dynamic>>[]))
-                    .add(data);
+                (deletes.putIfAbsent(
+                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
                 walOp = _WalOp(op, data, walPointer: walPtr);
-                (ordered.putIfAbsent(table, () => <_WalOp>[])).add(walOp);
-                orderedOpsInWalOrder.add((table: table, op: walOp));
+                (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
+                    .add(walOp);
+                orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
                 break;
               case BufferOperationType.rewrite:
                 break;
@@ -2730,17 +2759,42 @@ class ParallelJournalManager {
           if (entry == null) continue;
 
           if (entry is BatchStartEntry && entry.batchId == batch.batchId) {
-            tablePlans.addAll(entry.tablePlan);
+            final migMgr = _dataStore.migrationManager;
+            if (migMgr != null) {
+              final pendingRenames = migMgr.getPendingTableRenames();
+              entry.tablePlan.forEach((key, val) {
+                final resolvedKey = pendingRenames[key] ?? key;
+                tablePlans[resolvedKey] = val;
+              });
+            } else {
+              tablePlans.addAll(entry.tablePlan);
+            }
           } else if (entry is BatchCompletedEntry &&
               entry.batchId == batch.batchId) {
             isCompleted = true;
           } else if (entry is TableMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
-            flushedTables.add(entry.table);
+            var resolvedTable = entry.table;
+            final migMgr = _dataStore.migrationManager;
+            if (migMgr != null) {
+              final pendingRenames = migMgr.getPendingTableRenames();
+              if (pendingRenames.containsKey(entry.table)) {
+                resolvedTable = pendingRenames[entry.table]!;
+              }
+            }
+            flushedTables.add(resolvedTable);
           } else if (entry is IndexMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
+            var resolvedTable = entry.table;
+            final migMgr = _dataStore.migrationManager;
+            if (migMgr != null) {
+              final pendingRenames = migMgr.getPendingTableRenames();
+              if (pendingRenames.containsKey(entry.table)) {
+                resolvedTable = pendingRenames[entry.table]!;
+              }
+            }
             flushedIndexes
-                .putIfAbsent(entry.table, () => <String>{})
+                .putIfAbsent(resolvedTable, () => <String>{})
                 .add(entry.index);
           }
         } catch (_) {}
