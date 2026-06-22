@@ -1454,13 +1454,23 @@ class ParallelJournalManager {
             lastSeq = seq;
 
             final table = entry['table'] as String?;
-            final data = (entry['data'] as Map?)?.cast<String, dynamic>();
+            var data = (entry['data'] as Map?)?.cast<String, dynamic>();
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
 
+            var resolvedTable = table;
+            final migMgr = _dataStore.migrationManager;
+            if (migMgr != null) {
+              final pendingRenames = migMgr.getPendingTableRenames();
+              if (pendingRenames.containsKey(table)) {
+                resolvedTable = pendingRenames[table]!;
+                data = migMgr.translateLegacyWalEntry(table, data);
+              }
+            }
+
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = tableCutoffs[table];
+            final cutoffs = tableCutoffs[resolvedTable] ?? tableCutoffs[table];
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -1477,7 +1487,7 @@ class ParallelJournalManager {
             final op = BufferOperationType.values[opIdx];
 
             final schema =
-                await _dataStore.schemaManager?.getTableSchema(table);
+                await _dataStore.schemaManager?.getTableSchema(resolvedTable);
             if (schema == null) {
               // Table was dropped or schema unavailable; skip this WAL entry.
               continue;
@@ -1496,17 +1506,17 @@ class ParallelJournalManager {
               final pkValue = data[schema.primaryKey];
               if (pkValue != null) {
                 // Get or create matcher for this table
-                MatcherFunction? pkMatcher = pkMatchersByTable[table];
+                MatcherFunction? pkMatcher = pkMatchersByTable[resolvedTable];
                 if (pkMatcher == null) {
                   pkMatcher = ValueMatcher.getMatcher(
                       schema.getPrimaryKeyMatcherType());
-                  pkMatchersByTable[table] = pkMatcher;
+                  pkMatchersByTable[resolvedTable] = pkMatcher;
                 }
 
                 // Update max primary key for this table
-                final currentMax = maxPkByTable[table];
+                final currentMax = maxPkByTable[resolvedTable];
                 if (currentMax == null || pkMatcher(pkValue, currentMax) > 0) {
-                  maxPkByTable[table] = pkValue;
+                  maxPkByTable[resolvedTable] = pkValue;
                 }
               }
             }
@@ -1519,9 +1529,9 @@ class ParallelJournalManager {
               oldValues: (entry['oldValues'] as Map?)?.cast<String, dynamic>(),
             );
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
-            final uniqueRefs = await _computeUniqueKeyRefs(table, data);
+            final uniqueRefs = await _computeUniqueKeyRefs(resolvedTable, data);
             await _bufferManager.addRecord(
-              tableName: table,
+              tableName: resolvedTable,
               recordId: recordId,
               entry: be.copyWith(walPointer: walPtr),
               uniqueKeys: uniqueRefs,
