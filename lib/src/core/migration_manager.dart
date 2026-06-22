@@ -2124,12 +2124,12 @@ class MigrationManager {
       }
 
       // 2. Clear pending background write scheduler entries for this table
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-          tableName, BackgroundWriteType.largeUpdate);
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-          tableName, BackgroundWriteType.largeDelete);
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-          tableName, BackgroundWriteType.keyMigration);
+      await _dataStore.backgroundWriteScheduler
+          .clearEntriesForTable(tableName, BackgroundWriteType.largeUpdate);
+      await _dataStore.backgroundWriteScheduler
+          .clearEntriesForTable(tableName, BackgroundWriteType.largeDelete);
+      await _dataStore.backgroundWriteScheduler
+          .clearEntriesForTable(tableName, BackgroundWriteType.keyMigration);
 
       final oldSchema =
           await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -4978,43 +4978,6 @@ class MigrationManager {
       }
     }
     return renames;
-  }
-
-  /// Translates a legacy WAL entry table name and field names to current table name and field names.
-  Map<String, dynamic> translateLegacyWalEntry(
-    String oldTableName,
-    Map<String, dynamic> data,
-  ) {
-    MigrationTask? task;
-    for (final t in _pendingTasks) {
-      if (t.tableName == oldTableName) {
-        task = t;
-        break;
-      }
-    }
-    if (task == null) return data;
-
-    // Resolve field rename mapping for this task
-    final fieldRenames = <String, String>{}; // oldFieldName -> newFieldName
-    for (final op in task.operations) {
-      if (op.type == MigrationType.renameField &&
-          op.fieldName != null &&
-          op.newName != null) {
-        fieldRenames[op.fieldName!] = op.newName!;
-      }
-    }
-
-    if (fieldRenames.isEmpty) {
-      return data;
-    }
-
-    final translatedData = <String, dynamic>{};
-    data.forEach((key, val) {
-      final newKey = fieldRenames[key] ?? key;
-      translatedData[newKey] = val;
-    });
-
-    return translatedData;
   }
 
   /// Load unfinished schema migration tasks from disk into [_pendingTasks].

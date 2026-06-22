@@ -1464,7 +1464,6 @@ class ParallelJournalManager {
               final pendingRenames = migMgr.getPendingTableRenames();
               if (pendingRenames.containsKey(table)) {
                 resolvedTable = pendingRenames[table]!;
-                data = migMgr.translateLegacyWalEntry(table, data);
               }
             }
 
