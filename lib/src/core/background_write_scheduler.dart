@@ -1,6 +1,7 @@
 import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/cancellation_token.dart';
+import 'yield_controller.dart';
 
 /// A background write scheduler that manages pending background write operations
 /// (schema migrations, key migrations, large deletes, and large updates).
@@ -28,7 +29,8 @@ class BackgroundWriteScheduler {
   /// Whether any not-yet-polled entry has the given [type].
   bool hasPendingEntriesOfType(BackgroundWriteType type) {
     for (var i = _headIndex; i < _orderedQueue.length; i++) {
-      if (_orderedQueue[i].type == type) return true;
+      final entry = _orderedQueue[i];
+      if (entry.isValid && entry.type == type) return true;
     }
     return false;
   }
@@ -134,10 +136,6 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Poll background write entries for the current active background task.
-  ///
-  /// Identifies the oldest taskId in the queue and pulls up to [limit] entries
-  /// belonging to that task.
   List<BackgroundWriteEntry> pollBackgroundWriteEntries(int limit) {
     if (isEmpty || limit <= 0) {
       _resetQueueIfNeeded();
@@ -150,6 +148,10 @@ class BackgroundWriteScheduler {
 
     while (_headIndex < _orderedQueue.length && count < limit) {
       final entry = _orderedQueue[_headIndex];
+      if (!entry.isValid) {
+        _headIndex++;
+        continue;
+      }
       if (entry.taskId != activeTaskId) {
         break; // Stop when encountering another task's entries
       }
@@ -198,13 +200,24 @@ class BackgroundWriteScheduler {
   /// Clear all pending background write entries of the given [type].
   ///
   /// This removes them from both lookup maps and the ordered queue.
-  void clearEntriesOfType(BackgroundWriteType type) {
+  Future<void> clearEntriesOfType(BackgroundWriteType type) async {
+    final yieldController = YieldController('BackgroundWriteScheduler.clearEntriesOfType');
+
     // 1. Remove from _queue maps
-    for (final tableMap in _queue.values) {
-      for (final existingMap in tableMap.values) {
-        final entry = existingMap.remove(type);
-        if (entry != null) {
-          entry.isValid = false;
+    final tables = _queue.keys.toList();
+    for (final tableName in tables) {
+      final tableMap = _queue[tableName];
+      if (tableMap != null) {
+        final pks = tableMap.keys.toList();
+        for (final pk in pks) {
+          await yieldController.maybeYield();
+          final existingMap = tableMap[pk];
+          if (existingMap != null) {
+            final entry = existingMap.remove(type);
+            if (entry != null) {
+              entry.isValid = false;
+            }
+          }
         }
       }
     }
@@ -217,7 +230,10 @@ class BackgroundWriteScheduler {
     // 2. Remove from _orderedQueue
     if (_headIndex < _orderedQueue.length) {
       final List<BackgroundWriteEntry> remaining = [];
-      for (var i = _headIndex; i < _orderedQueue.length; i++) {
+      final originalLength = _orderedQueue.length;
+      for (var i = _headIndex; i < originalLength; i++) {
+        await yieldController.maybeYield();
+        if (i >= _orderedQueue.length) break; // Guard against concurrent clear/truncation
         final entry = _orderedQueue[i];
         if (entry.type == type) {
           entry.isValid = false;
@@ -225,33 +241,100 @@ class BackgroundWriteScheduler {
           remaining.add(entry);
         }
       }
-      // Re-populate orderedQueue for the pending segment
-      _orderedQueue.length = _headIndex; // Keep already-polled prefix intact
-      _orderedQueue.addAll(remaining);
+
+      if (_headIndex < _orderedQueue.length) {
+        final int currentLen = _orderedQueue.length;
+        final newAppended = currentLen > originalLength
+            ? _orderedQueue.sublist(originalLength)
+            : const <BackgroundWriteEntry>[];
+        _orderedQueue.length = _headIndex; // Keep already-polled prefix intact
+        _orderedQueue.addAll(remaining);
+        _orderedQueue.addAll(newAppended);
+      }
+    }
+  }
+
+  /// Clear all pending background write entries for the given [tableName] and [type].
+  Future<void> clearEntriesForTable(String tableName, BackgroundWriteType type) async {
+    final yieldController = YieldController('BackgroundWriteScheduler.clearEntriesForTable');
+
+    // 1. Remove from _queue maps
+    final tableMap = _queue[tableName];
+    if (tableMap != null) {
+      final pks = tableMap.keys.toList();
+      for (final pk in pks) {
+        await yieldController.maybeYield();
+        final existingMap = tableMap[pk];
+        if (existingMap != null) {
+          final entry = existingMap.remove(type);
+          if (entry != null) {
+            entry.isValid = false;
+          }
+        }
+      }
+      tableMap.removeWhere((pk, existingMap) => existingMap.isEmpty);
+      if (tableMap.isEmpty) {
+        _queue.remove(tableName);
+      }
+    }
+
+    // 2. Remove from _orderedQueue
+    if (_headIndex < _orderedQueue.length) {
+      final List<BackgroundWriteEntry> remaining = [];
+      final originalLength = _orderedQueue.length;
+      for (var i = _headIndex; i < originalLength; i++) {
+        await yieldController.maybeYield();
+        if (i >= _orderedQueue.length) break; // Guard against concurrent clear/truncation
+        final entry = _orderedQueue[i];
+        if (entry.tableName == tableName && entry.type == type) {
+          entry.isValid = false;
+        } else {
+          remaining.add(entry);
+        }
+      }
+
+      if (_headIndex < _orderedQueue.length) {
+        final int currentLen = _orderedQueue.length;
+        final newAppended = currentLen > originalLength
+            ? _orderedQueue.sublist(originalLength)
+            : const <BackgroundWriteEntry>[];
+        _orderedQueue.length = _headIndex; // Keep already-polled prefix intact
+        _orderedQueue.addAll(remaining);
+        _orderedQueue.addAll(newAppended);
+      }
     }
   }
 
   /// Rename table for queued and ordered background write entries.
-  void renameTable(String oldTableName, String newTableName) {
+  Future<void> renameTable(String oldTableName, String newTableName) async {
     if (oldTableName == newTableName) return;
+    final yieldController = YieldController('BackgroundWriteScheduler.renameTable');
 
     // 1. Rename in _queue maps
     final tableMap = _queue.remove(oldTableName);
     if (tableMap != null) {
       final updatedTableMap =
           <String, Map<BackgroundWriteType, BackgroundWriteEntry>>{};
-      tableMap.forEach((pk, typeMap) {
-        final updatedTypeMap = <BackgroundWriteType, BackgroundWriteEntry>{};
-        typeMap.forEach((type, entry) {
-          updatedTypeMap[type] = entry.copyWith(tableName: newTableName);
-        });
-        updatedTableMap[pk] = updatedTypeMap;
-      });
+      final pks = tableMap.keys.toList();
+      for (final pk in pks) {
+        await yieldController.maybeYield();
+        final typeMap = tableMap[pk];
+        if (typeMap != null) {
+          final updatedTypeMap = <BackgroundWriteType, BackgroundWriteEntry>{};
+          typeMap.forEach((type, entry) {
+            updatedTypeMap[type] = entry.copyWith(tableName: newTableName);
+          });
+          updatedTableMap[pk] = updatedTypeMap;
+        }
+      }
       _queue[newTableName] = updatedTableMap;
     }
 
     // 2. Rename in _orderedQueue
-    for (var i = _headIndex; i < _orderedQueue.length; i++) {
+    final originalLength = _orderedQueue.length;
+    for (var i = _headIndex; i < originalLength; i++) {
+      await yieldController.maybeYield();
+      if (i >= _orderedQueue.length) break;
       final entry = _orderedQueue[i];
       if (entry.tableName == oldTableName) {
         _orderedQueue[i] = entry.copyWith(tableName: newTableName);
@@ -261,23 +344,9 @@ class BackgroundWriteScheduler {
 
   /// Clear all pending entries in the scheduler.
   void clearAll() {
-    // 1. Mark entries in queue mapping as invalid and clear
-    for (final tableMap in _queue.values) {
-      for (final existingMap in tableMap.values) {
-        for (final entry in existingMap.values) {
-          entry.isValid = false;
-        }
-      }
-    }
     _queue.clear();
-
-    // 2. Mark entries in ordered queue as invalid and truncate pending segment
-    if (_headIndex < _orderedQueue.length) {
-      for (var i = _headIndex; i < _orderedQueue.length; i++) {
-        _orderedQueue[i].isValid = false;
-      }
-      _orderedQueue.length = _headIndex; // Keep already-polled prefix intact
-    }
+    _orderedQueue.clear();
+    _headIndex = 0;
   }
 
   /// Get priority for background write types.

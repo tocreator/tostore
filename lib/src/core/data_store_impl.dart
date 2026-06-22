@@ -7028,8 +7028,8 @@ class DataStoreImpl {
 
       // Synchronize in-memory structures and state for renaming
       await transactionManager?.renameTableInCaches(oldTableName, newTableName);
-      backgroundWriteScheduler.renameTable(oldTableName, newTableName);
-      writeBufferManager.renameTable(oldTableName, newTableName);
+      await backgroundWriteScheduler.renameTable(oldTableName, newTableName);
+      await writeBufferManager.renameTable(oldTableName, newTableName);
       tableDataManager.renameTable(oldTableName, newTableName);
 
       await _renameTableInLargeOperations(oldTableName, newTableName);

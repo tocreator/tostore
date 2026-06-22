@@ -28,6 +28,7 @@ import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'key_migration_runner.dart';
+import 'large_operation_runner.dart';
 import 'transaction_context.dart';
 import 'yield_controller.dart';
 
@@ -2108,7 +2109,28 @@ class MigrationManager {
       }
     }
 
+    final currentSpace = _dataStore.currentSpaceName;
+    bool keyMigrating = false;
+    bool backgroundPaused = false;
+
     try {
+      // 1. Pause background tasks to isolate schema cutover
+      await LargeOperationRunner.pauseAndAwait(currentSpace);
+      backgroundPaused = true;
+
+      keyMigrating = KeyMigrationRunner.isTableMigrating(tableName);
+      if (keyMigrating) {
+        await _dataStore.keyManager.pauseKeyMigration();
+      }
+
+      // 2. Clear pending background write scheduler entries for this table
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+          tableName, BackgroundWriteType.largeUpdate);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+          tableName, BackgroundWriteType.largeDelete);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+          tableName, BackgroundWriteType.keyMigration);
+
       final oldSchema =
           await _dataStore.schemaManager?.getTableSchema(tableName);
       final resolvedTargetSchema = targetSchema ??
@@ -2153,6 +2175,12 @@ class MigrationManager {
       }
       return currentTableName;
     } finally {
+      if (backgroundPaused) {
+        unawaited(LargeOperationRunner.runPendingOperations(_dataStore));
+      }
+      if (keyMigrating) {
+        unawaited(_dataStore.keyManager.startDeferredKeyMigrationWork());
+      }
       if (lockMgr != null) {
         for (final entry in acquiredLocks.entries.toList().reversed) {
           lockMgr.releaseExclusiveLock(entry.key, entry.value);
@@ -3902,17 +3930,17 @@ class MigrationManager {
               return;
             }
 
-            if (renameOp != null && renameOp.newTableName != null) {
-              final cutover = currentTask.schemaCutoverWalPointer;
-              if (cutover != null) {
-                // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
-                // This ensures all buffered old-name writes are safely flushed to disk.
-                while (!_dataStore.walManager.isAtOrBefore(
-                    cutover, _dataStore.walManager.meta.checkpoint)) {
-                  await Future.delayed(const Duration(milliseconds: 100));
-                }
+            final cutover = currentTask.schemaCutoverWalPointer;
+            if (cutover != null) {
+              // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
+              // This ensures all buffered legacy-shape writes are safely flushed to disk.
+              while (!_dataStore.walManager.isAtOrBefore(
+                  cutover, _dataStore.walManager.meta.checkpoint)) {
+                await Future.delayed(const Duration(milliseconds: 100));
               }
+            }
 
+            if (renameOp != null && renameOp.newTableName != null) {
               if (currentTask.pendingPhysicalRenameSpaces.contains(space)) {
                 // After checkpoint catchup, perform physical renaming cutover.
                 await migrationInstance.renameTableOnDisk(

@@ -13,12 +13,12 @@ import 'data_store_impl.dart';
 import 'yield_controller.dart';
 
 class WriteQueueEntry {
-  final String tableName;
+  String tableName;
   final String recordId;
   final BufferOperationType operationType;
   final WalPointer walPointer;
 
-  const WriteQueueEntry({
+  WriteQueueEntry({
     required this.tableName,
     required this.recordId,
     required this.operationType,
@@ -374,8 +374,10 @@ class WriteBufferManager {
   }
 
   /// Rename table in write-sets, buffers, clear epochs, transaction buffers, queues, and cleanups.
-  void renameTable(String oldTableName, String newTableName) {
+  Future<void> renameTable(String oldTableName, String newTableName) async {
     if (oldTableName == newTableName) return;
+
+    final yieldControl = YieldController('WriteBufferManager.renameTable');
 
     // 1. Rename key in _buffersByTable
     final buffer = _buffersByTable.remove(oldTableName);
@@ -390,7 +392,9 @@ class WriteBufferManager {
     }
 
     // 3. Rename key in _txnBuffers (transactionId -> tableName -> _TxnUniqueTableBuffer)
-    for (final txnId in _txnBuffers.keys) {
+    final txnIds = _txnBuffers.keys.toList();
+    for (final txnId in txnIds) {
+      await yieldControl.maybeYield();
       final txnTables = _txnBuffers[txnId];
       if (txnTables != null) {
         final txnBuf = txnTables.remove(oldTableName);
@@ -401,42 +405,22 @@ class WriteBufferManager {
     }
 
     // 4. Rename in _writeQueue (Queue<WriteQueueEntry>)
-    final updatedQueue = Queue<WriteQueueEntry>();
-    while (_writeQueue.isNotEmpty) {
-      final entry = _writeQueue.removeFirst();
+    final writeQueueList = _writeQueue.toList();
+    for (final entry in writeQueueList) {
+      await yieldControl.maybeYield();
       if (entry.tableName == oldTableName) {
-        updatedQueue.add(WriteQueueEntry(
-          tableName: newTableName,
-          recordId: entry.recordId,
-          operationType: entry.operationType,
-          walPointer: entry.walPointer,
-        ));
-      } else {
-        updatedQueue.add(entry);
+        entry.tableName = newTableName;
       }
     }
-    _writeQueue.addAll(updatedQueue);
 
     // 5. Rename in _pendingCleanupQueue (Queue<_PendingCleanup>)
-    final updatedCleanupQueue = Queue<_PendingCleanup>();
-    while (_pendingCleanupQueue.isNotEmpty) {
-      final pc = _pendingCleanupQueue.removeFirst();
-      final entry = pc.entry;
-      if (entry.tableName == oldTableName) {
-        updatedCleanupQueue.add(_PendingCleanup(
-          WriteQueueEntry(
-            tableName: newTableName,
-            recordId: entry.recordId,
-            operationType: entry.operationType,
-            walPointer: entry.walPointer,
-          ),
-          pc.flushMarker,
-        ));
-      } else {
-        updatedCleanupQueue.add(pc);
+    final pendingCleanupList = _pendingCleanupQueue.toList();
+    for (final pc in pendingCleanupList) {
+      await yieldControl.maybeYield();
+      if (pc.entry.tableName == oldTableName) {
+        pc.entry.tableName = newTableName;
       }
     }
-    _pendingCleanupQueue.addAll(updatedCleanupQueue);
   }
 
   /// Remove a specific record from buffer and queue (best effort)

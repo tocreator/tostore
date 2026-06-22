@@ -69,9 +69,9 @@ class LargeOperationRunner {
     }
 
     // Clear pending large operations in the scheduler to avoid stalling shutdown/space-switch
-    dataStore.backgroundWriteScheduler
+    await dataStore.backgroundWriteScheduler
         .clearEntriesOfType(BackgroundWriteType.largeDelete);
-    dataStore.backgroundWriteScheduler
+    await dataStore.backgroundWriteScheduler
         .clearEntriesOfType(BackgroundWriteType.largeUpdate);
 
     Logger.info('Background large operations stopped for space [$space].');
