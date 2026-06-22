@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../handler/chacha20_poly1305.dart';
 import '../handler/encoder.dart';
 import '../handler/logger.dart';
+import '../model/db_exception.dart';
 import '../model/data_store_config.dart';
 import '../model/key_migration_info.dart';
 import '../model/space_config.dart';
@@ -403,6 +404,10 @@ class KeyManager {
         targetKeyId: info.newKeyId,
         keyChangeInfo: info,
       );
+    } on DbClosedException catch (_) {
+      // Silent
+    } catch (e) {
+      Logger.error('Key migration failed', rawError: e);
     } finally {
       _keyMigrationScheduled = false;
       _keyMigrationFuture = null;

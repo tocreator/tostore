@@ -2684,7 +2684,7 @@ class DataStoreImpl {
         }
 
         // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this));
+        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
 
         return finish(DbResult.success(
           message:
@@ -3594,7 +3594,7 @@ class DataStoreImpl {
         }
 
         // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this));
+        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
 
         return finish(DbResult.success(
           message:
@@ -7285,10 +7285,10 @@ class DataStoreImpl {
 
       // 3. Symmetrically resume background tasks if they were paused
       if (keyMigrating) {
-        unawaited(keyManager.startDeferredKeyMigrationWork());
+        unawaited(keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this));
+        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
       }
     } catch (error, stackTrace) {
       // 4. Symmetrically resume on exceptions and roll back metadata changes
@@ -7309,10 +7309,10 @@ class DataStoreImpl {
             spaceName: currentSpace,
           );
         } catch (_) {}
-        unawaited(keyManager.startDeferredKeyMigrationWork());
+        unawaited(keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this));
+        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
       }
       try {
         final oldPath = await dirMgr.getTableDirectoryPathByScope(

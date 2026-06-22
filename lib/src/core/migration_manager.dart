@@ -878,7 +878,12 @@ class MigrationManager {
           Logger.info(
             'Database migration generated ${allTasks.length} migration tasks, running asynchronously in background.',
           );
-          unawaited(processMigrationTasks());
+          unawaited(processMigrationTasks().catchError((e) {
+            if (e is DbClosedException) {
+              return MigrationTasksResult(success: false);
+            }
+            throw e;
+          }));
         }
       }
 
@@ -1702,7 +1707,12 @@ class MigrationManager {
 
       // only trigger task processing when startProcessing is true
       if (startProcessing) {
-        unawaited(processMigrationTasks());
+        unawaited(processMigrationTasks().catchError((e) {
+          if (e is DbClosedException) {
+            return MigrationTasksResult(success: false);
+          }
+          throw e;
+        }));
       }
 
       return task;
@@ -2176,10 +2186,10 @@ class MigrationManager {
       return currentTableName;
     } finally {
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(_dataStore));
+        unawaited(LargeOperationRunner.runPendingOperations(_dataStore).catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (keyMigrating) {
-        unawaited(_dataStore.keyManager.startDeferredKeyMigrationWork());
+        unawaited(_dataStore.keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (lockMgr != null) {
         for (final entry in acquiredLocks.entries.toList().reversed) {
@@ -4955,6 +4965,7 @@ class MigrationManager {
         // Remove from _pendingTableRenames now that the physical cutover is complete for this space
         _dataStore.pendingTableRenames.remove(newTableName);
       } catch (e) {
+        if (e is DbClosedException) return;
         Logger.error('Failed in async renameTableOnDisk for current space',
             rawError: e);
       }
@@ -5077,7 +5088,12 @@ class MigrationManager {
       }
 
       _rebuildRuntimeMigrations();
-      unawaited(processMigrationTasks());
+      unawaited(processMigrationTasks().catchError((e) {
+        if (e is DbClosedException) {
+          return MigrationTasksResult(success: false);
+        }
+        throw e;
+      }));
     }
   }
 
