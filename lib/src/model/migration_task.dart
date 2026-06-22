@@ -16,6 +16,8 @@ class MigrationTask {
   final bool isSchemaUpdated;
   // pending migration spaces
   final List<String> pendingMigrationSpaces;
+  // pending physical rename spaces (for table renames)
+  final List<String> pendingPhysicalRenameSpaces;
   // migration operations
   final List<MigrationOperation> operations;
   // create time
@@ -54,6 +56,7 @@ class MigrationTask {
     required this.tableName,
     required this.isSchemaUpdated,
     required this.pendingMigrationSpaces,
+    this.pendingPhysicalRenameSpaces = const <String>[],
     required this.operations,
     required this.createTime,
     required this.dirIndex,
@@ -79,6 +82,9 @@ class MigrationTask {
         isSchemaUpdated: json['isSchemaUpdated'] as bool,
         pendingMigrationSpaces:
             (json['pendingMigrationSpaces'] as List).cast<String>(),
+        pendingPhysicalRenameSpaces: json['pendingPhysicalRenameSpaces'] != null
+            ? (json['pendingPhysicalRenameSpaces'] as List).cast<String>()
+            : const <String>[],
         operations: (json['operations'] as List)
             .map((e) => MigrationOperation.fromJson(e as Map<String, dynamic>))
             .toList(),
@@ -135,6 +141,7 @@ class MigrationTask {
         'tableName': tableName,
         'isSchemaUpdated': isSchemaUpdated,
         'pendingMigrationSpaces': pendingMigrationSpaces,
+        'pendingPhysicalRenameSpaces': pendingPhysicalRenameSpaces,
         'operations': operations.map((op) => op.toJson()).toList(),
         'createTime': createTime.toIso8601String(),
         'dirIndex': dirIndex,
@@ -210,12 +217,26 @@ class MigrationTask {
     );
   }
 
+  /// remove a single pending physical rename space
+  MigrationTask removePendingPhysicalRenameSpace(String space) {
+    if (!pendingPhysicalRenameSpaces.contains(space)) {
+      return this;
+    }
+    return copyWith(
+      pendingPhysicalRenameSpaces: [
+        for (final s in pendingPhysicalRenameSpaces)
+          if (s != space) s
+      ],
+    );
+  }
+
   /// create a copy (basic method)
   MigrationTask copyWith({
     String? taskId,
     String? tableName,
     bool? isSchemaUpdated,
     List<String>? pendingMigrationSpaces,
+    List<String>? pendingPhysicalRenameSpaces,
     List<MigrationOperation>? operations,
     DateTime? createTime,
     int? dirIndex,
@@ -239,6 +260,8 @@ class MigrationTask {
         isSchemaUpdated: isSchemaUpdated ?? this.isSchemaUpdated,
         pendingMigrationSpaces:
             pendingMigrationSpaces ?? this.pendingMigrationSpaces,
+        pendingPhysicalRenameSpaces:
+            pendingPhysicalRenameSpaces ?? this.pendingPhysicalRenameSpaces,
         operations: operations ?? this.operations,
         createTime: createTime ?? this.createTime,
         dirIndex: dirIndex ?? this.dirIndex,
