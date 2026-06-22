@@ -620,8 +620,9 @@ class SchemaManager {
 
   /// get table partition index
   Future<int?> getTablePartition(String tableName) async {
+    final physicalName = _dataStore.resolvePhysicalTableName(tableName);
     final meta = await getSchemaMeta();
-    return meta.tablePartitionMap[tableName];
+    return meta.tablePartitionMap[physicalName];
   }
 
   /// find suitable partition
@@ -905,6 +906,7 @@ class SchemaManager {
   /// Internal helper to actually load schema from file.
   Future<TableSchema?> _doLoadTableSchema(String tableName) async {
     try {
+      final physicalName = _dataStore.resolvePhysicalTableName(tableName);
       final partitionIndex = await getTablePartition(tableName);
       if (partitionIndex == null) return null;
 
@@ -923,9 +925,9 @@ class SchemaManager {
 
       try {
         final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-        if (!partitionMeta.tableSchemas.containsKey(tableName)) return null;
+        if (!partitionMeta.tableSchemas.containsKey(physicalName)) return null;
 
-        final raw = partitionMeta.tableSchemas[tableName];
+        final raw = partitionMeta.tableSchemas[physicalName];
         Map<String, dynamic>? schemaMap;
         if (raw is Map<String, dynamic>) {
           schemaMap = raw;
@@ -941,9 +943,12 @@ class SchemaManager {
         }
         if (schemaMap == null) return null;
 
-        final schema = TableSchema.fromJson(schemaMap);
+        var schema = TableSchema.fromJson(schemaMap);
+        if (physicalName != tableName) {
+          schema = schema.copyWith(name: tableName);
+        }
         cacheTableSchema(tableName, schema);
-        final layoutRaw = partitionMeta.tableFieldLayouts[tableName];
+        final layoutRaw = partitionMeta.tableFieldLayouts[physicalName];
         final parsedLayout = _tryParseFieldStorageLayout(layoutRaw);
         if (parsedLayout != null) {
           _tableFieldLayoutCache[tableName] = parsedLayout;
