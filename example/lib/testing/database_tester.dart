@@ -901,6 +901,8 @@ class DatabaseTester {
       spaceName: 'default',
       enableLog: true,
       logLevel: LogLevel.warn,
+      maxFlushLatencyMs: 100,
+      writeBatchSize: 5,
     );
   }
 
@@ -1088,6 +1090,22 @@ class DatabaseTester {
         applyActiveSpaceOnDefault: false,
       );
 
+      // 6.5 Insert unflushed data under the old schema (these will stay in WAL/buffers with old table name)
+      final insAOld1 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_old_unflushed_1',
+        'old_field_2': 99,
+        'toBeIndexed': 'index_val_old_1',
+        'shouldRemoveIndex': 'rm_idx_old_1',
+      });
+      final insAOld2 = await testDb.insert('legacy_table_a', {
+        'old_field_1': 'val1_old_unflushed_2',
+        'old_field_2': 199,
+        'toBeIndexed': 'index_val_old_2',
+        'shouldRemoveIndex': 'rm_idx_old_2',
+      });
+      isTestPassed &= _expect('Pre-rename unflushed inserts should succeed',
+          !insAOld1.hasErrors && !insAOld2.hasErrors, true);
+
       // 7. Perform runtime schema migration: 2 table renames, 2 field renames, 1 add field, 1 add index, 1 remove index
       final updateResultA = await testDb
           .updateSchema('legacy_table_a')
@@ -1110,6 +1128,36 @@ class DatabaseTester {
           'Table A migration taskId should be assigned', taskIdA != null, true);
       isTestPassed &= _expect(
           'Table B migration taskId should be assigned', taskIdB != null, true);
+
+      // 7.5 Perform high-frequency concurrent writes/reads on the new tables to trigger fast background flushes
+      // since maxFlushLatencyMs is set to 100ms, a loop of 10 rounds * 50ms = 500ms guarantees that background
+      // flush thread runs multiple times, processing WAL entries written in 6.5 (old table name) concurrently with the rename.
+      for (int i = 0; i < 10; i++) {
+        final loopInsA = await testDb.insert('new_table_a', {
+          'new_field_1': 'new_val_loop_$i',
+          'new_field_2': 100 + i,
+          'toBeIndexed': 'idx_new_loop_$i',
+          'shouldRemoveIndex': 'rm_new_loop_$i',
+        });
+        isTestPassed &= _expect('Loop insert into new_table_a should succeed',
+            loopInsA.hasErrors, false);
+
+        final loopInsB = await testDb.insert('new_table_b', {
+          'name': 'new_b_loop_$i',
+        });
+        isTestPassed &= _expect('Loop insert into new_table_b should succeed',
+            loopInsB.hasErrors, false);
+
+        // Fetch using the new schema/table name
+        final loopQuery = await testDb
+            .query('new_table_a')
+            .where('toBeIndexed', '=', 'idx_new_loop_$i')
+            .first();
+        isTestPassed &= _expect('Loop query should find new record',
+            loopQuery != null, true);
+
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
 
       // 8. IMMEDIATELY perform Round 1 writes/reads on the new tables while migration is running (tests buffer-file coexistence)
       final insNewA1 = await testDb.insert('new_table_a', {
@@ -1241,6 +1289,29 @@ class DatabaseTester {
           .first();
       isTestPassed &=
           _expect('Deleted legacy record should not exist', queryDel1, null);
+
+      // Verify unflushed old data was migrated correctly
+      final queryOldUnflushed1 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_old_unflushed_1')
+          .first();
+      isTestPassed &= _expect('Should query migrated unflushed old data 1',
+          queryOldUnflushed1 != null, true);
+      if (queryOldUnflushed1 != null) {
+        isTestPassed &= _expect('Migrated unflushed old record 1 field 2 value',
+            queryOldUnflushed1['new_field_2'], 99);
+      }
+
+      final queryOldUnflushed2 = await testDb
+          .query('new_table_a')
+          .where('new_field_1', '=', 'val1_old_unflushed_2')
+          .first();
+      isTestPassed &= _expect('Should query migrated unflushed old data 2',
+          queryOldUnflushed2 != null, true);
+      if (queryOldUnflushed2 != null) {
+        isTestPassed &= _expect('Migrated unflushed old record 2 field 2 value',
+            queryOldUnflushed2['new_field_2'], 199);
+      }
 
       // 12. Call flush to force all buffers/indexes to flush to files
       await testDb.flush();
