@@ -1457,81 +1457,162 @@ class IdGeneratorFactory {
 }
 
 /// Global ID generator shared by locks, partitions, WAL, migration etc.
-/// Default returns Base62 short string, can switch encoding format via parameter.
+/// Generates short, filesystem-safe IDs.
+/// Output: exactly [_coreLen] chars — 1 random lowercase letter + Base36 body.
+/// All chars are lowercase letters or digits; the first char is always a letter.
+/// Safe as a filename, table name, identifier, and cross-platform path component.
+/// [_coreLen] is derived automatically from _timestampBits + _sequenceBits.
 class GlobalIdGenerator {
   static final Random _random = Random.secure();
-
-  static const int _timestampBits = 41;
-  static const int _sequenceBits = 12;
+  static const int _timestampBits = 36; // 36 bits seconds (~2177 years)
+  static const int _nodeBits = 14;      // 14 bits node ID (up to 16384 nodes)
+  static const int _sequenceBits = 22;  // 22 bits sequence (4,194,304 ids/sec/node)
 
   static const int _sequenceMask = (1 << _sequenceBits) - 1;
+  static const int _nodeMask = (1 << _nodeBits) - 1;
   static const int _timestampMask = (1 << _timestampBits) - 1;
 
-  static int _lastTimestampMs = 0;
+  // Custom Epoch: 2026-01-01 00:00:00 UTC (1767225600 seconds)
+  static const int _epochStartSeconds = 1767225600;
+
+  // Global static node ID, defaults to 1. Injected at startup using initialize(nodeId)
+  static int _nodeId = 1;
+
+  /// Initializes the GlobalIdGenerator with the distributed nodeId.
+  /// Node ID is clamped to 14 bits (0 - 16383).
+  static void initialize(int nodeId) {
+    _nodeId = nodeId & _nodeMask;
+  }
+
+  // Base36 charset: digits first, then lowercase letters.
+  static const String _base36Chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+  // Pre-computed code-unit tables — avoids repeated String indexing in the hot path.
+  static final List<int> _base36Units =
+      _base36Chars.codeUnits.toList(growable: false);
+
+  static const int _totalBits = _timestampBits + _nodeBits + _sequenceBits; // 72 bits
+
+  /// Mathematically correct body length calculation.
+  /// Uses final instead of const since log/ceil are computed at runtime.
+  static final int _bodyLen = (_totalBits / (log(36) / log(2))).ceil();
+  static final int _coreLen = 1 + _bodyLen; // 1 lead + body digits
+
+  /// Unified static output buffer for prefix + core + suffix in a single allocation.
+  /// WARNING: This buffer is globally shared and reused in a single isolate.
+  /// Do not read directly from it or pass it out of _build.
+  /// It is dirty-written; String.fromCharCodes relies strictly on the length argument to isolate output.
+  static final List<int> _outBuf = List<int>.filled(128, 0x30);
+
+  static int _lastTimestampSec = 0;
   static int _sequence = 0;
 
-  /// Generate ID with optional prefix and encoding type.
-  /// [width] - optional fixed width for the random part (padding with 0).
-  ///            If set, result is padded to this length.
-  ///            Default 0 means no padding.
-  static String generate(String prefix, {bool base62 = true, int width = 0}) {
-    final core = base62 ? _nextBase62(width) : _nextDecimal(width);
-    return prefix.isEmpty ? core : '$prefix$core';
-  }
+  /// Generates [prefix] + core ID in a single [String.fromCharCodes] call.
+  /// Core is exactly [_coreLen] chars: one lead letter + [_bodyLen] Base36 digits.
+  static String generate(String prefix) => _build(prefix, null);
 
-  /// Prefix + optional suffix, and allow specifying encoding type.
-  static String generateWithSuffix(String prefix,
-      {String? suffix, bool base62 = true}) {
-    final base = generate(prefix, base62: base62);
-    if (suffix == null || suffix.isEmpty) return base;
-    return '$base$suffix';
-  }
+  /// Generates [prefix] + core ID + optional [suffix] in a single [String.fromCharCodes] call.
+  static String generateWithSuffix(String prefix, {String? suffix}) =>
+      _build(prefix, suffix);
 
-  static String _nextBase62(int width) {
-    String res = Base62Encoder.encode(BigInt.from(_nextId()));
-    if (width > 0 && res.length < width) {
-      res = res.padLeft(width, '0');
-    }
-    return res;
-  }
+  /// Builds the complete output string in-place with exactly one String allocation.
+  ///
+  static String _build(String prefix, String? suffix) {
+    final BigInt id = _nextId();
+    final int pLen = prefix.length;
+    final int sLen = suffix?.length ?? 0;
+    final int coreEnd = pLen + _coreLen;
+    final int totalLen = coreEnd + sLen;
 
-  static String _nextDecimal(int width) {
-    String res = _nextId().toString();
-    if (width > 0 && res.length < width) {
-      res = res.padLeft(width, '0');
-    }
-    return res;
-  }
+    // Fallback dynamic buffer to prevent out-of-bounds RangeError crash in production.
+    // Keeps 0-GC overhead for <= 128 chars, but handles arbitrarily long inputs gracefully.
+    final List<int> buf =
+        totalLen <= 128 ? _outBuf : List<int>.filled(totalLen, 0x30);
 
-  static int _nextId() {
-    int timestamp = DateTime.now().millisecondsSinceEpoch;
-
-    if (timestamp < _lastTimestampMs) {
-      // Clock went backwards; force monotonicity.
-      timestamp = _lastTimestampMs + 1;
+    // ── prefix ──────────────────────────────────────────────────────────────
+    for (int i = 0; i < pLen; i++) {
+      buf[i] = prefix.codeUnitAt(i);
     }
 
-    if (timestamp == _lastTimestampMs) {
+    // ── suffix (write before body so pos cursor starts cleanly at coreEnd) ──
+    for (int i = 0; i < sLen; i++) {
+      buf[coreEnd + i] = suffix!.codeUnitAt(i);
+    }
+
+    // ── body: right-to-left into [pLen+1 .. coreEnd-1] ─────────────────────
+    int pos = coreEnd;
+    BigInt body = id;
+    final BigInt base = BigInt.from(36);
+    do {
+      final BigInt q = body ~/ base;
+      final BigInt r = body - q * base;
+      buf[pos - 1] = _base36Units[r.toInt()];
+      pos--;
+      body = q;
+    } while (body > BigInt.zero);
+
+    // ── zero-pad gap between lead slot and first encoded digit ───────────────
+    while (pos > pLen + 1) {
+      buf[pos - 1] = 0x30; // '0'
+      pos--;
+    }
+
+    // ── lead: letter written LAST at pLen — encode loop never reaches it
+    // To guarantee global monotonic sorting order, we fix the lead character.
+    // If prefix is empty, we use 't' (0x74) to make the ID look like 't[body]'.
+    // If prefix is not empty, we use 'a' (0x61) to avoid double-character stacking (e.g., 'tt...' when prefix is 't').
+    buf[pLen] = pLen == 0 ? 0x74 : 0x61;
+
+    return String.fromCharCodes(buf, 0, totalLen); // single allocation
+  }
+
+  static BigInt _nextId() {
+    int timestamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000) - _epochStartSeconds;
+
+    if (timestamp < _lastTimestampSec) {
+      // Clock went backwards — typically an NTP step correction.
+      // Force monotonicity.
+      timestamp = _lastTimestampSec;
+    }
+
+    if (timestamp == _lastTimestampSec) {
       _sequence = (_sequence + 1) & _sequenceMask;
       if (_sequence == 0) {
-        // Sequence overflow within same ms, wait for next millisecond.
-        timestamp = _waitNextMillis(_lastTimestampMs);
+        // Sequence overflow within same second, wait for next second.
+        timestamp = _waitNextSecond(_lastTimestampSec);
       }
     } else {
       // Randomize start sequence a bit to reduce contention under bursts.
       _sequence = _random.nextInt(4);
     }
 
-    _lastTimestampMs = timestamp;
+    _lastTimestampSec = timestamp;
 
-    final int timestampPart = (timestamp & _timestampMask) << _sequenceBits;
-    return timestampPart | (_sequence & _sequenceMask);
+    // Assemble 72 bits unsigned value using BigInt
+    final BigInt timestampBig = BigInt.from(timestamp & _timestampMask);
+    final BigInt nodeBig = BigInt.from(_nodeId & _nodeMask);
+    final BigInt seqBig = BigInt.from(_sequence & _sequenceMask);
+
+    return (timestampBig << (_nodeBits + _sequenceBits)) |
+           (nodeBig << _sequenceBits) |
+           seqBig;
   }
 
-  static int _waitNextMillis(int lastTimestamp) {
-    int ts = DateTime.now().millisecondsSinceEpoch;
+  static int _waitNextSecond(int lastTimestamp) {
+    final int startMs = DateTime.now().millisecondsSinceEpoch;
+    int ts = (startMs ~/ 1000) - _epochStartSeconds;
+
+    // Spin-wait but limit to a maximum of 50ms to prevent Isolate freeze and CPU starvation
     while (ts <= lastTimestamp) {
-      ts = DateTime.now().millisecondsSinceEpoch;
+      final int nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (nowMs - startMs > 50) {
+        break; // Spin timeout reached
+      }
+      ts = (nowMs ~/ 1000) - _epochStartSeconds;
+    }
+
+    if (ts <= lastTimestamp) {
+      // Force virtual time forward by 1 second as a monotonic fallback
+      ts = lastTimestamp + 1;
     }
     return ts;
   }

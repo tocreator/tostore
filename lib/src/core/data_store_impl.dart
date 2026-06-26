@@ -735,6 +735,9 @@ class DataStoreImpl {
       _config =
           _config!.copyWith(dbPath: _dbPath, dbName: _dbName ?? config?.dbName);
 
+      // Initialize GlobalIdGenerator with the distributed node id from the config
+      GlobalIdGenerator.initialize(_config!.distributedNodeConfig.nodeId);
+
       if (PlatformHandler.isWeb && _config!.enableJournal) {
         Logger.warn(
           'Web does not support enableJournal efficiently. Keeping it on can noticeably slow writes and startup. Recommended: set DataStoreConfig(enableJournal: false).',

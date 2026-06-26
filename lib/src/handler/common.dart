@@ -40,7 +40,7 @@ class InternalConfig {
   /// - This is **engine-managed**, not a user-facing config.
   /// - Persisted in [GlobalConfig.maxEntriesPerDir] for forward-compatibility.
   /// - Used for deterministic sharding: `dirIndex = pIndex ~/ maxEntriesPerDir`.
-  static const int defaultMaxEntriesPerDir = 500;
+  static const int defaultMaxEntriesPerDir = 2000;
 }
 
 /// convert any object type to string
