@@ -61,7 +61,6 @@ import 'compute/record_compute.dart';
 import 'compute/unique_ref_compute.dart';
 import 'compute_manager.dart';
 import 'crontab_manager.dart';
-import 'directory_manager.dart';
 import 'foreign_key_manager.dart';
 import 'index_manager.dart';
 import 'index_tree_partition_manager.dart';
@@ -159,7 +158,6 @@ class DataStoreImpl {
   SpaceConfig? _spaceConfigCache;
   SchemaManager? schemaManager;
   PathManager? _pathManager;
-  DirectoryManager? directoryManager;
   LockManager? lockManager;
   TransactionManager? transactionManager;
   ResourceManager? _resourceManager;
@@ -827,7 +825,6 @@ class DataStoreImpl {
         }
       }
 
-      directoryManager = DirectoryManager(this);
       _indexManager = IndexManager(this);
       _vectorIndexManager = VectorIndexManager(this);
       indexTreePartitionManager = IndexTreePartitionManager(this);
@@ -990,7 +987,7 @@ class DataStoreImpl {
 
       // Check if there are existing table structures
       final schemaMeta = await schemaManager!.getSchemaMeta();
-      if (schemaMeta.tablePartitionMap.isEmpty) {
+      if (schemaMeta.routes.isEmpty) {
         // First run, need to initialize
         needInitialize = true;
       } else {
@@ -1221,7 +1218,6 @@ class DataStoreImpl {
         _integrityChecker = null;
         _keyManager = null;
         _weightManager = null;
-        directoryManager = null;
         schemaManager = null;
         transactionManager = null;
         _resourceManager = null;
@@ -1267,9 +1263,31 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    try {
-      var schemaValid = schema;
+    // Strip user-defined internal properties to prevent tampering
+    final userSchema = schema.copyWith(
+      tableUid: null,
+      isSystemTable: false,
+      schemaVersion: null,
+      autoIndexes: null,
+    );
 
+    // Generate stable internal tableUid
+    final tableUid = GlobalIdGenerator.generate("t");
+
+    // Update each index to have a stable unique indexUid
+    final updatedIndexes = <IndexSchema>[];
+    for (final idx in userSchema.indexes) {
+      final indexUid = GlobalIdGenerator.generate("i");
+      updatedIndexes.add(idx.copyWith(indexUid: indexUid));
+    }
+
+    final schemaValid = userSchema.copyWith(
+      tableUid: tableUid,
+      indexes: updatedIndexes,
+      isSystemTable: isSystemTable,
+    );
+
+    try {
       // Check if table already exists
       final tableExists = await this.tableExists(schema.name);
       if (tableExists) {
@@ -1294,7 +1312,6 @@ class DataStoreImpl {
         );
 
         // Validate foreign key constraints with referenced tables
-        // This ensures field type compatibility and referenced table existence
         for (final fk in schemaValid.foreignKeys) {
           if (!fk.enabled) continue;
 
@@ -1346,14 +1363,11 @@ class DataStoreImpl {
           }
         }
 
-        // Create table path
-        await _pathManager!.createTablePath(schema.name, schema.isGlobal);
-
-        // Write schema file
-        await schemaManager?.saveTableSchema(schema.name, schemaValid);
+        // Write schema file and register routing
+        await schemaManager?.saveTableSchema(
+            tableUid, schema.name, schemaValid);
 
         // Create B+Tree indexes (explicit, unique, and foreign key).
-        // Vector indexes are managed by VectorIndexManager (lazy init on first write).
         final btreeIndexes =
             schemaManager?.getBtreeIndexesFor(schemaValid) ?? <IndexSchema>[];
         for (var index in btreeIndexes) {
@@ -1361,11 +1375,8 @@ class DataStoreImpl {
         }
 
         // Auto-create indexes for foreign keys
-        // Skip for system tables - they don't have foreign keys and system_fk_references
-        // may not be fully initialized yet during system table creation
         if (_foreignKeyManager != null &&
             !SystemTable.isSystemTable(schema.name)) {
-          //Update system table with foreign key relationships (for fast startup loading)
           await _foreignKeyManager!
               .updateSystemTableForTable(schema.name, schemaValid);
         }
@@ -1386,9 +1397,7 @@ class DataStoreImpl {
       } catch (e) {
         // Cleanup schema
         if (schemaManager != null) {
-          await schemaManager!.deleteTableSchema(schema.name);
-          // Release directory
-          await directoryManager!.releaseTableDirectory(schema.name);
+          await schemaManager!.deleteTableSchema(tableUid);
         }
 
         Logger.error('Create table failed', rawError: e);
@@ -2687,7 +2696,8 @@ class DataStoreImpl {
         }
 
         // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(LargeOperationRunner.runPendingOperations(this)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
 
         return finish(DbResult.success(
           message:
@@ -3597,7 +3607,8 @@ class DataStoreImpl {
         }
 
         // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(LargeOperationRunner.runPendingOperations(this)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
 
         return finish(DbResult.success(
           message:
@@ -3850,8 +3861,13 @@ class DataStoreImpl {
         await ensureInitialized();
       }
 
+      // Resolve tableUid
+      final tableUid = schemaManager?.getUidByName(tableName);
+
       // Check if table exists
-      final schema = await schemaManager?.getTableSchema(tableName);
+      final schema = tableUid != null
+          ? await schemaManager?.getTableSchema(tableUid)
+          : null;
       if (schema == null) {
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
@@ -3865,21 +3881,16 @@ class DataStoreImpl {
           'Deleting table $tableName data in space $_currentSpaceName during migration',
         );
 
-        // Get table directory path
-        final tablePath = await directoryManager!
-            .getTableDirectoryPath(tableName, spaceName: _currentSpaceName);
-
-        // Delete table directory
-        if (tablePath != null && await storage.existsDirectory(tablePath)) {
-          await storage.deleteDirectory(tablePath);
-          Logger.info(
-            'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
-          );
+        if (tableUid != null) {
+          final tablePath = _pathManager!.getTablePathByUid(tableUid);
+          if (await storage.existsDirectory(tablePath)) {
+            await storage.deleteDirectory(tablePath);
+            Logger.info(
+              'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
+            );
+          }
+          await schemaManager?.deleteTableSchema(tableUid);
         }
-
-        // Remove table directory mapping from space configuration
-        await directoryManager!.removeTableDirectoryMapping(tableName,
-            spaceName: _currentSpaceName);
 
         return finish(DbResult.success(
           message:
@@ -3905,21 +3916,15 @@ class DataStoreImpl {
         }
 
         // Handle foreign key cascade operations before dropping the table
-        // This ensures data consistency: child records are handled according to foreign key policies
-        // Note: handleCascadeClear can be reused for dropTable since the logic is the same:
-        // both operations remove all records from the parent table, requiring the same cascade handling
         if (_foreignKeyManager != null) {
           try {
             await _foreignKeyManager!.handleCascadeClear(tableName);
           } catch (e) {
             Logger.error('Cascade drop failed', rawError: e);
-            // Convert exception to DbResult for graceful error handling
             return finish(_normalizeCascadeError(e, 'drop'));
           }
 
           // Clean up system table entries for the dropped table
-          // This removes both: records where this table references others,
-          // and records where others reference this table
           await _foreignKeyManager!
               .cleanupSystemTableForDroppedTable(tableName);
         }
@@ -3932,26 +3937,23 @@ class DataStoreImpl {
 
         // Get table path
         String? tablePath;
-        try {
-          tablePath = await _pathManager!.getTablePath(tableName);
-        } catch (e) {
-          // Ignore errors where the table does not exist
+        if (tableUid != null) {
+          try {
+            tablePath = _pathManager!.getTablePathByUid(tableUid);
+          } catch (e) {
+            // skip
+          }
         }
 
         // Delete table structure
-        if (schemaManager != null) {
-          await schemaManager!.deleteTableSchema(tableName);
-          // Release directory
-          await directoryManager!.releaseTableDirectory(tableName);
+        if (schemaManager != null && tableUid != null) {
+          await schemaManager!.deleteTableSchema(tableUid);
         }
 
         // Delete table directory and all related files
         if (tablePath != null && await storage.existsDirectory(tablePath)) {
           await storage.deleteDirectory(tablePath);
         }
-
-        // Clear path cache
-        _pathManager?.clearTableCache(tableName);
 
         if (registerWalOp) {
           // Add migration task to delete table data in each space
@@ -7071,17 +7073,18 @@ class DataStoreImpl {
     }
 
     final schemaMgr = schemaManager;
-    final dirMgr = directoryManager;
-    if (schemaMgr == null || dirMgr == null) {
+    if (schemaMgr == null) {
       throw DbClosedException();
     }
 
     final currentSpace = spaceName ?? currentSpaceName;
 
     // Load schemas
-    final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
+    final actualOldSchema = await schemaMgr
+        .getTableSchema(schemaMgr.getUidByName(oldTableName) ?? oldTableName);
     final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
-    final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
+    final existingNewSchema = await schemaMgr
+        .getTableSchema(schemaMgr.getUidByName(newTableName) ?? newTableName);
     final schemaForLayout = existingOldSchema ?? existingNewSchema;
     if (schemaForLayout == null) {
       _pendingTableRenames.remove(newTableName);
@@ -7089,16 +7092,17 @@ class DataStoreImpl {
     }
 
     final isGlobal = schemaForLayout.isGlobal;
+    final tableUid = schemaForLayout.tableUid;
 
-    // Check directory mappings
-    dynamic oldDirInfo = await dirMgr
-        .getTableDirectoryInfo(oldTableName, isGlobal, spaceName: currentSpace);
-    dynamic newDirInfo = await dirMgr
-        .getTableDirectoryInfo(newTableName, isGlobal, spaceName: currentSpace);
+    if (tableUid == null) {
+      _pendingTableRenames.remove(newTableName);
+      return;
+    }
 
     // Idempotent recovery check: If newTableName already has schema, and oldTableName mapping/directory
     // is already missing, it means physical rename is already fully done.
-    if (existingNewSchema != null && oldDirInfo == null) {
+    if (existingNewSchema != null &&
+        !schemaMgr.uidByName.containsKey(oldTableName)) {
       Logger.info(
           'Physical rename $oldTableName -> $newTableName already completed, skip.');
       _pendingTableRenames.remove(newTableName);
@@ -7128,127 +7132,9 @@ class DataStoreImpl {
         await keyManager.pauseKeyMigration();
       }
 
-      // 2. Perform the physical directory moves and file metadata updates
-      final oldPath = await dirMgr.getTableDirectoryPathByScope(
-        oldTableName,
-        isGlobal: isGlobal,
-        spaceName: currentSpace,
-      );
-      String? newPath = await dirMgr.getTableDirectoryPathByScope(
-        newTableName,
-        isGlobal: isGlobal,
-        spaceName: currentSpace,
-      );
-      final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
-      if (newPath == null && resolvedDirIndex != null) {
-        newPath = dirMgr.buildTableDirectoryPath(
-          newTableName,
-          isGlobal: isGlobal,
-          dirIndex: resolvedDirIndex,
-          spaceName: currentSpace,
-        );
-      }
-
-      String? effectiveSourcePath = oldPath;
-      if (resolvedDirIndex != null) {
-        final legacySourcePath = dirMgr.buildTableDirectoryPath(
-          oldTableName,
-          isGlobal: isGlobal,
-          dirIndex: resolvedDirIndex,
-          spaceName: currentSpace,
-        );
-        if (legacySourcePath != newPath &&
-            await storage.existsDirectory(legacySourcePath)) {
-          final mappedSourceExists = effectiveSourcePath != null &&
-              effectiveSourcePath != newPath &&
-              await storage.existsDirectory(effectiveSourcePath);
-          if (!mappedSourceExists) {
-            effectiveSourcePath = legacySourcePath;
-          }
-        }
-      }
-
-      var sourceExists = effectiveSourcePath != null &&
-          effectiveSourcePath != newPath &&
-          await storage.existsDirectory(effectiveSourcePath);
-      var targetExists =
-          newPath != null && await storage.existsDirectory(newPath);
-
-      if (sourceExists && newPath != null && effectiveSourcePath != newPath) {
-        if (targetExists) {
-          if (newDirInfo != null && oldDirInfo == null) {
-            await storage.deleteDirectory(effectiveSourcePath);
-            sourceExists = false;
-          } else if (oldDirInfo != null && newDirInfo == null) {
-            await storage.deleteDirectory(newPath);
-            await storage.moveDirectory(effectiveSourcePath, newPath);
-            sourceExists = false;
-            targetExists = true;
-          } else {
-            // Both directories exist. Resolve based on directory mappings.
-            final mappingHasNew = newDirInfo != null;
-            if (mappingHasNew) {
-              await storage.deleteDirectory(effectiveSourcePath);
-              sourceExists = false;
-            } else {
-              await storage.deleteDirectory(newPath);
-              await storage.moveDirectory(effectiveSourcePath, newPath);
-              sourceExists = false;
-              targetExists = true;
-            }
-          }
-        } else {
-          await storage.moveDirectory(effectiveSourcePath, newPath);
-          sourceExists = false;
-          targetExists = true;
-        }
-      }
-
-      bool mappingRenamed = false;
-      if (newDirInfo != null && oldDirInfo == null) {
-        mappingRenamed = true;
-      }
-      if (oldDirInfo == null && newDirInfo == null) {
-        // No directory mapping exists for either, physical rename of directory is a no-op
-        mappingRenamed = true;
-      }
-
-      if (!mappingRenamed) {
-        mappingRenamed = await dirMgr.renameTableDirectoryMapping(
-          oldTableName,
-          newTableName,
-          isGlobal: isGlobal,
-          spaceName: currentSpace,
-        );
-        if (!mappingRenamed) {
-          if (targetExists && resolvedDirIndex != null) {
-            mappingRenamed = await dirMgr.ensureTableDirectoryMapping(
-              newTableName,
-              isGlobal: isGlobal,
-              dirIndex: resolvedDirIndex,
-              spaceName: currentSpace,
-            );
-          } else {
-            final recoveredNewDirInfo = await dirMgr.getTableDirectoryInfo(
-                newTableName, isGlobal,
-                spaceName: currentSpace);
-            mappingRenamed = recoveredNewDirInfo != null && targetExists;
-          }
-        }
-      }
-
-      if (!mappingRenamed) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message:
-                'Cannot rename table $oldTableName -> $newTableName: directory mapping not found',
-          )
-        ]);
-      }
-
       if (updateSchema && actualOldSchema != null) {
-        await schemaMgr.renameTableSchema(oldTableName, renamedSchema);
+        await schemaMgr.renameTableSchema(
+            tableUid, oldTableName, renamedSchema);
       }
       if (updateSchema) {
         await _updateSchemasReferencingRenamedTable(
@@ -7288,10 +7174,13 @@ class DataStoreImpl {
 
       // 3. Symmetrically resume background tasks if they were paused
       if (keyMigrating) {
-        unawaited(keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(keyManager
+            .startDeferredKeyMigrationWork()
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(LargeOperationRunner.runPendingOperations(this)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
     } catch (error, stackTrace) {
       // 4. Symmetrically resume on exceptions and roll back metadata changes
@@ -7312,63 +7201,19 @@ class DataStoreImpl {
             spaceName: currentSpace,
           );
         } catch (_) {}
-        unawaited(keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(keyManager
+            .startDeferredKeyMigrationWork()
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this).catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(LargeOperationRunner.runPendingOperations(this)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
       try {
-        final oldPath = await dirMgr.getTableDirectoryPathByScope(
-          oldTableName,
-          isGlobal: isGlobal,
-          spaceName: currentSpace,
-        );
-        String? newPath = await dirMgr.getTableDirectoryPathByScope(
-          newTableName,
-          isGlobal: isGlobal,
-          spaceName: currentSpace,
-        );
-        final resolvedDirIndex = oldDirInfo?.dirIndex ?? newDirInfo?.dirIndex;
-        if (newPath == null && resolvedDirIndex != null) {
-          newPath = dirMgr.buildTableDirectoryPath(
-            newTableName,
-            isGlobal: isGlobal,
-            dirIndex: resolvedDirIndex,
-            spaceName: currentSpace,
-          );
+        if (updateSchema && actualOldSchema != null) {
+          await schemaMgr.renameTableSchema(
+              tableUid, newTableName, schemaForLayout);
         }
-        String? effectiveSourcePath = oldPath;
-        if (resolvedDirIndex != null) {
-          final legacySourcePath = dirMgr.buildTableDirectoryPath(
-            oldTableName,
-            isGlobal: isGlobal,
-            dirIndex: resolvedDirIndex,
-            spaceName: currentSpace,
-          );
-          if (legacySourcePath != newPath &&
-              await storage.existsDirectory(legacySourcePath)) {
-            final mappedSourceExists = effectiveSourcePath != null &&
-                effectiveSourcePath != newPath &&
-                await storage.existsDirectory(effectiveSourcePath);
-            if (!mappedSourceExists) {
-              effectiveSourcePath = legacySourcePath;
-            }
-          }
-        }
-
-        await _rollbackRenameTableForMigration(
-          oldTableName,
-          newTableName,
-          isGlobal: isGlobal,
-          schemaForLayout: schemaForLayout,
-          existingOldSchema: existingOldSchema,
-          updateSchema: updateSchema,
-          refreshForeignKeySystemTables: refreshForeignKeySystemTables,
-          updatedReferencingTables: updatedReferencingTables,
-          oldPath: effectiveSourcePath ?? oldPath,
-          newPath: newPath,
-          spaceName: currentSpace,
-        );
       } catch (rollbackError) {
         Logger.error(
             'Failed to rollback table rename $oldTableName -> $newTableName after error',
@@ -7376,123 +7221,10 @@ class DataStoreImpl {
       }
       Error.throwWithStackTrace(error, stackTrace);
     } finally {
-      _pathManager?.clearTableCache(oldTableName);
-      _pathManager?.clearTableCache(newTableName);
       await cacheManager.invalidateCache(oldTableName);
       await cacheManager.invalidateCache(newTableName);
       endTableRenameBarrier(oldTableName, newTableName);
     }
-  }
-
-  Future<void> _rollbackRenameTableForMigration(
-    String oldTableName,
-    String newTableName, {
-    required bool isGlobal,
-    required TableSchema schemaForLayout,
-    required TableSchema? existingOldSchema,
-    required bool updateSchema,
-    required bool refreshForeignKeySystemTables,
-    required Set<String> updatedReferencingTables,
-    String? oldPath,
-    String? newPath,
-    String? spaceName,
-  }) async {
-    final schemaMgr = schemaManager;
-    final dirMgr = directoryManager;
-    if (schemaMgr == null || dirMgr == null) {
-      throw DbClosedException();
-    }
-
-    final rollbackSchema = existingOldSchema ??
-        _schemaWithRenamedReferencedTable(
-          schemaForLayout.copyWith(name: oldTableName),
-          newTableName,
-          oldTableName,
-        );
-
-    final currentSpace = spaceName ?? currentSpaceName;
-
-    if (updateSchema && updatedReferencingTables.isNotEmpty) {
-      await _updateSchemasReferencingRenamedTable(
-        newTableName,
-        oldTableName,
-        candidateTables: updatedReferencingTables,
-      );
-    }
-
-    if (updateSchema) {
-      final currentOldSchema = await schemaMgr.getTableSchema(oldTableName);
-      final currentNewSchema = await schemaMgr.getTableSchema(newTableName);
-      if (currentOldSchema == null && currentNewSchema != null) {
-        await schemaMgr.renameTableSchema(newTableName, rollbackSchema);
-      }
-    }
-
-    final currentOldDirInfo = await dirMgr
-        .getTableDirectoryInfo(oldTableName, isGlobal, spaceName: currentSpace);
-    final currentNewDirInfo = await dirMgr
-        .getTableDirectoryInfo(newTableName, isGlobal, spaceName: currentSpace);
-    if (currentOldDirInfo == null && currentNewDirInfo != null) {
-      final restored = await dirMgr.renameTableDirectoryMapping(
-        newTableName,
-        oldTableName,
-        isGlobal: isGlobal,
-        spaceName: currentSpace,
-      );
-      if (!restored) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message:
-                'Failed to restore directory mapping for table $oldTableName during rollback',
-          )
-        ]);
-      }
-    }
-
-    if (oldPath != null && newPath != null && oldPath != newPath) {
-      final oldExists = await storage.existsDirectory(oldPath);
-      final newExists = await storage.existsDirectory(newPath);
-      if (!oldExists && newExists) {
-        await storage.moveDirectory(newPath, oldPath);
-      }
-    }
-
-    _pathManager?.clearTableCache(oldTableName);
-    _pathManager?.clearTableCache(newTableName);
-    await cacheManager.invalidateCache(oldTableName, invalidateSchema: false);
-    await cacheManager.invalidateCache(newTableName, invalidateSchema: false);
-
-    final restoredSchema = await schemaMgr.getTableSchema(oldTableName);
-    if (restoredSchema != null) {
-      await _rewriteMovedTableMetadataAfterRename(
-        oldTableName,
-        rollbackSchema,
-      );
-    }
-
-    if (refreshForeignKeySystemTables && updateSchema) {
-      await _refreshForeignKeyMetadataAfterRename(
-        newTableName,
-        oldTableName,
-        referencingTables: updatedReferencingTables,
-        throwOnError: true,
-      );
-    }
-
-    if (_weightManager != null) {
-      final btreeIndexes =
-          schemaManager?.getBtreeIndexesFor(schemaForLayout) ?? <IndexSchema>[];
-      final indexNames = btreeIndexes.map((i) => i.actualIndexName).toList();
-      await _weightManager!.renameTableWeights(
-        newTableName,
-        oldTableName,
-        oldIndexNames: indexNames,
-        newIndexNames: indexNames,
-        spaceName: isGlobal ? '__global__' : currentSpace,
-      );
-    }
-    await _renameTableInLargeOperations(newTableName, oldTableName);
   }
 
   TableSchema _schemaWithRenamedReferencedTable(
@@ -7541,7 +7273,8 @@ class DataStoreImpl {
       if (identical(updatedSchema, schema)) {
         continue;
       }
-      await schemaMgr.saveTableSchema(tableName, updatedSchema);
+      final tableUid = schemaMgr.getUidByName(tableName) ?? tableName;
+      await schemaMgr.saveTableSchema(tableUid, tableName, updatedSchema);
       updatedTables?.add(tableName);
     }
   }
@@ -7550,28 +7283,9 @@ class DataStoreImpl {
     String tableName,
     TableSchema schemaForLayout,
   ) async {
-    final currentTableMeta = await tableDataManager.getTableMeta(tableName);
-    if (currentTableMeta != null && currentTableMeta.name != tableName) {
-      await tableDataManager.updateTableMeta(
-        tableName,
-        currentTableMeta.copyWith(name: tableName),
-      );
-    }
-
-    final btreeIndexes =
-        schemaManager?.getBtreeIndexesFor(schemaForLayout) ?? <IndexSchema>[];
-    for (final index in btreeIndexes) {
-      final indexMeta =
-          await indexManager?.getIndexMeta(tableName, index.actualIndexName);
-      if (indexMeta == null || indexMeta.tableName == tableName) {
-        continue;
-      }
-      await indexManager?.updateIndexMeta(
-        tableName: tableName,
-        indexName: index.actualIndexName,
-        updatedMeta: indexMeta.copyWith(tableName: tableName),
-      );
-    }
+    // With stable UIDs, TableMeta and B+Tree IndexMeta contain only tableUid/indexUid
+    // which are stable and do not change when the table is renamed.
+    // We only need to update the tableName property inside NghIndexMeta for vector indexes.
 
     final vectorIndexes =
         schemaManager?.getVectorIndexesFor(schemaForLayout) ?? <IndexSchema>[];
@@ -7593,36 +7307,15 @@ class DataStoreImpl {
       }
 
       final meta = NghIndexMeta.fromJson(Map<String, dynamic>.from(json));
-      final updatedMeta = meta.copyWith(
-        tableName: tableName,
-        nodeIdToPkMeta: meta.nodeIdToPkMeta?.copyWith(tableName: tableName),
-        pkToNodeIdMeta: meta.pkToNodeIdMeta?.copyWith(tableName: tableName),
-      );
-
-      if (updatedMeta.tableName == meta.tableName &&
-          updatedMeta.nodeIdToPkMeta?.tableName ==
-              meta.nodeIdToPkMeta?.tableName &&
-          updatedMeta.pkToNodeIdMeta?.tableName ==
-              meta.pkToNodeIdMeta?.tableName) {
+      if (meta.tableName == tableName) {
         continue;
       }
 
-      await storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
+      final updatedMeta = meta.copyWith(
+        tableName: tableName,
+      );
 
-      if (updatedMeta.nodeIdToPkMeta != null) {
-        await indexManager?.updateIndexMeta(
-          tableName: tableName,
-          indexName: updatedMeta.nid2pkIndexName,
-          updatedMeta: updatedMeta.nodeIdToPkMeta,
-        );
-      }
-      if (updatedMeta.pkToNodeIdMeta != null) {
-        await indexManager?.updateIndexMeta(
-          tableName: tableName,
-          indexName: updatedMeta.pk2nidIndexName,
-          updatedMeta: updatedMeta.pkToNodeIdMeta,
-        );
-      }
+      await storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
     }
   }
 
@@ -7794,20 +7487,8 @@ class DataStoreImpl {
 
   /// Check if table exists in current space
   Future<bool> tableExistsInCurrentSpace(String tableName) async {
-    try {
-      final spaceConfig = await getSpaceConfig();
-      if (spaceConfig == null) {
-        return false;
-      }
-
-      final spacePrefix = _currentSpaceName;
-      final tableKey = '$spacePrefix:$tableName';
-      return spaceConfig.tableDirectoryMap.containsKey(tableKey);
-    } catch (e) {
-      Logger.error('Error checking if table exists in current space',
-          rawError: e);
-      return false;
-    }
+    if (schemaManager == null) return false;
+    return schemaManager!.uidByName.containsKey(tableName);
   }
 
   /// Get information about the current space
@@ -7828,11 +7509,12 @@ class DataStoreImpl {
         config = await getSpaceConfig();
       }
 
-      final spacePrefix = '$_currentSpaceName:';
-      final userTables = (config?.tableDirectoryMap.keys ?? const <String>[])
-          .where((tableKey) => tableKey.startsWith(spacePrefix))
-          .map((tableKey) => tableKey.substring(spacePrefix.length))
-          .where((tableName) => !SystemTable.isSystemTable(tableName))
+      final activeUids =
+          await schemaManager?.getActiveUidsForSpace(_currentSpaceName) ?? [];
+      final userTables = activeUids
+          .map((uid) => schemaManager?.getNameByUid(uid))
+          .whereType<String>()
+          .where((name) => !SystemTable.isSystemTable(name))
           .toList(growable: false);
 
       // Create the SpaceInfo object with user-table information
