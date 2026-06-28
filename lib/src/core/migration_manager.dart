@@ -11,6 +11,7 @@ import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
 import '../model/db_exception.dart';
+import '../model/id_generator.dart';
 import '../model/key_migration_info.dart';
 import '../model/meta_info.dart';
 import '../model/migration_meta.dart';
@@ -1667,10 +1668,13 @@ class MigrationManager {
               task.currentTableName ?? targetTableName,
               indexName,
             );
+            final tableName = task.currentTableName ?? targetTableName;
+            final tableUid =
+                _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+            final indexUid = idxSchema.indexUid ?? indexName;
             final indexMeta = IndexMeta.createEmpty(
-              name: indexName,
-              tableName: task.currentTableName ?? targetTableName,
-              fields: idxSchema.fields,
+              indexUid: indexUid,
+              tableUid: tableUid,
               isUnique: idxSchema.unique,
               isBuilding: true,
             );
@@ -2168,9 +2172,19 @@ class MigrationManager {
         );
       }
 
+      final tableUid = resolvedTargetSchema.tableUid ??
+          _dataStore.schemaManager?.getUidByName(currentTableName) ??
+          _dataStore.schemaManager?.getUidByName(tableName) ??
+          GlobalIdGenerator.generate("t");
+      final schemaToSave = resolvedTargetSchema.copyWith(
+        tableUid: tableUid,
+        schemaVersion: GlobalIdGenerator.generate("s"),
+      );
+
       await _dataStore.schemaManager?.saveTableSchema(
+        tableUid,
         currentTableName,
-        resolvedTargetSchema,
+        schemaToSave,
         fieldRenameHints: fieldRenameHints,
       );
 
@@ -2186,10 +2200,13 @@ class MigrationManager {
       return currentTableName;
     } finally {
       if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(_dataStore).catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(LargeOperationRunner.runPendingOperations(_dataStore)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (keyMigrating) {
-        unawaited(_dataStore.keyManager.startDeferredKeyMigrationWork().catchError((_) {}, test: (e) => e is DbClosedException));
+        unawaited(_dataStore.keyManager
+            .startDeferredKeyMigrationWork()
+            .catchError((_) {}, test: (e) => e is DbClosedException));
       }
       if (lockMgr != null) {
         for (final entry in acquiredLocks.entries.toList().reversed) {
@@ -3923,14 +3940,20 @@ class MigrationManager {
 
             // Check if table exists under either the old or new name in this space before migration.
             final isGlobalTable = oldSchema?.isGlobal ?? false;
-            final dirInfo = await migrationInstance.directoryManager
-                ?.getTableDirectoryInfo(originalTableName, isGlobalTable);
-
-            bool exists = dirInfo != null;
-            if (!exists && originalTableName != currentTableName) {
-              final dirInfoNew = await migrationInstance.directoryManager
-                  ?.getTableDirectoryInfo(currentTableName, isGlobalTable);
-              exists = dirInfoNew != null;
+            bool exists = false;
+            final schemaMgr = migrationInstance.schemaManager;
+            if (schemaMgr != null) {
+              if (isGlobalTable) {
+                exists = schemaMgr.getUidByName(originalTableName) != null ||
+                    schemaMgr.getUidByName(currentTableName) != null;
+              } else {
+                final originalUid = schemaMgr.getUidByName(originalTableName);
+                final currentUid = schemaMgr.getUidByName(currentTableName);
+                final activeUids = await schemaMgr.getActiveUidsForSpace(space);
+                exists =
+                    (originalUid != null && activeUids.contains(originalUid)) ||
+                        (currentUid != null && activeUids.contains(currentUid));
+              }
             }
 
             if (!exists && !SystemTable.isSystemTable(originalTableName)) {
@@ -4066,12 +4089,15 @@ class MigrationManager {
                       indexName,
                     );
                     if (existingMeta == null || !existingMeta.isBuilding) {
+                      final tableUid = migrationInstance.schemaManager
+                              ?.getUidByName(currentTableName) ??
+                          currentTableName;
+                      final indexUid = idxSchema.indexUid ?? indexName;
                       final indexMeta = (existingMeta != null)
                           ? existingMeta.copyWith(isBuilding: true)
                           : IndexMeta.createEmpty(
-                              name: indexName,
-                              tableName: currentTableName,
-                              fields: idxSchema.fields,
+                              indexUid: indexUid,
+                              tableUid: tableUid,
                               isUnique: idxSchema.unique,
                               isBuilding: true,
                             );
@@ -4595,7 +4621,15 @@ class MigrationManager {
         }
       }
 
-      await schemaMgr.saveTableSchema(childTableName, updatedChildSchema);
+      final childUid = updatedChildSchema.tableUid ??
+          schemaMgr.getUidByName(childTableName) ??
+          GlobalIdGenerator.generate("t");
+      final childSchemaToSave = updatedChildSchema.copyWith(
+        tableUid: childUid,
+        schemaVersion: GlobalIdGenerator.generate("s"),
+      );
+      await schemaMgr.saveTableSchema(
+          childUid, childTableName, childSchemaToSave);
       await fkManager.updateSystemTableForTable(
         childTableName,
         updatedChildSchema,
@@ -5343,18 +5377,47 @@ class MigrationManager {
                 ]),
               );
 
-      final currentSchema =
-          await _dataStore.schemaManager?.getTableSchema(targetTableName);
+      final schemaMgr = _dataStore.schemaManager;
+      final currentSchema = await schemaMgr?.getTableSchema(targetTableName);
 
-      // Convert schemas to JSON for deep comparison
-      final definitionJson = jsonEncode(definitionSchema.toJson());
-      final currentJson =
-          currentSchema != null ? jsonEncode(currentSchema.toJson()) : null;
+      // Compare schemas structurally (ignoring tableUid, indexUid, schemaVersion, and autoIndexes)
+      bool isConsistent = false;
+      if (currentSchema != null) {
+        final cleanCurrent = currentSchema.copyWith(
+          tableUid: null,
+          schemaVersion: null,
+          autoIndexes: null,
+          indexes: currentSchema.indexes
+              .map((i) => i.copyWith(indexUid: null))
+              .toList(),
+        );
+        final cleanDef = definitionSchema.copyWith(
+          tableUid: null,
+          schemaVersion: null,
+          autoIndexes: null,
+          indexes: definitionSchema.indexes
+              .map((i) => i.copyWith(indexUid: null))
+              .toList(),
+        );
+        isConsistent =
+            jsonEncode(cleanCurrent.toJson()) == jsonEncode(cleanDef.toJson());
+      }
 
       // Only update if schemas are different
-      if (currentJson == null || definitionJson != currentJson) {
-        await _dataStore.schemaManager!
-            .saveTableSchema(targetTableName, definitionSchema);
+      if (!isConsistent) {
+        final tableUid = currentSchema?.tableUid ??
+            schemaMgr?.getUidByName(targetTableName) ??
+            GlobalIdGenerator.generate("t");
+
+        final schemaToSave = definitionSchema
+            .generateAutoIndexes(oldSchema: currentSchema)
+            .copyWith(
+              tableUid: tableUid,
+              schemaVersion: GlobalIdGenerator.generate("s"),
+            );
+
+        await schemaMgr!
+            .saveTableSchema(tableUid, targetTableName, schemaToSave);
       } else {
         Logger.debug(
           'Schema for table [$targetTableName] is already consistent with definition',
@@ -5381,17 +5444,48 @@ class MigrationManager {
 
     final currentSchema =
         await _dataStore.schemaManager?.getTableSchema(currentTableName);
-    final currentJson =
-        currentSchema != null ? jsonEncode(currentSchema.toJson()) : null;
-    final definitionJson = jsonEncode(definitionSchema.toJson());
+    // Compare schemas structurally (ignoring tableUid, indexUid, schemaVersion, and autoIndexes)
+    bool isConsistent = false;
+    if (currentSchema != null) {
+      final cleanCurrent = currentSchema.copyWith(
+        tableUid: null,
+        schemaVersion: null,
+        autoIndexes: null,
+        indexes: currentSchema.indexes
+            .map((i) => i.copyWith(indexUid: null))
+            .toList(),
+      );
+      final cleanDef = definitionSchema.copyWith(
+        tableUid: null,
+        schemaVersion: null,
+        autoIndexes: null,
+        indexes: definitionSchema.indexes
+            .map((i) => i.copyWith(indexUid: null))
+            .toList(),
+      );
+      isConsistent =
+          jsonEncode(cleanCurrent.toJson()) == jsonEncode(cleanDef.toJson());
+    }
 
-    if (currentJson == definitionJson) {
+    if (isConsistent) {
       return;
     }
 
-    await _dataStore.schemaManager?.saveTableSchema(
+    final schemaMgr = _dataStore.schemaManager;
+    final tableUid = currentSchema?.tableUid ??
+        schemaMgr?.getUidByName(currentTableName) ??
+        GlobalIdGenerator.generate("t");
+
+    final schemaToSave =
+        definitionSchema.generateAutoIndexes(oldSchema: currentSchema).copyWith(
+              tableUid: tableUid,
+              schemaVersion: GlobalIdGenerator.generate("s"),
+            );
+
+    await schemaMgr?.saveTableSchema(
+      tableUid,
       currentTableName,
-      definitionSchema,
+      schemaToSave,
     );
   }
 
