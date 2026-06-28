@@ -7906,7 +7906,7 @@ class DataStoreImpl {
       }
 
       // 1. Get the path for the space
-      final spacePath = pathManager.getSpacePath();
+      final spacePath = pathManager.getSpacePath(spaceName: spaceName);
 
       // 2. Delete the space directory
       if (await storage.existsDirectory(spacePath)) {
