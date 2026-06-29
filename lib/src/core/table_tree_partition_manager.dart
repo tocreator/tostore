@@ -326,9 +326,9 @@ final class TableTreePartitionManager {
     return loadedBytes;
   }
 
-  /// Create an initial TableMeta with first partition and B+Tree fields.
   Future<TableMeta> _createInitialTableMeta(String tableName) async {
-    return TableMeta.createEmpty(name: tableName);
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    return TableMeta.createEmpty(tableUid: tableUid);
   }
 
   /// Get partition file path using the dirIndex from partition meta.
