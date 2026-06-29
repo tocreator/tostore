@@ -193,7 +193,7 @@ class FileMeta {
 /// table meta model
 class TableMeta {
   final int version;
-  final String name;
+  final String tableUid;
   final int totalSizeInBytes;
   final int totalRecords;
   final Timestamps timestamps;
@@ -231,7 +231,7 @@ class TableMeta {
 
   TableMeta({
     int? version,
-    required this.name,
+    required this.tableUid,
     required this.totalSizeInBytes,
     required this.totalRecords,
     required this.timestamps,
@@ -253,7 +253,7 @@ class TableMeta {
 
   /// Creates an initial empty [TableMeta] with default B+Tree configuration.
   ///
-  /// [name] - The table name.
+  /// [tableUid] - The table unique identifier.
   /// [pageSize] - Page size in bytes (default: 16KB).
   /// [partitionCount] - Initial partition count (default: 1).
   /// [now] - Optional timestamp override; uses current time if not provided.
@@ -262,14 +262,14 @@ class TableMeta {
   /// - Creating a new table
   /// - Clearing an existing table (with optional preserved pageSize/partitionCount)
   static TableMeta createEmpty({
-    required String name,
+    required String tableUid,
     int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
   }) {
     final timestamp = now ?? DateTime.now();
     return TableMeta(
-      name: name,
+      tableUid: tableUid,
       totalSizeInBytes: 0,
       totalRecords: 0,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
@@ -285,7 +285,7 @@ class TableMeta {
 
   TableMeta copyWith({
     int? version,
-    String? name,
+    String? tableUid,
     int? totalSizeInBytes,
     int? totalRecords,
     Timestamps? timestamps,
@@ -300,7 +300,7 @@ class TableMeta {
   }) {
     return TableMeta(
       version: version ?? this.version,
-      name: name ?? this.name,
+      tableUid: tableUid ?? this.tableUid,
       totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
       totalRecords: totalRecords ?? this.totalRecords,
       timestamps: timestamps ?? this.timestamps,
@@ -317,7 +317,8 @@ class TableMeta {
 
   /// deserialize from json
   factory TableMeta.fromJson(Map<String, dynamic> json) {
-    if (json['name'] == null ||
+    final loadedUid = (json['tableUid'] ?? json['name']) as String?;
+    if (loadedUid == null ||
         json['totalSizeInBytes'] == null ||
         json['totalRecords'] == null ||
         json['timestamps'] == null ||
@@ -332,8 +333,8 @@ class TableMeta {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Missing required fields for TableMeta (v2+). Missing fields: ${[
-            if (json['name'] == null) 'name',
+              'Missing required fields for TableMeta. Missing fields: ${[
+            if (loadedUid == null) 'tableUid',
             if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
             if (json['totalRecords'] == null) 'totalRecords',
             if (json['timestamps'] == null) 'timestamps',
@@ -352,7 +353,7 @@ class TableMeta {
     return TableMeta(
       version:
           resolveVersionValue(json['version'], InternalConfig.tableDataVersion),
-      name: json['name'] as String,
+      tableUid: loadedUid,
       totalSizeInBytes: json['totalSizeInBytes'] is int
           ? json['totalSizeInBytes'] as int
           : int.parse('${json['totalSizeInBytes']}'),
@@ -379,7 +380,7 @@ class TableMeta {
   Map<String, dynamic> toJson() {
     return {
       'version': version,
-      'name': name,
+      'tableUid': tableUid,
       'totalSizeInBytes': totalSizeInBytes,
       'totalRecords': totalRecords,
       'timestamps': timestamps.toJson(),
@@ -396,7 +397,7 @@ class TableMeta {
 
   @override
   String toString() =>
-      'TableMeta(version: $version, name: $name, totalSizeInBytes: $totalSizeInBytes, totalRecords: $totalRecords, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+      'TableMeta(version: $version, tableUid: $tableUid, totalSizeInBytes: $totalSizeInBytes, totalRecords: $totalRecords, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
 }
 
 /// timestamp info
@@ -744,36 +745,45 @@ class SchemaPartitionMeta {
   }
 }
 
-/// table directory info
-class TableDirectoryInfo {
-  /// whether the table is global
+/// stable table schema route entry
+class TableSchemaRouteEntry {
+  final String tableUid;
+  final String tableName;
+  final int dirIndex;
+  final int partitionIndex;
+  final int dataDirIndex;
   final bool isGlobal;
 
-  /// directory index
-  final int dirIndex;
-
-  TableDirectoryInfo({
-    required this.isGlobal,
+  TableSchemaRouteEntry({
+    required this.tableUid,
+    required this.tableName,
     required this.dirIndex,
+    required this.partitionIndex,
+    required this.dataDirIndex,
+    required this.isGlobal,
   });
 
-  factory TableDirectoryInfo.fromJson(Map<String, dynamic> json) {
-    return TableDirectoryInfo(
-      isGlobal: json['isGlobal'] as bool,
+  factory TableSchemaRouteEntry.fromJson(Map<String, dynamic> json) {
+    return TableSchemaRouteEntry(
+      tableUid: json['tableUid'] as String,
+      tableName: json['tableName'] as String,
       dirIndex: json['dirIndex'] as int,
+      partitionIndex: json['partitionIndex'] as int,
+      dataDirIndex: json['dataDirIndex'] as int,
+      isGlobal: json['isGlobal'] as bool? ?? false,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
-      'isGlobal': isGlobal,
+      'tableUid': tableUid,
+      'tableName': tableName,
       'dirIndex': dirIndex,
+      'partitionIndex': partitionIndex,
+      'dataDirIndex': dataDirIndex,
+      'isGlobal': isGlobal,
     };
   }
-
-  @override
-  String toString() =>
-      'TableDirectoryInfo(isGlobal: $isGlobal, dirIndex: $dirIndex)';
 }
 
 /// database schema meta
@@ -781,9 +791,8 @@ class SchemaMeta {
   /// database version
   final int version;
 
-  /// table and partition mapping - key is table name, value is partition index containing the table
-  /// Note: Each table schema should be stored in a single partition file to avoid decoding issues
-  final Map<String, int> tablePartitionMap;
+  /// table schema route entries
+  final List<TableSchemaRouteEntry> routes;
 
   /// timestamps
   final Timestamps timestamps;
@@ -794,101 +803,58 @@ class SchemaMeta {
   /// system table schema hash
   final String? systemSchemaHash;
 
-  /// Directory mapping for schema partitions.
-  /// Maintains partition index -> directory index mapping and directory file counts.
-  final DirectoryMapping? directoryMapping;
-
   SchemaMeta({
     int? version,
-    required this.tablePartitionMap,
+    required this.routes,
     required this.timestamps,
     this.userSchemaHash,
     this.systemSchemaHash,
-    this.directoryMapping,
   }) : version = version ?? InternalConfig.schemaVersion;
 
   SchemaMeta copyWith({
     int? version,
-    Map<String, int>? tablePartitionMap,
+    List<TableSchemaRouteEntry>? routes,
     Timestamps? timestamps,
     String? userSchemaHash,
     String? systemSchemaHash,
-    DirectoryMapping? directoryMapping,
   }) {
     return SchemaMeta(
       version: version ?? this.version,
-      tablePartitionMap: tablePartitionMap ?? Map.from(this.tablePartitionMap),
+      routes: routes ?? List<TableSchemaRouteEntry>.from(this.routes),
       timestamps: timestamps ?? this.timestamps,
       userSchemaHash: userSchemaHash ?? this.userSchemaHash,
       systemSchemaHash: systemSchemaHash ?? this.systemSchemaHash,
-      directoryMapping: directoryMapping ?? this.directoryMapping,
     );
   }
 
   factory SchemaMeta.fromJson(Map<String, dynamic> json) {
-    // Handle backward compatibility: old format had Map<String, List<int>>
-    Map<String, int> tablePartitionMap;
-    final rawTablePartitionMap = json['tablePartitionMap'];
-
-    if (rawTablePartitionMap is Map<String, dynamic>) {
-      tablePartitionMap = <String, int>{};
-
-      for (final entry in rawTablePartitionMap.entries) {
-        final key = entry.key;
-        final value = entry.value;
-
-        if (value is List) {
-          // Old format: Map<String, List<int>> - take the first partition index
-          if (value.isNotEmpty && value.first is int) {
-            tablePartitionMap[key] = value.first as int;
-          }
-        } else if (value is int) {
-          // New format: Map<String, int>
-          tablePartitionMap[key] = value;
-        }
-      }
-    } else {
-      tablePartitionMap = <String, int>{};
-    }
-
-    DirectoryMapping? directoryMapping;
-    if (json['directoryMapping'] != null) {
-      directoryMapping = DirectoryMapping.fromJson(
-          json['directoryMapping'] as Map<String, dynamic>);
-    }
-
-    final legacySchemaHash = json['schemaHash'] as String?;
-    final parsedUserSchemaHash =
-        json['userSchemaHash'] as String? ?? legacySchemaHash;
-    final parsedSystemSchemaHash = json['systemSchemaHash'] as String?;
-
     return SchemaMeta(
       version: resolveVersionValue(
-          json['version'], InternalConfig.legacySchemaVersion),
-      tablePartitionMap: tablePartitionMap,
+          json['version'], InternalConfig.schemaVersion),
+      routes: (json['routes'] as List<dynamic>?)
+              ?.map((e) => TableSchemaRouteEntry.fromJson(e as Map<String, dynamic>))
+              .toList() ??
+          [],
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
-      userSchemaHash: parsedUserSchemaHash,
-      systemSchemaHash: parsedSystemSchemaHash,
-      directoryMapping: directoryMapping,
+      userSchemaHash: json['userSchemaHash'] as String?,
+      systemSchemaHash: json['systemSchemaHash'] as String?,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
       'version': version,
-      'tablePartitionMap': tablePartitionMap,
+      'routes': routes.map((e) => e.toJson()).toList(),
       'timestamps': timestamps.toJson(),
       if (userSchemaHash != null) 'userSchemaHash': userSchemaHash,
       if (systemSchemaHash != null) 'systemSchemaHash': systemSchemaHash,
-      if (directoryMapping != null)
-        'directoryMapping': directoryMapping!.toJson(),
     };
   }
 
   @override
   String toString() {
-    return 'SchemaMeta(version: $version, tablePartitionMap: $tablePartitionMap, timestamps: $timestamps, userSchemaHash: $userSchemaHash, systemSchemaHash: $systemSchemaHash)';
+    return 'SchemaMeta(version: $version, routesCount: ${routes.length}, timestamps: $timestamps, userSchemaHash: $userSchemaHash, systemSchemaHash: $systemSchemaHash)';
   }
 }
 
@@ -897,14 +863,11 @@ class IndexMeta {
   /// index version
   final int version;
 
-  /// index name
-  final String name;
+  /// index unique identifier
+  final String indexUid;
 
-  /// table name
-  final String tableName;
-
-  /// index fields
-  final List<String> fields;
+  /// table unique identifier
+  final String tableUid;
 
   /// whether the index is unique
   final bool isUnique;
@@ -949,9 +912,8 @@ class IndexMeta {
 
   IndexMeta({
     int? version,
-    required this.name,
-    required this.tableName,
-    required this.fields,
+    required this.indexUid,
+    required this.tableUid,
     required this.isUnique,
     this.isBuilding = false,
     required this.timestamps,
@@ -974,21 +936,15 @@ class IndexMeta {
 
   /// Creates an initial empty [IndexMeta] with default B+Tree configuration.
   ///
-  /// [name] - The index name.
-  /// [tableName] - The table name this index belongs to.
-  /// [fields] - The indexed field names.
+  /// [indexUid] - The index unique identifier.
+  /// [tableUid] - The table unique identifier.
   /// [isUnique] - Whether this is a unique index.
   /// [pageSize] - Page size in bytes (default: 16KB).
   /// [partitionCount] - Initial partition count (default: 1).
   /// [now] - Optional timestamp override; uses current time if not provided.
-  ///
-  /// This is the canonical way to create an initial [IndexMeta] when:
-  /// - Creating a new index
-  /// - Rebuilding an existing index
   static IndexMeta createEmpty({
-    required String name,
-    required String tableName,
-    required List<String> fields,
+    required String indexUid,
+    required String tableUid,
     required bool isUnique,
     bool isBuilding = false,
     int pageSize = defaultPageSize,
@@ -997,9 +953,8 @@ class IndexMeta {
   }) {
     final timestamp = now ?? DateTime.now();
     return IndexMeta(
-      name: name,
-      tableName: tableName,
-      fields: fields,
+      indexUid: indexUid,
+      tableUid: tableUid,
       isUnique: isUnique,
       isBuilding: isBuilding,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
@@ -1017,12 +972,10 @@ class IndexMeta {
 
   IndexMeta copyWith({
     int? version,
-    String? name,
-    String? tableName,
-    List<String>? fields,
+    String? indexUid,
+    String? tableUid,
     bool? isUnique,
     bool? isBuilding,
-    int? bTreeOrder,
     Timestamps? timestamps,
     int? totalSizeInBytes,
     int? totalEntries,
@@ -1036,9 +989,8 @@ class IndexMeta {
   }) {
     return IndexMeta(
       version: version ?? this.version,
-      name: name ?? this.name,
-      tableName: tableName ?? this.tableName,
-      fields: fields ?? List.from(this.fields),
+      indexUid: indexUid ?? this.indexUid,
+      tableUid: tableUid ?? this.tableUid,
       isUnique: isUnique ?? this.isUnique,
       isBuilding: isBuilding ?? this.isBuilding,
       timestamps: timestamps ?? this.timestamps,
@@ -1055,9 +1007,11 @@ class IndexMeta {
   }
 
   factory IndexMeta.fromJson(Map<String, dynamic> json) {
-    if (json['name'] == null ||
-        json['tableName'] == null ||
-        json['fields'] == null ||
+    final loadedIndexUid = (json['indexUid'] ?? json['name']) as String?;
+    final loadedTableUid = (json['tableUid'] ?? json['tableName']) as String?;
+
+    if (loadedIndexUid == null ||
+        loadedTableUid == null ||
         json['isUnique'] == null ||
         json['timestamps'] == null ||
         json['btreePageSize'] == null ||
@@ -1071,10 +1025,9 @@ class IndexMeta {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Missing required fields for IndexMeta (v2+). Missing fields: ${[
-            if (json['name'] == null) 'name',
-            if (json['tableName'] == null) 'tableName',
-            if (json['fields'] == null) 'fields',
+              'Missing required fields for IndexMeta. Missing fields: ${[
+            if (loadedIndexUid == null) 'indexUid',
+            if (loadedTableUid == null) 'tableUid',
             if (json['isUnique'] == null) 'isUnique',
             if (json['timestamps'] == null) 'timestamps',
             if (json['btreePageSize'] == null) 'btreePageSize',
@@ -1092,9 +1045,8 @@ class IndexMeta {
     return IndexMeta(
       version:
           resolveVersionValue(json['version'], InternalConfig.indexVersion),
-      name: json['name'] as String,
-      tableName: json['tableName'] as String,
-      fields: (json['fields'] as List).map((e) => e as String).toList(),
+      indexUid: loadedIndexUid,
+      tableUid: loadedTableUid,
       isUnique: json['isUnique'] as bool,
       isBuilding: json['isBuilding'] as bool? ?? false,
       timestamps:
@@ -1117,9 +1069,8 @@ class IndexMeta {
   Map<String, dynamic> toJson() {
     return {
       'version': version,
-      'name': name,
-      'tableName': tableName,
-      'fields': fields,
+      'indexUid': indexUid,
+      'tableUid': tableUid,
       'isUnique': isUnique,
       'isBuilding': isBuilding,
       'totalSizeInBytes': totalSizeInBytes,
@@ -1137,7 +1088,7 @@ class IndexMeta {
 
   @override
   String toString() {
-    return 'IndexMeta(version: $version, name: $name, tableName: $tableName, isBuilding: $isBuilding, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+    return 'IndexMeta(version: $version, indexUid: $indexUid, tableUid: $tableUid, isBuilding: $isBuilding, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
   }
 }
 
