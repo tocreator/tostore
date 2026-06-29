@@ -391,7 +391,7 @@ class TableDataManager {
   int _estimateTableMetaSize(TableMeta meta) {
     // v2+ meta is small and fixed-shape (no partition lists).
     // Keep a conservative estimate to guide cache sizing.
-    return 160 + meta.name.length * 2;
+    return 160 + meta.tableUid.length * 2;
   }
 
   /// Query weight for table record cache entry
@@ -1755,28 +1755,32 @@ class TableDataManager {
 
   /// get table file size
   Future<int> getTableFileSize(String tableName) async {
-    if (!_fileSizes.containsKey(tableName)) {
-      final meta = await getTableMeta(tableName);
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    if (!_fileSizes.containsKey(tableUid)) {
+      final meta = await getTableMeta(tableUid);
       return meta?.totalSizeInBytes ?? 0;
     }
-    return _fileSizes[tableName] ?? 0;
+    return _fileSizes[tableUid] ?? 0;
   }
 
   /// update table file size and modified time
   Future<void> updateFileSize(String tableName, int size) async {
-    _fileSizes[tableName] = size;
-    _lastModifiedTimes[tableName] = DateTime.now();
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    _fileSizes[tableUid] = size;
+    _lastModifiedTimes[tableUid] = DateTime.now();
   }
 
   /// check if file is modified
   bool isFileModified(String tableName, DateTime lastReadTime) {
-    final lastModified = _lastModifiedTimes[tableName];
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final lastModified = _lastModifiedTimes[tableUid];
     return lastModified == null || lastModified.isAfter(lastReadTime);
   }
 
   /// get file last modified time
   DateTime? getLastModifiedTime(String tableName) {
-    return _lastModifiedTimes[tableName];
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    return _lastModifiedTimes[tableUid];
   }
 
   /// Rename table in all internal metadata maps.
@@ -1842,35 +1846,37 @@ class TableDataManager {
 
   /// Get table meta information
   Future<TableMeta?> getTableMeta(String tableName) async {
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+
     // Table meta cache fast path
-    final cached = _tableMetaCache.get(tableName);
+    final cached = _tableMetaCache.get(tableUid);
     if (cached != null) return cached;
 
     // Check if another call is already loading this meta
-    final existingFuture = _metaLoadingFutures[tableName];
+    final existingFuture = _metaLoadingFutures[tableUid];
     if (existingFuture != null) {
       return existingFuture;
     }
 
     // Load from disk with future tracking
-    final loadFuture = _doLoadTableMeta(tableName);
-    _metaLoadingFutures[tableName] = loadFuture;
+    final loadFuture = _doLoadTableMeta(tableUid);
+    _metaLoadingFutures[tableUid] = loadFuture;
 
     try {
       return await loadFuture;
     } finally {
       // Clean up future after completion
-      if (_metaLoadingFutures[tableName] == loadFuture) {
-        _metaLoadingFutures.remove(tableName);
+      if (_metaLoadingFutures[tableUid] == loadFuture) {
+        _metaLoadingFutures.remove(tableUid);
       }
     }
   }
 
   /// Internal method to perform the actual file load
-  Future<TableMeta?> _doLoadTableMeta(String tableName) async {
+  Future<TableMeta?> _doLoadTableMeta(String tableUid) async {
     try {
       final mainFilePath =
-          await _dataStore.pathManager.getDataMetaPath(tableName);
+          await _dataStore.pathManager.getDataMetaPath(tableUid);
       if (!await _dataStore.storage.existsFile(mainFilePath)) {
         return null;
       }
@@ -1895,7 +1901,7 @@ class TableDataManager {
 
         final meta = TableMeta.fromJson(jsonData);
         // Cache update
-        _tableMetaCache.put(tableName, meta);
+        _tableMetaCache.put(tableUid, meta);
         return meta;
       } catch (e) {
         Logger.error('Failed to parse table meta', rawError: e);
@@ -1910,22 +1916,23 @@ class TableDataManager {
   /// Update table meta
   Future<void> updateTableMeta(String tableName, TableMeta meta,
       {bool flush = true}) async {
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     final mainFilePath =
-        await _dataStore.pathManager.getDataMetaPath(tableName);
+        await _dataStore.pathManager.getDataMetaPath(tableUid);
 
     // Create directory if not exists
     final partitionsDir =
-        await _dataStore.pathManager.getPartitionsDirPath(tableName);
+        await _dataStore.pathManager.getPartitionsDirPath(tableUid);
     await _ensureDirectoryExists(partitionsDir);
 
     try {
       // Update meta cache in memory first so subsequent reads see latest value.
       _tableMetaCache.put(
-        tableName,
+        tableUid,
         meta,
         size: _estimateTableMetaSize(meta),
       );
-      _lastModifiedTimes[tableName] = DateTime.now();
+      _lastModifiedTimes[tableUid] = DateTime.now();
 
       // then write to file
       await _dataStore.storage
@@ -1937,7 +1944,7 @@ class TableDataManager {
     }
 
     // update file size
-    updateFileSize(tableName, meta.totalSizeInBytes);
+    updateFileSize(tableUid, meta.totalSizeInBytes);
   }
 
   /// Ensure directory exists
@@ -2710,12 +2717,11 @@ class TableDataManager {
           final prevMeta = await getTableMeta(tableName);
           final int pageSize =
               prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
-          // If we failed to delete the directory, avoid reusing old partition files:
-          // bump partition count so new writes allocate a fresh partitionNo.
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
+          final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
           final emptyMeta = TableMeta.createEmpty(
-            name: tableName,
+            tableUid: tableUid,
             pageSize: pageSize,
             partitionCount: newPartitionCount,
           );
