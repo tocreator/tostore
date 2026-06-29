@@ -6,10 +6,13 @@ import 'package:path/path.dart' as p;
 import 'logger.dart';
 import 'platform_handler.dart';
 
+const int schemaMaxPartitionFileSize = 512 * 1024; // 512KB
+
 /// internal configuration
 class InternalConfig {
   /// whether to show Logger specific label
   static const bool showLoggerInternalLabel = false;
+
 
   /// public label
   static const String publicLabel = 'ToStore';
