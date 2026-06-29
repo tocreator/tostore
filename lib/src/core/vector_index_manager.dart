@@ -1227,21 +1227,20 @@ class VectorIndexManager {
     bool changed = false;
     IndexMeta? nid2pk = meta.nodeIdToPkMeta;
     IndexMeta? pk2nid = meta.pkToNodeIdMeta;
+    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
 
     if (nid2pk == null) {
       nid2pk = IndexMeta.createEmpty(
-        name: meta.nid2pkIndexName,
-        tableName: tableName,
-        fields: const ['__nodeId'],
+        indexUid: meta.nid2pkIndexName,
+        tableUid: tableUid,
         isUnique: true,
       );
       changed = true;
     }
     if (pk2nid == null) {
       pk2nid = IndexMeta.createEmpty(
-        name: meta.pk2nidIndexName,
-        tableName: tableName,
-        fields: const ['__pk'],
+        indexUid: meta.pk2nidIndexName,
+        tableUid: tableUid,
         isUnique: true,
       );
       changed = true;
