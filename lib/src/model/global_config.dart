@@ -1,5 +1,4 @@
 import '../handler/common.dart';
-import 'meta_info.dart';
 
 /// global config model
 class GlobalConfig {
@@ -29,14 +28,6 @@ class GlobalConfig {
   /// Authoritative state is in migration_meta.json (task files + keyMigrationInfo).
   final bool hasMigrationTask;
 
-  /// table directory mapping - record the directory index of each table
-  /// the key format is "spaceName:tableName", for global space use "global:tableName"
-  final Map<String, TableDirectoryInfo> tableDirectoryMap;
-
-  /// directory usage - record the number of tables in each directory
-  /// the key format is "spaceName:dirIndex", for global space use "global:dirIndex"
-  final Map<String, int> directoryUsageMap;
-
   GlobalConfig({
     int? version,
     int? userVersion,
@@ -44,15 +35,11 @@ class GlobalConfig {
     Set<String>? spaceNames,
     this.activeSpace,
     this.hasMigrationTask = false,
-    Map<String, TableDirectoryInfo>? tableDirectoryMap,
-    Map<String, int>? directoryUsageMap,
   })  : version = version ?? InternalConfig.engineVersion,
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
             maxEntriesPerDir ?? InternalConfig.defaultMaxEntriesPerDir,
-        spaceNames = spaceNames ?? {'default'},
-        tableDirectoryMap = tableDirectoryMap ?? {},
-        directoryUsageMap = directoryUsageMap ?? {};
+        spaceNames = spaceNames ?? {'default'};
 
   /// create from json
   factory GlobalConfig.fromJson(Map<String, dynamic> json) {
@@ -68,19 +55,6 @@ class GlobalConfig {
           {'default'},
       activeSpace: json['activeSpace'] as String? ?? 'default',
       hasMigrationTask: json['hasMigrationTask'] as bool? ?? false,
-      tableDirectoryMap: json.containsKey('tableDirectoryMap')
-          ? (json['tableDirectoryMap'] as Map<String, dynamic>).map(
-              (key, value) => MapEntry(
-                key,
-                TableDirectoryInfo.fromJson(value as Map<String, dynamic>),
-              ),
-            )
-          : {},
-      directoryUsageMap: json.containsKey('directoryUsageMap')
-          ? (json['directoryUsageMap'] as Map<String, dynamic>).map(
-              (key, value) => MapEntry(key, value as int),
-            )
-          : {},
     );
   }
 
@@ -93,9 +67,6 @@ class GlobalConfig {
       'spaceNames': spaceNames.toList(),
       if (activeSpace != null) 'activeSpace': activeSpace!,
       'hasMigrationTask': hasMigrationTask,
-      'tableDirectoryMap':
-          tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
-      'directoryUsageMap': directoryUsageMap,
     };
   }
 
@@ -109,8 +80,6 @@ class GlobalConfig {
     String? activeSpace,
     bool clearActiveSpace = false,
     bool? hasMigrationTask,
-    Map<String, TableDirectoryInfo>? tableDirectoryMap,
-    Map<String, int>? directoryUsageMap,
   }) {
     return GlobalConfig(
       version: version ?? this.version,
@@ -119,8 +88,6 @@ class GlobalConfig {
       spaceNames: spaceNames ?? this.spaceNames,
       activeSpace: clearActiveSpace ? null : (activeSpace ?? this.activeSpace),
       hasMigrationTask: hasMigrationTask ?? this.hasMigrationTask,
-      tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
-      directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
     );
   }
 
