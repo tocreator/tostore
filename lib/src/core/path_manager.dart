@@ -12,20 +12,7 @@ class PathManager {
   final DataStoreImpl dataStore;
   DataStoreConfig get config => dataStore.config;
 
-  // table path cache
-  final Map<String, String> _tablePathCache = {};
-
   PathManager(this.dataStore);
-
-  /// clear all cache
-  void clearCache() {
-    _tablePathCache.clear();
-  }
-
-  /// clear specific table cache
-  void clearTableCache(String tableName) {
-    _tablePathCache.remove(tableName);
-  }
 
   //==================================
   // base path methods (sync methods)
@@ -90,6 +77,12 @@ class PathManager {
     return pathJoin(spacePath, 'space_config.json');
   }
 
+  /// get space tables active list binary path
+  String getSpaceTablesBinPath(String spaceName) {
+    final spacePath = getSpacePath(spaceName: spaceName);
+    return pathJoin(spacePath, 'space_tables.bin');
+  }
+
   /// Get weight file path
   String getWeightFilePath({String? spaceName}) {
     final spacePath = getSpacePath(spaceName: spaceName);
@@ -123,161 +116,126 @@ class PathManager {
   // table path methods (async methods)
   //==================================
 
-  /// get table path
-  Future<String> getTablePath(
-    String tableName, {
-    bool createIfMissing = true,
-  }) async {
-    // check cache
-    if (_tablePathCache.containsKey(tableName)) {
-      return _tablePathCache[tableName]!;
-    }
+  //==================================
+  // table path methods (async methods)
+  //==================================
 
-    // In-memory mode: synthesize a stable in-memory path without directory lookup.
+  /// get table path by UID
+  String getTablePathByUid(String tableUid) {
     if (dataStore.config.persistenceMode == PersistenceMode.memory) {
-      final synthetic =
-          'memory://${dataStore.currentSpaceName}/tables/$tableName';
-      _tablePathCache[tableName] = synthetic;
-      return synthetic;
+      return 'memory://${dataStore.currentSpaceName}/tables/$tableUid';
     }
 
-    // get table directory info using DirectoryManager
-    final tablePath = await dataStore.directoryManager?.getTablePathIfExists(
-      tableName,
-      createIfMappingMissing: createIfMissing,
-    );
-    if (tablePath == null) {
+    final route = dataStore.schemaManager?.getRouteByUid(tableUid);
+    if (route == null) {
+      // Fallback: check if the argument was actually tableName
+      final realUid = dataStore.schemaManager?.getUidByName(tableUid);
+      if (realUid != null) {
+        return getTablePathByUid(realUid);
+      }
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message:
-              'Table $tableName does not exist or path cannot be determined',
-          tableName: tableName,
+          message: 'Table Route Entry not found for table: $tableUid',
+          tableName: tableUid,
         ),
       ]);
     }
 
-    // update cache
-    _tablePathCache[tableName] = tablePath;
-
-    return tablePath;
-  }
-
-  /// create table path for new table
-  Future<String> createTablePath(String tableName, bool isGlobal) async {
-    // get table path
-    final tablePath = await dataStore.directoryManager
-        ?.createTablePathIfNotExists(tableName, isGlobal);
-
-    if (tablePath == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'Failed to create path for table $tableName',
-        ),
-      ]);
+    final String parentDir;
+    if (route.isGlobal) {
+      parentDir = pathJoin(_instancePath, 'global');
+    } else {
+      parentDir = getSpacePath(spaceName: dataStore.currentSpaceName);
     }
 
-    // update cache
-    _tablePathCache[tableName] = tablePath;
-
-    return tablePath;
+    return pathJoin(parentDir, 'tables_${route.dataDirIndex}', tableUid);
   }
 
   /// get table data root directory path
-  Future<String> getDataDirPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
+  Future<String> getDataDirPath(String tableUid) async {
+    final tablePath = getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'data');
   }
 
   /// get table data main meta file path
-  Future<String> getDataMetaPath(String tableName) async {
-    final dataPath = await getDataDirPath(tableName);
+  Future<String> getDataMetaPath(String tableUid) async {
+    final dataPath = await getDataDirPath(tableUid);
     return pathJoin(dataPath, 'meta.json');
   }
 
   /// get table data btree partitions directory path
-  Future<String> getPartitionsDirPath(String tableName) async {
-    final dataPath = await getDataDirPath(tableName);
+  Future<String> getPartitionsDirPath(String tableUid) async {
+    final dataPath = await getDataDirPath(tableUid);
     return pathJoin(dataPath, 'btree');
   }
 
   /// Get table overflow (TOAST-like) directory path.
-  ///
-  /// This directory stores out-of-line large values referenced by pointers in the
-  /// primary B+Tree. We keep it separated from `btree/` so future format evolution
-  /// (heap pages / slotted pages / compression) can be isolated.
-  Future<String> getOverflowDirPath(String tableName) async {
-    final dataPath = await getDataDirPath(tableName);
+  Future<String> getOverflowDirPath(String tableUid) async {
+    final dataPath = await getDataDirPath(tableUid);
     return pathJoin(dataPath, 'overflow');
   }
 
   /// Get overflow partition file path by partitionNo.
-  ///
-  /// Deterministic sharding:
-  /// `dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir`
   Future<String> getOverflowPartitionFilePathByNo(
-      String tableName, int partitionNo) async {
-    final overflowDir = await getOverflowDirPath(tableName);
+      String tableUid, int partitionNo) async {
+    final overflowDir = await getOverflowDirPath(tableUid);
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dirPath = pathJoin(overflowDir, 'dir_$dirIndex');
     return pathJoin(dirPath, 'p$partitionNo.dat');
   }
 
   /// get table data partition directory path
-  Future<String> getPartitionDirPath(String tableName, int dirIndex) async {
-    final partitionsPath = await getPartitionsDirPath(tableName);
+  Future<String> getPartitionDirPath(String tableUid, int dirIndex) async {
+    final partitionsPath = await getPartitionsDirPath(tableUid);
     return pathJoin(partitionsPath, 'dir_$dirIndex');
   }
 
   /// Get table B+Tree partition file path by partitionNo (new layout).
-  ///
-  /// Deterministic sharding:
-  /// `dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir`
   Future<String> getPartitionFilePathByNo(
-      String tableName, int partitionNo) async {
+      String tableUid, int partitionNo) async {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dirPath = await getPartitionDirPath(tableName, dirIndex);
+    final dirPath = await getPartitionDirPath(tableUid, dirIndex);
     return pathJoin(dirPath, 'p$partitionNo.dat');
   }
 
   /// get table index directory path
-  Future<String> getIndexDirPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
+  Future<String> getIndexDirPath(String tableUid) async {
+    final tablePath = getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'index');
   }
 
   /// get index root directory path
-  Future<String> getIndexPath(String tableName, String indexName) async {
-    final indexDirPath = await getIndexDirPath(tableName);
-    return pathJoin(indexDirPath, indexName);
+  Future<String> getIndexPath(String tableUid, String indexUid) async {
+    final indexDirPath = await getIndexDirPath(tableUid);
+    return pathJoin(indexDirPath, indexUid);
   }
 
   /// get index meta file path
-  Future<String> getIndexMetaPath(String tableName, String indexName) async {
-    final indexPath = await getIndexPath(tableName, indexName);
+  Future<String> getIndexMetaPath(String tableUid, String indexUid) async {
+    final indexPath = await getIndexPath(tableUid, indexUid);
     return pathJoin(indexPath, 'meta.json');
   }
 
   /// get index btree partition directory path
   Future<String> getIndexPartitionDirPath(
-      String tableName, String indexName, int dirIndex) async {
-    final indexPath = await getIndexPath(tableName, indexName);
+      String tableUid, String indexUid, int dirIndex) async {
+    final indexPath = await getIndexPath(tableUid, indexUid);
     return pathJoin(indexPath, 'btree', 'dir_$dirIndex');
   }
 
   /// Get index B+Tree partition file path by partitionNo (new layout).
   Future<String> getIndexPartitionPathByNo(
-      String tableName, String indexName, int partitionNo) async {
+      String tableUid, String indexUid, int partitionNo) async {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dirPath =
-        await getIndexPartitionDirPath(tableName, indexName, dirIndex);
+        await getIndexPartitionDirPath(tableUid, indexUid, dirIndex);
     return pathJoin(dirPath, 'p$partitionNo.idx');
   }
 
   /// get stats file path
-  Future<String> getStatsPath(String tableName) async {
-    final tablePath = await getTablePath(tableName);
+  Future<String> getStatsPath(String tableUid) async {
+    final tablePath = getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'stats.json');
   }
 
@@ -286,54 +244,54 @@ class PathManager {
   // ==================================
 
   /// Root path for an NGH vector index.
-  Future<String> getNghIndexPath(String tableName, String indexName) async {
-    final indexPath = await getIndexPath(tableName, indexName);
+  Future<String> getNghIndexPath(String tableUid, String indexUid) async {
+    final indexPath = await getIndexPath(tableUid, indexUid);
     return pathJoin(indexPath, 'ngh');
   }
 
   /// NGH index metadata file.
-  Future<String> getNghMetaPath(String tableName, String indexName) async {
-    final nghPath = await getNghIndexPath(tableName, indexName);
+  Future<String> getNghMetaPath(String tableUid, String indexUid) async {
+    final nghPath = await getNghIndexPath(tableUid, indexUid);
     return pathJoin(nghPath, 'meta.json');
   }
 
   /// NGH PQ codebook file.
-  Future<String> getNghCodebookPath(String tableName, String indexName) async {
-    final nghPath = await getNghIndexPath(tableName, indexName);
+  Future<String> getNghCodebookPath(String tableUid, String indexUid) async {
+    final nghPath = await getNghIndexPath(tableUid, indexUid);
     return pathJoin(nghPath, 'codebook.ngh');
   }
 
   /// NGH graph partition directory path.
   Future<String> _nghPartitionDirPath(
-      String tableName, String indexName, String category, int dirIndex) async {
-    final nghPath = await getNghIndexPath(tableName, indexName);
+      String tableUid, String indexUid, String category, int dirIndex) async {
+    final nghPath = await getNghIndexPath(tableUid, indexUid);
     return pathJoin(nghPath, category, 'dir_$dirIndex');
   }
 
   /// NGH graph partition file path by partitionNo.
   Future<String> getNghGraphPartitionPath(
-      String tableName, String indexName, int partitionNo) async {
+      String tableUid, String indexUid, int partitionNo) async {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dir =
-        await _nghPartitionDirPath(tableName, indexName, 'graph', dirIndex);
+        await _nghPartitionDirPath(tableUid, indexUid, 'graph', dirIndex);
     return pathJoin(dir, 'p$partitionNo.ngh');
   }
 
   /// NGH PQ-code partition file path by partitionNo.
   Future<String> getNghPqCodePartitionPath(
-      String tableName, String indexName, int partitionNo) async {
+      String tableUid, String indexUid, int partitionNo) async {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dir =
-        await _nghPartitionDirPath(tableName, indexName, 'pqcode', dirIndex);
+        await _nghPartitionDirPath(tableUid, indexUid, 'pqcode', dirIndex);
     return pathJoin(dir, 'p$partitionNo.ngh');
   }
 
   /// NGH raw-vector partition file path by partitionNo.
   Future<String> getNghRawVectorPartitionPath(
-      String tableName, String indexName, int partitionNo) async {
+      String tableUid, String indexUid, int partitionNo) async {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dir =
-        await _nghPartitionDirPath(tableName, indexName, 'rawvec', dirIndex);
+        await _nghPartitionDirPath(tableUid, indexUid, 'rawvec', dirIndex);
     return pathJoin(dir, 'p$partitionNo.ngh');
   }
 
