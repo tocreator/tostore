@@ -7,6 +7,7 @@ import '../core/data_store_impl.dart';
 import '../core/path_manager.dart';
 import '../core/storage_adapter.dart';
 import '../core/yield_controller.dart';
+import '../model/table_schema.dart';
 
 /// Old path structure migration handler
 /// Handles the logic for migrating from the old version database path structure to the new version
@@ -235,9 +236,11 @@ class OldStructureMigrationHandler {
         try {
           final schemaJson = jsonDecode(schemaContent);
           // create new table using SchemaManager
+          final schema = TableSchema.fromJson(schemaJson);
           await dataStore.schemaManager!.saveTableSchema(
             tableName,
-            schemaJson,
+            tableName,
+            schema,
           );
           Logger.info('Table $tableName structure migration succeeded');
         } catch (e) {
