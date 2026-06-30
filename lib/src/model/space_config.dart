@@ -1,5 +1,4 @@
 import '../handler/common.dart';
-import 'meta_info.dart';
 
 /// The initialization configuration model
 class SpaceConfig {
@@ -14,14 +13,6 @@ class SpaceConfig {
 
   /// Internal engine/storage format version
   final int version;
-
-  /// Table directory mapping - Records the directory index where each table is located
-  /// Key format is "spaceName:tableName"
-  final Map<String, TableDirectoryInfo> tableDirectoryMap;
-
-  /// Directory usage - Records how many tables each directory contains
-  /// Key format is "spaceName:dirIndex"
-  final Map<String, int> directoryUsageMap;
 
   /// Total number of tables
   final int totalTableCount;
@@ -40,16 +31,12 @@ class SpaceConfig {
     this.previous,
     List<EncryptionKeyInfo>? historyKeys,
     int? version,
-    Map<String, TableDirectoryInfo>? tableDirectoryMap,
-    Map<String, int>? directoryUsageMap,
     this.totalTableCount = 0,
     this.totalRecordCount = 0,
     this.totalDataSizeBytes = 0,
     this.lastStatisticsTime,
   })  : version = version ?? InternalConfig.engineVersion,
-        historyKeys = (historyKeys ?? const []).toList(),
-        tableDirectoryMap = tableDirectoryMap ?? {},
-        directoryUsageMap = directoryUsageMap ?? {};
+        historyKeys = (historyKeys ?? const []).toList();
 
   factory SpaceConfig.fromJson(Map<String, dynamic> json) {
     return SpaceConfig(
@@ -67,19 +54,6 @@ class SpaceConfig {
             : null,
         version: resolveVersionValue(
             json['version'], InternalConfig.legacyEngineVersion),
-        tableDirectoryMap: json.containsKey('tableDirectoryMap')
-            ? (json['tableDirectoryMap'] as Map<String, dynamic>).map(
-                (key, value) => MapEntry(
-                  key,
-                  TableDirectoryInfo.fromJson(value as Map<String, dynamic>),
-                ),
-              )
-            : {},
-        directoryUsageMap: json.containsKey('directoryUsageMap')
-            ? (json['directoryUsageMap'] as Map<String, dynamic>).map(
-                (key, value) => MapEntry(key, value as int),
-              )
-            : {},
         totalTableCount: json['totalTableCount'] as int? ?? 0,
         totalRecordCount: json['totalRecordCount'] as int? ?? 0,
         totalDataSizeBytes: json['totalDataSizeBytes'] as int? ?? 0,
@@ -94,9 +68,6 @@ class SpaceConfig {
       'previous': previous?.toJson(),
       'historyKeys': historyKeys.map((e) => e.toJson()).toList(),
       'version': version,
-      'tableDirectoryMap':
-          tableDirectoryMap.map((key, value) => MapEntry(key, value.toJson())),
-      'directoryUsageMap': directoryUsageMap,
       'totalTableCount': totalTableCount,
       'totalRecordCount': totalRecordCount,
       'totalDataSizeBytes': totalDataSizeBytes,
@@ -110,8 +81,6 @@ class SpaceConfig {
     EncryptionKeyInfo? previous,
     List<EncryptionKeyInfo>? historyKeys,
     int? version,
-    Map<String, TableDirectoryInfo>? tableDirectoryMap,
-    Map<String, int>? directoryUsageMap,
     int? totalTableCount,
     int? totalRecordCount,
     int? totalDataSizeBytes,
@@ -122,8 +91,6 @@ class SpaceConfig {
       previous: previous ?? this.previous,
       historyKeys: historyKeys ?? this.historyKeys,
       version: version ?? this.version,
-      tableDirectoryMap: tableDirectoryMap ?? this.tableDirectoryMap,
-      directoryUsageMap: directoryUsageMap ?? this.directoryUsageMap,
       totalTableCount: totalTableCount ?? this.totalTableCount,
       totalRecordCount: totalRecordCount ?? this.totalRecordCount,
       totalDataSizeBytes: totalDataSizeBytes ?? this.totalDataSizeBytes,
