@@ -6,12 +6,17 @@ import '../handler/encoder.dart';
 import '../handler/logger.dart';
 import '../handler/chacha20_poly1305_old.dart';
 import '../model/global_config.dart';
+import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/space_config.dart';
 import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
+import 'v3_upgrade.dart';
 
 /// Version 2 upgrade handler.
 /// This upgrade adds stable partition directory mapping for table data partitions,
@@ -33,6 +38,11 @@ class V2Upgrade {
 
     // Upgrade migration metadata (global, not space-specific)
     await _upgradeMigrationMeta(_dataStore);
+
+    // IMMEDIATELY execute version 3 metadata and directory mapping upgrade
+    // so that subsequent data rewriting has correct path resolution via table UIDs.
+    final v3Upgrade = V3Upgrade(_dataStore);
+    await v3Upgrade.execute(oldGlobalConfig, skipVersionBump: true);
 
     // Backup and upgrade encryption keys for each space before migration
     // This ensures we can recover from backup if migration fails
@@ -214,11 +224,12 @@ class V2Upgrade {
       final content = await db.storage.readAsString(schemaMetaPath);
       if (content == null || content.isEmpty) return;
 
-      final schemaMeta = SchemaMeta.fromJson(jsonDecode(content));
+      final json = jsonDecode(content) as Map<String, dynamic>;
 
       // If directoryMapping already exists and covers all partitions, skip.
-      final existingMapping = schemaMeta.directoryMapping;
-      final partitions = schemaMeta.tablePartitionMap.values.toSet().toList();
+      final existingMapping = json['directoryMapping'] as Map<String, dynamic>?;
+      final tpm = json['tablePartitionMap'] as Map<String, dynamic>? ?? {};
+      final partitions = tpm.values.toSet().toList();
       bool needUpgrade = false;
 
       if (existingMapping == null) {
@@ -226,9 +237,11 @@ class V2Upgrade {
       } else if (partitions.isEmpty) {
         needUpgrade = false;
       } else {
+        final p2d =
+            existingMapping['partitionToDir'] as Map<String, dynamic>? ?? {};
         // Check if all partitions have mappings
         for (final pIndex in partitions) {
-          if (existingMapping.getDirIndex(pIndex) == null) {
+          if (!p2d.containsKey(pIndex.toString())) {
             needUpgrade = true;
             break;
           }
@@ -240,14 +253,14 @@ class V2Upgrade {
       }
 
       final maxEntriesPerDir = db.maxEntriesPerDir;
-      final Map<int, int> p2d = <int, int>{};
-      final Map<int, int> d2c = <int, int>{};
+      final Map<String, int> p2d = <String, int>{};
+      final Map<String, int> d2c = <String, int>{};
 
       for (final pIndex in partitions) {
         // Legacy algorithm (only used during this one-time upgrade).
-        final dirIndex = pIndex ~/ maxEntriesPerDir;
-        p2d[pIndex] = dirIndex;
-        d2c[dirIndex] = (d2c[dirIndex] ?? 0) + 1;
+        final dirIndex = (pIndex as int) ~/ maxEntriesPerDir;
+        p2d[pIndex.toString()] = dirIndex;
+        d2c[dirIndex.toString()] = (d2c[dirIndex.toString()] ?? 0) + 1;
 
         // Update partition meta dirIndex if needed
         final legacyDirIndex = pIndex ~/ maxEntriesPerDir;
@@ -269,15 +282,13 @@ class V2Upgrade {
         }
       }
 
-      final newMapping = DirectoryMapping(
-        partitionToDir: p2d,
-        dirToFileCount: d2c,
-      );
+      final newMapping = {
+        'partitionToDir': p2d,
+        'dirToFileCount': d2c,
+      };
 
-      final updatedSchemaMeta =
-          schemaMeta.copyWith(directoryMapping: newMapping);
-      await db.storage.writeAsString(
-          schemaMetaPath, jsonEncode(updatedSchemaMeta.toJson()));
+      json['directoryMapping'] = newMapping;
+      await db.storage.writeAsString(schemaMetaPath, jsonEncode(json));
 
       Logger.info(
         'Upgraded Schema partition directory mapping',
@@ -363,8 +374,15 @@ class V2Upgrade {
         'Starting table data upgrade for table: $tableName',
       );
 
+      final tableUid = db.schemaManager?.getUidByName(tableName);
+      if (tableUid == null) {
+        Logger.warn(
+            'Table UID not found for table: $tableName, skipping data upgrade');
+        return;
+      }
+
       // Manually build old table meta path (old format: main.dat)
-      final tablePath = await db.pathManager.getTablePath(tableName);
+      final tablePath = _manualGetTablePath(db, tableName);
       final oldDataMetaPath = pathJoin(tablePath, 'data', 'main.dat');
 
       // Check if old data meta file exists
@@ -409,9 +427,8 @@ class V2Upgrade {
       );
 
       // Delete new ranges directory and data meta file to avoid data migration confusion
-      final newRangesPath =
-          await db.pathManager.getPartitionsDirPath(tableName);
-      final newDataMetaPath = await db.pathManager.getDataMetaPath(tableName);
+      final newRangesPath = await db.pathManager.getPartitionsDirPath(tableUid);
+      final newDataMetaPath = await db.pathManager.getDataMetaPath(tableUid);
       if (await db.storage.existsDirectory(newRangesPath)) {
         await db.storage.deleteDirectory(newRangesPath);
       }
@@ -420,7 +437,7 @@ class V2Upgrade {
       }
 
       // delete index root directory
-      final indexRootPath = await db.pathManager.getIndexDirPath(tableName);
+      final indexRootPath = await db.pathManager.getIndexDirPath(tableUid);
       if (await db.storage.existsDirectory(indexRootPath)) {
         await db.storage.deleteDirectory(indexRootPath);
       }
@@ -584,7 +601,7 @@ class V2Upgrade {
       final dirIndex = oldPartitionIndex ~/ db.maxEntriesPerDir;
 
       // Manually build old partition file path (old format: p{index}.dat)
-      final tablePath = await db.pathManager.getTablePath(tableName);
+      final tablePath = _manualGetTablePath(db, tableName);
       final oldPartitionPath = pathJoin(tablePath, 'data', 'partitions',
           'dir_$dirIndex', 'p$oldPartitionIndex.dat');
 
@@ -652,5 +669,36 @@ class V2Upgrade {
       Logger.error('Failed to parse old partition file', rawError: e);
       return [];
     }
+  }
+
+  String _manualGetTablePath(DataStoreImpl db, String tableName) {
+    final tableUid = db.schemaManager?.getUidByName(tableName);
+    if (tableUid == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table UID not found for table: $tableName',
+          tableName: tableName,
+        )
+      ]);
+    }
+    if (db.config.persistenceMode == PersistenceMode.memory) {
+      return 'memory://${db.currentSpaceName}/tables/$tableUid';
+    }
+    final route = db.schemaManager?.getRouteByUid(tableUid);
+    if (route == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message:
+              'Route entry tableUid: $tableUid not found for table: $tableName',
+          tableName: tableName,
+        )
+      ]);
+    }
+    final parentDir = route.isGlobal
+        ? db.pathManager.getGlobalPath()
+        : db.pathManager.getSpacePath();
+    return pathJoin(parentDir, 'tables_${route.dataDirIndex}', tableUid);
   }
 }
