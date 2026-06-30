@@ -58,9 +58,7 @@ class VersionUpgradeManager {
       if (currentVersion < 2 && engineVersion >= 2) {
         final v2Upgrade = V2Upgrade(_dataStore);
         await v2Upgrade.execute(globalConfig);
-      }
-
-      if (currentVersion < 3 && engineVersion >= 3) {
+      } else if (currentVersion < 3 && engineVersion >= 3) {
         final v3Upgrade = V3Upgrade(_dataStore);
         await v3Upgrade.execute(globalConfig);
       }
