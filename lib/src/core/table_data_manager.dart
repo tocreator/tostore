@@ -945,6 +945,7 @@ class TableDataManager {
     List<UniqueKeyRef>? uniqueKeyRefs,
     Map<String, dynamic>? oldValues,
     String? transactionId,
+    required String schemaVersion,
   }) async {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
     if (schema == null) {
@@ -1134,7 +1135,8 @@ class TableDataManager {
         transactionId: currentTxId,
         walPointer: walPointer,
         oldValues:
-            finalOperation == BufferOperationType.update ? oldValues : null);
+            finalOperation == BufferOperationType.update ? oldValues : null,
+        schemaVersion: schemaVersion);
 
     // Enqueue into write buffer/queue (in-memory)
     await _dataStore.writeBufferManager.addRecord(
@@ -1191,6 +1193,7 @@ class TableDataManager {
     Map<String, Map<String, dynamic>>? oldRecordsMap,
     String? transactionId,
     DateTime? timestamp,
+    required String schemaVersion,
   }) async {
     if (records.isEmpty) {
       return (
@@ -1371,6 +1374,7 @@ class TableDataManager {
             transactionId: currentTxId,
             walPointer: pointers[i],
             oldValues: oldR,
+            schemaVersion: schemaVersion,
           ));
           recordIds.add(recordId);
           if (operation != BufferOperationType.delete) {
@@ -1531,7 +1535,8 @@ class TableDataManager {
 
   /// Add records to delete buffer - for batch deleting
   Future<void> addToDeleteBuffer(
-      String tableName, List<Map<String, dynamic>> records) async {
+      String tableName, List<Map<String, dynamic>> records,
+      {required String schemaVersion}) async {
     if (records.isEmpty) return;
 
     final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
@@ -1568,6 +1573,7 @@ class TableDataManager {
         schema: schema,
         uniqueKeyRefsList:
             List.filled(trimmedRecords.length, const <UniqueKeyRef>[]),
+        schemaVersion: schemaVersion,
       );
     }
 
@@ -1755,7 +1761,8 @@ class TableDataManager {
 
   /// get table file size
   Future<int> getTableFileSize(String tableName) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     if (!_fileSizes.containsKey(tableUid)) {
       final meta = await getTableMeta(tableUid);
       return meta?.totalSizeInBytes ?? 0;
@@ -1765,21 +1772,24 @@ class TableDataManager {
 
   /// update table file size and modified time
   Future<void> updateFileSize(String tableName, int size) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     _fileSizes[tableUid] = size;
     _lastModifiedTimes[tableUid] = DateTime.now();
   }
 
   /// check if file is modified
   bool isFileModified(String tableName, DateTime lastReadTime) {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     final lastModified = _lastModifiedTimes[tableUid];
     return lastModified == null || lastModified.isAfter(lastReadTime);
   }
 
   /// get file last modified time
   DateTime? getLastModifiedTime(String tableName) {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     return _lastModifiedTimes[tableUid];
   }
 
@@ -1846,7 +1856,8 @@ class TableDataManager {
 
   /// Get table meta information
   Future<TableMeta?> getTableMeta(String tableName) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
 
     // Table meta cache fast path
     final cached = _tableMetaCache.get(tableUid);
@@ -1916,9 +1927,9 @@ class TableDataManager {
   /// Update table meta
   Future<void> updateTableMeta(String tableName, TableMeta meta,
       {bool flush = true}) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
-    final mainFilePath =
-        await _dataStore.pathManager.getDataMetaPath(tableUid);
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final mainFilePath = await _dataStore.pathManager.getDataMetaPath(tableUid);
 
     // Create directory if not exists
     final partitionsDir =
@@ -2719,7 +2730,8 @@ class TableDataManager {
               prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
-          final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+          final tableUid =
+              _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
           final emptyMeta = TableMeta.createEmpty(
             tableUid: tableUid,
             pageSize: pageSize,
