@@ -9,6 +9,7 @@ import '../handler/value_matcher.dart';
 import 'db_exception.dart';
 import 'result_status.dart';
 import 'result_type.dart';
+import 'id_generator.dart';
 
 /// table schema
 class TableSchema {
@@ -41,12 +42,24 @@ class TableSchema {
   /// Table unique identifier, used for rename detection
   final String? tableId;
 
+  /// Stable internal unique identifier for routing and buffers
+  final String? tableUid;
+
+  /// Schema structure version tracking migration tasks
+  final String? schemaVersion;
+
+  /// Whether this is a system metadata table
+  final bool isSystemTable;
+
   /// Table-level TTL config.
   /// - null: TTL disabled
   /// - sourceField == null: use internal `_system_ingest_ts_ms`
   final TableTtlConfig? ttlConfig;
 
-  // Default constructor
+  /// List of automatically generated / implicit indexes
+  final List<IndexSchema>? autoIndexes;
+
+  // Public constructor
   const TableSchema({
     required this.name,
     required this.primaryKeyConfig,
@@ -56,6 +69,25 @@ class TableSchema {
     this.isGlobal = false,
     this.tableId,
     this.ttlConfig,
+  })  : tableUid = null,
+        schemaVersion = null,
+        isSystemTable = false,
+        autoIndexes = null;
+
+  // Private constructor for internal copyWith / fromJson
+  const TableSchema._internal({
+    required this.name,
+    required this.primaryKeyConfig,
+    required this.fields,
+    required this.indexes,
+    required this.foreignKeys,
+    required this.isGlobal,
+    this.tableId,
+    this.ttlConfig,
+    this.tableUid,
+    this.schemaVersion,
+    required this.isSystemTable,
+    this.autoIndexes,
   });
 
   /// Get primary key name
@@ -79,11 +111,15 @@ class TableSchema {
 
   /// Get all indexes (Consolidated list of Explicit, Unique, and FK indexes)
   List<IndexSchema> getAllIndexes() {
+    if (autoIndexes != null) {
+      return [
+        ...indexes,
+        ...autoIndexes!,
+      ];
+    }
+
     final allIndexes = <IndexSchema>[];
     final existingIndexNames = <String>{};
-    // Track which fields are already the *prefix* of an index
-    // Key: Field Name, Value: Is this field the first field in an index?
-    final fieldIndexPrefixMap = <String, bool>{};
 
     // 1. Add explicit indexes
     for (final index in indexes) {
@@ -95,23 +131,17 @@ class TableSchema {
       }
       allIndexes.add(index);
       existingIndexNames.add(index.actualIndexName);
-      if (index.fields.isNotEmpty) {
-        fieldIndexPrefixMap[index.fields.first] = true;
-      }
     }
 
     // 2. Add implicit unique indexes and field-level indexes
     for (final field in fields) {
-      // Skip primary key (already handled by storage engine)
       if (field.name == primaryKey) continue;
 
       if (field.unique) {
-        // Check if there's already an explicit unique index on this single field
         final alreadyHasUniqueIndex = indexes.any((i) =>
             i.unique && i.fields.length == 1 && i.fields.first == field.name);
 
         if (!alreadyHasUniqueIndex) {
-          // Avoid duplicate names (though unlikely if schema validation is correct)
           final uniqueIndexSchema = IndexSchema(
             indexName: field.name,
             fields: [field.name],
@@ -120,14 +150,9 @@ class TableSchema {
           if (!existingIndexNames.contains(uniqueIndexSchema.actualIndexName)) {
             allIndexes.add(uniqueIndexSchema);
             existingIndexNames.add(uniqueIndexSchema.actualIndexName);
-            fieldIndexPrefixMap[field.name] = true;
           }
         }
       } else if (field.createIndex) {
-        // Identify if there is an explicit index on this field
-        // Note: Even if there is a composite index starting with this field,
-        // if the user explicitly marks createIndex, we prefer to create a separate independent index
-        // to ensure simple query optimization (unless a single-field index already exists).
         final alreadyHasIndex = indexes
             .any((i) => i.fields.length == 1 && i.fields.first == field.name);
 
@@ -138,19 +163,15 @@ class TableSchema {
             unique: false,
           );
 
-          // Check if we already created a unique index derived from field.unique above
-          // (Actually if field.unique is true, we entered the block above, not this one)
-          // So just check name collision
           if (!existingIndexNames.contains(indexSchema.actualIndexName)) {
             allIndexes.add(indexSchema);
             existingIndexNames.add(indexSchema.actualIndexName);
-            fieldIndexPrefixMap[field.name] = true;
           }
         }
       }
     }
 
-    // 2.5 Add implicit TTL source index (for efficient expiration cleanup)
+    // 2.5 Add implicit TTL source index
     final ttl = ttlConfig;
     final ttlField = (ttl != null)
         ? ((ttl.sourceField == null || ttl.sourceField!.isEmpty)
@@ -177,10 +198,8 @@ class TableSchema {
     for (final fk in foreignKeys) {
       if (!fk.enabled || !fk.autoCreateIndex) continue;
 
-      // Check if covered
       bool isCovered = false;
 
-      // Check exact match or prefix match
       for (final index in allIndexes) {
         if (index.fields.length >= fk.fields.length) {
           bool match = true;
@@ -198,21 +217,209 @@ class TableSchema {
       }
 
       if (!isCovered) {
-        // Create auto index for FK
         final fkIndex = IndexSchema(
           indexName: fk.actualName,
           fields: fk.fields,
-          unique: false, // FKs are not necessarily unique
+          unique: false,
         );
         if (!existingIndexNames.contains(fkIndex.actualIndexName)) {
           allIndexes.add(fkIndex);
-          existingIndexNames.add(fkIndex
-              .actualIndexName); // This is approximate, actual comparison handled better structurally
+          existingIndexNames.add(fkIndex.actualIndexName);
         }
       }
     }
 
     return allIndexes;
+  }
+
+  /// Dynamically generate implicit indexes and inherit indexUids from oldSchema if matches are found.
+  TableSchema generateAutoIndexes({TableSchema? oldSchema}) {
+    final implicitIndexes = _computeRawImplicitIndexes();
+    final List<IndexSchema> populatedAutoIndexes = [];
+
+    for (final implicit in implicitIndexes) {
+      IndexSchema resolvedImplicit = implicit;
+      if (oldSchema != null) {
+        IndexSchema? matchedOldIdx;
+        for (final idx in oldSchema.indexes) {
+          if (idx.actualIndexName == implicit.actualIndexName ||
+              _areIndexFieldsAndTypesEqual(idx, implicit)) {
+            matchedOldIdx = idx;
+            break;
+          }
+        }
+        if (matchedOldIdx == null && oldSchema.autoIndexes != null) {
+          for (final idx in oldSchema.autoIndexes!) {
+            if (idx.actualIndexName == implicit.actualIndexName ||
+                _areIndexFieldsAndTypesEqual(idx, implicit)) {
+              matchedOldIdx = idx;
+              break;
+            }
+          }
+        }
+        if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
+          resolvedImplicit = implicit.copyWith(indexUid: matchedOldIdx.indexUid);
+        }
+      }
+      if (resolvedImplicit.indexUid == null) {
+        resolvedImplicit = resolvedImplicit.copyWith(
+          indexUid: GlobalIdGenerator.generate("i"),
+        );
+      }
+      populatedAutoIndexes.add(resolvedImplicit);
+    }
+
+    final List<IndexSchema> populatedExplicitIndexes = [];
+    for (final explicit in indexes) {
+      IndexSchema resolvedExplicit = explicit;
+      if (resolvedExplicit.indexUid == null && oldSchema != null) {
+        IndexSchema? matchedOldIdx;
+        for (final idx in oldSchema.indexes) {
+          if (idx.actualIndexName == explicit.actualIndexName ||
+              _areIndexFieldsAndTypesEqual(idx, explicit)) {
+            matchedOldIdx = idx;
+            break;
+          }
+        }
+        if (matchedOldIdx == null && oldSchema.autoIndexes != null) {
+          for (final idx in oldSchema.autoIndexes!) {
+            if (idx.actualIndexName == explicit.actualIndexName ||
+                _areIndexFieldsAndTypesEqual(idx, explicit)) {
+              matchedOldIdx = idx;
+              break;
+            }
+          }
+        }
+        if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
+          resolvedExplicit = explicit.copyWith(indexUid: matchedOldIdx.indexUid);
+        }
+      }
+      if (resolvedExplicit.indexUid == null) {
+        resolvedExplicit = resolvedExplicit.copyWith(
+          indexUid: GlobalIdGenerator.generate("i"),
+        );
+      }
+      populatedExplicitIndexes.add(resolvedExplicit);
+    }
+
+    return copyWith(
+      indexes: populatedExplicitIndexes,
+      autoIndexes: populatedAutoIndexes,
+    );
+  }
+
+  bool _areIndexFieldsAndTypesEqual(IndexSchema a, IndexSchema b) {
+    if (a.unique != b.unique || a.type != b.type) return false;
+    if (a.fields.length != b.fields.length) return false;
+    for (int i = 0; i < a.fields.length; i++) {
+      if (a.fields[i] != b.fields[i]) return false;
+    }
+    return true;
+  }
+
+  List<IndexSchema> _computeRawImplicitIndexes() {
+    final implicitIndexes = <IndexSchema>[];
+    final existingIndexNames = <String>{};
+    for (final index in indexes) {
+      if (!_isPrimaryKeyOnlyIndex(index)) {
+        existingIndexNames.add(index.actualIndexName);
+      }
+    }
+
+    for (final field in fields) {
+      if (field.name == primaryKey) continue;
+
+      if (field.unique) {
+        final alreadyHasUniqueIndex = indexes.any((i) =>
+            i.unique && i.fields.length == 1 && i.fields.first == field.name);
+
+        if (!alreadyHasUniqueIndex) {
+          final uniqueIndexSchema = IndexSchema(
+            indexName: field.name,
+            fields: [field.name],
+            unique: true,
+          );
+          if (!existingIndexNames.contains(uniqueIndexSchema.actualIndexName)) {
+            implicitIndexes.add(uniqueIndexSchema);
+            existingIndexNames.add(uniqueIndexSchema.actualIndexName);
+          }
+        }
+      } else if (field.createIndex) {
+        final alreadyHasIndex = indexes
+            .any((i) => i.fields.length == 1 && i.fields.first == field.name);
+
+        if (!alreadyHasIndex) {
+          final indexSchema = IndexSchema(
+            indexName: field.name,
+            fields: [field.name],
+            unique: false,
+          );
+
+          if (!existingIndexNames.contains(indexSchema.actualIndexName)) {
+            implicitIndexes.add(indexSchema);
+            existingIndexNames.add(indexSchema.actualIndexName);
+          }
+        }
+      }
+    }
+
+    final ttl = ttlConfig;
+    final ttlField = (ttl != null)
+        ? ((ttl.sourceField == null || ttl.sourceField!.isEmpty)
+            ? internalTtlIngestTsMsField
+            : ttl.sourceField!)
+        : null;
+    if (ttlField != null) {
+      final alreadyCovered = indexes.any((i) => i.fields.isNotEmpty && i.fields.first == ttlField) ||
+          implicitIndexes.any((i) => i.fields.isNotEmpty && i.fields.first == ttlField);
+      if (!alreadyCovered) {
+        final ttlIndex = IndexSchema(
+          indexName: ttlField,
+          fields: [ttlField],
+          unique: false,
+        );
+        if (!existingIndexNames.contains(ttlIndex.actualIndexName)) {
+          implicitIndexes.add(ttlIndex);
+          existingIndexNames.add(ttlIndex.actualIndexName);
+        }
+      }
+    }
+
+    for (final fk in foreignKeys) {
+      if (!fk.enabled || !fk.autoCreateIndex) continue;
+
+      bool isCovered = false;
+      final candidates = [...indexes, ...implicitIndexes];
+      for (final index in candidates) {
+        if (index.fields.length >= fk.fields.length) {
+          bool match = true;
+          for (int i = 0; i < fk.fields.length; i++) {
+            if (index.fields[i] != fk.fields[i]) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            isCovered = true;
+            break;
+          }
+        }
+      }
+
+      if (!isCovered) {
+        final fkIndex = IndexSchema(
+          indexName: fk.actualName,
+          fields: fk.fields,
+          unique: false,
+        );
+        if (!existingIndexNames.contains(fkIndex.actualIndexName)) {
+          implicitIndexes.add(fkIndex);
+          existingIndexNames.add(fkIndex.actualIndexName);
+        }
+      }
+    }
+
+    return implicitIndexes;
   }
 
   /// Validate table schema
@@ -646,8 +853,12 @@ class TableSchema {
     bool? isGlobal,
     String? tableId,
     TableTtlConfig? ttlConfig,
+    String? tableUid,
+    String? schemaVersion,
+    bool? isSystemTable,
+    List<IndexSchema>? autoIndexes,
   }) {
-    return TableSchema(
+    return TableSchema._internal(
       name: name ?? this.name,
       primaryKeyConfig: primaryKeyConfig ?? this.primaryKeyConfig,
       fields: fields ?? this.fields,
@@ -656,6 +867,10 @@ class TableSchema {
       isGlobal: isGlobal ?? this.isGlobal,
       tableId: tableId ?? this.tableId,
       ttlConfig: ttlConfig ?? this.ttlConfig,
+      tableUid: tableUid ?? this.tableUid,
+      schemaVersion: schemaVersion ?? this.schemaVersion,
+      isSystemTable: isSystemTable ?? this.isSystemTable,
+      autoIndexes: autoIndexes ?? this.autoIndexes,
     );
   }
 
@@ -669,6 +884,11 @@ class TableSchema {
       'isGlobal': isGlobal,
       if (tableId != null) 'tableId': tableId,
       if (ttlConfig != null) 'ttlConfig': ttlConfig!.toJson(),
+      if (tableUid != null) 'tableUid': tableUid,
+      if (schemaVersion != null) 'schemaVersion': schemaVersion,
+      if (isSystemTable) 'isSystemTable': isSystemTable,
+      if (autoIndexes != null)
+        'autoIndexes': autoIndexes!.map((i) => i.toJson()).toList(),
     };
   }
 
@@ -699,7 +919,7 @@ class TableSchema {
       return const PrimaryKeyConfig();
     }
 
-    return TableSchema(
+    return TableSchema._internal(
       name: json['name'] as String,
       primaryKeyConfig: getPrimaryKeyConfig(),
       fields: (json['fields'] as List)
@@ -719,6 +939,12 @@ class TableSchema {
       ttlConfig: json['ttlConfig'] is Map<String, dynamic>
           ? TableTtlConfig.fromJson(json['ttlConfig'] as Map<String, dynamic>)
           : null,
+      tableUid: json['tableUid'] as String?,
+      schemaVersion: json['schemaVersion'] as String?,
+      isSystemTable: json['isSystemTable'] as bool? ?? false,
+      autoIndexes: (json['autoIndexes'] as List?)
+          ?.map((i) => IndexSchema.fromJson(i as Map<String, dynamic>))
+          .toList(),
     );
   }
 
@@ -1915,12 +2141,24 @@ class IndexSchema {
   /// Vector index configuration (only valid when type is IndexType.vector)
   final VectorIndexConfig? vectorConfig;
 
+  /// Index unique identifier
+  final String? indexUid;
+
   const IndexSchema({
     this.indexName,
     required this.fields,
     this.unique = false,
     this.type = IndexType.btree,
     this.vectorConfig,
+  }) : indexUid = null;
+
+  const IndexSchema._internal({
+    this.indexName,
+    required this.fields,
+    required this.unique,
+    required this.type,
+    this.vectorConfig,
+    this.indexUid,
   });
 
   /// get actual index name
@@ -1959,12 +2197,13 @@ class IndexSchema {
           json['vectorConfig'] as Map<String, dynamic>);
     }
 
-    return IndexSchema(
+    return IndexSchema._internal(
       indexName: json['indexName'] as String?,
       fields: (json['fields'] as List).cast<String>(),
       unique: json['unique'] as bool? ?? false,
       type: indexType,
       vectorConfig: vectorConfig,
+      indexUid: json['indexUid'] as String?,
     );
   }
 
@@ -1975,6 +2214,7 @@ class IndexSchema {
       'unique': unique,
       'type': type.toString().split('.').last,
       if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
+      if (indexUid != null) 'indexUid': indexUid,
     };
   }
 
@@ -1984,13 +2224,15 @@ class IndexSchema {
     bool? unique,
     IndexType? type,
     VectorIndexConfig? vectorConfig,
+    String? indexUid,
   }) {
-    return IndexSchema(
+    return IndexSchema._internal(
       indexName: indexName ?? this.indexName,
       fields: fields ?? this.fields,
       unique: unique ?? this.unique,
       type: type ?? this.type,
       vectorConfig: vectorConfig ?? this.vectorConfig,
+      indexUid: indexUid ?? this.indexUid,
     );
   }
 }
