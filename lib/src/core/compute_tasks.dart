@@ -611,11 +611,15 @@ class MigrationRecordProcessRequest {
   /// Yield budget in milliseconds
   final int? yieldDurationMs;
 
+  /// Target schema version
+  final String targetSchemaVersion;
+
   MigrationRecordProcessRequest({
     required this.records,
     required this.operations,
     this.oldSchema,
     this.yieldDurationMs,
+    required this.targetSchemaVersion,
   });
 }
 
@@ -859,6 +863,7 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
         data: transformed,
         timestamp: timestamp,
         walPointer: const WalPointer(partitionIndex: -1, entrySeq: 0),
+        schemaVersion: request.targetSchemaVersion,
       ));
     }
 
