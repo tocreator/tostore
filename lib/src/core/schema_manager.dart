@@ -11,6 +11,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
 import '../model/id_generator.dart';
 import 'data_store_impl.dart';
 import 'tree_cache.dart';
@@ -107,6 +108,80 @@ class SchemaManager {
     _ensureTableSchemaCache().put(tableUid, schema);
     _indexListCache[tableUid] = _buildIndexListCache(schema);
     _storageFieldStructCache.remove(tableUid);
+    if (schema.schemaVersion != null) {
+      _dataStore.migrationManager?.registerSchemaVersion(schema);
+    }
+  }
+
+  /// Get TableContext by tableUid (asynchronous)
+  Future<TableContext?> getTableContext(String tableUid) async {
+    final route = getRouteByUid(tableUid);
+    if (route == null) return null;
+    final schema = await getTableSchema(tableUid);
+    if (schema == null) return null;
+    return TableContext(
+      tableUid: tableUid,
+      tableName: route.tableName,
+      isGlobal: route.isGlobal,
+      dataDirIndex: route.dataDirIndex,
+      schema: schema,
+    );
+  }
+
+  /// Get TableContext by tableUid (synchronous, checks memory cache)
+  TableContext? getTableContextSync(String tableUid) {
+    final route = getRouteByUid(tableUid);
+    if (route == null) return null;
+    final schema = getCachedTableSchema(tableUid);
+    if (schema == null) return null;
+    return TableContext(
+      tableUid: tableUid,
+      tableName: route.tableName,
+      isGlobal: route.isGlobal,
+      dataDirIndex: route.dataDirIndex,
+      schema: schema,
+    );
+  }
+
+  /// Get TableContext by schemaVersion (O(1) lookup in migrationManager)
+  TableContext getTableContextByVersion(String schemaVersion) {
+    final migrationMgr = _dataStore.migrationManager;
+    final schema = migrationMgr?.getTableSchemaByVersion(schemaVersion);
+    if (schema == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Table schema for version "$schemaVersion" not found in memory caches.',
+        )
+      ]);
+    }
+    final uid = schema.tableUid;
+    if (uid.isEmpty) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'TableUid is empty for schema version "$schemaVersion".',
+        )
+      ]);
+    }
+    final route = getRouteByUid(uid);
+    if (route == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Route entry not found for tableUid "$uid" (schema version "$schemaVersion").',
+        )
+      ]);
+    }
+    return TableContext(
+      tableUid: uid,
+      tableName: route.tableName,
+      isGlobal: route.isGlobal,
+      dataDirIndex: route.dataDirIndex,
+      schema: schema,
+    );
   }
 
   /// Remove cached schema for [tableUid].
@@ -180,7 +255,9 @@ class SchemaManager {
         counts[route.dataDirIndex] = (counts[route.dataDirIndex] ?? 0) + 1;
 
         _partitionDirIndexMap[route.partitionIndex] = route.dirIndex;
-        _dirPartitions.putIfAbsent(route.dirIndex, () => {}).add(route.partitionIndex);
+        _dirPartitions
+            .putIfAbsent(route.dirIndex, () => {})
+            .add(route.partitionIndex);
 
         if (route.isGlobal) {
           uidByName[route.tableName] = route.tableUid;
@@ -211,7 +288,9 @@ class SchemaManager {
     counts[route.dataDirIndex] = (counts[route.dataDirIndex] ?? 0) + 1;
 
     _partitionDirIndexMap[route.partitionIndex] = route.dirIndex;
-    _dirPartitions.putIfAbsent(route.dirIndex, () => {}).add(route.partitionIndex);
+    _dirPartitions
+        .putIfAbsent(route.dirIndex, () => {})
+        .add(route.partitionIndex);
 
     final activeSpace = _dataStore.currentSpaceName;
     final isActive = route.isGlobal ||
@@ -359,7 +438,7 @@ class SchemaManager {
     return null;
   }
 
-  FieldStorageLayout _evolveFieldStorageLayout({
+  FieldStorageLayout evolveFieldStorageLayout({
     FieldStorageLayout? existingLayout,
     required TableSchema nextSchema,
     Map<String, String> renameHints = const <String, String>{},
@@ -598,7 +677,7 @@ class SchemaManager {
 
   /// Get consolidated index list for a table (explicit + implicit).
   List<IndexSchema> getAllIndexesFor(TableSchema schema) {
-    final cacheKey = schema.tableUid ?? schema.name;
+    final cacheKey = schema.tableUid;
     final entry = _indexListCache[cacheKey] ?? _buildIndexListCache(schema);
     _indexListCache[cacheKey] = entry;
     return entry.allIndexes;
@@ -606,7 +685,7 @@ class SchemaManager {
 
   /// Get all unique indexes (including composite unique indexes) for a table.
   List<IndexSchema> getUniqueIndexesFor(TableSchema schema) {
-    final cacheKey = schema.tableUid ?? schema.name;
+    final cacheKey = schema.tableUid;
     final entry = _indexListCache[cacheKey] ?? _buildIndexListCache(schema);
     _indexListCache[cacheKey] = entry;
     return entry.uniqueIndexes;
@@ -614,7 +693,7 @@ class SchemaManager {
 
   /// Get all non-vector (B+Tree) indexes for a table.
   List<IndexSchema> getBtreeIndexesFor(TableSchema schema) {
-    final cacheKey = schema.tableUid ?? schema.name;
+    final cacheKey = schema.tableUid;
     final entry = _indexListCache[cacheKey] ?? _buildIndexListCache(schema);
     _indexListCache[cacheKey] = entry;
     return entry.btreeIndexes;
@@ -622,7 +701,7 @@ class SchemaManager {
 
   /// Get all vector indexes for a table.
   List<IndexSchema> getVectorIndexesFor(TableSchema schema) {
-    final cacheKey = schema.tableUid ?? schema.name;
+    final cacheKey = schema.tableUid;
     final entry = _indexListCache[cacheKey] ?? _buildIndexListCache(schema);
     _indexListCache[cacheKey] = entry;
     return entry.vectorIndexes;
@@ -742,7 +821,8 @@ class SchemaManager {
     }
 
     final count = _dirPartitions[maxDir]?.length ?? 0;
-    final allocatedDir = (count < _dataStore.maxEntriesPerDir) ? maxDir : maxDir + 1;
+    final allocatedDir =
+        (count < _dataStore.maxEntriesPerDir) ? maxDir : maxDir + 1;
 
     // Optimistically update memory mappings
     _partitionDirIndexMap[partitionIndex] = allocatedDir;
@@ -833,7 +913,13 @@ class SchemaManager {
     int? dataDirIndex,
   }) async {
     try {
-      final currentSchema = await getTableSchema(tableUid);
+      if (schema.tableUid.isEmpty) {
+        var targetUid =
+            tableUid.isNotEmpty ? tableUid : GlobalIdGenerator.generate("t");
+        schema = schema.copyWith(tableUid: targetUid);
+      }
+
+      final currentSchema = await getTableSchema(schema.tableUid);
       schema = schema.generateAutoIndexes(oldSchema: currentSchema);
 
       if (schema.schemaVersion == null) {
@@ -875,7 +961,7 @@ class SchemaManager {
                     renameHints: fieldRenameHints,
                   ))
               ? existingLayout
-              : _evolveFieldStorageLayout(
+              : evolveFieldStorageLayout(
                   existingLayout: existingLayout,
                   nextSchema: schema,
                   renameHints: fieldRenameHints,
@@ -1136,7 +1222,7 @@ class SchemaManager {
               partitionMeta.tableFieldLayouts[tableUid]) ??
           _tableFieldLayoutCache[tableUid] ??
           _createInitialFieldStorageLayout(newSchema);
-      final newLayout = _evolveFieldStorageLayout(
+      final newLayout = evolveFieldStorageLayout(
         existingLayout: oldLayout,
         nextSchema: newSchema,
       );
