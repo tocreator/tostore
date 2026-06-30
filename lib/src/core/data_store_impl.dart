@@ -22,6 +22,7 @@ import '../model/config_info.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
+import '../model/table_context.dart';
 import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
@@ -1562,6 +1563,31 @@ class DataStoreImpl {
     }
   }
 
+  /// Easily obtain the TableContext of this table
+  Future<TableContext> getTableContext(String tableName) async {
+    final tableUid = schemaManager?.getUidByName(tableName);
+    if (tableUid == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          tableName: tableName,
+        )
+      ]);
+    }
+    final context = await schemaManager?.getTableContext(tableUid);
+    if (context == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          tableName: tableName,
+        )
+      ]);
+    }
+    return context;
+  }
+
   /// Insert data complete process
   ///
   /// [retryOnPkConflict] is an internal flag to avoid infinite recursion when
@@ -1590,14 +1616,8 @@ class DataStoreImpl {
 
     try {
       // 1. Data validation
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table $tableName does not exist');
-        return finish(DbResult.error(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-        ));
-      }
+      final tableContext = await getTableContext(tableName);
+      final schema = tableContext.schema;
 
       final validationErrors = <String>[];
       try {
@@ -1778,6 +1798,7 @@ class DataStoreImpl {
         BufferOperationType.insert,
         uniqueKeyRefs: uniqueRefs,
         transactionId: txId,
+        schemaVersion: tableContext.schema.schemaVersion ?? '',
       );
 
       notificationManager.notify(ChangeEvent(
@@ -2445,14 +2466,8 @@ class DataStoreImpl {
 
     try {
       // validate data
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table $tableName does not exist');
-        return finish(DbResult.error(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-        ));
-      }
+      final tableContext = await getTableContext(tableName);
+      final schema = tableContext.schema;
       Map<String, dynamic>? validData;
       try {
         validData =
@@ -3029,6 +3044,7 @@ class DataStoreImpl {
             uniqueKeyRefs: uniqueRefsUpd,
             oldValues: oldValues.isEmpty ? null : oldValues,
             transactionId: txId,
+            schemaVersion: tableContext.schema.schemaVersion ?? '',
           );
 
           if (notificationManager.hasListeners(tableName)) {
@@ -3317,14 +3333,8 @@ class DataStoreImpl {
           resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
 
       // get table schema
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.warn('Table $tableName does not exist');
-        return finish(DbResult.error(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-        ));
-      }
+      final tableContext = await getTableContext(tableName);
+      final schema = tableContext.schema;
 
       final conditionMap = condition.build();
 
@@ -3533,7 +3543,11 @@ class DataStoreImpl {
         }
 
         // Add records to delete buffer instead of directly writing to file
-        await tableDataManager.addToDeleteBuffer(tableName, recordsToDelete);
+        await tableDataManager.addToDeleteBuffer(
+          tableName,
+          recordsToDelete,
+          schemaVersion: tableContext.schema.schemaVersion ?? '',
+        );
 
         if (notificationManager.hasListeners(tableName)) {
           for (final record in recordsToDelete) {
@@ -4425,6 +4439,7 @@ class DataStoreImpl {
               schema: tableSchema,
               uniqueKeyRefsList: batchUniqueRefsForBuffer,
               transactionId: txId,
+              schemaVersion: tableSchema.schemaVersion ?? '',
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
@@ -5697,6 +5712,7 @@ class DataStoreImpl {
             uniqueKeyRefsList: batchUniqueKeyRefs,
             oldRecordsMap: oldRecordsMap,
             transactionId: txId,
+            schemaVersion: schema.schemaVersion ?? '',
           );
 
           if (returnResultDetails) {
@@ -7093,11 +7109,6 @@ class DataStoreImpl {
 
     final isGlobal = schemaForLayout.isGlobal;
     final tableUid = schemaForLayout.tableUid;
-
-    if (tableUid == null) {
-      _pendingTableRenames.remove(newTableName);
-      return;
-    }
 
     // Idempotent recovery check: If newTableName already has schema, and oldTableName mapping/directory
     // is already missing, it means physical rename is already fully done.
