@@ -1153,8 +1153,8 @@ class DatabaseTester {
             .query('new_table_a')
             .where('toBeIndexed', '=', 'idx_new_loop_$i')
             .first();
-        isTestPassed &= _expect('Loop query should find new record',
-            loopQuery != null, true);
+        isTestPassed &= _expect(
+            'Loop query should find new record', loopQuery != null, true);
 
         await Future.delayed(const Duration(milliseconds: 50));
       }
