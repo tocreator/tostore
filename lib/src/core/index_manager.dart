@@ -372,9 +372,7 @@ class IndexManager {
   }
 
   int _estimateIndexMetaSize(IndexMeta meta) {
-    return 220 +
-        meta.indexUid.length * 2 +
-        meta.tableUid.length * 2;
+    return 220 + meta.indexUid.length * 2 + meta.tableUid.length * 2;
   }
 
   List<IndexSchema> getEngineManagedBtreeIndexes(
@@ -986,7 +984,8 @@ class IndexManager {
   /// Get index metadata
   /// First tries to get from cache, if not found, loads from file and caches it
   Future<IndexMeta?> getIndexMeta(String tableName, String indexName) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
 
     // Resolve indexName to indexUid
     String indexUid = indexName;
@@ -1030,8 +1029,7 @@ class IndexManager {
   }
 
   /// Internal method to perform the actual file load
-  Future<IndexMeta?> _doLoadIndexMeta(
-      String tableUid, String indexUid) async {
+  Future<IndexMeta?> _doLoadIndexMeta(String tableUid, String indexUid) async {
     try {
       final bool isMemoryMode =
           _dataStore.config.persistenceMode == PersistenceMode.memory;
@@ -1050,15 +1048,20 @@ class IndexManager {
             if (schema != null) {
               final allIndexes = <IndexSchema>[
                 ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
-                ...getEngineManagedBtreeIndexes(_dataStore.schemaManager?.getNameByUid(tableUid) ?? tableUid, schema),
+                ...getEngineManagedBtreeIndexes(
+                    _dataStore.schemaManager?.getNameByUid(tableUid) ??
+                        tableUid,
+                    schema),
               ];
               final idx = allIndexes.firstWhere(
                 (i) => i.indexUid == indexUid || i.actualIndexName == indexUid,
                 orElse: () => IndexSchema(indexName: '', fields: const []),
               );
               if (idx.fields.isNotEmpty) {
-                final isBuilding =
-                    _shouldCreateIndexAsBuilding(_dataStore.schemaManager?.getNameByUid(tableUid) ?? tableUid, idx.actualIndexName);
+                final isBuilding = _shouldCreateIndexAsBuilding(
+                    _dataStore.schemaManager?.getNameByUid(tableUid) ??
+                        tableUid,
+                    idx.actualIndexName);
                 final meta = IndexMeta.createEmpty(
                   indexUid: indexUid,
                   tableUid: tableUid,
@@ -1112,7 +1115,8 @@ class IndexManager {
     final meta = updatedMeta;
     if (meta == null) return null;
 
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
 
     // Resolve indexName to indexUid
     String indexUid = indexName;
@@ -1486,7 +1490,8 @@ class IndexManager {
 
         // Lock the index building state
         final existingMeta = await getIndexMeta(tableName, indexName);
-        final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+        final tableUid =
+            _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
         final indexUid = index.indexUid ?? indexName;
         final indexMeta = (existingMeta != null)
             ? existingMeta.copyWith(isBuilding: true)
@@ -2517,9 +2522,11 @@ class IndexManager {
               schema.indexes.where((i) => i != targetIndex).toList();
           final newSchema = schema.copyWith(indexes: newIndexes);
 
-          final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+          final tableUid =
+              _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
           // update table schema
-          await _dataStore.schemaManager!.saveTableSchema(tableUid, tableName, newSchema);
+          await _dataStore.schemaManager!
+              .saveTableSchema(tableUid, tableName, newSchema);
         }
       } finally {
         if (indexLocked && lockMgr != null) {
@@ -2784,7 +2791,8 @@ class IndexManager {
         final indexName = indexSchema.actualIndexName;
         // Clean physical index files before rebuild starts
         await deletePhysicalIndexArtifacts(tableName, indexName);
-        final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+        final tableUid =
+            _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
         final indexUid = indexSchema.indexUid ?? indexName;
         final indexMeta = IndexMeta.createEmpty(
           indexUid: indexUid,
@@ -3000,7 +3008,8 @@ class IndexManager {
     required String pkValue,
   }) {
     final indexSchema = schema.getAllIndexes().firstWhere(
-          (i) => i.indexUid == meta.indexUid || i.actualIndexName == meta.indexUid,
+          (i) =>
+              i.indexUid == meta.indexUid || i.actualIndexName == meta.indexUid,
           orElse: () => IndexSchema(indexName: '', fields: const []),
         );
     final fields = indexSchema.fields;
@@ -3112,7 +3121,8 @@ class IndexManager {
         continue;
       }
       idxTasks.add(() async {
-        final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+        final tableUid =
+            _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
         final indexUid = idx.indexUid ?? indexName;
         var meta = await getIndexMeta(tableName, indexName);
         // If index metadata doesn't exist, create it in memory only (avoid extra IO)
@@ -3314,7 +3324,9 @@ class IndexManager {
       }
 
       final indexSchema = schema.getAllIndexes().firstWhere(
-            (i) => i.indexUid == meta.indexUid || i.actualIndexName == meta.indexUid,
+            (i) =>
+                i.indexUid == meta.indexUid ||
+                i.actualIndexName == meta.indexUid,
             orElse: () => IndexSchema(indexName: '', fields: const []),
           );
       final fields = indexSchema.fields;
