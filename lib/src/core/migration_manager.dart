@@ -70,6 +70,34 @@ class MigrationManager {
   // Runtime conversion descriptors for tables that are schema-updated but data not fully migrated yet.
   final Map<String, _RuntimeMigrationDescriptor> _runtimeMigrations =
       <String, _RuntimeMigrationDescriptor>{};
+
+  // Cache of versioned table schemas for active migrations keyed by schemaVersion
+  final Map<String, TableSchema> _schemaByVersion = {};
+
+  /// Register schema version in memory cache.
+  void registerSchemaVersion(TableSchema schema) {
+    if (schema.schemaVersion != null && schema.schemaVersion!.isNotEmpty) {
+      _schemaByVersion[schema.schemaVersion!] = schema;
+    }
+  }
+
+  /// Batch register schema versions from migration tasks.
+  void registerSchemaVersionsFromTasks(List<MigrationTask> tasks) {
+    for (final task in tasks) {
+      if (task.oldSchemaSnapshot != null) {
+        registerSchemaVersion(task.oldSchemaSnapshot!);
+      }
+      if (task.targetSchemaSnapshot != null) {
+        registerSchemaVersion(task.targetSchemaSnapshot!);
+      }
+    }
+  }
+
+  /// Retrieve TableSchema by schema version.
+  TableSchema? getTableSchemaByVersion(String schemaVersion) {
+    return _schemaByVersion[schemaVersion];
+  }
+
   static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
   static const String _globalMigrationScope = '__global__';
 
@@ -233,6 +261,15 @@ class MigrationManager {
     final task = _findTaskInMemoryByTableName(tableName);
     if (task == null) return null;
     return task.checkpointKeyForSpace(spaceName);
+  }
+
+  String? getPersistedCheckpointKeyForTask(String taskId, String spaceName) {
+    for (final task in _pendingTasks) {
+      if (task.taskId == taskId) {
+        return task.checkpointKeyForSpace(spaceName);
+      }
+    }
+    return null;
   }
 
   MigrationTask? _findTaskInMemoryByTableName(String tableName) {
@@ -1316,14 +1353,13 @@ class MigrationManager {
       }
     }
 
-    // Dedupe schema tasks only — key migration must not block new schema tasks here.
+    // Dedupe schema tasks check: relaxed to allow multiple unfinished schema migration tasks.
     final existingTaskIds =
         await _findUnfinishedSchemaTaskIdsForTable(tableName);
     if (existingTaskIds.isNotEmpty) {
       Logger.info(
-        'Table [$tableName] already has ${existingTaskIds.length} unfinished schema migration tasks (${existingTaskIds.join(',')}), skipping adding new task',
+        'Table [$tableName] already has ${existingTaskIds.length} unfinished schema migration tasks (${existingTaskIds.join(',')}), adding an additional chain task',
       );
-      return null;
     }
 
     final task = await addMigrationTask(
@@ -1346,6 +1382,12 @@ class MigrationManager {
       MigrationWriteMode? writeMode,
       List<String>? specificIndexes}) async {
     try {
+      TableSchema? targetSchema = targetSchemaSnapshot;
+      if (targetSchema != null && targetSchema.schemaVersion == null) {
+        targetSchema = targetSchema.copyWith(
+          schemaVersion: GlobalIdGenerator.generate("s"),
+        );
+      }
       if (operations.isEmpty) {
         throw DbException([
           InvalidArgumentStatus(
@@ -1363,27 +1405,30 @@ class MigrationManager {
       final sortedOperations = _sortOperations(List.from(operations));
       final renameOp = _findRenameOperation(sortedOperations);
       final targetTableName = renameOp?.newTableName ?? tableName;
-      final pendingTask = await _findPendingTaskForTable(
-        tableName: tableName,
-        targetTableName: targetTableName,
-      );
-      if (pendingTask != null) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message: 'Table [$tableName] already has a pending migration task '
-                '[${pendingTask.taskId}]. Wait until it completes before calling updateSchema again.',
-          )
-        ]);
-      }
 
-      final oldSchema =
-          await _dataStore.schemaManager?.getTableSchema(tableName);
-      final oldFieldLayout = oldSchema != null
-          ? await _dataStore.schemaManager
-              ?.getTableFieldLayout(tableName, schema: oldSchema)
-          : null;
-      TableSchema? targetSchema = targetSchemaSnapshot;
+      final latestPending = _findLatestPendingTaskForTable(tableName);
+
+      final oldSchema = latestPending != null
+          ? latestPending.targetSchemaSnapshot
+          : await _dataStore.schemaManager?.getTableSchema(tableName);
+
+      FieldStorageLayout? oldFieldLayout;
+      if (latestPending != null) {
+        final prevLayout = latestPending.oldFieldLayoutSnapshot;
+        if (prevLayout != null && latestPending.targetSchemaSnapshot != null) {
+          final renameHints = _buildFieldRenameHints(latestPending.operations);
+          oldFieldLayout = _dataStore.schemaManager?.evolveFieldStorageLayout(
+            existingLayout: prevLayout,
+            nextSchema: latestPending.targetSchemaSnapshot!,
+            renameHints: renameHints,
+          );
+        }
+      } else {
+        oldFieldLayout = oldSchema != null
+            ? await _dataStore.schemaManager
+                ?.getTableFieldLayout(tableName, schema: oldSchema)
+            : null;
+      }
       if (oldSchema == null) {
         // If it's not a system auto-migration and the table doesn't exist, it's an error for updateSchema
         if (!isAutoGenerated) {
@@ -1709,6 +1754,13 @@ class MigrationManager {
         _startAsyncRenameTableOnDiskForCurrentSpace(task);
       }
 
+      if (task.oldSchemaSnapshot != null) {
+        registerSchemaVersion(task.oldSchemaSnapshot!);
+      }
+      if (task.targetSchemaSnapshot != null) {
+        registerSchemaVersion(task.targetSchemaSnapshot!);
+      }
+
       // only trigger task processing when startProcessing is true
       if (startProcessing) {
         unawaited(processMigrationTasks().catchError((e) {
@@ -1726,6 +1778,20 @@ class MigrationManager {
       }
       rethrow;
     }
+  }
+
+  MigrationTask? _findLatestPendingTaskForTable(String tableName) {
+    MigrationTask? latest;
+    for (final task in _pendingTasks) {
+      final currentName = task.currentTableName ??
+          _resolveCurrentTableName(task.tableName, task.operations);
+      if (task.tableName == tableName || currentName == tableName) {
+        if (latest == null || task.createTime.isAfter(latest.createTime)) {
+          latest = task;
+        }
+      }
+    }
+    return latest;
   }
 
   /// Wait for a specific migration task to complete (either currently executing or in queue).
@@ -1752,55 +1818,6 @@ class MigrationManager {
         await Future.delayed(const Duration(milliseconds: 50));
       }
     }
-  }
-
-  Future<MigrationTask?> _findPendingTaskForTable({
-    required String tableName,
-    required String targetTableName,
-  }) async {
-    for (final task in _pendingTasks) {
-      if (task.pendingMigrationSpaces.isEmpty) continue;
-      if (_taskMatchesTable(task, tableName, targetTableName)) {
-        return task;
-      }
-    }
-
-    final meta = await _getOrLoadMigrationMeta();
-    final tasksToRemove = <String>[];
-    for (final entry in meta.directoryMapping.idToDir.entries) {
-      final taskId = entry.key;
-      final dirIndex = entry.value;
-      try {
-        final taskPath =
-            _dataStore.pathManager.getMigrationTaskPath(dirIndex, taskId);
-        final fileExists = await _dataStore.storage.existsFile(taskPath);
-        if (!fileExists) {
-          tasksToRemove.add(taskId);
-          continue;
-        }
-        final content = await _dataStore.storage.readAsString(taskPath);
-        if (content == null || content.isEmpty) {
-          tasksToRemove.add(taskId);
-          continue;
-        }
-        final task = MigrationTask.fromJson(jsonDecode(content));
-        if (task.pendingMigrationSpaces.isEmpty) {
-          tasksToRemove.add(taskId);
-          continue;
-        }
-        if (_taskMatchesTable(task, tableName, targetTableName)) {
-          return task;
-        }
-      } catch (_) {
-        tasksToRemove.add(taskId);
-      }
-    }
-
-    if (tasksToRemove.isNotEmpty) {
-      await _cleanupOrphanedMappings(tasksToRemove);
-    }
-
-    return null;
   }
 
   bool _taskMatchesTable(
@@ -2172,13 +2189,11 @@ class MigrationManager {
         );
       }
 
-      final tableUid = resolvedTargetSchema.tableUid ??
-          _dataStore.schemaManager?.getUidByName(currentTableName) ??
-          _dataStore.schemaManager?.getUidByName(tableName) ??
-          GlobalIdGenerator.generate("t");
+      final tableUid = resolvedTargetSchema.tableUid;
       final schemaToSave = resolvedTargetSchema.copyWith(
         tableUid: tableUid,
-        schemaVersion: GlobalIdGenerator.generate("s"),
+        schemaVersion: resolvedTargetSchema.schemaVersion ??
+            GlobalIdGenerator.generate("s"),
       );
 
       await _dataStore.schemaManager?.saveTableSchema(
@@ -2238,6 +2253,11 @@ class MigrationManager {
       }
     }
     return null;
+  }
+
+  String resolveCurrentTableName(
+      String tableName, List<MigrationOperation> operations) {
+    return _resolveCurrentTableName(tableName, operations);
   }
 
   String _resolveCurrentTableName(
@@ -3671,6 +3691,9 @@ class MigrationManager {
 
           // task completed successfully, remove and clean up
           _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
+          if (task.oldSchemaSnapshot?.schemaVersion != null) {
+            _schemaByVersion.remove(task.oldSchemaSnapshot!.schemaVersion!);
+          }
           await _cleanupTask(task);
           _unregisterRuntimeMigrationForTask(task);
         } catch (e) {
@@ -4145,6 +4168,8 @@ class MigrationManager {
                     records,
                     sortedOperations,
                     oldSchema: oldSchema,
+                    targetSchemaVersion:
+                        currentTask.targetSchemaSnapshot?.schemaVersion ?? '',
                   );
 
                   if (migratedRecords.isNotEmpty) {
@@ -4621,9 +4646,7 @@ class MigrationManager {
         }
       }
 
-      final childUid = updatedChildSchema.tableUid ??
-          schemaMgr.getUidByName(childTableName) ??
-          GlobalIdGenerator.generate("t");
+      final childUid = updatedChildSchema.tableUid;
       final childSchemaToSave = updatedChildSchema.copyWith(
         tableUid: childUid,
         schemaVersion: GlobalIdGenerator.generate("s"),
@@ -4782,7 +4805,7 @@ class MigrationManager {
   /// Apply migration operations to records
   Future<List<BufferEntry>> _applyMigrationOperations(
       List<Map<String, dynamic>> records, List<MigrationOperation> operations,
-      {TableSchema? oldSchema}) async {
+      {TableSchema? oldSchema, required String targetSchemaVersion}) async {
     if (records.isEmpty || operations.isEmpty) {
       final timestamp = DateTime.now();
       return records
@@ -4791,6 +4814,7 @@ class MigrationManager {
                 data: r,
                 timestamp: timestamp,
                 walPointer: const WalPointer(partitionIndex: -1, entrySeq: 0),
+                schemaVersion: targetSchemaVersion,
               ))
           .toList();
     }
@@ -4817,6 +4841,7 @@ class MigrationManager {
                   operations: operations,
                   oldSchema: oldSchema,
                   yieldDurationMs: _dataStore.config.yieldDurationMs,
+                  targetSchemaVersion: targetSchemaVersion,
                 ),
               ),
               useIsolate: records.length > 500,
@@ -5121,6 +5146,7 @@ class MigrationManager {
         });
       }
 
+      registerSchemaVersionsFromTasks(_pendingTasks);
       _rebuildRuntimeMigrations();
       unawaited(processMigrationTasks().catchError((e) {
         if (e is DbClosedException) {
