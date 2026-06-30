@@ -258,6 +258,7 @@ class KeyMigrationRunner {
                 operation: BufferOperationType.rewrite,
                 data: record,
                 timestamp: DateTime.now(),
+                schemaVersion: schema.schemaVersion ?? '',
               );
 
               dataStore.backgroundWriteScheduler.addEntry(
