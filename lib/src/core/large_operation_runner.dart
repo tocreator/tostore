@@ -308,6 +308,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.delete,
               data: record,
               timestamp: DateTime.now(),
+              schemaVersion: schema.schemaVersion ?? '',
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -765,6 +766,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.delete,
               data: record,
               timestamp: DateTime.now(),
+              schemaVersion: schema.schemaVersion ?? '',
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -787,6 +789,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.insert,
               data: record,
               timestamp: DateTime.now(),
+              schemaVersion: schema.schemaVersion ?? '',
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -814,6 +817,7 @@ class LargeOperationRunner {
               timestamp: DateTime.now(),
               // Pass the complete old record directly to avoid partial index oldValues missing
               oldValues: oldRecord,
+              schemaVersion: schema.schemaVersion ?? '',
             );
 
             dataStore.backgroundWriteScheduler.addEntry(
