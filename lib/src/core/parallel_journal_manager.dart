@@ -1526,6 +1526,7 @@ class ParallelJournalManager {
               timestamp: DateTime.now(),
               transactionId: entry['txId'] as String?,
               oldValues: (entry['oldValues'] as Map?)?.cast<String, dynamic>(),
+              schemaVersion: entry['schemaVersion'] as String? ?? '',
             );
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
             final uniqueRefs = await _computeUniqueKeyRefs(resolvedTable, data);
@@ -2050,6 +2051,7 @@ class ParallelJournalManager {
           timestamp: DateTime.now(),
           oldValues: op.oldValues,
           walPointer: op.walPointer,
+          schemaVersion: schema.schemaVersion ?? '',
         );
 
         final uniqueKeys = await _computeUniqueKeyRefs(table, op.data);
