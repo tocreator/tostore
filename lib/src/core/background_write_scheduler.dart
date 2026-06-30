@@ -201,7 +201,8 @@ class BackgroundWriteScheduler {
   ///
   /// This removes them from both lookup maps and the ordered queue.
   Future<void> clearEntriesOfType(BackgroundWriteType type) async {
-    final yieldController = YieldController('BackgroundWriteScheduler.clearEntriesOfType');
+    final yieldController =
+        YieldController('BackgroundWriteScheduler.clearEntriesOfType');
 
     // 1. Remove from _queue maps
     final tables = _queue.keys.toList();
@@ -233,7 +234,9 @@ class BackgroundWriteScheduler {
       final originalLength = _orderedQueue.length;
       for (var i = _headIndex; i < originalLength; i++) {
         await yieldController.maybeYield();
-        if (i >= _orderedQueue.length) break; // Guard against concurrent clear/truncation
+        if (i >= _orderedQueue.length) {
+          break; // Guard against concurrent clear/truncation
+        }
         final entry = _orderedQueue[i];
         if (entry.type == type) {
           entry.isValid = false;
@@ -255,8 +258,10 @@ class BackgroundWriteScheduler {
   }
 
   /// Clear all pending background write entries for the given [tableName] and [type].
-  Future<void> clearEntriesForTable(String tableName, BackgroundWriteType type) async {
-    final yieldController = YieldController('BackgroundWriteScheduler.clearEntriesForTable');
+  Future<void> clearEntriesForTable(
+      String tableName, BackgroundWriteType type) async {
+    final yieldController =
+        YieldController('BackgroundWriteScheduler.clearEntriesForTable');
 
     // 1. Remove from _queue maps
     final tableMap = _queue[tableName];
@@ -284,7 +289,9 @@ class BackgroundWriteScheduler {
       final originalLength = _orderedQueue.length;
       for (var i = _headIndex; i < originalLength; i++) {
         await yieldController.maybeYield();
-        if (i >= _orderedQueue.length) break; // Guard against concurrent clear/truncation
+        if (i >= _orderedQueue.length) {
+          break; // Guard against concurrent clear/truncation
+        }
         final entry = _orderedQueue[i];
         if (entry.tableName == tableName && entry.type == type) {
           entry.isValid = false;
@@ -308,7 +315,8 @@ class BackgroundWriteScheduler {
   /// Rename table for queued and ordered background write entries.
   Future<void> renameTable(String oldTableName, String newTableName) async {
     if (oldTableName == newTableName) return;
-    final yieldController = YieldController('BackgroundWriteScheduler.renameTable');
+    final yieldController =
+        YieldController('BackgroundWriteScheduler.renameTable');
 
     // 1. Rename in _queue maps
     final tableMap = _queue.remove(oldTableName);
