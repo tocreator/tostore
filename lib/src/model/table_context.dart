@@ -2,11 +2,11 @@ import 'table_schema.dart';
 
 /// Table context, mainly used to pass resolved table info conveniently across the engine path.
 class TableContext {
-  final String tableUid;       // Table unique identifier
-  String tableName;            // Table name (can be updated on renaming in memory context)
-  final bool isGlobal;         // Whether it is a global table
-  final int dataDirIndex;      // Data directory index
-  final TableSchema schema;    // Schema snapshot
+  final String tableUid; // Table unique identifier
+  String tableName; // Table name (can be updated on renaming in memory context)
+  final bool isGlobal; // Whether it is a global table
+  final int dataDirIndex; // Data directory index
+  final TableSchema schema; // Schema snapshot
 
   TableContext({
     required this.tableUid,
@@ -17,7 +17,8 @@ class TableContext {
   });
 
   @override
-  String toString() => 'TableContext(uid: $tableUid, name: $tableName, isGlobal: $isGlobal, dir: $dataDirIndex, schemaVersion: ${schema.schemaVersion})';
+  String toString() =>
+      'TableContext(uid: $tableUid, name: $tableName, isGlobal: $isGlobal, dir: $dataDirIndex, schemaVersion: ${schema.schemaVersion})';
 }
 
 /// Index context, used for index operations.
@@ -35,5 +36,6 @@ class IndexContext {
   });
 
   @override
-  String toString() => 'IndexContext(uid: $indexUid, name: $indexName, table: ${table.tableName})';
+  String toString() =>
+      'IndexContext(uid: $indexUid, name: $indexName, table: ${table.tableName})';
 }
