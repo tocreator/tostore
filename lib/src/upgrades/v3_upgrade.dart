@@ -30,7 +30,8 @@ class V3Upgrade {
 
     // Recovery from previous crash: restore old schema_meta if present
     if (await _dataStore.storage.existsFile(schemaMetaPathOld)) {
-      Logger.info('Recovering schema metadata from previous crashed v3 upgrade run');
+      Logger.info(
+          'Recovering schema metadata from previous crashed v3 upgrade run');
       if (await _dataStore.storage.existsFile(schemaMetaPath)) {
         await _dataStore.storage.deleteFile(schemaMetaPath);
       }
@@ -62,8 +63,10 @@ class V3Upgrade {
           }
           userSchemaHash = json['userSchemaHash'] as String?;
           systemSchemaHash = json['systemSchemaHash'] as String?;
-          if (json['timestamps'] != null && json['timestamps']['created'] != null) {
-            createdTime = DateTime.parse(json['timestamps']['created'] as String);
+          if (json['timestamps'] != null &&
+              json['timestamps']['created'] != null) {
+            createdTime =
+                DateTime.parse(json['timestamps']['created'] as String);
           }
         } catch (e) {
           Logger.warn('Failed to parse old schema meta in v3 upgrade',
@@ -74,7 +77,7 @@ class V3Upgrade {
       if (!await _dataStore.storage.existsFile(schemaMetaPathOld)) {
         await _dataStore.storage.copyFile(schemaMetaPath, schemaMetaPathOld);
       }
-      
+
       // Construct a new, empty-routes SchemaMeta in the new format but preserving hashes/timestamps
       final emptySchemaMeta = SchemaMeta(
         version: InternalConfig.schemaVersion,
@@ -86,10 +89,11 @@ class V3Upgrade {
           modified: DateTime.now(),
         ),
       );
-      
+
       // Overwrite schema_meta.json with the empty new-format layout
-      await _dataStore.storage.writeAsString(schemaMetaPath, jsonEncode(emptySchemaMeta.toJson()));
-      
+      await _dataStore.storage
+          .writeAsString(schemaMetaPath, jsonEncode(emptySchemaMeta.toJson()));
+
       // Invalidate the cache inside schemaManager so it loads the new file on next read
       _dataStore.schemaManager?.invalidateCache();
     }
@@ -189,7 +193,8 @@ class V3Upgrade {
               var upgradedSchema = schema.generateAutoIndexes();
               upgradedSchema = upgradedSchema.copyWith(
                 tableUid: tableUid,
-                schemaVersion: schema.schemaVersion ?? GlobalIdGenerator.generate("s"),
+                schemaVersion:
+                    schema.schemaVersion ?? GlobalIdGenerator.generate("s"),
               );
 
               // Map generated indexUids for directory rename
@@ -218,8 +223,6 @@ class V3Upgrade {
       }
     }
 
-
-
     // 4. Move physical folders and rewrite metadata files for tables
     for (final tableName in tableUidMap.keys) {
       final tableUid = tableUidMap[tableName]!;
@@ -238,8 +241,11 @@ class V3Upgrade {
         }
         final actualOldGlobalDirIndex = oldGlobalDirIndex ?? 0;
 
-        final oldGlobalPath = path.join(_dataStore.config.dbPath!,
-            _dataStore.config.dbName, 'tables_$actualOldGlobalDirIndex', tableName);
+        final oldGlobalPath = path.join(
+            _dataStore.config.dbPath!,
+            _dataStore.config.dbName,
+            'tables_$actualOldGlobalDirIndex',
+            tableName);
         final newGlobalPath = path.join(_dataStore.config.dbPath!,
             _dataStore.config.dbName, 'tables_$finalDirIndex', tableUid);
         await _migrateTableDirectory(
