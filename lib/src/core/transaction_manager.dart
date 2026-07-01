@@ -693,6 +693,7 @@ class TransactionManager {
             schema: schema,
             uniqueKeyRefsList: uniqueKeysList,
             transactionId: plan.transactionId,
+            schemaVersion: schema.schemaVersion ?? '',
           );
 
           progress['inserts']![table] = end;
@@ -763,6 +764,7 @@ class TransactionManager {
             uniqueKeyRefsList: uniqueKeysList,
             oldRecordsMap: oldRecordsMap,
             transactionId: plan.transactionId,
+            schemaVersion: schema.schemaVersion ?? '',
           );
 
           progress['updates']![table] = end;
@@ -804,7 +806,13 @@ class TransactionManager {
               if (k != null && k.isNotEmpty) cacheKeys.add(k);
             } catch (_) {}
           }
-          await _dataStore.tableDataManager.addToDeleteBuffer(table, batch);
+          final schema = await _dataStore.schemaManager?.getTableSchema(table);
+          final version = schema?.schemaVersion ?? '';
+          await _dataStore.tableDataManager.addToDeleteBuffer(
+            table,
+            batch,
+            schemaVersion: version,
+          );
           progress['deletes']![table] = end;
           processedSinceLastCheckpoint += (end - i);
           if (processedSinceLastCheckpoint >= checkpointEvery) {
