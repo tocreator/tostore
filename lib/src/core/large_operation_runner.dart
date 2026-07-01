@@ -300,6 +300,13 @@ class LargeOperationRunner {
             return true;
           }
 
+          var entryVersion = schema.schemaVersion ?? '';
+          if (dataStore.migrationManager
+                  ?.hasRuntimeMigrationForTable(tableName) ??
+              false) {
+            entryVersion = '';
+          }
+
           // 4. Populate scheduler for batch flushing
           for (final record in deletes) {
             if (token.isCancelled) return false;
@@ -308,7 +315,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.delete,
               data: record,
               timestamp: DateTime.now(),
-              schemaVersion: schema.schemaVersion ?? '',
+              schemaVersion: entryVersion,
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -759,6 +766,13 @@ class LargeOperationRunner {
             cacheKeysToRemove.add(pkValueStr);
           }
 
+          var entryVersion = schema.schemaVersion ?? '';
+          if (dataStore.migrationManager
+                  ?.hasRuntimeMigrationForTable(tableName) ??
+              false) {
+            entryVersion = '';
+          }
+
           // Populate scheduler
           for (final record in deletes) {
             final pk = record[primaryKey].toString();
@@ -766,7 +780,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.delete,
               data: record,
               timestamp: DateTime.now(),
-              schemaVersion: schema.schemaVersion ?? '',
+              schemaVersion: entryVersion,
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -789,7 +803,7 @@ class LargeOperationRunner {
               operation: BufferOperationType.insert,
               data: record,
               timestamp: DateTime.now(),
-              schemaVersion: schema.schemaVersion ?? '',
+              schemaVersion: entryVersion,
             );
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
@@ -817,7 +831,7 @@ class LargeOperationRunner {
               timestamp: DateTime.now(),
               // Pass the complete old record directly to avoid partial index oldValues missing
               oldValues: oldRecord,
-              schemaVersion: schema.schemaVersion ?? '',
+              schemaVersion: entryVersion,
             );
 
             dataStore.backgroundWriteScheduler.addEntry(
