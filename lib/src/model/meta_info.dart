@@ -332,8 +332,7 @@ class TableMeta {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message:
-              'Missing required fields for TableMeta. Missing fields: ${[
+          message: 'Missing required fields for TableMeta. Missing fields: ${[
             if (loadedUid == null) 'tableUid',
             if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
             if (json['totalRecords'] == null) 'totalRecords',
@@ -829,10 +828,11 @@ class SchemaMeta {
 
   factory SchemaMeta.fromJson(Map<String, dynamic> json) {
     return SchemaMeta(
-      version: resolveVersionValue(
-          json['version'], InternalConfig.schemaVersion),
+      version:
+          resolveVersionValue(json['version'], InternalConfig.schemaVersion),
       routes: (json['routes'] as List<dynamic>?)
-              ?.map((e) => TableSchemaRouteEntry.fromJson(e as Map<String, dynamic>))
+              ?.map((e) =>
+                  TableSchemaRouteEntry.fromJson(e as Map<String, dynamic>))
               .toList() ??
           [],
       timestamps:
@@ -1024,8 +1024,7 @@ class IndexMeta {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message:
-              'Missing required fields for IndexMeta. Missing fields: ${[
+          message: 'Missing required fields for IndexMeta. Missing fields: ${[
             if (loadedIndexUid == null) 'indexUid',
             if (loadedTableUid == null) 'tableUid',
             if (json['isUnique'] == null) 'isUnique',
