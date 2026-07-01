@@ -374,7 +374,7 @@ Durante `ToStore.open()`, il motore rileva automaticamente le modifiche struttur
 
 ### Monitoraggio del progresso di avvio
 
-Le modifiche normali allo schema sono trasparenti per la logica di business e non bloccano l'avvio. Solo in rari casi eccezionali specifici per app mobili frequentemente chiuse forzatamente (ad esempio, una migrazione precedente è stata interrotta e una nuova modifica dello schema richiede ora la risoluzione dei conflitti, o una breve convalida dei dati dopo un'uscita anomala) l'inizializzazione può richiedere un tempo percettibile — usa `onStartupProgress` per mostrare una schermata iniziale o un indicatore di avanzamento:
+Le modifiche normali allo schema sono trasparenti per la logica di business e non bloccano l'avvio. Solo in rari casi eccezionali specifici per app mobili frequentemente chiuse forzatamente (ad esempio, una breve convalida dei dati e il ripristino dei crash dopo un'uscita anomala) l'inizializzazione può richiedere un tempo percettibile — usa `onStartupProgress` per mostrare una schermata iniziale o un indicatore di avanzamento:
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Fasi:
 - `opening` — Caricamento configurazione, preparazione del motore di base
 - `recovering` — Controlli di sicurezza e ripristino dopo crash
-- `optimizing` — Evoluzione dello schema e migrazione dei dati
+- `optimizing` — Messa a punto interna del motore e ottimizzazione strutturale
 - `ready` — Inizializzazione completata, pronto all'uso
 
 
