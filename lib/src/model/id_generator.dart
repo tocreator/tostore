@@ -1465,8 +1465,9 @@ class IdGeneratorFactory {
 class GlobalIdGenerator {
   static final Random _random = Random.secure();
   static const int _timestampBits = 36; // 36 bits seconds (~2177 years)
-  static const int _nodeBits = 14;      // 14 bits node ID (up to 16384 nodes)
-  static const int _sequenceBits = 22;  // 22 bits sequence (4,194,304 ids/sec/node)
+  static const int _nodeBits = 14; // 14 bits node ID (up to 16384 nodes)
+  static const int _sequenceBits =
+      22; // 22 bits sequence (4,194,304 ids/sec/node)
 
   static const int _sequenceMask = (1 << _sequenceBits) - 1;
   static const int _nodeMask = (1 << _nodeBits) - 1;
@@ -1490,7 +1491,8 @@ class GlobalIdGenerator {
   static final List<int> _base36Units =
       _base36Chars.codeUnits.toList(growable: false);
 
-  static const int _totalBits = _timestampBits + _nodeBits + _sequenceBits; // 72 bits
+  static const int _totalBits =
+      _timestampBits + _nodeBits + _sequenceBits; // 72 bits
 
   /// Mathematically correct body length calculation.
   /// Uses final instead of const since log/ceil are computed at runtime.
@@ -1566,7 +1568,8 @@ class GlobalIdGenerator {
   }
 
   static BigInt _nextId() {
-    int timestamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000) - _epochStartSeconds;
+    int timestamp =
+        (DateTime.now().millisecondsSinceEpoch ~/ 1000) - _epochStartSeconds;
 
     if (timestamp < _lastTimestampSec) {
       // Clock went backwards — typically an NTP step correction.
@@ -1593,8 +1596,8 @@ class GlobalIdGenerator {
     final BigInt seqBig = BigInt.from(_sequence & _sequenceMask);
 
     return (timestampBig << (_nodeBits + _sequenceBits)) |
-           (nodeBig << _sequenceBits) |
-           seqBig;
+        (nodeBig << _sequenceBits) |
+        seqBig;
   }
 
   static int _waitNextSecond(int lastTimestamp) {
