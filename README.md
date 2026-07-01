@@ -374,7 +374,7 @@ During `ToStore.open()`, the engine automatically detects structural changes in 
 
 ### Tracking Startup Progress
 
-Normal schema changes are transparent to business logic and never block startup. Only in rare edge cases specific to mobile apps that are frequently force-closed (e.g., a previous migration was interrupted and a new schema change now requires conflict resolution, or brief data validation after an abnormal exit) may initialization take noticeable time — use `onStartupProgress` to show a splash screen or progress indicator:
+Normal schema changes are transparent to business logic and never block startup. Only in rare edge cases specific to mobile apps that are frequently force-closed (e.g., brief data validation and crash recovery after an abnormal exit) may initialization take noticeable time — use `onStartupProgress` to show a splash screen or progress indicator:
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Stages:
 - `opening` — Loading configuration and preparing the base engine
 - `recovering` — Security checks and crash recovery
-- `optimizing` — Schema evolution and data migration
+- `optimizing` — Internal engine tuning and structural optimization
 - `ready` — Initialization complete, ready for use
 
 
