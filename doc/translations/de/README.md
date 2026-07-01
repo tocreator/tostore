@@ -374,7 +374,7 @@ Während `ToStore.open()` erkennt die Engine automatisch strukturelle Änderunge
 
 ### Startfortschritt verfolgen
 
-Normale Schema-Änderungen sind für die Geschäftslogik transparent und blockieren den Start nicht. Nur in seltenen Ausnahmefällen bei mobilen Apps, die häufig zwangsweise geschlossen werden (z. B. wenn eine vorherige Migration unterbrochen wurde und eine neue Schema-Änderung jetzt eine Konfliktlösung erfordert, oder kurze Datenvalidierung nach einem abnormalen Beenden) kann die Initialisierung spürbar dauern — verwenden Sie `onStartupProgress`, um einen Splash-Screen oder Fortschrittsbalken anzuzeigen:
+Normale Schema-Änderungen sind für die Geschäftslogik transparent und blockieren den Start nicht. Nur in seltenen Ausnahmefällen bei mobilen Apps, die häufig zwangsweise geschlossen werden (z. B. kurze Datenvalidierung und Crash-Wiederherstellung nach einem abnormalen Beenden) kann die Initialisierung spürbar dauern — verwenden Sie `onStartupProgress`, um einen Splash-Screen oder Fortschrittsbalken anzuzeigen:
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Phasen:
 - `opening` — Konfiguration laden, Basis-Engine vorbereiten
 - `recovering` — Sicherheitsprüfungen und Absturzwiederherstellung
-- `optimizing` — Schema-Evolution und Datenmigration
+- `optimizing` — Interne Motorabstimmung und Strukturpflege-Optimierung
 - `ready` — Initialisierung abgeschlossen, einsatzbereit
 
 
