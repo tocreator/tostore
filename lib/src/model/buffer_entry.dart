@@ -17,13 +17,17 @@ class BufferEntry {
   /// Used for unique/index maintenance without
   final Map<String, dynamic>? oldValues;
 
+  /// The version of the table schema that validated this change.
+  final String schemaVersion;
+
   BufferEntry(
       {required this.operation,
       required this.data,
       required this.timestamp,
       this.walPointer,
       this.transactionId,
-      this.oldValues});
+      this.oldValues,
+      required this.schemaVersion});
 
   BufferEntry copyWith({
     Map<String, dynamic>? data,
@@ -32,6 +36,7 @@ class BufferEntry {
     WalPointer? walPointer,
     String? transactionId,
     Map<String, dynamic>? oldValues,
+    String? schemaVersion,
   }) {
     return BufferEntry(
       data: data ?? this.data,
@@ -40,6 +45,7 @@ class BufferEntry {
       walPointer: walPointer ?? this.walPointer,
       transactionId: transactionId ?? this.transactionId,
       oldValues: oldValues ?? this.oldValues,
+      schemaVersion: schemaVersion ?? this.schemaVersion,
     );
   }
 
@@ -51,6 +57,7 @@ class BufferEntry {
       if (walPointer != null) 'walPointer': walPointer!.toJson(),
       if (transactionId != null) 'transactionId': transactionId,
       if (oldValues != null) 'oldValues': oldValues,
+      'schemaVersion': schemaVersion,
     };
   }
 
@@ -68,6 +75,7 @@ class BufferEntry {
       oldValues: json.containsKey('oldValues')
           ? (json['oldValues'] as Map?)?.cast<String, dynamic>()
           : null,
+      schemaVersion: json['schemaVersion'] as String? ?? '',
     );
   }
 }
