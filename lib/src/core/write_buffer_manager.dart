@@ -493,6 +493,7 @@ class WriteBufferManager {
           walPointer: effectiveEntry.walPointer,
           transactionId: prior.transactionId ?? entry.transactionId,
           oldValues: null,
+          schemaVersion: entry.schemaVersion,
         );
         skipQueueEnqueue =
             true; // Skip queue enqueue - INSERT entry already exists
@@ -517,6 +518,7 @@ class WriteBufferManager {
           walPointer: entry.walPointer,
           transactionId: prior.transactionId ?? entry.transactionId,
           oldValues: prior.oldValues ?? prior.data,
+          schemaVersion: entry.schemaVersion,
         );
         restoreDeletedCount = true;
       }
@@ -695,6 +697,7 @@ class WriteBufferManager {
           walPointer: entry.walPointer,
           transactionId: prior.transactionId ?? entry.transactionId,
           oldValues: prior.oldValues ?? prior.data,
+          schemaVersion: entry.schemaVersion,
         );
       }
 
@@ -1750,6 +1753,7 @@ class WriteBufferManager {
             transactionId: prior.transactionId,
             walPointer: prior.walPointer,
             oldValues: null,
+            schemaVersion: entry.schemaVersion,
           );
           skipQueueEnqueue = true; // Insert is already in queue
         } else if (prior.operation == BufferOperationType.update) {
@@ -1764,6 +1768,7 @@ class WriteBufferManager {
             transactionId: prior.transactionId,
             walPointer: prior.walPointer,
             oldValues: prior.oldValues ?? entry.oldValues,
+            schemaVersion: entry.schemaVersion,
           );
         }
       }
