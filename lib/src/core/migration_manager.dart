@@ -117,9 +117,6 @@ class MigrationManager {
   // Active executing task Future
   Future<void>? _activeTaskFuture;
 
-  // Set of task IDs that are in version conflict during startup
-  final Set<String> _conflictTaskIds = {};
-
   /// Whether schema or key migration work is still pending.
   static bool computeHasPendingMigrationWork({
     required bool hasSchemaTasks,
@@ -662,32 +659,7 @@ class MigrationManager {
         return;
       }
 
-      // Resolve version conflicts for any tables that have pending tasks
-      final tasksToWait = <MigrationTask>[];
-      for (final task in _pendingTasks) {
-        if (task.pendingMigrationSpaces.isEmpty) continue;
-        if (_conflictTaskIds.contains(task.taskId)) {
-          tasksToWait.add(task);
-        }
-      }
 
-      if (tasksToWait.isNotEmpty) {
-        for (int i = 0; i < tasksToWait.length; i++) {
-          final task = tasksToWait[i];
-          await waitForTaskCompletion(
-            task.taskId,
-            onProgress: (double taskProgress) {
-              if (onProgress != null) {
-                double totalTaskWeight = 1.0 / tasksToWait.length;
-                double currentTaskBase = i * totalTaskWeight;
-                double mappedProgress =
-                    currentTaskBase + (taskProgress * totalTaskWeight);
-                onProgress(mappedProgress.clamp(0.0, 1.0));
-              }
-            },
-          );
-        }
-      }
 
       // Get all existing tables
       var existingTables = await _dataStore.getTableNames();
@@ -1709,6 +1681,9 @@ class MigrationManager {
       await _saveMigrationTask(task);
       _updatePendingTaskInMemory(task);
       _pendingTasks.add(task);
+
+      // Reconcile pending tasks for the table to merge or cancel redundant ops
+      await _reconcilePendingTasksForTable(tableName);
 
       await syncHasMigrationTask();
 
@@ -4849,7 +4824,6 @@ class MigrationManager {
   }) async {
     try {
       _runtimeMigrations.clear();
-      _conflictTaskIds.clear();
       await _recoverPendingSchemaTasksFromDisk(
         userSchemas: userSchemas,
         systemSchemas: systemSchemas,
@@ -5055,41 +5029,14 @@ class MigrationManager {
     }
 
     if (_pendingTasks.isNotEmpty) {
-      // Check conflict tasks and record them — check against both user and system schemas
-      final allSchemas = <TableSchema>[...userSchemas, ...systemSchemas];
-      if (allSchemas.isNotEmpty) {
-        for (final task in _pendingTasks) {
-          TableSchema? targetSchema;
-          for (final s in allSchemas) {
-            if (s.name == task.tableName) {
-              targetSchema = s;
-              break;
-            }
-          }
-          if (targetSchema != null) {
-            final bootedHash = TableSchema.generateSchemasHash([targetSchema]);
-            final pendingTargetHash = task.targetSchemaSnapshot != null
-                ? TableSchema.generateSchemasHash([task.targetSchemaSnapshot!])
-                : '';
-            if (bootedHash != pendingTargetHash) {
-              _conflictTaskIds.add(task.taskId);
-            }
-          }
-        }
-      }
-
-      // Sort _pendingTasks to prioritize conflict tasks
-      if (_conflictTaskIds.isNotEmpty) {
-        _pendingTasks.sort((a, b) {
-          final aConflict = _conflictTaskIds.contains(a.taskId);
-          final bConflict = _conflictTaskIds.contains(b.taskId);
-          if (aConflict && !bConflict) return -1;
-          if (!aConflict && bConflict) return 1;
-          return 0;
-        });
-      }
-
       registerSchemaVersionsFromTasks(_pendingTasks);
+
+      // Reconcile pending tasks for recovered tables to merge or cancel redundant ops
+      final uniqueTableNames = _pendingTasks.map((t) => t.tableName).toSet();
+      for (final tName in uniqueTableNames) {
+        await _reconcilePendingTasksForTable(tName);
+      }
+
       _rebuildRuntimeMigrations();
       unawaited(processMigrationTasks().catchError((e) {
         if (e is DbClosedException) {
@@ -6111,6 +6058,184 @@ class MigrationManager {
     }
     final calculatedMs = (recordCount * msPerRecord).round() + 5;
     return Duration(milliseconds: calculatedMs);
+  }
+
+  /// Reconcile and optimize chained pending migration tasks for a table.
+  /// This merges sequential table renames and cancels redundant index builds.
+  Future<void> _reconcilePendingTasksForTable(String tableName) async {
+    final pending = <MigrationTask>[..._pendingTasks];
+    if (pending.isEmpty) return;
+
+    MigrationTask? seed;
+    for (final task in pending) {
+      if (_taskMatchesTable(task, tableName, '')) {
+        seed = task;
+        break;
+      }
+    }
+    if (seed == null) return;
+
+    final component = _collectLinkedPendingTasks(pending, seed);
+    if (component.length < 2) return;
+
+    // Sort by createTime
+    component.sort((a, b) {
+      final c = a.createTime.compareTo(b.createTime);
+      if (c != 0) return c;
+      return a.taskId.compareTo(b.taskId);
+    });
+
+    // 1. Redundant Index building cancellation
+    final removedIndexes = <String>{};
+    for (int i = component.length - 1; i >= 0; i--) {
+      final task = component[i];
+
+      // Remove specific indexes that are subsequently dropped
+      if (task.specificIndexes != null && task.specificIndexes!.isNotEmpty) {
+        final initialLength = task.specificIndexes!.length;
+        final updatedSpecificIndexes = task.specificIndexes!
+            .where((idx) => !removedIndexes.contains(idx))
+            .toList();
+
+        if (updatedSpecificIndexes.length < initialLength) {
+          var updatedTask = task.copyWith(specificIndexes: updatedSpecificIndexes);
+
+          if (updatedSpecificIndexes.isEmpty) {
+            if (updatedTask.writeMode == MigrationWriteMode.indexOnly) {
+              updatedTask = updatedTask.copyWith(writeMode: MigrationWriteMode.none);
+            } else if (updatedTask.writeMode == MigrationWriteMode.tableAndIndex) {
+              updatedTask = updatedTask.copyWith(writeMode: MigrationWriteMode.tableOnly);
+            }
+          }
+
+          final scopes = await _getMigrationScopesForSchema(task.targetSchemaSnapshot ?? task.oldSchemaSnapshot);
+          final isTaskStarted = task.taskId == _activeExecutingTaskId ||
+              task.spaceCheckpointKeys.isNotEmpty ||
+              task.pendingMigrationSpaces.length < scopes.length;
+
+          // If a task is completely resolved to no-op (no write mode, no physical rename, no force write),
+          // we can discard the task if it is already schema-updated and NOT physically started yet.
+          if (updatedTask.writeMode == MigrationWriteMode.none &&
+              !updatedTask.forceDataMigration &&
+              updatedTask.pendingPhysicalRenameSpaces.isEmpty &&
+              updatedTask.isSchemaUpdated &&
+              !isTaskStarted) {
+            _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
+            await _cleanupTask(task);
+            _unregisterRuntimeMigrationForTask(task);
+            Logger.info('Cancelled redundant migration task [${task.taskId}] on table [${task.tableName}] due to index cancellation');
+            continue;
+          } else {
+            await _saveMigrationTask(updatedTask);
+            _updatePendingTaskInMemory(updatedTask);
+          }
+        }
+      }
+
+      // Collect indexes dropped by this task
+      for (final op in task.operations) {
+        if (op.type == MigrationType.removeIndex && op.indexName != null) {
+          removedIndexes.add(op.indexName!);
+        }
+      }
+      if (task.targetSchemaSnapshot != null) {
+        final targetIdxNames = task.targetSchemaSnapshot!
+            .getAllIndexes()
+            .map((idx) => idx.actualIndexName)
+            .toSet();
+        if (task.oldSchemaSnapshot != null) {
+          for (final oldIdx in task.oldSchemaSnapshot!.getAllIndexes()) {
+            if (!targetIdxNames.contains(oldIdx.actualIndexName)) {
+              removedIndexes.add(oldIdx.actualIndexName);
+            }
+          }
+        }
+      }
+    }
+
+    // Refresh component after index cancellations
+    final refreshedPending = <MigrationTask>[..._pendingTasks];
+    final refreshedComponent = _collectLinkedPendingTasks(refreshedPending, seed)
+      ..sort((a, b) {
+        final c = a.createTime.compareTo(b.createTime);
+        if (c != 0) return c;
+        return a.taskId.compareTo(b.taskId);
+      });
+
+    // 2. Chained table rename merging
+    for (int i = 0; i < refreshedComponent.length - 1; i++) {
+      final taskA = refreshedComponent[i];
+      final renameOpA = _findRenameOperation(taskA.operations);
+      if (renameOpA == null || renameOpA.newTableName == null) continue;
+
+      final scopesA = await _getMigrationScopesForSchema(taskA.targetSchemaSnapshot ?? taskA.oldSchemaSnapshot);
+      final isTaskAStarted = taskA.taskId == _activeExecutingTaskId ||
+          taskA.spaceCheckpointKeys.isNotEmpty ||
+          taskA.pendingPhysicalRenameSpaces.length < scopesA.length;
+      if (isTaskAStarted) continue;
+
+      for (int j = i + 1; j < refreshedComponent.length; j++) {
+        final taskB = refreshedComponent[j];
+        final renameOpB = _findRenameOperation(taskB.operations);
+        if (renameOpB == null || renameOpB.newTableName == null) continue;
+
+        final scopesB = await _getMigrationScopesForSchema(taskB.targetSchemaSnapshot ?? taskB.oldSchemaSnapshot);
+        final isTaskBStarted = taskB.taskId == _activeExecutingTaskId ||
+            taskB.spaceCheckpointKeys.isNotEmpty ||
+            taskB.pendingPhysicalRenameSpaces.length < scopesB.length;
+        if (isTaskBStarted) continue;
+
+        if (renameOpA.newTableName == taskB.tableName) {
+          final finalNewName = renameOpB.newTableName!;
+
+          // Update taskA rename operation and schema snapshot
+          final updatedOpsA = taskA.operations.map((op) {
+            if (op.type == MigrationType.renameTable) {
+              return MigrationOperation(
+                type: MigrationType.renameTable,
+                newTableName: finalNewName,
+              );
+            }
+            return op;
+          }).toList();
+
+          TableSchema? updatedTargetSchemaA = taskA.targetSchemaSnapshot;
+          if (updatedTargetSchemaA != null) {
+            updatedTargetSchemaA = updatedTargetSchemaA.copyWith(name: finalNewName);
+          }
+
+          var updatedTaskA = taskA.copyWith(
+            operations: updatedOpsA,
+            currentTableName: finalNewName,
+            targetSchemaSnapshot: updatedTargetSchemaA,
+          );
+
+          await _saveMigrationTask(updatedTaskA);
+          _updatePendingTaskInMemory(updatedTaskA);
+
+          // Update/Remove taskB rename operation
+          final updatedOpsB = taskB.operations.where((op) => op.type != MigrationType.renameTable).toList();
+
+          if (updatedOpsB.isEmpty) {
+            _pendingTasks.removeWhere((t) => t.taskId == taskB.taskId);
+            await _cleanupTask(taskB);
+            _unregisterRuntimeMigrationForTask(taskB);
+          } else {
+            var updatedTaskB = taskB.copyWith(
+              tableName: finalNewName,
+              operations: updatedOpsB,
+            );
+            await _saveMigrationTask(updatedTaskB);
+            _updatePendingTaskInMemory(updatedTaskB);
+          }
+
+          Logger.info('Merged chained rename tasks for table [${taskA.tableName}]: rename directly to $finalNewName');
+          break;
+        }
+      }
+    }
+
+    _rebuildRuntimeMigrations(tableName);
   }
 }
 
