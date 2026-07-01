@@ -374,7 +374,7 @@ Durante `ToStore.open()`, el motor detecta automáticamente cambios estructurale
 
 ### Seguimiento del progreso de inicio
 
-Los cambios de esquema normales son transparentes para la lógica de negocio y no bloquean el inicio. Solo en casos excepcionales raros específicos de aplicaciones móviles que se cierran forzosamente con frecuencia (por ejemplo, una migración previa fue interrumpida y un nuevo cambio de esquema ahora requiere resolución de conflictos, o una breve validación de datos tras una salida anormal) la inicialización puede tardar un tiempo perceptible — use `onStartupProgress` para mostrar una pantalla de bienvenida o un indicador de progreso:
+Los cambios de esquema normales son transparentes para la lógica de negocio y no bloquean el inicio. Solo en casos excepcionales raros específicos de aplicaciones móviles que se cierran forzosamente con frecuencia (por ejemplo, una breve validación de datos y recuperación de fallas tras una salida anormal) la inicialización puede tardar un tiempo perceptible — use `onStartupProgress` para mostrar una pantalla de bienvenida o un indicador de progreso:
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Etapas:
 - `opening` — Cargando configuración, preparando el motor base
 - `recovering` — Comprobaciones de seguridad y recuperación tras fallo
-- `optimizing` — Evolución de esquema y migración de datos
+- `optimizing` — Ajuste interno del motor y optimización estructural
 - `ready` — Inicialización completa, listo para usar
 
 
