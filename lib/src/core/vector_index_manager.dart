@@ -1227,7 +1227,8 @@ class VectorIndexManager {
     bool changed = false;
     IndexMeta? nid2pk = meta.nodeIdToPkMeta;
     IndexMeta? pk2nid = meta.pkToNodeIdMeta;
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
 
     if (nid2pk == null) {
       nid2pk = IndexMeta.createEmpty(
