@@ -248,6 +248,13 @@ class KeyMigrationRunner {
               checkInterval: 64,
             );
 
+            var entryVersion = schema.schemaVersion ?? '';
+            if (dataStore.migrationManager
+                    ?.hasRuntimeMigrationForTable(tableName) ??
+                false) {
+              entryVersion = '';
+            }
+
             for (final record in records) {
               if (isPauseRequested) return false;
               await yieldController.maybeYield();
@@ -258,7 +265,7 @@ class KeyMigrationRunner {
                 operation: BufferOperationType.rewrite,
                 data: record,
                 timestamp: DateTime.now(),
-                schemaVersion: schema.schemaVersion ?? '',
+                schemaVersion: entryVersion,
               );
 
               dataStore.backgroundWriteScheduler.addEntry(
