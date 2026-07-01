@@ -1301,9 +1301,8 @@ class DataStoreImpl {
 
       try {
         // Validate primary key configuration and field types
-        final reservedSystemTableNames = SystemTable.knownSystemTableNames;
-        final bool isKnownSystemTable =
-            SystemTable.isKnownSystemTable(schema.name);
+        final reservedSystemTableNames = SystemTable.systemTableNames;
+        final bool isKnownSystemTable = SystemTable.isSystemTable(schema.name);
         final bool allowSystemSchema = isKnownSystemTable || isSystemTable;
         schemaValid.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,

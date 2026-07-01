@@ -4,11 +4,11 @@ class SystemTable {
   /// Foreign key references system table name
   /// This table stores the reverse mapping of foreign key relationships
   /// Structure: referenced_table -> referencing_table -> foreign_key_info
-  static const String _fkReferencesName = 'system_fk_references';
+  static const String _fkReferencesName = '_system_fk_references';
 
   /// Key-value store table name
-  static const String _keyValueName = 'kv_store';
-  static const String _globalKeyValueName = 'global_kv_store';
+  static const String _keyValueName = '_system_kv_store';
+  static const String _globalKeyValueName = '_system_global_kv_store';
 
   /// Key-value store field names
   static const String keyValueKeyField = 'key';
@@ -43,36 +43,24 @@ class SystemTable {
   /// Scope marker for global tables in key migration progress rows.
   static const String globalMigrationScope = '__global__';
 
-  // is a system table (current version)
-  static bool isSystemTable(String tableName) {
-    return tableName == _keyValueName ||
-        tableName == _globalKeyValueName ||
-        tableName == _fkReferencesName ||
-        tableName == keyMigrationProgressTableName;
-  }
-
-  /// Names that have ever been system tables (current + deprecated).
-  /// Used by migration when [systemOnly] to decide which on-disk tables to manage:
-  /// only tables in this set are considered for create/alter/drop; all others are
-  /// treated as user tables and left untouched. This list is code-only (not from
-  /// TableSchema), so user-defined schemas cannot mark a table as system.
-  /// When deprecating a system table, add its name here so migration can drop it.
-  static const Set<String> _knownSystemTableNames = {
+  static const Set<String> _systemTableNames = {
     _fkReferencesName,
     _keyValueName,
     _globalKeyValueName,
     keyMigrationProgressTableName,
     // Legacy system table names (append when a system table is removed):
-    // 'legacy_sys_table',
+    'system_fk_references',
+    'kv_store',
+    'global_kv_store',
   };
 
-  /// True if [tableName] is a known system table (current or legacy).
-  static bool isKnownSystemTable(String tableName) =>
-      _knownSystemTableNames.contains(tableName);
+  /// True if [tableName] is a system table (current or legacy).
+  static bool isSystemTable(String tableName) =>
+      _systemTableNames.contains(tableName);
 
   /// All known system table names (current + deprecated).
   /// This is a const set and must remain stable across versions.
-  static Set<String> get knownSystemTableNames => _knownSystemTableNames;
+  static Set<String> get systemTableNames => _systemTableNames;
 
   /// get all table schemas
   static List<TableSchema> gettableSchemas = [
@@ -100,7 +88,7 @@ class SystemTable {
   /// - Index on referenced_table: For fast lookup of all tables referencing a given table
   static TableSchema _fkReferencesTable() => TableSchema(
         name: _fkReferencesName,
-        tableId: _fkReferencesName,
+        tableId: 'system_fk_references',
         isGlobal: true, // System table, always global
         primaryKeyConfig: const PrimaryKeyConfig(),
         fields: [
@@ -213,7 +201,7 @@ class SystemTable {
   /// Key-value store table
   static TableSchema _kVTable(bool isGlobal) => TableSchema(
         name: getKeyValueName(isGlobal),
-        tableId: getKeyValueName(isGlobal),
+        tableId: isGlobal ? 'global_kv_store' : 'kv_store',
         isGlobal: isGlobal,
         primaryKeyConfig: const PrimaryKeyConfig(),
         fields: [

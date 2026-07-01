@@ -1292,7 +1292,7 @@ class ToStore implements DataStoreInterface {
 
   /// Check system table access and throw exception if denied
   void _checkSystemTableAccess(String tableName, String action, String label) {
-    if (SystemTable.isKnownSystemTable(tableName)) {
+    if (SystemTable.isSystemTable(tableName)) {
       final msg = 'Table $tableName is a system table and $action.';
       Logger.error(msg);
       throw DbException([
