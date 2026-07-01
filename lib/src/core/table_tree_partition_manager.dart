@@ -71,38 +71,64 @@ final class TableTreePartitionManager {
     } else {
       bytes = sv.inlineBytes;
     }
+
+    int? storedFieldCount;
+    if (bytes.length >= 2) {
+      storedFieldCount = (bytes[0] << 8) | bytes[1];
+    }
+
     final migrationManager = _dataStore.migrationManager;
     final hasRuntimeMigration = migrationManager != null &&
         migrationManager.hasRuntimeMigrationForTable(tableName);
 
-    if (allowLegacyMigrationFallback && hasRuntimeMigration) {
-      final preferLegacy = migrationManager.shouldPreferLegacyDecodeForKey(
-        tableName,
-        primaryKeyBytes,
-      );
-      if (preferLegacy) {
-        final legacyDecoded =
-            migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
-        if (legacyDecoded != null) {
-          return legacyDecoded;
+    // Tier 1: Direct decoding if slot counts match
+    if (storedFieldCount != null && storedFieldCount == fieldStruct.length) {
+      final decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+      if (decoded != null) {
+        return decoded;
+      }
+    }
+
+    // Tier 2: Match layout dynamically by slot count if they differ (independent of fallback flag)
+    if (hasRuntimeMigration && storedFieldCount != null) {
+      final historicSchema = await migrationManager.getTableSchemaBySlotCount(
+          tableName, storedFieldCount);
+      if (historicSchema != null) {
+        final historicFieldStruct =
+            await _dataStore.schemaManager?.getStorageFieldStructure(
+          tableName,
+          schema: historicSchema,
+        );
+        if (historicFieldStruct != null) {
+          final decoded =
+              BinarySchemaCodec.decodeRecord(bytes, historicFieldStruct);
+          if (decoded != null) {
+            return migrationManager.normalizeRecordToLatestSync(
+              tableName,
+              decoded,
+              fromVersion: historicSchema.schemaVersion ?? '',
+            );
+          }
         }
       }
     }
 
-    final decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
-
-    if (decoded != null) {
-      if (allowLegacyMigrationFallback && hasRuntimeMigration) {
-        return migrationManager.normalizeRecordForReadSync(tableName, decoded);
+    // Tier 3: Legacy migration fallback pathway
+    if (allowLegacyMigrationFallback && hasRuntimeMigration) {
+      final legacyDecoded =
+          migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
+      if (legacyDecoded != null) {
+        return legacyDecoded;
       }
-      return decoded;
     }
 
-    if (!allowLegacyMigrationFallback || !hasRuntimeMigration) {
-      return null;
+    // Tier 4: Bottom-line fallback decoding with the provided layout
+    final fallbackDecoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+    if (fallbackDecoded != null) {
+      return fallbackDecoded;
     }
 
-    return migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
+    return null;
   }
 
   Future<List<FieldStructure>> _resolveStorageFieldStructure({
