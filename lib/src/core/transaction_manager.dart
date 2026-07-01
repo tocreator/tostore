@@ -676,7 +676,8 @@ class TransactionManager {
             rec.remove('_oldValues'); // inserts do not use oldValues
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                    fromVersion: '')
                 : rec;
             uniqueKeysList.add(uks
                     ?.map(
@@ -737,10 +738,12 @@ class TransactionManager {
             final old = rec.remove('_oldValues') as Map<String, dynamic>?;
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                    fromVersion: '')
                 : rec;
-            final normalizedOld = (hasRuntimeMigration)
-                ? migrationManager.normalizeOldValuesForReadSync(table, old)
+            final normalizedOld = (hasRuntimeMigration && old != null)
+                ? migrationManager.normalizeRecordToLatestSync(table, old,
+                    fromVersion: '')
                 : old;
 
             final rId = normalizedRec[pkName]?.toString();
@@ -797,7 +800,8 @@ class TransactionManager {
             final rec = Map<String, dynamic>.from(recs[j]);
             rec.remove('_oldValues'); // delete: old values not used
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordForReadSync(table, rec)
+                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                    fromVersion: '')
                 : rec;
             batch.add(normalizedRec);
             try {
