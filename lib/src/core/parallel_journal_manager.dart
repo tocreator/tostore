@@ -520,19 +520,23 @@ class ParallelJournalManager {
           BufferEntry effectiveEntry = be;
           final migrationManager = _dataStore.migrationManager;
           if (migrationManager != null &&
+              migrationManager.hasRuntimeMigrationForTable(e.tableName) &&
               migrationManager.shouldNormalizeBufferedWrite(
                 e.tableName,
                 be.walPointer,
               )) {
-            final normalizedData = migrationManager.normalizeRecordForReadSync(
+            final normalizedData = migrationManager.normalizeRecordToLatestSync(
               e.tableName,
               be.data,
+              fromVersion: be.schemaVersion,
             );
-            final normalizedOldValues =
-                migrationManager.normalizeOldValuesForReadSync(
-              e.tableName,
-              be.oldValues,
-            );
+            final normalizedOldValues = be.oldValues != null
+                ? migrationManager.normalizeRecordToLatestSync(
+                    e.tableName,
+                    be.oldValues!,
+                    fromVersion: be.schemaVersion,
+                  )
+                : null;
             effectiveEntry = be.copyWith(
                 data: normalizedData, oldValues: normalizedOldValues);
           }
@@ -765,14 +769,6 @@ class ParallelJournalManager {
                   if (schema == null) return;
                   final pkName = schema.primaryKey;
                   final migrationManager = _dataStore.migrationManager;
-                  final legacyFieldStruct =
-                      migrationManager?.getLegacyFieldStructureForWrite(table);
-                  final legacySchema =
-                      migrationManager?.getLegacySchemaForWrite(table);
-                  final hasLegacyPhysicalSplit = migrationManager != null &&
-                      legacyFieldStruct != null &&
-                      legacyFieldStruct.isNotEmpty &&
-                      migrationManager.hasRuntimeMigrationForTable(table);
 
                   // Extract and separate valid background write data
                   final activeBgEntries =
@@ -795,69 +791,32 @@ class ParallelJournalManager {
                     unifiedPkMap.addAll(businessPkMap);
                   }
 
-                  // 2) Parse the checkpoint key once outside the loops (intention vs persisted)
-                  dynamic decodedCheckpointKey;
-                  final cpCursor = targetCheckpoints[table] ??
-                      migrationManager?.getPersistedCheckpointKey(
-                          table, _dataStore.currentSpaceName);
-                  if (cpCursor != null) {
-                    decodedCheckpointKey =
-                        _decodePrimaryKeyFromCursor(cpCursor);
-                  }
-
                   final insertRecords = <Map<String, dynamic>>[];
                   final updateRecords = <Map<String, dynamic>>[];
                   final deleteRecords = <Map<String, dynamic>>[];
-                  final legacyInsertRecords = <Map<String, dynamic>>[];
-                  final legacyUpdateRecords = <Map<String, dynamic>>[];
-                  final legacyDeleteRecords = <Map<String, dynamic>>[];
 
-                  // 3) Classify records into latest/legacy based on checkpoint cursor comparison
+                  // 3) Symmetrically upgrade records to current active version and classify
                   for (final be in unifiedPkMap.values) {
                     await yieldController.maybeYield();
-                    final data = be.data;
-                    bool useLegacy = true;
-
-                    if (decodedCheckpointKey != null) {
-                      final pkValue = data[pkName];
-                      if (pkValue != null &&
-                          decodedCheckpointKey is Comparable &&
-                          pkValue is Comparable) {
-                        try {
-                          if (pkValue.compareTo(decodedCheckpointKey) <= 0) {
-                            useLegacy = false;
-                          }
-                        } catch (_) {}
-                      }
-                    }
-
-                    if (!hasLegacyPhysicalSplit) {
-                      useLegacy = false;
-                    }
-
-                    if (useLegacy) {
-                      final legacyData = migrationManager!
-                          .convertCurrentRecordToLegacyForWriteSync(
+                    var currentData = be.data;
+                    if (migrationManager != null &&
+                        be.schemaVersion.isNotEmpty &&
+                        migrationManager.hasRuntimeMigrationForTable(table)) {
+                      currentData =
+                          migrationManager.normalizeRecordToLatestSync(
                         table,
-                        data,
+                        be.data,
+                        fromVersion: be.schemaVersion,
                       );
-                      if (be.operation == BufferOperationType.insert ||
-                          be.operation == BufferOperationType.rewrite) {
-                        legacyInsertRecords.add(legacyData);
-                      } else if (be.operation == BufferOperationType.update) {
-                        legacyUpdateRecords.add(legacyData);
-                      } else if (be.operation == BufferOperationType.delete) {
-                        legacyDeleteRecords.add(legacyData);
-                      }
-                    } else {
-                      if (be.operation == BufferOperationType.insert ||
-                          be.operation == BufferOperationType.rewrite) {
-                        insertRecords.add(data);
-                      } else if (be.operation == BufferOperationType.update) {
-                        updateRecords.add(data);
-                      } else if (be.operation == BufferOperationType.delete) {
-                        deleteRecords.add(data);
-                      }
+                    }
+
+                    if (be.operation == BufferOperationType.insert ||
+                        be.operation == BufferOperationType.rewrite) {
+                      insertRecords.add(currentData);
+                    } else if (be.operation == BufferOperationType.update) {
+                      updateRecords.add(currentData);
+                    } else if (be.operation == BufferOperationType.delete) {
+                      deleteRecords.add(currentData);
                     }
                   }
 
@@ -890,15 +849,12 @@ class ParallelJournalManager {
                         if (migrationManager != null &&
                             migrationManager
                                 .hasRuntimeMigrationForTable(table)) {
-                          final cpBytes = cpCursor != null
-                              ? Uint8List.fromList(base64Decode(cpCursor))
-                              : null;
-                          if (migrationManager
-                              .shouldPreferLegacyDecodeForRecord(table, r,
-                                  batchCheckpoint: cpBytes)) {
-                            normalizedRecord = migrationManager
-                                .normalizeRecordForReadSync(table, r);
-                          }
+                          normalizedRecord =
+                              migrationManager.normalizeRecordToLatestSync(
+                            table,
+                            r,
+                            fromVersion: '',
+                          );
                         }
                         oldByPk[pk] = normalizedRecord;
                       }
@@ -982,21 +938,6 @@ class ParallelJournalManager {
 
                   // 6) Execution actions
                   Future<void> writeTableData() async {
-                    if (legacyInsertRecords.isNotEmpty ||
-                        legacyUpdateRecords.isNotEmpty ||
-                        legacyDeleteRecords.isNotEmpty) {
-                      await _dataStore.tableDataManager.writeChanges(
-                        tableName: table,
-                        inserts: legacyInsertRecords,
-                        updates: legacyUpdateRecords,
-                        deletes: legacyDeleteRecords,
-                        batchContext: currentBatchContext,
-                        concurrency: split.tableDataTokens,
-                        tableLock: tableLock,
-                        fieldStructureOverride: legacyFieldStruct,
-                        schemaOverride: legacySchema,
-                      );
-                    }
                     if (insertRecords.isNotEmpty ||
                         updateRecords.isNotEmpty ||
                         deleteRecords.isNotEmpty) {
@@ -2963,19 +2904,6 @@ class ParallelJournalManager {
     } catch (_) {
       // ignore
     }
-  }
-
-  static dynamic _decodePrimaryKeyFromCursor(String? cursor) {
-    if (cursor == null || cursor.isEmpty) return null;
-    try {
-      final decoded =
-          utf8.decode(base64Url.decode(base64Url.normalize(cursor)));
-      final obj = jsonDecode(decoded);
-      if (obj is Map) {
-        return obj['pk'];
-      }
-    } catch (_) {}
-    return null;
   }
 }
 
