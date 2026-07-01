@@ -1058,10 +1058,18 @@ class WriteBufferManager {
         !migrationManager.hasRuntimeMigrationForTable(tableName)) {
       return entry;
     }
-    final normalizedData =
-        migrationManager.normalizeRecordForReadSync(tableName, entry.data);
-    final normalizedOldValues = migrationManager.normalizeOldValuesForReadSync(
-        tableName, entry.oldValues);
+    final normalizedData = migrationManager.normalizeRecordToLatestSync(
+      tableName,
+      entry.data,
+      fromVersion: entry.schemaVersion,
+    );
+    final normalizedOldValues = entry.oldValues != null
+        ? migrationManager.normalizeRecordToLatestSync(
+            tableName,
+            entry.oldValues!,
+            fromVersion: entry.schemaVersion,
+          )
+        : null;
     if (identical(normalizedData, entry.data) &&
         identical(normalizedOldValues, entry.oldValues)) {
       return entry;
