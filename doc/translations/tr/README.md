@@ -374,7 +374,7 @@ await db.switchSpace(spaceName: 'user_123');
 
 ### Başlangıç İlerlemesini Takip Etme
 
-Normal şema değişiklikleri iş mantığına karşı şeffaftır ve başlatmayı engellemez. Yalnızca sık sık zorla kapatılan mobil uygulamalara özgü nadir istisnai durumlarda (örneğin, önceki bir geçiş kesintiye uğramış ve yeni bir şema değişikliği artık çakışma çözümü gerektiriyorsa veya anormal bir çıkıştan sonra kısa veri doğrulaması) başlatma fark edilebilir bir süre alabilir — bu durumda bir açılış ekranı veya ilerleme göstergesi göstermek için `onStartupProgress` kullanın:
+Normal şema değişiklikleri iş mantığına karşı şeffaftır ve başlatmayı engellemez. Yalnızca sık sık zorla kapatılan mobil uygulamalara özgü nadir istisnai durumlarda (örneğin, anormal bir çıkıştan sonra kısa veri doğrulaması ve kilitlenme kurtarma) başlatma fark edilebilir bir süre alabilir — bu durumda bir açılış ekranı veya ilerleme göstergesi göstermek için `onStartupProgress` kullanın:
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Aşamalar:
 - `opening` — Yapılandırma yükleniyor, temel motor hazırlanıyor
 - `recovering` — Güvenlik kontrolleri ve çökme kurtarma
-- `optimizing` — Şema evrimi ve veri geçişi
+- `optimizing` — Dahili motor ayarı ve yapısal optimizasyon
 - `ready` — Başlatma tamamlandı, kullanıma hazır
 
 
