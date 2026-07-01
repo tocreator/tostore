@@ -327,7 +327,8 @@ final class TableTreePartitionManager {
   }
 
   Future<TableMeta> _createInitialTableMeta(String tableName) async {
-    final tableUid = _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid =
+        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
     return TableMeta.createEmpty(tableUid: tableUid);
   }
 
