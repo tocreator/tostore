@@ -394,7 +394,7 @@ await db.switchSpace(spaceName: 'user_123');
 
 ### 追踪启动进度
 
-正常表结构变更业务无感知并不阻塞启动；仅在移动端频繁关闭应用的少数特殊场景（如上次迁移被中断后又触发新变更需等待冲突处理、异常退出后的短暂数据校验）下才会出现启动耗时，此时可通过 `onStartupProgress` 展示闪屏或进度指示器：
+正常表结构变更业务无感知并不阻塞启动；仅在移动端频繁关闭应用的少数特殊场景（如异常退出后的短暂数据校验与崩溃恢复）下才会出现启动耗时，此时可通过 `onStartupProgress` 展示闪屏或进度指示器：
 
 ```dart
 final db = await ToStore.open(
@@ -412,7 +412,7 @@ final db = await ToStore.open(
 各阶段说明：
 - `opening` — 加载配置，准备基础引擎
 - `recovering` — 安全检查与崩溃恢复
-- `optimizing` — 表结构演进与数据迁移
+- `optimizing` — 引擎参数调优、结构维护优化
 - `ready` — 初始化完成，可以正常使用
 
 
