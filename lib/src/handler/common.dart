@@ -13,7 +13,6 @@ class InternalConfig {
   /// whether to show Logger specific label
   static const bool showLoggerInternalLabel = false;
 
-
   /// public label
   static const String publicLabel = 'ToStore';
 
