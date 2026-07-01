@@ -374,7 +374,7 @@ Pendant `ToStore.open()`, le moteur détecte automatiquement les modifications s
 
 ### Suivi de la progression du démarrage
 
-Les changements de schéma normaux sont transparents pour la logique métier et ne bloquent pas le démarrage. Ce n'est que dans de rares cas exceptionnels spécifiques aux applications mobiles fréquemment fermées de force (par exemple, une migration précédente a été interrompue et un nouveau changement de schéma nécessite maintenant une résolution de conflit, ou une brève validation des données après une sortie anormale) que l'initialisation peut prendre un temps perceptible — utilisez `onStartupProgress` pour afficher un écran d'accueil ou un indicateur de progression :
+Les changements de schéma normaux sont transparents pour la logique métier et ne bloquent pas le démarrage. Ce n'est que dans de rares cas exceptionnels spécifiques aux applications mobiles fréquemment fermées de force (par exemple, une brève validation des données et une récupération après plantage après une sortie anormale) que l'initialisation peut prendre un temps perceptible — utilisez `onStartupProgress` pour afficher un écran d'accueil ou un indicateur de progression :
 
 ```dart
 final db = await ToStore.open(
@@ -392,7 +392,7 @@ final db = await ToStore.open(
 Étapes :
 - `opening` — Chargement de la configuration, préparation du moteur de base
 - `recovering` — Vérifications de sécurité et récupération après plantage
-- `optimizing` — Évolution du schéma et migration des données
+- `optimizing` — Réglage interne du moteur et optimisation structurelle
 - `ready` — Initialisation terminée, prêt à l'emploi
 
 
