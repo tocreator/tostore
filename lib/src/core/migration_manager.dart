@@ -5,7 +5,6 @@ import 'dart:typed_data';
 
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
-import '../handler/memcomparable.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
@@ -477,81 +476,6 @@ class MigrationManager {
     return !walPointer.isNewerThan(cutover, walCycle);
   }
 
-  /// Returns true when the storage payload for [record] should still be written
-  /// in legacy physical field layout for the current space.
-  ///
-  /// This uses the per-space PK checkpoint:
-  /// - key <= checkpoint  => new layout
-  /// - key > checkpoint   => legacy layout
-  /// - no checkpoint      => legacy layout
-  bool shouldStoreLegacyPhysicalFormatForRecord(
-    String tableName,
-    Map<String, dynamic> record, {
-    Uint8List? batchCheckpoint,
-  }) {
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) {
-      return false;
-    }
-
-    // Alias table entries (typically pre-rename) are always treated as legacy.
-    if (tableName != descriptor.tableName) {
-      return true;
-    }
-
-    final checkpoint = batchCheckpoint ?? descriptor.currentSpaceCheckpointKey;
-    if (checkpoint == null || checkpoint.isEmpty) {
-      return true;
-    }
-
-    final keyBytes = _encodeLegacyPrimaryKeyBytes(descriptor, record);
-    if (keyBytes == null || keyBytes.isEmpty) {
-      return true;
-    }
-    return MemComparableKey.compare(keyBytes, checkpoint) > 0;
-  }
-
-  /// Prefer decoding the payload by legacy layout first for this key.
-  bool shouldPreferLegacyDecodeForKey(
-    String tableName,
-    Uint8List? primaryKeyBytes, {
-    Uint8List? batchCheckpoint,
-  }) {
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) {
-      return false;
-    }
-    if (tableName != descriptor.tableName) {
-      return true;
-    }
-
-    final checkpoint = batchCheckpoint ?? descriptor.currentSpaceCheckpointKey;
-    if (checkpoint == null || checkpoint.isEmpty || primaryKeyBytes == null) {
-      return true;
-    }
-
-    return MemComparableKey.compare(primaryKeyBytes, checkpoint) > 0;
-  }
-
-  /// Prefer decoding the payload by legacy layout first for this record.
-  bool shouldPreferLegacyDecodeForRecord(
-    String tableName,
-    Map<String, dynamic> record, {
-    Uint8List? batchCheckpoint,
-  }) {
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) {
-      return false;
-    }
-
-    final keyBytes = _encodeLegacyPrimaryKeyBytes(descriptor, record);
-    return shouldPreferLegacyDecodeForKey(
-      tableName,
-      keyBytes,
-      batchCheckpoint: batchCheckpoint,
-    );
-  }
-
   List<FieldStructure>? getLegacyFieldStructureForWrite(String tableName) {
     final descriptor = _findRuntimeMigrationDescriptor(tableName);
     if (descriptor == null) {
@@ -578,58 +502,120 @@ class MigrationManager {
     return out;
   }
 
-  Map<String, dynamic> convertCurrentRecordToLegacyForWriteSync(
-    String tableName,
-    Map<String, dynamic> record,
-  ) {
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) {
-      return record;
-    }
-    return applyMigrationReverseOperationsSync(
-      Map<String, dynamic>.from(record),
-      descriptor.operations,
-      descriptor.oldSchema,
-    );
-  }
-
   _RuntimeMigrationDescriptor? _findRuntimeMigrationDescriptor(
       String tableName) {
     return _runtimeMigrations[tableName];
   }
 
-  Uint8List? _encodeLegacyPrimaryKeyBytes(
-    _RuntimeMigrationDescriptor descriptor,
-    Map<String, dynamic> record,
-  ) {
-    // Resolve current PK name by replaying PK-rename operations from old -> new.
-    var currentPrimaryKeyName = descriptor.oldSchema.primaryKey;
-    for (final op in descriptor.operations) {
-      if (op.type != MigrationType.setPrimaryKeyConfig) continue;
-      final oldPk = op.oldPrimaryKeyConfig?.name;
-      final newPk = op.primaryKeyConfig?.name;
-      if (oldPk == null || newPk == null) continue;
-      if (currentPrimaryKeyName == oldPk) {
-        currentPrimaryKeyName = newPk;
+  /// Symmetrically normalizes a record from a historical version up to the latest active schema version.
+  Map<String, dynamic> normalizeRecordToLatestSync(
+    String tableName,
+    Map<String, dynamic> record, {
+    required String fromVersion,
+  }) {
+    final tableTasks = _pendingTasks.where((t) {
+      final currentName = t.currentTableName ??
+          _resolveCurrentTableName(t.tableName, t.operations);
+      return t.tableName == tableName || currentName == tableName;
+    }).toList()
+      ..sort((a, b) => a.createTime.compareTo(b.createTime));
+
+    var currentRecord = Map<String, dynamic>.from(record);
+
+    if (fromVersion.isEmpty) {
+      bool shouldApply = false;
+      for (final task in tableTasks) {
+        if (!shouldApply) {
+          for (final op in task.operations) {
+            if (op.type == MigrationType.renameField &&
+                op.fieldName != null &&
+                op.newName != null &&
+                record.containsKey(op.fieldName) &&
+                !record.containsKey(op.newName)) {
+              shouldApply = true;
+              break;
+            }
+            if (op.type == MigrationType.addField) {
+              final newName = op.field?.name ?? op.fieldName;
+              if (newName != null && !record.containsKey(newName)) {
+                shouldApply = true;
+                break;
+              }
+            }
+          }
+        }
+        if (shouldApply) {
+          currentRecord = applyMigrationOperationsSync(
+            currentRecord,
+            task.operations,
+            task.oldSchemaSnapshot,
+          );
+        }
+      }
+      return currentRecord;
+    }
+
+    bool startUpgrading = false;
+
+    for (final task in tableTasks) {
+      final taskOldVersion = task.oldSchemaSnapshot?.schemaVersion;
+      final taskTargetVersion = task.targetSchemaSnapshot?.schemaVersion;
+
+      if (taskOldVersion == fromVersion) {
+        startUpgrading = true;
+      }
+
+      if (startUpgrading) {
+        currentRecord = applyMigrationOperationsSync(
+          currentRecord,
+          task.operations,
+          task.oldSchemaSnapshot,
+        );
+      }
+
+      if (taskTargetVersion == fromVersion) {
+        startUpgrading = true;
       }
     }
 
-    dynamic rawValue;
-    if (record.containsKey(currentPrimaryKeyName)) {
-      rawValue = record[currentPrimaryKeyName];
-    } else if (record.containsKey(descriptor.oldSchema.primaryKey)) {
-      rawValue = record[descriptor.oldSchema.primaryKey];
-    }
+    return currentRecord;
+  }
 
-    final pk = rawValue?.toString();
-    if (pk == null || pk.isEmpty) {
-      return null;
+  /// Symmetrically resolves a historical TableSchema by slot count from pending tasks list.
+  Future<TableSchema?> getTableSchemaBySlotCount(
+    String tableName,
+    int slotCount,
+  ) async {
+    final schemaMgr = _dataStore.schemaManager;
+    if (schemaMgr == null) return null;
+
+    final tableTasks = _pendingTasks.where((t) {
+      final currentName = t.currentTableName ??
+          _resolveCurrentTableName(t.tableName, t.operations);
+      return t.tableName == tableName || currentName == tableName;
+    });
+
+    for (final t in tableTasks) {
+      if (t.oldSchemaSnapshot != null) {
+        final layout = await schemaMgr.getTableFieldLayout(
+          tableName,
+          schema: t.oldSchemaSnapshot,
+        );
+        if (layout.totalSlots == slotCount) {
+          return t.oldSchemaSnapshot;
+        }
+      }
+      if (t.targetSchemaSnapshot != null) {
+        final layout = await schemaMgr.getTableFieldLayout(
+          tableName,
+          schema: t.targetSchemaSnapshot,
+        );
+        if (layout.totalSlots == slotCount) {
+          return t.targetSchemaSnapshot;
+        }
+      }
     }
-    try {
-      return descriptor.oldSchema.encodePrimaryKeyComponent(pk);
-    } catch (_) {
-      return null;
-    }
+    return null;
   }
 
   /// Execute migration from old version to new version
@@ -2047,22 +2033,6 @@ class MigrationManager {
     }
   }
 
-  Map<String, dynamic> normalizeRecordForReadSync(
-    String tableName,
-    Map<String, dynamic> record,
-  ) {
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) {
-      return record;
-    }
-    final normalized = applyMigrationOperationsSync(
-      Map<String, dynamic>.from(record),
-      descriptor.operations,
-      descriptor.oldSchema,
-    );
-    return normalized;
-  }
-
   Map<String, dynamic>? decodeLegacyRecordForReadSync(
     String tableName,
     Uint8List encodedRecord,
@@ -2080,20 +2050,6 @@ class MigrationManager {
     }
     return applyMigrationOperationsSync(
       decoded,
-      descriptor.operations,
-      descriptor.oldSchema,
-    );
-  }
-
-  Map<String, dynamic>? normalizeOldValuesForReadSync(
-    String tableName,
-    Map<String, dynamic>? oldValues,
-  ) {
-    if (oldValues == null) return null;
-    final descriptor = _findRuntimeMigrationDescriptor(tableName);
-    if (descriptor == null) return oldValues;
-    return applyMigrationOperationsSync(
-      Map<String, dynamic>.from(oldValues),
       descriptor.operations,
       descriptor.oldSchema,
     );
@@ -5563,7 +5519,43 @@ class MigrationManager {
     if (currentLayout.totalSlots == 0) {
       return task;
     }
-    if (currentLayout.deletedSlotsRatio < 0.30) {
+    final deletedCount = currentLayout.deletedSlotsCount;
+    final totalCount = currentLayout.totalSlots;
+    final targetCompactedSlotsCount = totalCount - deletedCount;
+
+    final hasRatioPass = currentLayout.deletedSlotsRatio >= 0.30;
+    final hasCountPass = deletedCount >= 50;
+
+    if (!hasRatioPass || !hasCountPass) {
+      return task;
+    }
+
+    bool hasCollision = false;
+    for (final t in _pendingTasks) {
+      if (t.taskId == task.taskId) continue;
+      final prevLayout = t.oldFieldLayoutSnapshot;
+      if (prevLayout != null &&
+          prevLayout.totalSlots == targetCompactedSlotsCount) {
+        hasCollision = true;
+        break;
+      }
+      if (t.targetSchemaSnapshot != null) {
+        final targetLayout = await schemaMgr.getTableFieldLayout(
+          currentTableName,
+          schema: t.targetSchemaSnapshot,
+        );
+        if (targetLayout.totalSlots == targetCompactedSlotsCount) {
+          hasCollision = true;
+          break;
+        }
+      }
+    }
+
+    if (hasCollision) {
+      Logger.warn(
+        'Compaction of table [$currentTableName] deferred because target compacted slots count ($targetCompactedSlotsCount) '
+        'collides with another pending task version total slots.',
+      );
       return task;
     }
 
