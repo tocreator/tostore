@@ -43,7 +43,7 @@ class TableSchema {
   final String? tableId;
 
   /// Stable internal unique identifier for routing and buffers
-  final String? tableUid;
+  final String tableUid;
 
   /// Schema structure version tracking migration tasks
   final String? schemaVersion;
@@ -69,7 +69,7 @@ class TableSchema {
     this.isGlobal = false,
     this.tableId,
     this.ttlConfig,
-  })  : tableUid = null,
+  })  : tableUid = '',
         schemaVersion = null,
         isSystemTable = false,
         autoIndexes = null;
@@ -84,7 +84,7 @@ class TableSchema {
     required this.isGlobal,
     this.tableId,
     this.ttlConfig,
-    this.tableUid,
+    this.tableUid = '',
     this.schemaVersion,
     required this.isSystemTable,
     this.autoIndexes,
@@ -258,7 +258,8 @@ class TableSchema {
           }
         }
         if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
-          resolvedImplicit = implicit.copyWith(indexUid: matchedOldIdx.indexUid);
+          resolvedImplicit =
+              implicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
       if (resolvedImplicit.indexUid == null) {
@@ -291,7 +292,8 @@ class TableSchema {
           }
         }
         if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
-          resolvedExplicit = explicit.copyWith(indexUid: matchedOldIdx.indexUid);
+          resolvedExplicit =
+              explicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
       if (resolvedExplicit.indexUid == null) {
@@ -370,8 +372,10 @@ class TableSchema {
             : ttl.sourceField!)
         : null;
     if (ttlField != null) {
-      final alreadyCovered = indexes.any((i) => i.fields.isNotEmpty && i.fields.first == ttlField) ||
-          implicitIndexes.any((i) => i.fields.isNotEmpty && i.fields.first == ttlField);
+      final alreadyCovered = indexes
+              .any((i) => i.fields.isNotEmpty && i.fields.first == ttlField) ||
+          implicitIndexes
+              .any((i) => i.fields.isNotEmpty && i.fields.first == ttlField);
       if (!alreadyCovered) {
         final ttlIndex = IndexSchema(
           indexName: ttlField,
@@ -884,7 +888,7 @@ class TableSchema {
       'isGlobal': isGlobal,
       if (tableId != null) 'tableId': tableId,
       if (ttlConfig != null) 'ttlConfig': ttlConfig!.toJson(),
-      if (tableUid != null) 'tableUid': tableUid,
+      'tableUid': tableUid,
       if (schemaVersion != null) 'schemaVersion': schemaVersion,
       if (isSystemTable) 'isSystemTable': isSystemTable,
       if (autoIndexes != null)
@@ -939,7 +943,7 @@ class TableSchema {
       ttlConfig: json['ttlConfig'] is Map<String, dynamic>
           ? TableTtlConfig.fromJson(json['ttlConfig'] as Map<String, dynamic>)
           : null,
-      tableUid: json['tableUid'] as String?,
+      tableUid: (json['tableUid'] as String?) ?? '',
       schemaVersion: json['schemaVersion'] as String?,
       isSystemTable: json['isSystemTable'] as bool? ?? false,
       autoIndexes: (json['autoIndexes'] as List?)
