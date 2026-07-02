@@ -64,7 +64,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
           // Directly call the executor to bypass builder overhead and avoid cloning.
           // This warms up the B-Tree Page Cache and Record Cache in ResourceManager.
           await _db.queryExecutor.execute(
-            _tableName,
+            await _db.getTableContext(_tableName),
             condition: _condition,
             orderBy: _orderBy,
             limit: _limit,
@@ -224,9 +224,19 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder joinWithForeignKey(String tableName,
       {JoinType type = JoinType.inner}) {
     // Store the join request - will be resolved during query execution
+    final joinUid = _db.schemaManager?.getUidByName(TableName(tableName));
+    if (joinUid == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Target table $tableName does not exist',
+          tableName: tableName,
+        ),
+      ]);
+    }
     _pendingForeignKeyJoins ??= [];
     _pendingForeignKeyJoins!.add(PendingForeignKeyJoin(
-      tableName: tableName,
+      tableUid: joinUid,
       type: type,
     ));
     _onChanged();
@@ -291,9 +301,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<bool> clearQueryCache() async {
     await _db.ensureInitialized();
 
+    final tableUid = _db.schemaManager?.getUidByName(TableName(_tableName));
+    if (tableUid == null) return false;
+
     // Build cache key to ensure correct matching
     final cacheKey = QueryCacheKey(
-      tableName: _tableName,
+      tableUid: tableUid,
       condition: queryCondition,
       orderBy: _orderBy,
       limit: _limit,
@@ -316,7 +329,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (queryCondition.isEmpty &&
         _joins.isEmpty &&
         _pendingForeignKeyJoins?.isEmpty != false) {
-      return await _db.tableDataManager.getTableRecordCount(_tableName);
+      final table = await _db.getTableContext(_tableName);
+      return await _db.tableDataManager.getTableRecordCount(table);
     }
 
     if (_joins.isEmpty &&
@@ -340,7 +354,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (queryCondition.isEmpty &&
         _joins.isEmpty &&
         _pendingForeignKeyJoins?.isEmpty != false) {
-      final total = await _db.tableDataManager.getTableRecordCount(_tableName);
+      final table = await _db.getTableContext(_tableName);
+      final total = await _db.tableDataManager.getTableRecordCount(table);
       return total > 0;
     }
 
@@ -535,8 +550,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         // We need to ensure db is initialized before accessing notificationManager
         await _db.ensureInitialized();
 
+        final table = await _db.getTableContext(_tableName);
         subscription = _db.notificationManager.register(
-          _tableName,
+          table.tableUid,
           queryCondition,
           (event) async {
             // A query is already in flight — just mark that the result
@@ -593,8 +609,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (extraAggregations != null) combinedAggs.addAll(extraAggregations);
     combinedAggs.addAll(_extraAggregations);
 
+    final table = await _db.getTableContext(_tableName);
     final result = await _db.getQueryExecutor()?.execute(
-              _tableName,
+              table,
               condition: queryCondition,
               orderBy: _orderBy,
               limit: _limit,
@@ -893,7 +910,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     // Get current table schema
-    final currentSchema = await _db.schemaManager?.getTableSchema(_tableName);
+    final currentSchema =
+        await _db.schemaManager?.getTableSchemaByName(TableName(_tableName));
     if (currentSchema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -905,11 +923,14 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     for (final pendingJoin in _pendingForeignKeyJoins!) {
-      final tableName = pendingJoin.tableName;
+      final joinTableUid = TableUid(pendingJoin.tableUid);
+      final resolvedName = _db.schemaManager?.getNameByUid(joinTableUid);
+      final tableName = resolvedName?.value ?? pendingJoin.tableUid;
       final type = pendingJoin.type;
 
       // Get target table schema
-      final targetSchema = await _db.schemaManager?.getTableSchema(tableName);
+      final targetSchema =
+          await _db.schemaManager?.getTableSchemaByName(TableName(tableName));
       if (targetSchema == null) {
         throw DbException([
           SchemaValidationStatus(
