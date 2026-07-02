@@ -8,6 +8,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/schema_update_result.dart';
 import '../model/migration_write_mode.dart';
+import '../model/table_identity.dart';
 
 /// Schema builder for chain operations
 class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
@@ -275,7 +276,9 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
   Future<SchemaUpdateResult> get future async {
     SchemaUpdateResult result;
     try {
-      final tableUid = _dataStore.schemaManager?.getUidByName(_tableName) ?? _tableName;
+      final tableUid =
+          _dataStore.schemaManager?.getUidByName(TableName(_tableName)) ??
+              TableUid(_tableName);
       final task = await _dataStore.migrationManager?.addMigrationTask(
         tableUid,
         _operations,
