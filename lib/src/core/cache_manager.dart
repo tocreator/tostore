@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../handler/logger.dart';
+import '../model/table_context.dart';
 import '../model/table_statistics.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
@@ -103,13 +104,13 @@ final class CacheManager {
     return recordCacheSize + pageCacheSize;
   }
 
-  void _markQueryCacheDirty(String tableName) {
+  void _markQueryCacheDirty(TableContext table) {
     // Invalidate immediately for correctness (no stale window), but coalesce
     // repeated calls within the same microtask tick to avoid churn.
-    final firstInTick = _pendingQueryInvalidations.add(tableName);
+    final firstInTick = _pendingQueryInvalidations.add(table.tableUid);
     if (firstInTick) {
       try {
-        _dataStore.queryExecutor.invalidateQueryCacheForTable(tableName);
+        _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
       } catch (_) {}
     }
 
@@ -123,12 +124,12 @@ final class CacheManager {
 
   // -------------------- Statistics cache --------------------
 
-  void cacheStatistics(String tableName, TableStatistics stats) {
-    _statsCache[tableName] = stats;
+  void cacheStatistics(TableContext table, TableStatistics stats) {
+    _statsCache[table.tableUid] = stats;
   }
 
-  TableStatistics? getStatistics(String tableName) {
-    return _statsCache[tableName];
+  TableStatistics? getStatistics(TableContext table) {
+    return _statsCache[table.tableUid];
   }
 
   // -------------------- Space / lifecycle --------------------
@@ -155,7 +156,7 @@ final class CacheManager {
 
   /// Invalidate all caches of a table
   Future<void> invalidateCache(
-    String tableName, {
+    TableContext table, {
     bool invalidateSchema = true,
     bool invalidateQuery = true,
     bool invalidateRecords = true,
@@ -170,41 +171,42 @@ final class CacheManager {
     bool invalidateCompactionHints = true,
     bool removeTableState = false,
   }) async {
+    final tableName = table.tableName;
     try {
-      _statsCache.remove(tableName);
+      _statsCache.remove(table.tableUid);
 
       if (invalidateRecords) {
-        await _dataStore.tableDataManager.clearTableRecordsForTable(tableName);
+        await _dataStore.tableDataManager.clearTableRecordsForTable(table);
       } else if (invalidateRecordCount) {
         // Record count cache may need refresh even when hot records are kept.
-        _dataStore.tableDataManager.removeRecordCountCache(tableName);
+        _dataStore.tableDataManager.removeRecordCountCache(table);
       }
       if (invalidateTableMeta) {
-        _dataStore.tableDataManager.invalidateTableMetaCacheForTable(tableName);
+        _dataStore.tableDataManager.invalidateTableMetaCacheForTable(table);
       }
       if (invalidateTablePages) {
-        _dataStore.tableTreePartitionManager?.clearPageCacheForTable(tableName);
+        _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
       }
       if (invalidateSchema) {
-        _dataStore.schemaManager?.removeCachedTableSchema(tableName);
+        _dataStore.schemaManager?.removeCachedTableSchema(table.tableUid);
       }
 
       if (invalidateQuery) {
-        _markQueryCacheDirty(tableName);
+        _markQueryCacheDirty(table);
       }
 
       if (invalidateIndexData) {
-        await _dataStore.indexManager?.removeFullIndexCacheForTable(tableName);
+        await _dataStore.indexManager?.removeFullIndexCacheForTable(table);
       }
       if (invalidateIndexMeta) {
-        await _dataStore.indexManager?.removeIndexMetaCacheForTable(tableName);
+        await _dataStore.indexManager?.removeIndexMetaCacheForTable(table);
       }
       if (invalidateIndexPages) {
-        _dataStore.indexTreePartitionManager?.clearPageCacheForTable(tableName);
+        _dataStore.indexTreePartitionManager?.clearPageCacheForTable(table);
       }
 
       if (invalidateVectorCache) {
-        _dataStore.vectorIndexManager?.clearCacheForTable(tableName);
+        _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
       }
 
       if (invalidateForeignKey) {
@@ -212,13 +214,13 @@ final class CacheManager {
       }
 
       if (invalidateCompactionHints) {
-        _dataStore.compactionManager.clearHintsForTable(tableName);
+        _dataStore.compactionManager.clearHintsForTable(table);
       }
 
-      _dataStore.weightManager?.clearWeightsForTable(tableName);
+      _dataStore.weightManager?.clearWeightsForTable(table);
 
       if (removeTableState) {
-        await _dataStore.tableDataManager.removeTable(tableName);
+        await _dataStore.tableDataManager.removeTable(table);
       }
     } catch (e) {
       Logger.error(
