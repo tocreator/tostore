@@ -248,7 +248,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   @override
   Future<DbResult> get future async {
     _future ??= _db.updateInternal(
-      _tableName,
+      await _db.getTableContext(_tableName),
       _updateData,
       queryCondition,
       orderBy: _orderBy,
