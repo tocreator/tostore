@@ -426,16 +426,15 @@ class QueryExecutor {
       }
 
       final stopwatch = Stopwatch()..start();
-
       final schema = schemas[tableName]!;
       ConditionRecordMatcher? matcher;
       ConditionRecordMatcher? postJoinMatcher;
 
       // Decode cursor token if provided.
       final _QueryCursorToken? cursorToken =
-          hasCursor ? _QueryCursorToken.tryDecode(cursor) : null;
+          cursor != null ? _QueryCursorToken.tryDecode(cursor) : null;
       if (cursorToken != null) {
-        if (cursorToken.tableName != tableName) {
+        if (cursorToken.tableUid != schema.tableUid) {
           throw DbException([
             InvalidArgumentStatus(
               type: ResultType.devInvalidCursorTable,
@@ -1058,15 +1057,14 @@ class QueryExecutor {
             pivotValues
                 .addAll(MemComparableKey.decodeTuple(cursorToken.indexKey!));
 
-            final idxName = cursorToken.indexName!;
+            final idxUid = cursorToken.indexUid!;
             // Find index schema match.
-            // Note: indexName in token is really the actual name.
             IndexSchema? idx;
             try {
               final allIndexes =
                   _dataStore.schemaManager?.getAllIndexesFor(schema) ??
                       <IndexSchema>[];
-              idx = allIndexes.firstWhere((i) => i.actualIndexName == idxName);
+              idx = allIndexes.firstWhere((i) => i.indexUid == idxUid);
             } catch (_) {
               // Not found
             }
@@ -3129,7 +3127,7 @@ class QueryExecutor {
         ]);
       }
       return _QueryCursorToken.primaryKey(
-        tableName: tableName,
+        tableUid: schema.tableUid,
         primaryKey: pkVal,
         reverse: pkOrder.reverse,
         isBackward: isBackward,
@@ -3188,7 +3186,7 @@ class QueryExecutor {
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
 
       return _QueryCursorToken.sortKey(
-        tableName: tableName,
+        tableUid: schema.tableUid,
         sortFields: sortFields,
         sortDesc: sortDesc,
         sortKey: MemComparableKey.encodeTuple(comps),
@@ -3256,9 +3254,17 @@ class QueryExecutor {
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
     }
 
+    final IndexSchema? idx = (schema.indexes.cast<IndexSchema?>().firstWhere(
+            (i) => i?.actualIndexName == idxName,
+            orElse: () => null) ??
+        schema.autoIndexes?.cast<IndexSchema?>().firstWhere(
+            (i) => i?.actualIndexName == idxName,
+            orElse: () => null));
+    final indexUid = idx?.indexUid ?? idxName;
+
     return _QueryCursorToken.indexKey(
-      tableName: tableName,
-      indexName: idxName,
+      tableUid: schema.tableUid,
+      indexUid: indexUid,
       indexKey: MemComparableKey.encodeTuple(comps),
       isBackward: isBackward,
       querySigHash: sigHash,
@@ -3646,7 +3652,7 @@ final class _QueryCursorToken {
 
   final int version;
   final _CursorMode mode;
-  final String tableName;
+  final String tableUid;
   final int? querySigHash;
 
   // primaryKey mode
@@ -3654,7 +3660,7 @@ final class _QueryCursorToken {
   final bool reverse;
 
   // indexKey mode
-  final String? indexName;
+  final String? indexUid;
   final Uint8List? indexKey;
 
   // sortKey mode (orderBy fields + primary key tie-breaker)
@@ -3668,10 +3674,10 @@ final class _QueryCursorToken {
   const _QueryCursorToken._({
     required this.version,
     required this.mode,
-    required this.tableName,
+    required this.tableUid,
     required this.primaryKey,
     required this.reverse,
-    required this.indexName,
+    required this.indexUid,
     required this.indexKey,
     required this.sortFields,
     required this.sortDesc,
@@ -3681,7 +3687,7 @@ final class _QueryCursorToken {
   });
 
   factory _QueryCursorToken.primaryKey({
-    required String tableName,
+    required String tableUid,
     required String primaryKey,
     required bool reverse,
     bool isBackward = false,
@@ -3690,10 +3696,10 @@ final class _QueryCursorToken {
     return _QueryCursorToken._(
       version: _currentVersion,
       mode: _CursorMode.primaryKey,
-      tableName: tableName,
+      tableUid: tableUid,
       primaryKey: primaryKey,
       reverse: reverse,
-      indexName: null,
+      indexUid: null,
       indexKey: null,
       sortFields: null,
       sortDesc: null,
@@ -3704,8 +3710,8 @@ final class _QueryCursorToken {
   }
 
   factory _QueryCursorToken.indexKey({
-    required String tableName,
-    required String indexName,
+    required String tableUid,
+    required String indexUid,
     required Uint8List indexKey,
     bool isBackward = false,
     int? querySigHash,
@@ -3713,10 +3719,10 @@ final class _QueryCursorToken {
     return _QueryCursorToken._(
       version: _currentVersion,
       mode: _CursorMode.indexKey,
-      tableName: tableName,
+      tableUid: tableUid,
       primaryKey: null,
       reverse: false,
-      indexName: indexName,
+      indexUid: indexUid,
       indexKey: indexKey,
       sortFields: null,
       sortDesc: null,
@@ -3727,7 +3733,7 @@ final class _QueryCursorToken {
   }
 
   factory _QueryCursorToken.sortKey({
-    required String tableName,
+    required String tableUid,
     required List<String> sortFields,
     required List<bool> sortDesc,
     required Uint8List sortKey,
@@ -3737,10 +3743,10 @@ final class _QueryCursorToken {
     return _QueryCursorToken._(
       version: _currentVersion,
       mode: _CursorMode.sortKey,
-      tableName: tableName,
+      tableUid: tableUid,
       primaryKey: null,
       reverse: false,
-      indexName: null,
+      indexUid: null,
       indexKey: null,
       sortFields: List<String>.from(sortFields, growable: false),
       sortDesc: List<bool>.from(sortDesc, growable: false),
@@ -3753,7 +3759,7 @@ final class _QueryCursorToken {
   String encode() {
     final Map<String, dynamic> payload = <String, dynamic>{
       'v': version,
-      't': tableName,
+      't': tableUid,
       'm': mode == _CursorMode.primaryKey
           ? 'pk'
           : (mode == _CursorMode.indexKey ? 'idx' : 'sk'),
@@ -3765,7 +3771,7 @@ final class _QueryCursorToken {
       payload['pk'] = primaryKey;
       payload['r'] = reverse;
     } else if (mode == _CursorMode.indexKey) {
-      payload['i'] = indexName;
+      payload['i'] = indexUid;
       payload['k'] = base64Url.encode(indexKey ?? Uint8List(0));
     } else {
       payload['f'] = sortFields ?? const <String>[];
@@ -3829,7 +3835,7 @@ final class _QueryCursorToken {
         final bool reverse = obj['r'] == true;
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.primaryKey(
-          tableName: t,
+          tableUid: t,
           primaryKey: pk,
           reverse: reverse,
           isBackward: isBackward,
@@ -3862,8 +3868,8 @@ final class _QueryCursorToken {
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.indexKey(
-          tableName: t,
-          indexName: idx,
+          tableUid: t,
+          indexUid: idx,
           indexKey: keyBytes,
           isBackward: isBackward,
           querySigHash: querySigHash,
@@ -3922,7 +3928,7 @@ final class _QueryCursorToken {
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.sortKey(
-          tableName: t,
+          tableUid: t,
           sortFields: fields,
           sortDesc: desc,
           sortKey: keyBytes,

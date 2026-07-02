@@ -1802,7 +1802,7 @@ class DataStoreImpl {
 
       notificationManager.notify(ChangeEvent(
         type: ChangeType.insert,
-        tableName: tableName,
+        tableUid: tableContext.tableUid,
         record: orderedValidData,
       ));
 
@@ -2384,10 +2384,10 @@ class DataStoreImpl {
           cleanupBeforeRestore: cleanupBeforeRestore);
 
       // Notify all listeners to refresh, as the entire data state has changed.
-      for (final tableName in notificationManager.getActiveTables()) {
+      for (final tableUid in notificationManager.getActiveTables()) {
         notificationManager.notify(ChangeEvent(
           type: ChangeType.clear,
-          tableName: tableName,
+          tableUid: tableUid,
         ));
       }
 
@@ -3046,10 +3046,10 @@ class DataStoreImpl {
             schemaVersion: tableContext.schema.schemaVersion ?? '',
           );
 
-          if (notificationManager.hasListeners(tableName)) {
+          if (notificationManager.hasListeners(tableContext.tableUid)) {
             notificationManager.notify(ChangeEvent(
               type: ChangeType.update,
-              tableName: tableName,
+              tableUid: tableContext.tableUid,
               record: updatedRecord,
               oldRecord: record,
             ));
@@ -3223,7 +3223,7 @@ class DataStoreImpl {
       // Notify watchers that the table has been cleared
       notificationManager.notify(ChangeEvent(
         type: ChangeType.clear,
-        tableName: tableName,
+        tableUid: schema.tableUid,
       ));
 
       // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
@@ -3548,11 +3548,11 @@ class DataStoreImpl {
           schemaVersion: tableContext.schema.schemaVersion ?? '',
         );
 
-        if (notificationManager.hasListeners(tableName)) {
+        if (notificationManager.hasListeners(tableContext.tableUid)) {
           for (final record in recordsToDelete) {
             notificationManager.notify(ChangeEvent(
               type: ChangeType.delete,
-              tableName: tableName,
+              tableUid: tableContext.tableUid,
               oldRecord: record,
             ));
           }
@@ -3990,7 +3990,7 @@ class DataStoreImpl {
         // Notify watchers that the table has been dropped/cleared
         notificationManager.notify(ChangeEvent(
           type: ChangeType.clear,
-          tableName: tableName,
+          tableUid: tableUid!,
         ));
 
         return finish(DbResult.success(
@@ -4447,14 +4447,14 @@ class DataStoreImpl {
               }
               successCount += bufferResult.successRecordIds.length;
 
-              if (notificationManager.hasListeners(tableName)) {
+              if (notificationManager.hasListeners(tableSchema.tableUid)) {
                 final successSet = bufferResult.successRecordIds.toSet();
                 for (final record in batchRecordsForBuffer) {
                   final pkVal = record[primaryKey]?.toString();
                   if (pkVal != null && successSet.contains(pkVal)) {
                     notificationManager.notify(ChangeEvent(
                       type: ChangeType.insert,
-                      tableName: tableName,
+                      tableUid: tableSchema.tableUid,
                       record: record,
                     ));
                   }
@@ -5738,13 +5738,13 @@ class DataStoreImpl {
           }
 
           if (commitResult.successRecordIds.isNotEmpty &&
-              notificationManager.hasListeners(tableName)) {
+              notificationManager.hasListeners(schema.tableUid)) {
             final successSet = commitResult.successRecordIds.toSet();
             for (int k = 0; k < recordsToCommit.length; k++) {
               if (successSet.contains(commitPkVals[k])) {
                 notificationManager.notify(ChangeEvent(
                   type: ChangeType.update,
-                  tableName: tableName,
+                  tableUid: schema.tableUid,
                   record: recordsToCommit[k],
                   oldRecord: oldRecordsToCommit[k],
                 ));

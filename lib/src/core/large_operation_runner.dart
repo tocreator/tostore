@@ -284,10 +284,10 @@ class LargeOperationRunner {
             deletedCount++;
             deletes.add(record);
 
-            if (dataStore.notificationManager.hasListeners(tableName)) {
+            if (dataStore.notificationManager.hasListeners(schema.tableUid)) {
               dataStore.notificationManager.notify(ChangeEvent(
                 type: ChangeType.delete,
-                tableName: tableName,
+                tableUid: schema.tableUid,
                 oldRecord: record,
               ));
             }
@@ -752,10 +752,10 @@ class LargeOperationRunner {
               }
             }
 
-            if (dataStore.notificationManager.hasListeners(tableName)) {
+            if (dataStore.notificationManager.hasListeners(schema.tableUid)) {
               dataStore.notificationManager.notify(ChangeEvent(
                 type: ChangeType.update,
-                tableName: tableName,
+                tableUid: schema.tableUid,
                 record: updatedRecord,
                 oldRecord: record,
               ));

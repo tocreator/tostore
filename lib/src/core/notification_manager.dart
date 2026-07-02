@@ -7,7 +7,7 @@ import '../model/table_schema.dart';
 import '../handler/value_matcher.dart';
 
 class NotificationManager {
-  // Table Name -> QueryIndex
+  // Table UID -> QueryIndex
   final Map<String, QueryIndex> _indexes = {};
 
   // Keep track of subscriptions by ID for easy removal
@@ -19,22 +19,22 @@ class NotificationManager {
   final Map<String, TableSchema> _schemas;
 
   NotificationManager([List<TableSchema> schemas = const []])
-      : _schemas = {for (var s in schemas) s.name: s};
+      : _schemas = {for (var s in schemas) s.tableUid: s};
 
   /// Check if there are any active subscriptions for a table
-  bool hasListeners(String tableName) {
-    final index = _indexes[tableName];
+  bool hasListeners(String tableUid) {
+    final index = _indexes[tableUid];
     return index != null && !index.isEmpty;
   }
 
-  /// Get all table names that have at least one active subscription
+  /// Get all table UIDs that have at least one active subscription
   Iterable<String> getActiveTables() {
     return _indexes.entries.where((e) => !e.value.isEmpty).map((e) => e.key);
   }
 
   /// Register a listener for a specific query
   StreamSubscription<ChangeEvent> register(
-    String tableName,
+    String tableUid,
     QueryCondition condition,
     void Function(ChangeEvent) onData,
   ) {
@@ -53,11 +53,11 @@ class NotificationManager {
       },
     );
 
-    if (!_indexes.containsKey(tableName)) {
-      _indexes[tableName] = QueryIndex();
+    if (!_indexes.containsKey(tableUid)) {
+      _indexes[tableUid] = QueryIndex();
     }
 
-    _indexes[tableName]!.add(subscription);
+    _indexes[tableUid]!.add(subscription);
     _activeSubscriptions[id] = subscription;
 
     // Forward events to the user provided callback
@@ -66,16 +66,16 @@ class NotificationManager {
 
     // When the user cancels the stream subscription, we remove the query subscription
     streamSub.onDone(() {
-      _unregister(tableName, id);
+      _unregister(tableUid, id);
     });
 
     return streamSub;
   }
 
-  void _unregister(String tableName, String id) {
+  void _unregister(String tableUid, String id) {
     if (_activeSubscriptions.containsKey(id)) {
       final sub = _activeSubscriptions.remove(id)!;
-      _indexes[tableName]?.remove(sub);
+      _indexes[tableUid]?.remove(sub);
     }
     final controller = _controllers.remove(id);
     if (controller != null && !controller.isClosed) {
@@ -85,7 +85,7 @@ class NotificationManager {
 
   /// Notify listeners of a change
   void notify(ChangeEvent event) {
-    final index = _indexes[event.tableName];
+    final index = _indexes[event.tableUid];
     if (index == null) return;
 
     // For clear operation, we notify all subscriptions on the table
@@ -120,11 +120,11 @@ class NotificationManager {
       bool matchesOld = false;
 
       if (event.record != null) {
-        matchesNew = _matches(sub.condition, event.record!, event.tableName);
+        matchesNew = _matches(sub.condition, event.record!, event.tableUid);
       }
 
       if (event.oldRecord != null) {
-        matchesOld = _matches(sub.condition, event.oldRecord!, event.tableName);
+        matchesOld = _matches(sub.condition, event.oldRecord!, event.tableUid);
       }
 
       // If it matches either state, we notify.
@@ -137,9 +137,9 @@ class NotificationManager {
 
   /// Verify if a record matches a condition
   bool _matches(
-      QueryCondition condition, Map<String, dynamic> record, String tableName) {
+      QueryCondition condition, Map<String, dynamic> record, String tableUid) {
     final matcher =
-        ConditionRecordMatcher.prepare(condition, _schemas, tableName);
+        ConditionRecordMatcher.prepare(condition, _schemas, tableUid);
     return matcher.matches(record);
   }
 
