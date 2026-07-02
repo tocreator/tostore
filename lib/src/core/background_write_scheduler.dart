@@ -1,6 +1,8 @@
 import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/cancellation_token.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'yield_controller.dart';
 
 /// A background write scheduler that manages pending background write operations
@@ -9,9 +11,9 @@ import 'yield_controller.dart';
 /// It coordinates entry queuing, merging priorities on matching primary keys,
 /// and sequential polling for flushes.
 class BackgroundWriteScheduler {
-  // Table name -> PrimaryKey -> BackgroundWriteType -> BackgroundWriteEntry
-  final Map<String, Map<String, Map<BackgroundWriteType, BackgroundWriteEntry>>>
-      _queue = {};
+  // Table uid -> PrimaryKey -> BackgroundWriteType -> BackgroundWriteEntry
+  final Map<TableUid,
+      Map<String, Map<BackgroundWriteType, BackgroundWriteEntry>>> _queue = {};
 
   // Ordered queue for FIFO sequence maintenance
   final List<BackgroundWriteEntry> _orderedQueue = [];
@@ -53,11 +55,11 @@ class BackgroundWriteScheduler {
   /// Merges or invalidates existing entries for the same table and primary key
   /// according to priority rules: keyMigration < schemaMigration < largeUpdate < largeDelete.
   void addEntry(BackgroundWriteEntry entry, String primaryKey) {
-    final tableName = entry.tableName;
+    final tableUid = entry.tableUid;
     final newType = entry.type;
     final newPriority = _getPriority(newType);
 
-    final tableMap = _queue.putIfAbsent(tableName, () => {});
+    final tableMap = _queue.putIfAbsent(tableUid, () => {});
     final existingMap = tableMap[primaryKey];
 
     bool keepNew = true;
@@ -119,8 +121,9 @@ class BackgroundWriteScheduler {
   /// from overwriting new online data.
   ///
   /// Marks all pending background entries for the same primary key as invalid.
-  void handleOnlineWrite(String tableName, String primaryKey) {
-    final tableMap = _queue[tableName];
+  void handleOnlineWrite(TableContext table, String primaryKey) {
+    final tableUid = table.tableUid;
+    final tableMap = _queue[tableUid];
     if (tableMap == null) return;
 
     final existingMap = tableMap[primaryKey];
@@ -132,7 +135,7 @@ class BackgroundWriteScheduler {
     // Remove all references from queue map since they are now invalid
     tableMap.remove(primaryKey);
     if (tableMap.isEmpty) {
-      _queue.remove(tableName);
+      _queue.remove(tableUid);
     }
   }
 
@@ -161,7 +164,7 @@ class BackgroundWriteScheduler {
       count++;
 
       // Clean up lookup maps to release memory using its primaryKey
-      _removeFromLookup(entry.tableName, entry.primaryKey, entry.type);
+      _removeFromLookup(entry.tableUid, entry.primaryKey, entry.type);
     }
 
     _resetQueueIfNeeded();
@@ -170,8 +173,8 @@ class BackgroundWriteScheduler {
 
   /// Remove entry from the queue lookup table.
   void _removeFromLookup(
-      String tableName, String primaryKey, BackgroundWriteType type) {
-    final tableMap = _queue[tableName];
+      TableUid tableUid, String primaryKey, BackgroundWriteType type) {
+    final tableMap = _queue[tableUid];
     if (tableMap == null) return;
 
     final existingMap = tableMap[primaryKey];
@@ -182,7 +185,7 @@ class BackgroundWriteScheduler {
       tableMap.remove(primaryKey);
     }
     if (tableMap.isEmpty) {
-      _queue.remove(tableName);
+      _queue.remove(tableUid);
     }
   }
 
@@ -205,9 +208,9 @@ class BackgroundWriteScheduler {
         YieldController('BackgroundWriteScheduler.clearEntriesOfType');
 
     // 1. Remove from _queue maps
-    final tables = _queue.keys.toList();
-    for (final tableName in tables) {
-      final tableMap = _queue[tableName];
+    final tableUids = _queue.keys.toList();
+    for (final tableUid in tableUids) {
+      final tableMap = _queue[tableUid];
       if (tableMap != null) {
         final pks = tableMap.keys.toList();
         for (final pk in pks) {
@@ -223,7 +226,7 @@ class BackgroundWriteScheduler {
       }
     }
     // Clean up empty maps in _queue
-    _queue.removeWhere((tableName, tableMap) {
+    _queue.removeWhere((tableUid, tableMap) {
       tableMap.removeWhere((pk, existingMap) => existingMap.isEmpty);
       return tableMap.isEmpty;
     });
@@ -257,14 +260,15 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Clear all pending background write entries for the given [tableName] and [type].
+  /// Clear all pending background write entries for the given [table] and [type].
   Future<void> clearEntriesForTable(
-      String tableName, BackgroundWriteType type) async {
+      TableContext table, BackgroundWriteType type) async {
     final yieldController =
         YieldController('BackgroundWriteScheduler.clearEntriesForTable');
+    final tableUid = table.tableUid;
 
     // 1. Remove from _queue maps
-    final tableMap = _queue[tableName];
+    final tableMap = _queue[tableUid];
     if (tableMap != null) {
       final pks = tableMap.keys.toList();
       for (final pk in pks) {
@@ -279,7 +283,7 @@ class BackgroundWriteScheduler {
       }
       tableMap.removeWhere((pk, existingMap) => existingMap.isEmpty);
       if (tableMap.isEmpty) {
-        _queue.remove(tableName);
+        _queue.remove(tableUid);
       }
     }
 
@@ -293,7 +297,7 @@ class BackgroundWriteScheduler {
           break; // Guard against concurrent clear/truncation
         }
         final entry = _orderedQueue[i];
-        if (entry.tableName == tableName && entry.type == type) {
+        if (entry.tableUid == tableUid && entry.type == type) {
           entry.isValid = false;
         } else {
           remaining.add(entry);
@@ -312,42 +316,11 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Rename table for queued and ordered background write entries.
-  Future<void> renameTable(String oldTableName, String newTableName) async {
-    if (oldTableName == newTableName) return;
-    final yieldController =
-        YieldController('BackgroundWriteScheduler.renameTable');
-
-    // 1. Rename in _queue maps
-    final tableMap = _queue.remove(oldTableName);
-    if (tableMap != null) {
-      final updatedTableMap =
-          <String, Map<BackgroundWriteType, BackgroundWriteEntry>>{};
-      final pks = tableMap.keys.toList();
-      for (final pk in pks) {
-        await yieldController.maybeYield();
-        final typeMap = tableMap[pk];
-        if (typeMap != null) {
-          final updatedTypeMap = <BackgroundWriteType, BackgroundWriteEntry>{};
-          typeMap.forEach((type, entry) {
-            updatedTypeMap[type] = entry.copyWith(tableName: newTableName);
-          });
-          updatedTableMap[pk] = updatedTypeMap;
-        }
-      }
-      _queue[newTableName] = updatedTableMap;
-    }
-
-    // 2. Rename in _orderedQueue
-    final originalLength = _orderedQueue.length;
-    for (var i = _headIndex; i < originalLength; i++) {
-      await yieldController.maybeYield();
-      if (i >= _orderedQueue.length) break;
-      final entry = _orderedQueue[i];
-      if (entry.tableName == oldTableName) {
-        _orderedQueue[i] = entry.copyWith(tableName: newTableName);
-      }
-    }
+  /// Rename table for queued background write entries.
+  ///
+  /// Queue keys and entries use stable [table.tableUid], so table rename is a no-op.
+  Future<void> renameTable(TableContext table) async {
+    // Entries and lookup maps are keyed by stable tableUid; nothing to remap.
   }
 
   /// Clear all pending entries in the scheduler.
