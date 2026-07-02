@@ -44,7 +44,7 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
   @override
   Future<DbResult> get future async {
     _future ??= _db.deleteInternal(
-      _tableName,
+      await _db.getTableContext(_tableName),
       queryCondition,
       orderBy: _orderBy,
       limit: _limit,
