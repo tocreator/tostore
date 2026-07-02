@@ -4,6 +4,8 @@ import 'dart:collection';
 import '../handler/logger.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'workload_scheduler.dart';
@@ -52,33 +54,34 @@ final class CompactionManager {
   }
 
   /// Enqueue a table compaction task (deduplicated by table).
-  void enqueueTable(String tableName, {TreePagePtr? hint}) {
-    if (tableName.isEmpty) return;
-    final key = 't:$tableName';
+  void enqueueTable(TableContext table, {TreePagePtr? hint}) {
+    if (table.tableUid.isEmpty) return;
+    final key = 't:${table.tableUid}';
     if (hint != null && !hint.isNull) {
-      _tableHint[tableName] = hint;
+      _tableHint[table.tableUid] = hint;
     }
     if (_dedup.contains(key)) return;
     _dedup.add(key);
-    _queue.add(_CompactionTask.table(tableName));
+    _queue.add(_CompactionTask.table(table.tableUid));
   }
 
   /// Enqueue an index compaction task (deduplicated by table+index).
-  void enqueueIndex(String tableName, String indexName, {TreePagePtr? hint}) {
-    if (tableName.isEmpty || indexName.isEmpty) return;
-    final key = 'i:$tableName:$indexName';
+  void enqueueIndex(TableContext table, IndexUid indexUid,
+      {TreePagePtr? hint}) {
+    if (table.tableUid.isEmpty || indexUid.isEmpty) return;
+    final key = 'i:${table.tableUid}:${indexUid.value}';
     if (hint != null && !hint.isNull) {
-      _indexHint['$tableName:$indexName'] = hint;
+      _indexHint['${table.tableUid}:${indexUid.value}'] = hint;
     }
     if (_dedup.contains(key)) return;
     _dedup.add(key);
-    _queue.add(_CompactionTask.index(tableName, indexName));
+    _queue.add(_CompactionTask.index(table.tableUid, indexUid));
   }
 
   /// Clear compaction hints for a table
-  void clearHintsForTable(String tableName) {
-    _tableHint.remove(tableName);
-    _indexHint.removeWhere((key, _) => key.startsWith('$tableName:'));
+  void clearHintsForTable(TableContext table) {
+    _tableHint.remove(table.tableUid);
+    _indexHint.removeWhere((key, _) => key.startsWith('${table.tableUid}:'));
   }
 
   Future<void> _tick() async {
@@ -154,10 +157,13 @@ final class CompactionManager {
         bool finished = true;
         try {
           if (task.kind == _CompactionKind.table) {
-            final TreePagePtr? hint = _tableHint[task.tableName];
+            final tableCtx =
+                _dataStore.schemaManager?.getTableContextSync(task.tableUid);
+            if (tableCtx == null) continue;
+            final TreePagePtr? hint = _tableHint[task.tableUid];
             final next =
                 await _dataStore.tableTreePartitionManager?.compactLeafChain(
-              tableName: task.tableName,
+              table: tableCtx,
               startFrom: task.cursor ?? hint,
               maxVisitedLeaves: maxVisitedLeaves,
               maxMerges: maxMerges,
@@ -168,12 +174,15 @@ final class CompactionManager {
               finished = false;
             }
           } else {
+            final tableCtx =
+                _dataStore.schemaManager?.getTableContextSync(task.tableUid);
+            if (tableCtx == null) continue;
             final TreePagePtr? hint =
-                _indexHint['${task.tableName}:${task.indexName}'];
+                _indexHint['${task.tableUid}:${task.indexUid!.value}'];
             final next =
                 await _dataStore.indexTreePartitionManager?.compactLeafChain(
-              tableName: task.tableName,
-              indexName: task.indexName!,
+              table: tableCtx,
+              indexUid: task.indexUid!,
               startFrom: task.cursor ?? hint,
               maxVisitedLeaves: maxVisitedLeaves,
               maxMerges: maxMerges,
@@ -188,9 +197,9 @@ final class CompactionManager {
           if (finished) {
             _dedup.remove(dedupKey);
             if (task.kind == _CompactionKind.table) {
-              _tableHint.remove(task.tableName);
+              _tableHint.remove(task.tableUid);
             } else {
-              _indexHint.remove('${task.tableName}:${task.indexName}');
+              _indexHint.remove('${task.tableUid}:${task.indexUid!.value}');
             }
           }
         }
@@ -209,31 +218,28 @@ enum _CompactionKind { table, idx }
 
 final class _CompactionTask {
   final _CompactionKind kind;
-  final String tableName;
-  final String? indexName;
+  final TableUid tableUid;
+  final IndexUid? indexUid;
   final TreePagePtr? cursor;
 
   const _CompactionTask._(
-      {required this.kind,
-      required this.tableName,
-      this.indexName,
-      this.cursor});
+      {required this.kind, required this.tableUid, this.indexUid, this.cursor});
 
-  factory _CompactionTask.table(String table) =>
-      _CompactionTask._(kind: _CompactionKind.table, tableName: table);
+  factory _CompactionTask.table(TableUid tableUid) =>
+      _CompactionTask._(kind: _CompactionKind.table, tableUid: tableUid);
 
-  factory _CompactionTask.index(String table, String index) =>
+  factory _CompactionTask.index(TableUid tableUid, IndexUid indexUid) =>
       _CompactionTask._(
-          kind: _CompactionKind.idx, tableName: table, indexName: index);
+          kind: _CompactionKind.idx, tableUid: tableUid, indexUid: indexUid);
 
   String get dedupKey => kind == _CompactionKind.table
-      ? 't:$tableName'
-      : 'i:$tableName:$indexName';
+      ? 't:$tableUid'
+      : 'i:$tableUid:${indexUid!.value}';
 
   _CompactionTask withCursor(TreePagePtr next) => _CompactionTask._(
         kind: kind,
-        tableName: tableName,
-        indexName: indexName,
+        tableUid: tableUid,
+        indexUid: indexUid,
         cursor: next,
       );
 }
