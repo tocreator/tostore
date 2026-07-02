@@ -275,8 +275,9 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
   Future<SchemaUpdateResult> get future async {
     SchemaUpdateResult result;
     try {
+      final tableUid = _dataStore.schemaManager?.getUidByName(_tableName) ?? _tableName;
       final task = await _dataStore.migrationManager?.addMigrationTask(
-        _tableName,
+        tableUid,
         _operations,
         startProcessing: true,
         allowAfterDataMigration: _allowAfterDataMigration,

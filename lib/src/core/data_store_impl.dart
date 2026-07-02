@@ -3968,9 +3968,9 @@ class DataStoreImpl {
           await storage.deleteDirectory(tablePath);
         }
 
-        if (registerWalOp) {
+        if (registerWalOp && tableUid != null) {
           // Add migration task to delete table data in each space
-          await migrationManager?.addMigrationTask(tableName,
+          await migrationManager?.addMigrationTask(tableUid,
               [const MigrationOperation(type: MigrationType.dropTable)]);
         }
 
