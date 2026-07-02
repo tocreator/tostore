@@ -13,6 +13,7 @@ import '../handler/value_matcher.dart';
 import '../model/data_store_config.dart';
 import '../model/encoder_config.dart';
 import '../model/migration_task.dart';
+import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../core/vector_quantizer.dart';
 import '../handler/wal_encoder.dart';
@@ -1027,8 +1028,8 @@ class TimeBasedIdGenerateRequest {
   /// Node configuration
   final DistributedNodeConfig nodeConfig;
 
-  /// Table name
-  final String tableName;
+  /// Table unique identifier
+  final TableUid tableUid;
 
   /// Generation count
   final int count;
@@ -1051,7 +1052,7 @@ class TimeBasedIdGenerateRequest {
   TimeBasedIdGenerateRequest({
     required this.keyType,
     required this.nodeConfig,
-    required this.tableName,
+    required this.tableUid,
     required this.count,
     required this.startValue,
     required this.startSequence,
@@ -1608,8 +1609,8 @@ final class BatchBTreePageEncodeRequest {
   /// - Redo records store logical identity (table/index + partitionNo + pageNo), not absolute paths,
   ///   so recovery can rebuild paths even if directory layout changes across restart.
   final int? pageRedoTreeKindIndex; // PageRedoTreeKind.indexTree
-  final String? pageRedoTableName;
-  final String? pageRedoIndexName; // required when treeKind == index
+  final TableUid? pageRedoTableUid;
+  final IndexUid? pageRedoIndexUid; // required when treeKind == index
 
   const BatchBTreePageEncodeRequest({
     required this.pageSize,
@@ -1619,8 +1620,8 @@ final class BatchBTreePageEncodeRequest {
     this.customKey,
     this.customKeyId,
     this.pageRedoTreeKindIndex,
-    this.pageRedoTableName,
-    this.pageRedoIndexName,
+    this.pageRedoTableUid,
+    this.pageRedoIndexUid,
   });
 }
 
@@ -1628,7 +1629,7 @@ final class BatchBTreePageEncodeRequest {
 final class BatchBTreePageEncodeResult {
   final List<Uint8List> pageBytes;
 
-  /// Present when request had [pageRedoTreeKindIndex] and [pageRedoTableName]; encoded in isolate.
+  /// Present when request had [pageRedoTreeKindIndex] and [pageRedoTableUid]; encoded in isolate.
   final Uint8List? pageRedoBytes;
 
   const BatchBTreePageEncodeResult(this.pageBytes, [this.pageRedoBytes]);
@@ -1733,20 +1734,20 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
 
   Uint8List? pageRedoBytes;
   final kindIdx = request.pageRedoTreeKindIndex;
-  final tableName = request.pageRedoTableName;
+  final tableUid = request.pageRedoTableUid;
   if (kindIdx != null &&
-      tableName != null &&
+      tableUid != null &&
       kindIdx >= 0 &&
       kindIdx < PageRedoTreeKind.values.length) {
     final treeKind = PageRedoTreeKind.values[kindIdx];
-    final indexName = request.pageRedoIndexName;
+    final indexUid = request.pageRedoIndexUid;
     final records = <Uint8List>[];
     for (int i = 0; i < out.length; i++) {
       final p = pages[i];
       records.add(PageRedoLogCodec.encodePageRecord(
         treeKind: treeKind,
-        tableName: tableName,
-        indexName: treeKind == PageRedoTreeKind.indexTree ? indexName : null,
+        tableUid: tableUid,
+        indexUid: treeKind == PageRedoTreeKind.indexTree ? indexUid : null,
         partitionNo: p.partitionNo,
         pageNo: p.pageNo,
         payload: out[i],
