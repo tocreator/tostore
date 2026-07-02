@@ -107,10 +107,12 @@ class StreamQueryBuilder {
 
   /// Get (or create) the underlying stream
   Stream<Map<String, dynamic>> _getStream() {
-    _stream ??= _db.streamRecords(
-      _tableName,
-      condition: _condition,
-      selectedFields: _selectedFields,
+    _stream ??= Stream.fromFuture(_db.getTableContext(_tableName)).asyncExpand(
+      (table) => _db.streamRecords(
+        table,
+        condition: _condition,
+        selectedFields: _selectedFields,
+      ),
     );
     return _stream!;
   }
