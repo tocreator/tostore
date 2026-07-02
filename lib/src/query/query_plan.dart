@@ -55,7 +55,7 @@ class QueryPlan {
       case QueryOperationType.indexScan:
         final v = operation.value;
         final where = (v is Map<String, dynamic>) ? v['where'] : null;
-        return 'INDEX SCAN using ${operation.indexName} with conditions: $where';
+        return 'INDEX SCAN using ${operation.indexUid} with conditions: $where';
       case QueryOperationType.union:
         final v = operation.value;
         final table = (v is Map<String, dynamic>) ? (v['table'] ?? '') : '';
@@ -82,20 +82,20 @@ class QueryPlan {
 /// query operation
 class QueryOperation {
   final QueryOperationType type;
-  final String? indexName;
+  final String? indexUid;
   final dynamic value;
 
   QueryOperation({
     required this.type,
-    this.indexName,
+    this.indexUid,
     this.value,
   });
 
   @override
   String toString() {
     final parts = [type.toString().split('.').last];
-    if (indexName != null) {
-      parts.add('index: $indexName');
+    if (indexUid != null) {
+      parts.add('indexUid: $indexUid');
     }
     if (value != null) {
       parts.add('value: $value');

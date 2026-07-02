@@ -711,14 +711,14 @@ class IndexManager {
     final allIndexes =
         _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
     var indexSchema = allIndexes.firstWhere(
-      (i) => i.actualIndexName == indexName,
+      (i) => i.indexUid == indexName || i.actualIndexName == indexName,
       orElse: () => IndexSchema(indexName: '', fields: []),
     );
 
     if (indexSchema.fields.isEmpty) {
       final engineManaged =
           getEngineManagedBtreeIndexes(tableName, schema).firstWhere(
-        (i) => i.actualIndexName == indexName,
+        (i) => i.indexUid == indexName || i.actualIndexName == indexName,
         orElse: () => IndexSchema(indexName: '', fields: []),
       );
       if (engineManaged.fields.isNotEmpty) {
@@ -802,7 +802,7 @@ class IndexManager {
     final allIndexes =
         _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
     final indexSchema = allIndexes.firstWhere(
-      (i) => i.actualIndexName == indexName,
+      (i) => i.indexUid == indexName || i.actualIndexName == indexName,
       orElse: () => IndexSchema(indexName: '', fields: const []),
     );
     final int fieldCount = indexSchema.fields.length;
@@ -995,7 +995,9 @@ class IndexManager {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableUid);
     if (schema != null) {
       for (final idx in schema.getAllIndexes()) {
-        if (idx.indexName == indexName || idx.actualIndexName == indexName) {
+        if (idx.indexUid == indexName ||
+            idx.indexName == indexName ||
+            idx.actualIndexName == indexName) {
           if (idx.indexUid != null) {
             indexUid = idx.indexUid!;
           }
@@ -1126,7 +1128,9 @@ class IndexManager {
     final schema = await _dataStore.schemaManager?.getTableSchema(tableUid);
     if (schema != null) {
       for (final idx in schema.getAllIndexes()) {
-        if (idx.indexName == indexName || idx.actualIndexName == indexName) {
+        if (idx.indexUid == indexName ||
+            idx.indexName == indexName ||
+            idx.actualIndexName == indexName) {
           if (idx.indexUid != null) {
             indexUid = idx.indexUid!;
           }
@@ -1334,13 +1338,13 @@ class IndexManager {
       // Clear all index data (files + caches).
       final indexesToReset = _dataStore.schemaManager
               ?.getAllIndexesFor(schema)
-              .map((i) => i.actualIndexName)
+              .map((i) => i.indexUid ?? i.actualIndexName)
               .toList() ??
           const <String>[];
       final engineManagedIndexes = getEngineManagedBtreeIndexes(
         tableName,
         schema,
-      ).map((i) => i.actualIndexName);
+      ).map((i) => i.indexUid ?? i.actualIndexName);
 
       // Add internal mapping B+Tree indexes for vector indexes only.
       // These use virtual names (__nid2pk, __pk2nid) and are NOT in the schema index list.
@@ -1392,21 +1396,27 @@ class IndexManager {
 
         // Clear index data from memory and files
         final yieldController = YieldController('IndexManager.resetIndexes');
-        for (final indexName in dedupedSortedIndexes) {
+        for (final indexUid in dedupedSortedIndexes) {
           // Remove from cache
-          _indexMetaCache.remove([tableName, indexName]);
-          _indexDataCache.remove([tableName, indexName]);
+          _indexMetaCache.remove([tableName, indexUid]);
+          _indexDataCache.remove([tableName, indexUid]);
 
           // v2+ layout: delete entire index directory (fast & deterministic).
           await yieldController.maybeYield();
           try {
             final indexPath =
-                await _dataStore.pathManager.getIndexPath(tableName, indexName);
+                await _dataStore.pathManager.getIndexPath(tableName, indexUid);
             if (await _dataStore.storage.existsDirectory(indexPath)) {
               await _dataStore.storage.deleteDirectory(indexPath);
             }
           } catch (e) {
-            Logger.warn('Failed to delete index directory for $indexName',
+            final idxSchema = schema.getAllIndexes().firstWhere(
+                (i) => i.indexUid == indexUid || i.actualIndexName == indexUid,
+                orElse: () => IndexSchema(indexName: '', fields: const []));
+            final friendlyName = idxSchema.actualIndexName.isNotEmpty
+                ? idxSchema.actualIndexName
+                : indexUid;
+            Logger.warn('Failed to delete index directory for $friendlyName',
                 rawError: e);
           }
         }

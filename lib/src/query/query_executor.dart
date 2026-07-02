@@ -923,7 +923,7 @@ class QueryExecutor {
           );
           final indexRes = await _performIndexScan(
             tableName,
-            operation.indexName!,
+            operation.indexUid!,
             cond,
             matcher,
             limit: limit,
@@ -1278,7 +1278,7 @@ class QueryExecutor {
                     : const <String, dynamic>{};
                 return (await _performIndexScan(
                   tableName,
-                  op.indexName!,
+                  op.indexUid!,
                   cond,
                   clauseMatcher,
                   limit: limit,
@@ -1921,7 +1921,7 @@ class QueryExecutor {
   /// perform index scan
   Future<TableScanResult> _performIndexScan(
     String tableName,
-    String indexName,
+    String indexUid,
     Map<String, dynamic> conditions,
     ConditionRecordMatcher? matcher, {
     int? limit,
@@ -1945,18 +1945,22 @@ class QueryExecutor {
       }
 
       // Index name used by storage is already the actual index name.
-      final String actualIndexName = indexName;
+      final String actualIndexUid = indexUid;
 
       IndexSchema? indexSchema;
       try {
         final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
             <IndexSchema>[];
         indexSchema = allIndexes.firstWhere(
-          (idx) => idx.actualIndexName == actualIndexName,
+          (idx) =>
+              idx.indexUid == actualIndexUid ||
+              idx.actualIndexName == actualIndexUid,
         );
       } catch (_) {
         indexSchema = null;
       }
+      final String actualIndexName = indexSchema?.actualIndexName ?? indexUid;
+
       final IndexCondition? builtCondition = _buildIndexConditionForSchema(
         indexSchema,
         actualIndexName,
@@ -2718,10 +2722,10 @@ class QueryExecutor {
   }) {
     final op = plan.operation;
     if (op.type == QueryOperationType.indexScan) {
-      final idxName = op.indexName;
-      if (idxName != null && idxName.isNotEmpty) {
+      final idxUid = op.indexUid;
+      if (idxUid != null && idxUid.isNotEmpty) {
         try {
-          final spec = _resolveIndexSpecForCursor(schema, idxName);
+          final spec = _resolveIndexSpecForCursor(schema, idxUid);
           if (spec.fields.isNotEmpty) {
             return List<String>.from(spec.fields, growable: false);
           }
@@ -2739,14 +2743,14 @@ class QueryExecutor {
     required List<String>? orderBy,
   }) {
     if (orderBy == null || orderBy.isEmpty) return false;
-    final idxName = plan.operation.indexName;
-    if (idxName == null) return false;
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null) return false;
     try {
       final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return false;
-      final idx = allIndexes.firstWhere((i) => i.actualIndexName == idxName);
+      final idx = allIndexes.firstWhere(
+          (i) => i.indexUid == idxUid || i.actualIndexName == idxUid);
       if (orderBy.length != idx.fields.length) return false;
-
       // We assume validation has already passed and all fields have uniform direction.
       final parsed = _parseSortField(orderBy[0]);
       return parsed.descending;
@@ -2757,22 +2761,23 @@ class QueryExecutor {
 
   /// Resolve index spec for cursor building.
   ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
-      TableSchema schema, String indexName) {
+      TableSchema schema, String indexUidOrName) {
     try {
       final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return (fields: <String>[], isUnique: false);
-      final idx = allIndexes.firstWhere((i) => i.actualIndexName == indexName);
+      final idx = allIndexes.firstWhere(
+          (i) => i.indexUid == indexUidOrName || i.actualIndexName == indexUidOrName);
       return (fields: idx.fields, isUnique: idx.unique);
     } catch (e) {
       if (e is DbException) rethrow;
       // Fallback for implicit unique single-field indexes (uniq_field).
-      if (indexName.startsWith('uniq_') && indexName.length > 5) {
-        return (fields: <String>[indexName.substring(5)], isUnique: true);
+      if (indexUidOrName.startsWith('uniq_') && indexUidOrName.length > 5) {
+        return (fields: <String>[indexUidOrName.substring(5)], isUnique: true);
       }
       throw DbException([
         GeneralStatus(
           type: ResultType.devIndexNotFound,
-          message: 'Index schema not found for cursor pagination: $indexName.',
+          message: 'Index schema not found for cursor pagination: $indexUidOrName.',
         ),
       ]);
     }
@@ -2785,17 +2790,16 @@ class QueryExecutor {
     required QueryPlan plan,
     required List<String> orderBy,
   }) {
-    final idxName = plan.operation.indexName;
-    if (idxName == null) {
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null) {
       throw DbException([
         GeneralStatus(
           type: ResultType.devIndexNotFound,
-          message:
-              'Index scan plan is missing indexName for cursor pagination.',
+          message: 'Index scan plan is missing indexUid for cursor pagination.',
         ),
       ]);
     }
-    final spec = _resolveIndexSpecForCursor(schema, idxName);
+    final spec = _resolveIndexSpecForCursor(schema, idxUid);
 
     // Dynamic tie-breaker PK normalization:
     // If the user specifies the primary key at the end of orderBy (e.g. ['age', 'score', 'id']
@@ -3046,13 +3050,13 @@ class QueryExecutor {
     }
 
     if (op.type == QueryOperationType.indexScan) {
-      final idxName = op.indexName ?? '';
-      if (idxName.isEmpty) {
+      final idxUid = op.indexUid ?? '';
+      if (idxUid.isEmpty) {
         throw DbException([
           GeneralStatus(
             type: ResultType.devIndexNotFound,
             message:
-                'Index scan plan is missing indexName for cursor pagination.',
+                'Index scan plan is missing indexUid for cursor pagination.',
           ),
         ]);
       }
@@ -3196,8 +3200,8 @@ class QueryExecutor {
     }
 
     // indexKey cursor
-    final idxName = plan.operation.indexName;
-    if (idxName == null || idxName.isEmpty) {
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null || idxUid.isEmpty) {
       throw DbException([
         GeneralStatus(
           type: ResultType.devIndexNotFound,
@@ -3206,7 +3210,7 @@ class QueryExecutor {
         ),
       ]);
     }
-    final spec = _resolveIndexSpecForCursor(schema, idxName);
+    final spec = _resolveIndexSpecForCursor(schema, idxUid);
     if (spec.fields.isEmpty) {
       throw DbException([
         GeneralStatus(
@@ -3255,12 +3259,12 @@ class QueryExecutor {
     }
 
     final IndexSchema? idx = (schema.indexes.cast<IndexSchema?>().firstWhere(
-            (i) => i?.actualIndexName == idxName,
+            (i) => i?.indexUid == idxUid || i?.actualIndexName == idxUid,
             orElse: () => null) ??
         schema.autoIndexes?.cast<IndexSchema?>().firstWhere(
-            (i) => i?.actualIndexName == idxName,
+            (i) => i?.indexUid == idxUid || i?.actualIndexName == idxUid,
             orElse: () => null));
-    final indexUid = idx?.indexUid ?? idxName;
+    final indexUid = idx?.indexUid ?? idxUid;
 
     return _QueryCursorToken.indexKey(
       tableUid: schema.tableUid,

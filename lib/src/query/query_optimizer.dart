@@ -34,7 +34,8 @@ class QueryOptimizer {
             return QueryPlan(
               QueryOperation(
                 type: QueryOperationType.indexScan,
-                indexName: bestSortingIndex.actualIndexName,
+                indexUid: bestSortingIndex.indexUid ??
+                    bestSortingIndex.actualIndexName,
                 value: <String, dynamic>{'table': tableName, 'where': null},
               ),
               naturalOrderBy: bestSortingIndex.fields,
@@ -75,7 +76,8 @@ class QueryOptimizer {
 
         // If already using the same index, keep the filter plan.
         if (filterPlan.operation.type == QueryOperationType.indexScan &&
-            filterPlan.operation.indexName == sortingIdx.actualIndexName) {
+            filterPlan.operation.indexUid ==
+                (sortingIdx.indexUid ?? sortingIdx.actualIndexName)) {
           return filterPlan;
         }
 
@@ -99,7 +101,7 @@ class QueryOptimizer {
         final sortPlan = QueryPlan(
           QueryOperation(
             type: QueryOperationType.indexScan,
-            indexName: sortingIdx.actualIndexName,
+            indexUid: sortingIdx.indexUid ?? sortingIdx.actualIndexName,
             value: <String, dynamic>{'table': tableName, 'where': tableWhere},
           ),
           naturalOrderBy: sortingIdx.fields,
@@ -371,7 +373,7 @@ class QueryOptimizer {
       return QueryPlan(
         QueryOperation(
           type: QueryOperationType.indexScan,
-          indexName: bestUniqueEq.actualIndexName,
+          indexUid: bestUniqueEq.indexUid ?? bestUniqueEq.actualIndexName,
           value: <String, dynamic>{'table': tableName, 'where': tableWhere},
         ),
         naturalOrderBy: bestUniqueEq.fields,
@@ -400,7 +402,7 @@ class QueryOptimizer {
       return QueryPlan(
         QueryOperation(
           type: QueryOperationType.indexScan,
-          indexName: bestIndex.actualIndexName,
+          indexUid: bestIndex.indexUid ?? bestIndex.actualIndexName,
           value: <String, dynamic>{'table': tableName, 'where': tableWhere},
         ),
         naturalOrderBy: bestIndex.fields,
@@ -751,15 +753,16 @@ class QueryOptimizer {
     return sel.clamp(minSel, 1.0);
   }
 
-  List<String> _resolveIndexFields(TableSchema schema, String indexName) {
+  List<String> _resolveIndexFields(TableSchema schema, String indexUid) {
     try {
       final indexes =
           _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
-      final idx = indexes.firstWhere((i) => i.actualIndexName == indexName);
+      final idx = indexes.firstWhere(
+          (i) => i.indexUid == indexUid || i.actualIndexName == indexUid);
       return idx.fields;
     } catch (_) {
-      if (indexName.startsWith('uniq_') && indexName.length > 5) {
-        return <String>[indexName.substring(5)];
+      if (indexUid.startsWith('uniq_') && indexUid.length > 5) {
+        return <String>[indexUid.substring(5)];
       }
       return const <String>[];
     }
@@ -776,9 +779,9 @@ class QueryOptimizer {
       return fieldSelectivity[pk] ?? 1.0;
     }
     if (op.type == QueryOperationType.indexScan) {
-      final idxName = op.indexName;
-      if (idxName == null || idxName.isEmpty) return 1.0;
-      final fields = _resolveIndexFields(schema, idxName);
+      final idxUid = op.indexUid;
+      if (idxUid == null || idxUid.isEmpty) return 1.0;
+      final fields = _resolveIndexFields(schema, idxUid);
       if (fields.isEmpty) return 1.0;
       double sel = 1.0;
       for (final f in fields) {
