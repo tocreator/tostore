@@ -1,6 +1,7 @@
 import '../../model/db_exception.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
@@ -9,7 +10,7 @@ import 'unique_ref_compute.dart';
 /// Pure-compute request for a batchInsert preparation chunk.
 class BatchInsertPrepareRequest {
   final TableSchema schema;
-  final String tableName;
+  final TableContext table;
   final List<Map<String, dynamic>> records;
   final List<IndexSchema> uniqueIndexes;
   final List<bool> skipPrimaryKeyFormatChecks;
@@ -17,7 +18,7 @@ class BatchInsertPrepareRequest {
 
   BatchInsertPrepareRequest({
     required this.schema,
-    required this.tableName,
+    required this.table,
     required this.records,
     required this.uniqueIndexes,
     required this.skipPrimaryKeyFormatChecks,
@@ -78,7 +79,7 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
       validData = validateAndProcessRecordPure(
         schema: request.schema,
         data: request.records[i],
-        tableName: request.tableName,
+        tableName: request.table.tableName,
         skipPrimaryKeyFormatCheck: request.skipPrimaryKeyFormatChecks[i],
         validationErrors: errors,
         fieldMap: fieldMap,
