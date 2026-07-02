@@ -1,4 +1,5 @@
 import '../../handler/value_matcher.dart';
+import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
 import '../../query/query_condition.dart';
 import '../yield_controller.dart';
@@ -6,14 +7,14 @@ import '../yield_controller.dart';
 /// Pure-compute request for matching a condition against a batch of records.
 class BatchMatchRequest {
   final TableSchema schema;
-  final String tableName;
+  final TableContext table;
   final Map<String, dynamic> condition;
   final List<Map<String, dynamic>> records;
   final int? maxMatchCount;
 
   BatchMatchRequest({
     required this.schema,
-    required this.tableName,
+    required this.table,
     required this.condition,
     required this.records,
     this.maxMatchCount,
@@ -42,8 +43,8 @@ Future<BatchMatchResult> matchConditionChunk(
       : QueryCondition.fromMap(request.condition);
   final matcher = ConditionRecordMatcher.prepare(
     queryCondition,
-    {request.tableName: request.schema},
-    request.tableName,
+    {request.table.tableUid: request.schema},
+    request.table.tableUid,
   );
 
   final matchedIndices = <int>[];
