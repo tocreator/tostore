@@ -11,12 +11,14 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_context.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'ngh_page.dart';
 import 'tree_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 // ============================================================================
 // NGH Partition Manager
@@ -132,13 +134,14 @@ final class NghPartitionManager {
 
   /// Read a graph page from cache or disk.
   Future<NghGraphPage> readGraphPage(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int partitionNo,
     int pageNo, {
     Map<int, NghGraphPage>? localCache,
   }) async {
+    final tableUid = table.tableUid;
     final cacheKey = _cacheKey(partitionNo, pageNo);
 
     // 1. Local batch cache
@@ -148,19 +151,19 @@ final class NghPartitionManager {
     }
 
     // 2. Instance cache
-    final instanceKey = [tableName, indexName, partitionNo, pageNo];
+    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
     final cached = _graphPageCache.get(instanceKey);
     if (cached != null) return cached;
 
     // When index is marked fully cached, do not fall back to disk
-    if (_graphPageCache.isFullyCached(_indexPrefix(tableName, indexName))) {
+    if (_graphPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
       return NghGraphPage.empty(
           maxDegree: meta.maxDegree, slotCount: meta.nodesPerGraphPage);
     }
 
     // 3. Disk read
     final path = await _dataStore.pathManager
-        .getNghGraphPartitionPath(tableName, indexName, partitionNo);
+        .getNghGraphPartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * meta.nghPageSize,
         length: meta.nghPageSize);
@@ -195,13 +198,14 @@ final class NghPartitionManager {
 
   /// Read a PQ-code page from cache or disk.
   Future<NghPqCodePage> readPqCodePage(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int partitionNo,
     int pageNo, {
     Map<int, NghPqCodePage>? localCache,
   }) async {
+    final tableUid = table.tableUid;
     final cacheKey = _cacheKey(partitionNo, pageNo);
 
     if (localCache != null) {
@@ -209,17 +213,17 @@ final class NghPartitionManager {
       if (cached != null) return cached;
     }
 
-    final instanceKey = [tableName, indexName, partitionNo, pageNo];
+    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
     final cached = _pqCodePageCache.get(instanceKey);
     if (cached != null) return cached;
 
-    if (_pqCodePageCache.isFullyCached(_indexPrefix(tableName, indexName))) {
+    if (_pqCodePageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
       return NghPqCodePage.empty(
           pqSubspaces: meta.pqSubspaces, capacity: meta.vectorsPerPqPage);
     }
 
     final path = await _dataStore.pathManager
-        .getNghPqCodePartitionPath(tableName, indexName, partitionNo);
+        .getNghPqCodePartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * meta.nghPageSize,
         length: meta.nghPageSize);
@@ -240,13 +244,14 @@ final class NghPartitionManager {
 
   /// Read a raw-vector page from cache or disk.
   Future<NghRawVectorPage> readRawVectorPage(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int partitionNo,
     int pageNo, {
     Map<int, NghRawVectorPage>? localCache,
   }) async {
+    final tableUid = table.tableUid;
     final cacheKey = _cacheKey(partitionNo, pageNo);
 
     if (localCache != null) {
@@ -254,11 +259,11 @@ final class NghPartitionManager {
       if (cached != null) return cached;
     }
 
-    final instanceKey = [tableName, indexName, partitionNo, pageNo];
+    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
     final cached = _rawVectorPageCache.get(instanceKey);
     if (cached != null) return cached;
 
-    if (_rawVectorPageCache.isFullyCached(_indexPrefix(tableName, indexName))) {
+    if (_rawVectorPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
       return NghRawVectorPage.empty(
           dimensions: meta.dimensions,
           precisionIndex: meta.precision.index,
@@ -266,7 +271,7 @@ final class NghPartitionManager {
     }
 
     final path = await _dataStore.pathManager
-        .getNghRawVectorPartitionPath(tableName, indexName, partitionNo);
+        .getNghRawVectorPartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * meta.nghPageSize,
         length: meta.nghPageSize);
@@ -293,13 +298,13 @@ final class NghPartitionManager {
   // Lazy full-cache preload for vector search (TreeCache isFullyCached)
   // =====================================================================
 
-  /// Prefix key for TreeCache group [tableName, indexName] (groupDepth 2).
-  List<dynamic> _indexPrefix(String tableName, String indexName) =>
-      [tableName, indexName];
+  /// Prefix key for TreeCache group [table.tableUid, indexUid] (groupDepth 2).
+  List<dynamic> _indexPrefix(TableUid tableUid, IndexUid indexUid) =>
+      [tableUid, indexUid];
 
   /// Whether this index is already marked fully cached (skip preload).
-  bool isFullyCachedForIndex(String tableName, String indexName) {
-    final prefix = _indexPrefix(tableName, indexName);
+  bool isFullyCachedForIndex(TableUid tableUid, IndexUid indexUid) {
+    final prefix = _indexPrefix(tableUid, indexUid);
     return _graphPageCache.isFullyCached(prefix);
   }
 
@@ -307,12 +312,13 @@ final class NghPartitionManager {
   /// [WorkloadType.maintenance] and [ParallelProcessor]. Schedules work in a
   /// microtask so the caller is not blocked by any computation.
   Future<void> preloadForVectorSearch(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
   ) {
+    final tableUid = table.tableUid;
     return Future.microtask(() {
-      final prefix = _indexPrefix(tableName, indexName);
+      final prefix = _indexPrefix(tableUid, indexUid);
       if (_graphPageCache.isFullyCached(prefix)) return;
       if (meta.totalVectors <= 0) return;
       final indexBudget =
@@ -324,20 +330,21 @@ final class NghPartitionManager {
         return;
       }
 
-      final key = '$tableName/$indexName';
+      final key = '$tableUid/$indexUid';
       if (_preloadFutures.containsKey(key)) return;
 
-      final future = _doPreloadForVectorSearch(tableName, indexName, meta)
+      final future = _doPreloadForVectorSearch(table, indexUid, meta)
           .whenComplete(() => _preloadFutures.remove(key));
       _preloadFutures[key] = future;
     });
   }
 
   Future<void> _doPreloadForVectorSearch(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
   ) async {
+    final tableUid = table.tableUid;
     WorkloadLease? lease;
     try {
       lease = await _dataStore.workloadScheduler.acquire(
@@ -363,7 +370,7 @@ final class NghPartitionManager {
       final partitionNo = logicalPage ~/ meta.graphPagesPerPartition;
       final pageNo = firstData + (logicalPage % meta.graphPagesPerPartition);
       graphTasks.add(() async {
-        await readGraphPage(tableName, indexName, meta, partitionNo, pageNo);
+        await readGraphPage(table, indexUid, meta, partitionNo, pageNo);
       });
     }
     final pqTasks = <Future<void> Function()>[];
@@ -371,7 +378,7 @@ final class NghPartitionManager {
       final partitionNo = logicalPage ~/ meta.pqCodePagesPerPartition;
       final pageNo = firstData + (logicalPage % meta.pqCodePagesPerPartition);
       pqTasks.add(() async {
-        await readPqCodePage(tableName, indexName, meta, partitionNo, pageNo);
+        await readPqCodePage(table, indexUid, meta, partitionNo, pageNo);
       });
     }
 
@@ -381,15 +388,15 @@ final class NghPartitionManager {
       label: 'ngh_preload',
     );
 
-    final prefix = _indexPrefix(tableName, indexName);
+    final prefix = _indexPrefix(tableUid, indexUid);
     _graphPageCache.setFullyCached(prefix, true);
     _pqCodePageCache.setFullyCached(prefix, true);
     lease?.release();
   }
 
   /// Clear fully-cached markers for an index after write (next search may preload again).
-  void clearFullyCachedForIndex(String tableName, String indexName) {
-    final prefix = _indexPrefix(tableName, indexName);
+  void clearFullyCachedForIndex(TableUid tableUid, IndexUid indexUid) {
+    final prefix = _indexPrefix(tableUid, indexUid);
     _graphPageCache.setFullyCached(prefix, false);
     _pqCodePageCache.setFullyCached(prefix, false);
     _rawVectorPageCache.setFullyCached(prefix, false);
@@ -410,8 +417,8 @@ final class NghPartitionManager {
   /// [dirtyRawVectorPages] — raw-vector pages modified during insertion.
   /// [meta]                — current NGH index metadata (may be mutated for partition rotation).
   Future<NghIndexMeta> writeChanges({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     required Map<NghPagePtr, NghGraphPage> dirtyGraphPages,
     required Map<NghPagePtr, NghPqCodePage> dirtyPqCodePages,
@@ -422,6 +429,7 @@ final class NghPartitionManager {
     int? concurrency,
     int? yieldBudgetMs,
   }) async {
+    final tableUid = table.tableUid;
     if (dirtyGraphPages.isEmpty &&
         dirtyPqCodePages.isEmpty &&
         dirtyRawVectorPages.isEmpty) {
@@ -468,7 +476,7 @@ final class NghPartitionManager {
           _buildPageBytes(BTreePageType.nghGraph, payload, pageSize, encrypt);
       final stats = getStats(graphStats, ptr.partitionNo);
       stats.path ??= await _dataStore.pathManager
-          .getNghGraphPartitionPath(tableName, indexName, ptr.partitionNo);
+          .getNghGraphPartitionPath(tableUid, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -478,7 +486,7 @@ final class NghPartitionManager {
 
       // Update instance cache
       _graphPageCache
-          .put([tableName, indexName, ptr.partitionNo, ptr.pageNo], page);
+          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
     // ── Encode & stage PQ-code pages ──
@@ -491,7 +499,7 @@ final class NghPartitionManager {
           _buildPageBytes(BTreePageType.nghPqCode, payload, pageSize, encrypt);
       final stats = getStats(pqStats, ptr.partitionNo);
       stats.path ??= await _dataStore.pathManager
-          .getNghPqCodePartitionPath(tableName, indexName, ptr.partitionNo);
+          .getNghPqCodePartitionPath(tableUid, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -500,7 +508,7 @@ final class NghPartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
       _pqCodePageCache
-          .put([tableName, indexName, ptr.partitionNo, ptr.pageNo], page);
+          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
     // ── Encode & stage raw-vector pages ──
@@ -513,7 +521,7 @@ final class NghPartitionManager {
           BTreePageType.nghRawVector, payload, pageSize, encrypt);
       final stats = getStats(rawStats, ptr.partitionNo);
       stats.path ??= await _dataStore.pathManager
-          .getNghRawVectorPartitionPath(tableName, indexName, ptr.partitionNo);
+          .getNghRawVectorPartitionPath(tableUid, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -522,7 +530,7 @@ final class NghPartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
       _rawVectorPageCache
-          .put([tableName, indexName, ptr.partitionNo, ptr.pageNo], page);
+          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
     // ── Stage per-partition meta pages (pageNo=0) ──
@@ -574,7 +582,8 @@ final class NghPartitionManager {
             workloadType,
             requestedTokens: requested,
             minTokens: 1,
-            label: 'NghPartitionManager.writeChanges($tableName.$indexName)',
+            label:
+                'NghPartitionManager.writeChanges(${table.tableName}.$indexUid)',
           );
           await ParallelProcessor.execute<void>(
             tasks,
@@ -610,11 +619,11 @@ final class NghPartitionManager {
   Future<(NghPagePtr, NghIndexMeta)> allocatePage(
     NghDataCategory category,
     NghIndexMeta meta,
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
   ) async {
     // 1) Try free-list pop
-    final reused = await _popFreePage(category, meta, tableName, indexName);
+    final reused = await _popFreePage(category, meta, table, indexUid);
     if (reused != null) {
       return (reused, meta);
     }
@@ -692,8 +701,8 @@ final class NghPartitionManager {
     NghDataCategory category,
     NghPagePtr ptr,
     NghIndexMeta meta,
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     void Function(String path, int offset, Uint8List bytes) stageWrite,
   ) async {
     final pageSize = meta.nghPageSize;
@@ -709,7 +718,7 @@ final class NghPartitionManager {
     );
 
     final path =
-        await _partitionPath(category, tableName, indexName, ptr.partitionNo);
+        await _partitionPath(category, table, indexUid, ptr.partitionNo);
     stageWrite(path, ptr.pageNo * pageSize, freeBytes);
 
     // Update head pointer
@@ -723,8 +732,8 @@ final class NghPartitionManager {
   Future<NghPagePtr?> _popFreePage(
     NghDataCategory category,
     NghIndexMeta meta,
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
   ) async {
     final heads = _getFreeListHeads(category, meta);
     final yc = YieldController(
@@ -739,8 +748,7 @@ final class NghPartitionManager {
       final headPageNo = entry.value;
       if (headPageNo < NghIndexMeta.firstDataPageNo) continue;
 
-      final path =
-          await _partitionPath(category, tableName, indexName, partitionNo);
+      final path = await _partitionPath(category, table, indexUid, partitionNo);
       final pageSize = meta.nghPageSize;
 
       try {
@@ -798,18 +806,19 @@ final class NghPartitionManager {
   }
 
   /// Resolve the partition file path for a given category and partition number.
-  Future<String> _partitionPath(NghDataCategory category, String tableName,
-      String indexName, int partitionNo) async {
+  Future<String> _partitionPath(NghDataCategory category, TableContext table,
+      IndexUid indexUid, int partitionNo) async {
+    final tableUid = table.tableUid;
     switch (category) {
       case NghDataCategory.graph:
         return _dataStore.pathManager
-            .getNghGraphPartitionPath(tableName, indexName, partitionNo);
+            .getNghGraphPartitionPath(tableUid, indexUid, partitionNo);
       case NghDataCategory.pqCode:
         return _dataStore.pathManager
-            .getNghPqCodePartitionPath(tableName, indexName, partitionNo);
+            .getNghPqCodePartitionPath(tableUid, indexUid, partitionNo);
       case NghDataCategory.rawVector:
         return _dataStore.pathManager
-            .getNghRawVectorPartitionPath(tableName, indexName, partitionNo);
+            .getNghRawVectorPartitionPath(tableUid, indexUid, partitionNo);
     }
   }
 
@@ -819,17 +828,18 @@ final class NghPartitionManager {
 
   /// Write a PQ codebook to the dedicated codebook file.
   Future<void> writeCodebook(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghCodebookPage codebook,
     int pageSize,
   ) async {
+    final tableUid = table.tableUid;
     final encCfg = _dataStore.config.encryptionConfig;
     final encrypt = encCfg != null &&
         encCfg.encryptVectorIndex &&
         encCfg.encryptionType != EncryptionType.none;
     final path =
-        await _dataStore.pathManager.getNghCodebookPath(tableName, indexName);
+        await _dataStore.pathManager.getNghCodebookPath(tableUid, indexUid);
     await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
 
     // Check if codebook fits in a single page
@@ -934,12 +944,13 @@ final class NghPartitionManager {
   /// Read the PQ codebook from disk.
   /// Supports both single-page and multi-page codebooks.
   Future<NghCodebookPage?> readCodebook(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     int pageSize,
   ) async {
+    final tableUid = table.tableUid;
     final path =
-        await _dataStore.pathManager.getNghCodebookPath(tableName, indexName);
+        await _dataStore.pathManager.getNghCodebookPath(tableUid, indexUid);
     try {
       // Read first page to determine structure
       final firstPageRaw =
@@ -1055,17 +1066,17 @@ final class NghPartitionManager {
   }
 
   /// Clear caches for a specific table.
-  void clearPageCacheForTable(String tableName) {
-    _graphPageCache.remove([tableName]);
-    _pqCodePageCache.remove([tableName]);
-    _rawVectorPageCache.remove([tableName]);
+  void clearPageCacheForTable(TableUid tableUid) {
+    _graphPageCache.remove([tableUid]);
+    _pqCodePageCache.remove([tableUid]);
+    _rawVectorPageCache.remove([tableUid]);
   }
 
   /// Clear caches for a specific index.
-  void clearPageCacheForIndex(String tableName, String indexName) {
-    _graphPageCache.remove([tableName, indexName]);
-    _pqCodePageCache.remove([tableName, indexName]);
-    _rawVectorPageCache.remove([tableName, indexName]);
+  void clearPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    _graphPageCache.remove([tableUid, indexUid]);
+    _pqCodePageCache.remove([tableUid, indexUid]);
+    _rawVectorPageCache.remove([tableUid, indexUid]);
   }
 
   // =====================================================================
