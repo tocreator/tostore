@@ -19,6 +19,7 @@ import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_context.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute_tasks.dart';
@@ -28,6 +29,7 @@ import 'storage_adapter.dart';
 import 'tree_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 /// New baseline implementation: paged global leaf-chain B+Tree per index.
 ///
@@ -45,7 +47,7 @@ final class IndexTreePartitionManager {
   String keyOfPtr(TreePagePtr p) => '${p.partitionNo}:${p.pageNo}';
 
   // Instance-level page cache for read operations (cross-method calls)
-  // Key format: [tableName, indexName, partitionNo, pageNo]
+  // Key format: [tableUid, indexUid, partitionNo, pageNo]
   // This cache significantly reduces IO reads for frequently accessed pages,
   // especially internal nodes which are shared across many queries.
   late final TreeCache<LeafPage> _leafPageCache;
@@ -65,7 +67,7 @@ final class IndexTreePartitionManager {
       sizeCalculator: _estimateLeafPageSize,
       maxByteThreshold: leafCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
-      groupDepth: 2, // Group by [tableName, indexName]
+      groupDepth: 2, // Group by [table.tableUid, indexUid]
       debugLabel: 'IndexLeafPageCache',
     );
 
@@ -73,9 +75,15 @@ final class IndexTreePartitionManager {
       sizeCalculator: _estimateInternalPageSize,
       maxByteThreshold: internalCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
-      groupDepth: 2, // Group by [tableName, indexName]
+      groupDepth: 2, // Group by [table.tableUid, indexUid]
       debugLabel: 'IndexInternalPageCache',
     );
+  }
+
+  String _indexDisplayName(TableContext table, IndexUid indexUid) {
+    final idx =
+        _dataStore.schemaManager?.findIndexSchemaByUid(table.schema, indexUid);
+    return idx?.actualIndexName ?? indexUid.value;
   }
 
   /// Estimate size in bytes for a LeafPage
@@ -128,20 +136,20 @@ final class IndexTreePartitionManager {
   }
 
   /// Clear page cache for a specific table
-  void clearPageCacheForTable(String tableName) {
+  void clearPageCacheForTable(TableContext table) {
     try {
-      _leafPageCache.remove([tableName]);
-      _internalPageCache.remove([tableName]);
+      _leafPageCache.remove([table.tableUid]);
+      _internalPageCache.remove([table.tableUid]);
     } catch (e) {
       Logger.warn('Clear page cache for table failed', rawError: e);
     }
   }
 
   /// Clear page cache for a specific index
-  void clearPageCacheForIndex(String tableName, String indexName) {
+  void clearPageCacheForIndex(TableContext table, IndexUid indexUid) {
     try {
-      _leafPageCache.remove([tableName, indexName]);
-      _internalPageCache.remove([tableName, indexName]);
+      _leafPageCache.remove([table.tableUid, indexUid]);
+      _internalPageCache.remove([table.tableUid, indexUid]);
     } catch (e) {
       Logger.warn('Clear page cache for index failed', rawError: e);
     }
@@ -151,14 +159,15 @@ final class IndexTreePartitionManager {
   ///
   /// Returns an approximate number of bytes loaded into the page cache.
   Future<int> prewarmBoundaryPages(
-    String tableName,
-    String indexName, {
+    TableContext table,
+    IndexUid indexUid, {
     IndexMeta? meta,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final resolvedMeta = meta ??
-        await _dataStore.indexManager?.getIndexMeta(tableName, indexName);
+    final tableUid = table.tableUid;
+    final resolvedMeta =
+        meta ?? await _dataStore.indexManager?.getIndexMeta(table, indexUid);
     if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
       return 0;
     }
@@ -170,11 +179,11 @@ final class IndexTreePartitionManager {
 
     Future<void> prewarmLeaf(TreePagePtr ptr) async {
       if (ptr.isNull) return;
-      final cacheKey = [tableName, indexName, ptr.partitionNo, ptr.pageNo];
+      final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
       final alreadyCached = _leafPageCache.containsKey(cacheKey);
       await _readLeaf(
-        tableName,
-        indexName,
+        table,
+        indexUid,
         resolvedMeta,
         ptr,
         encryptionKey: encryptionKey,
@@ -194,7 +203,7 @@ final class IndexTreePartitionManager {
   }
 
   /// Get partition file path using the dirIndex from partition meta.
-  Future<String> _partitionFilePath(String tableName, String indexName,
+  Future<String> _partitionFilePath(TableContext table, IndexUid indexUid,
       IndexMeta meta, int partitionNo) async {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
@@ -206,7 +215,7 @@ final class IndexTreePartitionManager {
       ]);
     }
     return _dataStore.pathManager
-        .getIndexPartitionPathByNo(tableName, indexName, partitionNo);
+        .getIndexPartitionPathByNo(table.tableUid, indexUid, partitionNo);
   }
 
   Uint8List _aad(TreePagePtr ptr, BTreePageType type) {
@@ -218,8 +227,8 @@ final class IndexTreePartitionManager {
   }
 
   Future<LeafPage> _readLeaf(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     IndexMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
@@ -227,6 +236,8 @@ final class IndexTreePartitionManager {
     Map<String, LeafPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     if (ptr.isNull) return LeafPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
@@ -237,7 +248,7 @@ final class IndexTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableName, indexName, ptr.partitionNo, ptr.pageNo];
+    final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
     final instanceCached = _leafPageCache.get(cacheKey);
     if (instanceCached != null) {
       // Copy to local cache if provided
@@ -253,7 +264,7 @@ final class IndexTreePartitionManager {
       return LeafPage.empty();
     }
     final path =
-        await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
+        await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
     final pageSize = meta.btreePageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
@@ -286,14 +297,14 @@ final class IndexTreePartitionManager {
         e,
         forceType: ResultType.engError,
         message:
-            'Corrupted B+Tree leaf page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+            'Corrupted B+Tree leaf page: index=$tableName.${_indexDisplayName(table, indexUid)} ptr=$ptr path=$path err=$e',
       );
     }
   }
 
   Future<InternalPage> _readInternal(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     IndexMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
@@ -301,6 +312,8 @@ final class IndexTreePartitionManager {
     Map<String, InternalPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     if (ptr.isNull) return InternalPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
@@ -311,7 +324,7 @@ final class IndexTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableName, indexName, ptr.partitionNo, ptr.pageNo];
+    final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
     final instanceCached = _internalPageCache.get(cacheKey);
     if (instanceCached != null) {
       // Copy to local cache if provided
@@ -327,7 +340,7 @@ final class IndexTreePartitionManager {
       return InternalPage.empty();
     }
     final path =
-        await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
+        await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
     final pageSize = meta.btreePageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
@@ -361,7 +374,7 @@ final class IndexTreePartitionManager {
         e,
         forceType: ResultType.engError,
         message:
-            'Corrupted B+Tree internal page: index=$tableName.$indexName ptr=$ptr path=$path err=$e',
+            'Corrupted B+Tree internal page: index=$tableName.${_indexDisplayName(table, indexUid)} ptr=$ptr path=$path err=$e',
       );
     }
   }
@@ -381,8 +394,8 @@ final class IndexTreePartitionManager {
       meta.copyWith(btreeNextPageNo: meta.btreeNextPageNo + 1);
 
   Future<TreePagePtr> _locateLeafForKey(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     IndexMeta meta,
     Uint8List keyBytes, {
     Uint8List? encryptionKey,
@@ -395,7 +408,7 @@ final class IndexTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternal(tableName, indexName, meta, cur,
+      final node = await _readInternal(table, indexUid, meta, cur,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -407,8 +420,8 @@ final class IndexTreePartitionManager {
   }
 
   Future<TreePagePtr> _locateRightmostLeaf(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     IndexMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -420,7 +433,7 @@ final class IndexTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternal(tableName, indexName, meta, cur,
+      final node = await _readInternal(table, indexUid, meta, cur,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -432,8 +445,8 @@ final class IndexTreePartitionManager {
   }
 
   Future<TreePagePtr> _locateRightmostLeafFast(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     IndexMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -445,8 +458,8 @@ final class IndexTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     if (lastLeaf.isNull) {
       return _locateRightmostLeaf(
-        tableName,
-        indexName,
+        table,
+        indexUid,
         meta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
@@ -456,8 +469,8 @@ final class IndexTreePartitionManager {
 
     try {
       final leaf = await _readLeaf(
-        tableName,
-        indexName,
+        table,
+        indexUid,
         meta,
         lastLeaf,
         encryptionKey: encryptionKey,
@@ -472,8 +485,8 @@ final class IndexTreePartitionManager {
     } catch (_) {}
 
     return _locateRightmostLeaf(
-      tableName,
-      indexName,
+      table,
+      indexUid,
       meta,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
@@ -483,8 +496,8 @@ final class IndexTreePartitionManager {
 
   /// Apply index deltas (put/delete) to paged tree.
   Future<void> writeChanges({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta indexMeta,
     required List<DataBlockEntry> deltas,
     BatchContext? batchContext,
@@ -492,6 +505,9 @@ final class IndexTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
+    final indexLogName = _indexDisplayName(table, indexUid);
     final sw = Stopwatch()..start();
     final totalDeltas = deltas.length;
 
@@ -560,7 +576,7 @@ final class IndexTreePartitionManager {
     Future<void> ensurePartitionHeaderLoaded(int pNo) async {
       final stats = getStats(pNo);
       if (stats.headerLoaded) return;
-      stats.path ??= await _partitionFilePath(tableName, indexName, meta, pNo);
+      stats.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
       final pageSize = meta.btreePageSize;
       try {
         final raw0 =
@@ -596,7 +612,7 @@ final class IndexTreePartitionManager {
       await ensurePartitionHeaderLoaded(ptr.partitionNo);
       final stats = getStats(ptr.partitionNo);
       stats.path ??=
-          await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
+          await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -619,7 +635,7 @@ final class IndexTreePartitionManager {
       final head = stats.freeListHeadPageNo;
       if (head < _firstDataPageNo) return null;
       stats.path ??=
-          await _partitionFilePath(tableName, indexName, meta, partitionNo);
+          await _partitionFilePath(table, indexUid, meta, partitionNo);
       final pageSize = meta.btreePageSize;
       final off = head * pageSize;
       final stagedBytes = peekStaged(stats.path!, off);
@@ -718,14 +734,14 @@ final class IndexTreePartitionManager {
     }
 
     Future<LeafPage> getLeaf(TreePagePtr ptr) async {
-      return await _readLeaf(tableName, indexName, meta, ptr,
+      return await _readLeaf(table, indexUid, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           localCache: leafCache);
     }
 
     Future<InternalPage> getInternal(TreePagePtr ptr) async {
-      return await _readInternal(tableName, indexName, meta, ptr,
+      return await _readInternal(table, indexUid, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           localCache: internalCache);
@@ -1012,7 +1028,7 @@ final class IndexTreePartitionManager {
     if (sawDelete && lastDeleteLeafPtr != null && !lastDeleteLeafPtr.isNull) {
       try {
         _dataStore.compactionManager
-            .enqueueIndex(tableName, indexName, hint: lastDeleteLeafPtr);
+            .enqueueIndex(table, indexUid, hint: lastDeleteLeafPtr);
       } catch (_) {}
     }
 
@@ -1075,8 +1091,8 @@ final class IndexTreePartitionManager {
           pages: List<BTreePageEncodeItem>.from(pending, growable: false),
           pageRedoTreeKindIndex:
               batchContext != null ? PageRedoTreeKind.indexTree.index : null,
-          pageRedoTableName: batchContext != null ? tableName : null,
-          pageRedoIndexName: batchContext != null ? indexName : null,
+          pageRedoTableUid: batchContext != null ? tableUid : null,
+          pageRedoIndexUid: batchContext != null ? indexUid : null,
         );
 
         final bytesList = res.pageBytes;
@@ -1093,8 +1109,8 @@ final class IndexTreePartitionManager {
           await stageYc.maybeYield();
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
-          stats.path ??= await _partitionFilePath(
-              tableName, indexName, meta, ptr.partitionNo);
+          stats.path ??=
+              await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
           if (!stats.dirEnsured) {
             await _storage.ensureDirectoryExists(p.dirname(stats.path!));
             stats.dirEnsured = true;
@@ -1148,7 +1164,7 @@ final class IndexTreePartitionManager {
                 GeneralStatus(
                   type: ResultType.engError,
                   message:
-                      'Index $tableName.$indexName: page overflow after split '
+                      'Index $tableName.$indexLogName: page overflow after split '
                       '(single entry may exceed page capacity). '
                       'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
                       'pageSize=${meta.btreePageSize}',
@@ -1209,7 +1225,7 @@ final class IndexTreePartitionManager {
                 GeneralStatus(
                   type: ResultType.engError,
                   message:
-                      'Index $tableName.$indexName: internal ptr not found in descent frames',
+                      'Index $tableName.$indexLogName: internal ptr not found in descent frames',
                 ),
               ]);
             }
@@ -1237,7 +1253,7 @@ final class IndexTreePartitionManager {
                 GeneralStatus(
                   type: ResultType.engError,
                   message:
-                      'Index $tableName.$indexName: internal page overflow after split. '
+                      'Index $tableName.$indexLogName: internal page overflow after split. '
                       'pageSize=${meta.btreePageSize}',
                 ),
               ]);
@@ -1283,7 +1299,7 @@ final class IndexTreePartitionManager {
       final pNo = entry.key;
       final stats = entry.value;
 
-      stats.path ??= await _partitionFilePath(tableName, indexName, meta, pNo);
+      stats.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1370,8 +1386,8 @@ final class IndexTreePartitionManager {
         final currentTotalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
         await _dataStore.parallelJournalManager.appendJournalEntry(
           IndexPartitionFlushedEntry(
-            table: tableName,
-            index: indexName,
+            table: tableUid,
+            index: indexUid.value,
             partitionNo: pNo,
             totalEntries: currentTotalEntries, // New: complete index statistics
             totalSizeInBytes:
@@ -1393,8 +1409,8 @@ final class IndexTreePartitionManager {
       await _storage.ensureDirectoryExists(p.dirname(redoPath));
       final rec = PageRedoLogCodec.encodeTreeMetaRecord(
         treeKind: PageRedoTreeKind.indexTree,
-        tableName: tableName,
-        indexName: indexName,
+        tableUid: table.tableUid,
+        indexUid: indexUid,
         btreePageSize: meta.btreePageSize,
         btreeNextPageNo: meta.btreeNextPageNo,
         btreePartitionCount: meta.btreePartitionCount,
@@ -1454,7 +1470,7 @@ final class IndexTreePartitionManager {
               requestedTokens: requested,
               minTokens: 1,
               label:
-                  'IndexTreePartitionManager.writeChanges($tableName.$indexName)',
+                  'IndexTreePartitionManager.writeChanges($tableName.$indexLogName)',
             );
 
             final int ioConcurrency = min(tasks.length, max(1, lease.tokens));
@@ -1483,8 +1499,8 @@ final class IndexTreePartitionManager {
       );
 
       await indexManager.updateIndexMeta(
-        tableName: tableName,
-        indexName: indexName,
+        table: table,
+        indexUid: indexUid,
         updatedMeta: updatedMeta,
         flush: false,
       );
@@ -1494,8 +1510,8 @@ final class IndexTreePartitionManager {
       if (batchContext != null) {
         await _dataStore.parallelJournalManager.appendJournalEntry(
           IndexMetaUpdatedEntry(
-            table: tableName,
-            index: indexName,
+            table: tableUid,
+            index: indexUid.value,
             batchId: batchContext.batchId,
             batchType: batchContext.batchType,
           ),
@@ -1511,15 +1527,15 @@ final class IndexTreePartitionManager {
       final totalEntries = max(0, meta.totalEntries + entriesDeltaSum);
       final totalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
       Logger.debug(
-          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexName, batchEntries=$totalDeltas, totalEntries=$totalEntries, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
+          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexLogName, batchEntries=$totalDeltas, totalEntries=$totalEntries, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
   /// Background compaction: scan leaf chain and merge underfull adjacent siblings.
   /// Returns next cursor, or null when finished for now.
   Future<TreePagePtr?> compactLeafChain({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     TreePagePtr? startFrom,
     required int maxVisitedLeaves,
     required int maxMerges,
@@ -1527,8 +1543,7 @@ final class IndexTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final meta0 =
-        await _dataStore.indexManager?.getIndexMeta(tableName, indexName);
+    final meta0 = await _dataStore.indexManager?.getIndexMeta(table, indexUid);
     if (meta0 == null || meta0.btreeFirstLeaf.isNull) return null;
     var meta = meta0;
     if (maxVisitedLeaves <= 0 || maxMerges <= 0) return startFrom;
@@ -1549,7 +1564,7 @@ final class IndexTreePartitionManager {
     Future<void> ensureHeaderLoaded(int pNo) async {
       final s = getStats(pNo);
       if (s.headerLoaded) return;
-      s.path ??= await _partitionFilePath(tableName, indexName, meta, pNo);
+      s.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
       try {
         final raw0 = await _storage.readAsBytesAt(s.path!, 0,
             length: meta.btreePageSize);
@@ -1576,8 +1591,8 @@ final class IndexTreePartitionManager {
       if (pagePtr.pageNo <= 0) return;
       await ensureHeaderLoaded(pagePtr.partitionNo);
       final s = getStats(pagePtr.partitionNo);
-      s.path ??= await _partitionFilePath(
-          tableName, indexName, meta, pagePtr.partitionNo);
+      s.path ??=
+          await _partitionFilePath(table, indexUid, meta, pagePtr.partitionNo);
       if (!s.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(s.path!));
         s.dirEnsured = true;
@@ -1637,7 +1652,7 @@ final class IndexTreePartitionManager {
       if (meta.btreeHeight <= 0) return meta.btreeRoot;
       TreePagePtr cur = meta.btreeRoot;
       for (int depth = meta.btreeHeight; depth > 0; depth--) {
-        final node = await _readInternal(tableName, indexName, meta, cur,
+        final node = await _readInternal(table, indexUid, meta, cur,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         if (node.children.isEmpty) return meta.btreeFirstLeaf;
         final idx = node.childIndexForKey(key);
@@ -1654,7 +1669,7 @@ final class IndexTreePartitionManager {
 
     while (!ptr.isNull && visited < maxVisitedLeaves && merged < maxMerges) {
       await yc.maybeYield();
-      final leaf = await _readLeaf(tableName, indexName, meta, ptr,
+      final leaf = await _readLeaf(table, indexUid, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       visited++;
       if (leaf.keys.isEmpty) {
@@ -1685,7 +1700,7 @@ final class IndexTreePartitionManager {
         ptr = leaf.next;
         continue;
       }
-      final right = await _readLeaf(tableName, indexName, meta, rightPtr,
+      final right = await _readLeaf(table, indexUid, meta, rightPtr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       if (right.keys.isEmpty) {
         ptr = leaf.next;
@@ -1715,12 +1730,11 @@ final class IndexTreePartitionManager {
       final oldRightNext = right.next;
       leaf.next = oldRightNext;
       if (!oldRightNext.isNull) {
-        final nextLeaf = await _readLeaf(
-            tableName, indexName, meta, oldRightNext,
+        final nextLeaf = await _readLeaf(table, indexUid, meta, oldRightNext,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         nextLeaf.prev = ptr;
         final pth = await _partitionFilePath(
-            tableName, indexName, meta, oldRightNext.partitionNo);
+            table, indexUid, meta, oldRightNext.partitionNo);
         stageWrite(pth, oldRightNext.pageNo * meta.btreePageSize,
             encodeLeaf(oldRightNext, nextLeaf));
       }
@@ -1739,13 +1753,13 @@ final class IndexTreePartitionManager {
         await pushFree(parentFrame.ptr);
       } else {
         final parentPath = await _partitionFilePath(
-            tableName, indexName, meta, parentFrame.ptr.partitionNo);
+            table, indexUid, meta, parentFrame.ptr.partitionNo);
         stageWrite(parentPath, parentFrame.ptr.pageNo * meta.btreePageSize,
             encodeInternal(parentFrame.ptr, parent));
       }
 
       final leftPath =
-          await _partitionFilePath(tableName, indexName, meta, ptr.partitionNo);
+          await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
       stageWrite(
           leftPath, ptr.pageNo * meta.btreePageSize, encodeLeaf(ptr, leaf));
       await pushFree(rightPtr);
@@ -1763,7 +1777,7 @@ final class IndexTreePartitionManager {
       for (final e in partitionStats.entries) {
         final pNo = e.key;
         final s = e.value;
-        s.path ??= await _partitionFilePath(tableName, indexName, meta, pNo);
+        s.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
         if (!s.dirEnsured) {
           await _storage.ensureDirectoryExists(p.dirname(s.path!));
           s.dirEnsured = true;
@@ -1801,8 +1815,8 @@ final class IndexTreePartitionManager {
 
     // Update IndexMeta (structure pointers only).
     await _dataStore.indexManager?.updateIndexMeta(
-      tableName: tableName,
-      indexName: indexName,
+      table: table,
+      indexUid: indexUid,
       updatedMeta: meta.copyWith(
         timestamps: Timestamps(
             created: meta.timestamps.created, modified: DateTime.now()),
@@ -1814,21 +1828,26 @@ final class IndexTreePartitionManager {
     return ptr.isNull ? null : ptr;
   }
 
+  IndexUid _effectiveIndexUid(IndexUid indexUid, IndexMeta meta) {
+    return meta.indexUid.isNotEmpty ? meta.indexUid : indexUid;
+  }
+
   /// Point lookup for unique index key. Returns PK string if exists.
   Future<String?> lookupUniquePrimaryKey({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta meta,
     required Uint8List uniqueKey,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool readFromFileOnly = false,
   }) async {
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return null;
     var leafPtr = await _locateLeafForKey(
-      tableName,
-      indexName,
+      table,
+      resolvedUid,
       meta,
       uniqueKey,
       encryptionKey: encryptionKey,
@@ -1836,7 +1855,7 @@ final class IndexTreePartitionManager {
       readFromFileOnly: readFromFileOnly,
     );
     if (leafPtr.isNull) leafPtr = firstLeaf;
-    final leaf = await _readLeaf(tableName, indexName, meta, leafPtr,
+    final leaf = await _readLeaf(table, resolvedUid, meta, leafPtr,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         readFromFileOnly: readFromFileOnly);
@@ -1856,14 +1875,15 @@ final class IndexTreePartitionManager {
   /// Batch lookup PKs for unique index keys. Returns one PK per key (null if not found).
   /// Groups by leaf to minimize leaf reads; tree descent is still per-key.
   Future<List<String?>> lookupUniquePrimaryKeysBatch({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta meta,
     required List<Uint8List> uniqueKeys,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool readFromFileOnly = false,
   }) async {
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
     if (uniqueKeys.isEmpty) return const [];
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) {
@@ -1872,8 +1892,8 @@ final class IndexTreePartitionManager {
     final leafPtrToKeyIndices = <String, List<int>>{};
     for (int i = 0; i < uniqueKeys.length; i++) {
       var leafPtr = await _locateLeafForKey(
-        tableName,
-        indexName,
+        table,
+        resolvedUid,
         meta,
         uniqueKeys[i],
         encryptionKey: encryptionKey,
@@ -1888,7 +1908,7 @@ final class IndexTreePartitionManager {
     for (final entry in leafPtrToKeyIndices.entries) {
       final parts = entry.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeaf(tableName, indexName, meta, ptr,
+      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -1908,13 +1928,14 @@ final class IndexTreePartitionManager {
 
   /// Batch existence check for unique keys (bool per key).
   Future<List<bool>> existsUniqueKeysBatch({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta meta,
     required List<Uint8List> uniqueKeys,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
     if (uniqueKeys.isEmpty) return const <bool>[];
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) {
@@ -1926,8 +1947,8 @@ final class IndexTreePartitionManager {
     for (int i = 0; i < uniqueKeys.length; i++) {
       final k = uniqueKeys[i];
       final ptr = await _locateLeafForKey(
-        tableName,
-        indexName,
+        table,
+        resolvedUid,
         meta,
         k,
         encryptionKey: encryptionKey,
@@ -1947,7 +1968,7 @@ final class IndexTreePartitionManager {
       await yc.maybeYield();
       final parts = e.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeaf(tableName, indexName, meta, ptr,
+      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       for (final idx in e.value) {
         final key = uniqueKeys[idx];
@@ -1962,8 +1983,8 @@ final class IndexTreePartitionManager {
   /// For non-unique indexes, PK is encoded as last component of key bytes.
   /// For unique indexes, PK is stored in value bytes.
   Future<IndexSearchResult> searchByKeyRange({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta meta,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
@@ -1974,6 +1995,7 @@ final class IndexTreePartitionManager {
     int? encryptionKeyId,
     bool readFromFileOnly = false,
   }) async {
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return IndexSearchResult.empty();
 
@@ -1988,8 +2010,8 @@ final class IndexTreePartitionManager {
       if (endKeyExclusive.isNotEmpty) {
         // Reverse scan with upper bound (or cursor): start near the upper bound.
         leafPtr = await _locateLeafForKey(
-          tableName,
-          indexName,
+          table,
+          resolvedUid,
           meta,
           endKeyExclusive,
           encryptionKey: encryptionKey,
@@ -2001,8 +2023,8 @@ final class IndexTreePartitionManager {
         // Fast path: trust meta.btreeLastLeaf when it still points to the
         // boundary leaf, and fall back to a full right-edge descent otherwise.
         leafPtr = await _locateRightmostLeafFast(
-          tableName,
-          indexName,
+          table,
+          resolvedUid,
           meta,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
@@ -2012,8 +2034,8 @@ final class IndexTreePartitionManager {
     } else {
       // Forward scan: start at lower bound.
       leafPtr = await _locateLeafForKey(
-        tableName,
-        indexName,
+        table,
+        resolvedUid,
         meta,
         startKeyInclusive,
         encryptionKey: encryptionKey,
@@ -2035,8 +2057,8 @@ final class IndexTreePartitionManager {
       final f = prefetched.remove(k);
       if (f != null) return f;
       return _readLeaf(
-        tableName,
-        indexName,
+        table,
+        resolvedUid,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2050,8 +2072,8 @@ final class IndexTreePartitionManager {
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
       prefetched[k] = _readLeaf(
-        tableName,
-        indexName,
+        table,
+        resolvedUid,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2159,12 +2181,13 @@ final class IndexTreePartitionManager {
   /// WARNING: This is inherently a full scan; only used when user explicitly
   /// calls `IndexManager.prewarmIndexDataCache`.
   Future<List<DecodedIndexEntry>> getAllDecodedEntries({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required IndexMeta meta,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return const <DecodedIndexEntry>[];
 
@@ -2174,7 +2197,7 @@ final class IndexTreePartitionManager {
         checkInterval: 50);
     while (!ptr.isNull) {
       await yc.maybeYield();
-      final leaf = await _readLeaf(tableName, indexName, meta, ptr,
+      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       for (int i = 0; i < leaf.keys.length; i++) {
         await yc.maybeYield();
