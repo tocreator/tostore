@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import '../../model/data_store_config.dart';
 import '../../model/encoder_config.dart';
+import '../../model/table_identity.dart';
 import '../compute_manager.dart';
 import '../compute_tasks.dart';
 import 'compute_batch_planner.dart';
@@ -35,8 +36,8 @@ final class BTreePageEncodeBatchRunner {
     int? customKeyId,
     required List<BTreePageEncodeItem> pages,
     int? pageRedoTreeKindIndex,
-    String? pageRedoTableName,
-    String? pageRedoIndexName,
+    TableUid? pageRedoTableUid,
+    IndexUid? pageRedoIndexUid,
   }) async {
     if (pages.isEmpty) {
       return const BatchBTreePageEncodeResult(<Uint8List>[]);
@@ -70,8 +71,8 @@ final class BTreePageEncodeBatchRunner {
             customKeyId: customKeyId,
             pages: pages.sublist(range.start, range.end),
             pageRedoTreeKindIndex: pageRedoTreeKindIndex,
-            pageRedoTableName: pageRedoTableName,
-            pageRedoIndexName: pageRedoIndexName,
+            pageRedoTableUid: pageRedoTableUid,
+            pageRedoIndexUid: pageRedoIndexUid,
           ),
         ),
       );
