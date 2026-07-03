@@ -1,5 +1,6 @@
 import 'dart:async';
 import '../model/data_store_config.dart';
+import '../model/table_identity.dart';
 
 /// Lightweight transaction-scoped context for tracking touched file paths
 /// without introducing circular dependencies. Values are stored in Zone.
@@ -16,7 +17,7 @@ class TransactionContext {
   /// Zone key for current transaction acquired exclusive locks: `Map<resource, operationId>`
   static const Symbol acquiredExclusiveLocksKey = #to_exclusive_locks;
 
-  /// Zone key for read-set tracking in current transaction: `Map<tableName, Set<primaryKey>>`
+  /// Zone key for read-set tracking in current transaction: `Map<tableUid, Set<primaryKey>>`
   static const Symbol readKeysKey = #to_read_keys;
 
   /// Zone key indicating we are applying commit (bypassing tx deferral)
@@ -59,19 +60,19 @@ class TransactionContext {
   }
 
   /// Register a read key under table in current transaction scope (for SSI)
-  static void registerReadKey(String tableName, String primaryKey) {
-    final map = Zone.current[readKeysKey] as Map<String, Set<String>>?;
+  static void registerReadKey(TableUid tableUid, String primaryKey) {
+    final map = Zone.current[readKeysKey] as Map<TableUid, Set<String>>?;
     if (map == null) return;
-    final set = map.putIfAbsent(tableName, () => <String>{});
+    final set = map.putIfAbsent(tableUid, () => <String>{});
     set.add(primaryKey);
   }
 
   /// Snapshot read keys map
-  static Map<String, Set<String>> getReadKeys() {
-    final map = Zone.current[readKeysKey] as Map<String, Set<String>>?;
-    if (map == null) return <String, Set<String>>{};
+  static Map<TableUid, Set<String>> getReadKeys() {
+    final map = Zone.current[readKeysKey] as Map<TableUid, Set<String>>?;
+    if (map == null) return <TableUid, Set<String>>{};
     // deep copy sets
-    final out = <String, Set<String>>{};
+    final out = <TableUid, Set<String>>{};
     map.forEach((k, v) {
       out[k] = Set<String>.from(v);
     });
