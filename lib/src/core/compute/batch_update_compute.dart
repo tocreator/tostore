@@ -3,6 +3,7 @@ import '../../model/db_exception.dart';
 import '../../model/expr.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
@@ -11,7 +12,7 @@ import 'unique_ref_compute.dart';
 /// Pure-compute request for a batchUpdate preparation chunk.
 class BatchUpdatePrepareRequest {
   final TableSchema schema;
-  final String tableName;
+  final TableContext table;
   final List<Map<String, dynamic>> records;
   final List<Map<String, dynamic>?> existingRecords;
   final List<IndexSchema> uniqueIndexes;
@@ -19,7 +20,7 @@ class BatchUpdatePrepareRequest {
 
   BatchUpdatePrepareRequest({
     required this.schema,
-    required this.tableName,
+    required this.table,
     required this.records,
     required this.existingRecords,
     required this.uniqueIndexes,
@@ -61,13 +62,13 @@ class BatchUpdatePrepareResult {
 /// same validated update payload is applied to many existing records.
 class UniformUpdatePrepareRequest {
   final TableSchema schema;
-  final String tableName;
+  final TableContext table;
   final Map<String, dynamic> validData;
   final List<Map<String, dynamic>> existingRecords;
 
   UniformUpdatePrepareRequest({
     required this.schema,
-    required this.tableName,
+    required this.table,
     required this.validData,
     required this.existingRecords,
   });
@@ -136,7 +137,7 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
       validData = validateAndProcessUpdateDataPure(
         schema: request.schema,
         data: record,
-        tableName: request.tableName,
+        tableName: request.table.tableName,
         ignoreUnknownFields: request.ignoreUnknownFields,
       );
       if (validData == null || validData.isEmpty) {
