@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_identity.dart';
 
 /// Page redo log: append-only records for crash-safe page replay.
 ///
@@ -29,16 +30,16 @@ sealed class PageRedoLogRecord {
 /// One full page image write (after-image).
 final class PageRedoPageRecord extends PageRedoLogRecord {
   final PageRedoTreeKind treeKind;
-  final String tableName;
-  final String? indexName;
+  final TableUid tableUid;
+  final IndexUid? indexUid;
   final int partitionNo;
   final int pageNo;
   final Uint8List payload; // full page bytes
 
   const PageRedoPageRecord({
     required this.treeKind,
-    required this.tableName,
-    required this.indexName,
+    required this.tableUid,
+    required this.indexUid,
     required this.partitionNo,
     required this.pageNo,
     required this.payload,
@@ -49,8 +50,8 @@ final class PageRedoPageRecord extends PageRedoLogRecord {
 /// Tree structure snapshot (no totals). Used to keep meta consistent with replayed pages.
 final class PageRedoTreeMetaRecord extends PageRedoLogRecord {
   final PageRedoTreeKind treeKind;
-  final String tableName;
-  final String? indexName;
+  final TableUid tableUid;
+  final IndexUid? indexUid;
 
   final int btreePageSize;
   final int btreeNextPageNo;
@@ -66,8 +67,8 @@ final class PageRedoTreeMetaRecord extends PageRedoLogRecord {
 
   const PageRedoTreeMetaRecord({
     required this.treeKind,
-    required this.tableName,
-    required this.indexName,
+    required this.tableUid,
+    required this.indexUid,
     required this.btreePageSize,
     required this.btreeNextPageNo,
     required this.btreePartitionCount,
@@ -104,24 +105,24 @@ final class PageRedoLogCodec {
   /// Encode one page write record (full page bytes).
   static Uint8List encodePageRecord({
     required PageRedoTreeKind treeKind,
-    required String tableName,
-    String? indexName,
+    required TableUid tableUid,
+    IndexUid? indexUid,
     required int partitionNo,
     required int pageNo,
     required Uint8List payload,
   }) {
-    final tableBytes = _u16StringBytes(tableName);
+    final tableBytes = _u16StringBytes(tableUid);
     final indexBytes = (treeKind == PageRedoTreeKind.indexTree)
-        ? _u16StringBytes(indexName ?? '')
+        ? _u16StringBytes(indexUid?.value ?? '')
         : Uint8List(0);
 
     if (treeKind == PageRedoTreeKind.indexTree &&
-        (indexName == null || indexName.isEmpty)) {
+        (indexUid == null || indexUid.isEmpty)) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'PageRedoLog: indexName required for index records',
-          parameterName: 'indexName',
+          message: 'PageRedoLog: indexUid required for index records',
+          parameterName: 'indexUid',
         ),
       ]);
     }
@@ -172,8 +173,8 @@ final class PageRedoLogCodec {
   /// Encode one tree structure snapshot record (no totals).
   static Uint8List encodeTreeMetaRecord({
     required PageRedoTreeKind treeKind,
-    required String tableName,
-    String? indexName,
+    required TableUid tableUid,
+    IndexUid? indexUid,
     required int btreePageSize,
     required int btreeNextPageNo,
     required int btreePartitionCount,
@@ -185,18 +186,18 @@ final class PageRedoLogCodec {
     required int btreeLastLeafPageNo,
     required int btreeHeight,
   }) {
-    final tableBytes = _u16StringBytes(tableName);
+    final tableBytes = _u16StringBytes(tableUid);
     final indexBytes = (treeKind == PageRedoTreeKind.indexTree)
-        ? _u16StringBytes(indexName ?? '')
+        ? _u16StringBytes(indexUid?.value ?? '')
         : Uint8List(0);
 
     if (treeKind == PageRedoTreeKind.indexTree &&
-        (indexName == null || indexName.isEmpty)) {
+        (indexUid == null || indexUid.isEmpty)) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'PageRedoLog: indexName required for index meta records',
-          parameterName: 'indexName',
+          message: 'PageRedoLog: indexUid required for index meta records',
+          parameterName: 'indexUid',
         ),
       ]);
     }
@@ -281,17 +282,17 @@ final class PageRedoLogCodec {
     final tableLen = bd.getUint16(pos, Endian.little);
     pos += 2;
     if (pos + tableLen > end) return null;
-    final tableName =
-        utf8.decode(Uint8List.sublistView(bytes, pos, pos + tableLen));
+    final tableUid = TableUid(
+        utf8.decode(Uint8List.sublistView(bytes, pos, pos + tableLen)));
     pos += tableLen;
 
     if (pos + 2 > end) return null;
     final indexLen = bd.getUint16(pos, Endian.little);
     pos += 2;
     if (pos + indexLen > end) return null;
-    final String? indexName = indexLen == 0
+    final IndexUid? indexUid = indexLen == 0
         ? null
-        : utf8.decode(Uint8List.sublistView(bytes, pos, pos + indexLen));
+        : IndexUid(utf8.decode(Uint8List.sublistView(bytes, pos, pos + indexLen)));
     pos += indexLen;
 
     switch (recType) {
@@ -307,8 +308,8 @@ final class PageRedoLogCodec {
         final payload = Uint8List.sublistView(bytes, pos, pos + payloadLen);
         return PageRedoPageRecord(
           treeKind: kind,
-          tableName: tableName,
-          indexName: indexName,
+          tableUid: tableUid,
+          indexUid: indexUid,
           partitionNo: partitionNo,
           pageNo: pageNo,
           payload: payload,
@@ -339,8 +340,8 @@ final class PageRedoLogCodec {
         final btreeHeight = bd.getInt32(pos, Endian.little);
         return PageRedoTreeMetaRecord(
           treeKind: kind,
-          tableName: tableName,
-          indexName: indexName,
+          tableUid: tableUid,
+          indexUid: indexUid,
           btreePageSize: btreePageSize,
           btreeNextPageNo: btreeNextPageNo,
           btreePartitionCount: btreePartitionCount,
