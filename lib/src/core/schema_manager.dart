@@ -1,18 +1,21 @@
+import 'dart:async';
 import 'dart:convert';
+
 import 'package:path/path.dart' show dirname;
 
 import '../handler/binary_schema_codec.dart';
+import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/space_tables_codec.dart';
-import '../handler/common.dart';
 import '../model/db_exception.dart';
+import '../model/id_generator.dart';
 import '../model/meta_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
 import '../model/table_context.dart';
-import '../model/id_generator.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import 'data_store_impl.dart';
 import 'tree_cache.dart';
 
@@ -67,17 +70,58 @@ class SchemaManager {
   SchemaManager(this._dataStore);
 
   /// Get tableUid by tableName
-  String? getUidByName(String tableName) {
-    return uidByName[tableName];
+  TableUid? getUidByName(TableName tableName) {
+    final uid = uidByName[tableName];
+    return uid == null ? null : TableUid(uid);
   }
 
   /// Get tableName by tableUid
-  String? getNameByUid(String tableUid) {
-    return nameByUid[tableUid];
+  TableName? getNameByUid(TableUid tableUid) {
+    final name = nameByUid[tableUid];
+    return name == null ? null : TableName(name);
+  }
+
+  /// Normalize a persisted uid-or-name field to a stable map key (prefers uid).
+  String normalizeTableFieldKey(String field) {
+    if (field.isEmpty) return field;
+    if (routeByUid.containsKey(field)) return field;
+    return getUidByName(TableName(field))?.value ?? field;
+  }
+
+  /// Whether [normalizedKey] is an active table uid in the route map (O(1)).
+  bool isActiveTableUidKey(String normalizedKey) {
+    return normalizedKey.isNotEmpty && routeByUid.containsKey(normalizedKey);
+  }
+
+  /// Resolve user-visible table name from a persisted uid-or-name field.
+  TableName? resolveTableNameFromField(String field) {
+    if (field.isEmpty) return null;
+    final byUid = getNameByUid(TableUid(field));
+    if (byUid != null) return byUid;
+    if (uidByName.containsKey(field)) return TableName(field);
+    return null;
+  }
+
+  /// Whether [field] refers to the same table as [tableUid] (legacy name aware).
+  bool tableFieldMatches(String field, TableUid tableUid) {
+    if (field == tableUid.value) return true;
+    return getUidByName(TableName(field)) == tableUid;
+  }
+
+  /// Resolve key used in schema partition maps (uid preferred, legacy name fallback).
+  String? _resolvePartitionTableKey(
+    SchemaPartitionMeta meta,
+    TableUid tableUid,
+  ) {
+    final uidStr = tableUid.value;
+    if (meta.tableSchemas.containsKey(uidStr)) return uidStr;
+    final name = getNameByUid(tableUid)?.value;
+    if (name != null && meta.tableSchemas.containsKey(name)) return name;
+    return null;
   }
 
   /// Get TableSchemaRouteEntry by tableUid
-  TableSchemaRouteEntry? getRouteByUid(String tableUid) {
+  TableSchemaRouteEntry? getRouteByUid(TableUid tableUid) {
     return routeByUid[tableUid];
   }
 
@@ -99,12 +143,12 @@ class SchemaManager {
   }
 
   /// Get cached [TableSchema] if present (O(1)).
-  TableSchema? getCachedTableSchema(String tableUid) {
+  TableSchema? getCachedTableSchema(TableUid tableUid) {
     return _tableSchemaCache?.get(tableUid);
   }
 
   /// Cache [TableSchema] into hotspot cache.
-  void cacheTableSchema(String tableUid, TableSchema schema) {
+  void cacheTableSchema(TableUid tableUid, TableSchema schema) {
     _ensureTableSchemaCache().put(tableUid, schema);
     _indexListCache[tableUid] = _buildIndexListCache(schema);
     _storageFieldStructCache.remove(tableUid);
@@ -113,30 +157,49 @@ class SchemaManager {
     }
   }
 
-  /// Get TableContext by tableUid (asynchronous)
-  Future<TableContext?> getTableContext(String tableUid) async {
-    final route = getRouteByUid(tableUid);
-    if (route == null) return null;
-    final schema = await getTableSchema(tableUid);
+  /// Get TableContext by tableUid (asynchronous).
+  ///
+  /// When [tableUid] is a legacy logical table name stored in older metadata,
+  /// falls back to name lookup only if route resolution fails.
+  Future<TableContext?> getTableContext(TableUid tableUid) async {
+    if (tableUid.isEmpty) return null;
+    var uid = tableUid;
+    var route = getRouteByUid(uid);
+    if (route == null) {
+      final legacyUid = getUidByName(TableName(uid));
+      if (legacyUid == null) return null;
+      uid = legacyUid;
+      route = getRouteByUid(uid);
+      if (route == null) return null;
+    }
+    final schema = await getTableSchema(uid);
     if (schema == null) return null;
     return TableContext(
-      tableUid: tableUid,
-      tableName: route.tableName,
+      tableUid: uid,
+      tableName: TableName(route.tableName),
       isGlobal: route.isGlobal,
       dataDirIndex: route.dataDirIndex,
       schema: schema,
     );
   }
 
-  /// Get TableContext by tableUid (synchronous, checks memory cache)
-  TableContext? getTableContextSync(String tableUid) {
-    final route = getRouteByUid(tableUid);
-    if (route == null) return null;
-    final schema = getCachedTableSchema(tableUid);
+  /// Get TableContext by tableUid (synchronous, checks memory cache).
+  TableContext? getTableContextSync(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    var uid = tableUid;
+    var route = getRouteByUid(uid);
+    if (route == null) {
+      final legacyUid = getUidByName(TableName(uid));
+      if (legacyUid == null) return null;
+      uid = legacyUid;
+      route = getRouteByUid(uid);
+      if (route == null) return null;
+    }
+    final schema = getCachedTableSchema(uid);
     if (schema == null) return null;
     return TableContext(
-      tableUid: tableUid,
-      tableName: route.tableName,
+      tableUid: uid,
+      tableName: TableName(route.tableName),
       isGlobal: route.isGlobal,
       dataDirIndex: route.dataDirIndex,
       schema: schema,
@@ -177,7 +240,7 @@ class SchemaManager {
     }
     return TableContext(
       tableUid: uid,
-      tableName: route.tableName,
+      tableName: TableName(route.tableName),
       isGlobal: route.isGlobal,
       dataDirIndex: route.dataDirIndex,
       schema: schema,
@@ -185,7 +248,7 @@ class SchemaManager {
   }
 
   /// Remove cached schema for [tableUid].
-  void removeCachedTableSchema(String tableUid) {
+  void removeCachedTableSchema(TableUid tableUid) {
     _tableSchemaCache?.remove(tableUid);
     _indexListCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
@@ -269,7 +332,7 @@ class SchemaManager {
     final activeSpace = _dataStore.currentSpaceName;
     final activeUids = _activeUidsBySpace[activeSpace] ?? [];
     for (final uid in activeUids) {
-      final route = getRouteByUid(uid);
+      final route = getRouteByUid(TableUid(uid));
       if (route != null && !route.isGlobal) {
         uidByName[route.tableName] = route.tableUid;
         nameByUid[route.tableUid] = route.tableName;
@@ -557,7 +620,7 @@ class SchemaManager {
 
   /// Get stable storage field layout for a table.
   Future<FieldStorageLayout> getTableFieldLayout(
-    String tableUid, {
+    TableUid tableUid, {
     TableSchema? schema,
   }) async {
     final cached = _tableFieldLayoutCache[tableUid];
@@ -598,7 +661,7 @@ class SchemaManager {
 
   /// Get stable storage field structure used by the record binary codec.
   Future<List<FieldStructure>> getStorageFieldStructure(
-    String tableUid, {
+    TableUid tableUid, {
     TableSchema? schema,
     FieldStorageLayout? layoutOverride,
   }) async {
@@ -631,13 +694,13 @@ class SchemaManager {
 
   /// Persist only table field layout without modifying schema payload.
   Future<void> saveTableFieldLayout(
-    String tableUid,
+    TableUid tableUid,
     FieldStorageLayout layout, {
     TableSchema? schema,
   }) async {
     final resolvedSchema = schema ?? await getTableSchema(tableUid);
 
-    final name = getNameByUid(tableUid) ?? resolvedSchema?.name;
+    final name = getNameByUid(tableUid)?.value ?? resolvedSchema?.name;
     if (resolvedSchema == null || name == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -647,9 +710,18 @@ class SchemaManager {
         ),
       ]);
     }
+    final tableContext = getTableContextSync(tableUid);
+    if (tableContext == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table context not found for table: $tableUid',
+          tableName: name,
+        ),
+      ]);
+    }
     await saveTableSchema(
-      tableUid,
-      name,
+      tableContext,
       resolvedSchema,
       layoutOverride: layout,
     );
@@ -708,24 +780,93 @@ class SchemaManager {
   }
 
   /// Async helper by tableUid – mainly for management / background tasks.
-  Future<List<IndexSchema>> getAllIndexesForTable(String tableUid) async {
+  Future<List<IndexSchema>> getAllIndexesForTable(TableUid tableUid) async {
     final schema = await getTableSchema(tableUid);
     if (schema == null) return const <IndexSchema>[];
     return getAllIndexesFor(schema);
   }
 
   /// Async helper by tableUid – unique indexes only.
-  Future<List<IndexSchema>> getUniqueIndexesForTable(String tableUid) async {
+  Future<List<IndexSchema>> getUniqueIndexesForTable(TableUid tableUid) async {
     final schema = await getTableSchema(tableUid);
     if (schema == null) return const <IndexSchema>[];
     return getUniqueIndexesFor(schema);
   }
 
   /// Async helper by tableUid – vector indexes only.
-  Future<List<IndexSchema>> getVectorIndexesForTable(String tableUid) async {
+  Future<List<IndexSchema>> getVectorIndexesForTable(TableUid tableUid) async {
     final schema = await getTableSchema(tableUid);
     if (schema == null) return const <IndexSchema>[];
     return getVectorIndexesFor(schema);
+  }
+
+  _IndexListCacheEntry _indexCacheEntryFor(TableSchema schema) {
+    final cacheKey = schema.tableUid;
+    final entry = _indexListCache[cacheKey] ?? _buildIndexListCache(schema);
+    _indexListCache[cacheKey] = entry;
+    return entry;
+  }
+
+  /// O(1) lookup of [IndexSchema] by stable [IndexUid].
+  IndexSchema? findIndexSchemaByUid(TableSchema schema, IndexUid indexUid) {
+    if (indexUid.isEmpty) return null;
+    return _indexCacheEntryFor(schema).byUid[indexUid];
+  }
+
+  /// O(1) lookup by uid-or-legacy-name field (compat path only on alias miss).
+  IndexSchema? findIndexSchemaByField(TableSchema schema, String field) {
+    if (field.isEmpty) return null;
+    final entry = _indexCacheEntryFor(schema);
+    final byUid = entry.byUid[field];
+    if (byUid != null) return byUid;
+    return entry.byAlias[field];
+  }
+
+  /// Resolve a persisted uid-or-legacy-name field to a stable [IndexUid].
+  ///
+  /// Fast path: O(1) via per-table index cache. When [field] is not found in
+  /// schema indexes, returns [IndexUid(field)] so callers can still access
+  /// pre-migration on-disk artifacts keyed by legacy names.
+  IndexUid resolveIndexUidFromField(TableSchema schema, String field) {
+    if (field.isEmpty) return IndexUid.empty;
+    final entry = _indexCacheEntryFor(schema);
+    if (entry.byUid.containsKey(field)) return IndexUid(field);
+    final byAlias = entry.byAlias[field];
+    if (byAlias != null && byAlias.indexUid.isNotEmpty) {
+      return byAlias.indexUid;
+    }
+    return IndexUid(field);
+  }
+
+  /// Build [IndexContext] from a stable [IndexUid] (returns null if unknown).
+  IndexContext? resolveIndexContext(TableContext table, IndexUid indexUid) {
+    if (indexUid.isEmpty) return null;
+    final idx = findIndexSchemaByUid(table.schema, indexUid);
+    if (idx == null) return null;
+    return IndexContext(
+      indexUid: indexUid,
+      indexName: IndexName(idx.indexName ?? idx.actualIndexName),
+      schema: idx,
+      table: table,
+    );
+  }
+
+  /// Resolve [IndexContext] from uid-or-legacy-name (compat only on cache miss).
+  IndexContext? resolveIndexContextFromField(
+    TableContext table,
+    String uidOrName,
+  ) {
+    if (uidOrName.isEmpty) return null;
+    final indexUid = resolveIndexUidFromField(table.schema, uidOrName);
+    return resolveIndexContext(table, indexUid) ??
+        (findIndexSchemaByField(table.schema, uidOrName) == null
+            ? null
+            : IndexContext(
+                indexUid: indexUid,
+                indexName: IndexName(uidOrName),
+                schema: findIndexSchemaByField(table.schema, uidOrName)!,
+                table: table,
+              ));
   }
 
   /// get database schema meta
@@ -772,13 +913,13 @@ class SchemaManager {
   }
 
   /// get table schema metadata partition index
-  int? getTableSchemaPartitionIndex(String tableUid) {
+  int? getTableSchemaPartitionIndex(TableUid tableUid) {
     final route = getRouteByUid(tableUid);
     return route?.partitionIndex;
   }
 
   /// get table schema metadata directory index
-  int? getTableSchemaDirIndex(String tableUid) {
+  int? getTableSchemaDirIndex(TableUid tableUid) {
     final route = getRouteByUid(tableUid);
     return route?.dirIndex;
   }
@@ -833,7 +974,7 @@ class SchemaManager {
 
   /// find suitable partition for schema storage
   Future<int> _findSuitablePartition(
-      SchemaMeta meta, String tableUid, int contentSize) async {
+      SchemaMeta meta, TableUid tableUid, int contentSize) async {
     try {
       final existingRoute = getRouteByUid(tableUid);
       if (existingRoute != null) {
@@ -871,7 +1012,7 @@ class SchemaManager {
       version: 1,
       index: index,
       fileSizeInBytes: 0,
-      tableNames: [],
+      tableUids: [],
       tableSizes: {},
       tableSchemas: {},
       tableFieldLayouts: {},
@@ -905,17 +1046,21 @@ class SchemaManager {
 
   /// save table schema, auto manage partitions
   Future<void> saveTableSchema(
-    String tableUid,
-    String tableName,
+    TableContext table,
     TableSchema schema, {
     FieldStorageLayout? layoutOverride,
     Map<String, String> fieldRenameHints = const <String, String>{},
     int? dataDirIndex,
   }) async {
+    final tableUid = table.tableUid;
+    final tableUidStr = tableUid;
+    final tableName = table.tableName;
+    final tableNameStr = tableName;
     try {
       if (schema.tableUid.isEmpty) {
-        var targetUid =
-            tableUid.isNotEmpty ? tableUid : GlobalIdGenerator.generate("t");
+        var targetUid = tableUid.isNotEmpty
+            ? tableUid
+            : TableUid(GlobalIdGenerator.generate("t"));
         schema = schema.copyWith(tableUid: targetUid);
       }
 
@@ -932,7 +1077,7 @@ class SchemaManager {
       var contentSize = _estimateTableSchemaSize(schema);
 
       int targetPartition =
-          await _findSuitablePartition(meta, tableUid, contentSize);
+          await _findSuitablePartition(meta, tableUidStr, contentSize);
       final dirIndex = getOrCreatePartitionDirIndex(targetPartition);
 
       final partitionPath = _dataStore.pathManager
@@ -952,7 +1097,7 @@ class SchemaManager {
 
       final schemaObject = schema.toJson();
       final existingLayout = _tryParseFieldStorageLayout(
-          partitionMeta.tableFieldLayouts[tableUid]);
+          partitionMeta.tableFieldLayouts[tableUidStr]);
       final resolvedLayout = layoutOverride ??
           ((existingLayout != null &&
                   _canReuseExistingFieldStorageLayout(
@@ -969,27 +1114,27 @@ class SchemaManager {
       final layoutObject = resolvedLayout.toJson();
       contentSize += _estimateFieldStorageLayoutSize(resolvedLayout);
 
-      final oldSize = partitionMeta.tableSizes[tableUid] ?? 0;
-      final newSizeChange = partitionMeta.tableNames.contains(tableUid)
+      final oldSize = partitionMeta.tableSizes[tableUidStr] ?? 0;
+      final newSizeChange = partitionMeta.tableUids.contains(tableUidStr)
           ? contentSize - oldSize
           : contentSize;
 
       final updatedMeta = partitionMeta.copyWith(
         fileSizeInBytes: partitionMeta.fileSizeInBytes + newSizeChange,
-        tableNames: partitionMeta.tableNames.contains(tableUid)
-            ? partitionMeta.tableNames
-            : [...partitionMeta.tableNames, tableUid],
+        tableUids: partitionMeta.tableUids.contains(tableUidStr)
+            ? partitionMeta.tableUids
+            : [...partitionMeta.tableUids, tableUidStr],
         tableSizes: {
           ...partitionMeta.tableSizes,
-          tableUid: contentSize,
+          tableUidStr: contentSize,
         },
         tableSchemas: {
           ...partitionMeta.tableSchemas,
-          tableUid: schemaObject,
+          tableUidStr: schemaObject,
         },
         tableFieldLayouts: {
           ...partitionMeta.tableFieldLayouts,
-          tableUid: layoutObject,
+          tableUidStr: layoutObject,
         },
         timestamps: Timestamps(
           created: partitionMeta.timestamps.created,
@@ -1002,15 +1147,15 @@ class SchemaManager {
           .writeAsString(partitionPath, jsonEncode(updatedMeta.toJson()));
       _partitionSizes[targetPartition] = updatedMeta.fileSizeInBytes;
 
-      int idx = meta.routes.indexWhere((r) => r.tableUid == tableUid);
+      int idx = meta.routes.indexWhere((r) => r.tableUid == tableUidStr);
       int finalDataDirIndex = dataDirIndex ??
           ((idx >= 0)
               ? meta.routes[idx].dataDirIndex
               : allocateDataDirIndex(schema.isGlobal));
 
       final routeEntry = TableSchemaRouteEntry(
-        tableUid: tableUid,
-        tableName: tableName,
+        tableUid: tableUidStr,
+        tableName: tableNameStr,
         dirIndex: dirIndex,
         partitionIndex: targetPartition,
         dataDirIndex: finalDataDirIndex,
@@ -1027,8 +1172,8 @@ class SchemaManager {
       if (!schema.isGlobal) {
         final currentSpace = _dataStore.currentSpaceName;
         final list = _activeUidsBySpace.putIfAbsent(currentSpace, () => []);
-        if (!list.contains(tableUid)) {
-          list.add(tableUid);
+        if (!list.contains(tableUidStr)) {
+          list.add(tableUidStr);
           await saveSpaceTables(currentSpace);
         }
       }
@@ -1036,8 +1181,8 @@ class SchemaManager {
       _registerRouteInLookups(routeEntry);
 
       cacheTableSchema(tableUid, schema);
-      _tableFieldLayoutCache[tableUid] = resolvedLayout;
-      _storageFieldStructCache.remove(tableUid);
+      _tableFieldLayoutCache[tableUidStr] = resolvedLayout;
+      _storageFieldStructCache.remove(tableUidStr);
 
       _dataStore.upsertTtlPlanForSchema(schema);
     } catch (e) {
@@ -1047,8 +1192,8 @@ class SchemaManager {
     }
   }
 
-  /// read table schema
-  Future<TableSchema?> getTableSchema(String tableUid) async {
+  /// read table schema by stable uid
+  Future<TableSchema?> getTableSchema(TableUid tableUid) async {
     final cached = getCachedTableSchema(tableUid);
     if (cached != null) return cached;
 
@@ -1066,8 +1211,45 @@ class SchemaManager {
     }
   }
 
+  /// read table schema by logical table name (user-facing / FK DSL)
+  Future<TableSchema?> getTableSchemaByName(TableName tableName) async {
+    final tableUid = await resolveTableUidFromName(tableName);
+    if (tableUid == null) return null;
+    return getTableSchema(tableUid);
+  }
+
+  /// Resolve table uid by name, lazily activating the table in the current space when needed.
+  Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
+    final cached = getUidByName(tableName);
+    if (cached != null) return cached;
+
+    await getSchemaMeta();
+
+    TableSchemaRouteEntry? route;
+    for (final r in routeByUid.values) {
+      if (r.tableName == tableName) {
+        route = r;
+        break;
+      }
+    }
+    if (route == null) return null;
+
+    if (route.isGlobal) {
+      _registerRouteInLookups(route);
+    } else {
+      final currentSpace = _dataStore.currentSpaceName;
+      final list = _activeUidsBySpace.putIfAbsent(currentSpace, () => []);
+      if (!list.contains(route.tableUid)) {
+        list.add(route.tableUid);
+        await saveSpaceTables(currentSpace);
+      }
+      _registerRouteInLookups(route);
+    }
+    return TableUid(route.tableUid);
+  }
+
   /// Internal helper to actually load schema from file.
-  Future<TableSchema?> _doLoadTableSchema(String tableUid) async {
+  Future<TableSchema?> _doLoadTableSchema(TableUid tableUid) async {
     try {
       final route = getRouteByUid(tableUid);
       if (route == null) return null;
@@ -1081,9 +1263,12 @@ class SchemaManager {
 
       try {
         final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-        if (!partitionMeta.tableSchemas.containsKey(tableUid)) return null;
+        final partitionKey = _resolvePartitionTableKey(partitionMeta, tableUid);
+        if (partitionKey == null) {
+          return null;
+        }
 
-        final raw = partitionMeta.tableSchemas[tableUid];
+        final raw = partitionMeta.tableSchemas[partitionKey];
         Map<String, dynamic>? schemaMap;
         if (raw is Map<String, dynamic>) {
           schemaMap = raw;
@@ -1100,26 +1285,54 @@ class SchemaManager {
         if (schemaMap == null) return null;
 
         final schema = TableSchema.fromJson(schemaMap);
-        cacheTableSchema(tableUid, schema);
-        final layoutRaw = partitionMeta.tableFieldLayouts[tableUid];
+        var normalized = schema;
+        if (normalized.getAllIndexes().any((idx) => idx.indexUid.isEmpty)) {
+          normalized = normalized.generateAutoIndexes();
+          unawaited(() async {
+            try {
+              final route = getRouteByUid(tableUid);
+              if (route == null) return;
+              await saveTableSchema(
+                TableContext(
+                  tableUid: tableUid,
+                  tableName: TableName(route.tableName),
+                  isGlobal: route.isGlobal,
+                  dataDirIndex: route.dataDirIndex,
+                  schema: normalized,
+                ),
+                normalized,
+              );
+            } catch (e) {
+              Logger.warn(
+                'Failed to persist indexUid repair for table $tableUid',
+                rawError: e,
+              );
+            }
+          }());
+        }
+        cacheTableSchema(tableUid, normalized);
+        final layoutRaw = partitionMeta.tableFieldLayouts[partitionKey] ??
+            partitionMeta.tableFieldLayouts[tableUid];
         final parsedLayout = _tryParseFieldStorageLayout(layoutRaw);
         if (parsedLayout != null) {
           _tableFieldLayoutCache[tableUid] = parsedLayout;
           _storageFieldStructCache.remove(tableUid);
         }
-        return schema;
+        return normalized;
       } catch (e) {
-        Logger.error('Failed to parse table schema: $tableUid, ', rawError: e);
+        final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
+        Logger.error('Failed to parse table schema: $logTable, ', rawError: e);
         return null;
       }
     } catch (e) {
-      Logger.error('Failed to get table schema: $tableUid, ', rawError: e);
+      final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
+      Logger.error('Failed to get table schema: $logTable, ', rawError: e);
       return null;
     }
   }
 
   /// delete table schema
-  Future<bool> deleteTableSchema(String tableUid) async {
+  Future<bool> deleteTableSchema(TableUid tableUid) async {
     try {
       final meta = await getSchemaMeta();
       int routeIdx = meta.routes.indexWhere((r) => r.tableUid == tableUid);
@@ -1142,29 +1355,34 @@ class SchemaManager {
           }
         }
 
-        final tableName = getNameByUid(tableUid) ?? '';
+        final tableName = getNameByUid(tableUid);
         _unregisterRouteFromLookups(route);
         removeCachedTableSchema(tableUid);
 
-        _dataStore.removeTtlPlanForTable(tableName);
+        if (tableName != null && tableName.isNotEmpty) {
+          _dataStore.removeTtlPlanForTable(getTableContextSync(tableUid)!);
+        }
       }
 
       return success;
     } catch (e) {
-      Logger.error('Failed to delete table schema: $tableUid, ', rawError: e);
+      final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
+      Logger.error('Failed to delete table schema: $logTable, ', rawError: e);
       return false;
     }
   }
 
   /// Rename an existing table schema in place while preserving the partition.
   Future<void> renameTableSchema(
-    String tableUid,
+    TableContext table,
     String oldTableName,
     TableSchema newSchema,
   ) async {
+    final tableUid = table.tableUid;
+    final tableUidStr = tableUid;
     final newTableName = newSchema.name;
     if (oldTableName == newTableName) {
-      await saveTableSchema(tableUid, newTableName, newSchema);
+      await saveTableSchema(table, newSchema);
       return;
     }
 
@@ -1207,7 +1425,7 @@ class SchemaManager {
       }
 
       final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-      if (!partitionMeta.tableSchemas.containsKey(tableUid)) {
+      if (!partitionMeta.tableSchemas.containsKey(tableUidStr)) {
         throw DbException([
           GeneralStatus(
             type: ResultType.engError,
@@ -1219,8 +1437,8 @@ class SchemaManager {
       }
 
       final oldLayout = _tryParseFieldStorageLayout(
-              partitionMeta.tableFieldLayouts[tableUid]) ??
-          _tableFieldLayoutCache[tableUid] ??
+              partitionMeta.tableFieldLayouts[tableUidStr]) ??
+          _tableFieldLayoutCache[tableUidStr] ??
           _createInitialFieldStorageLayout(newSchema);
       final newLayout = evolveFieldStorageLayout(
         existingLayout: oldLayout,
@@ -1229,16 +1447,16 @@ class SchemaManager {
 
       final newSize = _estimateTableSchemaSize(newSchema) +
           _estimateFieldStorageLayoutSize(newLayout);
-      final oldSize = partitionMeta.tableSizes[tableUid] ?? 0;
+      final oldSize = partitionMeta.tableSizes[tableUidStr] ?? 0;
 
       final updatedTableSizes = Map<String, int>.from(partitionMeta.tableSizes)
-        ..[tableUid] = newSize;
+        ..[tableUidStr] = newSize;
       final updatedTableSchemas =
           Map<String, dynamic>.from(partitionMeta.tableSchemas)
-            ..[tableUid] = newSchema.toJson();
+            ..[tableUidStr] = newSchema.toJson();
       final updatedTableLayouts =
           Map<String, dynamic>.from(partitionMeta.tableFieldLayouts)
-            ..[tableUid] = newLayout.toJson();
+            ..[tableUidStr] = newLayout.toJson();
 
       final updatedPartitionMeta = partitionMeta.copyWith(
         fileSizeInBytes: partitionMeta.fileSizeInBytes + newSize - oldSize,
@@ -1255,7 +1473,7 @@ class SchemaManager {
           partitionPath, jsonEncode(updatedPartitionMeta.toJson()));
 
       final newRoute = TableSchemaRouteEntry(
-        tableUid: tableUid,
+        tableUid: tableUidStr,
         tableName: newTableName,
         dirIndex: route.dirIndex,
         partitionIndex: route.partitionIndex,
@@ -1269,9 +1487,9 @@ class SchemaManager {
 
       removeCachedTableSchema(tableUid);
       cacheTableSchema(tableUid, newSchema);
-      _tableFieldLayoutCache[tableUid] = newLayout;
-      _storageFieldStructCache.remove(tableUid);
-      _dataStore.removeTtlPlanForTable(oldTableName);
+      _tableFieldLayoutCache[tableUidStr] = newLayout;
+      _storageFieldStructCache.remove(tableUidStr);
+      _dataStore.removeTtlPlanForTable(getTableContextSync(tableUid)!);
       _dataStore.upsertTtlPlanForSchema(newSchema);
     } catch (e) {
       Logger.error(
@@ -1283,7 +1501,7 @@ class SchemaManager {
 
   /// remove table from partition
   Future<bool> _removeTableFromPartition(
-      String tableUid, int partitionIndex, int dirIndex) async {
+      TableUid tableUid, int partitionIndex, int dirIndex) async {
     final partitionPath = _dataStore.pathManager
         .getSchemaPartitionFilePath(partitionIndex, dirIndex);
     if (!await _dataStore.storage.existsFile(partitionPath)) return false;
@@ -1300,8 +1518,8 @@ class SchemaManager {
 
       final updatedMeta = partitionMeta.copyWith(
         fileSizeInBytes: newSize,
-        tableNames:
-            partitionMeta.tableNames.where((uid) => uid != tableUid).toList(),
+        tableUids:
+            partitionMeta.tableUids.where((uid) => uid != tableUid).toList(),
         tableSizes: Map.from(partitionMeta.tableSizes)..remove(tableUid),
         tableSchemas: Map.from(partitionMeta.tableSchemas)..remove(tableUid),
         tableFieldLayouts: Map.from(partitionMeta.tableFieldLayouts)
@@ -1367,7 +1585,7 @@ class SchemaManager {
                     schemaMaxPartitionFileSize *
                     100)
                 .toStringAsFixed(2),
-            'tableCount': partitionMeta.tableNames.length,
+            'tableCount': partitionMeta.tableUids.length,
             'lastModified': partitionMeta.timestamps.modified.toIso8601String(),
           });
         }
@@ -1452,7 +1670,7 @@ class SchemaManager {
 
         final tablesToMove = <String>[];
 
-        for (final tableUid in overloadedMeta.tableNames) {
+        for (final tableUid in overloadedMeta.tableUids) {
           final tableSize = overloadedMeta.tableSizes[tableUid] ?? 0;
           if (tableSize > 0 && tableSize < schemaMaxPartitionFileSize * 0.5) {
             tablesToMove.add(tableUid);
@@ -1488,7 +1706,7 @@ class SchemaManager {
             'Moving table $tableUid from partition $overloadedIndex to partition $targetPartition (size: $tableSize bytes)',
           );
 
-          final success = await _removeTableFromPartition(tableUid,
+          final success = await _removeTableFromPartition(TableUid(tableUid),
               overloadedIndex, getOrCreatePartitionDirIndex(overloadedIndex));
           if (success) {
             final targetDirIndex =
@@ -1514,7 +1732,7 @@ class SchemaManager {
 
             final updatedMeta = targetPartitionMeta.copyWith(
               fileSizeInBytes: targetPartitionMeta.fileSizeInBytes + tableSize,
-              tableNames: [...targetPartitionMeta.tableNames, tableUid],
+              tableUids: [...targetPartitionMeta.tableUids, tableUid],
               tableSizes: {
                 ...targetPartitionMeta.tableSizes,
                 tableUid: tableSize,
@@ -1578,7 +1796,7 @@ class SchemaManager {
   }
 
   /// get table is global table
-  Future<bool?> isTableGlobal(String tableUid) async {
+  Future<bool?> isTableGlobal(TableUid tableUid) async {
     final schema = await getTableSchema(tableUid);
     if (schema == null) {
       return null;
@@ -1665,11 +1883,19 @@ class _IndexListCacheEntry {
   /// All non-vector indexes (btree).
   final List<IndexSchema> btreeIndexes;
 
+  /// Stable uid -> schema (O(1) hot-path lookup).
+  final Map<String, IndexSchema> byUid;
+
+  /// Legacy alias -> schema (actualIndexName / indexName; compat only).
+  final Map<String, IndexSchema> byAlias;
+
   const _IndexListCacheEntry({
     required this.allIndexes,
     required this.uniqueIndexes,
     required this.vectorIndexes,
     required this.btreeIndexes,
+    required this.byUid,
+    required this.byAlias,
   });
 }
 
@@ -1687,12 +1913,16 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
       uniqueIndexes: emptyList,
       vectorIndexes: emptyList,
       btreeIndexes: emptyList,
+      byUid: {},
+      byAlias: {},
     );
   }
 
   final unique = <IndexSchema>[];
   final vector = <IndexSchema>[];
   final btree = <IndexSchema>[];
+  final byUid = <String, IndexSchema>{};
+  final byAlias = <String, IndexSchema>{};
 
   for (final idx in all) {
     if (idx.unique) {
@@ -1703,6 +1933,14 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     } else {
       btree.add(idx);
     }
+    if (idx.indexUid.isNotEmpty) {
+      byUid[idx.indexUid] = idx;
+    }
+    byAlias[idx.actualIndexName] = idx;
+    final logicalName = idx.indexName;
+    if (logicalName != null && logicalName.isNotEmpty) {
+      byAlias[logicalName] = idx;
+    }
   }
 
   // Use unmodifiable views to guard against accidental mutation.
@@ -1711,5 +1949,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     uniqueIndexes: List<IndexSchema>.unmodifiable(unique),
     vectorIndexes: List<IndexSchema>.unmodifiable(vector),
     btreeIndexes: List<IndexSchema>.unmodifiable(btree),
+    byUid: Map<String, IndexSchema>.unmodifiable(byUid),
+    byAlias: Map<String, IndexSchema>.unmodifiable(byAlias),
   );
 }
