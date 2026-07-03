@@ -166,26 +166,27 @@ class LargeOperationRunner {
 
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
-    Logger.info(
-        'Starting/resuming background delete for table [${op.table}] (opId: ${op.opId}).');
-
     try {
-      final tableName = op.table;
-      final schema = await dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        // Table not found, clean metadata and complete
+      final table = await dataStore.schemaManager?.getTableContext(op.tableUid);
+      if (table == null) {
+        Logger.warn(
+            'Background delete skipped: table not found (opId: ${op.opId}).');
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeDelete(op.opId);
         return;
       }
 
+      Logger.info(
+          'Starting/resuming background delete for table [${table.tableName}] (opId: ${op.opId}).');
+
+      final schema = table.schema;
       final primaryKey = schema.primaryKey;
       int deletedCount = op.deletedSoFar;
       final conditionMap = op.condition;
       final writeBatchSize = dataStore.config.writeBatchSize;
 
       await dataStore.queryExecutor.queryEachBatch(
-        tableName,
+        table,
         batchSize: writeBatchSize,
         checkpointCursor: op.checkpointCursor,
         cancellationToken: token,
@@ -206,8 +207,10 @@ class LargeOperationRunner {
           Map<String, int> skipMap = {};
           try {
             if (await dataStore.tableExists(tempConflictTableName)) {
+              final conflictTable =
+                  await dataStore.getTableContext(tempConflictTableName);
               final conflictRecords = await dataStore.executeQuery(
-                tempConflictTableName,
+                conflictTable,
                 QueryCondition.fromMap({
                   'primaryKey': {
                     'IN': records.map((r) => r[primaryKey].toString()).toList()
@@ -230,7 +233,7 @@ class LargeOperationRunner {
           // 2. Perform batch index matching
           final matchResult = await ConditionBatchMatcher.matchRecordIndices(
             schema: schema,
-            tableName: tableName,
+            table: table,
             condition: conditionMap,
             records: records,
             estimateRecordBytes:
@@ -259,7 +262,7 @@ class LargeOperationRunner {
               try {
                 await dataStore.foreignKeyManager!
                     .checkRestrictConstraintsForDelete(
-                  tableName: tableName,
+                  table: table,
                   deletedPkValues: pkValue,
                 );
               } catch (e) {
@@ -270,7 +273,7 @@ class LargeOperationRunner {
 
               try {
                 await dataStore.foreignKeyManager!.handleCascadeDelete(
-                  tableName: tableName,
+                  table: table,
                   deletedPkValues: pkValue,
                   skipRestrictCheck: true,
                 );
@@ -293,7 +296,7 @@ class LargeOperationRunner {
             }
 
             dataStore.tableDataManager
-                .removeRecordFromBuffer(tableName, pkValueStr);
+                .removeRecordFromBuffer(table, pkValueStr);
           }
 
           if (deletes.isEmpty) {
@@ -301,8 +304,7 @@ class LargeOperationRunner {
           }
 
           var entryVersion = schema.schemaVersion ?? '';
-          if (dataStore.migrationManager
-                  ?.hasRuntimeMigrationForTable(tableName) ??
+          if (dataStore.migrationManager?.hasRuntimeMigrationForTable(table) ??
               false) {
             entryVersion = '';
           }
@@ -320,7 +322,7 @@ class LargeOperationRunner {
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
                 taskId: op.opId,
-                tableName: tableName,
+                tableUid: table.tableUid,
                 primaryKey: pkValueStr,
                 type: BackgroundWriteType.largeDelete,
                 mode: MigrationWriteMode.tableAndIndex,
@@ -350,7 +352,7 @@ class LargeOperationRunner {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeDelete(op.opId);
         Logger.info(
-            'Background delete completed for table [${op.table}] (opId: ${op.opId}).');
+            'Background delete completed for table [${table.tableName}] (opId: ${op.opId}).');
       } catch (_) {}
     } catch (e) {
       Logger.error('Large delete failed for ${op.opId}', rawError: e);
@@ -374,18 +376,20 @@ class LargeOperationRunner {
 
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
-    Logger.info(
-        'Starting/resuming background update for table [${op.table}] (opId: ${op.opId}).');
-
     try {
-      final tableName = op.table;
-      final schema = await dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
+      final table = await dataStore.schemaManager?.getTableContext(op.tableUid);
+      if (table == null) {
+        Logger.warn(
+            'Background update skipped: table not found (opId: ${op.opId}).');
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeUpdate(op.opId);
         return;
       }
 
+      Logger.info(
+          'Starting/resuming background update for table [${table.tableName}] (opId: ${op.opId}).');
+
+      final schema = table.schema;
       final primaryKey = schema.primaryKey;
       int updatedCount = op.updatedSoFar;
       final conditionMap = op.condition;
@@ -409,7 +413,7 @@ class LargeOperationRunner {
       }
 
       await dataStore.queryExecutor.queryEachBatch(
-        tableName,
+        table,
         batchSize: writeBatchSize,
         checkpointCursor: op.checkpointCursor,
         cancellationToken: token,
@@ -431,8 +435,10 @@ class LargeOperationRunner {
           Map<String, List<String>> conflictFieldsMap = {};
           try {
             if (await dataStore.tableExists(tempConflictTableName)) {
+              final conflictTable =
+                  await dataStore.getTableContext(tempConflictTableName);
               final conflictRecords = await dataStore.executeQuery(
-                tempConflictTableName,
+                conflictTable,
                 QueryCondition.fromMap({
                   'primaryKey': {
                     'IN': records.map((r) => r[primaryKey].toString()).toList()
@@ -459,7 +465,7 @@ class LargeOperationRunner {
           // 2. Perform batch index matching
           final matchResult = await ConditionBatchMatcher.matchRecordIndices(
             schema: schema,
-            tableName: tableName,
+            table: table,
             condition: conditionMap,
             records: records,
             estimateRecordBytes:
@@ -509,7 +515,7 @@ class LargeOperationRunner {
           final preparedMatchedRecords =
               await dataStore.prepareUniformUpdateRecords(
             schema,
-            tableName,
+            table,
             validData,
             matchedRecords,
           );
@@ -555,7 +561,7 @@ class LargeOperationRunner {
                 dataStore.indexManager != null &&
                 !isPrimaryKeyUpdate) {
               final planUpd = dataStore.planUniqueForUpdate(
-                tableName,
+                table,
                 schema,
                 updatedRecord,
                 validData.keys.toSet(),
@@ -564,7 +570,7 @@ class LargeOperationRunner {
               try {
                 reservedKeys =
                     dataStore.writeBufferManager.tryReserveUniqueKeys(
-                  tableName: tableName,
+                  table: table,
                   recordId: pkValueStr,
                   uniqueKeys: planUpd.refs,
                   isUpdate: true,
@@ -585,7 +591,7 @@ class LargeOperationRunner {
               try {
                 final violation =
                     await dataStore.indexManager!.checkUniqueConstraints(
-                  tableName,
+                  table,
                   updatedRecord,
                   isUpdate: true,
                   skipBufferCheck: true,
@@ -595,7 +601,7 @@ class LargeOperationRunner {
                     ConstraintStatus(
                       type: ResultType.bizUniqueViolation,
                       message: violation.message,
-                      tableName: tableName,
+                      tableName: table.tableName,
                       constraintName: violation.indexName,
                       fields: violation.fields,
                       conflictingKeys: [violation.value],
@@ -607,7 +613,7 @@ class LargeOperationRunner {
                 if (reservedKeys != null) {
                   try {
                     dataStore.writeBufferManager.releaseReservedUniqueKeys(
-                      tableName: tableName,
+                      table: table,
                       recordId: pkValueStr,
                     );
                   } catch (_) {}
@@ -629,7 +635,7 @@ class LargeOperationRunner {
               final newPkVal = updatedRecord[primaryKey]?.toString();
               if (newPkVal != null && newPkVal != pkValueStr) {
                 final planIns = dataStore.planUniqueForInsert(
-                  tableName,
+                  table,
                   schema,
                   updatedRecord,
                 );
@@ -638,7 +644,7 @@ class LargeOperationRunner {
                 try {
                   pkReservedKeys =
                       dataStore.writeBufferManager.tryReserveUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: newPkVal,
                     uniqueKeys: planIns.refs,
                     isUpdate: false,
@@ -659,7 +665,7 @@ class LargeOperationRunner {
                 try {
                   final violation =
                       await dataStore.indexManager!.checkUniqueConstraints(
-                    tableName,
+                    table,
                     updatedRecord,
                     isUpdate: true,
                     skipBufferCheck: true,
@@ -669,7 +675,7 @@ class LargeOperationRunner {
                       ConstraintStatus(
                         type: ResultType.bizUniqueViolation,
                         message: violation.message,
-                        tableName: tableName,
+                        tableName: table.tableName,
                         constraintName: violation.indexName,
                         fields: violation.fields,
                         conflictingKeys: [violation.value],
@@ -681,7 +687,7 @@ class LargeOperationRunner {
                   if (pkReservedKeys != null) {
                     try {
                       dataStore.writeBufferManager.releaseReservedUniqueKeys(
-                        tableName: tableName,
+                        table: table,
                         recordId: newPkVal,
                       );
                     } catch (_) {}
@@ -703,7 +709,7 @@ class LargeOperationRunner {
                   try {
                     await dataStore.foreignKeyManager!
                         .checkRestrictConstraintsForUpdate(
-                      tableName: tableName,
+                      table: table,
                       oldPkValues: pkValueStr,
                     );
                   } catch (e) {
@@ -715,7 +721,7 @@ class LargeOperationRunner {
 
                   try {
                     await dataStore.foreignKeyManager!.handleCascadeUpdate(
-                      tableName: tableName,
+                      table: table,
                       oldPkValues: pkValueStr,
                       newPkValues: newPkVal,
                     );
@@ -741,7 +747,7 @@ class LargeOperationRunner {
               try {
                 await dataStore.foreignKeyManager!
                     .validateForeignKeyConstraints(
-                  tableName: tableName,
+                  table: table,
                   data: updatedRecord,
                   operation: ForeignKeyOperation.update,
                 );
@@ -762,13 +768,12 @@ class LargeOperationRunner {
             }
 
             dataStore.tableDataManager
-                .removeRecordFromBuffer(tableName, pkValueStr);
+                .removeRecordFromBuffer(table, pkValueStr);
             cacheKeysToRemove.add(pkValueStr);
           }
 
           var entryVersion = schema.schemaVersion ?? '';
-          if (dataStore.migrationManager
-                  ?.hasRuntimeMigrationForTable(tableName) ??
+          if (dataStore.migrationManager?.hasRuntimeMigrationForTable(table) ??
               false) {
             entryVersion = '';
           }
@@ -785,7 +790,7 @@ class LargeOperationRunner {
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
                 taskId: op.opId,
-                tableName: tableName,
+                tableUid: table.tableUid,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
                 mode: MigrationWriteMode.tableAndIndex,
@@ -808,7 +813,7 @@ class LargeOperationRunner {
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
                 taskId: op.opId,
-                tableName: tableName,
+                tableUid: table.tableUid,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
                 mode: MigrationWriteMode.tableAndIndex,
@@ -837,7 +842,7 @@ class LargeOperationRunner {
             dataStore.backgroundWriteScheduler.addEntry(
               BackgroundWriteEntry(
                 taskId: op.opId,
-                tableName: tableName,
+                tableUid: table.tableUid,
                 primaryKey: pk,
                 type: BackgroundWriteType.largeUpdate,
                 mode: MigrationWriteMode.tableAndIndex,
@@ -864,7 +869,7 @@ class LargeOperationRunner {
         await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
         await dataStore.walManager.completeLargeUpdate(op.opId);
         Logger.info(
-            'Background update completed for table [${op.table}] (opId: ${op.opId}).');
+            'Background update completed for table [${table.tableName}] (opId: ${op.opId}).');
       } catch (_) {}
     } catch (e) {
       Logger.error('Large update failed for ${op.opId}', rawError: e);
