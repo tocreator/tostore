@@ -9,6 +9,8 @@ import '../model/result_type.dart';
 import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 
 /// data integrity checker
 class IntegrityChecker {
@@ -18,20 +20,18 @@ class IntegrityChecker {
 
   /// check table structure integrity
   /// For large-scale data scenarios, uses sampling validation (first/last few records)
-  Future<bool> checkTableStructure(String tableName) async {
+  Future<bool> checkTableStructure(TableContext table) async {
+    final tableName = table.tableName;
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return false;
-      }
-      final dataPath = await _dataStore.pathManager.getDataMetaPath(tableName);
+      final schema = table.schema;
+      final dataPath =
+          await _dataStore.pathManager.getDataMetaPath(table.tableUid);
 
       if (!await _dataStore.storage.existsFile(dataPath)) {
         return false;
       }
 
-      final fileMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
+      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -47,7 +47,7 @@ class IntegrityChecker {
         return false;
       }
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: Uint8List(0),
         endKeyExclusive: Uint8List(0),
         reverse: false,
@@ -70,7 +70,7 @@ class IntegrityChecker {
 
       // Sample last few records (reverse scan)
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: Uint8List(0),
         endKeyExclusive: Uint8List(0),
         reverse: true,
@@ -102,18 +102,13 @@ class IntegrityChecker {
 
   /// check data consistency
   /// For large-scale data scenarios, only validates first/last partition meta pages
-  Future<bool> checkDataConsistency(String tableName) async {
+  Future<bool> checkDataConsistency(TableContext table) async {
+    final tableName = table.tableName;
     try {
       // get table meta data
-      final fileMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
+      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
 
       // get table schema info
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return false;
-      }
-
       if (fileMeta == null) {
         Logger.warn('Table meta not found for $tableName');
         return false;
@@ -132,7 +127,7 @@ class IntegrityChecker {
       // Find and check last existing partition
       for (int pNo = fileMeta.btreePartitionCount - 1; pNo >= 0; pNo--) {
         final path = await _dataStore.pathManager
-            .getPartitionFilePathByNo(tableName, pNo);
+            .getPartitionFilePathByNo(table.tableUid, pNo);
         if (await _dataStore.storage.existsFile(path) &&
             await _dataStore.storage.getFileSize(path) > 0) {
           partitionsToCheck.add(pNo);
@@ -143,7 +138,7 @@ class IntegrityChecker {
       // Validate sampled partition meta pages
       for (final pNo in partitionsToCheck) {
         final path = await _dataStore.pathManager
-            .getPartitionFilePathByNo(tableName, pNo);
+            .getPartitionFilePathByNo(table.tableUid, pNo);
         if (!await _dataStore.storage.existsFile(path)) {
           if (pNo == 0) {
             Logger.error('First partition file missing (pNo=0)');
@@ -208,15 +203,11 @@ class IntegrityChecker {
 
   /// check foreign key constraints
   /// For large-scale data scenarios, uses sampling validation (first/last few records)
-  Future<bool> checkForeignKeyConstraints(String tableName) async {
+  Future<bool> checkForeignKeyConstraints(TableContext table) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return false;
-      }
+      final schema = table.schema;
 
-      final fileMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
+      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -231,7 +222,7 @@ class IntegrityChecker {
 
       // Sample first few records
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: Uint8List(0),
         endKeyExclusive: Uint8List(0),
         reverse: false,
@@ -244,7 +235,7 @@ class IntegrityChecker {
             if (!await _validateForeignKeyReference(
               data[field.name],
               field.name,
-              tableName,
+              table,
             )) {
               Logger.error(
                   'Foreign key constraint validation failed at start: ${field.name}=${data[field.name]}');
@@ -256,7 +247,7 @@ class IntegrityChecker {
 
       // Sample last few records (reverse scan)
       await for (var data in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: Uint8List(0),
         endKeyExclusive: Uint8List(0),
         reverse: true,
@@ -269,7 +260,7 @@ class IntegrityChecker {
             if (!await _validateForeignKeyReference(
               data[field.name],
               field.name,
-              tableName,
+              table,
             )) {
               Logger.error(
                   'Foreign key constraint validation failed at end: ${field.name}=${data[field.name]}');
@@ -293,19 +284,21 @@ class IntegrityChecker {
   Future<bool> _validateForeignKeyReference(
     dynamic value,
     String fieldName,
-    String tableName,
+    TableContext table,
   ) async {
     if (value == null) return true;
 
     final referencedTable = _inferReferencedTable(fieldName);
     try {
-      final referencedSchema =
-          await _dataStore.schemaManager?.getTableSchema(referencedTable);
+      final referencedSchema = await _dataStore.schemaManager
+          ?.getTableSchemaByName(TableName(referencedTable));
       if (referencedSchema == null) {
         return false;
       }
       final dataPath = await _dataStore.pathManager.getDataMetaPath(
-        referencedTable,
+        referencedSchema.tableUid.isNotEmpty
+            ? TableUid(referencedSchema.tableUid)
+            : TableUid(referencedTable),
       );
 
       if (!await _dataStore.storage.existsFile(dataPath)) {
@@ -314,8 +307,9 @@ class IntegrityChecker {
 
       // Use efficient point lookup instead of full table scan
       // This avoids traversing billions of records which would be fatal
+      final refTable = await _dataStore.getTableContext(referencedTable);
       final record = await _dataStore.tableDataManager
-          .queryRecordsBatch(referencedTable, [value]);
+          .queryRecordsBatch(refTable, [value]);
       return record.records.isNotEmpty;
     } catch (e) {
       Logger.warn(
@@ -338,15 +332,11 @@ class IntegrityChecker {
   /// Note: Full unique constraint validation would require scanning all records,
   /// which is fatal for billion-scale data. This method validates index metadata
   /// structure instead, assuming index uniqueness is enforced at write time.
-  Future<bool> checkUniqueConstraints(String tableName) async {
+  Future<bool> checkUniqueConstraints(TableContext table) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return false;
-      }
+      final schema = table.schema;
 
-      final fileMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
+      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -362,8 +352,11 @@ class IntegrityChecker {
 
       // Validate that unique index metadata files exist and are accessible
       for (var index in uniqueIndexes) {
-        final indexMetaPath = await _dataStore.pathManager
-            .getIndexMetaPath(tableName, index.actualIndexName);
+        final indexMetaPath = await _dataStore.pathManager.getIndexMetaPath(
+            table.tableUid,
+            IndexUid(index.indexUid.isNotEmpty
+                ? index.indexUid
+                : index.actualIndexName));
         if (!await _dataStore.storage.existsFile(indexMetaPath)) {
           Logger.warn(
               'Unique index metadata file not found: ${index.actualIndexName}');
@@ -374,7 +367,7 @@ class IntegrityChecker {
         // Verify index metadata can be loaded
         try {
           final indexMeta = await _dataStore.indexManager
-              ?.getIndexMeta(tableName, index.actualIndexName);
+              ?.getIndexMeta(table, index.indexUid);
           if (indexMeta == null) {
             Logger.warn(
                 'Failed to load unique index metadata: ${index.actualIndexName}');
@@ -479,22 +472,23 @@ class IntegrityChecker {
 
   /// efficient migration validation method
   Future<bool> validateMigration(
-    String tableName,
+    TableContext table,
     TableSchema newSchema,
   ) async {
+    final tableName = table.tableName;
     // record start time for performance evaluation
     final stopwatch = Stopwatch()..start();
 
     try {
       // check if table meta data file exists
       final dataMetaPath =
-          await _dataStore.pathManager.getDataMetaPath(tableName);
+          await _dataStore.pathManager.getDataMetaPath(table.tableUid);
       final tableMetaExists = await _dataStore.storage.existsFile(dataMetaPath);
 
       // get table meta data (if exists)
       TableMeta? fileMeta;
       if (tableMetaExists) {
-        fileMeta = await _dataStore.tableDataManager.getTableMeta(tableName);
+        fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
       }
 
       // check if it is a new table (no meta data or meta data has no partition info)
@@ -511,8 +505,11 @@ class IntegrityChecker {
             _dataStore.schemaManager?.getBtreeIndexesFor(newSchema) ??
                 <IndexSchema>[];
         for (var index in allIndexes) {
-          final indexMetaPath = await _dataStore.pathManager
-              .getIndexMetaPath(tableName, index.actualIndexName);
+          final indexMetaPath = await _dataStore.pathManager.getIndexMetaPath(
+              table.tableUid,
+              IndexUid(index.indexUid.isNotEmpty
+                  ? index.indexUid
+                  : index.actualIndexName));
 
           if (!await _dataStore.storage.existsFile(indexMetaPath)) {
             Logger.info(
@@ -526,7 +523,7 @@ class IntegrityChecker {
         Future<int?> findLastExistingPartitionNo() async {
           for (int pNo = meta.btreePartitionCount - 1; pNo >= 0; pNo--) {
             final path = await _dataStore.pathManager
-                .getPartitionFilePathByNo(tableName, pNo);
+                .getPartitionFilePathByNo(table.tableUid, pNo);
             if (await _dataStore.storage.existsFile(path) &&
                 await _dataStore.storage.getFileSize(path) > 0) {
               return pNo;
@@ -538,7 +535,7 @@ class IntegrityChecker {
 
         Future<bool> validatePartitionMetaPage(int partitionNo) async {
           final path = await _dataStore.pathManager
-              .getPartitionFilePathByNo(tableName, partitionNo);
+              .getPartitionFilePathByNo(table.tableUid, partitionNo);
           if (!await _dataStore.storage.existsFile(path)) {
             // partitionNo=0 should exist if table has committed data.
             return partitionNo != 0;
@@ -579,7 +576,7 @@ class IntegrityChecker {
 
           // Sample first few records
           await for (var record in rangeManager.streamRecordsByPrimaryKeyRange(
-            tableName: tableName,
+            table: table,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
             reverse: false,
@@ -604,7 +601,7 @@ class IntegrityChecker {
 
           // Sample last few records (reverse scan)
           await for (var record in rangeManager.streamRecordsByPrimaryKeyRange(
-            tableName: tableName,
+            table: table,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
             reverse: true,
@@ -653,18 +650,18 @@ class IntegrityChecker {
 
   /// Validate table data integrity
   Future<bool> validateTableData(
-    String tableName,
+    TableContext table,
     TableSchema schema,
     DataStoreConfig config,
   ) async {
     try {
       // Check data consistency
-      if (!await checkDataConsistency(tableName)) {
+      if (!await checkDataConsistency(table)) {
         return false;
       }
 
       // Check unique constraints
-      if (!await checkUniqueConstraints(tableName)) {
+      if (!await checkUniqueConstraints(table)) {
         return false;
       }
 
