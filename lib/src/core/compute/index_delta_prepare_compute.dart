@@ -9,6 +9,7 @@ import '../../model/table_schema.dart';
 import '../../model/db_exception.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/table_identity.dart';
 import '../yield_controller.dart';
 
 /// Operation kind for batched B+Tree index delta preparation.
@@ -21,8 +22,8 @@ enum IndexDeltaOperationKind {
 /// Pure-compute request for preparing index write deltas.
 class IndexDeltaPrepareRequest {
   final TableSchema schema;
-  final String tableName;
-  final String indexName;
+  final TableName tableName;
+  final IndexName indexName;
   final String primaryKeyField;
   final List<String> fields;
   final bool isUnique;
