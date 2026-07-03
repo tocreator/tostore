@@ -13,10 +13,12 @@ import '../model/key_migration_info.dart';
 import '../model/meta_info.dart';
 import '../model/space_config.dart';
 import '../model/system_table.dart';
+import '../model/table_context.dart';
 import '../model/table_schema.dart' show IndexSchema, IndexType, TableSchema;
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 /// Background key re-encryption via [BackgroundWriteScheduler].
 class KeyMigrationRunner {
@@ -29,23 +31,25 @@ class KeyMigrationRunner {
 
   static CancellationToken? _runToken;
 
-  static String taskIdForTable(String tableName) => '$taskIdPrefix:$tableName';
+  static String taskIdForTable(TableContext table) =>
+      '$taskIdPrefix:${table.tableUid}';
 
   static bool isKeyMigrationTaskId(String taskId) =>
       taskId.startsWith('$taskIdPrefix:');
 
-  static String? tableNameFromTaskId(String taskId) {
+  static String? tableUidFromTaskId(String taskId) {
     if (!isKeyMigrationTaskId(taskId)) return null;
     return taskId.substring(taskIdPrefix.length + 1);
   }
 
-  static bool isTableMigrating(String tableName) =>
-      _activeTableMigrations.contains(tableName);
+  static bool isTableMigrating(TableContext table) =>
+      _activeTableMigrations.contains(table.tableUid);
 
-  static void renameTable(String oldTableName, String newTableName) {
-    if (_activeTableMigrations.remove(oldTableName)) {
-      _activeTableMigrations.add(newTableName);
+  static void renameTable(TableContext table, String newTableName) {
+    if (_activeTableMigrations.remove(table.tableUid)) {
+      _activeTableMigrations.add(table.tableUid);
     }
+    table.tableName = TableName(newTableName);
   }
 
   static bool get isRunning => _runToken != null;
@@ -191,44 +195,48 @@ class KeyMigrationRunner {
 
       if (tableName == SystemTable.keyMigrationProgressTableName) continue;
 
-      final schema = await dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) continue;
-      if (schema.isGlobal && !migrateGlobal) continue;
-      if (!schema.isGlobal && !migrateNonGlobal) continue;
+      final tableUid =
+          dataStore.schemaManager?.getUidByName(TableName(tableName));
+      if (tableUid == null) continue;
+      final table = await dataStore.schemaManager?.getTableContext(tableUid);
+      if (table == null) continue;
 
-      if (await _isTableAlreadyMigrated(dataStore, tableName, targetKeyId)) {
-        final scope = await scopeForTable(dataStore, tableName);
+      if (table.isGlobal && !migrateGlobal) continue;
+      if (!table.isGlobal && !migrateNonGlobal) continue;
+
+      if (await _isTableAlreadyMigrated(dataStore, table, targetKeyId)) {
+        final scope = scopeForTable(dataStore, table);
         await KeyMigrationProgressStore.markCompleted(
           dataStore,
-          tableName: tableName,
+          table: table,
           spaceName: scope,
         );
         continue;
       }
 
-      _activeTableMigrations.add(tableName);
+      _activeTableMigrations.add(table.tableUid);
       try {
-        final scope = await scopeForTable(dataStore, tableName);
-        await _purgeTableIndexes(dataStore, tableName);
-        await dataStore.cacheManager.invalidateCache(tableName);
+        final scope = scopeForTable(dataStore, table);
+        await _purgeTableIndexes(dataStore, table);
+        await dataStore.cacheManager.invalidateCache(table);
 
         final startCursor = await KeyMigrationProgressStore.loadCheckpoint(
           dataStore,
-          tableName: tableName,
+          table: table,
           spaceName: scope,
         );
 
         await KeyMigrationProgressStore.upsertRunning(
           dataStore,
-          tableName: tableName,
+          table: table,
           spaceName: scope,
           checkpointKey: startCursor,
         );
 
-        final pkName = schema.primaryKey;
+        final pkName = table.schema.primaryKey;
 
         await dataStore.queryExecutor.queryEachBatch(
-          tableName,
+          table,
           batchSize: writeBatchSize,
           checkpointCursor: startCursor,
           cancellationToken: _runToken,
@@ -248,9 +256,9 @@ class KeyMigrationRunner {
               checkInterval: 64,
             );
 
-            var entryVersion = schema.schemaVersion ?? '';
+            var entryVersion = table.schema.schemaVersion ?? '';
             if (dataStore.migrationManager
-                    ?.hasRuntimeMigrationForTable(tableName) ??
+                    ?.hasRuntimeMigrationForTable(table) ??
                 false) {
               entryVersion = '';
             }
@@ -270,8 +278,8 @@ class KeyMigrationRunner {
 
               dataStore.backgroundWriteScheduler.addEntry(
                 BackgroundWriteEntry(
-                  taskId: taskIdForTable(tableName),
-                  tableName: tableName,
+                  taskId: taskIdForTable(table),
+                  tableUid: table.tableUid,
                   primaryKey: pk,
                   type: BackgroundWriteType.keyMigration,
                   mode: MigrationWriteMode.tableAndIndex,
@@ -297,15 +305,16 @@ class KeyMigrationRunner {
 
         await KeyMigrationProgressStore.markCompleted(
           dataStore,
-          tableName: tableName,
+          table: table,
           spaceName: scope,
         );
       } catch (e) {
         if (e is DbClosedException) rethrow;
-        Logger.error('Key migration failed for table $tableName', rawError: e);
+        Logger.error('Key migration failed for table ${table.tableName}',
+            rawError: e);
         rethrow;
       } finally {
-        _activeTableMigrations.remove(tableName);
+        _activeTableMigrations.remove(table.tableUid);
       }
     }
   }
@@ -389,14 +398,11 @@ class KeyMigrationRunner {
   }
 
   static Future<void> _purgeTableIndexes(
-      DataStoreImpl dataStore, String tableName) async {
-    final schema = await dataStore.schemaManager?.getTableSchema(tableName);
-    if (schema == null) return;
-
+      DataStoreImpl dataStore, TableContext table) async {
     final indexes = <IndexSchema>[
-      ...schema.getAllIndexes(),
+      ...table.schema.getAllIndexes(),
       ...?dataStore.indexManager
-          ?.getEngineManagedBtreeIndexes(tableName, schema),
+          ?.getEngineManagedBtreeIndexes(table, table.schema),
     ];
 
     final indexManager = dataStore.indexManager;
@@ -405,16 +411,14 @@ class KeyMigrationRunner {
     for (final index in indexes) {
       if (index.type == IndexType.vector) continue;
       await indexManager.deletePhysicalIndexArtifacts(
-        tableName,
-        index.actualIndexName,
+        table,
+        index.indexUid,
       );
     }
   }
 
-  static Future<String> scopeForTable(
-      DataStoreImpl dataStore, String tableName) async {
-    final schema = await dataStore.schemaManager?.getTableSchema(tableName);
-    return _scopeForSchema(dataStore, schema);
+  static String scopeForTable(DataStoreImpl dataStore, TableContext table) {
+    return _scopeForSchema(dataStore, table.schema);
   }
 
   static String _scopeForSchema(DataStoreImpl? dataStore, TableSchema? schema) {
@@ -426,12 +430,11 @@ class KeyMigrationRunner {
 
   static Future<bool> _isTableAlreadyMigrated(
     DataStoreImpl dataStore,
-    String tableName,
+    TableContext table,
     int targetKeyId,
   ) async {
     try {
-      final tableMeta =
-          await dataStore.tableDataManager.getTableMeta(tableName);
+      final tableMeta = await dataStore.tableDataManager.getTableMeta(table);
       if (tableMeta == null || tableMeta.btreeFirstLeaf.isNull) {
         return true;
       }
@@ -442,7 +445,7 @@ class KeyMigrationRunner {
       Future<bool> checkPage(TreePagePtr leaf) async {
         if (leaf.isNull) return true;
         final path = await dataStore.pathManager
-            .getPartitionFilePathByNo(tableName, leaf.partitionNo);
+            .getPartitionFilePathByNo(table.tableUid, leaf.partitionNo);
         final fileSize = await dataStore.storage.getFileSize(path);
         final offset = leaf.pageNo * btreePageSize + 20;
         if (fileSize < offset + 32) return false;
@@ -460,7 +463,7 @@ class KeyMigrationRunner {
       }
       return true;
     } catch (e) {
-      Logger.warn('Could not probe key migration state for $tableName',
+      Logger.warn('Could not probe key migration state for ${table.tableName}',
           rawError: e);
       return false;
     }
