@@ -3,6 +3,7 @@ import '../../model/db_exception.dart';
 import '../../model/expr.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/table_identity.dart';
 import '../../model/table_schema.dart';
 
 /// Pure record validation + conversion path that is safe to run in an isolate.
@@ -14,7 +15,7 @@ import '../../model/table_schema.dart';
 Map<String, dynamic>? validateAndProcessRecordPure({
   required TableSchema schema,
   required Map<String, dynamic> data,
-  required String tableName,
+  required TableName tableName,
   bool skipPrimaryKeyFormatCheck = false,
   List<String>? validationErrors,
   Map<String, FieldSchema>? fieldMap,
@@ -184,7 +185,7 @@ String? validateRecordIdentifierPure({
 Map<String, dynamic>? validateAndProcessUpdateDataPure({
   required TableSchema schema,
   required Map<String, dynamic> data,
-  required String tableName,
+  required TableName tableName,
   bool ignoreUnknownFields = true,
 }) {
   try {
