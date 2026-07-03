@@ -6,8 +6,10 @@ import '../model/system_table.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_context.dart';
 import 'data_store_impl.dart';
 import '../Interface/chain_builder.dart';
+import '../model/table_identity.dart';
 
 /// ForeignKeyManager: Foreign key manager
 ///
@@ -18,10 +20,9 @@ import '../Interface/chain_builder.dart';
 class ForeignKeyManager {
   final DataStoreImpl _dataStore;
 
-  // Reverse mapping cache: referenced table -> referencing tables
-  // This provides O(1) lookup instead of O(n) table scan
-  // Structure: Map<referencedTableName, Map<referencingTableName, List<ForeignKeySchema>>>
-  Map<String, Map<String, List<ForeignKeySchema>>>? _referencingTablesCache;
+  // Reverse mapping cache: referenced table uid -> referencing table uid -> FK schemas
+  // Provides O(1) lookup instead of O(n) table scan.
+  Map<TableUid, Map<TableUid, List<ForeignKeySchema>>>? _referencingTablesCache;
 
   // Track if cache needs rebuild (when schema changes)
   // Note: No time-based expiry - foreign key relationships are part of table structure
@@ -32,6 +33,12 @@ class ForeignKeyManager {
   Future<void>? _cacheLoadingFuture;
 
   ForeignKeyManager(this._dataStore);
+
+  TableUid? _uidForName(String name) =>
+      _dataStore.schemaManager?.getUidByName(TableName(name));
+
+  TableName _nameForUid(TableUid uid) =>
+      _dataStore.schemaManager?.getNameByUid(uid) ?? TableName(uid);
 
   /// Preload foreign key cache synchronously
   ///
@@ -104,7 +111,7 @@ class ForeignKeyManager {
         // - Modify table schemas to add foreign keys
         // These operations call updateSystemTableForTable() to update the system table
         _referencingTablesCache =
-            <String, Map<String, List<ForeignKeySchema>>>{};
+            <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
         _cacheNeedsRebuild = false;
       }
     } catch (e) {
@@ -141,7 +148,8 @@ class ForeignKeyManager {
       }
 
       // Rebuild cache from system table data
-      _referencingTablesCache = <String, Map<String, List<ForeignKeySchema>>>{};
+      _referencingTablesCache =
+          <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
 
       for (final record in results.data) {
         final referencedTable = record['referenced_table'] as String?;
@@ -194,6 +202,12 @@ class ForeignKeyManager {
           continue;
         }
 
+        final referencedUid = _uidForName(referencedTable);
+        final referencingUid = _uidForName(referencingTable);
+        if (referencedUid == null || referencingUid == null) {
+          continue;
+        }
+
         // Create foreign key schema
         final fk = ForeignKeySchema(
           name: fkName,
@@ -206,17 +220,17 @@ class ForeignKeyManager {
         );
 
         // Add to cache
-        if (!_referencingTablesCache!.containsKey(referencedTable)) {
-          _referencingTablesCache![referencedTable] =
-              <String, List<ForeignKeySchema>>{};
+        if (!_referencingTablesCache!.containsKey(referencedUid)) {
+          _referencingTablesCache![referencedUid] =
+              <TableUid, List<ForeignKeySchema>>{};
         }
 
-        if (!_referencingTablesCache![referencedTable]!
-            .containsKey(referencingTable)) {
-          _referencingTablesCache![referencedTable]![referencingTable] = [];
+        if (!_referencingTablesCache![referencedUid]!
+            .containsKey(referencingUid)) {
+          _referencingTablesCache![referencedUid]![referencingUid] = [];
         }
 
-        _referencingTablesCache![referencedTable]![referencingTable]!.add(fk);
+        _referencingTablesCache![referencedUid]![referencingUid]!.add(fk);
       }
 
       _cacheNeedsRebuild = false;
@@ -240,11 +254,13 @@ class ForeignKeyManager {
   ///
   /// Throws [DbException] if foreign key constraints are violated
   Future<void> validateForeignKeyConstraints({
-    required String tableName,
+    required TableContext table,
     required Map<String, dynamic> data,
     required ForeignKeyOperation operation,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final tableName = table.tableName;
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     // Check all foreign key constraints for this table
@@ -311,7 +327,7 @@ class ForeignKeyManager {
       await _validateReferencedRecord(
         fk: fk,
         fkValues: fkValues,
-        tableName: tableName,
+        table: table,
       );
     }
   }
@@ -320,10 +336,11 @@ class ForeignKeyManager {
   Future<void> _validateReferencedRecord({
     required ForeignKeySchema fk,
     required Map<String, dynamic> fkValues,
-    required String tableName,
+    required TableContext table,
   }) async {
-    final referencedSchema =
-        await _dataStore.schemaManager?.getTableSchema(fk.referencedTable);
+    final tableName = table.tableName;
+    final referencedSchema = await _dataStore.schemaManager
+        ?.getTableSchemaByName(TableName(fk.referencedTable));
     if (referencedSchema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -498,11 +515,12 @@ class ForeignKeyManager {
   ///
   /// Throws [DbException] if any RESTRICT/NO ACTION constraint is violated
   Future<void> checkRestrictConstraintsForDelete({
-    required String tableName,
+    required TableContext table,
     required dynamic deletedPkValues,
   }) async {
+    final tableName = table.tableName;
     // Find all foreign keys that reference this table
-    final referencingTables = await _findReferencingTables(tableName);
+    final referencingTables = await _findReferencingTables(table.tableUid);
 
     // Sort table names to ensure deterministic order
     final sortedEntries = referencingTables.entries.toList()
@@ -510,7 +528,8 @@ class ForeignKeyManager {
 
     // Check RESTRICT/NO ACTION constraints
     for (final entry in sortedEntries) {
-      final childTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -518,7 +537,7 @@ class ForeignKeyManager {
             fk.onDelete == ForeignKeyCascadeAction.noAction) {
           // Check if there are any child records referencing the record to be deleted
           final hasReferences = await _checkChildReferences(
-            childTableName: childTableName,
+            childTableUid: childTableUid,
             fk: fk,
             parentPkValues: deletedPkValues,
           );
@@ -555,11 +574,12 @@ class ForeignKeyManager {
   ///
   /// Throws [DbException] if any RESTRICT/NO ACTION constraint is violated
   Future<void> checkRestrictConstraintsForUpdate({
-    required String tableName,
+    required TableContext table,
     required dynamic oldPkValues,
   }) async {
+    final tableName = table.tableName;
     // Find all foreign keys that reference this table
-    final referencingTables = await _findReferencingTables(tableName);
+    final referencingTables = await _findReferencingTables(table.tableUid);
 
     // Sort table names to ensure deterministic order
     final sortedEntries = referencingTables.entries.toList()
@@ -567,7 +587,8 @@ class ForeignKeyManager {
 
     // Check RESTRICT/NO ACTION constraints
     for (final entry in sortedEntries) {
-      final childTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -575,7 +596,7 @@ class ForeignKeyManager {
             fk.onUpdate == ForeignKeyCascadeAction.noAction) {
           // Check if there are any child records referencing the record to be updated
           final hasReferences = await _checkChildReferences(
-            childTableName: childTableName,
+            childTableUid: childTableUid,
             fk: fk,
             parentPkValues: oldPkValues,
           );
@@ -612,11 +633,13 @@ class ForeignKeyManager {
   ///
   /// Returns the number of records deleted by cascading
   Future<int> handleCascadeDelete({
-    required String tableName,
+    required TableContext table,
     required dynamic deletedPkValues,
     Set<String>? visitedRecords,
     bool skipRestrictCheck = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     int totalCascaded = 0;
 
     // Create a new set to avoid sharing between concurrent operations
@@ -625,7 +648,7 @@ class ForeignKeyManager {
         visitedRecords != null ? Set<String>.from(visitedRecords) : <String>{};
 
     // Generate unique key for the current record
-    final recordKey = _generateRecordKey(tableName, deletedPkValues);
+    final recordKey = _generateRecordKey(tableUid, deletedPkValues);
 
     if (visited.contains(recordKey)) {
       // Record already visited in this cascade chain, skip to avoid infinite recursion
@@ -634,7 +657,7 @@ class ForeignKeyManager {
     visited.add(recordKey);
 
     // Find all foreign keys that reference this table (with caching optimization)
-    final referencingTables = await _findReferencingTables(tableName);
+    final referencingTables = await _findReferencingTables(table.tableUid);
 
     // Sort table names to ensure deterministic lock acquisition order (prevents deadlocks)
     final sortedEntries = referencingTables.entries.toList()
@@ -652,7 +675,8 @@ class ForeignKeyManager {
     // If any RESTRICT constraint is violated, reject the deletion immediately
     if (!skipRestrictCheck) {
       for (final entry in sortedEntries) {
-        final childTableName = entry.key;
+        final childTableUid = entry.key;
+        final childTableName = _nameForUid(childTableUid);
         final fks = entry.value;
 
         for (final fk in fks) {
@@ -662,7 +686,7 @@ class ForeignKeyManager {
             // This check happens BEFORE CASCADE deletes, so it will catch all references
             // regardless of whether they would be deleted via other CASCADE paths
             final hasReferences = await _checkChildReferences(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: deletedPkValues,
             );
@@ -690,7 +714,8 @@ class ForeignKeyManager {
 
     // Phase 2: After RESTRICT checks pass, process all CASCADE, SET NULL, and SET DEFAULT actions
     for (final entry in sortedEntries) {
-      final childTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -703,7 +728,7 @@ class ForeignKeyManager {
           // to ensure transaction rollback and data consistency
           try {
             final deletedCount = await _cascadeDeleteWithRecursion(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: deletedPkValues,
               visitedRecords: visited,
@@ -720,7 +745,7 @@ class ForeignKeyManager {
           // Error handling: propagate errors to ensure transaction rollback
           try {
             await _setForeignKeyToNull(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: deletedPkValues,
             );
@@ -734,7 +759,7 @@ class ForeignKeyManager {
           // Error handling: propagate errors to ensure transaction rollback
           try {
             await _setForeignKeyToDefault(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: deletedPkValues,
             );
@@ -763,12 +788,14 @@ class ForeignKeyManager {
   ///
   /// Returns the number of records updated by cascading
   Future<int> handleCascadeUpdate({
-    required String tableName,
+    required TableContext table,
     required dynamic oldPkValues,
     required dynamic newPkValues,
     Set<String>? visitedTables,
     bool skipRestrictCheck = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     int totalCascaded = 0;
 
     // Create a new set to avoid sharing between concurrent operations
@@ -776,16 +803,16 @@ class ForeignKeyManager {
         visitedTables != null ? Set<String>.from(visitedTables) : <String>{};
 
     // Prevent infinite recursion in case of circular foreign key references
-    if (visited.contains(tableName)) {
+    if (visited.contains(tableUid)) {
       Logger.warn(
         'Circular foreign key reference detected during cascade update involving table $tableName',
       );
       return 0;
     }
-    visited.add(tableName);
+    visited.add(tableUid);
 
     // Find all foreign keys that reference this table (with caching optimization)
-    final referencingTables = await _findReferencingTables(tableName);
+    final referencingTables = await _findReferencingTables(table.tableUid);
 
     // Sort table names to ensure deterministic lock acquisition order (prevents deadlocks)
     final sortedEntries = referencingTables.entries.toList()
@@ -793,7 +820,8 @@ class ForeignKeyManager {
 
     // Handle each referenced table
     for (final entry in sortedEntries) {
-      final childTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -802,7 +830,7 @@ class ForeignKeyManager {
                 fk.onUpdate == ForeignKeyCascadeAction.noAction)) {
           // Check if there are any child records referencing the updated record
           final hasReferences = await _checkChildReferences(
-            childTableName: childTableName,
+            childTableUid: childTableUid,
             fk: fk,
             parentPkValues: oldPkValues,
           );
@@ -826,7 +854,7 @@ class ForeignKeyManager {
         } else if (fk.onUpdate == ForeignKeyCascadeAction.cascade) {
           // Cascade update: update all foreign key fields referencing this record
           // Check for potential circular reference: if updating would create a cycle, skip
-          if (childTableName == tableName && oldPkValues == newPkValues) {
+          if (childTableUid == table.tableUid && oldPkValues == newPkValues) {
             // Self-reference with same value, skip to avoid infinite loop
             continue;
           }
@@ -835,7 +863,7 @@ class ForeignKeyManager {
           int updatedCount = 0;
           try {
             updatedCount = await _cascadeUpdateChildren(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               oldParentPkValues: oldPkValues,
               newParentPkValues: newPkValues,
@@ -871,7 +899,7 @@ class ForeignKeyManager {
           // Error handling: propagate errors to ensure transaction rollback
           try {
             await _setForeignKeyToNull(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: oldPkValues,
             );
@@ -886,7 +914,7 @@ class ForeignKeyManager {
           // Error handling: propagate errors to ensure transaction rollback
           try {
             await _setForeignKeyToDefault(
-              childTableName: childTableName,
+              childTableUid: childTableUid,
               fk: fk,
               parentPkValues: oldPkValues,
             );
@@ -911,9 +939,10 @@ class ForeignKeyManager {
   /// [tableName] Table to be cleared (parent table)
   ///
   /// Throws [DbException] if any foreign key has RESTRICT/NO ACTION and there are child records
-  Future<void> handleCascadeClear(String tableName) async {
+  Future<void> handleCascadeClear(TableContext table) async {
+    final tableName = table.tableName;
     // Find all foreign keys that reference this table
-    final referencingTables = await _findReferencingTables(tableName);
+    final referencingTables = await _findReferencingTables(table.tableUid);
 
     if (referencingTables.isEmpty) {
       // No foreign key references, can clear safely
@@ -950,7 +979,7 @@ class ForeignKeyManager {
           try {
             // Get child table schema to understand field types
             final childSchema = await _dataStore.schemaManager!
-                .getTableSchema(referencingTableName);
+                .getTableSchemaByName(TableName(referencingTableName));
             if (childSchema == null) {
               // Table doesn't exist, skip this check
               continue;
@@ -1018,7 +1047,8 @@ class ForeignKeyManager {
       ..sort((a, b) => a.key.compareTo(b.key));
 
     for (final entry in sortedEntries) {
-      final childTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -1081,7 +1111,7 @@ class ForeignKeyManager {
           try {
             // Get child table schema to get default values
             final childSchema =
-                await _dataStore.schemaManager?.getTableSchema(childTableName);
+                await _dataStore.schemaManager?.getTableSchema(childTableUid);
             if (childSchema == null) {
               Logger.warn(
                 'Child table $childTableName does not exist during cascade clear, skipping',
@@ -1131,10 +1161,11 @@ class ForeignKeyManager {
   ///
   /// Optimized to use index lookup when possible
   Future<bool> _checkChildReferences({
-    required String childTableName,
+    required TableUid childTableUid,
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
+    final childTableName = _nameForUid(childTableUid);
     // Build query conditions using helper method
     final condition = _buildForeignKeyCondition(fk, parentPkValues);
 
@@ -1144,7 +1175,7 @@ class ForeignKeyManager {
 
     // Get child table schema to ensure type conversion
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableName);
+        await _dataStore.schemaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       return false;
     }
@@ -1201,11 +1232,12 @@ class ForeignKeyManager {
   /// Optimization: Uses chunked processing (pagination) to handle large number of child records
   /// to avoid memory issues (OOM).
   Future<int> _cascadeDeleteWithRecursion({
-    required String childTableName,
+    required TableUid childTableUid,
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
     required Set<String> visitedRecords,
   }) async {
+    final childTableName = _nameForUid(childTableUid);
     // Build query conditions using helper method
     final condition = _buildForeignKeyCondition(fk, parentPkValues);
     if (condition.isEmpty) {
@@ -1215,7 +1247,7 @@ class ForeignKeyManager {
     // Get child schema for primary key
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableName);
+        await _dataStore.schemaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade delete, skipping',
@@ -1232,7 +1264,7 @@ class ForeignKeyManager {
       // Convert condition values to match child table field types
       // This is critical for type matching (e.g., integer foreign key vs text primary key)
       final childSchemaForConversion =
-          await _dataStore.schemaManager?.getTableSchema(childTableName);
+          await _dataStore.schemaManager?.getTableSchema(childTableUid);
       final convertedCondition = <String, dynamic>{};
       if (childSchemaForConversion != null) {
         for (final entry in condition.entries) {
@@ -1293,7 +1325,7 @@ class ForeignKeyManager {
 
       // Find all tables that reference the child table (for recursive cascade)
       final childReferencingTables =
-          await _findReferencingTables(childTableName);
+          await _findReferencingTables(childTableUid);
 
       // Recursively delete all descendants first (depth-first)
       // Important: If any recursive delete fails, we should propagate the error
@@ -1304,7 +1336,8 @@ class ForeignKeyManager {
           ..sort((a, b) => a.key.compareTo(b.key));
 
         for (final childEntry in sortedChildTables) {
-          final grandChildTableName = childEntry.key;
+          final grandChildTableUid = childEntry.key;
+          final grandChildTableName = _nameForUid(grandChildTableUid);
           final grandChildFks = childEntry.value;
 
           for (final grandChildFk in grandChildFks) {
@@ -1319,7 +1352,7 @@ class ForeignKeyManager {
               for (final childPk in childPkValues) {
                 try {
                   final recursiveCount = await _cascadeDeleteWithRecursion(
-                    childTableName: grandChildTableName,
+                    childTableUid: grandChildTableUid,
                     fk: grandChildFk,
                     parentPkValues: childPk,
                     visitedRecords: visitedRecords,
@@ -1369,8 +1402,8 @@ class ForeignKeyManager {
     return totalDeleted;
   }
 
-  /// Generate a unique key for a record (tableName:pkValue)
-  String _generateRecordKey(String tableName, dynamic pkValue) {
+  /// Generate a unique key for a record (tableUid:pkValue)
+  String _generateRecordKey(TableUid tableUid, dynamic pkValue) {
     if (pkValue is Map) {
       // Composite key: sort keys to ensure consistent string representation
       final sortedKeys = pkValue.keys.toList()..sort();
@@ -1378,9 +1411,9 @@ class ForeignKeyManager {
       for (final key in sortedKeys) {
         buffer.write('$key:${pkValue[key]}|');
       }
-      return '$tableName:$buffer';
+      return '$tableUid:$buffer';
     } else {
-      return '$tableName:$pkValue';
+      return '$tableUid:$pkValue';
     }
   }
 
@@ -1391,14 +1424,15 @@ class ForeignKeyManager {
   /// Note: This method validates that the new primary key value exists in the referenced table
   /// before performing the update to ensure referential integrity.
   Future<int> _cascadeUpdateChildren({
-    required String childTableName,
+    required TableUid childTableUid,
     required ForeignKeySchema fk,
     required dynamic oldParentPkValues,
     required dynamic newParentPkValues,
   }) async {
+    final childTableName = _nameForUid(childTableUid);
     // Verify that the child table still exists (may have been dropped during cascade)
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableName);
+        await _dataStore.schemaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade update, skipping',
@@ -1407,8 +1441,8 @@ class ForeignKeyManager {
     }
 
     // Verify that the referenced table still exists
-    final referencedSchema =
-        await _dataStore.schemaManager?.getTableSchema(fk.referencedTable);
+    final referencedSchema = await _dataStore.schemaManager
+        ?.getTableSchemaByName(TableName(fk.referencedTable));
     if (referencedSchema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1450,7 +1484,7 @@ class ForeignKeyManager {
     // For self-referencing foreign keys, if oldPkValues == newPkValues, skip validation
     // since we're updating the same record (already handled in handleCascadeUpdate)
     bool skipValidation = false;
-    if (childTableName == fk.referencedTable) {
+    if (childTableName.value == fk.referencedTable) {
       // Self-referencing foreign key
       if (oldParentPkValues is Map && newParentPkValues is Map) {
         // Compare composite keys
@@ -1539,14 +1573,15 @@ class ForeignKeyManager {
   ///
   /// Validates that the foreign key fields allow NULL values before setting
   Future<void> _setForeignKeyToNull({
-    required String childTableName,
+    required TableUid childTableUid,
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
+    final childTableName = _nameForUid(childTableUid);
     // Validate that foreign key fields allow NULL
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableName);
+        await _dataStore.schemaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set NULL operation, skipping',
@@ -1608,14 +1643,15 @@ class ForeignKeyManager {
   /// Note: For dynamic default values (e.g., currentTimestamp), all affected records
   /// will get the same value at the time of cascade operation, ensuring consistency.
   Future<void> _setForeignKeyToDefault({
-    required String childTableName,
+    required TableUid childTableUid,
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
+    final childTableName = _nameForUid(childTableUid);
     // Get the child table structure
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableName);
+        await _dataStore.schemaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set DEFAULT operation, skipping',
@@ -1687,13 +1723,13 @@ class ForeignKeyManager {
   ///
   /// Note: Cache is loaded lazily on first access. No time-based expiry - foreign key
   /// relationships are part of table structure and only change when schemas are modified.
-  Future<Map<String, List<ForeignKeySchema>>> _findReferencingTables(
-      String tableName) async {
+  Future<Map<TableUid, List<ForeignKeySchema>>> _findReferencingTables(
+      TableUid referencedTableUid) async {
     // Ensure cache is loaded (lazy loading)
     await _ensureCacheLoaded();
 
     // Return cached result - O(1) lookup
-    return _referencingTablesCache?[tableName] ?? {};
+    return _referencingTablesCache?[referencedTableUid] ?? {};
   }
 
   /// Invalidate the foreign key relationship cache
@@ -1718,10 +1754,11 @@ class ForeignKeyManager {
   ///
   /// Note: This is a public method (not private) because it's called from DataStoreImpl
   Future<void> updateSystemTableForTable(
-    String tableName,
+    TableContext table,
     TableSchema schema, {
     bool throwOnError = false,
   }) async {
+    final tableName = table.tableName;
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
@@ -1859,9 +1896,9 @@ class ForeignKeyManager {
   /// Check if any tables reference the given table via foreign keys
   ///
   /// This is a public method to check foreign key references before dropping a table
-  Future<Map<String, List<ForeignKeySchema>>> findReferencingTables(
-      String tableName) async {
-    return await _findReferencingTables(tableName);
+  Future<Map<TableUid, List<ForeignKeySchema>>> findReferencingTables(
+      TableContext table) async {
+    return await _findReferencingTables(table.tableUid);
   }
 
   /// Clean up system table entries when a table is dropped
@@ -1873,9 +1910,10 @@ class ForeignKeyManager {
   ///
   /// [tableName] The table being dropped
   Future<void> cleanupSystemTableForDroppedTable(
-    String tableName, {
+    TableContext table, {
     bool throwOnError = false,
   }) async {
+    final tableName = table.tableName;
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
