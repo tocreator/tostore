@@ -5,6 +5,8 @@ import 'dart:typed_data';
 import '../handler/parallel_processor.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_quantizer.dart';
@@ -65,8 +67,8 @@ class NghGraphEngine {
   /// Returns top-[topK] results sorted by distance (ascending for L2/cosine,
   /// ascending-of-negated for inner-product).
   Future<List<NghSearchResult>> search({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     required VectorQuantizer quantizer,
     required Float32List query,
@@ -97,8 +99,8 @@ class NghGraphEngine {
 
     // Phase 2: Beam search through graph using ADC distances (parallel PQ reads when lease present)
     final candidates = await _beamSearch(
-      tableName: tableName,
-      indexName: indexName,
+      table: table,
+      indexUid: indexUid,
       meta: meta,
       quantizer: quantizer,
       distTable: distTable,
@@ -116,7 +118,7 @@ class NghGraphEngine {
     final toRerank = candidates.sublist(0, rerankCount);
     final nodeIds = [for (final c in toRerank) c.nodeId];
     final rawVectors = await _loadRawVectorsBatch(
-        tableName, indexName, meta, nodeIds,
+        table, indexUid, meta, nodeIds,
         workloadLease: workloadLease);
 
     final results = <NghSearchResult>[];
@@ -143,8 +145,8 @@ class NghGraphEngine {
   ///   - Batch PQ-code reads: neighbours on the same PQ page share one I/O
   ///   - Deletion check piggybacked on the already-loaded graph page
   Future<List<_SearchCandidate>> _beamSearch({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     required VectorQuantizer quantizer,
     required Float32List distTable,
@@ -168,8 +170,7 @@ class NghGraphEngine {
     final _FixedHeap resultHeap = _FixedHeap(ef, maxHeap: true);
 
     //  Load entry point
-    final entryCode =
-        await _loadPqCode(tableName, indexName, meta, entryNodeId);
+    final entryCode = await _loadPqCode(table, indexUid, meta, entryNodeId);
     if (entryCode == null) return const [];
     final entryDist = quantizer.adcDistance(distTable, entryCode);
 
@@ -200,7 +201,7 @@ class NghGraphEngine {
       final gKey = gPartition << 20 | gPage;
       var graphPage = graphPageLocal[gKey];
       graphPage ??= await _partitionManager.readGraphPage(
-          tableName, indexName, meta, gPartition, gPage,
+          table, indexUid, meta, gPartition, gPage,
           localCache: graphPageLocal);
       graphPageLocal[gKey] = graphPage;
 
@@ -245,7 +246,7 @@ class NghGraphEngine {
       if (pqConcurrency > 1) {
         final pqTasks = [
           for (final pgEntry in pqEntries)
-            () => _partitionManager.readPqCodePage(tableName, indexName, meta,
+            () => _partitionManager.readPqCodePage(table, indexUid, meta,
                 pgEntry.key >> 20, pgEntry.key & 0xFFFFF),
         ];
         final pqPages = await ParallelProcessor.execute<NghPqCodePage>(pqTasks,
@@ -269,7 +270,7 @@ class NghGraphEngine {
           final pqPartition = pgEntry.key >> 20;
           final pqPageNo = pgEntry.key & 0xFFFFF;
           final pqPage = await _partitionManager.readPqCodePage(
-              tableName, indexName, meta, pqPartition, pqPageNo);
+              table, indexUid, meta, pqPartition, pqPageNo);
           for (final (nId, pqSlot) in pgEntry.value) {
             if (pqSlot >= pqPage.vectorCount) continue;
             final code = pqPage.getCode(pqSlot);
@@ -295,8 +296,8 @@ class NghGraphEngine {
   ///
   /// Returns the dirty pages that need to be flushed, and the updated meta.
   Future<NghInsertResult> insertBatch({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     required VectorQuantizer quantizer,
     required List<Float32List> vectors,
@@ -322,12 +323,12 @@ class NghGraphEngine {
       currentMeta = currentMeta.copyWith(nextNodeId: nodeId + 1);
 
       // 1. Write PQ code
-      currentMeta = await _writePqCode(tableName, indexName, currentMeta,
-          nodeId, pqCode, dirtyPq, localPqCache);
+      currentMeta = await _writePqCode(
+          table, indexUid, currentMeta, nodeId, pqCode, dirtyPq, localPqCache);
 
       // 2. Write raw vector
-      currentMeta = await _writeRawVector(tableName, indexName, currentMeta,
-          nodeId, vector, dirtyRaw, localRawCache);
+      currentMeta = await _writeRawVector(table, indexUid, currentMeta, nodeId,
+          vector, dirtyRaw, localRawCache);
 
       // 3. Find neighbors via greedy search
       List<int> neighborIds;
@@ -349,8 +350,8 @@ class NghGraphEngine {
         }
       } else {
         neighborIds = await _greedySearchForInsert(
-          tableName,
-          indexName,
+          table,
+          indexUid,
           currentMeta,
           quantizer,
           vector,
@@ -362,8 +363,8 @@ class NghGraphEngine {
         // Robust Prune: select diverse subset when candidates exceed max degree
         if (neighborIds.length > currentMeta.maxDegree) {
           neighborIds = await _robustPrune(
-            tableName,
-            indexName,
+            table,
+            indexUid,
             currentMeta,
             quantizer,
             nodeId,
@@ -374,15 +375,15 @@ class NghGraphEngine {
       }
 
       // 4. Write new node's graph slot
-      currentMeta = await _writeGraphNode(tableName, indexName, currentMeta,
-          nodeId, neighborIds, dirtyGraph, localGraphCache);
+      currentMeta = await _writeGraphNode(table, indexUid, currentMeta, nodeId,
+          neighborIds, dirtyGraph, localGraphCache);
 
       // 5. Add reverse edges (bidirectional)
       for (final neighborId in neighborIds) {
         await yc.maybeYield();
         currentMeta = await _addReverseEdge(
-          tableName,
-          indexName,
+          table,
+          indexUid,
           currentMeta,
           quantizer,
           neighborId,
@@ -409,8 +410,8 @@ class NghGraphEngine {
 
   /// Mark nodes as deleted (tombstone). Actual cleanup is deferred to maintenance.
   Future<NghDeleteResult> deleteBatch({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     required List<int> nodeIds,
   }) async {
@@ -427,7 +428,7 @@ class NghGraphEngine {
 
       var page = localCache[cacheKey];
       page ??= await _partitionManager.readGraphPage(
-          tableName, indexName, meta, partitionNo, pageNo,
+          table, indexUid, meta, partitionNo, pageNo,
           localCache: localCache);
 
       if (slot < page.slots.length) {
@@ -450,8 +451,8 @@ class NghGraphEngine {
 
   /// Select up to R diverse neighbors from candidates using α-rule.
   Future<List<int>> _robustPrune(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     VectorQuantizer quantizer,
     int nodeId,
@@ -462,7 +463,7 @@ class NghGraphEngine {
     final alpha = meta.pruneAlpha;
 
     // Load PQ code for the node being pruned
-    final nodeCode = await _loadPqCode(tableName, indexName, meta, nodeId,
+    final nodeCode = await _loadPqCode(table, indexUid, meta, nodeId,
         localCache: localPqCache);
     if (nodeCode == null) return candidates.take(r).toList();
 
@@ -480,7 +481,7 @@ class NghGraphEngine {
     }
     for (final pgEntry in pqPageGroups.entries) {
       final pqPage = await _partitionManager.readPqCodePage(
-          tableName, indexName, meta, pgEntry.key >> 20, pgEntry.key & 0xFFFFF,
+          table, indexUid, meta, pgEntry.key >> 20, pgEntry.key & 0xFFFFF,
           localCache: localPqCache);
       for (final (cId, pqSlot) in pgEntry.value) {
         if (pqSlot < pqPage.vectorCount) {
@@ -536,8 +537,8 @@ class NghGraphEngine {
   // =====================================================================
 
   Future<Uint8List?> _loadPqCode(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId, {
     Map<int, NghPqCodePage>? localCache,
@@ -547,7 +548,7 @@ class NghGraphEngine {
     final slot = meta.pqSlotForNode(nodeId);
 
     final page = await _partitionManager.readPqCodePage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
     if (slot >= page.vectorCount) return null;
     return page.getCode(slot);
@@ -557,8 +558,8 @@ class NghGraphEngine {
   /// When [workloadLease] is set, reads unique pages in parallel via [ParallelProcessor].
   /// Returns list in same order as [nodeIds]; null where vector unavailable.
   Future<List<Float32List?>> _loadRawVectorsBatch(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     List<int> nodeIds, {
     WorkloadLease? workloadLease,
@@ -583,7 +584,7 @@ class NghGraphEngine {
       final tasks = [
         for (final entry in entries)
           () => _partitionManager.readRawVectorPage(
-              tableName, indexName, meta, entry.key >> 20, entry.key & 0xFFFFF),
+              table, indexUid, meta, entry.key >> 20, entry.key & 0xFFFFF),
       ];
       final pages = await ParallelProcessor.execute<NghRawVectorPage>(tasks,
           concurrency: min(concurrency, tasks.length),
@@ -602,7 +603,7 @@ class NghGraphEngine {
         final partitionNo = entry.key >> 20;
         final pageNo = entry.key & 0xFFFFF;
         final page = await _partitionManager.readRawVectorPage(
-            tableName, indexName, meta, partitionNo, pageNo);
+            table, indexUid, meta, partitionNo, pageNo);
         for (final (idx, slot) in entry.value) {
           if (slot < page.vectorCount) {
             result[idx] = page.getVectorAsFloat32(slot);
@@ -614,8 +615,8 @@ class NghGraphEngine {
   }
 
   Future<Uint32List?> _loadNeighbors(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId, {
     Map<int, NghGraphPage>? localCache,
@@ -625,7 +626,7 @@ class NghGraphEngine {
     final slot = meta.graphSlotForNode(nodeId);
 
     final page = await _partitionManager.readGraphPage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
     if (slot >= page.slots.length) return null;
     final node = page.slots[slot];
@@ -635,8 +636,8 @@ class NghGraphEngine {
   }
 
   Future<bool> _isNodeDeleted(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId, {
     Map<int, NghGraphPage>? localCache,
@@ -646,7 +647,7 @@ class NghGraphEngine {
     final slot = meta.graphSlotForNode(nodeId);
 
     final page = await _partitionManager.readGraphPage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
     if (slot >= page.slots.length) return true;
     return page.slots[slot].isDeleted;
@@ -657,8 +658,8 @@ class NghGraphEngine {
   // =====================================================================
 
   Future<NghIndexMeta> _writePqCode(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId,
     Uint8List pqCode,
@@ -679,7 +680,7 @@ class NghGraphEngine {
 
     var page = localCache[cacheKey];
     page ??= await _partitionManager.readPqCodePage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
 
     page.setCode(slot, pqCode);
@@ -689,8 +690,8 @@ class NghGraphEngine {
   }
 
   Future<NghIndexMeta> _writeRawVector(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId,
     Float32List vector,
@@ -709,7 +710,7 @@ class NghGraphEngine {
 
     var page = localCache[cacheKey];
     page ??= await _partitionManager.readRawVectorPage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
 
     page.setVectorFromFloat32(slot, vector);
@@ -720,8 +721,8 @@ class NghGraphEngine {
   }
 
   Future<NghIndexMeta> _writeGraphNode(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     int nodeId,
     List<int> neighborIds,
@@ -740,7 +741,7 @@ class NghGraphEngine {
 
     var page = localCache[cacheKey];
     page ??= await _partitionManager.readGraphPage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
 
     if (slot < page.slots.length) {
@@ -760,8 +761,8 @@ class NghGraphEngine {
   /// Add reverse edge: neighborId → nodeId.
   /// If neighbor is already at max degree, apply Robust Prune.
   Future<NghIndexMeta> _addReverseEdge(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     VectorQuantizer quantizer,
     int neighborId,
@@ -777,7 +778,7 @@ class NghGraphEngine {
 
     var page = localCache[cacheKey];
     page ??= await _partitionManager.readGraphPage(
-        tableName, indexName, meta, partitionNo, pageNo,
+        table, indexUid, meta, partitionNo, pageNo,
         localCache: localCache);
 
     if (slot >= page.slots.length) return meta;
@@ -802,8 +803,8 @@ class NghGraphEngine {
       currentNeighbors.add(nodeId);
 
       final pruned = await _robustPrune(
-        tableName,
-        indexName,
+        table,
+        indexUid,
         meta,
         quantizer,
         neighborId,
@@ -826,8 +827,8 @@ class NghGraphEngine {
   ///
   /// Uses the same optimised heap + batch I/O as [_beamSearch].
   Future<List<int>> _greedySearchForInsert(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     VectorQuantizer quantizer,
     Float32List vector,
@@ -843,7 +844,7 @@ class NghGraphEngine {
 
     if (meta.medoidNodeId < 0) return const [];
     final entryCode = await _loadPqCode(
-        tableName, indexName, meta, meta.medoidNodeId,
+        table, indexUid, meta, meta.medoidNodeId,
         localCache: localPqCache);
     if (entryCode == null) return [meta.medoidNodeId];
     final entryDist = quantizer.adcDistance(distTable, entryCode);
@@ -864,8 +865,7 @@ class NghGraphEngine {
       final currentDist = candidateHeap.lastPoppedDist;
       if (resultHeap.isFull && currentDist > resultHeap.peekDist) break;
 
-      final neighbors = await _loadNeighbors(
-          tableName, indexName, meta, currentId,
+      final neighbors = await _loadNeighbors(table, indexUid, meta, currentId,
           localCache: localGraphCache);
       if (neighbors == null) continue;
 
@@ -882,8 +882,8 @@ class NghGraphEngine {
       }
 
       for (final pgEntry in pqGroups.entries) {
-        final pqPage = await _partitionManager.readPqCodePage(tableName,
-            indexName, meta, pgEntry.key >> 20, pgEntry.key & 0xFFFFF,
+        final pqPage = await _partitionManager.readPqCodePage(
+            table, indexUid, meta, pgEntry.key >> 20, pgEntry.key & 0xFFFFF,
             localCache: localPqCache);
 
         for (final (nId, pqSlot) in pgEntry.value) {
@@ -958,8 +958,8 @@ class NghGraphEngine {
   /// [maxVisitedPages] caps the amount of work per invocation.
   /// Returns dirty graph pages and count of compacted tombstones.
   Future<NghCompactResult> compactTombstones({
-    required String tableName,
-    required String indexName,
+    required TableContext table,
+    required IndexUid indexUid,
     required NghIndexMeta meta,
     int maxVisitedPages = 100,
   }) async {
@@ -987,7 +987,7 @@ class NghGraphEngine {
         final cacheKey = pNo << 20 | pgNo;
         var page = localCache[cacheKey];
         page ??= await _partitionManager.readGraphPage(
-            tableName, indexName, meta, pNo, pgNo,
+            table, indexUid, meta, pNo, pgNo,
             localCache: localCache);
         bool pageDirty = false;
 
@@ -1001,13 +1001,13 @@ class NghGraphEngine {
             await yc.maybeYield();
             final neighborId = node.neighbors[n];
             final isDeleted = await _isNodeDeleted(
-                tableName, indexName, meta, neighborId,
+                table, indexUid, meta, neighborId,
                 localCache: localCache);
             if (!isDeleted) continue;
 
             // Load the deleted neighbor's own neighbors for reconnection
             final deletedNeighbors = await _loadNeighbors(
-                tableName, indexName, meta, neighborId,
+                table, indexUid, meta, neighborId,
                 localCache: localCache);
 
             // Find a replacement: first non-deleted, non-self, non-duplicate neighbor
@@ -1026,7 +1026,7 @@ class NghGraphEngine {
                 }
                 if (duplicate) continue;
                 final candDeleted = await _isNodeDeleted(
-                    tableName, indexName, meta, candidate,
+                    table, indexUid, meta, candidate,
                     localCache: localCache);
                 if (!candDeleted) {
                   replacement = candidate;
