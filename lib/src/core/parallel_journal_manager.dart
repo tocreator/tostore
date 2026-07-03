@@ -19,6 +19,7 @@ import '../model/index_entry.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
 import '../model/wal_pointer.dart';
 import 'btree_page.dart';
 import 'compute/wal_decode_batch_runner.dart';
@@ -31,6 +32,7 @@ import 'wal_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 class ParallelJournalManager {
   final DataStoreImpl _dataStore;
@@ -488,15 +490,15 @@ class ParallelJournalManager {
         final Map<String, String> targetCheckpoints = {};
         final flushCheckpointMap = <String, BgTaskProgress>{};
         for (final entry in bgEntries) {
-          bgEntriesByTable.putIfAbsent(entry.tableName, () => []).add(entry);
+          bgEntriesByTable.putIfAbsent(entry.tableUid, () => []).add(entry);
           if (entry.type == BackgroundWriteType.largeUpdate) {
             bgLargeUpdatesByTable
-                .putIfAbsent(entry.tableName, () => [])
+                .putIfAbsent(entry.tableUid, () => [])
                 .add(entry);
           }
           if (entry.type == BackgroundWriteType.schemaMigration &&
               entry.nextCursor != null) {
-            targetCheckpoints[entry.tableName] = entry.nextCursor!;
+            targetCheckpoints[entry.tableUid] = entry.nextCursor!;
           }
           final currentProgress = flushCheckpointMap[entry.taskId];
           final count = (currentProgress?.count ?? 0) + 1;
@@ -511,28 +513,30 @@ class ParallelJournalManager {
         // Process business writes (as the "newer" data, overwriting migration)
         for (final e in batch) {
           await yieldController.maybeYield();
+          final tableContext = _tableContextFromUid(e.tableUid);
+          if (tableContext == null) continue;
           tableEpochs.putIfAbsent(
-              e.tableName, () => _bufferManager.getClearEpoch(e.tableName));
+              e.tableUid, () => _bufferManager.getClearEpoch(tableContext));
 
-          final be = _bufferManager.getBufferedRecord(e.tableName, e.recordId);
+          final be = _bufferManager.getBufferedRecord(tableContext, e.recordId);
           if (be == null) continue;
 
           BufferEntry effectiveEntry = be;
           final migrationManager = _dataStore.migrationManager;
           if (migrationManager != null &&
-              migrationManager.hasRuntimeMigrationForTable(e.tableName) &&
+              migrationManager.hasRuntimeMigrationForTable(tableContext) &&
               migrationManager.shouldNormalizeBufferedWrite(
-                e.tableName,
+                tableContext,
                 be.walPointer,
               )) {
             final normalizedData = migrationManager.normalizeRecordToLatestSync(
-              e.tableName,
+              tableContext,
               be.data,
               fromVersion: be.schemaVersion,
             );
             final normalizedOldValues = be.oldValues != null
                 ? migrationManager.normalizeRecordToLatestSync(
-                    e.tableName,
+                    tableContext,
                     be.oldValues!,
                     fromVersion: be.schemaVersion,
                   )
@@ -542,15 +546,15 @@ class ParallelJournalManager {
           }
 
           // Check if table is being cleared - if so, skip this entry to avoid race condition
-          if (_dataStore.tableDataManager.isTableBeingCleared(e.tableName)) {
+          if (_dataStore.tableDataManager.isTableBeingCleared(tableContext)) {
             continue;
           }
 
           // Business write ALWAYS overwrites migration data for the same PK
-          final pkMap = tablePkMap.putIfAbsent(e.tableName, () => {});
+          final pkMap = tablePkMap.putIfAbsent(e.tableUid, () => {});
           pkMap[e.recordId] = effectiveEntry;
 
-          entriesByTable.putIfAbsent(e.tableName, () => []).add(e);
+          entriesByTable.putIfAbsent(e.tableUid, () => []).add(e);
         }
 
         // 3. Finalize 'grouped' structure from the coalesced PK maps
@@ -613,12 +617,14 @@ class ParallelJournalManager {
         int estimatedTotalWorkOps = 0;
         final allTables = <String>{...grouped.keys, ...bgEntriesByTable.keys};
 
-        for (final table in allTables) {
+        for (final tableUid in allTables) {
+          final tableContext = _resolveTableContext(tableUid);
+          if (tableContext == null) continue;
           try {
-            final schema =
-                await _dataStore.schemaManager?.getTableSchema(table);
+            final schema = await _dataStore.schemaManager
+                ?.getTableSchema(tableContext.tableUid);
             final tableMeta =
-                await _dataStore.tableDataManager.getTableMeta(table);
+                await _dataStore.tableDataManager.getTableMeta(tableContext);
             final indexNames = <String>[];
             final baseIndexTotalEntries = <String, int>{};
             final baseIndexTotalSizeInBytes = <String, int>{};
@@ -628,32 +634,33 @@ class ParallelJournalManager {
               final allIndexes = <IndexSchema>[
                 ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
                 ...?_dataStore.indexManager
-                    ?.getEngineManagedBtreeIndexes(table, schema),
+                    ?.getEngineManagedBtreeIndexes(tableContext, schema),
               ];
               for (final idx in allIndexes) {
-                final idxName = idx.actualIndexName;
-                indexNames.add(idxName);
+                final idxUid = idx.indexUid.value;
+                indexNames.add(idxUid);
 
                 // Fetch base index metadata
-                final idxMeta =
-                    await _dataStore.indexManager?.getIndexMeta(table, idxName);
+                final idxMeta = await _dataStore.indexManager
+                    ?.getIndexMeta(tableContext, idx.indexUid);
                 if (idxMeta != null) {
-                  baseIndexTotalEntries[idxName] = idxMeta.totalEntries;
-                  baseIndexTotalSizeInBytes[idxName] = idxMeta.totalSizeInBytes;
+                  baseIndexTotalEntries[idxUid] = idxMeta.totalEntries;
+                  baseIndexTotalSizeInBytes[idxUid] = idxMeta.totalSizeInBytes;
                 }
               }
             }
 
             // Calculate ops for timeout: records * (1 + indexCount)
             int tableRecordCount = 0;
-            grouped[table]?.forEach((_, map) => tableRecordCount += map.length);
+            grouped[tableUid]
+                ?.forEach((_, map) => tableRecordCount += map.length);
 
-            final bgRecords = bgEntriesByTable[table] ?? [];
+            final bgRecords = bgEntriesByTable[tableUid] ?? [];
             tableRecordCount += bgRecords.length;
 
             estimatedTotalWorkOps += tableRecordCount * (1 + indexNames.length);
 
-            tablePlan[table] = {
+            tablePlan[tableUid] = {
               'willUpdateTableMeta': true,
               'indexes': indexNames,
               'willUpdateIndexMeta': indexNames.isNotEmpty,
@@ -707,14 +714,17 @@ class ParallelJournalManager {
         late final int plannedTableConcurrency;
         late final int perTableTokenBudget;
 
-        for (final table in allTables) {
+        for (final tableUid in allTables) {
+          final tableContext = _tableContextFromUid(TableUid(tableUid));
+          if (tableContext == null) continue;
+          final tableName = tableContext.tableName;
           // Use the epoch captured before/during grouping
-          final capturedEpoch =
-              tableEpochs[table] ?? _bufferManager.getClearEpoch(table);
-          final tableQueueItems = entriesByTable[table] ?? [];
-          final tableBgEntries = bgEntriesByTable[table] ?? [];
+          final capturedEpoch = tableEpochs[tableUid] ??
+              _bufferManager.getClearEpoch(tableContext);
+          final tableQueueItems = entriesByTable[tableUid] ?? [];
+          final tableBgEntries = bgEntriesByTable[tableUid] ?? [];
 
-          final byOp = grouped[table];
+          final byOp = grouped[tableUid];
           final inserts = byOp?[BufferOperationType.insert]
                   ?.values
                   .toList(growable: false) ??
@@ -737,35 +747,37 @@ class ParallelJournalManager {
 
           tasks.add(() async {
             try {
-              if (_dataStore.tableDataManager.isTableBeingCleared(table)) {
+              if (_dataStore.tableDataManager
+                  .isTableBeingCleared(tableContext)) {
                 return;
               }
-              if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
+              if (_bufferManager.getClearEpoch(tableContext) != capturedEpoch) {
                 Logger.info(
-                    "Skipping stale batch for table $table because it was cleared/reset.");
+                    "Skipping stale batch for table $tableName because it was cleared/reset.");
                 return;
               }
 
               await _dataStore.tableDataManager.withTableWriteLock(
-                table,
+                tableContext,
                 (tableLock) async {
                   // clearTable sets this admission flag before it gets the
                   // table lock. A flush may win the lock race after that, so
                   // re-check here and let clearTable proceed first.
-                  if (_dataStore.tableDataManager.isTableBeingCleared(table)) {
+                  if (_dataStore.tableDataManager
+                      .isTableBeingCleared(tableContext)) {
                     return;
                   }
 
                   // Verify epoch hasn't changed (O(1) check for table clear race)
-                  if (_bufferManager.getClearEpoch(table) != capturedEpoch) {
+                  if (_bufferManager.getClearEpoch(tableContext) !=
+                      capturedEpoch) {
                     Logger.info(
-                        "Skipping stale batch for table $table because it was cleared/reset.");
+                        "Skipping stale batch for table $tableName because it was cleared/reset.");
                     return;
                   }
 
                   // Unified flush: parallelize table data and index maintenance
-                  final schema =
-                      await _dataStore.schemaManager?.getTableSchema(table);
+                  final schema = await _resolveTableSchema(tableUid);
                   if (schema == null) return;
                   final pkName = schema.primaryKey;
                   final migrationManager = _dataStore.migrationManager;
@@ -786,7 +798,7 @@ class ParallelJournalManager {
                   }
 
                   // Then overwrite with normal business writes (newer)
-                  final businessPkMap = tablePkMap[table];
+                  final businessPkMap = tablePkMap[tableUid];
                   if (businessPkMap != null) {
                     unifiedPkMap.addAll(businessPkMap);
                   }
@@ -801,10 +813,11 @@ class ParallelJournalManager {
                     var currentData = be.data;
                     if (migrationManager != null &&
                         be.schemaVersion.isNotEmpty &&
-                        migrationManager.hasRuntimeMigrationForTable(table)) {
+                        migrationManager
+                            .hasRuntimeMigrationForTable(tableContext)) {
                       currentData =
                           migrationManager.normalizeRecordToLatestSync(
-                        table,
+                        tableContext,
                         be.data,
                         fromVersion: be.schemaVersion,
                       );
@@ -837,7 +850,7 @@ class ParallelJournalManager {
                     try {
                       final olds =
                           await _dataStore.tableDataManager.queryRecordsBatch(
-                        table,
+                        tableContext,
                         missingOld,
                       );
                       for (final r in olds.records) {
@@ -848,10 +861,10 @@ class ParallelJournalManager {
                         var normalizedRecord = r;
                         if (migrationManager != null &&
                             migrationManager
-                                .hasRuntimeMigrationForTable(table)) {
+                                .hasRuntimeMigrationForTable(tableContext)) {
                           normalizedRecord =
                               migrationManager.normalizeRecordToLatestSync(
-                            table,
+                            tableContext,
                             r,
                             fromVersion: '',
                           );
@@ -895,7 +908,7 @@ class ParallelJournalManager {
                     final mode = bgEntry.mode;
                     if (mode == MigrationWriteMode.indexOnly ||
                         mode == MigrationWriteMode.tableAndIndex) {
-                      final specIdxs = bgEntry.specificIndexes;
+                      final specIdxs = bgEntry.specificIndexUids;
                       if (specIdxs == null || specIdxs.isEmpty) {
                         final be = bgEntry.entry;
                         if (be.operation == BufferOperationType.insert ||
@@ -926,7 +939,7 @@ class ParallelJournalManager {
                   final allIndexes = <IndexSchema>[
                     ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
                     ...?_dataStore.indexManager
-                        ?.getEngineManagedBtreeIndexes(table, schema),
+                        ?.getEngineManagedBtreeIndexes(tableContext, schema),
                   ];
                   final btreeIndexCount = allIndexes
                       .where((i) => i.type != IndexType.vector)
@@ -942,7 +955,7 @@ class ParallelJournalManager {
                         updateRecords.isNotEmpty ||
                         deleteRecords.isNotEmpty) {
                       await _dataStore.tableDataManager.writeChanges(
-                        tableName: table,
+                        table: tableContext,
                         inserts: insertRecords,
                         updates: updateRecords,
                         deletes: deleteRecords,
@@ -959,7 +972,7 @@ class ParallelJournalManager {
                             idxUpdates.isNotEmpty ||
                             idxDeletes.isNotEmpty)) {
                       await (_dataStore.indexManager?.writeChanges(
-                            tableName: table,
+                            table: tableContext,
                             inserts: idxInserts,
                             updates: idxUpdates,
                             deletes: idxDeletes,
@@ -972,7 +985,7 @@ class ParallelJournalManager {
                     if (bgIndexTasks.isNotEmpty) {
                       for (final specKey in bgIndexTasks.keys) {
                         final entries = bgIndexTasks[specKey]!;
-                        final specificIdxs = entries.first.specificIndexes;
+                        final specificIdxs = entries.first.specificIndexUids;
 
                         final specIns = <Map<String, dynamic>>[];
                         final specUps = <IndexRecordUpdate>[];
@@ -1006,12 +1019,12 @@ class ParallelJournalManager {
                         if (specificIdxs != null) {
                           targetOverride = allIndexes
                               .where((i) =>
-                                  specificIdxs.contains(i.actualIndexName))
+                                  specificIdxs.contains(i.indexUid.value))
                               .toList();
                         }
 
                         await (_dataStore.indexManager?.writeChanges(
-                              tableName: table,
+                              table: tableContext,
                               inserts: specIns,
                               updates: specUps,
                               deletes: specDels,
@@ -1039,13 +1052,13 @@ class ParallelJournalManager {
                   }
 
                   // Release unique key reservations for large update operations to prevent memory leaks and blocking
-                  final largeUpdates = bgLargeUpdatesByTable[table];
+                  final largeUpdates = bgLargeUpdatesByTable[tableUid];
                   if (largeUpdates != null && largeUpdates.isNotEmpty) {
                     for (final bgEntry in largeUpdates) {
                       if (bgEntry.isValid) {
                         try {
                           _bufferManager.releaseReservedUniqueKeys(
-                            tableName: table,
+                            table: tableContext,
                             recordId: bgEntry.primaryKey,
                           );
                         } catch (_) {}
@@ -1064,7 +1077,7 @@ class ParallelJournalManager {
                 if (totalCount > 0) {
                   await appendJournalEntry(TaskDoneEntry(
                     at: DateTime.now().toIso8601String(),
-                    table: table,
+                    table: tableUid,
                     count: totalCount,
                     batchId: currentBatchContext.batchId,
                     batchType: currentBatchContext.batchType,
@@ -1072,7 +1085,8 @@ class ParallelJournalManager {
                 }
               }
             } catch (e) {
-              Logger.error('Flush task failed for table [$table]', rawError: e);
+              Logger.error('Flush task failed for table [$tableName]',
+                  rawError: e);
               rethrow;
             }
           });
@@ -1308,9 +1322,10 @@ class ParallelJournalManager {
           <String, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          tableCutoffs
-              .putIfAbsent(op.table, () => <WalPointer>[])
-              .add(op.cutoff);
+          final key =
+              _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
+                  op.tableUid;
+          tableCutoffs.putIfAbsent(key, () => <WalPointer>[]).add(op.cutoff);
         }
       } catch (_) {}
       final encoderConfig = EncoderHandler.getCurrentEncodingState();
@@ -1399,18 +1414,12 @@ class ParallelJournalManager {
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
 
-            var resolvedTable = table;
-            final migMgr = _dataStore.migrationManager;
-            if (migMgr != null) {
-              final pendingRenames = migMgr.getPendingTableRenames();
-              if (pendingRenames.containsKey(table)) {
-                resolvedTable = pendingRenames[table]!;
-              }
-            }
+            var resolvedTable = _resolvePersistedTableField(table);
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = tableCutoffs[resolvedTable] ?? tableCutoffs[table];
+            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable) ??
+                _tableCutoffsFor(tableCutoffs, table);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -1426,10 +1435,12 @@ class ParallelJournalManager {
             }
             final op = BufferOperationType.values[opIdx];
 
-            final schema =
-                await _dataStore.schemaManager?.getTableSchema(resolvedTable);
+            final schema = await _resolveTableSchema(resolvedTable);
             if (schema == null) {
-              // Table was dropped or schema unavailable; skip this WAL entry.
+              Logger.warn(
+                'WAL recovery: skipping entry for unresolved table field '
+                '"$table"${resolvedTable != table ? ' (resolved: "$resolvedTable")' : ''}',
+              );
               continue;
             }
             final recordId = data[schema.primaryKey]?.toString();
@@ -1470,9 +1481,12 @@ class ParallelJournalManager {
               schemaVersion: entry['schemaVersion'] as String? ?? '',
             );
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
-            final uniqueRefs = await _computeUniqueKeyRefs(resolvedTable, data);
+            final uniqueRefs =
+                await _computeUniqueKeyRefs(TableUid(resolvedTable), data);
+            final tableContext = _resolveTableContext(resolvedTable);
+            if (tableContext == null) continue;
             await _bufferManager.addRecord(
-              tableName: resolvedTable,
+              table: tableContext,
               recordId: recordId,
               entry: be.copyWith(walPointer: walPtr),
               uniqueKeys: uniqueRefs,
@@ -1525,18 +1539,19 @@ class ParallelJournalManager {
       if (maxPkByTable.isNotEmpty) {
         try {
           for (final entry in maxPkByTable.entries) {
-            final table = entry.key;
+            final tableContext = _resolveTableContext(entry.key);
+            if (tableContext == null) continue;
             final maxPk = entry.value;
             // First, update memory and FileMeta with tracked WAL max to preserve it
             // This ensures the WAL max is saved even if buffer is cleared later
             await _dataStore.tableDataManager
-                .updateMaxIdInMemory(table, maxPk, updateFileMeta: true);
+                .updateMaxIdInMemory(tableContext, maxPk, updateFileMeta: true);
             // Then, call updateMaxIdFromTable to get the true maximum from all sources
             // It will compare: partition max, buffer max, and current memory value (which includes WAL max)
             // and update to the global maximum. Since we set forceRecalculate=true, it will
             // always recalculate even if cache matches, ensuring we get the true max from all sources.
             await _dataStore.tableDataManager
-                .updateMaxIdFromTable(table, forceRecalculate: true);
+                .updateMaxIdFromTable(tableContext, forceRecalculate: true);
           }
         } catch (e) {
           Logger.error('Failed to update maxId after WAL recovery',
@@ -1645,14 +1660,7 @@ class ParallelJournalManager {
             if (entry != null) {
               if (entry is TablePartitionFlushedEntry &&
                   entry.batchId == batch.batchId) {
-                var resolvedTable = entry.table;
-                final migMgr = _dataStore.migrationManager;
-                if (migMgr != null) {
-                  final pendingRenames = migMgr.getPendingTableRenames();
-                  if (pendingRenames.containsKey(entry.table)) {
-                    resolvedTable = pendingRenames[entry.table]!;
-                  }
-                }
+                final resolvedTable = _resolvePersistedTableField(entry.table);
                 // Track the last flushed entry (max partitionNo) for each table
                 final existing = tableLastFlushedEntry[resolvedTable];
                 if (existing == null ||
@@ -1661,14 +1669,7 @@ class ParallelJournalManager {
                 }
               } else if (entry is IndexPartitionFlushedEntry &&
                   entry.batchId == batch.batchId) {
-                var resolvedTable = entry.table;
-                final migMgr = _dataStore.migrationManager;
-                if (migMgr != null) {
-                  final pendingRenames = migMgr.getPendingTableRenames();
-                  if (pendingRenames.containsKey(entry.table)) {
-                    resolvedTable = pendingRenames[entry.table]!;
-                  }
-                }
+                final resolvedTable = _resolvePersistedTableField(entry.table);
                 // Track the last flushed entry (max partitionNo) for each index
                 final indexKey = '$resolvedTable:${entry.index}';
                 final existing = indexLastFlushedEntry[indexKey];
@@ -1687,24 +1688,98 @@ class ParallelJournalManager {
 
     // Recover table metadata
     for (final entry in tableLastFlushedEntry.entries) {
-      await _recoverTableMaintenanceMetadata(entry.key, entry.value);
+      final tableContext = _resolveTableContext(entry.key);
+      if (tableContext != null) {
+        await _recoverTableMaintenanceMetadata(tableContext, entry.value);
+      }
     }
 
     // Recover index metadata
     for (final entry in indexLastFlushedEntry.entries) {
       final parts = entry.key.split(':');
       if (parts.length == 2) {
-        await _recoverIndexMaintenanceMetadata(parts[0], parts[1], entry.value);
+        final tableContext = _resolveTableContext(parts[0]);
+        if (tableContext != null) {
+          await _recoverIndexMaintenanceMetadata(
+              tableContext, parts[1], entry.value);
+        }
       }
     }
   }
 
+  /// Resolve a persisted journal/WAL table field to a stable uid key.
+  ///
+  /// Fast path (common): normalize once; if already a live uid, return immediately.
+  /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
+  String _resolvePersistedTableField(String rawField) {
+    if (rawField.isEmpty) return rawField;
+    final mgr = _dataStore.schemaManager;
+    final normalized = mgr?.normalizeTableFieldKey(rawField) ?? rawField;
+    if (mgr != null && mgr.isActiveTableUidKey(normalized)) {
+      return normalized;
+    }
+    final migMgr = _dataStore.migrationManager;
+    if (migMgr == null) return normalized;
+    final pendingRenames = migMgr.getPendingTableRenames();
+    if (pendingRenames.isEmpty) return normalized;
+    final renamed = pendingRenames[rawField] ?? pendingRenames[normalized];
+    if (renamed == null) return normalized;
+    return mgr?.normalizeTableFieldKey(renamed) ?? renamed;
+  }
+
+  TableContext? _resolveTableContext(String tableField) {
+    if (tableField.isEmpty) return null;
+    final normalized = _resolvePersistedTableField(tableField);
+    return _dataStore.schemaManager?.getTableContextSync(TableUid(normalized));
+  }
+
+  TablePlan? _tablePlanFor(Map<String, TablePlan> plans, String tableField) {
+    if (plans.isEmpty || tableField.isEmpty) return null;
+    final normalized = _resolvePersistedTableField(tableField);
+    return plans[normalized] ?? plans[tableField];
+  }
+
+  List<WalPointer>? _tableCutoffsFor(
+    Map<String, List<WalPointer>> tableCutoffs,
+    String tableField,
+  ) {
+    final mgr = _dataStore.schemaManager;
+    if (mgr == null) return tableCutoffs[tableField];
+    final normalized = mgr.normalizeTableFieldKey(tableField);
+    return tableCutoffs[normalized] ?? tableCutoffs[tableField];
+  }
+
+  Future<TableSchema?> _resolveTableSchema(String tableField) async {
+    final ctx = _resolveTableContext(tableField);
+    if (ctx == null) return null;
+    return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
+  }
+
+  TableContext? _tableContextFromUid(TableUid tableUid) {
+    return _dataStore.schemaManager?.getTableContextSync(tableUid);
+  }
+
+  /// Resolve stable [IndexUid] for redo replay (legacy logs may store logical names).
+  IndexUid _resolveRedoIndexUid(TableSchema schema, IndexUid uidOrName) {
+    if (uidOrName.isEmpty ||
+        uidOrName.looksLikeStableUid ||
+        uidOrName.value == 'pk') {
+      return uidOrName;
+    }
+    final resolved = _dataStore.schemaManager
+        ?.resolveIndexUidFromField(schema, uidOrName.value);
+    if (resolved != null && resolved.isNotEmpty) {
+      return resolved;
+    }
+    return uidOrName;
+  }
+
   /// Recover table metadata from maintenance batch
   Future<void> _recoverTableMaintenanceMetadata(
-      String tableName, TablePartitionFlushedEntry lastEntry) async {
+      TableContext table, TablePartitionFlushedEntry lastEntry) async {
+    final tableName = table.tableName;
     try {
-      final tableMeta =
-          await _dataStore.tableDataManager.getTableMeta(tableName);
+      final tableMeta = await _dataStore.tableDataManager.getTableMeta(table);
       if (tableMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalRecords/totalSizeInBytes)
@@ -1726,7 +1801,7 @@ class ParallelJournalManager {
         final lastPartitionNo = lastEntry.partitionNo;
         try {
           final lastPartitionPath = await _dataStore.pathManager
-              .getPartitionFilePathByNo(tableName, lastPartitionNo);
+              .getPartitionFilePathByNo(table.tableUid, lastPartitionNo);
           if (await _dataStore.storage.existsFile(lastPartitionPath)) {
             // Read last partition's meta page to get actual partition count
             final raw0 = await _dataStore.storage
@@ -1778,8 +1853,7 @@ class ParallelJournalManager {
             modified: DateTime.now(),
           ),
         );
-        await _dataStore.tableDataManager
-            .updateTableMeta(tableName, updatedMeta);
+        await _dataStore.tableDataManager.updateTableMeta(table, updatedMeta);
 
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
@@ -1813,11 +1887,12 @@ class ParallelJournalManager {
   }
 
   /// Recover index metadata from maintenance batch
-  Future<void> _recoverIndexMaintenanceMetadata(String tableName,
+  Future<void> _recoverIndexMaintenanceMetadata(TableContext table,
       String indexName, IndexPartitionFlushedEntry lastEntry) async {
+    final tableName = table.tableName;
     try {
-      final indexMeta =
-          await _dataStore.indexManager?.getIndexMeta(tableName, indexName);
+      final indexMeta = await _dataStore.indexManager
+          ?.getIndexMeta(table, IndexUid(indexName));
       if (indexMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalEntries/totalSizeInBytes)
@@ -1839,7 +1914,8 @@ class ParallelJournalManager {
         final lastPartitionNo = lastEntry.partitionNo;
         try {
           final lastPartitionPath = await _dataStore.pathManager
-              .getIndexPartitionPathByNo(tableName, indexName, lastPartitionNo);
+              .getIndexPartitionPathByNo(table.tableUid,
+                  IndexUid(indexMeta.indexUid), lastPartitionNo);
           if (await _dataStore.storage.existsFile(lastPartitionPath)) {
             // Read last partition's meta page to get actual partition count
             final raw0 = await _dataStore.storage
@@ -1892,8 +1968,8 @@ class ParallelJournalManager {
           ),
         );
         await _dataStore.indexManager?.updateIndexMeta(
-          tableName: tableName,
-          indexName: indexName,
+          table: table,
+          indexUid: indexMeta.indexUid,
           updatedMeta: updatedMeta,
           flush: false,
         );
@@ -1977,11 +2053,17 @@ class ParallelJournalManager {
       // Iterate in exact WAL order so buffer queue order matches normal flush;
       // then pop(captureCount) yields exactly this batch (all tables, no partial-table loss).
       for (final item in walData.orderedOpsInWalOrder) {
-        final table = item.table;
+        final tableUid = item.table;
         final op = item.op;
         if (op.walPointer == null) continue;
-        final schema = await _dataStore.schemaManager?.getTableSchema(table);
-        if (schema == null) continue;
+        final tableContext = _resolveTableContext(tableUid);
+        if (tableContext == null) {
+          Logger.warn(
+            'Batch recovery: skipping WAL op for unresolved table "$tableUid"',
+          );
+          continue;
+        }
+        final schema = tableContext.schema;
         final pkName = schema.primaryKey;
         final pkValue = op.data[pkName]?.toString();
         if (pkValue == null) continue;
@@ -1995,10 +2077,11 @@ class ParallelJournalManager {
           schemaVersion: schema.schemaVersion ?? '',
         );
 
-        final uniqueKeys = await _computeUniqueKeyRefs(table, op.data);
+        final uniqueKeys =
+            await _computeUniqueKeyRefs(tableContext.tableUid, op.data);
 
         await _dataStore.tableDataManager.recoverRecordToBuffer(
-          table,
+          tableContext,
           op.data,
           op.op,
           entry: be,
@@ -2013,18 +2096,21 @@ class ParallelJournalManager {
         if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
             op.op == BufferOperationType.insert) {
           final id = int.tryParse(pkValue) ?? 0;
-          final currentMax = maxIds[table] ?? 0;
+          final currentMax = maxIds[tableUid] ?? 0;
           if (id > currentMax) {
-            maxIds[table] = id;
+            maxIds[tableUid] = id;
           }
         }
         count++;
       }
 
       // Batch update maxId
-      for (final table in maxIds.keys) {
-        await _dataStore.tableDataManager
-            .updateMaxIdInMemory(table, maxIds[table], updateFileMeta: false);
+      for (final tableUid in maxIds.keys) {
+        final tableContext = _resolveTableContext(tableUid);
+        if (tableContext == null) continue;
+        await _dataStore.tableDataManager.updateMaxIdInMemory(
+            tableContext, maxIds[tableUid]!,
+            updateFileMeta: false);
       }
 
       // Return a task to flush this specific batch and repair statistics if needed.
@@ -2089,10 +2175,13 @@ class ParallelJournalManager {
       final unflushedTables = batchTables.difference(flushedTables);
 
       // Repair table totals using batch-level base values.
-      for (final tableName in unflushedTables) {
-        Logger.debug('Restoring unflushed table base totals: $tableName');
+      for (final tableUid in unflushedTables) {
         try {
-          final plan = walData.tablePlans[tableName];
+          final tableContext = _resolveTableContext(tableUid);
+          if (tableContext == null) continue;
+          Logger.debug(
+              'Restoring unflushed table base totals: ${tableContext.tableName}');
+          final plan = _tablePlanFor(walData.tablePlans, tableUid);
           if (plan == null ||
               plan.baseTotalRecords == null ||
               plan.baseTotalSizeInBytes == null) {
@@ -2100,7 +2189,7 @@ class ParallelJournalManager {
           }
 
           final meta =
-              await _dataStore.tableDataManager.getTableMeta(tableName);
+              await _dataStore.tableDataManager.getTableMeta(tableContext);
           if (meta == null) continue;
 
           // Restore to the state BEFORE the batch.
@@ -2114,46 +2203,54 @@ class ParallelJournalManager {
           );
 
           await _dataStore.tableDataManager.updateTableMeta(
-            tableName,
+            tableContext,
             updated,
             flush: true,
           );
         } catch (e) {
-          Logger.warn('Failed to restore table $tableName base totals',
+          final logTableName =
+              _resolveTableContext(tableUid)?.tableName ?? 'unknown';
+          Logger.warn('Failed to restore table $logTableName base totals',
               rawError: e);
         }
       }
 
       // Repair index totals using batch-level base values.
-      for (final tableName in batchTables) {
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableName);
-        if (schema == null) continue;
+      for (final tableUid in batchTables) {
+        final tableContext = _resolveTableContext(tableUid);
+        if (tableContext == null) continue;
+        final schema = tableContext.schema;
 
         // B+Tree indexes only — vector indexes have separate meta and recovery.
-        final btreeIndexNames = <IndexSchema>[
+        final btreeIndexes = <IndexSchema>[
           ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
           ...?_dataStore.indexManager
-              ?.getEngineManagedBtreeIndexes(tableName, schema),
-        ].map((i) => i.actualIndexName).toList(growable: false);
-        if (btreeIndexNames.isEmpty) continue;
+              ?.getEngineManagedBtreeIndexes(tableContext, schema),
+        ];
+        if (btreeIndexes.isEmpty) continue;
 
-        final flushedForTable = flushedIndexes[tableName] ?? const <String>{};
-        final plan = walData.tablePlans[tableName];
+        final normalizedTableKey = _resolvePersistedTableField(tableUid);
+        final flushedForTable = flushedIndexes[normalizedTableKey] ??
+            flushedIndexes[tableUid] ??
+            const <String>{};
+        final plan = _tablePlanFor(walData.tablePlans, tableUid);
         if (plan == null) continue;
 
-        for (final indexName in btreeIndexNames) {
-          if (flushedForTable.contains(indexName)) continue;
+        for (final idx in btreeIndexes) {
+          final indexUid = idx.indexUid;
+          if (flushedForTable.contains(indexUid.value)) {
+            continue;
+          }
 
           Logger.debug(
-              'Restoring unflushed index base totals: $tableName.$indexName');
+              'Restoring unflushed index base totals: $tableUid.${idx.actualIndexName}');
           try {
-            final baseEntries = plan.baseIndexTotalEntries?[indexName];
-            final baseSize = plan.baseIndexTotalSizeInBytes?[indexName];
+            final baseEntries = plan.baseIndexTotalEntries?[indexUid.value];
+            final baseSize = plan.baseIndexTotalSizeInBytes?[indexUid.value];
             if (baseEntries == null || baseSize == null) continue;
 
             final idxMeta = await _dataStore.indexManager
-                ?.getIndexMeta(tableName, indexName);
+                ?.getIndexMeta(tableContext, indexUid);
             if (idxMeta == null) continue;
 
             // Restore index meta to its base (pre-batch) state.
@@ -2166,14 +2263,14 @@ class ParallelJournalManager {
             );
 
             await _dataStore.indexManager?.updateIndexMeta(
-              tableName: tableName,
-              indexName: indexName,
+              table: tableContext,
+              indexUid: idxMeta.indexUid,
               updatedMeta: updated,
               flush: true,
             );
           } catch (e) {
             Logger.warn(
-                'Failed to restore index $tableName.$indexName base totals',
+                'Failed to restore index $tableUid.${idx.actualIndexName} base totals',
                 rawError: e);
           }
         }
@@ -2205,9 +2302,10 @@ class ParallelJournalManager {
           <String, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          tableCutoffs
-              .putIfAbsent(op.table, () => <WalPointer>[])
-              .add(op.cutoff);
+          final key =
+              _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
+                  op.tableUid;
+          tableCutoffs.putIfAbsent(key, () => <WalPointer>[]).add(op.cutoff);
         }
       } catch (_) {}
       final startP = batch.start.partitionIndex;
@@ -2283,18 +2381,12 @@ class ParallelJournalManager {
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
 
-            var resolvedTable = table;
-            final migMgr = _dataStore.migrationManager;
-            if (migMgr != null) {
-              final pendingRenames = migMgr.getPendingTableRenames();
-              if (pendingRenames.containsKey(table)) {
-                resolvedTable = pendingRenames[table]!;
-              }
-            }
+            var resolvedTable = _resolvePersistedTableField(table);
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = tableCutoffs[resolvedTable] ?? tableCutoffs[table];
+            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable) ??
+                _tableCutoffsFor(tableCutoffs, table);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -2362,8 +2454,11 @@ class ParallelJournalManager {
   }
 
   /// Begin an ad-hoc batch for table maintenance so recovery can reconcile partial progress.
-  Future<BatchContext> beginMaintenanceBatch({required String table}) async {
+  Future<BatchContext> beginMaintenanceBatch(
+      {required TableContext table}) async {
     if (!_dataStore.config.enableJournal) return BatchContext.maintenance('');
+    final tableContext = table;
+    if (tableContext.tableUid.isEmpty) return BatchContext.maintenance('');
     // Register pending maintenance batch
     String batchId = GlobalIdGenerator.generate('maint_batch_');
     final batchContext = BatchContext.maintenance(batchId);
@@ -2382,42 +2477,42 @@ class ParallelJournalManager {
         recoverStartOffset: size,
         start: const WalPointer(partitionIndex: -1, entrySeq: -1),
         end: const WalPointer(partitionIndex: -1, entrySeq: -1),
-        tables: <String>[table],
+        tables: <String>[table.tableUid],
         createdAt: DateTime.now().toIso8601String(),
       ));
     } catch (_) {}
     // Build minimal plan and table plan metadata
+    final tableUid = table.tableUid;
     final Map<String, Map<int, int>> planned = {
-      table: {BufferOperationType.update.index: 0},
+      tableUid: {BufferOperationType.update.index: 0},
     };
     // Capture base totals so recovery can safely restore to "before maintenance batch".
-    final schema = await _dataStore.schemaManager?.getTableSchema(table);
-    final tableMeta = await _dataStore.tableDataManager.getTableMeta(table);
+    final schema = tableContext.schema;
+    final tableMeta =
+        await _dataStore.tableDataManager.getTableMeta(tableContext);
     final indexNames = <String>[];
     final baseIndexTotalEntries = <String, int>{};
     final baseIndexTotalSizeInBytes = <String, int>{};
     try {
-      if (schema != null) {
-        // B+Tree indexes only — vector index meta is separate, no B+Tree IndexMeta to read.
-        final btreeIndexes = <IndexSchema>[
-          ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
-          ...?_dataStore.indexManager
-              ?.getEngineManagedBtreeIndexes(table, schema),
-        ];
-        for (final idx in btreeIndexes) {
-          final idxName = idx.actualIndexName;
-          indexNames.add(idxName);
-          final idxMeta =
-              await _dataStore.indexManager?.getIndexMeta(table, idxName);
-          if (idxMeta != null) {
-            baseIndexTotalEntries[idxName] = idxMeta.totalEntries;
-            baseIndexTotalSizeInBytes[idxName] = idxMeta.totalSizeInBytes;
-          }
+      // B+Tree indexes only — vector index meta is separate, no B+Tree IndexMeta to read.
+      final btreeIndexes = <IndexSchema>[
+        ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+        ...?_dataStore.indexManager
+            ?.getEngineManagedBtreeIndexes(tableContext, schema),
+      ];
+      for (final idx in btreeIndexes) {
+        final idxUid = idx.indexUid.value;
+        indexNames.add(idxUid);
+        final idxMeta = await _dataStore.indexManager
+            ?.getIndexMeta(tableContext, idx.indexUid);
+        if (idxMeta != null) {
+          baseIndexTotalEntries[idxUid] = idxMeta.totalEntries;
+          baseIndexTotalSizeInBytes[idxUid] = idxMeta.totalSizeInBytes;
         }
       }
     } catch (_) {}
     final Map<String, TablePlan> tablePlan = {
-      table: TablePlan(
+      tableUid: TablePlan(
         willUpdateTableMeta: true,
         indexes: indexNames,
         willUpdateIndexMeta: indexNames.isNotEmpty,
@@ -2499,12 +2594,16 @@ class ParallelJournalManager {
     // Reason: redo log may contain multiple attempts or duplicates for the same page.
     final byPartition = <({
       PageRedoTreeKind kind,
-      String table,
-      String index,
+      TableUid tableUid,
+      IndexUid indexUid,
       int partitionNo
     }),
         Map<int, Uint8List>>{};
-    final treeMeta = <({PageRedoTreeKind kind, String table, String index}),
+    final treeMeta = <({
+      PageRedoTreeKind kind,
+      TableUid tableUid,
+      IndexUid indexUid
+    }),
         PageRedoTreeMetaRecord>{};
     const yieldInterval = 50;
     final parseYc = YieldController(
@@ -2518,8 +2617,8 @@ class ParallelJournalManager {
       if (rec is PageRedoPageRecord) {
         final key = (
           kind: rec.treeKind,
-          table: rec.tableName,
-          index: rec.indexName ?? '',
+          tableUid: rec.tableUid,
+          indexUid: rec.indexUid ?? IndexUid.empty,
           partitionNo: rec.partitionNo,
         );
         byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
@@ -2527,8 +2626,8 @@ class ParallelJournalManager {
       } else if (rec is PageRedoTreeMetaRecord) {
         final key = (
           kind: rec.treeKind,
-          table: rec.tableName,
-          index: rec.indexName ?? '',
+          tableUid: rec.tableUid,
+          indexUid: rec.indexUid ?? IndexUid.empty,
         );
         treeMeta[key] = rec;
       }
@@ -2541,16 +2640,22 @@ class ParallelJournalManager {
       final key = e.key;
       final pages = e.value;
       if (pages.isEmpty) continue;
-      if (key.kind == PageRedoTreeKind.indexTree && key.index.isEmpty) continue;
+      if (key.kind == PageRedoTreeKind.indexTree && key.indexUid.isEmpty) {
+        continue;
+      }
 
       String path;
       try {
         if (key.kind == PageRedoTreeKind.table) {
           path = await _dataStore.pathManager
-              .getPartitionFilePathByNo(key.table, key.partitionNo);
+              .getPartitionFilePathByNo(key.tableUid, key.partitionNo);
         } else {
-          path = await _dataStore.pathManager
-              .getIndexPartitionPathByNo(key.table, key.index, key.partitionNo);
+          final tableContext = _tableContextFromUid(key.tableUid);
+          if (tableContext == null) continue;
+          final indexUid =
+              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+          path = await _dataStore.pathManager.getIndexPartitionPathByNo(
+              key.tableUid, indexUid, key.partitionNo);
         }
       } catch (_) {
         continue;
@@ -2595,9 +2700,11 @@ class ParallelJournalManager {
       for (final rec in treeMeta.values) {
         await metaYc.maybeYield();
         try {
+          final tableContext = _tableContextFromUid(TableUid(rec.tableUid));
+          if (tableContext == null) continue;
           if (rec.treeKind == PageRedoTreeKind.table) {
             final meta =
-                await _dataStore.tableDataManager.getTableMeta(rec.tableName);
+                await _dataStore.tableDataManager.getTableMeta(tableContext);
             if (meta == null) continue;
             final updated = meta.copyWith(
               btreePageSize: rec.btreePageSize,
@@ -2616,12 +2723,14 @@ class ParallelJournalManager {
               ),
             );
             await _dataStore.tableDataManager
-                .updateTableMeta(rec.tableName, updated, flush: true);
+                .updateTableMeta(tableContext, updated, flush: true);
           } else {
-            final idxName = rec.indexName;
-            if (idxName == null || idxName.isEmpty) continue;
+            final idxUid = rec.indexUid;
+            if (idxUid == null || idxUid.isEmpty) continue;
+            final resolved =
+                _resolveRedoIndexUid(tableContext.schema, idxUid);
             final meta = await _dataStore.indexManager
-                ?.getIndexMeta(rec.tableName, idxName);
+                ?.getIndexMeta(tableContext, resolved);
             if (meta == null) continue;
             final updated = meta.copyWith(
               btreePageSize: rec.btreePageSize,
@@ -2640,8 +2749,8 @@ class ParallelJournalManager {
               ),
             );
             await _dataStore.indexManager?.updateIndexMeta(
-              tableName: rec.tableName,
-              indexName: idxName,
+              table: tableContext,
+              indexUid: IndexUid(idxUid),
               updatedMeta: updated,
               flush: true,
             );
@@ -2701,40 +2810,18 @@ class ParallelJournalManager {
           if (entry == null) continue;
 
           if (entry is BatchStartEntry && entry.batchId == batch.batchId) {
-            final migMgr = _dataStore.migrationManager;
-            if (migMgr != null) {
-              final pendingRenames = migMgr.getPendingTableRenames();
-              entry.tablePlan.forEach((key, val) {
-                final resolvedKey = pendingRenames[key] ?? key;
-                tablePlans[resolvedKey] = val;
-              });
-            } else {
-              tablePlans.addAll(entry.tablePlan);
-            }
+            entry.tablePlan.forEach((key, val) {
+              tablePlans[_resolvePersistedTableField(key)] = val;
+            });
           } else if (entry is BatchCompletedEntry &&
               entry.batchId == batch.batchId) {
             isCompleted = true;
           } else if (entry is TableMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
-            var resolvedTable = entry.table;
-            final migMgr = _dataStore.migrationManager;
-            if (migMgr != null) {
-              final pendingRenames = migMgr.getPendingTableRenames();
-              if (pendingRenames.containsKey(entry.table)) {
-                resolvedTable = pendingRenames[entry.table]!;
-              }
-            }
-            flushedTables.add(resolvedTable);
+            flushedTables.add(_resolvePersistedTableField(entry.table));
           } else if (entry is IndexMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
-            var resolvedTable = entry.table;
-            final migMgr = _dataStore.migrationManager;
-            if (migMgr != null) {
-              final pendingRenames = migMgr.getPendingTableRenames();
-              if (pendingRenames.containsKey(entry.table)) {
-                resolvedTable = pendingRenames[entry.table]!;
-              }
-            }
+            final resolvedTable = _resolvePersistedTableField(entry.table);
             flushedIndexes
                 .putIfAbsent(resolvedTable, () => <String>{})
                 .add(entry.index);
@@ -2782,10 +2869,10 @@ class ParallelJournalManager {
   }
 
   Future<List<UniqueKeyRef>> _computeUniqueKeyRefs(
-      String table, Map<String, dynamic> data) async {
+      TableUid tableUid, Map<String, dynamic> data) async {
     final refs = <UniqueKeyRef>[];
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(table);
+      final schema = await _dataStore.schemaManager?.getTableSchema(tableUid);
       if (schema == null) return refs;
 
       // Unique indexes from schema (implicit/explicit)
@@ -2799,7 +2886,7 @@ class ParallelJournalManager {
         }
         final ck = schema.createCanonicalIndexKey(idx.fields, data);
         if (ck == null) continue;
-        refs.add(UniqueKeyRef(idx.actualIndexName, ck));
+        refs.add(UniqueKeyRef(idx.indexUid, ck));
       }
     } catch (_) {}
     return refs;
