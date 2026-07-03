@@ -1,12 +1,16 @@
+import '../../model/table_identity.dart';
 import '../../model/table_schema.dart';
+
+/// Sentinel uid for primary-key uniqueness in write-buffer tracking.
+const IndexUid _pkIndexUid = IndexUid('pk');
 
 /// Lightweight sendable payload for a unique-key reference planned in pure compute.
 class PlannedUniqueKeyRef {
-  final String indexName;
+  final IndexUid indexUid;
   final dynamic compositeKey;
 
   const PlannedUniqueKeyRef({
-    required this.indexName,
+    required this.indexUid,
     required this.compositeKey,
   });
 }
@@ -23,7 +27,7 @@ List<PlannedUniqueKeyRef> planInsertUniqueRefsPure({
   if (pkVal != null) {
     refs.add(
       PlannedUniqueKeyRef(
-        indexName: 'pk',
+        indexUid: _pkIndexUid,
         compositeKey: pkVal.toString(),
       ),
     );
@@ -34,7 +38,7 @@ List<PlannedUniqueKeyRef> planInsertUniqueRefsPure({
     if (canKey != null) {
       refs.add(
         PlannedUniqueKeyRef(
-          indexName: index.actualIndexName,
+          indexUid: index.indexUid,
           compositeKey: canKey,
         ),
       );
@@ -60,7 +64,7 @@ List<PlannedUniqueKeyRef> planUpdateUniqueRefsPure({
     if (pkVal != null) {
       refs.add(
         PlannedUniqueKeyRef(
-          indexName: 'pk',
+          indexUid: _pkIndexUid,
           compositeKey: pkVal.toString(),
         ),
       );
@@ -77,7 +81,7 @@ List<PlannedUniqueKeyRef> planUpdateUniqueRefsPure({
     if (canKey != null) {
       refs.add(
         PlannedUniqueKeyRef(
-          indexName: index.actualIndexName,
+          indexUid: index.indexUid,
           compositeKey: canKey,
         ),
       );
