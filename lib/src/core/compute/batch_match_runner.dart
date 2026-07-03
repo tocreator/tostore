@@ -1,5 +1,6 @@
 import 'dart:math';
 
+import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
 import '../compute_manager.dart';
 import '../yield_controller.dart';
@@ -10,7 +11,7 @@ import 'compute_batch_planner.dart';
 class ConditionBatchMatcher {
   static Future<BatchMatchResult> matchRecordIndices({
     required TableSchema schema,
-    required String tableName,
+    required TableContext table,
     required Map<String, dynamic> condition,
     required List<Map<String, dynamic>> records,
     required int Function(Map<String, dynamic> record) estimateRecordBytes,
@@ -48,7 +49,7 @@ class ConditionBatchMatcher {
       final results = await ComputeManager.computeBatch(
         _buildTasks(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: condition,
           records: records,
           ranges: ranges,
@@ -84,7 +85,7 @@ class ConditionBatchMatcher {
       final results = await ComputeManager.computeBatch(
         _buildTasks(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: condition,
           records: records,
           ranges: waveRanges,
@@ -127,7 +128,7 @@ class ConditionBatchMatcher {
 
   static List<ComputeTask<BatchMatchRequest, BatchMatchResult>> _buildTasks({
     required TableSchema schema,
-    required String tableName,
+    required TableContext table,
     required Map<String, dynamic> condition,
     required List<Map<String, dynamic>> records,
     required List<ComputeTaskRange> ranges,
@@ -140,7 +141,7 @@ class ConditionBatchMatcher {
           function: matchConditionChunk,
           message: BatchMatchRequest(
             schema: schema,
-            tableName: tableName,
+            table: table,
             condition: condition,
             records: records.sublist(range.start, range.end),
             maxMatchCount: maxMatchCount,
