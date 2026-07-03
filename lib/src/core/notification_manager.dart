@@ -4,6 +4,7 @@ import '../model/change_event.dart';
 import '../query/query_condition.dart';
 import '../model/query_index.dart';
 import '../model/table_schema.dart';
+import '../model/table_identity.dart';
 import '../handler/value_matcher.dart';
 
 class NotificationManager {
@@ -22,7 +23,7 @@ class NotificationManager {
       : _schemas = {for (var s in schemas) s.tableUid: s};
 
   /// Check if there are any active subscriptions for a table
-  bool hasListeners(String tableUid) {
+  bool hasListeners(TableUid tableUid) {
     final index = _indexes[tableUid];
     return index != null && !index.isEmpty;
   }
@@ -34,7 +35,7 @@ class NotificationManager {
 
   /// Register a listener for a specific query
   StreamSubscription<ChangeEvent> register(
-    String tableUid,
+    TableUid tableUid,
     QueryCondition condition,
     void Function(ChangeEvent) onData,
   ) {
@@ -72,7 +73,7 @@ class NotificationManager {
     return streamSub;
   }
 
-  void _unregister(String tableUid, String id) {
+  void _unregister(TableUid tableUid, String id) {
     if (_activeSubscriptions.containsKey(id)) {
       final sub = _activeSubscriptions.remove(id)!;
       _indexes[tableUid]?.remove(sub);
@@ -136,8 +137,8 @@ class NotificationManager {
   }
 
   /// Verify if a record matches a condition
-  bool _matches(
-      QueryCondition condition, Map<String, dynamic> record, String tableUid) {
+  bool _matches(QueryCondition condition, Map<String, dynamic> record,
+      TableUid tableUid) {
     final matcher =
         ConditionRecordMatcher.prepare(condition, _schemas, tableUid);
     return matcher.matches(record);
