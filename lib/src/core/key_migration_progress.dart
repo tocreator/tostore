@@ -1,14 +1,16 @@
 import '../model/system_table.dart';
+import '../model/table_context.dart';
 import '../query/query_condition.dart';
 import 'data_store_impl.dart';
 import 'transaction_context.dart';
+import '../model/table_identity.dart';
 
 /// Persistence helpers for [_system_key_migration] progress rows.
 class KeyMigrationProgressStore {
   KeyMigrationProgressStore._();
 
-  static String progressKey(String tableName, String spaceName) =>
-      '$tableName|$spaceName';
+  static String progressKey(TableUid tableUid, String spaceName) =>
+      '$tableUid|$spaceName';
 
   static Future<void> ensureTable(DataStoreImpl dataStore) async {
     final schemaManager = dataStore.schemaManager;
@@ -25,14 +27,24 @@ class KeyMigrationProgressStore {
     });
   }
 
+  static Future<TableContext?> _progressTableContext(
+      DataStoreImpl dataStore) async {
+    final uid = dataStore.schemaManager
+        ?.getUidByName(TableName(SystemTable.keyMigrationProgressTableName));
+    if (uid == null) return null;
+    return dataStore.schemaManager?.getTableContext(uid);
+  }
+
   static Future<String?> loadCheckpoint(
     DataStoreImpl dataStore, {
-    required String tableName,
+    required TableContext table,
     required String spaceName,
   }) async {
-    final pk = progressKey(tableName, spaceName);
+    final progressTable = await _progressTableContext(dataStore);
+    if (progressTable == null) return null;
+    final pk = progressKey(table.tableUid, spaceName);
     final rows = await dataStore.queryBy(
-      SystemTable.keyMigrationProgressTableName,
+      progressTable,
       SystemTable.keyMigrationProgressKeyField,
       pk,
     );
@@ -45,13 +57,13 @@ class KeyMigrationProgressStore {
 
   static Future<void> upsertRunning(
     DataStoreImpl dataStore, {
-    required String tableName,
+    required TableContext table,
     required String spaceName,
     String? checkpointKey,
   }) async {
     await _upsert(
       dataStore,
-      tableName: tableName,
+      table: table,
       spaceName: spaceName,
       status: 'running',
       checkpointKey: checkpointKey,
@@ -60,12 +72,12 @@ class KeyMigrationProgressStore {
 
   static Future<void> markCompleted(
     DataStoreImpl dataStore, {
-    required String tableName,
+    required TableContext table,
     required String spaceName,
   }) async {
     await _upsert(
       dataStore,
-      tableName: tableName,
+      table: table,
       spaceName: spaceName,
       status: 'completed',
       clearCheckpoint: true,
@@ -80,13 +92,16 @@ class KeyMigrationProgressStore {
 
   static Future<void> renameTableProgress(
     DataStoreImpl dataStore, {
+    required TableContext table,
     required String oldTableName,
     required String newTableName,
     required String spaceName,
   }) async {
-    final oldPk = progressKey(oldTableName, spaceName);
+    final progressTable = await _progressTableContext(dataStore);
+    if (progressTable == null) return;
+    final oldPk = progressKey(table.tableUid, spaceName);
     final rows = await dataStore.queryBy(
-      SystemTable.keyMigrationProgressTableName,
+      progressTable,
       SystemTable.keyMigrationProgressKeyField,
       oldPk,
     );
@@ -101,7 +116,7 @@ class KeyMigrationProgressStore {
       // Delete old progress row
       await TransactionContext.runAsSystemOperation(() async {
         await dataStore.deleteInternal(
-          SystemTable.keyMigrationProgressTableName,
+          progressTable,
           QueryCondition.fromMap({
             SystemTable.keyMigrationProgressKeyField: oldPk,
           }),
@@ -109,9 +124,10 @@ class KeyMigrationProgressStore {
       });
 
       // Insert new progress row
+      table.tableName = TableName(newTableName);
       await _upsert(
         dataStore,
-        tableName: newTableName,
+        table: table,
         spaceName: spaceName,
         status: status,
         checkpointKey: checkpoint,
@@ -121,16 +137,16 @@ class KeyMigrationProgressStore {
 
   static Future<void> _upsert(
     DataStoreImpl dataStore, {
-    required String tableName,
+    required TableContext table,
     required String spaceName,
     required String status,
     String? checkpointKey,
     bool clearCheckpoint = false,
   }) async {
-    final pk = progressKey(tableName, spaceName);
+    final pk = progressKey(table.tableUid, spaceName);
     final row = <String, dynamic>{
       SystemTable.keyMigrationProgressKeyField: pk,
-      SystemTable.keyMigrationTableNameField: tableName,
+      SystemTable.keyMigrationTableNameField: table.tableName,
       SystemTable.keyMigrationSpaceNameField: spaceName,
       SystemTable.keyMigrationStatusField: status,
     };
