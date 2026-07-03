@@ -22,14 +22,13 @@ import '../model/config_info.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
-import '../model/table_context.dart';
+import '../model/db_startup_stage.dart';
 import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/memory_info.dart';
 import '../model/migration_task.dart';
-import '../model/db_startup_stage.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
@@ -37,6 +36,8 @@ import '../model/result_type.dart';
 import '../model/space_config.dart';
 import '../model/space_info.dart';
 import '../model/system_table.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import '../model/table_info.dart';
 import '../model/table_op_meta.dart';
 import '../model/table_schema.dart';
@@ -411,8 +412,8 @@ class DataStoreImpl {
     _ttlCleanupManager.upsertPlanForSchema(schema);
   }
 
-  void removeTtlPlanForTable(String tableName) {
-    _ttlCleanupManager.removePlanForTable(tableName);
+  void removeTtlPlanForTable(TableContext table) {
+    _ttlCleanupManager.removePlanForTable(table);
   }
 
   void clearAllTtlPlanCache() {
@@ -798,10 +799,10 @@ class DataStoreImpl {
         // can serve getTableSchema() without touching storage.
         if (isMemoryMode) {
           for (final s in SystemTable.gettableSchemas) {
-            schemaManager?.cacheTableSchema(s.name, s);
+            schemaManager?.cacheTableSchema(TableUid(s.tableUid), s);
           }
           for (final s in _userSchemas) {
-            schemaManager?.cacheTableSchema(s.name, s);
+            schemaManager?.cacheTableSchema(TableUid(s.tableUid), s);
           }
         }
         await Future.wait([
@@ -1272,19 +1273,12 @@ class DataStoreImpl {
       autoIndexes: null,
     );
 
-    // Generate stable internal tableUid
-    final tableUid = GlobalIdGenerator.generate("t");
-
-    // Update each index to have a stable unique indexUid
-    final updatedIndexes = <IndexSchema>[];
-    for (final idx in userSchema.indexes) {
-      final indexUid = GlobalIdGenerator.generate("i");
-      updatedIndexes.add(idx.copyWith(indexUid: indexUid));
-    }
+    // Generate stable internal tableUid; index uids are assigned in saveTableSchema
+    // via generateAutoIndexes().
+    final tableUid = TableUid(GlobalIdGenerator.generate("t"));
 
     final schemaValid = userSchema.copyWith(
       tableUid: tableUid,
-      indexes: updatedIndexes,
       isSystemTable: isSystemTable,
     );
 
@@ -1315,8 +1309,8 @@ class DataStoreImpl {
         for (final fk in schemaValid.foreignKeys) {
           if (!fk.enabled) continue;
 
-          final referencedSchema =
-              await schemaManager?.getTableSchema(fk.referencedTable);
+          final referencedSchema = await schemaManager
+              ?.getTableSchemaByName(TableName(fk.referencedTable));
           if (referencedSchema == null) {
             throw DbException([
               SchemaValidationStatus(
@@ -1364,25 +1358,38 @@ class DataStoreImpl {
         }
 
         // Write schema file and register routing
-        await schemaManager?.saveTableSchema(
-            tableUid, schema.name, schemaValid);
+        final tableCtx = TableContext(
+          tableUid: TableUid(tableUid),
+          tableName: TableName(schema.name),
+          isGlobal: schema.isGlobal,
+          dataDirIndex:
+              schemaManager!.getTableSchemaDirIndex(TableUid(tableUid)) ?? 0,
+          schema: schemaValid,
+        );
+        await schemaManager?.saveTableSchema(tableCtx, schemaValid);
 
-        // Create B+Tree indexes (explicit, unique, and foreign key).
+        // Initialize B+Tree index metadata (empty table — no full-table scan).
+        final persistedSchema =
+            schemaManager?.getCachedTableSchema(TableUid(tableUid)) ??
+                tableCtx.schema;
         final btreeIndexes =
-            schemaManager?.getBtreeIndexesFor(schemaValid) ?? <IndexSchema>[];
-        for (var index in btreeIndexes) {
-          await _indexManager?.createIndex(schema.name, index);
-        }
+            schemaManager?.getBtreeIndexesFor(persistedSchema) ??
+                <IndexSchema>[];
+        await _indexManager?.initializeEmptyTableIndexes(
+          tableCtx,
+          btreeIndexes,
+          tableSchemaOverride: persistedSchema,
+        );
 
         // Auto-create indexes for foreign keys
         if (_foreignKeyManager != null &&
             !SystemTable.isSystemTable(schema.name)) {
           await _foreignKeyManager!
-              .updateSystemTableForTable(schema.name, schemaValid);
+              .updateSystemTableForTable(tableCtx, schemaValid);
         }
 
         // New table created successfully, call table creation statistics method
-        tableDataManager.tableCreated(schema.name);
+        tableDataManager.tableCreated(tableCtx);
 
         if (!SystemTable.isSystemTable(schema.name)) {
           Logger.info(
@@ -1397,7 +1404,7 @@ class DataStoreImpl {
       } catch (e) {
         // Cleanup schema
         if (schemaManager != null) {
-          await schemaManager!.deleteTableSchema(tableUid);
+          await schemaManager!.deleteTableSchema(TableUid(tableUid));
         }
 
         Logger.error('Create table failed', rawError: e);
@@ -1564,7 +1571,8 @@ class DataStoreImpl {
 
   /// Easily obtain the TableContext of this table
   Future<TableContext> getTableContext(String tableName) async {
-    final tableUid = schemaManager?.getUidByName(tableName);
+    final name = TableName(tableName);
+    final tableUid = await schemaManager?.resolveTableUidFromName(name);
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1575,6 +1583,32 @@ class DataStoreImpl {
       ]);
     }
     final context = await schemaManager?.getTableContext(tableUid);
+    if (context == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          tableName: tableName,
+        )
+      ]);
+    }
+    return context;
+  }
+
+  /// Synchronous [TableContext] lookup (memory cache only).
+  TableContext getTableContextSync(String tableName) {
+    final name = TableName(tableName);
+    final tableUid = schemaManager?.getUidByName(name);
+    if (tableUid == null) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          tableName: tableName,
+        )
+      ]);
+    }
+    final context = schemaManager?.getTableContextSync(tableUid);
     if (context == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1612,18 +1646,19 @@ class DataStoreImpl {
     final String? txId = Zone.current[_txnZoneKey] as String?;
 
     Map<String, dynamic>? validData;
+    TableContext? table;
 
     try {
       // 1. Data validation
-      final tableContext = await getTableContext(tableName);
-      final schema = tableContext.schema;
+      table = await getTableContext(tableName);
+      final schema = table.schema;
 
       final validationErrors = <String>[];
       try {
         validData = await _validateAndProcessData(
           schema,
           data,
-          tableName,
+          table,
           validationErrors: validationErrors,
         );
       } on DbException catch (e) {
@@ -1649,14 +1684,14 @@ class DataStoreImpl {
       }
 
       // 2. Plan unique locks + refs once; acquire locks then reuse refs for buffer
-      final planIns = planUniqueForInsert(tableName, schema, validData);
+      final planIns = planUniqueForInsert(table, schema, validData);
 
       final recordId = validData[schema.primaryKey].toString();
 
       // Check and record conflicts for running large background operations
       if (!tableName.startsWith('_system_temp_op_conflict_')) {
         await _checkAndRecordConflictsForBatch(
-          tableName,
+          table,
           [validData],
           action: 'insert',
         );
@@ -1665,7 +1700,7 @@ class DataStoreImpl {
       // 3. Reservation based: try reserve unique keys first to lock the buffer
       try {
         writeBufferManager.tryReserveUniqueKeys(
-          tableName: tableName,
+          table: table,
           recordId: recordId,
           uniqueKeys: planIns.refs,
           transactionId: txId,
@@ -1685,7 +1720,7 @@ class DataStoreImpl {
             final providedId = validData[schema.primaryKey];
             if (providedId != null) {
               await tableDataManager.handlePrimaryKeyConflict(
-                  tableName, providedId);
+                  table, providedId);
             }
             if (!retryOnPkConflict) {
               return await insert(tableName, data, retryOnPkConflict: true);
@@ -1706,7 +1741,7 @@ class DataStoreImpl {
       if (hasForeignKeys) {
         try {
           await _foreignKeyManager!.validateForeignKeyConstraints(
-            tableName: tableName,
+            table: table,
             data: validData,
             operation: ForeignKeyOperation.insert,
           );
@@ -1714,7 +1749,7 @@ class DataStoreImpl {
           // Rollback reservation on FK failure
           try {
             writeBufferManager.releaseReservedUniqueKeys(
-              tableName: tableName,
+              table: table,
               recordId: recordId,
               transactionId: txId,
             );
@@ -1730,7 +1765,7 @@ class DataStoreImpl {
 
       // 5. Unique check (disk only) - skip buffer check as we already reserved the keys
       final uniqueViolation = await _indexManager?.checkUniqueConstraints(
-          tableName, validData,
+          table, validData,
           txId: txId, schemaOverride: schema, skipBufferCheck: true);
 
       if (uniqueViolation != null) {
@@ -1745,14 +1780,13 @@ class DataStoreImpl {
         if (isPkConflict && isSequentialPk && !userProvidedPk) {
           final providedId = validData[schema.primaryKey];
           if (providedId != null) {
-            await tableDataManager.handlePrimaryKeyConflict(
-                tableName, providedId);
+            await tableDataManager.handlePrimaryKeyConflict(table, providedId);
           }
           if (!retryOnPkConflict) {
             // Rollback reservation before retrying
             try {
               writeBufferManager.releaseReservedUniqueKeys(
-                tableName: tableName,
+                table: table,
                 recordId: recordId,
                 transactionId: txId,
               );
@@ -1765,7 +1799,7 @@ class DataStoreImpl {
         // Rollback reservation on disk conflict
         try {
           writeBufferManager.releaseReservedUniqueKeys(
-            tableName: tableName,
+            table: table,
             recordId: recordId,
             transactionId: txId,
           );
@@ -1792,17 +1826,17 @@ class DataStoreImpl {
       // 7. Add to write queue (insert operation) using planned refs (no extra parsing)
       final uniqueRefs = planIns.refs;
       await tableDataManager.addToBuffer(
-        tableName,
+        table,
         orderedValidData,
         BufferOperationType.insert,
         uniqueKeyRefs: uniqueRefs,
         transactionId: txId,
-        schemaVersion: tableContext.schema.schemaVersion ?? '',
+        schemaVersion: table.schema.schemaVersion ?? '',
       );
 
       notificationManager.notify(ChangeEvent(
         type: ChangeType.insert,
-        tableUid: tableContext.tableUid,
+        tableUid: table.tableUid,
         record: orderedValidData,
       ));
 
@@ -1817,22 +1851,23 @@ class DataStoreImpl {
 
       try {
         // Clear cache
-        final schema = await schemaManager?.getTableSchema(tableName);
+        final schema = table?.schema ??
+            await schemaManager?.getTableSchemaByName(TableName(tableName));
         final primaryKeyValue = validData != null && schema != null
             ? validData[schema.primaryKey]
             : null;
-        if (primaryKeyValue != null) {
-          await tableDataManager.removeTableRecords(tableName, [
+        if (primaryKeyValue != null && table != null) {
+          await tableDataManager.removeTableRecords(table, [
             primaryKeyValue.toString(),
           ]);
         }
 
         // clear write queue
-        if (schema != null) {
+        if (schema != null && table != null) {
           final primaryKey = schema.primaryKey;
           final recordId = data[primaryKey]?.toString();
           if (recordId != null) {
-            tableDataManager.removeRecordFromBuffer(tableName, recordId);
+            tableDataManager.removeRecordFromBuffer(table, recordId);
           }
         }
       } catch (rollbackError) {
@@ -1842,7 +1877,8 @@ class DataStoreImpl {
       // Identify the failed record's key
       List<String> failedKeys = [];
       try {
-        final schema = await schemaManager?.getTableSchema(tableName);
+        final schema =
+            await schemaManager?.getTableSchemaByName(TableName(tableName));
         if (schema != null && data.containsKey(schema.primaryKey)) {
           final keyValue = data[schema.primaryKey]?.toString();
           if (keyValue != null && keyValue.isNotEmpty) {
@@ -1871,17 +1907,18 @@ class DataStoreImpl {
   Future<Map<String, dynamic>?> _validateAndProcessData(
     TableSchema schema,
     Map<String, dynamic> data,
-    String tableName, {
+    TableContext table, {
     bool skipPrimaryKeyFormatCheck = false,
     List<String>? validationErrors,
     Map<String, FieldSchema>? fieldMap,
   }) async {
     Object? resolvedPrimaryKey;
     final primaryKey = schema.primaryKey;
+    final tableName = table.tableName;
 
     if ((!data.containsKey(primaryKey) || data[primaryKey] == null) &&
         schema.primaryKeyConfig.type != PrimaryKeyType.none) {
-      final nextId = await tableDataManager.getNextId(tableName);
+      final nextId = await tableDataManager.getNextId(table);
       if (nextId.isEmpty) {
         if (validationErrors != null) {
           validationErrors.add('Failed to generate primary key');
@@ -1909,7 +1946,7 @@ class DataStoreImpl {
 
   Future<List<BatchInsertPreparedRecord>> _prepareBatchInsertRecords(
     TableSchema schema,
-    String tableName,
+    TableContext table,
     List<Map<String, dynamic>> records,
     List<IndexSchema> uniqueIndexes,
     Set<Map<String, dynamic>> autoPkRecords,
@@ -1942,7 +1979,7 @@ class DataStoreImpl {
           function: prepareBatchInsertChunk,
           message: BatchInsertPrepareRequest(
             schema: schema,
-            tableName: tableName,
+            table: table,
             records: records.sublist(range.start, range.end),
             uniqueIndexes: uniqueIndexes,
             skipPrimaryKeyFormatChecks:
@@ -2043,7 +2080,7 @@ class DataStoreImpl {
 
   Future<List<BatchUpdatePreparedRecord>> _prepareBatchUpdateRecords(
     TableSchema schema,
-    String tableName,
+    TableContext table,
     List<Map<String, dynamic>> records,
     List<Map<String, dynamic>?> existingRecords,
     List<IndexSchema> uniqueIndexes,
@@ -2078,7 +2115,7 @@ class DataStoreImpl {
           function: prepareBatchUpdateChunk,
           message: BatchUpdatePrepareRequest(
             schema: schema,
-            tableName: tableName,
+            table: table,
             records: records.sublist(range.start, range.end),
             existingRecords: existingRecords.sublist(range.start, range.end),
             uniqueIndexes: uniqueIndexes,
@@ -2107,7 +2144,7 @@ class DataStoreImpl {
     return List<UniqueKeyRef>.generate(
       plannedRefs.length,
       (index) => UniqueKeyRef(
-        plannedRefs[index].indexName,
+        plannedRefs[index].indexUid,
         plannedRefs[index].compositeKey,
       ),
       growable: false,
@@ -2194,7 +2231,7 @@ class DataStoreImpl {
 
   Future<List<UniformUpdatePreparedRecord>> prepareUniformUpdateRecords(
     TableSchema schema,
-    String tableName,
+    TableContext table,
     Map<String, dynamic> validData,
     List<Map<String, dynamic>> existingRecords,
   ) async {
@@ -2222,7 +2259,7 @@ class DataStoreImpl {
           function: prepareUniformUpdateChunk,
           message: UniformUpdatePrepareRequest(
             schema: schema,
-            tableName: tableName,
+            table: table,
             validData: validData,
             existingRecords: existingRecords.sublist(range.start, range.end),
           ),
@@ -2242,7 +2279,7 @@ class DataStoreImpl {
 
   /// Execute query
   Future<List<Map<String, dynamic>>> executeQuery(
-    String tableName,
+    TableContext table,
     QueryCondition condition, {
     List<String>? orderBy,
     int? limit,
@@ -2250,7 +2287,7 @@ class DataStoreImpl {
   }) async {
     // Execute query using QueryExecutor (optimizer runs inside executor).
     final result = await _queryExecutor?.execute(
-          tableName,
+          table,
           condition: condition,
           orderBy: orderBy,
           limit: limit,
@@ -2261,14 +2298,14 @@ class DataStoreImpl {
   }
 
   UniquePlan planUniqueForInsert(
-      String tableName, TableSchema schema, Map<String, dynamic> data,
+      TableContext table, TableSchema schema, Map<String, dynamic> data,
       {List<IndexSchema>? uniqueIndexes}) {
     final refs = <UniqueKeyRef>[];
     final pk = schema.primaryKey;
     final pkVal = data[pk];
     if (pkVal != null) {
       // Primary key uniqueness is enforced via table range partitions (no pk index).
-      refs.add(UniqueKeyRef('pk', pkVal.toString()));
+      refs.add(UniqueKeyRef(IndexUid('pk'), pkVal.toString()));
     }
 
     final allIndexes = uniqueIndexes ??
@@ -2278,13 +2315,13 @@ class DataStoreImpl {
       // use actualIndexName which handles both explicit and implicit names
       final canKey = schema.createCanonicalIndexKey(idx.fields, data);
       if (canKey != null) {
-        refs.add(UniqueKeyRef(idx.actualIndexName, canKey));
+        refs.add(UniqueKeyRef(idx.indexUid, canKey));
       }
     }
     return UniquePlan(refs);
   }
 
-  UniquePlan planUniqueForUpdate(String tableName, TableSchema schema,
+  UniquePlan planUniqueForUpdate(TableContext table, TableSchema schema,
       Map<String, dynamic> updatedRecord, Set<String> changedFields) {
     final refs = <UniqueKeyRef>[];
     final allIndexes =
@@ -2295,7 +2332,7 @@ class DataStoreImpl {
         final canKey =
             schema.createCanonicalIndexKey(idx.fields, updatedRecord);
         if (canKey != null) {
-          refs.add(UniqueKeyRef(idx.actualIndexName, canKey));
+          refs.add(UniqueKeyRef(idx.indexUid, canKey));
         }
       }
     }
@@ -2317,7 +2354,8 @@ class DataStoreImpl {
       ));
     }
 
-    final schema = await schemaManager?.getTableSchema(tableName);
+    final schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -2387,7 +2425,7 @@ class DataStoreImpl {
       for (final tableUid in notificationManager.getActiveTables()) {
         notificationManager.notify(ChangeEvent(
           type: ChangeType.clear,
-          tableUid: tableUid,
+          tableUid: TableUid(tableUid),
         ));
       }
 
@@ -2402,18 +2440,18 @@ class DataStoreImpl {
   Future<Map<String, dynamic>?> _validateAndProcessUpdateData(
     TableSchema schema,
     Map<String, dynamic> data,
-    String tableName,
+    TableContext table,
   ) async {
     return validateAndProcessUpdateDataPure(
       schema: schema,
       data: data,
-      tableName: tableName,
+      tableName: table.tableName,
     );
   }
 
   /// update record
   Future<DbResult> updateInternal(
-    String tableName,
+    TableContext table,
     Map<String, dynamic> data,
     QueryCondition condition, {
     List<String>? orderBy,
@@ -2427,6 +2465,7 @@ class DataStoreImpl {
     String? checkpointCursor,
     bool returnResultDetails = true,
   }) async {
+    final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
     List<String>? partialUniqueFailedKeys;
     await ensureInitialized();
@@ -2465,12 +2504,10 @@ class DataStoreImpl {
 
     try {
       // validate data
-      final tableContext = await getTableContext(tableName);
-      final schema = tableContext.schema;
+      final schema = table.schema;
       Map<String, dynamic>? validData;
       try {
-        validData =
-            await _validateAndProcessUpdateData(schema, data, tableName);
+        validData = await _validateAndProcessUpdateData(schema, data, table);
       } on DbException catch (e) {
         return finish(DbResult.error(
           type: e.statuses.isNotEmpty
@@ -2537,7 +2574,7 @@ class DataStoreImpl {
 
           if (!isUniqueEquality) {
             final evalResult = await queryExecutor.execute(
-              tableName,
+              table,
               condition: condition,
               limit: 2,
             );
@@ -2554,7 +2591,7 @@ class DataStoreImpl {
                     message:
                         'Batch update would modify multiple records but unique key or primary key would be duplicated. '
                         'Conflicting fields: ${conflictFields.join(", ")}, Update values: ${conflictValues.map((v) => v.toString()).join(", ")}',
-                    tableName: tableName,
+                    tableName: table.tableName,
                     fields: conflictFields.isNotEmpty
                         ? conflictFields
                         : [schema.primaryKey],
@@ -2572,7 +2609,7 @@ class DataStoreImpl {
         }
       }
       // Get table file metadata to make an informed decision on the update strategy
-      final tableMeta = await tableDataManager.getTableMeta(tableName);
+      final tableMeta = await tableDataManager.getTableMeta(table);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -2668,7 +2705,7 @@ class DataStoreImpl {
         if (txId != null && !TransactionContext.isApplyingCommit()) {
           // Defer heavy update within transaction: record plan only and return success
           final hu = HeavyUpdatePlan(
-            tableName: tableName,
+            tableUid: table.tableUid,
             condition: conditionMap,
             updateData: validData,
             orderBy: orderBy,
@@ -2690,7 +2727,7 @@ class DataStoreImpl {
         if (checkpointOpId == null) {
           await walManager.beginLargeUpdate(
             opId: largeUpdateOpId,
-            table: tableName,
+            tableUid: table.tableUid,
             spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
             condition: conditionMap,
             updateData: validData,
@@ -2722,7 +2759,7 @@ class DataStoreImpl {
         // find matching records (for optimizable queries)
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
         final int effectiveLimit = limit ?? 1000000000;
-        final records = await executeQuery(tableName, condition,
+        final records = await executeQuery(table, condition,
             orderBy: orderBy, limit: effectiveLimit, offset: offset);
         if (records.isEmpty) {
           return finish(DbResult.error(
@@ -2757,7 +2794,7 @@ class DataStoreImpl {
                 // This ensures violations are caught early and transaction can be rolled back
                 try {
                   await _foreignKeyManager!.checkRestrictConstraintsForUpdate(
-                    tableName: tableName,
+                    table: table,
                     oldPkValues: oldPkValue,
                   );
                 } catch (e) {
@@ -2770,12 +2807,12 @@ class DataStoreImpl {
                   // In transaction: defer CASCADE operations until commit
                   // RESTRICT has already been checked above, so we can safely defer CASCADE
                   transactionManager?.registerDeferredCascadeUpdate(
-                      txId, tableName, oldPkValue, newPkValue);
+                      txId, table, oldPkValue, newPkValue);
                 } else {
                   // Outside transaction: execute CASCADE operations immediately
                   try {
                     await _foreignKeyManager!.handleCascadeUpdate(
-                      tableName: tableName,
+                      table: table,
                       oldPkValues: oldPkValue,
                       newPkValues: newPkValue,
                       visitedTables:
@@ -2819,7 +2856,7 @@ class DataStoreImpl {
 
         final preparedRecords = await prepareUniformUpdateRecords(
           schema,
-          tableName,
+          table,
           validData,
           records,
         );
@@ -2829,7 +2866,7 @@ class DataStoreImpl {
           final newRecords =
               preparedRecords.map((x) => x.updatedRecord).toList();
           await _checkAndRecordConflictsForBatch(
-            tableName,
+            table,
             newRecords,
             action: 'update',
             oldRecords: records,
@@ -2854,12 +2891,12 @@ class DataStoreImpl {
           if (fieldsToCheck.isNotEmpty) {
             // Plan unique + refs for update
             planUpd = planUniqueForUpdate(
-                tableName, schema, updatedRecord, changedFields);
+                table, schema, updatedRecord, changedFields);
 
             // 1. Try reserve unique keys first to lock the buffer
             try {
               oldUniqueKeys = writeBufferManager.tryReserveUniqueKeys(
-                tableName: tableName,
+                table: table,
                 recordId: recordKey,
                 uniqueKeys: planUpd.refs,
                 transactionId: txId,
@@ -2887,7 +2924,7 @@ class DataStoreImpl {
             if (hasForeignKeys && changedFields.isNotEmpty) {
               try {
                 await _foreignKeyManager!.validateForeignKeyConstraints(
-                  tableName: tableName,
+                  table: table,
                   data: updatedRecord,
                   operation: ForeignKeyOperation.update,
                 );
@@ -2895,7 +2932,7 @@ class DataStoreImpl {
                 // Rollback reservation on FK failure
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: recordKey,
                     transactionId: txId,
                     restoreKeys: oldUniqueKeys,
@@ -2927,7 +2964,7 @@ class DataStoreImpl {
               uniqueCheckData[fname] = updatedRecord[fname];
             }
             uniqueViolation = await _indexManager?.checkUniqueConstraints(
-              tableName,
+              table,
               uniqueCheckData,
               isUpdate: true,
               txId: txId,
@@ -2940,7 +2977,7 @@ class DataStoreImpl {
               // Rollback reservation on disk conflict
               try {
                 writeBufferManager.releaseReservedUniqueKeys(
-                  tableName: tableName,
+                  table: table,
                   recordId: recordKey,
                   transactionId: txId,
                   restoreKeys: oldUniqueKeys,
@@ -2973,7 +3010,7 @@ class DataStoreImpl {
               final ok = await lockMgr.acquireExclusiveLock(res, opId);
               if (!ok) {
                 writeBufferManager.releaseReservedUniqueKeys(
-                  tableName: tableName,
+                  table: table,
                   recordId: recordKey,
                   transactionId: txId,
                   restoreKeys: oldUniqueKeys,
@@ -3001,7 +3038,7 @@ class DataStoreImpl {
 
           // Register write-set for SSI conflict detection
           if (txId != null) {
-            transactionManager?.registerWriteKey(txId, tableName, recordKey);
+            transactionManager?.registerWriteKey(txId, table, recordKey);
           }
 
           // update write queue using planned refs
@@ -3014,7 +3051,7 @@ class DataStoreImpl {
           final allIndexes = <IndexSchema>[
             ...?schemaManager?.getAllIndexesFor(schema),
             ...?indexManager?.getEngineManagedBtreeIndexes(
-              tableName,
+              table,
               schema,
             ),
           ];
@@ -3037,19 +3074,19 @@ class DataStoreImpl {
             }
           }
           await tableDataManager.addToBuffer(
-            tableName,
+            table,
             updatedRecord,
             BufferOperationType.update,
             uniqueKeyRefs: uniqueRefsUpd,
             oldValues: oldValues.isEmpty ? null : oldValues,
             transactionId: txId,
-            schemaVersion: tableContext.schema.schemaVersion ?? '',
+            schemaVersion: table.schema.schemaVersion ?? '',
           );
 
-          if (notificationManager.hasListeners(tableContext.tableUid)) {
+          if (notificationManager.hasListeners(table.tableUid)) {
             notificationManager.notify(ChangeEvent(
               type: ChangeType.update,
-              tableUid: tableContext.tableUid,
+              tableUid: table.tableUid,
               record: updatedRecord,
               oldRecord: record,
             ));
@@ -3165,7 +3202,8 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    final schema = await schemaManager?.getTableSchema(tableName);
+    final schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
 
     if (schema == null) {
       Logger.error('Table $tableName does not exist');
@@ -3175,6 +3213,8 @@ class DataStoreImpl {
       ));
     }
 
+    final table = await getTableContext(tableName);
+
     String? clearOpId;
     if (registerWalOp && config.enableJournal) {
       try {
@@ -3182,7 +3222,7 @@ class DataStoreImpl {
         final opId = GlobalIdGenerator.generate('tbl_clear_');
         final op = TableOpMeta(
           opId: opId,
-          table: tableName,
+          tableUid: table.tableUid,
           type: 'clear',
           cutoff: cutoff,
           createdAt: DateTime.now().toIso8601String(),
@@ -3199,7 +3239,7 @@ class DataStoreImpl {
       // This ensures data consistency: child records are handled according to foreign key policies
       if (_foreignKeyManager != null) {
         try {
-          await _foreignKeyManager!.handleCascadeClear(tableName);
+          await _foreignKeyManager!.handleCascadeClear(table);
         } catch (e) {
           Logger.error('Cascade clear failed', rawError: e);
           // Convert exception to DbResult for graceful error handling
@@ -3212,13 +3252,13 @@ class DataStoreImpl {
       // clear application layer cache
       // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
       // especially in memory mode where schema may be in-memory only.
-      await cacheManager.invalidateCache(tableName, invalidateSchema: false);
+      await cacheManager.invalidateCache(table, invalidateSchema: false);
 
       //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
-      await tableDataManager.clearTable(tableName);
+      await tableDataManager.clearTable(table);
 
       //  reset index
-      await _indexManager?.resetIndexes(tableName);
+      await _indexManager?.resetIndexes(table);
 
       // Notify watchers that the table has been cleared
       notificationManager.notify(ChangeEvent(
@@ -3258,7 +3298,7 @@ class DataStoreImpl {
 
   /// delete record
   Future<DbResult> deleteInternal(
-    String tableName,
+    TableContext table,
     QueryCondition condition, {
     List<String>? orderBy,
     int? limit,
@@ -3270,6 +3310,7 @@ class DataStoreImpl {
     String? checkpointCursor,
     bool returnResultDetails = true,
   }) async {
+    final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
     await ensureInitialized();
 
@@ -3325,15 +3366,14 @@ class DataStoreImpl {
       // If inside a transaction and this is a heavy delete path, we should defer execution
       final String? txId = Zone.current[_txnZoneKey] as String?;
       // Get table file metadata to make an informed decision on the deletion strategy
-      final tableMeta = await tableDataManager.getTableMeta(tableName);
+      final tableMeta = await tableDataManager.getTableMeta(table);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
           resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
 
       // get table schema
-      final tableContext = await getTableContext(tableName);
-      final schema = tableContext.schema;
+      final schema = table.schema;
 
       final conditionMap = condition.build();
 
@@ -3418,7 +3458,7 @@ class DataStoreImpl {
         // standard method: get all records
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
         final int effectiveLimit = limit ?? 1000000000;
-        final recordsToDelete = await executeQuery(tableName, condition,
+        final recordsToDelete = await executeQuery(table, condition,
             orderBy: orderBy, limit: effectiveLimit, offset: offset);
 
         if (recordsToDelete.isEmpty) {
@@ -3431,7 +3471,7 @@ class DataStoreImpl {
         // Check and record conflicts for running large background operations
         if (!tableName.startsWith('_system_temp_op_conflict_')) {
           await _checkAndRecordConflictsForBatch(
-            tableName,
+            table,
             recordsToDelete,
             action: 'delete',
           );
@@ -3450,7 +3490,7 @@ class DataStoreImpl {
               // This ensures violations are caught early and transaction can be rolled back
               try {
                 await _foreignKeyManager!.checkRestrictConstraintsForDelete(
-                  tableName: tableName,
+                  table: table,
                   deletedPkValues: pkValue,
                 );
               } catch (e) {
@@ -3463,12 +3503,12 @@ class DataStoreImpl {
                 // In transaction: defer CASCADE operations until commit
                 // RESTRICT has already been checked above, so we can safely defer CASCADE
                 transactionManager?.registerDeferredCascadeDelete(
-                    txId, tableName, pkValue);
+                    txId, table, pkValue);
               } else {
                 // Outside transaction: execute CASCADE operations immediately
                 try {
                   await _foreignKeyManager!.handleCascadeDelete(
-                    tableName: tableName,
+                    table: table,
                     deletedPkValues: pkValue,
                     skipRestrictCheck: true, // RESTRICT already checked above
                   );
@@ -3519,7 +3559,7 @@ class DataStoreImpl {
 
           // Register write-set for SSI conflict detection
           if (txId != null) {
-            transactionManager?.registerWriteKey(txId, tableName, pkValue);
+            transactionManager?.registerWriteKey(txId, table, pkValue);
           }
 
           await yieldController.maybeYield();
@@ -3538,21 +3578,21 @@ class DataStoreImpl {
 
         // Remove from record cache only when not in a transaction
         if (txId == null) {
-          await tableDataManager.removeTableRecords(tableName, successKeys);
+          await tableDataManager.removeTableRecords(table, successKeys);
         }
 
         // Add records to delete buffer instead of directly writing to file
         await tableDataManager.addToDeleteBuffer(
-          tableName,
+          table,
           recordsToDelete,
-          schemaVersion: tableContext.schema.schemaVersion ?? '',
+          schemaVersion: table.schema.schemaVersion ?? '',
         );
 
-        if (notificationManager.hasListeners(tableContext.tableUid)) {
+        if (notificationManager.hasListeners(table.tableUid)) {
           for (final record in recordsToDelete) {
             notificationManager.notify(ChangeEvent(
               type: ChangeType.delete,
-              tableUid: tableContext.tableUid,
+              tableUid: table.tableUid,
               oldRecord: record,
             ));
           }
@@ -3584,7 +3624,7 @@ class DataStoreImpl {
         if (txId != null && !TransactionContext.isApplyingCommit()) {
           // Defer heavy delete within transaction: record plan only and return success
           final hd = HeavyDeletePlan(
-            tableName: tableName,
+            tableUid: table.tableUid,
             condition: conditionMap,
             orderBy: orderBy,
             limit: limit,
@@ -3602,7 +3642,7 @@ class DataStoreImpl {
         if (checkpointOpId == null) {
           await walManager.beginLargeDelete(
             opId: largeDeleteOpId,
-            table: tableName,
+            tableUid: table.tableUid,
             spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
             condition: conditionMap,
             orderBy: orderBy,
@@ -3655,26 +3695,35 @@ class DataStoreImpl {
         if (op.completed) {
           continue; // Already finished; only used for cutoff, do not re-execute
         }
+        final tableName =
+            schemaManager?.resolveTableNameFromField(op.tableUid)?.value ??
+                'unknown';
         try {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
           if (op.type == 'clear') {
-            final clearResult = await clear(op.table, registerWalOp: false);
+            if (tableName == 'unknown') {
+              Logger.warn(
+                'Skip resume clear for op ${op.opId}: table no longer exists',
+              );
+              continue;
+            }
+            final clearResult = await clear(tableName, registerWalOp: false);
             if (clearResult.hasErrors) {
               Logger.error(
-                'Failed to resume clear operation for table ${op.table}: ${clearResult.message}',
+                'Failed to resume clear operation for table $tableName: ${clearResult.message}',
               );
               // Continue with next operation even if this one failed
               continue;
             }
           } else if (op.type == 'drop') {
             final dropResult = await dropTable(
-              op.table,
+              tableName,
               isMigration: false,
               registerWalOp: false,
             );
             if (dropResult.hasErrors) {
               Logger.error(
-                'Failed to resume drop operation for table ${op.table}: ${dropResult.message}',
+                'Failed to resume drop operation for table $tableName: ${dropResult.message}',
               );
               // Continue with next operation even if this one failed
               continue;
@@ -3691,7 +3740,7 @@ class DataStoreImpl {
           }
         } catch (e) {
           Logger.warn(
-              'Resume table operation failed for ${op.opId} (${op.type} ${op.table})',
+              'Resume table operation failed for ${op.opId} (${op.type} $tableName)',
               rawError: e);
         }
       }
@@ -3799,7 +3848,7 @@ class DataStoreImpl {
         TransactionContext.isolationLevelKey:
             isolation ?? config.defaultTransactionIsolationLevel,
         TransactionContext.acquiredExclusiveLocksKey: <String, String>{},
-        TransactionContext.readKeysKey: <String, Set<String>>{},
+        TransactionContext.readKeysKey: <TableUid, Set<String>>{},
       });
       return result;
     } catch (e) {
@@ -3875,7 +3924,7 @@ class DataStoreImpl {
       }
 
       // Resolve tableUid
-      final tableUid = schemaManager?.getUidByName(tableName);
+      final tableUid = schemaManager?.getUidByName(TableName(tableName));
 
       // Check if table exists
       final schema = tableUid != null
@@ -3887,6 +3936,7 @@ class DataStoreImpl {
           message: 'Table $tableName does not exist',
         ));
       }
+      final table = await getTableContext(tableName);
       String? dropOpId;
       if (isMigration) {
         // During migration, only delete the table data directory in the current space
@@ -3902,7 +3952,7 @@ class DataStoreImpl {
               'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
             );
           }
-          await schemaManager?.deleteTableSchema(tableUid);
+          await schemaManager?.deleteTableSchema(TableUid(tableUid));
         }
 
         return finish(DbResult.success(
@@ -3916,7 +3966,7 @@ class DataStoreImpl {
             final opId = GlobalIdGenerator.generate('tbl_drop_');
             final op = TableOpMeta(
               opId: opId,
-              table: tableName,
+              tableUid: table.tableUid,
               type: 'drop',
               cutoff: cutoff,
               createdAt: DateTime.now().toIso8601String(),
@@ -3931,22 +3981,21 @@ class DataStoreImpl {
         // Handle foreign key cascade operations before dropping the table
         if (_foreignKeyManager != null) {
           try {
-            await _foreignKeyManager!.handleCascadeClear(tableName);
+            await _foreignKeyManager!.handleCascadeClear(table);
           } catch (e) {
             Logger.error('Cascade drop failed', rawError: e);
             return finish(_normalizeCascadeError(e, 'drop'));
           }
 
           // Clean up system table entries for the dropped table
-          await _foreignKeyManager!
-              .cleanupSystemTableForDroppedTable(tableName);
+          await _foreignKeyManager!.cleanupSystemTableForDroppedTable(table);
         }
 
         // Clear table cache and other memory caches
-        await _invalidateTableCaches(tableName);
+        await _invalidateTableCaches(table);
 
         // Deleting a table requires updating statistics
-        await tableDataManager.tableDeleted(tableName);
+        await tableDataManager.tableDeleted(table);
 
         // Get table path
         String? tablePath;
@@ -3960,7 +4009,7 @@ class DataStoreImpl {
 
         // Delete table structure
         if (schemaManager != null && tableUid != null) {
-          await schemaManager!.deleteTableSchema(tableUid);
+          await schemaManager!.deleteTableSchema(TableUid(tableUid));
         }
 
         // Delete table directory and all related files
@@ -4037,7 +4086,8 @@ class DataStoreImpl {
   Future<bool> tableExists(String tableName) async {
     if (schemaManager == null) return false;
     try {
-      final schema = await schemaManager!.getTableSchema(tableName);
+      final schema =
+          await schemaManager!.getTableSchemaByName(TableName(tableName));
       return schema != null;
     } catch (e) {
       Logger.error('Failed to check table existence', rawError: e);
@@ -4087,7 +4137,7 @@ class DataStoreImpl {
     TableSchema? schema;
     try {
       // 1. Get table schema and validate data
-      schema = await schemaManager?.getTableSchema(tableName);
+      schema = await schemaManager?.getTableSchemaByName(TableName(tableName));
       if (schema == null || schema.name.isEmpty) {
         Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
@@ -4097,6 +4147,7 @@ class DataStoreImpl {
       }
 
       final TableSchema tableSchema = schema;
+      final table = await getTableContext(tableName);
       final primaryKey = tableSchema.primaryKey;
       // Cache unique indexes for this table once per batch to avoid repeated
       // schemaManager lookups inside the hot record loop.
@@ -4111,7 +4162,7 @@ class DataStoreImpl {
       };
 
       // Snapshot table meta once: avoids repeated meta reads in hot loops.
-      final tableMeta = await tableDataManager.getTableMeta(tableName);
+      final tableMeta = await tableDataManager.getTableMeta(table);
       // We can safely skip disk unique checks if there is no committed data.
       final bool hasCommittedData =
           tableMeta != null && tableMeta.totalRecords > 0;
@@ -4152,7 +4203,7 @@ class DataStoreImpl {
 
         if (recordsNeedingPk.isNotEmpty) {
           final newIds = await tableDataManager.getBatchIds(
-              tableName, recordsNeedingPk.length);
+              table, recordsNeedingPk.length);
 
           if (newIds.length != recordsNeedingPk.length) {
             // Primary key generation failed for some/all records.
@@ -4253,7 +4304,7 @@ class DataStoreImpl {
           final currentRecords = recordsToProcess.sublist(start, end);
           final preparedRecords = await _prepareBatchInsertRecords(
             tableSchema,
-            tableName,
+            table,
             currentRecords,
             uniqueIndexesForTable,
             autoPkRecords,
@@ -4264,7 +4315,7 @@ class DataStoreImpl {
 
           // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
           final batchContext =
-              writeBufferManager.createBatchCheckContext(tableName, txId);
+              writeBufferManager.createBatchCheckContext(table, txId);
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
           final batchRecordsForBuffer = <Map<String, dynamic>>[];
@@ -4287,7 +4338,7 @@ class DataStoreImpl {
                     List<Map<String, dynamic>> recs) async {
                   try {
                     return await _indexManager!.checkUniqueConstraintsBatch(
-                      tableName,
+                      table,
                       recs,
                       schemaOverride: tableSchema,
                       skipBufferCheck: true,
@@ -4310,7 +4361,7 @@ class DataStoreImpl {
                       final sub = recs.sublist(off, to);
                       final subVios =
                           await _indexManager!.checkUniqueConstraintsBatch(
-                        tableName,
+                        table,
                         sub,
                         schemaOverride: tableSchema,
                         skipBufferCheck: true,
@@ -4352,7 +4403,7 @@ class DataStoreImpl {
                     if (rid.isNotEmpty) {
                       try {
                         writeBufferManager.releaseReservedUniqueKeys(
-                          tableName: tableName,
+                          table: table,
                           recordId: rid,
                           transactionId: txId,
                         );
@@ -4409,7 +4460,7 @@ class DataStoreImpl {
                   if (rid.isEmpty) continue;
                   try {
                     writeBufferManager.releaseReservedUniqueKeys(
-                      tableName: tableName,
+                      table: table,
                       recordId: rid,
                       transactionId: txId,
                     );
@@ -4432,7 +4483,7 @@ class DataStoreImpl {
             }
 
             final bufferResult = await tableDataManager.addBatchToBuffer(
-              tableName: tableName,
+              table: table,
               records: batchRecordsForBuffer,
               operation: BufferOperationType.insert,
               schema: tableSchema,
@@ -4468,7 +4519,7 @@ class DataStoreImpl {
               for (final failedId in bufferResult.failedRecordIds) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: failedId,
                     transactionId: txId,
                   );
@@ -4514,7 +4565,7 @@ class DataStoreImpl {
                     validData = await _validateAndProcessData(
                       tableSchema,
                       record,
-                      tableName,
+                      table,
                       skipPrimaryKeyFormatCheck: isAutoPk,
                       validationErrors: recordErrors,
                       fieldMap: fieldMapForValidation,
@@ -4583,7 +4634,7 @@ class DataStoreImpl {
                 if (hasForeignKeys) {
                   try {
                     await _foreignKeyManager!.validateForeignKeyConstraints(
-                      tableName: tableName,
+                      table: table,
                       data: validData,
                       operation: ForeignKeyOperation.insert,
                     );
@@ -4627,7 +4678,7 @@ class DataStoreImpl {
                           preparedRecord.plannedUniqueRefs,
                         )
                       : planUniqueForInsert(
-                          tableName,
+                          table,
                           tableSchema,
                           validData,
                           uniqueIndexes: uniqueIndexesForTable,
@@ -4654,7 +4705,7 @@ class DataStoreImpl {
                       try {
                         final dynamic pkVal = validData[primaryKey];
                         await tableDataManager.handlePrimaryKeyConflict(
-                            tableName, pkVal);
+                            table, pkVal);
 
                         // CRITICAL: Also consider records already processed in the current flush batch
                         // (but not yet in WriteBufferManager) to ensure the corrected sequence
@@ -4671,7 +4722,7 @@ class DataStoreImpl {
                         }
                         if (maxInCurrentBatch != null) {
                           await tableDataManager.updateMaxIdInMemory(
-                              tableName, maxInCurrentBatch);
+                              table, maxInCurrentBatch);
                         }
 
                         // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
@@ -4688,7 +4739,7 @@ class DataStoreImpl {
 
                           if (subsequentToReassign.isNotEmpty) {
                             final newIds = await tableDataManager.getBatchIds(
-                                tableName, subsequentToReassign.length);
+                                table, subsequentToReassign.length);
                             for (int k = 0;
                                 k < subsequentToReassign.length;
                                 k++) {
@@ -4753,7 +4804,7 @@ class DataStoreImpl {
                   // Release reservation on unexpected error
                   try {
                     writeBufferManager.releaseReservedUniqueKeys(
-                      tableName: tableName,
+                      table: table,
                       recordId: recordId,
                       transactionId: txId,
                     );
@@ -4943,13 +4994,16 @@ class DataStoreImpl {
       ));
     }
 
-    final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
+    final TableSchema? schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
         message: 'Table $tableName does not exist',
       ));
     }
+
+    final table = await getTableContext(tableName);
 
     final uniqueIndexes =
         schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
@@ -5025,7 +5079,7 @@ class DataStoreImpl {
       // Processing the full set here is more efficient as it maximizes
       // IndexManager's internal optimization and Page Cache reuse.
       final violations = await indexManager!.checkUniqueConstraintsBatch(
-        tableName,
+        table,
         validatedRecords,
         schemaOverride: schema,
         resolveInPlace: true,
@@ -5148,7 +5202,8 @@ class DataStoreImpl {
       ));
     }
 
-    final TableSchema? schema = await schemaManager?.getTableSchema(tableName);
+    final TableSchema? schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -5157,6 +5212,7 @@ class DataStoreImpl {
     }
 
     final String? txId = Zone.current[_txnZoneKey] as String?;
+    final table = await getTableContext(tableName);
     final primaryKey = schema.primaryKey;
     final allUniqueIndexes =
         schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
@@ -5234,7 +5290,7 @@ class DataStoreImpl {
       // PERFORMANCE: IndexManager.checkUniqueConstraintsBatch now sorts probe keys internally.
       // resolveInPlace: true ensures records are updated with their existingPrimaryKey directly.
       await indexManager!.checkUniqueConstraintsBatch(
-        tableName,
+        table,
         needsResolution,
         schemaOverride: schema,
         isUpdate: false,
@@ -5310,7 +5366,7 @@ class DataStoreImpl {
 
         // 4. Bulk Fetch Existing Records
         final results = await executeQuery(
-          tableName,
+          table,
           QueryCondition()..whereIn(primaryKey, pkList),
           limit: pkList.length,
         );
@@ -5348,7 +5404,7 @@ class DataStoreImpl {
 
         // 6. Optimization: Create batch context to hoist table/buffer lookups
         final batchContext =
-            writeBufferManager.createBatchCheckContext(tableName, txId);
+            writeBufferManager.createBatchCheckContext(table, txId);
 
         // 7. Pipeline Stage 1: Batch Merge and Validate
         final List<Map<String, dynamic>> candidateMergedRecords = [];
@@ -5359,7 +5415,7 @@ class DataStoreImpl {
         final List<List<UniqueKeyRef>> candidateCurrentUniqueRefs = [];
         final preparedRecords = await _prepareBatchUpdateRecords(
           schema,
-          tableName,
+          table,
           subBatch,
           existingRecords,
           allUniqueIndexes,
@@ -5520,7 +5576,7 @@ class DataStoreImpl {
                 for (final rPk in reservedRefsMap.keys) {
                   try {
                     writeBufferManager.releaseReservedUniqueKeys(
-                      tableName: tableName,
+                      table: table,
                       recordId: rPk,
                       transactionId: txId,
                     );
@@ -5549,7 +5605,7 @@ class DataStoreImpl {
         // 9. Pipeline Stage 3: Batch Unique Constraint Check (Disk Only)
         // Since we already hold the buffer locks, we only need to verify against committed disk state.
         final violations = await indexManager!.checkUniqueConstraintsBatch(
-          tableName,
+          table,
           readyForDiskCheck,
           schemaOverride: schema,
           transactionId: txId,
@@ -5592,7 +5648,7 @@ class DataStoreImpl {
             if (reservedRefsMap.containsKey(pkVal)) {
               try {
                 writeBufferManager.releaseReservedUniqueKeys(
-                  tableName: tableName,
+                  table: table,
                   recordId: pkVal,
                   transactionId: txId,
                 );
@@ -5604,7 +5660,7 @@ class DataStoreImpl {
               for (final rPk in reservedRefsMap.keys) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: rPk,
                     transactionId: txId,
                   );
@@ -5629,7 +5685,7 @@ class DataStoreImpl {
           if (_foreignKeyManager != null) {
             try {
               await _foreignKeyManager!.validateForeignKeyConstraints(
-                tableName: tableName,
+                table: table,
                 data: updatedRecord,
                 operation: ForeignKeyOperation.update,
               );
@@ -5658,7 +5714,7 @@ class DataStoreImpl {
               if (reservedRefsMap.containsKey(pkVal)) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: pkVal,
                     transactionId: txId,
                   );
@@ -5669,7 +5725,7 @@ class DataStoreImpl {
                 for (final rPk in reservedRefsMap.keys) {
                   try {
                     writeBufferManager.releaseReservedUniqueKeys(
-                      tableName: tableName,
+                      table: table,
                       recordId: rPk,
                       transactionId: txId,
                     );
@@ -5704,7 +5760,7 @@ class DataStoreImpl {
           }
 
           final commitResult = await tableDataManager.addBatchToBuffer(
-            tableName: tableName,
+            table: table,
             records: recordsToCommit,
             operation: BufferOperationType.update,
             schema: schema,
@@ -5728,7 +5784,7 @@ class DataStoreImpl {
               if (reservedRefsMap.containsKey(fId)) {
                 try {
                   writeBufferManager.releaseReservedUniqueKeys(
-                    tableName: tableName,
+                    table: table,
                     recordId: fId,
                     transactionId: txId,
                   );
@@ -5869,30 +5925,31 @@ class DataStoreImpl {
             continue;
           }
 
-          final tableMeta = await tableDataManager.getTableMeta(tableName);
+          final table = await getTableContext(tableName);
+          final tableMeta = await tableDataManager.getTableMeta(table);
           if (tableMeta != null && !tableMeta.btreeFirstLeaf.isNull) {
             await tableTreePartitionManager?.prewarmBoundaryPages(
-              tableName,
+              table,
               meta: tableMeta,
             );
           }
 
-          final schema = await schemaMgr.getTableSchema(tableName);
+          final schema =
+              await schemaMgr.getTableSchemaByName(TableName(tableName));
           if (schema != null) {
             final indexes = schemaMgr
                 .getBtreeIndexesFor(schema)
                 .where((index) => index.type == IndexType.btree);
             for (final index in indexes) {
               if (!_isInitialized) break;
-              final indexName = index.actualIndexName;
               final indexMeta =
-                  await _indexManager?.getIndexMeta(tableName, indexName);
+                  await _indexManager?.getIndexMeta(table, index.indexUid);
               if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
                 continue;
               }
               await indexTreePartitionManager?.prewarmBoundaryPages(
-                tableName,
-                indexName,
+                table,
+                index.indexUid,
                 meta: indexMeta,
               );
               await yieldController.maybeYield();
@@ -5950,18 +6007,19 @@ class DataStoreImpl {
     for (final tableName in kvTables) {
       if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
       try {
-        final tableMeta = await tableDataManager.getTableMeta(tableName);
+        final table = getTableContextSync(tableName);
+        final tableMeta = await tableDataManager.getTableMeta(table);
         if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
         if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
 
-        final indexBytes = await _estimateTableIndexBytes(tableName);
+        final indexBytes = await _estimateTableIndexBytes(table);
         final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
         if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
           continue;
         }
 
         await executeQuery(
-          tableName,
+          table,
           QueryCondition()..where(SystemTable.keyValueKeyField, '>=', ''),
           limit: maxRecordsSafetyCap,
         );
@@ -6014,13 +6072,13 @@ class DataStoreImpl {
         final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
         if (!tableExistsInSpace || !_isInitialized) continue;
 
-        final tableMeta = await tableDataManager.getTableMeta(tableName);
+        final table = await getTableContext(tableName);
+        final tableMeta = await tableDataManager.getTableMeta(table);
         if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
 
-        final schema = await schemaMgr.getTableSchema(tableName);
-        if (schema == null) continue;
+        final schema = table.schema;
 
-        final indexBytes = await _estimateTableIndexBytes(tableName);
+        final indexBytes = await _estimateTableIndexBytes(table);
         final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
 
         if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
@@ -6029,7 +6087,7 @@ class DataStoreImpl {
         }
 
         await executeQuery(
-          tableName,
+          table,
           QueryCondition()..where(schema.primaryKey, '>=', ''),
           limit: maxRecordsSafetyCap,
         );
@@ -6038,15 +6096,14 @@ class DataStoreImpl {
         final indexes = schemaMgr.getBtreeIndexesFor(schema);
         for (final index in indexes) {
           if (!_isInitialized) break;
-          final indexName = index.actualIndexName;
           final indexMeta =
-              await _indexManager?.getIndexMeta(tableName, indexName);
+              await _indexManager?.getIndexMeta(table, index.indexUid);
           if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
 
           // Warm the full index by traversing its leaf chain directly.
           await indexTreePartitionManager?.searchByKeyRange(
-            tableName: tableName,
-            indexName: indexName,
+            table: table,
+            indexUid: index.indexUid,
             meta: indexMeta,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
@@ -6064,11 +6121,10 @@ class DataStoreImpl {
     }
   }
 
-  Future<int> _estimateTableIndexBytes(String tableName) async {
+  Future<int> _estimateTableIndexBytes(TableContext table) async {
     final schemaMgr = schemaManager;
     if (schemaMgr == null) return 0;
-    final schema = await schemaMgr.getTableSchema(tableName);
-    if (schema == null) return 0;
+    final schema = table.schema;
 
     var total = 0;
     final yieldController = YieldController(
@@ -6079,7 +6135,7 @@ class DataStoreImpl {
         .where((index) => index.type == IndexType.btree);
     for (final index in indexes) {
       final indexMeta =
-          await _indexManager?.getIndexMeta(tableName, index.actualIndexName);
+          await _indexManager?.getIndexMeta(table, index.indexUid);
       if (indexMeta != null) {
         total += indexMeta.totalSizeInBytes;
       }
@@ -6139,7 +6195,10 @@ class DataStoreImpl {
     for (final tableName in allTables) {
       await yieldController.maybeYield();
       // Check if it's a global table
-      final isGlobal = await schemaManager?.isTableGlobal(tableName) ?? false;
+      final uid = schemaManager?.getUidByName(TableName(tableName));
+      final isGlobal = uid != null
+          ? await schemaManager?.isTableGlobal(uid) ?? false
+          : false;
       if (isGlobal) {
         globalTables.add(tableName);
       } else {
@@ -6152,17 +6211,18 @@ class DataStoreImpl {
   }
 
   /// query by id
-  Future<Map<String, dynamic>?> queryById(String tableName, dynamic id) async {
+  Future<Map<String, dynamic>?> queryById(
+      TableContext table, dynamic id) async {
     try {
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table $tableName does not exist');
+      final schema = table.schema;
+      if (schema.name.isEmpty) {
+        Logger.error('Table ${table.tableName} does not exist');
         return null;
       }
       final condition = QueryCondition()..where(schema.primaryKey, '=', id);
 
       final results = await executeQuery(
-        tableName,
+        table,
         condition,
         limit: 1,
       );
@@ -6175,19 +6235,19 @@ class DataStoreImpl {
 
   /// query by field
   Future<List<Map<String, dynamic>>> queryBy(
-    String tableName,
+    TableContext table,
     String field,
     dynamic value,
   ) async {
     try {
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        Logger.error('Table $tableName does not exist');
+      final schema = table.schema;
+      if (schema.name.isEmpty) {
+        Logger.error('Table ${table.tableName} does not exist');
         return [];
       }
       final condition = QueryCondition()..where(field, '=', value);
 
-      return await executeQuery(tableName, condition);
+      return await executeQuery(table, condition);
     } catch (e) {
       Logger.error('Query by field failed', rawError: e);
       rethrow;
@@ -6222,8 +6282,9 @@ class DataStoreImpl {
   }) async {
     await ensureInitialized();
     if (_vectorIndexManager == null) return const [];
+    final table = await getTableContext(tableName);
     return _vectorIndexManager!.vectorSearch(
-      tableName: tableName,
+      table: table,
       fieldName: fieldName,
       queryVector: queryVector,
       topK: topK,
@@ -6402,7 +6463,8 @@ class DataStoreImpl {
       _kvExpiresAtField: expiresAtIso,
     };
 
-    final schema = await schemaManager?.getTableSchema(tableName);
+    final schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -6459,7 +6521,8 @@ class DataStoreImpl {
       ));
     }
 
-    final schema = await schemaManager?.getTableSchema(tableName);
+    final schema =
+        await schemaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -6486,8 +6549,9 @@ class DataStoreImpl {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final result = await executeQuery(
-      tableName,
+      table,
       QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
     );
@@ -6497,7 +6561,7 @@ class DataStoreImpl {
 
     final row = result.first;
     if (_isKvRowExpired(row)) {
-      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
+      _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
       return null;
     }
 
@@ -6508,12 +6572,13 @@ class DataStoreImpl {
   Future<List<String>> getKeys({String? prefix, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final condition = QueryCondition();
     if (prefix != null && prefix.isNotEmpty) {
       condition.whereStartsWith(_kvKeyField, prefix);
     }
 
-    final rows = await executeQuery(tableName, condition);
+    final rows = await executeQuery(table, condition);
     final now = DateTime.now();
     final keys = <String>[];
 
@@ -6522,7 +6587,7 @@ class DataStoreImpl {
         keys.add(row[_kvKeyField].toString());
       } else {
         _scheduleExactExpiredKvCleanup(
-            tableName, row[_kvKeyField].toString(), row[_kvExpiresAtField]);
+            table, row[_kvKeyField].toString(), row[_kvExpiresAtField]);
       }
     }
     return keys;
@@ -6532,8 +6597,9 @@ class DataStoreImpl {
   Future<bool> exists(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final result = await executeQuery(
-      tableName,
+      table,
       QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
     );
@@ -6541,7 +6607,7 @@ class DataStoreImpl {
 
     final row = result.first;
     if (_isKvRowExpired(row)) {
-      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
+      _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
       return false;
     }
     return true;
@@ -6552,9 +6618,10 @@ class DataStoreImpl {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     // Build delete condition
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
-    return await deleteInternal(tableName, condition);
+    return await deleteInternal(table, condition);
   }
 
   /// Remove multiple key-value pairs.
@@ -6565,16 +6632,18 @@ class DataStoreImpl {
     if (keyList.isEmpty) return DbResult.success();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final condition = QueryCondition()..whereIn(_kvKeyField, keyList);
-    return await deleteInternal(tableName, condition);
+    return await deleteInternal(table, condition);
   }
 
   /// Get remaining TTL for a key.
   Future<Duration?> getTtl(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final result = await executeQuery(
-      tableName,
+      table,
       QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
     );
@@ -6586,7 +6655,7 @@ class DataStoreImpl {
 
     final now = DateTime.now();
     if (expiresAt.isBefore(now)) {
-      _scheduleExactExpiredKvCleanup(tableName, key, row[_kvExpiresAtField]);
+      _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
       return null;
     }
     return expiresAt.difference(now);
@@ -6597,6 +6666,7 @@ class DataStoreImpl {
       {DateTime? expiresAt, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
 
     final now = DateTime.now();
     final expiresAtIso = expiresAt?.toIso8601String() ??
@@ -6608,7 +6678,7 @@ class DataStoreImpl {
     };
 
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
-    return await updateInternal(tableName, data, condition);
+    return await updateInternal(table, data, condition);
   }
 
   /// Atomic increment for a numeric value.
@@ -6616,6 +6686,7 @@ class DataStoreImpl {
       {int amount = 1, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
 
     // Efficiently check if key exists and is not expired.
     // If not exists, we use setValue to handle insert and default values (TTL etc.)
@@ -6633,21 +6704,22 @@ class DataStoreImpl {
     };
 
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
-    return await updateInternal(tableName, data, condition);
+    return await updateInternal(table, data, condition);
   }
 
   /// Watch a single key-value pair and emit the latest value immediately.
   Stream<T?> watchValue<T>(String key,
       {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
 
     return _watchKvQuery<T?>(
-      tableName: tableName,
+      table: table,
       condition: condition,
       distinct: distinct,
       loadSnapshot: () async {
-        final rows = await executeQuery(tableName, condition);
+        final rows = await executeQuery(table, condition);
         if (rows.isEmpty) {
           return (
             value: defaultValue,
@@ -6664,7 +6736,7 @@ class DataStoreImpl {
         final rawExpiresAt = row[_kvExpiresAtField];
         final expiresAt = _parseKvDateTime(rawExpiresAt);
         if (expiresAt != null && !expiresAt.isAfter(DateTime.now())) {
-          _scheduleExactExpiredKvCleanup(tableName, key, rawExpiresAt);
+          _scheduleExactExpiredKvCleanup(table, key, rawExpiresAt);
           return (
             value: defaultValue,
             fingerprint: jsonEncode([
@@ -6701,6 +6773,7 @@ class DataStoreImpl {
     }
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
     final condition = QueryCondition();
     if (requestedKeys.length == 1) {
       condition.where(_kvKeyField, '=', requestedKeys.first);
@@ -6709,11 +6782,11 @@ class DataStoreImpl {
     }
 
     return _watchKvQuery<Map<String, dynamic>>(
-      tableName: tableName,
+      table: table,
       condition: condition,
       distinct: distinct,
       loadSnapshot: () async {
-        final rows = await executeQuery(tableName, condition);
+        final rows = await executeQuery(table, condition);
         final rowsByKey = <String, Map<String, dynamic>>{};
         for (final row in rows) {
           final rowKey = row[_kvKeyField];
@@ -6739,8 +6812,7 @@ class DataStoreImpl {
           if (expiresAt != null && !expiresAt.isAfter(now)) {
             values[requestedKey] = null;
             fingerprintParts.add([requestedKey, false, null]);
-            _scheduleExactExpiredKvCleanup(
-                tableName, requestedKey, rawExpiresAt);
+            _scheduleExactExpiredKvCleanup(table, requestedKey, rawExpiresAt);
             continue;
           }
 
@@ -6765,7 +6837,7 @@ class DataStoreImpl {
   }
 
   Stream<T> _watchKvQuery<T>({
-    required String tableName,
+    required TableContext table,
     required QueryCondition condition,
     required Future<({T value, String fingerprint, DateTime? nextRefreshAt})>
             Function()
@@ -6846,7 +6918,7 @@ class DataStoreImpl {
         }
 
         subscription = notificationManager.register(
-          tableName,
+          table.tableUid,
           condition,
           (event) async {
             if (queryPending) {
@@ -6924,7 +6996,7 @@ class DataStoreImpl {
   }
 
   void _scheduleExactExpiredKvCleanup(
-    String tableName,
+    TableContext table,
     String key,
     dynamic rawExpiresAt,
   ) {
@@ -6933,14 +7005,14 @@ class DataStoreImpl {
       return;
     }
     unawaited(_deleteExpiredKvRecordExact(
-      tableName,
+      table,
       key: key,
       expiresAtIso: expiresAtIso,
     ));
   }
 
   Future<void> _deleteExpiredKvRecordExact(
-    String tableName, {
+    TableContext table, {
     required String key,
     required String expiresAtIso,
   }) async {
@@ -6948,10 +7020,11 @@ class DataStoreImpl {
       final condition = QueryCondition()
         ..where(_kvKeyField, '=', key)
         ..where(_kvExpiresAtField, '=', expiresAtIso);
-      await deleteInternal(tableName, condition, limit: 1);
+      await deleteInternal(table, condition, limit: 1);
     } catch (e) {
       if (e is DbClosedException) return;
-      Logger.warn('Failed to cleanup expired kv key "$key" in $tableName',
+      Logger.warn(
+          'Failed to cleanup expired kv key "$key" in ${table.tableName}',
           rawError: e);
     }
   }
@@ -6972,21 +7045,24 @@ class DataStoreImpl {
     }
   }
 
+  /// get table schema by name (user-facing entry point)
+  Future<TableSchema?> getTableSchema(String tableName) async {
+    return schemaManager?.getTableSchemaByName(TableName(tableName));
+  }
+
   /// Get table info
+  /// get table info
   Future<TableInfo?> getTableInfo(String tableName) async {
     await ensureInitialized();
-    final schema = await schemaManager?.getTableSchema(tableName);
-    if (schema == null) {
-      Logger.error('Table $tableName does not exist');
-      return null;
-    }
-    final dataPath = await pathManager.getDataMetaPath(tableName);
+    final table = await getTableContext(tableName);
+    final schema = table.schema;
+    final dataPath = await pathManager.getDataMetaPath(table.tableUid);
     DateTime? createdAt;
     if (await storage.existsFile(dataPath)) {
       createdAt = await storage.getFileCreationTime(dataPath);
     }
-    final totalRecords = await tableDataManager.getTableRecordCount(tableName);
-    final fileSize = await tableDataManager.getTableFileSize(tableName);
+    final totalRecords = await tableDataManager.getTableRecordCount(table);
+    final fileSize = await tableDataManager.getTableFileSize(table);
     return TableInfo(
       tableName: tableName,
       totalRecords: totalRecords,
@@ -6994,7 +7070,7 @@ class DataStoreImpl {
       indexCount: schema.indexes.length,
       schema: schema,
       isGlobal: schema.isGlobal,
-      lastModified: tableDataManager.getLastModifiedTime(tableName),
+      lastModified: tableDataManager.getLastModifiedTime(table),
       createdAt: createdAt,
     );
   }
@@ -7018,8 +7094,10 @@ class DataStoreImpl {
       throw DbClosedException();
     }
 
-    final actualOldSchema = await schemaMgr.getTableSchema(oldTableName);
-    final existingNewSchema = await schemaMgr.getTableSchema(newTableName);
+    final actualOldSchema =
+        await schemaMgr.getTableSchemaByName(TableName(oldTableName));
+    final existingNewSchema =
+        await schemaMgr.getTableSchemaByName(TableName(newTableName));
     final currentSpace = spaceName ?? currentSpaceName;
 
     startTableRenameBarrier(oldTableName, newTableName);
@@ -7039,20 +7117,23 @@ class DataStoreImpl {
       _pendingTableRenames[newTableName] = oldTableName;
 
       // Update schema in cache immediately so that users can read/write using newTableName
+      final renameContext = await getTableContext(newTableName);
       if (updateSchema && renamedSchema != null) {
-        schemaMgr.cacheTableSchema(newTableName, renamedSchema);
-        schemaMgr.removeCachedTableSchema(oldTableName);
-        await cacheManager.invalidateCache(oldTableName,
+        schemaMgr.cacheTableSchema(renameContext.tableUid, renamedSchema);
+        schemaMgr.removeCachedTableSchema(
+            schemaMgr.getUidByName(TableName(oldTableName)) ??
+                renameContext.tableUid);
+        await cacheManager.invalidateCache(renameContext,
             invalidateSchema: true);
       }
 
       // Synchronize in-memory structures and state for renaming
       await transactionManager?.renameTableInCaches(oldTableName, newTableName);
-      await backgroundWriteScheduler.renameTable(oldTableName, newTableName);
-      await writeBufferManager.renameTable(oldTableName, newTableName);
+      await backgroundWriteScheduler.renameTable(renameContext);
+      await writeBufferManager.renameTable(
+          renameContext, oldTableName, newTableName);
       tableDataManager.renameTable(oldTableName, newTableName);
 
-      await _renameTableInLargeOperations(oldTableName, newTableName);
       await _renameKeyMigrationInMemory(
           oldTableName, newTableName, currentSpace);
     } finally {
@@ -7062,11 +7143,13 @@ class DataStoreImpl {
 
   Future<void> _renameKeyMigrationInMemory(
       String oldTableName, String newTableName, String spaceName) async {
-    if (KeyMigrationRunner.isTableMigrating(oldTableName)) {
-      KeyMigrationRunner.renameTable(oldTableName, newTableName);
+    final oldTable = getTableContextSync(oldTableName);
+    if (KeyMigrationRunner.isTableMigrating(oldTable)) {
+      KeyMigrationRunner.renameTable(oldTable, newTableName);
     }
     await KeyMigrationProgressStore.renameTableProgress(
       this,
+      table: oldTable,
       oldTableName: oldTableName,
       newTableName: newTableName,
       spaceName: spaceName,
@@ -7095,19 +7178,18 @@ class DataStoreImpl {
     final currentSpace = spaceName ?? currentSpaceName;
 
     // Load schemas
-    final actualOldSchema = await schemaMgr
-        .getTableSchema(schemaMgr.getUidByName(oldTableName) ?? oldTableName);
+    final actualOldSchema = await schemaMgr.getTableSchema(
+        schemaMgr.getUidByName(TableName(oldTableName)) ??
+            TableUid(oldTableName));
     final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
-    final existingNewSchema = await schemaMgr
-        .getTableSchema(schemaMgr.getUidByName(newTableName) ?? newTableName);
+    final existingNewSchema = await schemaMgr.getTableSchema(
+        schemaMgr.getUidByName(TableName(newTableName)) ??
+            TableUid(newTableName));
     final schemaForLayout = existingOldSchema ?? existingNewSchema;
     if (schemaForLayout == null) {
       _pendingTableRenames.remove(newTableName);
       return;
     }
-
-    final isGlobal = schemaForLayout.isGlobal;
-    final tableUid = schemaForLayout.tableUid;
 
     // Idempotent recovery check: If newTableName already has schema, and oldTableName mapping/directory
     // is already missing, it means physical rename is already fully done.
@@ -7137,14 +7219,15 @@ class DataStoreImpl {
       await LargeOperationRunner.pauseAndAwait(currentSpace);
       backgroundPaused = true;
 
-      keyMigrating = KeyMigrationRunner.isTableMigrating(newTableName);
+      keyMigrating = KeyMigrationRunner.isTableMigrating(
+          await getTableContext(oldTableName));
       if (keyMigrating) {
         await keyManager.pauseKeyMigration();
       }
 
       if (updateSchema && actualOldSchema != null) {
         await schemaMgr.renameTableSchema(
-            tableUid, oldTableName, renamedSchema);
+            await getTableContext(oldTableName), oldTableName, renamedSchema);
       }
       if (updateSchema) {
         await _updateSchemasReferencingRenamedTable(
@@ -7168,20 +7251,6 @@ class DataStoreImpl {
         );
       }
 
-      if (_weightManager != null) {
-        final btreeIndexes =
-            schemaManager?.getBtreeIndexesFor(schemaForLayout) ??
-                <IndexSchema>[];
-        final indexNames = btreeIndexes.map((i) => i.actualIndexName).toList();
-        await _weightManager!.renameTableWeights(
-          oldTableName,
-          newTableName,
-          oldIndexNames: indexNames,
-          newIndexNames: indexNames,
-          spaceName: isGlobal ? '__global__' : currentSpace,
-        );
-      }
-
       // 3. Symmetrically resume background tasks if they were paused
       if (keyMigrating) {
         unawaited(keyManager
@@ -7197,15 +7266,13 @@ class DataStoreImpl {
       if (removedMapping != null) {
         _pendingTableRenames[newTableName] = removedMapping;
       }
-      // Rollback WAL metadata large deletes/updates table representation
-      try {
-        await _renameTableInLargeOperations(newTableName, oldTableName);
-      } catch (_) {}
       if (keyMigrating) {
         try {
-          KeyMigrationRunner.renameTable(newTableName, oldTableName);
+          final rollbackTable = getTableContextSync(newTableName);
+          KeyMigrationRunner.renameTable(rollbackTable, oldTableName);
           await KeyMigrationProgressStore.renameTableProgress(
             this,
+            table: rollbackTable,
             oldTableName: newTableName,
             newTableName: oldTableName,
             spaceName: currentSpace,
@@ -7221,8 +7288,8 @@ class DataStoreImpl {
       }
       try {
         if (updateSchema && actualOldSchema != null) {
-          await schemaMgr.renameTableSchema(
-              tableUid, newTableName, schemaForLayout);
+          await schemaMgr.renameTableSchema(await getTableContext(newTableName),
+              newTableName, schemaForLayout);
         }
       } catch (rollbackError) {
         Logger.error(
@@ -7231,8 +7298,12 @@ class DataStoreImpl {
       }
       Error.throwWithStackTrace(error, stackTrace);
     } finally {
-      await cacheManager.invalidateCache(oldTableName);
-      await cacheManager.invalidateCache(newTableName);
+      try {
+        await cacheManager.invalidateCache(await getTableContext(oldTableName));
+      } catch (_) {}
+      try {
+        await cacheManager.invalidateCache(await getTableContext(newTableName));
+      } catch (_) {}
       endTableRenameBarrier(oldTableName, newTableName);
     }
   }
@@ -7270,7 +7341,7 @@ class DataStoreImpl {
     for (final tableName in tablesToScan) {
       if (tableName == newTableName) continue;
 
-      final schema = await schemaMgr.getTableSchema(tableName);
+      final schema = await schemaMgr.getTableSchemaByName(TableName(tableName));
       if (schema == null) {
         continue;
       }
@@ -7283,8 +7354,8 @@ class DataStoreImpl {
       if (identical(updatedSchema, schema)) {
         continue;
       }
-      final tableUid = schemaMgr.getUidByName(tableName) ?? tableName;
-      await schemaMgr.saveTableSchema(tableUid, tableName, updatedSchema);
+      final tableCtx = await getTableContext(tableName);
+      await schemaMgr.saveTableSchema(tableCtx, updatedSchema);
       updatedTables?.add(tableName);
     }
   }
@@ -7293,15 +7364,14 @@ class DataStoreImpl {
     String tableName,
     TableSchema schemaForLayout,
   ) async {
-    // With stable UIDs, TableMeta and B+Tree IndexMeta contain only tableUid/indexUid
-    // which are stable and do not change when the table is renamed.
-    // We only need to update the tableName property inside NghIndexMeta for vector indexes.
+    // With stable UIDs, TableMeta, B+Tree IndexMeta, and NghIndexMeta contain
+    // only tableUid/indexUid — logical names live in schema only.
 
     final vectorIndexes =
         schemaManager?.getVectorIndexesFor(schemaForLayout) ?? <IndexSchema>[];
     for (final index in vectorIndexes) {
-      final metaPath =
-          await pathManager.getNghMetaPath(tableName, index.actualIndexName);
+      final metaPath = await pathManager.getNghMetaPath(
+          TableUid(schemaForLayout.tableUid), index.indexUid);
       if (!await storage.existsFile(metaPath)) {
         continue;
       }
@@ -7317,43 +7387,15 @@ class DataStoreImpl {
       }
 
       final meta = NghIndexMeta.fromJson(Map<String, dynamic>.from(json));
-      if (meta.tableName == tableName) {
+      if (meta.tableUid == schemaForLayout.tableUid) {
         continue;
       }
 
       final updatedMeta = meta.copyWith(
-        tableName: tableName,
+        tableUid: schemaForLayout.tableUid,
       );
 
       await storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
-    }
-  }
-
-  Future<void> _renameTableInLargeOperations(
-      String oldTableName, String newTableName) async {
-    if (!config.enableJournal) return;
-    var metaDirty = false;
-
-    // 1. Rename table in largeDeletes
-    for (final entry in walManager.meta.largeDeletes.entries) {
-      if (entry.value.table == oldTableName) {
-        walManager.meta.largeDeletes[entry.key] =
-            entry.value.copyWith(table: newTableName);
-        metaDirty = true;
-      }
-    }
-
-    // 2. Rename table in largeUpdates
-    for (final entry in walManager.meta.largeUpdates.entries) {
-      if (entry.value.table == oldTableName) {
-        walManager.meta.largeUpdates[entry.key] =
-            entry.value.copyWith(table: newTableName);
-        metaDirty = true;
-      }
-    }
-
-    if (metaDirty) {
-      await walManager.persistMeta(flush: false);
     }
   }
 
@@ -7374,7 +7416,7 @@ class DataStoreImpl {
 
     final schemasToRefresh = <String, TableSchema>{};
     for (final tableName in tablesToRefresh) {
-      final schema = await schemaMgr.getTableSchema(tableName);
+      final schema = await schemaMgr.getTableSchemaByName(TableName(tableName));
       if (schema != null) {
         schemasToRefresh[tableName] = schema;
       }
@@ -7383,7 +7425,7 @@ class DataStoreImpl {
     final requiresRefresh = referencingTables.isNotEmpty ||
         schemasToRefresh.values.any((schema) => schema.foreignKeys.isNotEmpty);
     await fkManager.cleanupSystemTableForDroppedTable(
-      oldTableName,
+      await getTableContext(oldTableName),
       throwOnError: throwOnError,
     );
 
@@ -7393,7 +7435,7 @@ class DataStoreImpl {
 
     for (final entry in schemasToRefresh.entries) {
       await fkManager.updateSystemTableForTable(
-        entry.key,
+        await getTableContext(entry.key),
         entry.value,
         throwOnError: throwOnError,
       );
@@ -7401,8 +7443,8 @@ class DataStoreImpl {
   }
 
   /// Invalidate all caches for table
-  Future<void> _invalidateTableCaches(String tableName) async {
-    await cacheManager.invalidateCache(tableName, removeTableState: true);
+  Future<void> _invalidateTableCaches(TableContext table) async {
+    await cacheManager.invalidateCache(table, removeTableState: true);
   }
 
   /// Get global configuration
@@ -7522,8 +7564,9 @@ class DataStoreImpl {
       final activeUids =
           await schemaManager?.getActiveUidsForSpace(_currentSpaceName) ?? [];
       final userTables = activeUids
-          .map((uid) => schemaManager?.getNameByUid(uid))
-          .whereType<String>()
+          .map((uid) => schemaManager?.getNameByUid(TableUid(uid)))
+          .whereType<TableName>()
+          .map((name) => name.value)
           .where((name) => !SystemTable.isSystemTable(name))
           .toList(growable: false);
 
@@ -7647,12 +7690,13 @@ class DataStoreImpl {
   /// @param condition Optional query conditions to filter records
   /// @param selectedFields Optional list of fields to include in the results
   Stream<Map<String, dynamic>> streamRecords(
-    String tableName, {
+    TableContext table, {
     QueryCondition? condition,
     List<String>? selectedFields,
   }) async* {
     try {
       await ensureInitialized();
+      final tableName = table.tableName;
       // Check if table exists
       if (!await tableExists(tableName)) {
         Logger.error('Table $tableName does not exist');
@@ -7660,8 +7704,8 @@ class DataStoreImpl {
       }
 
       // Get table schema
-      final schema = await schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
+      final schema = table.schema;
+      if (schema.name.isEmpty) {
         Logger.error('Failed to get schema for $tableName');
         return;
       }
@@ -7672,7 +7716,7 @@ class DataStoreImpl {
           : null;
 
       // Stream all records from table using the existing tableDataManager method
-      final recordStream = tableDataManager.streamRecords(tableName);
+      final recordStream = tableDataManager.streamRecords(table);
 
       try {
         await for (final record in recordStream) {
@@ -7748,11 +7792,12 @@ class DataStoreImpl {
 
   /// Performs conflict checks and writes flags to corresponding system conflict tables for multiple records.
   Future<void> _checkAndRecordConflictsForBatch(
-    String tableName,
+    TableContext table,
     List<Map<String, dynamic>> records, {
     required String action, // 'insert', 'update', 'delete'
     List<Map<String, dynamic>>? oldRecords, // required for 'update'
   }) async {
+    final tableName = table.tableName;
     if (tableName.startsWith('_system_temp_op_conflict_')) return;
     if (records.isEmpty) return;
     if (walManager.meta.largeDeletes.isEmpty &&
@@ -7760,8 +7805,8 @@ class DataStoreImpl {
       return;
     }
 
-    final schema = await schemaManager?.getTableSchema(tableName);
-    if (schema == null) return;
+    final schema = table.schema;
+    if (schema.name.isEmpty) return;
     final primaryKey = schema.primaryKey;
 
     // Scan running largeDeletes
@@ -7771,14 +7816,16 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (op.table != tableName) continue;
+      if (!schemaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+        continue;
+      }
 
       final conflictTable = '_system_temp_op_conflict_${op.opId}';
 
       if (action == 'insert') {
         final matchResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: records,
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
@@ -7793,7 +7840,7 @@ class DataStoreImpl {
       } else if (action == 'update') {
         final matchResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: records, // new values
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
@@ -7815,14 +7862,16 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (op.table != tableName) continue;
+      if (!schemaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+        continue;
+      }
 
       final conflictTable = '_system_temp_op_conflict_${op.opId}';
 
       if (action == 'insert') {
         final matchResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: records,
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
@@ -7837,7 +7886,7 @@ class DataStoreImpl {
       } else if (action == 'delete') {
         final matchResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: records,
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
@@ -7854,7 +7903,7 @@ class DataStoreImpl {
 
         final matchOldResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: oldRecords,
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
@@ -7881,7 +7930,7 @@ class DataStoreImpl {
 
         final matchNewResult = await ConditionBatchMatcher.matchRecordIndices(
           schema: schema,
-          tableName: tableName,
+          table: table,
           condition: op.condition,
           records: records, // new values
           estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
